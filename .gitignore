@@ -1,0 +1,15 @@
+/Cargo.lock
+/target
+**/target
+
+/.idea
+.vscode
+
+# python
+.env
+venv
+**/.python-version
+__pycache__
+
+# macOS
+**/.DS_Store
