@@ -1,0 +1,50 @@
+[package]
+name = "hudi-fs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# arrow
+arrow = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-array = { workspace = true , features = ["chrono-tz"]}
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-json = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-schema = { workspace = true, features = ["serde"] }
+arrow-select = { workspace = true }
+parquet = { workspace = true, features = [
+    "async",
+    "object_store",
+] }
+pin-project-lite = "^0.2.7"
+
+# datafusion
+datafusion = { workspace = true, optional = true }
+datafusion-expr = { workspace = true, optional = true }
+datafusion-common = { workspace = true, optional = true }
+datafusion-proto = { workspace = true, optional = true }
+datafusion-sql = { workspace = true, optional = true }
+datafusion-physical-expr = { workspace = true, optional = true }
+
+# serde
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# "stdlib"
+bytes = { workspace = true }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+hashbrown = "0.14.3"
+regex = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+url = { workspace = true }
+
+# test
+tempfile = "3.10.1"
+zip-extract = "0.1.3"

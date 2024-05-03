@@ -1,10 +1,3 @@
-# hudi-rs
-
-## Quick Start
-
-### Apache DataFusion
-
-```rust
 use std::sync::Arc;
 
 use datafusion::error::Result;
@@ -21,4 +14,3 @@ async fn main() -> Result<()> {
     df.show().await?;
     Ok(())
 }
-```
