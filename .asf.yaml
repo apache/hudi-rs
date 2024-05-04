@@ -1,3 +1,4 @@
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -14,19 +15,30 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
-/Cargo.lock
-/target
-**/target
+# The format of this file is documented at
+# https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
 
-/.idea
-.vscode
-
-# python
-.env
-venv
-**/.python-version
-__pycache__
-
-# macOS
-**/.DS_Store
+github:
+  description: "A native Rust library for Apache Hudi, with bindings into Python"
+  homepage: https://hudi.apache.org/
+  labels:
+    - apache
+    - hudi
+    - rust
+    - python
+  features:
+    wiki: false
+    issues: true
+    projects: true
+  enabled_merge_buttons:
+    squash: true
+    merge: false
+    rebase: false
+  protected_branches:
+    main:
+      required_status_checks:
+        strict: true
+      required_linear_history: true
+      required_conversation_resolution: true

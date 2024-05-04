@@ -15,18 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
+header:
+  license:
+    spdx-id: Apache-2.0
+    copyright-owner: Apache Software Foundation
 
-/.idea
-.vscode
+  paths-ignore:
+    - 'LICENSE'
+    - 'NOTICE'
 
-# python
-.env
-venv
-**/.python-version
-__pycache__
+  comment: on-failure
 
-# macOS
-**/.DS_Store
+dependency:
+  files:
+    - Cargo.toml
