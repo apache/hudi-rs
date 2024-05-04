@@ -23,6 +23,7 @@ header:
   paths-ignore:
     - 'LICENSE'
     - 'NOTICE'
+    - '**/fixtures/**'
 
   comment: on-failure
 
