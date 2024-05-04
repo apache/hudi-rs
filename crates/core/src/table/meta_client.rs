@@ -120,9 +120,10 @@ fn meta_client_get_partition_paths() {
     let target_table_path = extract_test_table(fixture_path);
     let meta_client = MetaClient::new(&target_table_path);
     let partition_paths = meta_client.get_partition_paths().unwrap();
+    let partition_path_set: HashSet<&str> = HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
     assert_eq!(
-        partition_paths,
-        vec!["chennai", "sao_paulo", "san_francisco"]
+        partition_path_set,
+        HashSet::from_iter(vec!["chennai", "sao_paulo", "san_francisco"])
     )
 }
 
