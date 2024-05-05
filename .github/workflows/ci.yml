@@ -34,9 +34,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check License Header
+      - name: Check license header
         uses: apache/skywalking-eyes/header@v0.6.0
+      - name: Check code style
+        run: make check
 
   build:
     runs-on: ${{ matrix.os }}
@@ -55,6 +56,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Unit Test
+      - name: Unit test
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
