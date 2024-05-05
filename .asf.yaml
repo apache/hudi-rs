@@ -42,3 +42,7 @@ github:
         strict: true
       required_linear_history: true
       required_conversation_resolution: true
+notifications:
+  commits:      commits@hudi.apache.org
+  issues:       commits@hudi.apache.org
+  pullrequests: commits@hudi.apache.org
