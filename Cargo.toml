@@ -22,16 +22,16 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.75.0"
+rust-version = "1.78.0"
 
 [workspace.dependencies]
 # arrow
 arrow = { version = "50" }
 arrow-arith = { version = "50" }
-arrow-array = { version = "50", features = ["chrono-tz"]}
+arrow-array = { version = "50", features = ["chrono-tz"] }
 arrow-buffer = { version = "50" }
 arrow-cast = { version = "50" }
 arrow-ipc = { version = "50" }

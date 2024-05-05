@@ -19,30 +19,23 @@
 
 use arrow_array::RecordBatch;
 use std::any::Any;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::fs::File;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
-use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion_common;
 use datafusion_common::{project_schema, DataFusionError};
-use datafusion_expr;
 use datafusion_expr::{Expr, TableType};
-use datafusion_physical_expr;
 use datafusion_physical_expr::PhysicalSortExpr;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use hudi_core::HudiTable;
-use hudi_fs::test_utils::extract_test_table;
 
 #[derive(Debug, Clone)]
 pub struct HudiDataSource {
@@ -76,7 +69,7 @@ impl HudiDataSource {
                 }
                 Ok(record_batches)
             }
-            Err(e) => Err(DataFusionError::Execution(
+            Err(_e) => Err(DataFusionError::Execution(
                 "Failed to read records from table.".to_owned(),
             )),
         }
@@ -99,10 +92,10 @@ impl TableProvider for HudiDataSource {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        _state: &SessionState,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         return self.create_physical_plan(projection, self.schema()).await;
     }
@@ -157,15 +150,15 @@ impl ExecutionPlan for HudiExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
 
     fn execute(
         &self,
-        partition: usize,
-        context: Arc<TaskContext>,
+        _partition: usize,
+        _context: Arc<TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let data = self.data_source.get_record_batches()?;
         Ok(Box::pin(MemoryStream::try_new(data, self.schema(), None)?))

@@ -17,7 +17,6 @@
  * under the License.
  */
 
-use std::collections::HashSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -25,7 +24,6 @@ use std::{fs, io};
 use hashbrown::HashMap;
 
 use hudi_fs::file_systems::FileMetadata;
-use hudi_fs::test_utils::extract_test_table;
 
 use crate::file_group::{BaseFile, FileGroup};
 use crate::timeline::Timeline;
@@ -98,7 +96,7 @@ impl MetaClient {
                 let fg_id = &base_file.file_group_id;
                 fg_id_to_base_files
                     .entry(fg_id.to_owned())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(base_file);
             }
         }
@@ -114,40 +112,49 @@ impl MetaClient {
     }
 }
 
-#[test]
-fn meta_client_get_partition_paths() {
-    let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-    let target_table_path = extract_test_table(fixture_path);
-    let meta_client = MetaClient::new(&target_table_path);
-    let partition_paths = meta_client.get_partition_paths().unwrap();
-    let partition_path_set: HashSet<&str> = HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
-    assert_eq!(
-        partition_path_set,
-        HashSet::from_iter(vec!["chennai", "sao_paulo", "san_francisco"])
-    )
-}
+#[cfg(test)]
+mod tests {
+    use crate::table::meta_client::MetaClient;
+    use hudi_fs::test_utils::extract_test_table;
+    use std::collections::HashSet;
+    use std::path::Path;
 
-#[test]
-fn meta_client_get_file_groups() {
-    let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-    let target_table_path = extract_test_table(fixture_path);
-    let meta_client = MetaClient::new(&target_table_path);
-    let file_groups = meta_client.get_file_groups("san_francisco").unwrap();
-    assert_eq!(file_groups.len(), 3);
-    let fg_ids: HashSet<&str> = HashSet::from_iter(file_groups.iter().map(|fg| fg.id.as_str()));
-    assert_eq!(
-        fg_ids,
-        HashSet::from_iter(vec![
-            "5a226868-2934-4f84-a16f-55124630c68d-0",
-            "780b8586-3ad0-48ef-a6a1-d2217845ce4a-0",
-            "d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0"
-        ])
-    );
-}
-#[test]
-fn meta_client_active_timeline_init_as_expected() {
-    let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-    let target_table_path = extract_test_table(fixture_path);
-    let meta_client = MetaClient::new(&target_table_path);
-    assert_eq!(meta_client.timeline.instants.len(), 2)
+    #[test]
+    fn meta_client_get_partition_paths() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let target_table_path = extract_test_table(fixture_path);
+        let meta_client = MetaClient::new(&target_table_path);
+        let partition_paths = meta_client.get_partition_paths().unwrap();
+        let partition_path_set: HashSet<&str> =
+            HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
+        assert_eq!(
+            partition_path_set,
+            HashSet::from_iter(vec!["chennai", "sao_paulo", "san_francisco"])
+        )
+    }
+
+    #[test]
+    fn meta_client_get_file_groups() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let target_table_path = extract_test_table(fixture_path);
+        let meta_client = MetaClient::new(&target_table_path);
+        let file_groups = meta_client.get_file_groups("san_francisco").unwrap();
+        assert_eq!(file_groups.len(), 3);
+        let fg_ids: HashSet<&str> = HashSet::from_iter(file_groups.iter().map(|fg| fg.id.as_str()));
+        assert_eq!(
+            fg_ids,
+            HashSet::from_iter(vec![
+                "5a226868-2934-4f84-a16f-55124630c68d-0",
+                "780b8586-3ad0-48ef-a6a1-d2217845ce4a-0",
+                "d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0"
+            ])
+        );
+    }
+    #[test]
+    fn meta_client_active_timeline_init_as_expected() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let target_table_path = extract_test_table(fixture_path);
+        let meta_client = MetaClient::new(&target_table_path);
+        assert_eq!(meta_client.timeline.instants.len(), 2)
+    }
 }

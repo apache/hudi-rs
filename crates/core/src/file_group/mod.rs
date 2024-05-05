@@ -26,7 +26,7 @@ use hudi_fs::file_systems::FileMetadata;
 use crate::error::HudiFileGroupError;
 use crate::error::HudiFileGroupError::CommitTimeAlreadyExists;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BaseFile {
     pub file_group_id: String,
     pub commit_time: String,
@@ -53,12 +53,13 @@ impl BaseFile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileSlice {
     pub base_file: BaseFile,
     pub partition_path: Option<String>,
 }
 
+#[allow(dead_code)]
 impl FileSlice {
     pub fn file_path(&self) -> Option<&str> {
         match &self.base_file.metadata {
@@ -99,6 +100,7 @@ impl fmt::Display for FileGroup {
     }
 }
 
+#[allow(dead_code)]
 impl FileGroup {
     pub fn new(id: String, partition_path: Option<String>) -> Self {
         Self {
@@ -140,32 +142,38 @@ impl FileGroup {
     }
 }
 
-#[test]
-fn create_a_base_file_successfully() {
-    let base_file =
-        BaseFile::new("5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet");
-    assert_eq!(
-        base_file.file_group_id,
-        "5a226868-2934-4f84-a16f-55124630c68d-0"
-    );
-    assert_eq!(base_file.commit_time, "20240402144910683");
-}
+#[cfg(test)]
+mod tests {
+    use crate::file_group::{BaseFile, FileGroup};
 
-#[test]
-fn load_a_valid_file_group() {
-    let mut fg = FileGroup::new("5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(), None);
-    let _ = fg.add_base_file_from_name(
-        "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
-    );
-    let _ = fg.add_base_file_from_name(
-        "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402123035233.parquet",
-    );
-    assert_eq!(fg.file_slices.len(), 2);
-    assert!(fg.partition_path.is_none());
-    let commit_times: Vec<&str> = fg.file_slices.keys().map(|k| k.as_str()).collect();
-    assert_eq!(commit_times, vec!["20240402123035233", "20240402144910683"]);
-    assert_eq!(
-        fg.get_latest_file_slice().unwrap().base_file.commit_time,
-        "20240402144910683"
-    )
+    #[test]
+    fn create_a_base_file_successfully() {
+        let base_file = BaseFile::new(
+            "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
+        );
+        assert_eq!(
+            base_file.file_group_id,
+            "5a226868-2934-4f84-a16f-55124630c68d-0"
+        );
+        assert_eq!(base_file.commit_time, "20240402144910683");
+    }
+
+    #[test]
+    fn load_a_valid_file_group() {
+        let mut fg = FileGroup::new("5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(), None);
+        let _ = fg.add_base_file_from_name(
+            "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
+        );
+        let _ = fg.add_base_file_from_name(
+            "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402123035233.parquet",
+        );
+        assert_eq!(fg.file_slices.len(), 2);
+        assert!(fg.partition_path.is_none());
+        let commit_times: Vec<&str> = fg.file_slices.keys().map(|k| k.as_str()).collect();
+        assert_eq!(commit_times, vec!["20240402123035233", "20240402144910683"]);
+        assert_eq!(
+            fg.get_latest_file_slice().unwrap().base_file.commit_time,
+            "20240402144910683"
+        )
+    }
 }
