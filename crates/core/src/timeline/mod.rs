@@ -21,23 +21,19 @@ use hudi_fs::file_name_without_ext;
 use std::collections::HashMap;
 
 use arrow_schema::SchemaRef;
-use hudi_fs::test_utils::extract_test_table;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::file::serialized_reader::SerializedFileReader;
-use serde::de::Error;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use crate::error::HudiTimelineError;
-
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
-    REQUESTED,
-    INFLIGHT,
-    COMPLETED,
+    Requested,
+    Inflight,
+    Completed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,9 +46,9 @@ pub struct Instant {
 impl Instant {
     pub fn state_suffix(&self) -> String {
         match self.state {
-            State::REQUESTED => ".requested".to_owned(),
-            State::INFLIGHT => ".inflight".to_owned(),
-            State::COMPLETED => "".to_owned(),
+            State::Requested => ".requested".to_owned(),
+            State::Inflight => ".inflight".to_owned(),
+            State::Completed => "".to_owned(),
         }
     }
 
@@ -84,7 +80,7 @@ impl Timeline {
             let p = entry?.path();
             if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("commit") {
                 completed_commits.push(Instant {
-                    state: State::COMPLETED,
+                    state: State::Completed,
                     timestamp: file_name_without_ext(p.file_name()),
                     action: "commit".to_owned(),
                 })
@@ -107,15 +103,16 @@ impl Timeline {
                 let commit_metadata = serde_json::from_str(&content)?;
                 Ok(commit_metadata)
             }
-            None => return Ok(HashMap::new()),
+            None => Ok(HashMap::new()),
         }
     }
 
     pub fn get_latest_schema(&self) -> Result<SchemaRef, io::Error> {
         let commit_metadata = self.get_latest_commit_metadata()?;
-        if let Some(partitionToWriteStats) = commit_metadata["partitionToWriteStats"].as_object() {
-            for (_key, value) in partitionToWriteStats {
-                if let Some(first_value) = value.as_array().and_then(|arr| arr.get(0)) {
+        if let Some(partition_to_write_stats) = commit_metadata["partitionToWriteStats"].as_object()
+        {
+            if let Some((_, value)) = partition_to_write_stats.iter().next() {
+                if let Some(first_value) = value.as_array().and_then(|arr| arr.first()) {
                     if let Some(path) = first_value["path"].as_str() {
                         let mut base_file_path = PathBuf::from(&self.base_path);
                         base_file_path.push(path);
@@ -124,7 +121,6 @@ impl Timeline {
                         return Ok(builder.schema().to_owned());
                     }
                 }
-                break;
             }
         }
         Err(io::Error::new(
@@ -134,32 +130,39 @@ impl Timeline {
     }
 }
 
-#[test]
-fn init_commits_timeline() {
-    let fixture_path = Path::new("fixtures/timeline/commits_stub");
-    let timeline = Timeline::init(fixture_path).unwrap();
-    assert_eq!(
-        timeline.instants,
-        vec![
-            Instant {
-                state: State::COMPLETED,
-                action: "commit".to_owned(),
-                timestamp: "20240402123035233".to_owned(),
-            },
-            Instant {
-                state: State::COMPLETED,
-                action: "commit".to_owned(),
-                timestamp: "20240402144910683".to_owned(),
-            },
-        ]
-    )
-}
+#[cfg(test)]
+mod tests {
+    use crate::timeline::{Instant, State, Timeline};
+    use hudi_fs::test_utils::extract_test_table;
+    use std::path::Path;
 
-#[test]
-fn read_latest_schema() {
-    let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-    let target_table_path = extract_test_table(fixture_path);
-    let timeline = Timeline::init(target_table_path.as_path()).unwrap();
-    let table_schema = timeline.get_latest_schema().unwrap();
-    assert_eq!(table_schema.fields.len(), 11)
+    #[test]
+    fn read_latest_schema() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let target_table_path = extract_test_table(fixture_path);
+        let timeline = Timeline::init(target_table_path.as_path()).unwrap();
+        let table_schema = timeline.get_latest_schema().unwrap();
+        assert_eq!(table_schema.fields.len(), 11)
+    }
+
+    #[test]
+    fn init_commits_timeline() {
+        let fixture_path = Path::new("fixtures/timeline/commits_stub");
+        let timeline = Timeline::init(fixture_path).unwrap();
+        assert_eq!(
+            timeline.instants,
+            vec![
+                Instant {
+                    state: State::Completed,
+                    action: "commit".to_owned(),
+                    timestamp: "20240402123035233".to_owned(),
+                },
+                Instant {
+                    state: State::Completed,
+                    action: "commit".to_owned(),
+                    timestamp: "20240402144910683".to_owned(),
+                },
+            ]
+        )
+    }
 }

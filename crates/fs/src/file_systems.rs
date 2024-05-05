@@ -20,11 +20,9 @@
 use std::error::Error;
 use std::{fs::File, path::Path};
 
-use parquet::file::reader::{FileReader, Length, SerializedFileReader};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 
-use crate::assert_approx_eq;
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileMetadata {
     pub path: String,
     pub name: String,
@@ -46,12 +44,19 @@ impl FileMetadata {
     }
 }
 
-#[test]
-fn read_file_metadata() {
-    let fixture_path = Path::new("fixtures/a.parquet");
-    let fm = FileMetadata::from_path(fixture_path).unwrap();
-    assert_eq!(fm.path, "fixtures/a.parquet");
-    assert_eq!(fm.name, "a.parquet");
-    assert_approx_eq!(fm.size, 866, 20);
-    assert_eq!(fm.num_records, 5);
+#[cfg(test)]
+mod tests {
+    use crate::assert_approx_eq;
+    use crate::file_systems::FileMetadata;
+    use std::path::Path;
+
+    #[test]
+    fn read_file_metadata() {
+        let fixture_path = Path::new("fixtures/a.parquet");
+        let fm = FileMetadata::from_path(fixture_path).unwrap();
+        assert_eq!(fm.path, "fixtures/a.parquet");
+        assert_eq!(fm.name, "a.parquet");
+        assert_approx_eq!(fm.size, 866, 20);
+        assert_eq!(fm.num_records, 5);
+    }
 }

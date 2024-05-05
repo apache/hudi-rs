@@ -18,11 +18,9 @@
  */
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use arrow_schema::SchemaRef;
-
-use hudi_fs::test_utils::extract_test_table;
 
 use crate::table::file_system_view::FileSystemView;
 use crate::table::meta_client::MetaClient;
@@ -68,11 +66,18 @@ impl Table {
     }
 }
 
-#[test]
-fn load_snapshot_file_paths() {
-    let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-    let target_table_path = extract_test_table(fixture_path);
-    let hudi_table = Table::new(target_table_path.as_path().to_str().unwrap());
-    assert_eq!(hudi_table.get_snapshot_file_paths().unwrap().len(), 5);
-    println!("{}", hudi_table.schema().to_string());
+#[cfg(test)]
+mod tests {
+    use crate::table::Table;
+    use hudi_fs::test_utils::extract_test_table;
+    use std::path::Path;
+
+    #[test]
+    fn load_snapshot_file_paths() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let target_table_path = extract_test_table(fixture_path);
+        let hudi_table = Table::new(target_table_path.as_path().to_str().unwrap());
+        assert_eq!(hudi_table.get_snapshot_file_paths().unwrap().len(), 5);
+        println!("{}", hudi_table.schema());
+    }
 }
