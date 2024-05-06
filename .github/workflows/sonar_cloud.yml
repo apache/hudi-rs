@@ -33,9 +33,8 @@ jobs:
       - name: Check unused dependencies
         run: |
           rustup toolchain install nightly
-          cargo install cargo-udeps --locked
+          cargo install cargo-udeps cargo-sonar --locked
           cargo +nightly udeps --quiet --workspace --all-features --all-targets --output json > udeps.json
-          cargo install cargo-sonar
           cargo sonar --udeps --udeps-path udeps.json
       - name: SonarCloud scan
         uses: SonarSource/sonarcloud-github-action@master
