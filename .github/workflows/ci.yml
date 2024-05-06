@@ -62,6 +62,6 @@ jobs:
       - name: Unit test with code coverage
         run: cargo tarpaulin --verbose --no-fail-fast --all-features --workspace --out xml
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v2
         with:
           fail_ci_if_error: true
