@@ -30,3 +30,7 @@ __pycache__
 
 # macOS
 **/.DS_Store
+
+# coverage files
+*.profraw
+cobertura.xml
