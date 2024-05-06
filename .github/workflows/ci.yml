@@ -60,10 +60,5 @@ jobs:
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      - name: Unit test with code coverage
-        run: cargo tarpaulin --verbose --no-fail-fast --all-features --workspace --out xml
-      - name: SonarCloud scan
-        uses: SonarSource/sonarcloud-github-action@master
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
-          SONAR_TOKEN: ${{ secrets.SONARCLOUD_TOKEN }}
+      - name: Unit test
+        run: cargo test --verbose --no-fail-fast --all-features --all-targets --workspace
