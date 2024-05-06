@@ -32,6 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check unused dependencies
         run: |
+          rustup toolchain install nightly
           cargo install cargo-udeps --locked
           cargo +nightly udeps --quiet --workspace --all-features --all-targets --output json > udeps.json
           cargo binstall cargo-sonar
