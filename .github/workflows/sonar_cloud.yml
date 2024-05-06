@@ -35,7 +35,7 @@ jobs:
           rustup toolchain install nightly
           cargo install cargo-udeps --locked
           cargo +nightly udeps --quiet --workspace --all-features --all-targets --output json > udeps.json
-          cargo binstall cargo-sonar
+          cargo install cargo-sonar
           cargo sonar --udeps --udeps-path udeps.json
       - name: SonarCloud scan
         uses: SonarSource/sonarcloud-github-action@master
