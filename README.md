@@ -19,6 +19,8 @@
 
 # hudi-rs
 
+[![codecov](https://codecov.io/github/apache/hudi-rs/graph/badge.svg?token=E8CSWKJXLE)](https://codecov.io/github/apache/hudi-rs)
+
 ## Quick Start
 
 ### Apache DataFusion
