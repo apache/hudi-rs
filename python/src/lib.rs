@@ -17,20 +17,15 @@
  * under the License.
  */
 
-use crate::table::Table;
+use pyo3::prelude::*;
 
-mod error;
-mod file_group;
-pub mod table;
-pub type HudiTable = Table;
-mod timeline;
-
-pub const BASE_FILE_EXTENSIONS: [&str; 1] = ["parquet"];
-
-pub fn is_base_file_format_supported(ext: &str) -> bool {
-    BASE_FILE_EXTENSIONS.contains(&ext)
+#[pyfunction]
+fn rust_core_version() -> &'static str {
+    hudi::crate_version()
 }
 
-pub fn crate_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+#[pymodule]
+fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
+    Ok(())
 }
