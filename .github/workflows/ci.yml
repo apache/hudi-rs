@@ -61,7 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unit test with code coverage
-        run: cargo tarpaulin --verbose --no-fail-fast --all-features --workspace --out xml
+        # https://github.com/xd009642/tarpaulin/issues/1092#issuecomment-1407739176
+        run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace --out xml
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4
         with:

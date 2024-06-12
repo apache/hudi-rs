@@ -25,7 +25,7 @@ fn rust_core_version() -> &'static str {
 }
 
 #[pymodule]
-fn _internal(py: Python, m: &PyModule) -> PyResult<()> {
+fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
     Ok(())
 }
