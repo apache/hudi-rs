@@ -17,21 +17,23 @@
  * under the License.
  */
 
-use crate::table::Table;
+use std::{fs, io};
+use std::path::{Path, PathBuf};
 
-mod error;
-mod file_group;
-pub mod table;
-pub type HudiTable = Table;
-mod timeline;
-mod utils;
-
-pub const BASE_FILE_EXTENSIONS: [&str; 1] = ["parquet"];
-
-pub fn is_base_file_format_supported(ext: &str) -> bool {
-    BASE_FILE_EXTENSIONS.contains(&ext)
-}
-
-pub fn crate_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+pub fn get_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>, io::Error> {
+    let mut leaf_dirs = Vec::new();
+    let mut is_leaf_dir = true;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            is_leaf_dir = false;
+            let curr_sub_dir = entry.path();
+            let curr = get_leaf_dirs(&curr_sub_dir)?;
+            leaf_dirs.extend(curr);
+        }
+    }
+    if is_leaf_dir {
+        leaf_dirs.push(path.to_path_buf())
+    }
+    Ok(leaf_dirs)
 }

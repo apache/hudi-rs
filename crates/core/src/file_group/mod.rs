@@ -81,7 +81,7 @@ impl FileSlice {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileGroup {
     pub id: String,
     pub partition_path: Option<String>,

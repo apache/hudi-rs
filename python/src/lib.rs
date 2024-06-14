@@ -17,7 +17,46 @@
  * under the License.
  */
 
+use std::collections::HashMap;
 use pyo3::prelude::*;
+use hudi::table::Table;
+
+#[pyclass]
+struct BindingHudiTableMetaData {
+    #[pyo3(get)]
+    path: String,
+    #[pyo3(get)]
+    table_name: String,
+    #[pyo3(get)]
+    table_type: String,
+    #[pyo3(get)]
+    table_props: HashMap<String, Option<String>>,
+}
+
+#[pyclass]
+struct BindingHudiTable {
+    _table: hudi::HudiTable
+}
+
+#[pymethods]
+impl BindingHudiTable {
+    #[new]
+    #[pyo3(signature = (table_uri))]
+    fn new(py: Python, table_uri: &str) -> PyResult<Self> {
+        py.allow_threads(|| {
+            Ok(BindingHudiTable {
+                _table: Table::new(table_uri),
+            })
+        })
+    }
+
+    pub fn get_snapshot_file_paths(&self) -> PyResult<Vec<String>> {
+        match self._table.get_snapshot_file_paths() {
+            Ok(paths) => Ok(paths),
+            Err(e) => { panic!("Failed to retrieve snapshot files.")}
+        }
+    }
+}
 
 #[pyfunction]
 fn rust_core_version() -> &'static str {
@@ -26,6 +65,10 @@ fn rust_core_version() -> &'static str {
 
 #[pymodule]
 fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
+
+    m.add_class::<BindingHudiTableMetaData>()?;
+    m.add_class::<BindingHudiTable>()?;
     Ok(())
 }

@@ -15,23 +15,18 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from typing import Dict, List
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Union, List
 
-__version__: str
-
-
-def rust_core_version() -> str: ...
-
-
-class BindingHudiTableMetaData:
-    path: str
-    table_name: str
-    table_type: str
-    table_props: Dict[str, str]
+from python.hudi._internal import BindingHudiTable
 
 
-class BindingHudiTable:
+@dataclass(init=False)
+class HudiTable:
 
-    def __init__(self, table_uri: str): ...
+    def __init__(self, table_uri: Union[str, Path, ""]):
+        self._table = BindingHudiTable(str(table_uri))
 
-    def get_snapshot_file_paths(self) -> List[str]: ...
+    def get_snapshot_file_paths(self) -> List[str]:
+        return self._table.get_snapshot_file_paths()

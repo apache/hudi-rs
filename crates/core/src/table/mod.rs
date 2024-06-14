@@ -22,41 +22,43 @@ use std::path::PathBuf;
 
 use arrow_schema::SchemaRef;
 
-use crate::table::file_system_view::FileSystemView;
-use crate::table::meta_client::MetaClient;
+use crate::table::fs_view::FileSystemView;
+use crate::timeline::Timeline;
 
-mod file_system_view;
-mod meta_client;
+mod fs_view;
 
 #[derive(Debug, Clone)]
 pub struct Table {
-    pub base_path: PathBuf,
-    meta_client: MetaClient,
+    pub path: PathBuf,
 }
 
 impl Table {
-    pub fn new(base_path: &str) -> Self {
-        let p = PathBuf::from(base_path);
-        let meta_client = MetaClient::new(p.as_path());
-        Self {
-            base_path: p,
-            meta_client,
-        }
+    pub fn new(p: &str) -> Self {
+        let path = PathBuf::from(p);
+        Self { path }
+    }
+
+    pub fn get_timeline(&self) -> Result<Timeline, std::io::Error> {
+        Timeline::new(self.path.as_path())
     }
 
     pub fn schema(&self) -> SchemaRef {
-        match self.meta_client.timeline.get_latest_schema() {
-            Ok(table_schema) => SchemaRef::from(table_schema),
-            Err(e) => {
-                panic!("Failed to resolve table schema: {}", e)
+        match Timeline::new(self.path.as_path()) {
+            Ok(timeline) => {
+                match timeline.get_latest_schema() {
+                    Ok(schema) => {
+                        SchemaRef::from(schema)
+                    }
+                    Err(e) => { panic!("Failed to resolve table schema: {}", e) }
+                }
             }
+            Err(e) => { panic!("Failed to resolve table schema: {}", e) }
         }
     }
 
     pub fn get_snapshot_file_paths(&self) -> Result<Vec<String>, Box<dyn Error>> {
-        let meta_client = MetaClient::new(&self.base_path);
-        let fs_view = FileSystemView::init(meta_client)?;
         let mut file_paths = Vec::new();
+        let fs_view = FileSystemView::new(self.path.as_path())?;
         for f in fs_view.get_latest_file_slices() {
             if let Some(f) = f.file_path() {
                 file_paths.push(f.to_string());
@@ -76,7 +78,8 @@ mod tests {
     fn load_snapshot_file_paths() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let target_table_path = extract_test_table(fixture_path);
-        let hudi_table = Table::new(target_table_path.as_path().to_str().unwrap());
+        let hudi_table = Table::new(target_table_path.to_str().unwrap());
+        assert_eq!(hudi_table.get_timeline().unwrap().instants.len(), 2);
         assert_eq!(hudi_table.get_snapshot_file_paths().unwrap().len(), 5);
         println!("{}", hudi_table.schema());
     }
