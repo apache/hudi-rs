@@ -44,15 +44,15 @@ impl Table {
 
     pub fn schema(&self) -> SchemaRef {
         match Timeline::new(self.path.as_path()) {
-            Ok(timeline) => {
-                match timeline.get_latest_schema() {
-                    Ok(schema) => {
-                        SchemaRef::from(schema)
-                    }
-                    Err(e) => { panic!("Failed to resolve table schema: {}", e) }
+            Ok(timeline) => match timeline.get_latest_schema() {
+                Ok(schema) => SchemaRef::from(schema),
+                Err(e) => {
+                    panic!("Failed to resolve table schema: {}", e)
                 }
+            },
+            Err(e) => {
+                panic!("Failed to resolve table schema: {}", e)
             }
-            Err(e) => { panic!("Failed to resolve table schema: {}", e) }
         }
     }
 

@@ -17,8 +17,8 @@
  * under the License.
  */
 
-use std::{fs, io};
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 pub fn get_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>, io::Error> {
     let mut leaf_dirs = Vec::new();

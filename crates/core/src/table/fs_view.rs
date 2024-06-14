@@ -17,9 +17,9 @@
  * under the License.
  */
 
-use std::{fs, io};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use hashbrown::HashMap;
 
@@ -123,7 +123,6 @@ impl FileSystemView {
         file_slices
     }
 }
-
 
 #[cfg(test)]
 mod tests {

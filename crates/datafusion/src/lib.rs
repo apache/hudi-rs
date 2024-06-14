@@ -45,7 +45,7 @@ pub struct HudiDataSource {
 impl HudiDataSource {
     pub fn new(base_path: &str) -> Self {
         Self {
-            table: HudiTable::new(base_path)
+            table: HudiTable::new(base_path),
         }
     }
     pub(crate) async fn create_physical_plan(

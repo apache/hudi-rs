@@ -17,9 +17,9 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-use pyo3::prelude::*;
 use hudi::table::Table;
+use pyo3::prelude::*;
+use std::collections::HashMap;
 
 #[pyclass]
 struct BindingHudiTableMetaData {
@@ -35,7 +35,7 @@ struct BindingHudiTableMetaData {
 
 #[pyclass]
 struct BindingHudiTable {
-    _table: hudi::HudiTable
+    _table: hudi::HudiTable,
 }
 
 #[pymethods]
@@ -53,7 +53,9 @@ impl BindingHudiTable {
     pub fn get_snapshot_file_paths(&self) -> PyResult<Vec<String>> {
         match self._table.get_snapshot_file_paths() {
             Ok(paths) => Ok(paths),
-            Err(e) => { panic!("Failed to retrieve snapshot files.")}
+            Err(e) => {
+                panic!("Failed to retrieve snapshot files.")
+            }
         }
     }
 }
