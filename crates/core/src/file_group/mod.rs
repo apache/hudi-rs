@@ -59,9 +59,8 @@ pub struct FileSlice {
     pub partition_path: Option<String>,
 }
 
-#[allow(dead_code)]
 impl FileSlice {
-    pub fn file_path(&self) -> Option<&str> {
+    pub fn base_file_path(&self) -> Option<&str> {
         match &self.base_file.metadata {
             None => None,
             Some(file_metadata) => Some(file_metadata.path.as_str()),
@@ -70,10 +69,6 @@ impl FileSlice {
 
     pub fn file_group_id(&self) -> &str {
         &self.base_file.file_group_id
-    }
-
-    pub fn base_instant_time(&self) -> &str {
-        &self.base_file.commit_time
     }
 
     pub fn set_base_file(&mut self, base_file: BaseFile) {

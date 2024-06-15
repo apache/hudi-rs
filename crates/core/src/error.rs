@@ -40,4 +40,6 @@ pub enum HudiCoreError {
     FailToLoadFileGroup(#[from] HudiFileGroupError),
     #[error("Failed to build file system view")]
     FailToBuildFileSystemView(#[from] HudiFileSystemViewError),
+    #[error("Failed to load table properties")]
+    LoadTablePropertiesError,
 }

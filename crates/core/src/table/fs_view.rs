@@ -37,9 +37,9 @@ pub struct FileSystemView {
 }
 
 impl FileSystemView {
-    pub fn new(p: &Path) -> Result<Self, HudiFileSystemViewError> {
+    pub fn new(base_path: &Path) -> Result<Self, HudiFileSystemViewError> {
         let mut fs_view = FileSystemView {
-            base_path: p.to_path_buf(),
+            base_path: base_path.to_path_buf(),
             partition_to_file_groups: HashMap::new(),
         };
         fs_view.load_partitions()?;

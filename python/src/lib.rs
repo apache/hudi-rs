@@ -51,7 +51,7 @@ impl BindingHudiTable {
     }
 
     pub fn get_snapshot_file_paths(&self) -> PyResult<Vec<String>> {
-        match self._table.get_snapshot_file_paths() {
+        match self._table.get_latest_file_paths() {
             Ok(paths) => Ok(paths),
             Err(_e) => {
                 panic!("Failed to retrieve snapshot files.")

@@ -57,7 +57,7 @@ impl HudiDataSource {
     }
 
     fn get_record_batches(&self) -> datafusion_common::Result<Vec<RecordBatch>> {
-        match self.table.get_snapshot_file_paths() {
+        match self.table.get_latest_file_paths() {
             Ok(file_paths) => {
                 let mut record_batches = Vec::new();
                 for f in file_paths {
