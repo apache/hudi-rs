@@ -19,7 +19,6 @@
 use crate::table::config::{BaseFileFormat, TableType};
 
 pub trait ProvidesTableMetadata {
-
     fn base_file_format(&self) -> BaseFileFormat;
 
     fn checksum(&self) -> i64;

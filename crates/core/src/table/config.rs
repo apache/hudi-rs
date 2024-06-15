@@ -17,8 +17,8 @@
  * under the License.
  */
 
-use std::str::FromStr;
 use crate::error::HudiCoreError;
+use std::str::FromStr;
 
 pub enum ConfigKey {
     BaseFileFormat,
@@ -76,7 +76,7 @@ impl FromStr for TableType {
             "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" => Ok(Self::MergeOnRead),
             "mor" => Ok(Self::MergeOnRead),
-            _ => Err(HudiCoreError::LoadTablePropertiesError)
+            _ => Err(HudiCoreError::LoadTablePropertiesError),
         }
     }
 }
@@ -85,14 +85,13 @@ pub enum BaseFileFormat {
     Parquet,
 }
 
-
 impl FromStr for BaseFileFormat {
     type Err = HudiCoreError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
-            _ => Err(HudiCoreError::LoadTablePropertiesError)
+            _ => Err(HudiCoreError::LoadTablePropertiesError),
         }
     }
 }

@@ -27,15 +27,15 @@ use std::str::FromStr;
 use arrow_schema::SchemaRef;
 
 use crate::file_group::FileSlice;
-use crate::table::config::{ConfigKey, TableType};
 use crate::table::config::BaseFileFormat;
+use crate::table::config::{ConfigKey, TableType};
 use crate::table::fs_view::FileSystemView;
-use crate::table::metadata::{ProvidesTableMetadata};
+use crate::table::metadata::ProvidesTableMetadata;
 use crate::timeline::Timeline;
 
+mod config;
 mod fs_view;
 mod metadata;
-mod config;
 
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -48,10 +48,10 @@ impl Table {
         let base_path = PathBuf::from(table_base_path);
         let props_path = base_path.join(".hoodie").join("hoodie.properties");
         match Self::load_properties(props_path.as_path()) {
-            Ok(props) => {
-                Self { base_path, props, }
-            },
-            Err(e) => { panic!("Failed to load table properties: {}", e) }
+            Ok(props) => Self { base_path, props },
+            Err(e) => {
+                panic!("Failed to load table properties: {}", e)
+            }
         }
     }
 
@@ -77,7 +77,7 @@ impl Table {
     pub fn get_property(&self, key: &str) -> &str {
         match self.props.get(key) {
             Some(value) => value,
-            None => panic!("Failed to retrieve property {}", key)
+            None => panic!("Failed to retrieve property {}", key),
         }
     }
 
@@ -120,7 +120,6 @@ impl Table {
 }
 
 impl ProvidesTableMetadata for Table {
-
     fn base_file_format(&self) -> BaseFileFormat {
         BaseFileFormat::from_str(self.get_property(ConfigKey::BaseFileFormat.as_ref())).unwrap()
     }
@@ -130,7 +129,8 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn database_name(&self) -> String {
-        self.get_property(ConfigKey::DatabaseName.as_ref()).to_string()
+        self.get_property(ConfigKey::DatabaseName.as_ref())
+            .to_string()
     }
 
     fn drops_partition_fields(&self) -> bool {
@@ -146,11 +146,13 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn is_partitioned(&self) -> bool {
-        self.key_generator_class().ends_with("NonpartitionedKeyGenerator")
+        self.key_generator_class()
+            .ends_with("NonpartitionedKeyGenerator")
     }
 
     fn key_generator_class(&self) -> String {
-        self.get_property(ConfigKey::KeyGeneratorClass.as_ref()).to_string()
+        self.get_property(ConfigKey::KeyGeneratorClass.as_ref())
+            .to_string()
     }
 
     fn location(&self) -> String {
@@ -158,11 +160,15 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn partition_fields(&self) -> Vec<String> {
-        self.get_property(ConfigKey::PartitionFields.as_ref()).split(',').map(str::to_string).collect()
+        self.get_property(ConfigKey::PartitionFields.as_ref())
+            .split(',')
+            .map(str::to_string)
+            .collect()
     }
 
     fn precombine_field(&self) -> String {
-        self.get_property(ConfigKey::PrecombineField.as_ref()).to_string()
+        self.get_property(ConfigKey::PrecombineField.as_ref())
+            .to_string()
     }
 
     fn populates_meta_fields(&self) -> bool {
@@ -170,7 +176,10 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn record_key_fields(&self) -> Vec<String> {
-        self.get_property(ConfigKey::RecordKeyFields.as_ref()).split(',').map(str::to_string).collect()
+        self.get_property(ConfigKey::RecordKeyFields.as_ref())
+            .split(',')
+            .map(str::to_string)
+            .collect()
     }
 
     fn table_name(&self) -> String {
@@ -190,7 +199,8 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn timeline_timezone(&self) -> String {
-        self.get_property(ConfigKey::TimelineTimezone.as_ref()).to_string()
+        self.get_property(ConfigKey::TimelineTimezone.as_ref())
+            .to_string()
     }
 }
 
