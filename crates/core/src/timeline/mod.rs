@@ -64,7 +64,7 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    pub fn init(base_path: &Path) -> Result<Self, io::Error> {
+    pub fn new(base_path: &Path) -> Result<Self, io::Error> {
         let instants = Self::load_completed_commit_instants(base_path)?;
         Ok(Self {
             base_path: base_path.to_path_buf(),
@@ -140,7 +140,7 @@ mod tests {
     fn read_latest_schema() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let target_table_path = extract_test_table(fixture_path);
-        let timeline = Timeline::init(target_table_path.as_path()).unwrap();
+        let timeline = Timeline::new(target_table_path.as_path()).unwrap();
         let table_schema = timeline.get_latest_schema().unwrap();
         assert_eq!(table_schema.fields.len(), 11)
     }
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn init_commits_timeline() {
         let fixture_path = Path::new("fixtures/timeline/commits_stub");
-        let timeline = Timeline::init(fixture_path).unwrap();
+        let timeline = Timeline::new(fixture_path).unwrap();
         assert_eq!(
             timeline.instants,
             vec![

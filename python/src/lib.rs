@@ -19,6 +19,35 @@
 
 use pyo3::prelude::*;
 
+use hudi::table::Table;
+
+#[pyclass]
+struct BindingHudiTable {
+    _table: hudi::HudiTable,
+}
+
+#[pymethods]
+impl BindingHudiTable {
+    #[new]
+    #[pyo3(signature = (table_uri))]
+    fn new(py: Python, table_uri: &str) -> PyResult<Self> {
+        py.allow_threads(|| {
+            Ok(BindingHudiTable {
+                _table: Table::new(table_uri),
+            })
+        })
+    }
+
+    pub fn get_latest_file_paths(&self) -> PyResult<Vec<String>> {
+        match self._table.get_latest_file_paths() {
+            Ok(paths) => Ok(paths),
+            Err(_e) => {
+                panic!("Failed to retrieve the latest file paths.")
+            }
+        }
+    }
+}
+
 #[pyfunction]
 fn rust_core_version() -> &'static str {
     hudi::crate_version()
@@ -26,6 +55,9 @@ fn rust_core_version() -> &'static str {
 
 #[pymodule]
 fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
+
+    m.add_class::<BindingHudiTable>()?;
     Ok(())
 }

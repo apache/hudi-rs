@@ -17,7 +17,7 @@
 
 .DEFAULT_GOAL := help
 
-VENV := .venv
+VENV := venv
 MATURIN_VERSION := $(shell grep 'requires =' pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
 

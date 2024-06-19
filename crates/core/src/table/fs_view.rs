@@ -25,42 +25,42 @@ use hashbrown::HashMap;
 
 use hudi_fs::file_systems::FileMetadata;
 
-use crate::file_group::{BaseFile, FileGroup};
-use crate::timeline::Timeline;
+use crate::error::HudiFileSystemViewError;
+use crate::error::HudiFileSystemViewError::FailToLoadPartitions;
+use crate::file_group::{BaseFile, FileGroup, FileSlice};
+use crate::utils::get_leaf_dirs;
 
-#[derive(Debug, Clone)]
-pub struct MetaClient {
+#[derive(Clone, Debug)]
+pub struct FileSystemView {
     pub base_path: PathBuf,
-    pub timeline: Timeline,
+    partition_to_file_groups: HashMap<String, Vec<FileGroup>>,
 }
 
-impl MetaClient {
-    pub fn new(base_path: &Path) -> Self {
-        match Timeline::init(base_path) {
-            Ok(timeline) => Self {
-                base_path: base_path.to_path_buf(),
-                timeline,
-            },
-            Err(e) => panic!("Failed to instantiate meta client: {}", e),
-        }
+impl FileSystemView {
+    pub fn new(base_path: &Path) -> Result<Self, HudiFileSystemViewError> {
+        let mut fs_view = FileSystemView {
+            base_path: base_path.to_path_buf(),
+            partition_to_file_groups: HashMap::new(),
+        };
+        fs_view.load_partitions()?;
+        Ok(fs_view)
     }
 
-    fn get_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>, io::Error> {
-        let mut leaf_dirs = Vec::new();
-        let mut is_leaf_dir = true;
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                is_leaf_dir = false;
-                let curr_sub_dir = entry.path();
-                let curr = Self::get_leaf_dirs(&curr_sub_dir)?;
-                leaf_dirs.extend(curr);
+    fn load_partitions(&mut self) -> Result<(), HudiFileSystemViewError> {
+        match self.get_partition_paths() {
+            Ok(partition_paths) => {
+                for p in partition_paths {
+                    match self.get_file_groups(p.as_str()) {
+                        Ok(file_groups) => {
+                            self.partition_to_file_groups.insert(p, file_groups);
+                        }
+                        Err(e) => return Err(FailToLoadPartitions(e)),
+                    }
+                }
             }
+            Err(e) => return Err(FailToLoadPartitions(Box::new(e))),
         }
-        if is_leaf_dir {
-            leaf_dirs.push(path.to_path_buf())
-        }
-        Ok(leaf_dirs)
+        Ok(())
     }
 
     pub fn get_partition_paths(&self) -> Result<Vec<String>, io::Error> {
@@ -73,7 +73,7 @@ impl MetaClient {
         }
         let mut full_partition_paths: Vec<PathBuf> = Vec::new();
         for p in first_level_partition_paths {
-            full_partition_paths.extend(Self::get_leaf_dirs(p.as_path())?)
+            full_partition_paths.extend(get_leaf_dirs(p.as_path())?)
         }
         let common_prefix_len = self.base_path.to_str().unwrap().len() + 1;
         let mut partition_paths = Vec::new();
@@ -110,21 +110,35 @@ impl MetaClient {
         }
         Ok(file_groups)
     }
+
+    pub fn get_latest_file_slices(&self) -> Vec<&FileSlice> {
+        let mut file_slices = Vec::new();
+        for fgs in self.partition_to_file_groups.values() {
+            for fg in fgs {
+                if let Some(file_slice) = fg.get_latest_file_slice() {
+                    file_slices.push(file_slice)
+                }
+            }
+        }
+        file_slices
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::table::meta_client::MetaClient;
-    use hudi_fs::test_utils::extract_test_table;
     use std::collections::HashSet;
     use std::path::Path;
 
+    use hudi_fs::test_utils::extract_test_table;
+
+    use crate::table::fs_view::FileSystemView;
+
     #[test]
-    fn meta_client_get_partition_paths() {
+    fn get_partition_paths() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let target_table_path = extract_test_table(fixture_path);
-        let meta_client = MetaClient::new(&target_table_path);
-        let partition_paths = meta_client.get_partition_paths().unwrap();
+        let fs_view = FileSystemView::new(&target_table_path).unwrap();
+        let partition_paths = fs_view.get_partition_paths().unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(
@@ -134,27 +148,27 @@ mod tests {
     }
 
     #[test]
-    fn meta_client_get_file_groups() {
+    fn get_latest_file_slices() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let target_table_path = extract_test_table(fixture_path);
-        let meta_client = MetaClient::new(&target_table_path);
-        let file_groups = meta_client.get_file_groups("san_francisco").unwrap();
-        assert_eq!(file_groups.len(), 3);
-        let fg_ids: HashSet<&str> = HashSet::from_iter(file_groups.iter().map(|fg| fg.id.as_str()));
+        let fs_view = FileSystemView::new(&target_table_path).unwrap();
+        let file_slices = fs_view.get_latest_file_slices();
+        assert_eq!(file_slices.len(), 5);
+        let mut fg_ids = Vec::new();
+        for f in file_slices {
+            let fp = f.file_group_id();
+            fg_ids.push(fp);
+        }
+        let actual: HashSet<&str> = fg_ids.into_iter().collect();
         assert_eq!(
-            fg_ids,
+            actual,
             HashSet::from_iter(vec![
-                "5a226868-2934-4f84-a16f-55124630c68d-0",
                 "780b8586-3ad0-48ef-a6a1-d2217845ce4a-0",
-                "d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0"
+                "d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0",
+                "ee915c68-d7f8-44f6-9759-e691add290d8-0",
+                "68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0",
+                "5a226868-2934-4f84-a16f-55124630c68d-0"
             ])
         );
-    }
-    #[test]
-    fn meta_client_active_timeline_init_as_expected() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let target_table_path = extract_test_table(fixture_path);
-        let meta_client = MetaClient::new(&target_table_path);
-        assert_eq!(meta_client.timeline.instants.len(), 2)
     }
 }

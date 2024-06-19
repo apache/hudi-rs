@@ -17,29 +17,23 @@
  * under the License.
  */
 
-use std::error::Error;
-use std::fmt::Debug;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum HudiFileGroupError {
-    #[error("Commit time {0} is already present in File Group {1}")]
-    CommitTimeAlreadyExists(String, String),
-}
-
-#[derive(Debug, Error)]
-pub enum HudiFileSystemViewError {
-    #[error("Error in loading partitions: {0}")]
-    FailToLoadPartitions(Box<dyn Error>),
-}
-
-#[derive(Debug, Error)]
-pub enum HudiCoreError {
-    #[error("Failed to load file group")]
-    FailToLoadFileGroup(#[from] HudiFileGroupError),
-    #[error("Failed to build file system view")]
-    FailToBuildFileSystemView(#[from] HudiFileSystemViewError),
-    #[error("Failed to load table properties")]
-    LoadTablePropertiesError,
+pub fn get_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>, io::Error> {
+    let mut leaf_dirs = Vec::new();
+    let mut is_leaf_dir = true;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            is_leaf_dir = false;
+            let curr_sub_dir = entry.path();
+            let curr = get_leaf_dirs(&curr_sub_dir)?;
+            leaf_dirs.extend(curr);
+        }
+    }
+    if is_leaf_dir {
+        leaf_dirs.push(path.to_path_buf())
+    }
+    Ok(leaf_dirs)
 }

@@ -14,3 +14,7 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
+
+from ._internal import __version__ as __version__
+from ._internal import rust_core_version as rust_core_version
+from .table import HudiTable as HudiTable
