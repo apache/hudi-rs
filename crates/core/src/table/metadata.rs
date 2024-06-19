@@ -52,6 +52,4 @@ pub trait ProvidesTableMetadata {
     fn table_version(&self) -> u32;
 
     fn timeline_layout_version(&self) -> u32;
-
-    fn timeline_timezone(&self) -> String;
 }

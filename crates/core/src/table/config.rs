@@ -36,7 +36,6 @@ pub enum ConfigKey {
     TableType,
     TableVersion,
     TimelineLayoutVersion,
-    TimelineTimezone,
 }
 
 impl AsRef<str> for ConfigKey {
@@ -57,11 +56,11 @@ impl AsRef<str> for ConfigKey {
             Self::TableType => "hoodie.table.type",
             Self::TableVersion => "hoodie.table.version",
             Self::TimelineLayoutVersion => "hoodie.timeline.layout.version",
-            Self::TimelineTimezone => "hoodie.table.timeline.timezone",
         }
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum TableType {
     CopyOnWrite,
     MergeOnRead,
@@ -81,6 +80,7 @@ impl FromStr for TableType {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum BaseFileFormat {
     Parquet,
 }

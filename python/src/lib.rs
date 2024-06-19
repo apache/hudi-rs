@@ -17,21 +17,9 @@
  * under the License.
  */
 
-use hudi::table::Table;
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
-#[pyclass]
-struct BindingHudiTableMetaData {
-    #[pyo3(get)]
-    path: String,
-    #[pyo3(get)]
-    table_name: String,
-    #[pyo3(get)]
-    table_type: String,
-    #[pyo3(get)]
-    table_props: HashMap<String, Option<String>>,
-}
+use hudi::table::Table;
 
 #[pyclass]
 struct BindingHudiTable {
@@ -50,11 +38,11 @@ impl BindingHudiTable {
         })
     }
 
-    pub fn get_snapshot_file_paths(&self) -> PyResult<Vec<String>> {
+    pub fn get_latest_file_paths(&self) -> PyResult<Vec<String>> {
         match self._table.get_latest_file_paths() {
             Ok(paths) => Ok(paths),
             Err(_e) => {
-                panic!("Failed to retrieve snapshot files.")
+                panic!("Failed to retrieve the latest file paths.")
             }
         }
     }
@@ -70,7 +58,6 @@ fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
 
-    m.add_class::<BindingHudiTableMetaData>()?;
     m.add_class::<BindingHudiTable>()?;
     Ok(())
 }

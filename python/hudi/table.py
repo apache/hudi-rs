@@ -28,5 +28,5 @@ class HudiTable:
     def __init__(self, table_uri: Union[str, Path, ""]):
         self._table = BindingHudiTable(str(table_uri))
 
-    def get_snapshot_file_paths(self) -> List[str]:
-        return self._table.get_snapshot_file_paths()
+    def get_latest_file_paths(self) -> List[str]:
+        return self._table.get_latest_file_paths()

@@ -15,7 +15,7 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from typing import Dict, List
+from typing import List
 
 __version__: str
 
@@ -23,15 +23,8 @@ __version__: str
 def rust_core_version() -> str: ...
 
 
-class BindingHudiTableMetaData:
-    path: str
-    table_name: str
-    table_type: str
-    table_props: Dict[str, str]
-
-
 class BindingHudiTable:
 
     def __init__(self, table_uri: str): ...
 
-    def get_snapshot_file_paths(self) -> List[str]: ...
+    def get_latest_file_paths(self) -> List[str]: ...

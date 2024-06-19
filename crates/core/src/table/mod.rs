@@ -129,8 +129,10 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn database_name(&self) -> String {
-        self.get_property(ConfigKey::DatabaseName.as_ref())
-            .to_string()
+        match self.props.get(ConfigKey::DatabaseName.as_ref()) {
+            Some(value) => value.to_string(),
+            None => "default".to_string(),
+        }
     }
 
     fn drops_partition_fields(&self) -> bool {
@@ -146,7 +148,7 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn is_partitioned(&self) -> bool {
-        self.key_generator_class()
+        !self.key_generator_class()
             .ends_with("NonpartitionedKeyGenerator")
     }
 
@@ -197,28 +199,51 @@ impl ProvidesTableMetadata for Table {
     fn timeline_layout_version(&self) -> u32 {
         u32::from_str(self.get_property(ConfigKey::TimelineLayoutVersion.as_ref())).unwrap()
     }
-
-    fn timeline_timezone(&self) -> String {
-        self.get_property(ConfigKey::TimelineTimezone.as_ref())
-            .to_string()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
+    use crate::table::config::BaseFileFormat::Parquet;
+    use crate::table::config::TableType::CopyOnWrite;
+    use crate::table::metadata::ProvidesTableMetadata;
+    use crate::table::Table;
     use hudi_fs::test_utils::extract_test_table;
 
-    use crate::table::Table;
-
     #[test]
-    fn load_snapshot_file_paths() {
+    fn hudi_table_get_latest_file_paths() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let target_table_path = extract_test_table(fixture_path);
         let hudi_table = Table::new(target_table_path.to_str().unwrap());
         assert_eq!(hudi_table.get_timeline().unwrap().instants.len(), 2);
         assert_eq!(hudi_table.get_latest_file_paths().unwrap().len(), 5);
         println!("{}", hudi_table.schema());
+    }
+
+    #[test]
+    fn hudi_table_get_table_metadata() {
+        let fixture_path = Path::new("fixtures/table_metadata/sample_table_properties");
+        let table = Table::new(fixture_path.to_str().unwrap());
+        assert_eq!(table.base_file_format(), Parquet);
+        assert_eq!(table.checksum(), 3761586722);
+        assert_eq!(table.database_name(), "default");
+        assert!(!table.drops_partition_fields());
+        assert!(!table.is_hive_style_partitioning());
+        assert!(!table.is_partition_path_urlencoded());
+        assert!(table.is_partitioned());
+        assert_eq!(
+            table.key_generator_class(),
+            "org.apache.hudi.keygen.SimpleKeyGenerator"
+        );
+        assert_eq!(table.location(), "fixtures/table_metadata/sample_table_properties");
+        assert_eq!(table.partition_fields(), vec!["city"]);
+        assert_eq!(table.precombine_field(), "ts");
+        assert!(table.populates_meta_fields());
+        assert_eq!(table.record_key_fields(), vec!["uuid"]);
+        assert_eq!(table.table_name(), "trips");
+        assert_eq!(table.table_type(), CopyOnWrite);
+        assert_eq!(table.table_version(), 6);
+        assert_eq!(table.timeline_layout_version(), 1);
     }
 }
