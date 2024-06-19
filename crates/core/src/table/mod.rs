@@ -148,7 +148,8 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn is_partitioned(&self) -> bool {
-        !self.key_generator_class()
+        !self
+            .key_generator_class()
             .ends_with("NonpartitionedKeyGenerator")
     }
 
@@ -236,7 +237,10 @@ mod tests {
             table.key_generator_class(),
             "org.apache.hudi.keygen.SimpleKeyGenerator"
         );
-        assert_eq!(table.location(), "fixtures/table_metadata/sample_table_properties");
+        assert_eq!(
+            table.location(),
+            "fixtures/table_metadata/sample_table_properties"
+        );
         assert_eq!(table.partition_fields(), vec!["city"]);
         assert_eq!(table.precombine_field(), "ts");
         assert!(table.populates_meta_fields());
