@@ -72,8 +72,10 @@ impl FromStr for TableType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" => Ok(Self::CopyOnWrite),
+            "copy-on-write" => Ok(Self::CopyOnWrite),
             "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" => Ok(Self::MergeOnRead),
+            "merge-on-read" => Ok(Self::MergeOnRead),
             "mor" => Ok(Self::MergeOnRead),
             _ => Err(HudiCoreError::LoadTablePropertiesError),
         }
@@ -93,5 +95,53 @@ impl FromStr for BaseFileFormat {
             "parquet" => Ok(Self::Parquet),
             _ => Err(HudiCoreError::LoadTablePropertiesError),
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use crate::table::config::{BaseFileFormat, TableType};
+    use std::str::FromStr;
+
+    #[test]
+    fn create_table_type() {
+        assert_eq!(TableType::from_str("cow").unwrap(), TableType::CopyOnWrite);
+        assert_eq!(
+            TableType::from_str("copy_on_write").unwrap(),
+            TableType::CopyOnWrite
+        );
+        assert_eq!(
+            TableType::from_str("COPY-ON-WRITE").unwrap(),
+            TableType::CopyOnWrite
+        );
+        assert_eq!(TableType::from_str("MOR").unwrap(), TableType::MergeOnRead);
+        assert_eq!(
+            TableType::from_str("Merge_on_read").unwrap(),
+            TableType::MergeOnRead
+        );
+        assert_eq!(
+            TableType::from_str("Merge-on-read").unwrap(),
+            TableType::MergeOnRead
+        );
+        assert!(TableType::from_str("").is_err());
+        assert!(TableType::from_str("copyonwrite").is_err());
+        assert!(TableType::from_str("MERGEONREAD").is_err());
+        assert!(TableType::from_str("foo").is_err());
+    }
+
+    #[test]
+    fn create_base_file_format() {
+        assert_eq!(
+            BaseFileFormat::from_str("parquet").unwrap(),
+            BaseFileFormat::Parquet
+        );
+        assert_eq!(
+            BaseFileFormat::from_str("PArquet").unwrap(),
+            BaseFileFormat::Parquet
+        );
+        assert!(TableType::from_str("").is_err());
+        assert!(
+            TableType::from_str("orc").is_err(),
+            "orc is not yet supported."
+        );
     }
 }
