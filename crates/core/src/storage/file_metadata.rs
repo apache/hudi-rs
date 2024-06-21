@@ -17,23 +17,21 @@
  * under the License.
  */
 
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileMetadata {
+    pub path: String,
+    pub name: String,
+    pub size: usize,
+    pub num_records: Option<usize>,
+}
 
-pub fn get_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>, io::Error> {
-    let mut leaf_dirs = Vec::new();
-    let mut is_leaf_dir = true;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            is_leaf_dir = false;
-            let curr_sub_dir = entry.path();
-            let curr = get_leaf_dirs(&curr_sub_dir)?;
-            leaf_dirs.extend(curr);
+impl FileMetadata {
+    pub fn new(path: String, name: String, size: usize) -> FileMetadata {
+        FileMetadata {
+            path,
+            name,
+            size,
+            num_records: None,
         }
     }
-    if is_leaf_dir {
-        leaf_dirs.push(path.to_path_buf())
-    }
-    Ok(leaf_dirs)
 }

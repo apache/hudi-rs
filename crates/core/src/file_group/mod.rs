@@ -21,10 +21,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use hudi_fs::file_systems::FileMetadata;
-
 use crate::error::HudiFileGroupError;
 use crate::error::HudiFileGroupError::CommitTimeAlreadyExists;
+use crate::storage::file_metadata::FileMetadata;
 
 #[derive(Clone, Debug)]
 pub struct BaseFile {

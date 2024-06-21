@@ -36,6 +36,7 @@ arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow-select = { workspace = true }
+object_store = { workspace = true }
 parquet = { workspace = true, features = [
     "async",
     "object_store",
@@ -55,6 +56,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 # "stdlib"
+anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 hashbrown = "0.14.3"
@@ -62,6 +64,11 @@ regex = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 url = { workspace = true }
+
+# runtime / async
+async-recursion = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
 
 # test
 tempfile = "3.10.1"

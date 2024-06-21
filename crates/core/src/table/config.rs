@@ -71,12 +71,8 @@ impl FromStr for TableType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "copy_on_write" => Ok(Self::CopyOnWrite),
-            "copy-on-write" => Ok(Self::CopyOnWrite),
-            "cow" => Ok(Self::CopyOnWrite),
-            "merge_on_read" => Ok(Self::MergeOnRead),
-            "merge-on-read" => Ok(Self::MergeOnRead),
-            "mor" => Ok(Self::MergeOnRead),
+            "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
+            "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
             _ => Err(HudiCoreError::LoadTablePropertiesError),
         }
     }
