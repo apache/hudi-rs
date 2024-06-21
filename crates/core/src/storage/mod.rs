@@ -67,14 +67,6 @@ impl Storage {
             .collect()
     }
 
-    pub async fn list_dirs_in_full(&self, subdir: Option<&str>) -> Vec<String> {
-        self.list_dirs_as_paths(subdir)
-            .await
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect()
-    }
-
     pub async fn list_dirs_as_paths(&self, subdir: Option<&str>) -> Vec<ObjPath> {
         let mut prefix_url = self.base_url.clone();
         if let Some(subdir) = subdir {
@@ -133,6 +125,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Vec<Strin
 
 #[cfg(test)]
 mod tests {
+    use object_store::path::Path as ObjPath;
     use std::collections::{HashMap, HashSet};
     use std::fs::canonicalize;
     use std::path::Path;
@@ -160,6 +153,22 @@ mod tests {
         assert_eq!(second_level_dirs, vec!["part22"]);
         let no_dirs = storage.list_dirs(Some("part1")).await;
         assert!(no_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn storage_list_dirs_as_paths() {
+        let base_url = Url::from_directory_path(
+            canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
+        )
+        .unwrap();
+        let storage = Storage::new(base_url.path(), HashMap::new());
+        let first_level_dirs: HashSet<ObjPath> =
+            storage.list_dirs_as_paths(None).await.into_iter().collect();
+        let expected_paths: HashSet<ObjPath> = vec![".hoodie", "part1", "part2", "part3"]
+            .into_iter()
+            .map(|dir| ObjPath::from_url_path(base_url.join(dir).unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(first_level_dirs, expected_paths);
     }
 
     #[tokio::test]
