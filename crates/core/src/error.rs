@@ -17,7 +17,6 @@
  * under the License.
  */
 
-use std::error::Error;
 use std::fmt::Debug;
 
 use thiserror::Error;
@@ -29,17 +28,9 @@ pub enum HudiFileGroupError {
 }
 
 #[derive(Debug, Error)]
-pub enum HudiFileSystemViewError {
-    #[error("Error in loading partitions: {0}")]
-    FailToLoadPartitions(Box<dyn Error>),
-}
-
-#[derive(Debug, Error)]
 pub enum HudiCoreError {
     #[error("Failed to load file group")]
     FailToLoadFileGroup(#[from] HudiFileGroupError),
-    #[error("Failed to build file system view")]
-    FailToBuildFileSystemView(#[from] HudiFileSystemViewError),
     #[error("Failed to load table properties")]
     LoadTablePropertiesError,
 }

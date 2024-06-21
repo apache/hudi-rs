@@ -101,7 +101,7 @@ impl Table {
 
     pub fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>, Box<dyn Error>> {
         let mut file_slices = Vec::new();
-        let fs_view = FileSystemView::new(self.base_path.as_path())?;
+        let mut fs_view = FileSystemView::new(self.base_path.as_path());
         for f in fs_view.get_latest_file_slices() {
             file_slices.push(f.clone());
         }

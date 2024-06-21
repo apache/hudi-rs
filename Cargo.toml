@@ -53,10 +53,11 @@ datafusion-sql = { version = "35" }
 datafusion-physical-expr = { version = "35" }
 
 # serde
-serde = { version = "1.0.194", features = ["derive"] }
+serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1"
 
 # "stdlib"
+anyhow = { version = "1.0.86" }
 bytes = { version = "1" }
 chrono = { version = "=0.4.34", default-features = false, features = ["clock"] }
 tracing = { version = "0.1", features = ["log"] }
@@ -67,6 +68,7 @@ uuid = { version = "1" }
 
 # runtime / async
 async-trait = { version = "0.1" }
+async-recursion = { version = "1.1.1" }
 futures = { version = "0.3" }
 tokio = { version = "1" }
 num_cpus = { version = "1" }
