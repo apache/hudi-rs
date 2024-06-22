@@ -21,9 +21,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use crate::error::HudiFileGroupError;
-use crate::error::HudiFileGroupError::CommitTimeAlreadyExists;
 use crate::storage::file_metadata::FileMetadata;
+use anyhow::{anyhow, Result};
 
 #[derive(Clone, Debug)]
 pub struct BaseFile {
@@ -104,18 +103,16 @@ impl FileGroup {
         }
     }
 
-    pub fn add_base_file_from_name(
-        &mut self,
-        file_name: &str,
-    ) -> Result<&Self, HudiFileGroupError> {
+    pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let base_file = BaseFile::new(file_name);
         self.add_base_file(base_file)
     }
 
-    pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self, HudiFileGroupError> {
+    pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
         let commit_time = base_file.commit_time.as_str();
         if self.file_slices.contains_key(commit_time) {
-            Err(CommitTimeAlreadyExists(
+            Err(anyhow!(
+                "Commit time {0} is already present in File Group {1}",
                 commit_time.to_owned(),
                 self.to_string(),
             ))

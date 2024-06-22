@@ -61,7 +61,6 @@ bytes = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 hashbrown = "0.14.3"
 regex = { workspace = true }
-thiserror = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 url = { workspace = true }
 

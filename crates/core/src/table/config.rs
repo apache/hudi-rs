@@ -17,7 +17,8 @@
  * under the License.
  */
 
-use crate::error::HudiCoreError;
+use anyhow::anyhow;
+use anyhow::Result;
 use std::str::FromStr;
 
 pub enum ConfigKey {
@@ -67,13 +68,13 @@ pub enum TableType {
 }
 
 impl FromStr for TableType {
-    type Err = HudiCoreError;
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
-            _ => Err(HudiCoreError::LoadTablePropertiesError),
+            _ => Err(anyhow!("Unsupported table type: {}", s)),
         }
     }
 }
@@ -84,12 +85,12 @@ pub enum BaseFileFormat {
 }
 
 impl FromStr for BaseFileFormat {
-    type Err = HudiCoreError;
+    type Err = anyhow::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
-            _ => Err(HudiCoreError::LoadTablePropertiesError),
+            _ => Err(anyhow!("Unsupported base file format: {}", s)),
         }
     }
 }
