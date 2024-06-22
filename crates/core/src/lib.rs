@@ -19,7 +19,6 @@
 
 use crate::table::Table;
 
-mod error;
 mod file_group;
 pub mod table;
 pub type HudiTable = Table;

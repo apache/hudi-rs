@@ -17,16 +17,18 @@
  * under the License.
  */
 
-use hudi_fs::file_name_without_ext;
 use std::collections::HashMap;
+use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Result};
 use arrow_schema::SchemaRef;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
-use std::fs::File;
-use std::io::{ErrorKind, Read};
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+
+use hudi_fs::file_name_without_ext;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
@@ -64,7 +66,7 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    pub fn new(base_path: &Path) -> Result<Self, io::Error> {
+    pub fn new(base_path: &Path) -> Result<Self> {
         let instants = Self::load_completed_commit_instants(base_path)?;
         Ok(Self {
             base_path: base_path.to_path_buf(),
@@ -72,7 +74,7 @@ impl Timeline {
         })
     }
 
-    fn load_completed_commit_instants(base_path: &Path) -> Result<Vec<Instant>, io::Error> {
+    fn load_completed_commit_instants(base_path: &Path) -> Result<Vec<Instant>> {
         let mut completed_commits = Vec::new();
         let mut timeline_path = base_path.to_path_buf();
         timeline_path.push(".hoodie");
@@ -91,7 +93,7 @@ impl Timeline {
         Ok(completed_commits)
     }
 
-    pub fn get_latest_commit_metadata(&self) -> Result<HashMap<String, Value>, io::Error> {
+    pub fn get_latest_commit_metadata(&self) -> Result<HashMap<String, Value>> {
         match self.instants.iter().next_back() {
             Some(instant) => {
                 let mut latest_instant_file_path = self.base_path.to_path_buf();
@@ -107,7 +109,7 @@ impl Timeline {
         }
     }
 
-    pub fn get_latest_schema(&self) -> Result<SchemaRef, io::Error> {
+    pub fn get_latest_schema(&self) -> Result<SchemaRef> {
         let commit_metadata = self.get_latest_commit_metadata()?;
         if let Some(partition_to_write_stats) = commit_metadata["partitionToWriteStats"].as_object()
         {
@@ -123,18 +125,17 @@ impl Timeline {
                 }
             }
         }
-        Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "Failed to resolve schema.",
-        ))
+        Err(anyhow!("Failed to resolve schema."))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::timeline::{Instant, State, Timeline};
-    use hudi_fs::test_utils::extract_test_table;
     use std::path::Path;
+
+    use hudi_fs::test_utils::extract_test_table;
+
+    use crate::timeline::{Instant, State, Timeline};
 
     #[test]
     fn read_latest_schema() {
