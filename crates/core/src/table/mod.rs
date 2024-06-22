@@ -18,11 +18,11 @@
  */
 
 use std::collections::HashMap;
-use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use anyhow::Result;
 
 use arrow_schema::SchemaRef;
 
@@ -55,7 +55,7 @@ impl Table {
         }
     }
 
-    fn load_properties(path: &Path) -> Result<HashMap<String, String>, std::io::Error> {
+    fn load_properties(path: &Path) -> Result<HashMap<String, String>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let lines = reader.lines();
@@ -81,7 +81,7 @@ impl Table {
         }
     }
 
-    pub fn get_timeline(&self) -> Result<Timeline, std::io::Error> {
+    pub fn get_timeline(&self) -> Result<Timeline> {
         Timeline::new(self.base_path.as_path())
     }
 
@@ -99,7 +99,7 @@ impl Table {
         }
     }
 
-    pub fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>, Box<dyn Error>> {
+    pub fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
         let mut fs_view = FileSystemView::new(self.base_path.as_path());
         for f in fs_view.get_latest_file_slices() {
@@ -108,7 +108,7 @@ impl Table {
         Ok(file_slices)
     }
 
-    pub fn get_latest_file_paths(&self) -> Result<Vec<String>, Box<dyn Error>> {
+    pub fn get_latest_file_paths(&self) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         for f in self.get_latest_file_slices()? {
             if let Some(f) = f.base_file_path() {

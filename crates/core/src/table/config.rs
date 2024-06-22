@@ -70,7 +70,7 @@ pub enum TableType {
 impl FromStr for TableType {
     type Err = anyhow::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
