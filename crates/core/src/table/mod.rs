@@ -17,12 +17,12 @@
  * under the License.
  */
 
+use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use anyhow::Result;
 
 use arrow_schema::SchemaRef;
 
