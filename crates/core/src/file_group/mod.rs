@@ -93,7 +93,6 @@ impl fmt::Display for FileGroup {
     }
 }
 
-#[allow(dead_code)]
 impl FileGroup {
     pub fn new(id: String, partition_path: Option<String>) -> Self {
         Self {
@@ -103,6 +102,7 @@ impl FileGroup {
         }
     }
 
+    #[allow(dead_code)]
     pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let base_file = BaseFile::new(file_name);
         self.add_base_file(base_file)
@@ -114,7 +114,7 @@ impl FileGroup {
             Err(anyhow!(
                 "Commit time {0} is already present in File Group {1}",
                 commit_time.to_owned(),
-                self.to_string(),
+                self.id,
             ))
         } else {
             self.file_slices.insert(
@@ -166,5 +166,19 @@ mod tests {
             fg.get_latest_file_slice().unwrap().base_file.commit_time,
             "20240402144910683"
         )
+    }
+
+    #[test]
+    fn add_base_file_with_same_commit_time_should_fail() {
+        let mut fg = FileGroup::new("5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(), None);
+        let res1 = fg.add_base_file_from_name(
+            "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
+        );
+        assert!(res1.is_ok());
+        let res2 = fg.add_base_file_from_name(
+            "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402144910683.parquet",
+        );
+        assert!(res2.is_err());
+        assert_eq!(res2.unwrap_err().to_string(), "Commit time 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
     }
 }
