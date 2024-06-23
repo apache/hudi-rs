@@ -239,4 +239,21 @@ mod tests {
             vec![".hoodie", "part1", "part2/part22", "part3/part32/part33"]
         );
     }
+
+    #[tokio::test]
+    async fn get_file_metadata() {
+        let base_url =
+            Url::from_directory_path(canonicalize(Path::new("fixtures")).unwrap()).unwrap();
+        let storage = Storage::new(base_url.path(), HashMap::new());
+        let file_metadata = storage.get_file_metadata("a.parquet").await;
+        assert_eq!(file_metadata.name, "a.parquet");
+        assert_eq!(
+            file_metadata.path,
+            ObjPath::from_url_path(base_url.join("a.parquet").unwrap().path())
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(file_metadata.size, 866);
+        assert_eq!(file_metadata.num_records, None);
+    }
 }
