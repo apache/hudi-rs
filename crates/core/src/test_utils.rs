@@ -29,3 +29,19 @@ pub fn extract_test_table(fixture_path: &Path) -> PathBuf {
     zip_extract::extract(Cursor::new(archive), &target_dir, true).unwrap();
     target_dir
 }
+
+#[macro_export]
+macro_rules! assert_approx_eq {
+    ($a:expr, $b:expr, $delta:expr) => {{
+        let a = $a;
+        let b = $b;
+        let delta = $delta;
+        let diff = if a > b { a - b } else { b - a };
+
+        assert!(
+            diff <= delta,
+            "assertion failed: `(left ≈ right)`\n  left: `{:?}`,\n right: `{:?}`,\n delta: `{:?}`",
+            a, b, delta
+        );
+    }};
+}

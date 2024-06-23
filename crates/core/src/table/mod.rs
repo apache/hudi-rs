@@ -82,17 +82,36 @@ impl Table {
     }
 
     pub fn get_timeline(&self) -> Result<Timeline> {
-        Timeline::new(self.base_path.as_path())
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let f = async { Timeline::new(self.base_path.to_str().unwrap()).await };
+        rt.block_on(f)
     }
 
     pub fn schema(&self) -> SchemaRef {
-        match Timeline::new(self.base_path.as_path()) {
-            Ok(timeline) => match timeline.get_latest_schema() {
-                Ok(schema) => SchemaRef::from(schema),
-                Err(e) => {
-                    panic!("Failed to resolve table schema: {}", e)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let f = async { Timeline::new(self.base_path.to_str().unwrap()).await };
+        let timeline = rt.block_on(f);
+        match timeline {
+            Ok(timeline) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let wrapper = async { timeline.get_latest_schema().await };
+                let result = rt.block_on(wrapper);
+                match result {
+                    Ok(schema) => SchemaRef::from(schema),
+                    Err(e) => {
+                        panic!("Failed to resolve table schema: {}", e)
+                    }
                 }
-            },
+            }
             Err(e) => {
                 panic!("Failed to resolve table schema: {}", e)
             }
@@ -210,7 +229,7 @@ mod tests {
     use crate::table::config::TableType::CopyOnWrite;
     use crate::table::metadata::ProvidesTableMetadata;
     use crate::table::Table;
-    use hudi_fs::test_utils::extract_test_table;
+    use crate::test_utils::extract_test_table;
 
     #[test]
     fn hudi_table_get_latest_file_paths() {

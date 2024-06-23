@@ -19,10 +19,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_recursion::async_recursion;
+use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{parse_url_opts, DynObjectStore, ObjectStore};
+use object_store::{parse_url_opts, ObjectStore};
+use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
 use crate::storage::file_metadata::FileMetadata;
@@ -32,7 +37,7 @@ pub(crate) mod file_metadata;
 #[allow(dead_code)]
 pub struct Storage {
     base_url: Url,
-    object_store: Box<DynObjectStore>,
+    object_store: Arc<dyn ObjectStore>,
     options: HashMap<String, String>,
 }
 
@@ -43,20 +48,40 @@ impl Storage {
         let object_store = parse_url_opts(&base_url, &options).unwrap().0;
         Box::from(Storage {
             base_url,
-            object_store,
+            object_store: Arc::new(object_store),
             options,
         })
     }
 
-    pub async fn get_file_metadata(&self, path: &str) -> FileMetadata {
-        let p = ObjPath::from(path);
-        let meta = self.object_store.head(&p).await.unwrap();
+    pub async fn get_file_metadata(&self, relative_path: &str) -> FileMetadata {
+        let mut obj_url = self.base_url.clone();
+        obj_url.path_segments_mut().unwrap().push(relative_path);
+        let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
+        let meta = self.object_store.head(&obj_path).await.unwrap();
         FileMetadata {
             path: meta.location.to_string(),
-            name: p.filename().unwrap().to_string(),
+            name: obj_path.filename().unwrap().to_string(),
             size: meta.size,
             num_records: None,
         }
+    }
+
+    pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> ParquetMetaData {
+        let mut obj_url = self.base_url.clone();
+        obj_url.path_segments_mut().unwrap().push(relative_path);
+        let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
+        let meta = self.object_store.head(&obj_path).await.unwrap();
+        let reader = ParquetObjectReader::new(self.object_store.clone(), meta);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
+        builder.metadata().as_ref().to_owned()
+    }
+
+    pub async fn get_file_data(&self, relative_path: &str) -> Bytes {
+        let mut obj_url = self.base_url.clone();
+        obj_url.path_segments_mut().unwrap().push(relative_path);
+        let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
+        let result = self.object_store.get(&obj_path).await.unwrap();
+        result.bytes().await.unwrap()
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Vec<String> {
@@ -125,11 +150,11 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Vec<Strin
 
 #[cfg(test)]
 mod tests {
-    use object_store::path::Path as ObjPath;
     use std::collections::{HashMap, HashSet};
     use std::fs::canonicalize;
     use std::path::Path;
 
+    use object_store::path::Path as ObjPath;
     use url::Url;
 
     use crate::storage::{get_leaf_dirs, Storage};

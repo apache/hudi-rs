@@ -17,6 +17,10 @@
  * under the License.
  */
 
+use anyhow::anyhow;
+use anyhow::Result;
+use std::path::Path;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileMetadata {
     pub path: String,
@@ -34,4 +38,22 @@ impl FileMetadata {
             num_records: None,
         }
     }
+}
+
+pub fn split_filename(filename: &str) -> Result<(String, String)> {
+    let path = Path::new(filename);
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("No file stem found"))?
+        .to_string();
+
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    Ok((stem, extension))
 }

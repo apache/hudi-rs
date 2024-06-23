@@ -24,7 +24,6 @@ rust-version.workspace = true
 
 [dependencies]
 hudi-core = { path = "../core"}
-hudi-fs = { path = "../fs" }
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }
