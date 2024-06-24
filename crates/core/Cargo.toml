@@ -23,7 +23,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-hudi-fs = { path = "../fs"}
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }

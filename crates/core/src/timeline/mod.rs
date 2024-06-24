@@ -18,17 +18,16 @@
  */
 
 use std::collections::HashMap;
-use std::fs;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::fmt::Debug;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use arrow_schema::SchemaRef;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use serde_json::Value;
+use parquet::arrow::parquet_to_arrow_schema;
+use serde_json::{Map, Value};
 
-use hudi_fs::file_name_without_ext;
+use crate::storage::file_metadata::split_filename;
+use crate::storage::Storage;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
@@ -61,29 +60,28 @@ impl Instant {
 
 #[derive(Debug, Clone)]
 pub struct Timeline {
-    pub base_path: PathBuf,
+    pub base_path: String,
     pub instants: Vec<Instant>,
 }
 
 impl Timeline {
-    pub fn new(base_path: &Path) -> Result<Self> {
-        let instants = Self::load_completed_commit_instants(base_path)?;
+    pub async fn new(base_path: &str) -> Result<Self> {
+        let instants = Self::load_completed_commit_instants(base_path).await?;
         Ok(Self {
-            base_path: base_path.to_path_buf(),
+            base_path: base_path.to_string(),
             instants,
         })
     }
 
-    fn load_completed_commit_instants(base_path: &Path) -> Result<Vec<Instant>> {
+    async fn load_completed_commit_instants(base_path: &str) -> Result<Vec<Instant>> {
+        let storage = Storage::new(base_path, HashMap::new());
         let mut completed_commits = Vec::new();
-        let mut timeline_path = base_path.to_path_buf();
-        timeline_path.push(".hoodie");
-        for entry in fs::read_dir(timeline_path)? {
-            let p = entry?.path();
-            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("commit") {
+        for file_metadata in storage.list_files(Some(".hoodie")).await {
+            let (file_stem, file_ext) = split_filename(file_metadata.name.as_str())?;
+            if file_ext == "commit" {
                 completed_commits.push(Instant {
                     state: State::Completed,
-                    timestamp: file_name_without_ext(p.file_name()),
+                    timestamp: file_stem,
                     action: "commit".to_owned(),
                 })
             }
@@ -93,34 +91,40 @@ impl Timeline {
         Ok(completed_commits)
     }
 
-    pub fn get_latest_commit_metadata(&self) -> Result<HashMap<String, Value>> {
+    async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
         match self.instants.iter().next_back() {
             Some(instant) => {
-                let mut latest_instant_file_path = self.base_path.to_path_buf();
-                latest_instant_file_path.push(".hoodie");
-                latest_instant_file_path.push(instant.file_name());
-                let mut f = File::open(latest_instant_file_path)?;
-                let mut content = String::new();
-                f.read_to_string(&mut content)?;
-                let commit_metadata = serde_json::from_str(&content)?;
+                let mut commit_file_path = PathBuf::from(".hoodie");
+                commit_file_path.push(instant.file_name());
+                let storage = Storage::new(&self.base_path, HashMap::new());
+                let bytes = storage
+                    .get_file_data(commit_file_path.to_str().unwrap())
+                    .await;
+                let json: Value = serde_json::from_slice(&bytes)?;
+                let commit_metadata = json
+                    .as_object()
+                    .ok_or_else(|| anyhow!("Expected JSON object"))?
+                    .clone();
                 Ok(commit_metadata)
             }
-            None => Ok(HashMap::new()),
+            None => Ok(Map::new()),
         }
     }
 
-    pub fn get_latest_schema(&self) -> Result<SchemaRef> {
-        let commit_metadata = self.get_latest_commit_metadata()?;
+    pub async fn get_latest_schema(&self) -> Result<SchemaRef> {
+        let commit_metadata = self.get_latest_commit_metadata().await.unwrap();
         if let Some(partition_to_write_stats) = commit_metadata["partitionToWriteStats"].as_object()
         {
             if let Some((_, value)) = partition_to_write_stats.iter().next() {
                 if let Some(first_value) = value.as_array().and_then(|arr| arr.first()) {
                     if let Some(path) = first_value["path"].as_str() {
-                        let mut base_file_path = PathBuf::from(&self.base_path);
-                        base_file_path.push(path);
-                        let file = File::open(base_file_path)?;
-                        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-                        return Ok(builder.schema().to_owned());
+                        let storage = Storage::new(&self.base_path, HashMap::new());
+                        let parquet_meta = storage.get_parquet_file_metadata(path).await;
+                        let arrow_schema = parquet_to_arrow_schema(
+                            parquet_meta.file_metadata().schema_descr(),
+                            None,
+                        )?;
+                        return Ok(SchemaRef::from(arrow_schema));
                     }
                 }
             }
@@ -131,25 +135,26 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::canonicalize;
     use std::path::Path;
 
-    use hudi_fs::test_utils::extract_test_table;
-
+    use crate::test_utils::extract_test_table;
     use crate::timeline::{Instant, State, Timeline};
 
-    #[test]
-    fn read_latest_schema() {
+    #[tokio::test]
+    async fn read_latest_schema() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let target_table_path = extract_test_table(fixture_path);
-        let timeline = Timeline::new(target_table_path.as_path()).unwrap();
-        let table_schema = timeline.get_latest_schema().unwrap();
+        let base_path = canonicalize(target_table_path).unwrap();
+        let timeline = Timeline::new(base_path.to_str().unwrap()).await.unwrap();
+        let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 11)
     }
 
-    #[test]
-    fn init_commits_timeline() {
-        let fixture_path = Path::new("fixtures/timeline/commits_stub");
-        let timeline = Timeline::new(fixture_path).unwrap();
+    #[tokio::test]
+    async fn init_commits_timeline() {
+        let base_path = canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap();
+        let timeline = Timeline::new(base_path.to_str().unwrap()).await.unwrap();
         assert_eq!(
             timeline.instants,
             vec![

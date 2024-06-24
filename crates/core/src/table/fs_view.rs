@@ -135,7 +135,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::Path;
 
-    use hudi_fs::test_utils::extract_test_table;
+    use crate::test_utils::extract_test_table;
 
     use crate::table::fs_view::FileSystemView;
 
