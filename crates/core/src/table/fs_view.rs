@@ -195,7 +195,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_partition_paths() {
-        let fixture_path = canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
+        let fixture_path =
+            canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
         let base_url = Url::from_file_path(extract_test_table(&fixture_path)).unwrap();
         let fs_view = FileSystemView::new(base_url);
         let partition_paths = fs_view.get_partition_paths().await.unwrap();
@@ -209,7 +210,8 @@ mod tests {
 
     #[test]
     fn get_latest_file_slices() {
-        let fixture_path = canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
+        let fixture_path =
+            canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
         let base_url = Url::from_file_path(extract_test_table(&fixture_path)).unwrap();
         let mut fs_view = FileSystemView::new(base_url);
         fs_view.load_file_groups();

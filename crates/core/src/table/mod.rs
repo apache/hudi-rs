@@ -265,14 +265,15 @@ mod tests {
     fn hudi_table_get_latest_file_paths() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
-        let mut hudi_table = Table::new(&base_url.path(), HashMap::new());
+        let mut hudi_table = Table::new(base_url.path(), HashMap::new());
         assert_eq!(hudi_table.get_timeline().unwrap().instants.len(), 2);
         assert_eq!(hudi_table.get_latest_file_paths().unwrap().len(), 5);
     }
 
     #[test]
     fn hudi_table_get_table_metadata() {
-        let base_path = canonicalize(Path::new("fixtures/table_metadata/sample_table_properties")).unwrap();
+        let base_path =
+            canonicalize(Path::new("fixtures/table_metadata/sample_table_properties")).unwrap();
         let table = Table::new(base_path.to_str().unwrap(), HashMap::new());
         assert_eq!(table.base_file_format(), Parquet);
         assert_eq!(table.checksum(), 3761586722);

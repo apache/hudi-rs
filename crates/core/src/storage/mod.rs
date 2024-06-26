@@ -172,8 +172,8 @@ mod tests {
     use object_store::path::Path as ObjPath;
     use url::Url;
 
-    use crate::storage::{get_leaf_dirs, Storage};
     use crate::storage::utils::join_url_segments;
+    use crate::storage::{get_leaf_dirs, Storage};
 
     #[tokio::test]
     async fn storage_list_dirs() {
@@ -210,7 +210,10 @@ mod tests {
             .collect();
         let expected_paths: HashSet<ObjPath> = vec![".hoodie", "part1", "part2", "part3"]
             .into_iter()
-            .map(|dir| ObjPath::from_url_path(join_url_segments(&storage.base_url, &[dir]).unwrap().path()).unwrap())
+            .map(|dir| {
+                ObjPath::from_url_path(join_url_segments(&storage.base_url, &[dir]).unwrap().path())
+                    .unwrap()
+            })
             .collect();
         assert_eq!(first_level_dirs, expected_paths);
     }
