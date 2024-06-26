@@ -21,8 +21,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use futures::StreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{parse_url_opts, ObjectStore};
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -30,9 +32,12 @@ use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
-use crate::storage::file_metadata::FileMetadata;
+use crate::storage::file_info::FileInfo;
+use crate::storage::utils::join_url_segments;
 
-pub(crate) mod file_metadata;
+pub(crate) mod file_info;
+pub(crate) mod file_stats;
+pub(crate) mod utils;
 
 #[allow(dead_code)]
 pub struct Storage {
@@ -41,10 +46,8 @@ pub struct Storage {
     options: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl Storage {
-    pub fn new(base_uri: &str, options: HashMap<String, String>) -> Box<Storage> {
-        let base_url = Url::from_file_path(PathBuf::from(base_uri).as_path()).unwrap();
+    pub fn new(base_url: Url, options: HashMap<String, String>) -> Box<Storage> {
         let object_store = parse_url_opts(&base_url, &options).unwrap().0;
         Box::from(Storage {
             base_url,
@@ -53,76 +56,88 @@ impl Storage {
         })
     }
 
-    pub async fn get_file_metadata(&self, relative_path: &str) -> FileMetadata {
-        let mut obj_url = self.base_url.clone();
-        obj_url.path_segments_mut().unwrap().push(relative_path);
+    #[allow(dead_code)]
+    pub async fn get_file_info(&self, relative_path: &str) -> FileInfo {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path]).unwrap();
         let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
         let meta = self.object_store.head(&obj_path).await.unwrap();
-        FileMetadata {
-            path: meta.location.to_string(),
+        FileInfo {
+            uri: obj_url.to_string(),
             name: obj_path.filename().unwrap().to_string(),
             size: meta.size,
-            num_records: None,
         }
     }
 
     pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> ParquetMetaData {
-        let mut obj_url = self.base_url.clone();
-        obj_url.path_segments_mut().unwrap().push(relative_path);
+        let obj_url = join_url_segments(&self.base_url, &[relative_path]).unwrap();
         let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
-        let meta = self.object_store.head(&obj_path).await.unwrap();
-        let reader = ParquetObjectReader::new(self.object_store.clone(), meta);
+        let obj_store = self.object_store.clone();
+        let meta = obj_store.head(&obj_path).await.unwrap();
+        let reader = ParquetObjectReader::new(obj_store, meta);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
         builder.metadata().as_ref().to_owned()
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Bytes {
-        let mut obj_url = self.base_url.clone();
-        obj_url.path_segments_mut().unwrap().push(relative_path);
+        let obj_url = join_url_segments(&self.base_url, &[relative_path]).unwrap();
         let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
         let result = self.object_store.get(&obj_path).await.unwrap();
         result.bytes().await.unwrap()
     }
 
+    pub async fn get_parquet_file_data(&self, relative_path: &str) -> Vec<RecordBatch> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path]).unwrap();
+        let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
+        let obj_store = self.object_store.clone();
+        let meta = obj_store.head(&obj_path).await.unwrap();
+        let reader = ParquetObjectReader::new(obj_store, meta);
+        let stream = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Vec<String> {
-        self.list_dirs_as_paths(subdir)
+        self.list_dirs_as_obj_paths(subdir)
             .await
             .into_iter()
             .map(|p| p.filename().unwrap().to_string())
             .collect()
     }
 
-    pub async fn list_dirs_as_paths(&self, subdir: Option<&str>) -> Vec<ObjPath> {
-        let mut prefix_url = self.base_url.clone();
-        if let Some(subdir) = subdir {
-            prefix_url.path_segments_mut().unwrap().push(subdir);
-        }
-        let prefix = ObjPath::from_url_path(prefix_url.path()).unwrap();
+    async fn list_dirs_as_obj_paths(&self, subdir: Option<&str>) -> Vec<ObjPath> {
+        let prefix_url = join_url_segments(&self.base_url, &[subdir.unwrap_or_default()]).unwrap();
+        let prefix_path = ObjPath::from_url_path(prefix_url.path()).unwrap();
         self.object_store
-            .list_with_delimiter(Some(&prefix))
+            .list_with_delimiter(Some(&prefix_path))
             .await
             .unwrap()
             .common_prefixes
     }
 
-    pub async fn list_files(&self, subdir: Option<&str>) -> Vec<FileMetadata> {
-        let mut prefix_url = self.base_url.clone();
-        if let Some(subdir) = subdir {
-            prefix_url.path_segments_mut().unwrap().push(subdir);
-        }
-        let prefix = ObjPath::from_url_path(prefix_url.path()).unwrap();
+    pub async fn list_files(&self, subdir: Option<&str>) -> Vec<FileInfo> {
+        let prefix_url = join_url_segments(&self.base_url, &[subdir.unwrap_or_default()]).unwrap();
+        let prefix_path = ObjPath::from_url_path(prefix_url.path()).unwrap();
         self.object_store
-            .list_with_delimiter(Some(&prefix))
+            .list_with_delimiter(Some(&prefix_path))
             .await
             .unwrap()
             .objects
             .into_iter()
-            .map(|obj_meta| {
-                FileMetadata::new(
-                    obj_meta.location.to_string(),
-                    obj_meta.location.filename().unwrap().to_string(),
-                    obj_meta.size,
-                )
+            .map(|obj_meta| FileInfo {
+                uri: prefix_url
+                    .join(obj_meta.location.filename().unwrap())
+                    .unwrap()
+                    .to_string(),
+                name: obj_meta.location.filename().unwrap().to_string(),
+                size: obj_meta.size,
             })
             .collect()
     }
@@ -158,6 +173,7 @@ mod tests {
     use url::Url;
 
     use crate::storage::{get_leaf_dirs, Storage};
+    use crate::storage::utils::join_url_segments;
 
     #[tokio::test]
     async fn storage_list_dirs() {
@@ -165,7 +181,7 @@ mod tests {
             canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(base_url.path(), HashMap::new());
+        let storage = Storage::new(base_url, HashMap::new());
         let first_level_dirs: HashSet<String> = storage.list_dirs(None).await.into_iter().collect();
         assert_eq!(
             first_level_dirs,
@@ -186,12 +202,15 @@ mod tests {
             canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(base_url.path(), HashMap::new());
-        let first_level_dirs: HashSet<ObjPath> =
-            storage.list_dirs_as_paths(None).await.into_iter().collect();
+        let storage = Storage::new(base_url, HashMap::new());
+        let first_level_dirs: HashSet<ObjPath> = storage
+            .list_dirs_as_obj_paths(None)
+            .await
+            .into_iter()
+            .collect();
         let expected_paths: HashSet<ObjPath> = vec![".hoodie", "part1", "part2", "part3"]
             .into_iter()
-            .map(|dir| ObjPath::from_url_path(base_url.join(dir).unwrap().path()).unwrap())
+            .map(|dir| ObjPath::from_url_path(join_url_segments(&storage.base_url, &[dir]).unwrap().path()).unwrap())
             .collect();
         assert_eq!(first_level_dirs, expected_paths);
     }
@@ -202,7 +221,7 @@ mod tests {
             canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(base_url.path(), HashMap::new());
+        let storage = Storage::new(base_url, HashMap::new());
         let file_names_1: Vec<String> = storage
             .list_files(None)
             .await
@@ -232,7 +251,7 @@ mod tests {
             canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(base_url.path(), HashMap::new());
+        let storage = Storage::new(base_url, HashMap::new());
         let leaf_dirs = get_leaf_dirs(&storage, None).await;
         assert_eq!(
             leaf_dirs,
@@ -241,19 +260,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_file_metadata() {
+    async fn storage_get_file_info() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("fixtures")).unwrap()).unwrap();
-        let storage = Storage::new(base_url.path(), HashMap::new());
-        let file_metadata = storage.get_file_metadata("a.parquet").await;
+        let storage = Storage::new(base_url, HashMap::new());
+        let file_metadata = storage.get_file_info("a.parquet").await;
         assert_eq!(file_metadata.name, "a.parquet");
         assert_eq!(
-            file_metadata.path,
-            ObjPath::from_url_path(base_url.join("a.parquet").unwrap().path())
-                .unwrap()
-                .to_string()
+            file_metadata.uri,
+            storage.base_url.join("a.parquet").unwrap().to_string()
         );
         assert_eq!(file_metadata.size, 866);
-        assert_eq!(file_metadata.num_records, None);
     }
 }

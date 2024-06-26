@@ -15,7 +15,9 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from typing import List
+from typing import List, Dict, Optional
+
+import pyarrow
 
 __version__: str
 
@@ -23,8 +25,26 @@ __version__: str
 def rust_core_version() -> str: ...
 
 
+class HudiFileSlice:
+    file_group_id: str
+    partition_path: str
+    commit_time: str
+    base_file_name: str
+    base_file_path: str
+    base_file_size: int
+    num_records: int
+
+
 class BindingHudiTable:
 
-    def __init__(self, table_uri: str): ...
+    def __init__(
+            self,
+            table_uri: str,
+            storage_options: Optional[Dict[str, str]] = None,
+    ): ...
 
-    def get_latest_file_paths(self) -> List[str]: ...
+    def schema(self) -> "pyarrow.Schema": ...
+
+    def get_latest_file_slices(self) -> List[HudiFileSlice]: ...
+
+    def read_file_slice(self, relative_path) -> List["pyarrow.RecordBatch"]: ...

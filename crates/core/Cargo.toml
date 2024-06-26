@@ -67,6 +67,7 @@ url = { workspace = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 
 # test
 tempfile = "3.10.1"

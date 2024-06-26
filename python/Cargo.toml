@@ -27,10 +27,22 @@ doc = false
 
 [dependencies]
 object_store = { workspace = true }
+# arrow
+arrow = { workspace = true, features = ["ffi", "pyarrow"] }
+arrow-arith = { workspace = true }
+arrow-array = { workspace = true , features = ["chrono-tz"]}
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-json = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-schema = { workspace = true, features = ["serde"] }
+arrow-select = { workspace = true }
 
 [dependencies.pyo3]
-version = "0.21.2"
-features = ["extension-module", "abi3", "abi3-py38", "gil-refs"]
+version = "0.20.3"
+features = ["extension-module", "abi3", "abi3-py38"]
 
 [dependencies.hudi]
 path = "../crates/hudi"

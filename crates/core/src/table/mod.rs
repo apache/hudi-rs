@@ -17,16 +17,18 @@
  * under the License.
  */
 
-use anyhow::Result;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
+use anyhow::Result;
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
+use url::Url;
 
 use crate::file_group::FileSlice;
+use crate::storage::Storage;
 use crate::table::config::BaseFileFormat;
 use crate::table::config::{ConfigKey, TableType};
 use crate::table::fs_view::FileSystemView;
@@ -38,26 +40,44 @@ mod fs_view;
 mod metadata;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Table {
-    pub base_path: PathBuf,
+    pub base_url: Url,
     pub props: HashMap<String, String>,
+    pub file_system_view: Option<FileSystemView>,
+    pub storage_options: HashMap<String, String>,
 }
 
 impl Table {
-    pub fn new(table_base_path: &str) -> Self {
-        let base_path = PathBuf::from(table_base_path);
-        let props_path = base_path.join(".hoodie").join("hoodie.properties");
-        match Self::load_properties(props_path.as_path()) {
-            Ok(props) => Self { base_path, props },
+    pub fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Self {
+        let base_url = Url::from_file_path(PathBuf::from(base_uri).as_path()).unwrap();
+        match Self::load_properties(&base_url, ".hoodie/hoodie.properties", &storage_options) {
+            Ok(props) => Self {
+                base_url,
+                props,
+                file_system_view: None,
+                storage_options,
+            },
             Err(e) => {
                 panic!("Failed to load table properties: {}", e)
             }
         }
     }
 
-    fn load_properties(path: &Path) -> Result<HashMap<String, String>> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+    fn load_properties(
+        base_url: &Url,
+        props_path: &str,
+        storage_options: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let storage = Storage::new(base_url.clone(), storage_options.clone());
+        let get_data = async { storage.get_file_data(props_path).await };
+        let data = rt.block_on(get_data);
+        let cursor = std::io::Cursor::new(data);
+        let reader = BufReader::new(cursor);
         let lines = reader.lines();
         let mut properties: HashMap<String, String> = HashMap::new();
         for line in lines {
@@ -81,58 +101,65 @@ impl Table {
         }
     }
 
-    pub fn get_timeline(&self) -> Result<Timeline> {
+    #[cfg(test)]
+    fn get_timeline(&self) -> Result<Timeline> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let f = async { Timeline::new(self.base_path.to_str().unwrap()).await };
-        rt.block_on(f)
+        let init_timeline = async { Timeline::new(self.base_url.clone()).await };
+        rt.block_on(init_timeline)
     }
 
-    pub fn schema(&self) -> SchemaRef {
+    pub fn get_latest_schema(&self) -> SchemaRef {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let f = async { Timeline::new(self.base_path.to_str().unwrap()).await };
-        let timeline = rt.block_on(f);
+        let init_timeline = async { Timeline::new(self.base_url.clone()).await };
+        let timeline = rt.block_on(init_timeline);
         match timeline {
             Ok(timeline) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
-                let wrapper = async { timeline.get_latest_schema().await };
-                let result = rt.block_on(wrapper);
-                match result {
+                let get_schema = async { timeline.get_latest_schema().await };
+                match rt.block_on(get_schema) {
                     Ok(schema) => SchemaRef::from(schema),
-                    Err(e) => {
-                        panic!("Failed to resolve table schema: {}", e)
-                    }
+                    Err(e) => panic!("Failed to resolve table schema: {}", e),
                 }
             }
-            Err(e) => {
-                panic!("Failed to resolve table schema: {}", e)
-            }
+            Err(e) => panic!("Failed to resolve table schema: {}", e),
         }
     }
 
-    pub fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>> {
+    pub fn get_latest_file_slices(&mut self) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
-        let mut fs_view = FileSystemView::new(self.base_path.as_path());
-        for f in fs_view.get_latest_file_slices() {
+
+        if self.file_system_view.is_none() {
+            let mut new_fs_view = FileSystemView::new(self.base_url.clone());
+            new_fs_view.load_file_groups();
+            self.file_system_view = Some(new_fs_view);
+        }
+
+        let fs_view = self.file_system_view.as_mut().unwrap();
+
+        for f in fs_view.get_latest_file_slices_with_stats() {
             file_slices.push(f.clone());
         }
         Ok(file_slices)
     }
 
-    pub fn get_latest_file_paths(&self) -> Result<Vec<String>> {
+    pub fn read_file_slice(&self, relative_path: &str) -> Vec<RecordBatch> {
+        let fs_view = self.file_system_view.as_ref().unwrap();
+        fs_view.read_file_slice(relative_path)
+    }
+
+    pub fn get_latest_file_paths(&mut self) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         for f in self.get_latest_file_slices()? {
-            if let Some(f) = f.base_file_path() {
-                file_paths.push(f.to_string());
-            }
+            file_paths.push(f.base_file_path().to_string());
         }
         Ok(file_paths)
     }
@@ -178,7 +205,7 @@ impl ProvidesTableMetadata for Table {
     }
 
     fn location(&self) -> String {
-        self.base_path.to_str().unwrap().to_string()
+        self.base_url.path().to_string()
     }
 
     fn partition_fields(&self) -> Vec<String> {
@@ -223,7 +250,10 @@ impl ProvidesTableMetadata for Table {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs::canonicalize;
     use std::path::Path;
+    use url::Url;
 
     use crate::table::config::BaseFileFormat::Parquet;
     use crate::table::config::TableType::CopyOnWrite;
@@ -234,17 +264,16 @@ mod tests {
     #[test]
     fn hudi_table_get_latest_file_paths() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let target_table_path = extract_test_table(fixture_path);
-        let hudi_table = Table::new(target_table_path.to_str().unwrap());
+        let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
+        let mut hudi_table = Table::new(&base_url.path(), HashMap::new());
         assert_eq!(hudi_table.get_timeline().unwrap().instants.len(), 2);
         assert_eq!(hudi_table.get_latest_file_paths().unwrap().len(), 5);
-        println!("{}", hudi_table.schema());
     }
 
     #[test]
     fn hudi_table_get_table_metadata() {
-        let fixture_path = Path::new("fixtures/table_metadata/sample_table_properties");
-        let table = Table::new(fixture_path.to_str().unwrap());
+        let base_path = canonicalize(Path::new("fixtures/table_metadata/sample_table_properties")).unwrap();
+        let table = Table::new(base_path.to_str().unwrap(), HashMap::new());
         assert_eq!(table.base_file_format(), Parquet);
         assert_eq!(table.checksum(), 3761586722);
         assert_eq!(table.database_name(), "default");
@@ -256,10 +285,7 @@ mod tests {
             table.key_generator_class(),
             "org.apache.hudi.keygen.SimpleKeyGenerator"
         );
-        assert_eq!(
-            table.location(),
-            "fixtures/table_metadata/sample_table_properties"
-        );
+        assert_eq!(table.location(), base_path.to_str().unwrap());
         assert_eq!(table.partition_fields(), vec!["city"]);
         assert_eq!(table.precombine_field(), "ts");
         assert!(table.populates_meta_fields());
