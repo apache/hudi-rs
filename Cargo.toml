@@ -30,7 +30,7 @@ rust-version = "1.75.0"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "50" }
+arrow = { version = "50", features = ["pyarrow"] }
 arrow-arith = { version = "50" }
 arrow-array = { version = "50", features = ["chrono-tz"] }
 arrow-buffer = { version = "50" }
