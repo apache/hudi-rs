@@ -15,7 +15,26 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from ._internal import __version__ as __version__
-from ._internal import rust_core_version as rust_core_version
-from ._internal import HudiFileSlice as HudiFileSlice
-from .table import HudiTable as HudiTable
+import os
+import zipfile
+from pathlib import Path
+
+import pytest
+
+
+def _extract_testing_table(zip_file_path, target_path) -> str:
+    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
+        zip_ref.extractall(target_path)
+    return os.path.join(target_path, "trips_table")
+
+
+@pytest.fixture(
+    params=[
+        "0.x_cow_partitioned",
+    ]
+)
+def get_sample_table(request, tmp_path) -> str:
+    fixture_path = "../crates/core/fixtures/table"
+    table_name = request.param
+    zip_file_path = Path(fixture_path).joinpath(f"{table_name}.zip")
+    return _extract_testing_table(zip_file_path, tmp_path)

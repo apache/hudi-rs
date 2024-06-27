@@ -18,30 +18,33 @@
  */
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
+use arrow::record_batch::RecordBatch;
+use url::Url;
 
 use crate::file_group::{BaseFile, FileGroup, FileSlice};
-use crate::storage::file_metadata::FileMetadata;
+use crate::storage::file_info::FileInfo;
+use crate::storage::file_stats::FileStats;
 use crate::storage::{get_leaf_dirs, Storage};
 
 #[derive(Clone, Debug)]
 pub struct FileSystemView {
-    pub base_path: PathBuf,
+    pub base_url: Url,
     partition_to_file_groups: HashMap<String, Vec<FileGroup>>,
 }
 
 impl FileSystemView {
-    pub fn new(base_path: &Path) -> Self {
+    pub fn new(base_url: Url) -> Self {
         FileSystemView {
-            base_path: base_path.to_path_buf(),
+            base_url,
             partition_to_file_groups: HashMap::new(),
         }
     }
 
     async fn get_partition_paths(&self) -> Result<Vec<String>> {
-        let storage = Storage::new(self.base_path.to_str().unwrap(), HashMap::new());
+        let storage = Storage::new(self.base_url.clone(), HashMap::new());
         let top_level_dirs: Vec<String> = storage
             .list_dirs(None)
             .await
@@ -56,16 +59,16 @@ impl FileSystemView {
     }
 
     async fn get_file_groups(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
-        let storage = Storage::new(self.base_path.to_str().unwrap(), HashMap::new());
-        let file_metadata: Vec<FileMetadata> = storage
+        let storage = Storage::new(self.base_url.clone(), HashMap::new());
+        let file_info: Vec<FileInfo> = storage
             .list_files(Some(partition_path))
             .await
             .into_iter()
             .filter(|f| f.name.ends_with(".parquet"))
             .collect();
         let mut fg_id_to_base_files: HashMap<String, Vec<BaseFile>> = HashMap::new();
-        for f in file_metadata {
-            let base_file = BaseFile::from_file_metadata(f);
+        for f in file_info {
+            let base_file = BaseFile::from_file_info(f)?;
             let fg_id = &base_file.file_group_id;
             fg_id_to_base_files
                 .entry(fg_id.to_owned())
@@ -84,8 +87,7 @@ impl FileSystemView {
         Ok(file_groups)
     }
 
-    pub fn get_latest_file_slices(&mut self) -> Vec<&FileSlice> {
-        let mut file_slices = Vec::new();
+    pub fn load_file_groups(&mut self) {
         let fs_view = self.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -96,6 +98,10 @@ impl FileSystemView {
         for (k, v) in result {
             self.partition_to_file_groups.insert(k, v);
         }
+    }
+
+    pub fn get_latest_file_slices(&self) -> Vec<&FileSlice> {
+        let mut file_slices = Vec::new();
         for fgs in self.partition_to_file_groups.values() {
             for fg in fgs {
                 if let Some(file_slice) = fg.get_latest_file_slice() {
@@ -105,6 +111,52 @@ impl FileSystemView {
         }
         file_slices
     }
+
+    pub fn get_latest_file_slices_with_stats(&mut self) -> Vec<&mut FileSlice> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut file_slices = Vec::new();
+        let file_groups = &mut self.partition_to_file_groups.values_mut();
+        for fgs in file_groups {
+            for fg in fgs {
+                if let Some(file_slice) = fg.get_latest_file_slice_mut() {
+                    let wrapper = async { load_file_slice_stats(&self.base_url, file_slice).await };
+                    let _ = rt.block_on(wrapper);
+                    file_slices.push(file_slice)
+                }
+            }
+        }
+        file_slices
+    }
+
+    pub fn read_file_slice(&self, relative_path: &str) -> Vec<RecordBatch> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let storage = Storage::new(self.base_url.clone(), HashMap::new());
+        let wrapper = async { storage.get_parquet_file_data(relative_path).await };
+        rt.block_on(wrapper)
+    }
+}
+
+async fn load_file_slice_stats(base_url: &Url, file_slice: &mut FileSlice) -> Result<()> {
+    let base_file = &mut file_slice.base_file;
+    if base_file.stats.is_none() {
+        let storage = Storage::new(base_url.clone(), HashMap::new());
+        let ptn = file_slice.partition_path.clone();
+        let mut relative_path = PathBuf::from(ptn.unwrap_or("".to_string()));
+        let base_file_name = &base_file.info.name;
+        relative_path.push(base_file_name);
+        let parquet_meta = storage
+            .get_parquet_file_metadata(relative_path.to_str().unwrap())
+            .await;
+        let num_records = parquet_meta.file_metadata().num_rows();
+        base_file.populate_stats(FileStats { num_records });
+    }
+    Ok(())
 }
 
 async fn get_partitions_and_file_groups(
@@ -133,17 +185,20 @@ async fn get_partitions_and_file_groups(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs::canonicalize;
     use std::path::Path;
 
-    use crate::test_utils::extract_test_table;
+    use url::Url;
 
     use crate::table::fs_view::FileSystemView;
+    use crate::test_utils::extract_test_table;
 
     #[tokio::test]
     async fn get_partition_paths() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let target_table_path = extract_test_table(fixture_path);
-        let fs_view = FileSystemView::new(&target_table_path);
+        let fixture_path =
+            canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
+        let base_url = Url::from_file_path(extract_test_table(&fixture_path)).unwrap();
+        let fs_view = FileSystemView::new(base_url);
         let partition_paths = fs_view.get_partition_paths().await.unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
@@ -155,9 +210,11 @@ mod tests {
 
     #[test]
     fn get_latest_file_slices() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let target_table_path = extract_test_table(fixture_path);
-        let mut fs_view = FileSystemView::new(&target_table_path);
+        let fixture_path =
+            canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
+        let base_url = Url::from_file_path(extract_test_table(&fixture_path)).unwrap();
+        let mut fs_view = FileSystemView::new(base_url);
+        fs_view.load_file_groups();
         let file_slices = fs_view.get_latest_file_slices();
         assert_eq!(file_slices.len(), 5);
         let mut fg_ids = Vec::new();

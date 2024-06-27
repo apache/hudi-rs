@@ -21,33 +21,50 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use crate::storage::file_metadata::FileMetadata;
+use crate::storage::file_info::FileInfo;
+use crate::storage::file_stats::FileStats;
 use anyhow::{anyhow, Result};
 
 #[derive(Clone, Debug)]
 pub struct BaseFile {
     pub file_group_id: String,
     pub commit_time: String,
-    pub metadata: Option<FileMetadata>,
+    pub info: FileInfo,
+    pub stats: Option<FileStats>,
 }
 
 impl BaseFile {
-    pub fn new(file_name: &str) -> Self {
-        let (name, _) = file_name.rsplit_once('.').unwrap();
+    fn parse_file_name(file_name: &str) -> Result<(String, String)> {
+        let err_msg = format!("Failed to parse file name '{}' for base file.", file_name);
+        let (name, _) = file_name.rsplit_once('.').ok_or(anyhow!(err_msg.clone()))?;
         let parts: Vec<&str> = name.split('_').collect();
-        let file_group_id = parts[0].to_owned();
-        let commit_time = parts[2].to_owned();
-        Self {
-            file_group_id,
-            commit_time,
-            metadata: None,
-        }
+        let file_group_id = parts.first().ok_or(anyhow!(err_msg.clone()))?.to_string();
+        let commit_time = parts.get(2).ok_or(anyhow!(err_msg.clone()))?.to_string();
+        Ok((file_group_id, commit_time))
     }
 
-    pub fn from_file_metadata(file_metadata: FileMetadata) -> Self {
-        let mut base_file = Self::new(file_metadata.name.as_str());
-        base_file.metadata = Some(file_metadata);
-        base_file
+    pub fn from_file_name(file_name: &str) -> Result<Self> {
+        let (file_group_id, commit_time) = Self::parse_file_name(file_name)?;
+        Ok(Self {
+            file_group_id,
+            commit_time,
+            info: FileInfo::default(),
+            stats: None,
+        })
+    }
+
+    pub fn from_file_info(info: FileInfo) -> Result<Self> {
+        let (file_group_id, commit_time) = Self::parse_file_name(&info.name)?;
+        Ok(Self {
+            file_group_id,
+            commit_time,
+            info,
+            stats: None,
+        })
+    }
+
+    pub fn populate_stats(&mut self, stats: FileStats) {
+        self.stats = Some(stats)
     }
 }
 
@@ -58,11 +75,8 @@ pub struct FileSlice {
 }
 
 impl FileSlice {
-    pub fn base_file_path(&self) -> Option<&str> {
-        match &self.base_file.metadata {
-            None => None,
-            Some(file_metadata) => Some(file_metadata.path.as_str()),
-        }
+    pub fn base_file_path(&self) -> &str {
+        self.base_file.info.uri.as_str()
     }
 
     pub fn file_group_id(&self) -> &str {
@@ -102,9 +116,9 @@ impl FileGroup {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
-        let base_file = BaseFile::new(file_name);
+    #[cfg(test)]
+    fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
+        let base_file = BaseFile::from_file_name(file_name)?;
         self.add_base_file(base_file)
     }
 
@@ -131,6 +145,10 @@ impl FileGroup {
     pub fn get_latest_file_slice(&self) -> Option<&FileSlice> {
         return self.file_slices.values().next_back();
     }
+
+    pub fn get_latest_file_slice_mut(&mut self) -> Option<&mut FileSlice> {
+        return self.file_slices.values_mut().next_back();
+    }
 }
 
 #[cfg(test)]
@@ -139,9 +157,10 @@ mod tests {
 
     #[test]
     fn create_a_base_file_successfully() {
-        let base_file = BaseFile::new(
+        let base_file = BaseFile::from_file_name(
             "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
-        );
+        )
+        .unwrap();
         assert_eq!(
             base_file.file_group_id,
             "5a226868-2934-4f84-a16f-55124630c68d-0"

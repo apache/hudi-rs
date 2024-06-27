@@ -17,15 +17,7 @@
  * under the License.
  */
 
-use crate::table::Table;
-
-pub mod file_group;
-pub mod table;
-pub type HudiTable = Table;
-mod storage;
-pub mod test_utils;
-mod timeline;
-
-pub fn crate_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+#[derive(Clone, Debug, Default)]
+pub struct FileStats {
+    pub num_records: i64,
 }

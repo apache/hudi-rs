@@ -14,8 +14,10 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
+from typing import List, Any, Iterator
 
-from ._internal import __version__ as __version__
-from ._internal import rust_core_version as rust_core_version
-from ._internal import HudiFileSlice as HudiFileSlice
-from .table import HudiTable as HudiTable
+
+def split_list(lst: List[Any], n: int) -> Iterator[List[Any]]:
+    split_size = (len(lst) + n - 1) // n
+    for i in range(0, len(lst), split_size):
+        yield lst[i: i + split_size]

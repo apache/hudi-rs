@@ -19,6 +19,7 @@
 
 use arrow_array::RecordBatch;
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
 use std::sync::Arc;
@@ -45,7 +46,7 @@ pub struct HudiDataSource {
 impl HudiDataSource {
     pub fn new(base_path: &str) -> Self {
         Self {
-            table: HudiTable::new(base_path),
+            table: HudiTable::new(base_path, HashMap::new()),
         }
     }
     pub(crate) async fn create_physical_plan(
@@ -56,7 +57,7 @@ impl HudiDataSource {
         Ok(Arc::new(HudiExec::new(projections, schema, self.clone())))
     }
 
-    fn get_record_batches(&self) -> datafusion_common::Result<Vec<RecordBatch>> {
+    fn get_record_batches(&mut self) -> datafusion_common::Result<Vec<RecordBatch>> {
         match self.table.get_latest_file_paths() {
             Ok(file_paths) => {
                 let mut record_batches = Vec::new();
@@ -84,7 +85,7 @@ impl TableProvider for HudiDataSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.table.schema()
+        self.table.get_latest_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -161,7 +162,8 @@ impl ExecutionPlan for HudiExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let data = self.data_source.get_record_batches()?;
+        let mut data_source = self.data_source.clone();
+        let data = data_source.get_record_batches()?;
         Ok(Box::pin(MemoryStream::try_new(data, self.schema(), None)?))
     }
 }

@@ -15,18 +15,37 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Iterator, Optional, Dict
 
-from python.hudi._internal import BindingHudiTable
+import pyarrow
+
+from hudi._internal import BindingHudiTable, HudiFileSlice
+from hudi._utils import split_list
 
 
 @dataclass(init=False)
 class HudiTable:
 
-    def __init__(self, table_uri: Union[str, Path, ""]):
-        self._table = BindingHudiTable(str(table_uri))
+    def __init__(
+            self,
+            table_uri: Union[str, Path, "os.PathLike[str]"],
+            storage_options: Optional[Dict[str, str]] = None,
+    ):
+        self._table = BindingHudiTable(str(table_uri), storage_options)
 
-    def get_latest_file_paths(self) -> List[str]:
-        return self._table.get_latest_file_paths()
+    def schema(self) -> "pyarrow.Schema":
+        return self._table.schema()
+
+    def split_latest_file_slices(self, n) -> Iterator[List[HudiFileSlice]]:
+        file_slices = self.get_latest_file_slices()
+        for split in split_list(file_slices, n):
+            yield split
+
+    def get_latest_file_slices(self) -> List[HudiFileSlice]:
+        return self._table.get_latest_file_slices()
+
+    def read_file_slice(self, relative_path) -> List["pyarrow.RecordBatch"]:
+        return self._table.read_file_slice(relative_path)
