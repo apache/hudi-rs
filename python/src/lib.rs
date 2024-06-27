@@ -99,7 +99,7 @@ impl BindingHudiTable {
         }
     }
 
-    pub fn read_file_slice(&self, relative_path: &str, py: Python) -> PyResult<PyObject> {
+    pub fn read_file_slice(&mut self, relative_path: &str, py: Python) -> PyResult<PyObject> {
         self._table.read_file_slice(relative_path).to_pyarrow(py)
     }
 }

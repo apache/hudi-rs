@@ -135,8 +135,6 @@ impl Table {
     }
 
     pub fn get_latest_file_slices(&mut self) -> Result<Vec<FileSlice>> {
-        let mut file_slices = Vec::new();
-
         if self.file_system_view.is_none() {
             let mut new_fs_view = FileSystemView::new(self.base_url.clone());
             new_fs_view.load_file_groups();
@@ -145,13 +143,20 @@ impl Table {
 
         let fs_view = self.file_system_view.as_mut().unwrap();
 
+        let mut file_slices = Vec::new();
         for f in fs_view.get_latest_file_slices_with_stats() {
             file_slices.push(f.clone());
         }
         Ok(file_slices)
     }
 
-    pub fn read_file_slice(&self, relative_path: &str) -> Vec<RecordBatch> {
+    pub fn read_file_slice(&mut self, relative_path: &str) -> Vec<RecordBatch> {
+        if self.file_system_view.is_none() {
+            let mut new_fs_view = FileSystemView::new(self.base_url.clone());
+            new_fs_view.load_file_groups();
+            self.file_system_view = Some(new_fs_view);
+        }
+
         let fs_view = self.file_system_view.as_ref().unwrap();
         fs_view.read_file_slice(relative_path)
     }
@@ -288,6 +293,19 @@ mod tests {
                 "city"
             ])
         );
+    }
+
+    #[test]
+    fn hudi_table_read_file_slice() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
+        let mut hudi_table = Table::new(base_url.path(), HashMap::new());
+        let batches = hudi_table.read_file_slice(
+            "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet",
+        );
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches.first().unwrap().num_rows(), 1);
+        assert_eq!(batches.first().unwrap().num_columns(), 11);
     }
 
     #[test]
