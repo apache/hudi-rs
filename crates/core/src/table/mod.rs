@@ -262,6 +262,35 @@ mod tests {
     use crate::test_utils::extract_test_table;
 
     #[test]
+    fn hudi_table_get_latest_schema() {
+        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
+        let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
+        let hudi_table = Table::new(base_url.path(), HashMap::new());
+        let fields: Vec<String> = hudi_table
+            .get_latest_schema()
+            .all_fields()
+            .into_iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        assert_eq!(
+            fields,
+            Vec::from([
+                "_hoodie_commit_time",
+                "_hoodie_commit_seqno",
+                "_hoodie_record_key",
+                "_hoodie_partition_path",
+                "_hoodie_file_name",
+                "ts",
+                "uuid",
+                "rider",
+                "driver",
+                "fare",
+                "city"
+            ])
+        );
+    }
+
+    #[test]
     fn hudi_table_get_latest_file_paths() {
         let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
         let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();

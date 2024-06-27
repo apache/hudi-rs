@@ -275,4 +275,14 @@ mod tests {
         );
         assert_eq!(file_metadata.size, 866);
     }
+
+    #[tokio::test]
+    async fn storage_get_parquet_file_data() {
+        let base_url =
+            Url::from_directory_path(canonicalize(Path::new("fixtures")).unwrap()).unwrap();
+        let storage = Storage::new(base_url, HashMap::new());
+        let file_data = storage.get_parquet_file_data("a.parquet").await;
+        assert_eq!(file_data.len(), 1);
+        assert_eq!(file_data.first().unwrap().num_rows(), 5);
+    }
 }
