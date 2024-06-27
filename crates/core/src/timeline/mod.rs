@@ -74,8 +74,8 @@ impl Timeline {
     async fn load_completed_commit_instants(base_url: &Url) -> Result<Vec<Instant>> {
         let storage = Storage::new(base_url.clone(), HashMap::new());
         let mut completed_commits = Vec::new();
-        for file_metadata in storage.list_files(Some(".hoodie")).await {
-            let (file_stem, file_ext) = split_filename(file_metadata.name.as_str())?;
+        for file_info in storage.list_files(Some(".hoodie")).await {
+            let (file_stem, file_ext) = split_filename(file_info.name.as_str())?;
             if file_ext == "commit" {
                 completed_commits.push(Instant {
                     state: State::Completed,

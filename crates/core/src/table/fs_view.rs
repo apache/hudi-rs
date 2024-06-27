@@ -60,15 +60,15 @@ impl FileSystemView {
 
     async fn get_file_groups(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
         let storage = Storage::new(self.base_url.clone(), HashMap::new());
-        let file_metadata: Vec<FileInfo> = storage
+        let file_info: Vec<FileInfo> = storage
             .list_files(Some(partition_path))
             .await
             .into_iter()
             .filter(|f| f.name.ends_with(".parquet"))
             .collect();
         let mut fg_id_to_base_files: HashMap<String, Vec<BaseFile>> = HashMap::new();
-        for f in file_metadata {
-            let base_file = BaseFile::from_file_metadata(f)?;
+        for f in file_info {
+            let base_file = BaseFile::from_file_info(f)?;
             let fg_id = &base_file.file_group_id;
             fg_id_to_base_files
                 .entry(fg_id.to_owned())
@@ -148,7 +148,7 @@ async fn load_file_slice_stats(base_url: &Url, file_slice: &mut FileSlice) -> Re
         let storage = Storage::new(base_url.clone(), HashMap::new());
         let ptn = file_slice.partition_path.clone();
         let mut relative_path = PathBuf::from(ptn.unwrap_or("".to_string()));
-        let base_file_name = &base_file.metadata.name;
+        let base_file_name = &base_file.info.name;
         relative_path.push(base_file_name);
         let parquet_meta = storage
             .get_parquet_file_metadata(relative_path.to_str().unwrap())

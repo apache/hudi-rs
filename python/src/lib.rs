@@ -48,15 +48,15 @@ impl HudiFileSlice {
     pub fn from_file_slice(f: FileSlice) -> Self {
         let partition_path = f.partition_path.clone().unwrap_or("".to_string());
         let mut p = PathBuf::from(&partition_path);
-        p.push(f.base_file.metadata.name.clone());
+        p.push(f.base_file.info.name.clone());
         let base_file_path = p.to_str().unwrap().to_string();
         Self {
             file_group_id: f.file_group_id().to_string(),
             partition_path,
             commit_time: f.base_file.commit_time,
-            base_file_name: f.base_file.metadata.name,
+            base_file_name: f.base_file.info.name,
             base_file_path,
-            base_file_size: f.base_file.metadata.size,
+            base_file_size: f.base_file.info.size,
             num_records: f.base_file.stats.unwrap().num_records,
         }
     }

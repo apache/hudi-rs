@@ -29,7 +29,7 @@ use anyhow::{anyhow, Result};
 pub struct BaseFile {
     pub file_group_id: String,
     pub commit_time: String,
-    pub metadata: FileInfo,
+    pub info: FileInfo,
     pub stats: Option<FileStats>,
 }
 
@@ -48,17 +48,17 @@ impl BaseFile {
         Ok(Self {
             file_group_id,
             commit_time,
-            metadata: FileInfo::default(),
+            info: FileInfo::default(),
             stats: None,
         })
     }
 
-    pub fn from_file_metadata(metadata: FileInfo) -> Result<Self> {
-        let (file_group_id, commit_time) = Self::parse_file_name(&metadata.name)?;
+    pub fn from_file_info(info: FileInfo) -> Result<Self> {
+        let (file_group_id, commit_time) = Self::parse_file_name(&info.name)?;
         Ok(Self {
             file_group_id,
             commit_time,
-            metadata,
+            info,
             stats: None,
         })
     }
@@ -76,7 +76,7 @@ pub struct FileSlice {
 
 impl FileSlice {
     pub fn base_file_path(&self) -> &str {
-        self.base_file.metadata.uri.as_str()
+        self.base_file.info.uri.as_str()
     }
 
     pub fn file_group_id(&self) -> &str {

@@ -229,21 +229,21 @@ mod tests {
             .list_files(None)
             .await
             .into_iter()
-            .map(|file_metadata| file_metadata.name)
+            .map(|file_info| file_info.name)
             .collect();
         assert_eq!(file_names_1, vec!["a.parquet"]);
         let file_names_2: Vec<String> = storage
             .list_files(Some("part1"))
             .await
             .into_iter()
-            .map(|file_metadata| file_metadata.name)
+            .map(|file_info| file_info.name)
             .collect();
         assert_eq!(file_names_2, vec!["b.parquet"]);
         let file_names_3: Vec<String> = storage
             .list_files(Some("part2/part22"))
             .await
             .into_iter()
-            .map(|file_metadata| file_metadata.name)
+            .map(|file_info| file_info.name)
             .collect();
         assert_eq!(file_names_3, vec!["c.parquet"]);
     }
@@ -267,13 +267,13 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("fixtures")).unwrap()).unwrap();
         let storage = Storage::new(base_url, HashMap::new());
-        let file_metadata = storage.get_file_info("a.parquet").await;
-        assert_eq!(file_metadata.name, "a.parquet");
+        let file_info = storage.get_file_info("a.parquet").await;
+        assert_eq!(file_info.name, "a.parquet");
         assert_eq!(
-            file_metadata.uri,
+            file_info.uri,
             storage.base_url.join("a.parquet").unwrap().to_string()
         );
-        assert_eq!(file_metadata.size, 866);
+        assert_eq!(file_info.size, 866);
     }
 
     #[tokio::test]
