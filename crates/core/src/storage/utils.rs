@@ -17,8 +17,9 @@
  * under the License.
  */
 
-use anyhow::{anyhow, Result};
 use std::path::Path;
+
+use anyhow::{anyhow, Result};
 use url::{ParseError, Url};
 
 pub fn split_filename(filename: &str) -> Result<(String, String)> {
@@ -59,9 +60,11 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+
     use url::Url;
 
     use crate::storage::utils::join_url_segments;
+
     #[test]
     fn join_base_url_with_segments() {
         let base_url = Url::from_str("file:///base").unwrap();
@@ -90,5 +93,12 @@ mod tests {
             join_url_segments(&base_url, &["foo1/bar1", "foo2/bar2"]).unwrap(),
             Url::from_str("file:///base/foo1/bar1/foo2/bar2").unwrap()
         );
+    }
+
+    #[test]
+    fn join_failed_due_to_invalid_base() {
+        let base_url = Url::from_str("foo:text/plain,bar").unwrap();
+        let result = join_url_segments(&base_url, &["foo"]);
+        assert!(result.is_err());
     }
 }
