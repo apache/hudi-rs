@@ -132,8 +132,7 @@ impl Storage {
             .objects
             .into_iter()
             .map(|obj_meta| FileInfo {
-                uri: prefix_url
-                    .join(obj_meta.location.filename().unwrap())
+                uri: join_url_segments(&prefix_url, &[obj_meta.location.filename().unwrap()])
                     .unwrap()
                     .to_string(),
                 name: obj_meta.location.filename().unwrap().to_string(),
@@ -172,6 +171,7 @@ mod tests {
     use object_store::path::Path as ObjPath;
     use url::Url;
 
+    use crate::storage::file_info::FileInfo;
     use crate::storage::utils::join_url_segments;
     use crate::storage::{get_leaf_dirs, Storage};
 
@@ -224,28 +224,50 @@ mod tests {
             canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(base_url, HashMap::new());
-        let file_names_1: Vec<String> = storage
-            .list_files(None)
-            .await
-            .into_iter()
-            .map(|file_info| file_info.name)
-            .collect();
-        assert_eq!(file_names_1, vec!["a.parquet"]);
-        let file_names_2: Vec<String> = storage
+        let storage = Storage::new(base_url.clone(), HashMap::new());
+        let file_info_1: Vec<FileInfo> = storage.list_files(None).await.into_iter().collect();
+        assert_eq!(
+            file_info_1,
+            vec![FileInfo {
+                uri: base_url.clone().join("a.parquet").unwrap().to_string(),
+                name: "a.parquet".to_string(),
+                size: 0,
+            }]
+        );
+        let file_info_2: Vec<FileInfo> = storage
             .list_files(Some("part1"))
             .await
             .into_iter()
-            .map(|file_info| file_info.name)
             .collect();
-        assert_eq!(file_names_2, vec!["b.parquet"]);
-        let file_names_3: Vec<String> = storage
+        assert_eq!(
+            file_info_2,
+            vec![FileInfo {
+                uri: base_url
+                    .clone()
+                    .join("part1/b.parquet")
+                    .unwrap()
+                    .to_string(),
+                name: "b.parquet".to_string(),
+                size: 0,
+            }]
+        );
+        let file_info_3: Vec<FileInfo> = storage
             .list_files(Some("part2/part22"))
             .await
             .into_iter()
-            .map(|file_info| file_info.name)
             .collect();
-        assert_eq!(file_names_3, vec!["c.parquet"]);
+        assert_eq!(
+            file_info_3,
+            vec![FileInfo {
+                uri: base_url
+                    .clone()
+                    .join("part2/part22/c.parquet")
+                    .unwrap()
+                    .to_string(),
+                name: "c.parquet".to_string(),
+                size: 0,
+            }]
+        );
     }
 
     #[tokio::test]

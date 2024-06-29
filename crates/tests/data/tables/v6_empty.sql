@@ -17,14 +17,14 @@
  * under the License.
  */
 
-use crate::table::Table;
-
-pub mod file_group;
-pub mod table;
-pub type HudiTable = Table;
-mod storage;
-mod timeline;
-
-pub fn crate_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
+create table v6_empty (
+                          id INT,
+                          name STRING,
+                          isActive BOOLEAN
+)
+    USING HUDI
+    TBLPROPERTIES (
+        type = 'cow',
+        primaryKey = 'id',
+        'hoodie.metadata.enable' = 'false'
+);

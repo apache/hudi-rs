@@ -185,53 +185,50 @@ async fn get_partitions_and_file_groups(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::fs::canonicalize;
-    use std::path::Path;
 
-    use url::Url;
+    use hudi_tests::TestTable;
 
     use crate::table::fs_view::FileSystemView;
-    use crate::test_utils::extract_test_table;
 
     #[tokio::test]
-    async fn get_partition_paths() {
-        let fixture_path =
-            canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
-        let base_url = Url::from_file_path(extract_test_table(&fixture_path)).unwrap();
+    async fn get_partition_paths_for_nonpartitioned_table() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let fs_view = FileSystemView::new(base_url);
+        let partition_paths = fs_view.get_partition_paths().await.unwrap();
+        let partition_path_set: HashSet<&str> =
+            HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
+        assert_eq!(partition_path_set, HashSet::new(),)
+    }
+
+    #[tokio::test]
+    async fn get_partition_paths_for_complexkeygen_table() {
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let fs_view = FileSystemView::new(base_url);
         let partition_paths = fs_view.get_partition_paths().await.unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(
             partition_path_set,
-            HashSet::from_iter(vec!["chennai", "sao_paulo", "san_francisco"])
+            HashSet::from_iter(vec![
+                "byteField=10/shortField=300",
+                "byteField=20/shortField=100",
+                "byteField=30/shortField=100"
+            ])
         )
     }
 
     #[test]
     fn get_latest_file_slices() {
-        let fixture_path =
-            canonicalize(Path::new("fixtures/table/0.x_cow_partitioned.zip")).unwrap();
-        let base_url = Url::from_file_path(extract_test_table(&fixture_path)).unwrap();
+        let base_url = TestTable::V6Nonpartitioned.url();
         let mut fs_view = FileSystemView::new(base_url);
         fs_view.load_file_groups();
         let file_slices = fs_view.get_latest_file_slices();
-        assert_eq!(file_slices.len(), 5);
+        assert_eq!(file_slices.len(), 1);
         let mut fg_ids = Vec::new();
         for f in file_slices {
             let fp = f.file_group_id();
             fg_ids.push(fp);
         }
-        let actual: HashSet<&str> = fg_ids.into_iter().collect();
-        assert_eq!(
-            actual,
-            HashSet::from_iter(vec![
-                "780b8586-3ad0-48ef-a6a1-d2217845ce4a-0",
-                "d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0",
-                "ee915c68-d7f8-44f6-9759-e691add290d8-0",
-                "68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0",
-                "5a226868-2934-4f84-a16f-55124630c68d-0"
-            ])
-        );
+        assert_eq!(fg_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"])
     }
 }

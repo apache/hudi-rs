@@ -17,8 +17,9 @@
  * under the License.
  */
 
-use anyhow::{anyhow, Result};
 use std::path::Path;
+
+use anyhow::{anyhow, Result};
 use url::{ParseError, Url};
 
 pub fn split_filename(filename: &str) -> Result<(String, String)> {
@@ -46,9 +47,58 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
         url.path_segments_mut().unwrap().pop();
     }
 
-    url.path_segments_mut()
-        .map_err(|_| ParseError::RelativeUrlWithoutBase)?
-        .extend(segments);
+    for &seg in segments {
+        let segs: Vec<_> = seg.split('/').filter(|&s| !s.is_empty()).collect();
+        url.path_segments_mut()
+            .map_err(|_| ParseError::RelativeUrlWithoutBase)?
+            .extend(segs);
+    }
 
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use url::Url;
+
+    use crate::storage::utils::join_url_segments;
+
+    #[test]
+    fn join_base_url_with_segments() {
+        let base_url = Url::from_str("file:///base").unwrap();
+
+        assert_eq!(
+            join_url_segments(&base_url, &["foo"]).unwrap(),
+            Url::from_str("file:///base/foo").unwrap()
+        );
+
+        assert_eq!(
+            join_url_segments(&base_url, &["/foo"]).unwrap(),
+            Url::from_str("file:///base/foo").unwrap()
+        );
+
+        assert_eq!(
+            join_url_segments(&base_url, &["/foo", "bar/", "/baz/"]).unwrap(),
+            Url::from_str("file:///base/foo/bar/baz").unwrap()
+        );
+
+        assert_eq!(
+            join_url_segments(&base_url, &["foo/", "", "bar/baz"]).unwrap(),
+            Url::from_str("file:///base/foo/bar/baz").unwrap()
+        );
+
+        assert_eq!(
+            join_url_segments(&base_url, &["foo1/bar1", "foo2/bar2"]).unwrap(),
+            Url::from_str("file:///base/foo1/bar1/foo2/bar2").unwrap()
+        );
+    }
+
+    #[test]
+    fn join_failed_due_to_invalid_base() {
+        let base_url = Url::from_str("foo:text/plain,bar").unwrap();
+        let result = join_url_segments(&base_url, &["foo"]);
+        assert!(result.is_err());
+    }
 }

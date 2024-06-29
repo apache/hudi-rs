@@ -34,7 +34,7 @@ def _extract_testing_table(zip_file_path, target_path) -> str:
     ]
 )
 def get_sample_table(request, tmp_path) -> str:
-    fixture_path = "../crates/core/fixtures/table"
+    fixture_path = "tests/table"
     table_name = request.param
     zip_file_path = Path(fixture_path).joinpath(f"{table_name}.zip")
     return _extract_testing_table(zip_file_path, tmp_path)

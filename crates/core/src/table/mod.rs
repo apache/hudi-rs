@@ -255,21 +255,21 @@ impl ProvidesTableMetadata for Table {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::canonicalize;
     use std::path::Path;
-    use url::Url;
 
+    use hudi_tests::TestTable;
+
+    use crate::storage::utils::join_url_segments;
     use crate::table::config::BaseFileFormat::Parquet;
     use crate::table::config::TableType::CopyOnWrite;
     use crate::table::metadata::ProvidesTableMetadata;
     use crate::table::Table;
-    use crate::test_utils::extract_test_table;
 
     #[test]
     fn hudi_table_get_latest_schema() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
+        let base_url = TestTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path(), HashMap::new());
         let fields: Vec<String> = hudi_table
             .get_latest_schema()
@@ -285,36 +285,66 @@ mod tests {
                 "_hoodie_record_key",
                 "_hoodie_partition_path",
                 "_hoodie_file_name",
-                "ts",
-                "uuid",
-                "rider",
-                "driver",
-                "fare",
-                "city"
+                "id",
+                "name",
+                "isActive",
+                "byteField",
+                "shortField",
+                "intField",
+                "longField",
+                "floatField",
+                "doubleField",
+                "decimalField",
+                "dateField",
+                "timestampField",
+                "binaryField",
+                "arrayField",
+                "array",
+                "arr_struct_f1",
+                "arr_struct_f2",
+                "mapField",
+                "key_value",
+                "key",
+                "value",
+                "map_field_value_struct_f1",
+                "map_field_value_struct_f2",
+                "structField",
+                "field1",
+                "field2",
+                "child_struct",
+                "child_field1",
+                "child_field2"
             ])
         );
     }
 
     #[test]
     fn hudi_table_read_file_slice() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
+        let base_url = TestTable::V6Nonpartitioned.url();
         let mut hudi_table = Table::new(base_url.path(), HashMap::new());
         let batches = hudi_table.read_file_slice(
-            "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet",
+            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
         );
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches.first().unwrap().num_rows(), 1);
-        assert_eq!(batches.first().unwrap().num_columns(), 11);
+        assert_eq!(batches.first().unwrap().num_rows(), 4);
+        assert_eq!(batches.first().unwrap().num_columns(), 21);
     }
 
     #[test]
     fn hudi_table_get_latest_file_paths() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let base_url = Url::from_file_path(extract_test_table(fixture_path)).unwrap();
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let mut hudi_table = Table::new(base_url.path(), HashMap::new());
         assert_eq!(hudi_table.get_timeline().unwrap().instants.len(), 2);
-        assert_eq!(hudi_table.get_latest_file_paths().unwrap().len(), 5);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_latest_file_paths().unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
     }
 
     #[test]
