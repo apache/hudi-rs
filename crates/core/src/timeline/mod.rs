@@ -27,8 +27,8 @@ use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::storage::Storage;
 use crate::storage::utils::split_filename;
+use crate::storage::Storage;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
