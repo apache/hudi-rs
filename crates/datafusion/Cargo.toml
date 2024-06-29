@@ -17,17 +17,18 @@
 
 [package]
 name = "hudi-datafusion"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-hudi-core = { path = "../core"}
+hudi-core = { path = "../core" }
+hudi-tests = { path = "../tests" }
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }
-arrow-array = { workspace = true , features = ["chrono-tz"]}
+arrow-array = { workspace = true, features = ["chrono-tz"] }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }

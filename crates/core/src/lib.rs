@@ -23,7 +23,6 @@ pub mod file_group;
 pub mod table;
 pub type HudiTable = Table;
 mod storage;
-pub mod test_utils;
 mod timeline;
 
 pub fn crate_version() -> &'static str {

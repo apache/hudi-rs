@@ -27,8 +27,8 @@ use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::storage::utils::split_filename;
 use crate::storage::Storage;
+use crate::storage::utils::split_filename;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
@@ -138,17 +138,16 @@ mod tests {
 
     use url::Url;
 
-    use crate::test_utils::extract_test_table;
+    use hudi_tests::TestTable;
+
     use crate::timeline::{Instant, State, Timeline};
 
     #[tokio::test]
     async fn read_latest_schema() {
-        let fixture_path = Path::new("fixtures/table/0.x_cow_partitioned.zip");
-        let target_table_path = extract_test_table(fixture_path);
-        let base_url = Url::from_file_path(canonicalize(target_table_path).unwrap()).unwrap();
+        let base_url = TestTable::V6Nonpartitioned.url();
         let timeline = Timeline::new(base_url).await.unwrap();
         let table_schema = timeline.get_latest_schema().await.unwrap();
-        assert_eq!(table_schema.fields.len(), 11)
+        assert_eq!(table_schema.fields.len(), 21)
     }
 
     #[tokio::test]

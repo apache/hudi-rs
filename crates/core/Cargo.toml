@@ -17,16 +17,17 @@
 
 [package]
 name = "hudi-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hudi-tests = { path = "../tests" }
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }
-arrow-array = { workspace = true , features = ["chrono-tz"]}
+arrow-array = { workspace = true, features = ["chrono-tz"] }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }
@@ -68,7 +69,3 @@ async-recursion = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-
-# test
-tempfile = "3.10.1"
-zip-extract = "0.1.3"

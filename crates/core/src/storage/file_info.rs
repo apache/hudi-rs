@@ -17,7 +17,7 @@
  * under the License.
  */
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileInfo {
     pub uri: String,
     pub name: String,
