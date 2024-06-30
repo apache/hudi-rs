@@ -49,9 +49,15 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Self {
+    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Self {
         let base_url = Url::from_file_path(PathBuf::from(base_uri).as_path()).unwrap();
-        match Self::load_properties(&base_url, ".hoodie/hoodie.properties", &storage_options) {
+        match Self::load_properties(
+            base_url.clone(),
+            ".hoodie/hoodie.properties".to_string(),
+            storage_options.clone(),
+        )
+        .await
+        {
             Ok(props) => Self {
                 base_url,
                 props,
@@ -64,18 +70,13 @@ impl Table {
         }
     }
 
-    fn load_properties(
-        base_url: &Url,
-        props_path: &str,
-        storage_options: &HashMap<String, String>,
+    async fn load_properties(
+        base_url: Url,
+        props_path: String,
+        storage_options: HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let storage = Storage::new(base_url.clone(), storage_options.clone());
-        let get_data = async { storage.get_file_data(props_path).await };
-        let data = rt.block_on(get_data);
+        let storage = Storage::new(base_url, storage_options);
+        let data = storage.get_file_data(props_path.as_str()).await;
         let cursor = std::io::Cursor::new(data);
         let reader = BufReader::new(cursor);
         let lines = reader.lines();
@@ -102,30 +103,16 @@ impl Table {
     }
 
     #[cfg(test)]
-    fn get_timeline(&self) -> Result<Timeline> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let init_timeline = async { Timeline::new(self.base_url.clone()).await };
-        rt.block_on(init_timeline)
+    async fn get_timeline(&self) -> Result<Timeline> {
+        Timeline::new(self.base_url.clone()).await
     }
 
-    pub fn get_latest_schema(&self) -> SchemaRef {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let init_timeline = async { Timeline::new(self.base_url.clone()).await };
-        let timeline = rt.block_on(init_timeline);
-        match timeline {
+    pub async fn get_latest_schema(&self) -> SchemaRef {
+        let timeline_result = Timeline::new(self.base_url.clone()).await;
+        match timeline_result {
             Ok(timeline) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                let get_schema = async { timeline.get_latest_schema().await };
-                match rt.block_on(get_schema) {
+                let schema_result = timeline.get_latest_schema().await;
+                match schema_result {
                     Ok(schema) => SchemaRef::from(schema),
                     Err(e) => panic!("Failed to resolve table schema: {}", e),
                 }
@@ -134,38 +121,39 @@ impl Table {
         }
     }
 
-    pub fn get_latest_file_slices(&mut self) -> Result<Vec<FileSlice>> {
+    pub async fn get_latest_file_slices(&mut self) -> Result<Vec<FileSlice>> {
         if self.file_system_view.is_none() {
             let mut new_fs_view = FileSystemView::new(self.base_url.clone());
-            new_fs_view.load_file_groups();
+            new_fs_view.load_file_groups().await;
             self.file_system_view = Some(new_fs_view);
         }
 
         let fs_view = self.file_system_view.as_mut().unwrap();
 
         let mut file_slices = Vec::new();
-        for f in fs_view.get_latest_file_slices_with_stats() {
+        for f in fs_view.get_latest_file_slices_with_stats().await {
             file_slices.push(f.clone());
         }
         Ok(file_slices)
     }
 
-    pub fn read_file_slice(&mut self, relative_path: &str) -> Vec<RecordBatch> {
+    pub async fn read_file_slice(&mut self, relative_path: &str) -> Vec<RecordBatch> {
         if self.file_system_view.is_none() {
             let mut new_fs_view = FileSystemView::new(self.base_url.clone());
-            new_fs_view.load_file_groups();
+            new_fs_view.load_file_groups().await;
             self.file_system_view = Some(new_fs_view);
         }
 
         let fs_view = self.file_system_view.as_ref().unwrap();
-        fs_view.read_file_slice(relative_path)
+        fs_view.read_file_slice(relative_path).await
     }
 
-    pub fn get_latest_file_paths(&mut self) -> Result<Vec<String>> {
+    pub async fn get_latest_file_paths(&mut self) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
-        for f in self.get_latest_file_slices()? {
+        for f in self.get_latest_file_slices().await? {
             file_paths.push(f.base_file_path().to_string());
         }
+        println!("{:?}", file_paths);
         Ok(file_paths)
     }
 }
@@ -267,12 +255,13 @@ mod tests {
     use crate::table::metadata::ProvidesTableMetadata;
     use crate::table::Table;
 
-    #[test]
-    fn hudi_table_get_latest_schema() {
+    #[tokio::test]
+    async fn hudi_table_get_latest_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path(), HashMap::new());
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await;
         let fields: Vec<String> = hudi_table
             .get_latest_schema()
+            .await
             .all_fields()
             .into_iter()
             .map(|f| f.name().to_string())
@@ -318,25 +307,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hudi_table_read_file_slice() {
+    #[tokio::test]
+    async fn hudi_table_read_file_slice() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let mut hudi_table = Table::new(base_url.path(), HashMap::new());
-        let batches = hudi_table.read_file_slice(
-            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
-        );
+        let mut hudi_table = Table::new(base_url.path(), HashMap::new()).await;
+        let batches = hudi_table
+            .read_file_slice(
+                "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+            )
+            .await;
         assert_eq!(batches.len(), 1);
         assert_eq!(batches.first().unwrap().num_rows(), 4);
         assert_eq!(batches.first().unwrap().num_columns(), 21);
     }
 
-    #[test]
-    fn hudi_table_get_latest_file_paths() {
+    #[tokio::test]
+    async fn hudi_table_get_latest_file_paths() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let mut hudi_table = Table::new(base_url.path(), HashMap::new());
-        assert_eq!(hudi_table.get_timeline().unwrap().instants.len(), 2);
+        let mut hudi_table = Table::new(base_url.path(), HashMap::new()).await;
+        assert_eq!(hudi_table.get_timeline().await.unwrap().instants.len(), 2);
         let actual: HashSet<String> =
-            HashSet::from_iter(hudi_table.get_latest_file_paths().unwrap());
+            HashSet::from_iter(hudi_table.get_latest_file_paths().await.unwrap());
         let expected: HashSet<String> = HashSet::from_iter(vec![
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
             "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
@@ -347,11 +338,11 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn hudi_table_get_table_metadata() {
+    #[tokio::test]
+    async fn hudi_table_get_table_metadata() {
         let base_path =
             canonicalize(Path::new("fixtures/table_metadata/sample_table_properties")).unwrap();
-        let table = Table::new(base_path.to_str().unwrap(), HashMap::new());
+        let table = Table::new(base_path.to_str().unwrap(), HashMap::new()).await;
         assert_eq!(table.base_file_format(), Parquet);
         assert_eq!(table.checksum(), 3761586722);
         assert_eq!(table.database_name(), "default");
