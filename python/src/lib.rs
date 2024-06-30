@@ -28,6 +28,7 @@ use tokio::runtime::Runtime;
 use hudi::file_group::FileSlice;
 use hudi::HudiTable;
 
+#[cfg(not(tarpaulin))]
 #[pyclass]
 struct HudiFileSlice {
     #[pyo3(get)]
@@ -46,6 +47,7 @@ struct HudiFileSlice {
     num_records: i64,
 }
 
+#[cfg(not(tarpaulin))]
 impl HudiFileSlice {
     pub fn from_file_slice(f: FileSlice) -> Self {
         let partition_path = f.partition_path.clone().unwrap_or("".to_string());
@@ -64,11 +66,13 @@ impl HudiFileSlice {
     }
 }
 
+#[cfg(not(tarpaulin))]
 #[pyclass]
 struct BindingHudiTable {
     _table: HudiTable,
 }
 
+#[cfg(not(tarpaulin))]
 #[pymethods]
 impl BindingHudiTable {
     #[new]
@@ -107,11 +111,13 @@ impl BindingHudiTable {
     }
 }
 
+#[cfg(not(tarpaulin))]
 #[pyfunction]
 fn rust_core_version() -> &'static str {
     hudi::crate_version()
 }
 
+#[cfg(not(tarpaulin))]
 #[pymodule]
 fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -122,6 +128,7 @@ fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
     Ok(())
 }
 
+#[cfg(not(tarpaulin))]
 pub fn rt() -> &'static Runtime {
     static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
     TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
