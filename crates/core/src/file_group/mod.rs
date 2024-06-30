@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
+use std::path::PathBuf;
 
 use crate::storage::file_info::FileInfo;
 use crate::storage::file_stats::FileStats;
@@ -77,6 +78,16 @@ pub struct FileSlice {
 impl FileSlice {
     pub fn base_file_path(&self) -> &str {
         self.base_file.info.uri.as_str()
+    }
+
+    pub fn base_file_relative_path(&self) -> String {
+        let partition_path = self.partition_path.clone().unwrap_or_default();
+        let file_name = &self.base_file.info.name;
+        PathBuf::from(partition_path)
+            .join(file_name)
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     pub fn file_group_id(&self) -> &str {

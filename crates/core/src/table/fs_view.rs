@@ -87,14 +87,9 @@ impl FileSystemView {
         Ok(file_groups)
     }
 
-    pub fn load_file_groups(&mut self) {
+    pub async fn load_file_groups(&mut self) {
         let fs_view = self.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let wrapper = async { get_partitions_and_file_groups(&fs_view).await };
-        let result = rt.block_on(wrapper).unwrap();
+        let result = get_partitions_and_file_groups(&fs_view).await.unwrap();
         for (k, v) in result {
             self.partition_to_file_groups.insert(k, v);
         }
@@ -112,18 +107,13 @@ impl FileSystemView {
         file_slices
     }
 
-    pub fn get_latest_file_slices_with_stats(&mut self) -> Vec<&mut FileSlice> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    pub async fn get_latest_file_slices_with_stats(&mut self) -> Vec<&mut FileSlice> {
         let mut file_slices = Vec::new();
         let file_groups = &mut self.partition_to_file_groups.values_mut();
         for fgs in file_groups {
             for fg in fgs {
                 if let Some(file_slice) = fg.get_latest_file_slice_mut() {
-                    let wrapper = async { load_file_slice_stats(&self.base_url, file_slice).await };
-                    let _ = rt.block_on(wrapper);
+                    let _ = load_file_slice_stats(&self.base_url, file_slice).await;
                     file_slices.push(file_slice)
                 }
             }
@@ -131,14 +121,9 @@ impl FileSystemView {
         file_slices
     }
 
-    pub fn read_file_slice(&self, relative_path: &str) -> Vec<RecordBatch> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    pub async fn read_file_slice(&self, relative_path: &str) -> Vec<RecordBatch> {
         let storage = Storage::new(self.base_url.clone(), HashMap::new());
-        let wrapper = async { storage.get_parquet_file_data(relative_path).await };
-        rt.block_on(wrapper)
+        storage.get_parquet_file_data(relative_path).await
     }
 }
 
@@ -217,11 +202,11 @@ mod tests {
         )
     }
 
-    #[test]
-    fn get_latest_file_slices() {
+    #[tokio::test]
+    async fn get_latest_file_slices() {
         let base_url = TestTable::V6Nonpartitioned.url();
         let mut fs_view = FileSystemView::new(base_url);
-        fs_view.load_file_groups();
+        fs_view.load_file_groups().await;
         let file_slices = fs_view.get_latest_file_slices();
         assert_eq!(file_slices.len(), 1);
         let mut fg_ids = Vec::new();

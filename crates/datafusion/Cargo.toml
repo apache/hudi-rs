@@ -56,7 +56,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 # async
-tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true }
 
 # "stdlib"
 bytes = { workspace = true }

@@ -17,13 +17,13 @@
  * under the License.
  */
 
-use arrow_array::RecordBatch;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::fs::File;
 use std::sync::Arc;
+use std::thread;
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -34,7 +34,6 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_common::{project_schema, DataFusionError};
 use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::PhysicalSortExpr;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use hudi_core::HudiTable;
 
@@ -44,11 +43,12 @@ pub struct HudiDataSource {
 }
 
 impl HudiDataSource {
-    pub fn new(base_path: &str) -> Self {
+    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Self {
         Self {
-            table: HudiTable::new(base_path, HashMap::new()),
+            table: HudiTable::new(base_uri, storage_options).await,
         }
     }
+
     pub(crate) async fn create_physical_plan(
         &self,
         projections: Option<&Vec<usize>>,
@@ -57,17 +57,14 @@ impl HudiDataSource {
         Ok(Arc::new(HudiExec::new(projections, schema, self.clone())))
     }
 
-    fn get_record_batches(&mut self) -> datafusion_common::Result<Vec<RecordBatch>> {
-        match self.table.get_latest_file_paths() {
-            Ok(file_paths) => {
+    async fn get_record_batches(&mut self) -> datafusion_common::Result<Vec<RecordBatch>> {
+        match self.table.get_latest_file_slices().await {
+            Ok(file_slices) => {
                 let mut record_batches = Vec::new();
-                for f in file_paths {
-                    let file = File::open(f)?;
-                    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-                    let mut reader = builder.build()?;
-                    if let Ok(Some(result)) = reader.next().transpose() {
-                        record_batches.push(result)
-                    }
+                for f in file_slices {
+                    let relative_path = f.base_file_relative_path();
+                    let records = self.table.read_file_slice(&relative_path).await;
+                    record_batches.extend(records)
                 }
                 Ok(record_batches)
             }
@@ -85,7 +82,12 @@ impl TableProvider for HudiDataSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.table.get_latest_schema()
+        let table = self.table.clone();
+        let handle = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { table.get_latest_schema().await })
+        });
+        handle.join().unwrap()
     }
 
     fn table_type(&self) -> TableType {
@@ -163,7 +165,76 @@ impl ExecutionPlan for HudiExec {
         _context: Arc<TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let mut data_source = self.data_source.clone();
-        let data = data_source.get_record_batches()?;
+        let handle = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(data_source.get_record_batches()).unwrap()
+        });
+        let data = handle.join().unwrap();
         Ok(Box::pin(MemoryStream::try_new(data, self.schema(), None)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Int32Array, StringArray};
+    use datafusion::dataframe::DataFrame;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion_common::ScalarValue;
+
+    use hudi_tests::TestTable;
+
+    use crate::HudiDataSource;
+
+    #[tokio::test]
+    async fn datafusion_read_hudi_table() {
+        let config = SessionConfig::new().set(
+            "datafusion.sql_parser.enable_ident_normalization",
+            ScalarValue::from(false),
+        );
+        let ctx = SessionContext::new_with_config(config);
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
+        let hudi = HudiDataSource::new(base_url.path(), HashMap::new()).await;
+        ctx.register_table("hudi_table_complexkeygen", Arc::new(hudi))
+            .unwrap();
+        let df: DataFrame = ctx
+            .sql("SELECT * from hudi_table_complexkeygen where structField.field2 > 30 order by name")
+            .await.unwrap();
+        let records = df
+            .collect()
+            .await
+            .unwrap()
+            .to_vec()
+            .first()
+            .unwrap()
+            .to_owned();
+        let files: Vec<String> = records
+            .column_by_name("_hoodie_file_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+                "4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet"
+            ]
+        );
+        let ids: Vec<i32> = records
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .map(|i| i.unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec![2, 4])
     }
 }
