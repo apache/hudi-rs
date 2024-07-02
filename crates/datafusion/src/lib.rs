@@ -39,13 +39,20 @@ use hudi_core::HudiTable;
 
 #[derive(Debug, Clone)]
 pub struct HudiDataSource {
-    table: HudiTable,
+    table: Arc<HudiTable>,
 }
 
 impl HudiDataSource {
-    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Self {
-        Self {
-            table: HudiTable::new(base_uri, storage_options).await,
+    pub async fn new(
+        base_uri: &str,
+        storage_options: HashMap<String, String>,
+    ) -> datafusion_common::Result<Self> {
+        match HudiTable::new(base_uri, storage_options).await {
+            Ok(t) => Ok(Self { table: Arc::new(t) }),
+            Err(e) => Err(DataFusionError::Execution(format!(
+                "Failed to create Hudi table: {}",
+                e
+            ))),
         }
     }
 
@@ -58,20 +65,18 @@ impl HudiDataSource {
     }
 
     async fn get_record_batches(&mut self) -> datafusion_common::Result<Vec<RecordBatch>> {
-        match self.table.get_latest_file_slices().await {
-            Ok(file_slices) => {
-                let mut record_batches = Vec::new();
-                for f in file_slices {
-                    let relative_path = f.base_file_relative_path();
-                    let records = self.table.read_file_slice(&relative_path).await;
-                    record_batches.extend(records)
-                }
-                Ok(record_batches)
-            }
-            Err(_e) => Err(DataFusionError::Execution(
-                "Failed to read records from table.".to_owned(),
-            )),
+        let file_slices = self.table.get_file_slices().await.map_err(|e| {
+            DataFusionError::Execution(format!("Failed to load file slices from table: {}", e))
+        })?;
+
+        let mut record_batches = Vec::new();
+        for fsl in file_slices {
+            let batches = self.table.read_file_slice(&fsl).await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to read records from table: {}", e))
+            })?;
+            record_batches.extend(batches)
         }
+        Ok(record_batches)
     }
 }
 
@@ -85,9 +90,9 @@ impl TableProvider for HudiDataSource {
         let table = self.table.clone();
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { table.get_latest_schema().await })
+            rt.block_on(async { table.get_schema().await })
         });
-        handle.join().unwrap()
+        SchemaRef::from(handle.join().unwrap().unwrap())
     }
 
     fn table_type(&self) -> TableType {
@@ -196,7 +201,9 @@ mod tests {
         );
         let ctx = SessionContext::new_with_config(config);
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi = HudiDataSource::new(base_url.path(), HashMap::new()).await;
+        let hudi = HudiDataSource::new(base_url.path(), HashMap::new())
+            .await
+            .unwrap();
         ctx.register_table("hudi_table_complexkeygen", Arc::new(hudi))
             .unwrap();
         let df: DataFrame = ctx

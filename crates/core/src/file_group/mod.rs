@@ -22,9 +22,11 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::path::PathBuf;
 
+use anyhow::{anyhow, Result};
+
 use crate::storage::file_info::FileInfo;
 use crate::storage::file_stats::FileStats;
-use anyhow::{anyhow, Result};
+use crate::storage::Storage;
 
 #[derive(Clone, Debug)]
 pub struct BaseFile {
@@ -63,10 +65,6 @@ impl BaseFile {
             stats: None,
         })
     }
-
-    pub fn populate_stats(&mut self, stats: FileStats) {
-        self.stats = Some(stats)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -81,9 +79,9 @@ impl FileSlice {
     }
 
     pub fn base_file_relative_path(&self) -> String {
-        let partition_path = self.partition_path.clone().unwrap_or_default();
+        let ptn = self.partition_path.as_deref().unwrap_or_default();
         let file_name = &self.base_file.info.name;
-        PathBuf::from(partition_path)
+        PathBuf::from(ptn)
             .join(file_name)
             .to_str()
             .unwrap()
@@ -96,6 +94,18 @@ impl FileSlice {
 
     pub fn set_base_file(&mut self, base_file: BaseFile) {
         self.base_file = base_file
+    }
+
+    pub async fn load_stats(&mut self, storage: &Storage) -> Result<()> {
+        if self.base_file.stats.is_none() {
+            let parquet_meta = storage
+                .get_parquet_file_metadata(&self.base_file_relative_path())
+                .await;
+            let num_records = parquet_meta.file_metadata().num_rows();
+            let stats = FileStats { num_records };
+            self.base_file.stats = Some(stats);
+        }
+        Ok(())
     }
 }
 

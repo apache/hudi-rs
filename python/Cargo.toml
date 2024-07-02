@@ -42,13 +42,15 @@ arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
+anyhow = { workspace = true }
+
 # runtime / async
 futures = { workspace = true }
 tokio = { workspace = true }
 
 [dependencies.pyo3]
 version = "0.20.3"
-features = ["extension-module", "abi3", "abi3-py38"]
+features = ["extension-module", "abi3", "abi3-py38", "anyhow"]
 
 [dependencies.hudi]
 path = "../crates/hudi"
