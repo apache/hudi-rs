@@ -18,33 +18,44 @@
  */
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use url::Url;
 
 use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
-use crate::storage::file_stats::FileStats;
 use crate::storage::{get_leaf_dirs, Storage};
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct FileSystemView {
-    pub base_url: Url,
-    partition_to_file_groups: HashMap<String, Vec<FileGroup>>,
+    props: Arc<HashMap<String, String>>,
+    storage: Arc<Storage>,
+    partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
 }
 
 impl FileSystemView {
-    pub fn new(base_url: Url) -> Self {
-        FileSystemView {
-            base_url,
-            partition_to_file_groups: HashMap::new(),
-        }
+    pub async fn new(
+        base_url: Arc<Url>,
+        storage_options: Arc<HashMap<String, String>>,
+        props: Arc<HashMap<String, String>>,
+    ) -> Result<Self> {
+        let storage = Storage::new(base_url, storage_options)?;
+        let partition_paths = Self::get_partition_paths(&storage).await?;
+        let partition_to_file_groups =
+            Self::load_file_groups_for_partitions(&storage, partition_paths).await?;
+        let partition_to_file_groups = Arc::new(DashMap::from_iter(partition_to_file_groups));
+        Ok(FileSystemView {
+            props,
+            storage,
+            partition_to_file_groups,
+        })
     }
 
-    async fn get_partition_paths(&self) -> Result<Vec<String>> {
-        let storage = Storage::new(self.base_url.clone(), HashMap::new());
+    async fn get_partition_paths(storage: &Storage) -> Result<Vec<String>> {
         let top_level_dirs: Vec<String> = storage
             .list_dirs(None)
             .await
@@ -53,19 +64,41 @@ impl FileSystemView {
             .collect();
         let mut partition_paths = Vec::new();
         for dir in top_level_dirs {
-            partition_paths.extend(get_leaf_dirs(&storage, Some(&dir)).await);
+            partition_paths.extend(get_leaf_dirs(storage, Some(&dir)).await);
+        }
+        if partition_paths.is_empty() {
+            partition_paths.push("".to_string())
         }
         Ok(partition_paths)
     }
 
-    async fn get_file_groups(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
-        let storage = Storage::new(self.base_url.clone(), HashMap::new());
+    async fn load_file_groups_for_partitions(
+        storage: &Storage,
+        partition_paths: Vec<String>,
+    ) -> Result<HashMap<String, Vec<FileGroup>>> {
+        let mut partition_to_file_groups = HashMap::new();
+        for p in partition_paths {
+            match Self::load_file_groups_for_partition(storage, p.as_str()).await {
+                Ok(file_groups) => {
+                    partition_to_file_groups.insert(p, file_groups);
+                }
+                Err(e) => return Err(anyhow!("Failed to load partitions: {}", e)),
+            }
+        }
+        Ok(partition_to_file_groups)
+    }
+
+    async fn load_file_groups_for_partition(
+        storage: &Storage,
+        partition_path: &str,
+    ) -> Result<Vec<FileGroup>> {
         let file_info: Vec<FileInfo> = storage
             .list_files(Some(partition_path))
             .await
             .into_iter()
             .filter(|f| f.name.ends_with(".parquet"))
             .collect();
+
         let mut fg_id_to_base_files: HashMap<String, Vec<BaseFile>> = HashMap::new();
         for f in file_info {
             let base_file = BaseFile::from_file_info(f)?;
@@ -87,109 +120,68 @@ impl FileSystemView {
         Ok(file_groups)
     }
 
-    pub async fn load_file_groups(&mut self) {
-        let fs_view = self.clone();
-        let result = get_partitions_and_file_groups(&fs_view).await.unwrap();
-        for (k, v) in result {
-            self.partition_to_file_groups.insert(k, v);
-        }
-    }
-
-    pub fn get_latest_file_slices(&self) -> Vec<&FileSlice> {
+    pub fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
-        for fgs in self.partition_to_file_groups.values() {
-            for fg in fgs {
-                if let Some(file_slice) = fg.get_latest_file_slice() {
-                    file_slices.push(file_slice)
+        for fgs in self.partition_to_file_groups.iter() {
+            let fgs_ref = fgs.value();
+            for fg in fgs_ref {
+                if let Some(fsl) = fg.get_latest_file_slice() {
+                    file_slices.push(fsl.clone())
                 }
             }
         }
-        file_slices
+        Ok(file_slices)
     }
 
-    pub async fn get_latest_file_slices_with_stats(&mut self) -> Vec<&mut FileSlice> {
-        let mut file_slices = Vec::new();
-        let file_groups = &mut self.partition_to_file_groups.values_mut();
-        for fgs in file_groups {
-            for fg in fgs {
+    pub async fn load_latest_file_slices_stats(&self) -> Result<()> {
+        for mut fgs in self.partition_to_file_groups.iter_mut() {
+            let fgs_ref = fgs.value_mut();
+            for fg in fgs_ref {
                 if let Some(file_slice) = fg.get_latest_file_slice_mut() {
-                    let _ = load_file_slice_stats(&self.base_url, file_slice).await;
-                    file_slices.push(file_slice)
+                    file_slice
+                        .load_stats(&self.storage)
+                        .await
+                        .expect("Successful loading file stats.");
                 }
             }
         }
-        file_slices
+        Ok(())
     }
 
-    pub async fn read_file_slice(&self, relative_path: &str) -> Vec<RecordBatch> {
-        let storage = Storage::new(self.base_url.clone(), HashMap::new());
-        storage.get_parquet_file_data(relative_path).await
+    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
+        Ok(self.storage.get_parquet_file_data(relative_path).await)
     }
-}
-
-async fn load_file_slice_stats(base_url: &Url, file_slice: &mut FileSlice) -> Result<()> {
-    let base_file = &mut file_slice.base_file;
-    if base_file.stats.is_none() {
-        let storage = Storage::new(base_url.clone(), HashMap::new());
-        let ptn = file_slice.partition_path.clone();
-        let mut relative_path = PathBuf::from(ptn.unwrap_or("".to_string()));
-        let base_file_name = &base_file.info.name;
-        relative_path.push(base_file_name);
-        let parquet_meta = storage
-            .get_parquet_file_metadata(relative_path.to_str().unwrap())
-            .await;
-        let num_records = parquet_meta.file_metadata().num_rows();
-        base_file.populate_stats(FileStats { num_records });
-    }
-    Ok(())
-}
-
-async fn get_partitions_and_file_groups(
-    fs_view: &FileSystemView,
-) -> Result<HashMap<String, Vec<FileGroup>>> {
-    match fs_view.get_partition_paths().await {
-        Ok(mut partition_paths) => {
-            if partition_paths.is_empty() {
-                partition_paths.push("".to_string());
-            }
-            let mut partition_to_file_groups = HashMap::new();
-            for p in partition_paths {
-                match fs_view.get_file_groups(p.as_str()).await {
-                    Ok(file_groups) => {
-                        partition_to_file_groups.insert(p, file_groups);
-                    }
-                    Err(e) => return Err(anyhow!("Failed to load partitions: {}", e)),
-                }
-            }
-            Ok(partition_to_file_groups)
-        }
-        Err(e) => Err(anyhow!("Failed to load partitions: {}", e)),
+    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<Vec<RecordBatch>> {
+        self.read_file_slice_by_path(&file_slice.base_file_relative_path())
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use hudi_tests::TestTable;
 
+    use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
 
     #[tokio::test]
     async fn get_partition_paths_for_nonpartitioned_table() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let fs_view = FileSystemView::new(base_url);
-        let partition_paths = fs_view.get_partition_paths().await.unwrap();
+        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let partition_paths = FileSystemView::get_partition_paths(&storage).await.unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
-        assert_eq!(partition_path_set, HashSet::new(),)
+        assert_eq!(partition_path_set, HashSet::from([""]))
     }
 
     #[tokio::test]
     async fn get_partition_paths_for_complexkeygen_table() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let fs_view = FileSystemView::new(base_url);
-        let partition_paths = fs_view.get_partition_paths().await.unwrap();
+        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let partition_paths = FileSystemView::get_partition_paths(&storage).await.unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(
@@ -203,17 +195,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_latest_file_slices() {
+    async fn fs_view_get_latest_file_slices() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let mut fs_view = FileSystemView::new(base_url);
-        fs_view.load_file_groups().await;
-        let file_slices = fs_view.get_latest_file_slices();
+        let fs_view = FileSystemView::new(
+            Arc::new(base_url),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .await
+        .unwrap();
+        let file_slices = fs_view.get_latest_file_slices().unwrap();
         assert_eq!(file_slices.len(), 1);
-        let mut fg_ids = Vec::new();
-        for f in file_slices {
-            let fp = f.file_group_id();
-            fg_ids.push(fp);
-        }
+        let fg_ids = file_slices
+            .iter()
+            .map(|fsl| fsl.file_group_id())
+            .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"])
     }
 }

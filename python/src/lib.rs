@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use anyhow::anyhow;
 use arrow::pyarrow::ToPyArrow;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
@@ -29,6 +30,7 @@ use hudi::file_group::FileSlice;
 use hudi::HudiTable;
 
 #[cfg(not(tarpaulin))]
+#[derive(Clone, Debug)]
 #[pyclass]
 struct HudiFileSlice {
     #[pyo3(get)]
@@ -40,29 +42,41 @@ struct HudiFileSlice {
     #[pyo3(get)]
     base_file_name: String,
     #[pyo3(get)]
-    base_file_path: String,
-    #[pyo3(get)]
     base_file_size: usize,
     #[pyo3(get)]
     num_records: i64,
 }
 
 #[cfg(not(tarpaulin))]
+#[pymethods]
 impl HudiFileSlice {
-    pub fn from_file_slice(f: FileSlice) -> Self {
-        let partition_path = f.partition_path.clone().unwrap_or("".to_string());
-        let mut p = PathBuf::from(&partition_path);
-        p.push(f.base_file.info.name.clone());
-        let base_file_path = p.to_str().unwrap().to_string();
-        Self {
-            file_group_id: f.file_group_id().to_string(),
-            partition_path,
-            commit_time: f.base_file.commit_time,
-            base_file_name: f.base_file.info.name,
-            base_file_path,
-            base_file_size: f.base_file.info.size,
-            num_records: f.base_file.stats.unwrap().num_records,
+    pub fn base_file_relative_path(&self) -> PyResult<String> {
+        let mut p = PathBuf::from(&self.partition_path);
+        p.push(&self.base_file_name);
+        match p.to_str() {
+            Some(s) => Ok(s.to_string()),
+            None => Err(PyErr::from(anyhow!(
+                "Failed to get base file relative path for file slice: {:?}",
+                self
+            ))),
         }
+    }
+}
+
+fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
+    let file_group_id = f.file_group_id().to_string();
+    let partition_path = f.partition_path.as_deref().unwrap_or_default().to_string();
+    let commit_time = f.base_file.commit_time.to_string();
+    let base_file_name = f.base_file.info.name.clone();
+    let base_file_size = f.base_file.info.size;
+    let num_records = f.base_file.stats.clone().unwrap_or_default().num_records;
+    HudiFileSlice {
+        file_group_id,
+        partition_path,
+        commit_time,
+        base_file_name,
+        base_file_size,
+        num_records,
     }
 }
 
@@ -81,32 +95,24 @@ impl BindingHudiTable {
         let _table = rt().block_on(HudiTable::new(
             table_uri,
             storage_options.unwrap_or_default(),
-        ));
+        ))?;
         Ok(BindingHudiTable { _table })
     }
 
     pub fn schema(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.get_latest_schema())
+        rt().block_on(self._table.get_latest_schema())?
             .to_pyarrow(py)
     }
 
     pub fn get_latest_file_slices(&mut self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
-            let res = rt().block_on(self._table.get_latest_file_slices());
-            match res {
-                Ok(file_slices) => Ok(file_slices
-                    .into_iter()
-                    .map(HudiFileSlice::from_file_slice)
-                    .collect()),
-                Err(_e) => {
-                    panic!("Failed to retrieve the latest file slices.")
-                }
-            }
+            let file_slices = rt().block_on(self._table.get_latest_file_slices())?;
+            Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
 
     pub fn read_file_slice(&mut self, relative_path: &str, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.read_file_slice(relative_path))
+        rt().block_on(self._table.read_file_slice_by_path(relative_path))?
             .to_pyarrow(py)
     }
 }

@@ -68,6 +68,7 @@ uuid = { version = "1" }
 # runtime / async
 async-trait = { version = "0.1" }
 async-recursion = { version = "1.1.1" }
+dashmap = { version = "6.0.1" }
 futures = { version = "0.3" }
 tokio = { version = "1", features = ["rt-multi-thread"]}
 num_cpus = { version = "1" }

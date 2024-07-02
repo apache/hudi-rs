@@ -21,10 +21,11 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::Schema;
 use url::Url;
 
 use crate::file_group::FileSlice;
@@ -33,53 +34,60 @@ use crate::table::config::BaseFileFormat;
 use crate::table::config::{ConfigKey, TableType};
 use crate::table::fs_view::FileSystemView;
 use crate::table::metadata::ProvidesTableMetadata;
-use crate::timeline::Timeline;
+use crate::table::timeline::Timeline;
 
 mod config;
 mod fs_view;
 mod metadata;
+mod timeline;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Table {
-    pub base_url: Url,
-    pub props: HashMap<String, String>,
-    pub file_system_view: Option<FileSystemView>,
-    pub storage_options: HashMap<String, String>,
+    pub base_url: Arc<Url>,
+    pub storage_options: Arc<HashMap<String, String>>,
+    pub props: Arc<HashMap<String, String>>,
+    pub timeline: Timeline,
+    pub file_system_view: FileSystemView,
 }
 
 impl Table {
-    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Self {
-        let base_url = Url::from_file_path(PathBuf::from(base_uri).as_path()).unwrap();
-        match Self::load_properties(
-            base_url.clone(),
-            ".hoodie/hoodie.properties".to_string(),
-            storage_options.clone(),
-        )
-        .await
-        {
-            Ok(props) => Self {
-                base_url,
-                props,
-                file_system_view: None,
-                storage_options,
-            },
-            Err(e) => {
-                panic!("Failed to load table properties: {}", e)
-            }
-        }
+    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Result<Self> {
+        let base_url = Url::from_file_path(PathBuf::from(base_uri))
+            .map_err(|_| anyhow!("Failed to create table URL: {}", base_uri))?;
+        let base_url = Arc::new(base_url);
+        let storage_options = Arc::new(storage_options);
+
+        let props = Self::load_properties(base_url.clone(), storage_options.clone())
+            .await
+            .context("Failed to create a table")?;
+
+        let props = Arc::new(props);
+        let timeline = Timeline::new(base_url.clone(), storage_options.clone(), props.clone())
+            .await
+            .context("Failed to load timeline")?;
+
+        let file_system_view =
+            FileSystemView::new(base_url.clone(), storage_options.clone(), props.clone())
+                .await
+                .context("Failed to load file system view")?;
+
+        Ok(Table {
+            base_url,
+            storage_options,
+            props,
+            timeline,
+            file_system_view,
+        })
     }
 
     async fn load_properties(
-        base_url: Url,
-        props_path: String,
-        storage_options: HashMap<String, String>,
+        base_url: Arc<Url>,
+        storage_options: Arc<HashMap<String, String>>,
     ) -> Result<HashMap<String, String>> {
-        let storage = Storage::new(base_url, storage_options);
-        let data = storage.get_file_data(props_path.as_str()).await;
+        let storage = Storage::new(base_url, storage_options)?;
+        let data = storage.get_file_data(".hoodie/hoodie.properties").await;
         let cursor = std::io::Cursor::new(data);
-        let reader = BufReader::new(cursor);
-        let lines = reader.lines();
+        let lines = BufReader::new(cursor).lines();
         let mut properties: HashMap<String, String> = HashMap::new();
         for line in lines {
             let line = line?;
@@ -102,58 +110,34 @@ impl Table {
         }
     }
 
+    pub async fn get_latest_schema(&self) -> Result<Schema> {
+        self.timeline.get_latest_schema().await
+    }
+
+    pub async fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>> {
+        self.file_system_view
+            .load_latest_file_slices_stats()
+            .await
+            .expect("Successful loading of file slice stats.");
+        self.file_system_view.get_latest_file_slices()
+    }
+
+    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
+        self.file_system_view
+            .read_file_slice_by_path(relative_path)
+            .await
+    }
+
+    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<Vec<RecordBatch>> {
+        self.file_system_view.read_file_slice(file_slice).await
+    }
+
     #[cfg(test)]
-    async fn get_timeline(&self) -> Result<Timeline> {
-        Timeline::new(self.base_url.clone()).await
-    }
-
-    pub async fn get_latest_schema(&self) -> SchemaRef {
-        let timeline_result = Timeline::new(self.base_url.clone()).await;
-        match timeline_result {
-            Ok(timeline) => {
-                let schema_result = timeline.get_latest_schema().await;
-                match schema_result {
-                    Ok(schema) => SchemaRef::from(schema),
-                    Err(e) => panic!("Failed to resolve table schema: {}", e),
-                }
-            }
-            Err(e) => panic!("Failed to resolve table schema: {}", e),
-        }
-    }
-
-    pub async fn get_latest_file_slices(&mut self) -> Result<Vec<FileSlice>> {
-        if self.file_system_view.is_none() {
-            let mut new_fs_view = FileSystemView::new(self.base_url.clone());
-            new_fs_view.load_file_groups().await;
-            self.file_system_view = Some(new_fs_view);
-        }
-
-        let fs_view = self.file_system_view.as_mut().unwrap();
-
-        let mut file_slices = Vec::new();
-        for f in fs_view.get_latest_file_slices_with_stats().await {
-            file_slices.push(f.clone());
-        }
-        Ok(file_slices)
-    }
-
-    pub async fn read_file_slice(&mut self, relative_path: &str) -> Vec<RecordBatch> {
-        if self.file_system_view.is_none() {
-            let mut new_fs_view = FileSystemView::new(self.base_url.clone());
-            new_fs_view.load_file_groups().await;
-            self.file_system_view = Some(new_fs_view);
-        }
-
-        let fs_view = self.file_system_view.as_ref().unwrap();
-        fs_view.read_file_slice(relative_path).await
-    }
-
-    pub async fn get_latest_file_paths(&mut self) -> Result<Vec<String>> {
+    async fn get_latest_file_paths(&self) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         for f in self.get_latest_file_slices().await? {
             file_paths.push(f.base_file_path().to_string());
         }
-        println!("{:?}", file_paths);
         Ok(file_paths)
     }
 }
@@ -258,10 +242,11 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_latest_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path(), HashMap::new()).await;
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         let fields: Vec<String> = hudi_table
             .get_latest_schema()
             .await
+            .unwrap()
             .all_fields()
             .into_iter()
             .map(|f| f.name().to_string())
@@ -310,12 +295,13 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_read_file_slice() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let mut hudi_table = Table::new(base_url.path(), HashMap::new()).await;
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         let batches = hudi_table
-            .read_file_slice(
+            .read_file_slice_by_path(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches.first().unwrap().num_rows(), 4);
         assert_eq!(batches.first().unwrap().num_columns(), 21);
@@ -324,8 +310,8 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_latest_file_paths() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let mut hudi_table = Table::new(base_url.path(), HashMap::new()).await;
-        assert_eq!(hudi_table.get_timeline().await.unwrap().instants.len(), 2);
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+        assert_eq!(hudi_table.timeline.instants.len(), 2);
         let actual: HashSet<String> =
             HashSet::from_iter(hudi_table.get_latest_file_paths().await.unwrap());
         let expected: HashSet<String> = HashSet::from_iter(vec![
@@ -342,7 +328,9 @@ mod tests {
     async fn hudi_table_get_table_metadata() {
         let base_path =
             canonicalize(Path::new("fixtures/table_metadata/sample_table_properties")).unwrap();
-        let table = Table::new(base_path.to_str().unwrap(), HashMap::new()).await;
+        let table = Table::new(base_path.to_str().unwrap(), HashMap::new())
+            .await
+            .unwrap();
         assert_eq!(table.base_file_format(), Parquet);
         assert_eq!(table.checksum(), 3761586722);
         assert_eq!(table.database_name(), "default");

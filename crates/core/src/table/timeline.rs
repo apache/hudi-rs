@@ -17,12 +17,14 @@
  * under the License.
  */
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use arrow_schema::SchemaRef;
+use arrow_schema::Schema;
 use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use url::Url;
@@ -31,18 +33,30 @@ use crate::storage::utils::split_filename;
 use crate::storage::Storage;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum State {
     Requested,
     Inflight,
     Completed,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Instant {
     state: State,
     action: String,
     timestamp: String,
+}
+
+impl PartialOrd for Instant {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.timestamp.cmp(&other.timestamp))
+    }
+}
+
+impl Ord for Instant {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
 }
 
 impl Instant {
@@ -59,20 +73,30 @@ impl Instant {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Timeline {
-    pub base_url: Url,
+    props: Arc<HashMap<String, String>>,
+    storage: Arc<Storage>,
     pub instants: Vec<Instant>,
 }
 
 impl Timeline {
-    pub async fn new(base_url: Url) -> Result<Self> {
-        let instants = Self::load_completed_commit_instants(&base_url).await?;
-        Ok(Self { base_url, instants })
+    pub async fn new(
+        base_url: Arc<Url>,
+        storage_options: Arc<HashMap<String, String>>,
+        props: Arc<HashMap<String, String>>,
+    ) -> Result<Self> {
+        let storage = Storage::new(base_url, storage_options)?;
+        let instants = Self::load_completed_commit_instants(&storage).await?;
+        Ok(Self {
+            storage,
+            props,
+            instants,
+        })
     }
 
-    async fn load_completed_commit_instants(base_url: &Url) -> Result<Vec<Instant>> {
-        let storage = Storage::new(base_url.clone(), HashMap::new());
+    async fn load_completed_commit_instants(storage: &Storage) -> Result<Vec<Instant>> {
         let mut completed_commits = Vec::new();
         for file_info in storage.list_files(Some(".hoodie")).await {
             let (file_stem, file_ext) = split_filename(file_info.name.as_str())?;
@@ -84,8 +108,7 @@ impl Timeline {
                 })
             }
         }
-        // TODO: encapsulate sorting within Instant
-        completed_commits.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        completed_commits.sort();
         Ok(completed_commits)
     }
 
@@ -94,10 +117,11 @@ impl Timeline {
             Some(instant) => {
                 let mut commit_file_path = PathBuf::from(".hoodie");
                 commit_file_path.push(instant.file_name());
-                let storage = Storage::new(self.base_url.clone(), HashMap::new());
-                let bytes = storage
-                    .get_file_data(commit_file_path.to_str().unwrap())
-                    .await;
+                let relative_path = commit_file_path.to_str().ok_or(anyhow!(
+                    "Failed to get commit file path for instant: {:?}",
+                    instant
+                ));
+                let bytes = self.storage.get_file_data(relative_path?).await;
                 let json: Value = serde_json::from_slice(&bytes)?;
                 let commit_metadata = json
                     .as_object()
@@ -109,20 +133,19 @@ impl Timeline {
         }
     }
 
-    pub async fn get_latest_schema(&self) -> Result<SchemaRef> {
-        let commit_metadata = self.get_latest_commit_metadata().await.unwrap();
+    pub async fn get_latest_schema(&self) -> Result<Schema> {
+        let commit_metadata = self.get_latest_commit_metadata().await?;
         if let Some(partition_to_write_stats) = commit_metadata["partitionToWriteStats"].as_object()
         {
             if let Some((_, value)) = partition_to_write_stats.iter().next() {
                 if let Some(first_value) = value.as_array().and_then(|arr| arr.first()) {
                     if let Some(path) = first_value["path"].as_str() {
-                        let storage = Storage::new(self.base_url.clone(), HashMap::new());
-                        let parquet_meta = storage.get_parquet_file_metadata(path).await;
+                        let parquet_meta = self.storage.get_parquet_file_metadata(path).await;
                         let arrow_schema = parquet_to_arrow_schema(
                             parquet_meta.file_metadata().schema_descr(),
                             None,
                         )?;
-                        return Ok(SchemaRef::from(arrow_schema));
+                        return Ok(arrow_schema);
                     }
                 }
             }
@@ -133,19 +156,27 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs::canonicalize;
     use std::path::Path;
+    use std::sync::Arc;
 
     use url::Url;
 
     use hudi_tests::TestTable;
 
-    use crate::timeline::{Instant, State, Timeline};
+    use crate::table::timeline::{Instant, State, Timeline};
 
     #[tokio::test]
     async fn read_latest_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let timeline = Timeline::new(base_url).await.unwrap();
+        let timeline = Timeline::new(
+            Arc::new(base_url),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .await
+        .unwrap();
         let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 21)
     }
@@ -155,7 +186,13 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap())
                 .unwrap();
-        let timeline = Timeline::new(base_url).await.unwrap();
+        let timeline = Timeline::new(
+            Arc::new(base_url),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             timeline.instants,
             vec![

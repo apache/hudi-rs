@@ -30,10 +30,10 @@ class HudiFileSlice:
     partition_path: str
     commit_time: str
     base_file_name: str
-    base_file_path: str
     base_file_size: int
     num_records: int
 
+    def base_file_relative_path(self) -> str: ...
 
 class BindingHudiTable:
 
