@@ -110,16 +110,25 @@ impl Table {
         }
     }
 
-    pub async fn get_latest_schema(&self) -> Result<Schema> {
+    pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
 
-    pub async fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>> {
+    pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
         self.file_system_view
             .load_latest_file_slices_stats()
             .await
             .expect("Successful loading of file slice stats.");
         self.file_system_view.get_latest_file_slices()
+    }
+
+    #[cfg(test)]
+    async fn get_file_paths(&self) -> Result<Vec<String>> {
+        let mut file_paths = Vec::new();
+        for f in self.get_file_slices().await? {
+            file_paths.push(f.base_file_path().to_string());
+        }
+        Ok(file_paths)
     }
 
     pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
@@ -130,15 +139,6 @@ impl Table {
 
     pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<Vec<RecordBatch>> {
         self.file_system_view.read_file_slice(file_slice).await
-    }
-
-    #[cfg(test)]
-    async fn get_latest_file_paths(&self) -> Result<Vec<String>> {
-        let mut file_paths = Vec::new();
-        for f in self.get_latest_file_slices().await? {
-            file_paths.push(f.base_file_path().to_string());
-        }
-        Ok(file_paths)
     }
 }
 
@@ -244,7 +244,7 @@ mod tests {
         let base_url = TestTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         let fields: Vec<String> = hudi_table
-            .get_latest_schema()
+            .get_schema()
             .await
             .unwrap()
             .all_fields()
@@ -313,7 +313,7 @@ mod tests {
         let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         assert_eq!(hudi_table.timeline.instants.len(), 2);
         let actual: HashSet<String> =
-            HashSet::from_iter(hudi_table.get_latest_file_paths().await.unwrap());
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
         let expected: HashSet<String> = HashSet::from_iter(vec![
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
             "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",

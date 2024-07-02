@@ -65,7 +65,7 @@ impl HudiDataSource {
     }
 
     async fn get_record_batches(&mut self) -> datafusion_common::Result<Vec<RecordBatch>> {
-        let file_slices = self.table.get_latest_file_slices().await.map_err(|e| {
+        let file_slices = self.table.get_file_slices().await.map_err(|e| {
             DataFusionError::Execution(format!("Failed to load file slices from table: {}", e))
         })?;
 
@@ -90,7 +90,7 @@ impl TableProvider for HudiDataSource {
         let table = self.table.clone();
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { table.get_latest_schema().await })
+            rt.block_on(async { table.get_schema().await })
         });
         SchemaRef::from(handle.join().unwrap().unwrap())
     }

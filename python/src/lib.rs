@@ -101,13 +101,12 @@ impl BindingHudiTable {
     }
 
     pub fn schema(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.get_latest_schema())?
-            .to_pyarrow(py)
+        rt().block_on(self._table.get_schema())?.to_pyarrow(py)
     }
 
     pub fn get_latest_file_slices(&mut self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
-            let file_slices = rt().block_on(self._table.get_latest_file_slices())?;
+            let file_slices = rt().block_on(self._table.get_file_slices())?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
