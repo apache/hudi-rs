@@ -35,6 +35,7 @@ pub fn extract_test_table(zip_path: &Path) -> PathBuf {
 
 pub enum TestTable {
     V6ComplexkeygenHivestyle,
+    V6Empty,
     V6Nonpartitioned,
 }
 
@@ -46,6 +47,7 @@ impl TestTable {
             Self::V6ComplexkeygenHivestyle => data_path
                 .join("v6_complexkeygen_hivestyle.zip")
                 .into_boxed_path(),
+            Self::V6Empty => data_path.join("v6_empty.zip").into_boxed_path(),
             Self::V6Nonpartitioned => data_path.join("v6_nonpartitioned.zip").into_boxed_path(),
         }
     }
@@ -55,6 +57,11 @@ impl TestTable {
         match self {
             Self::V6ComplexkeygenHivestyle => extract_test_table(&zip_path)
                 .join("v6_complexkeygen_hivestyle")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            Self::V6Empty => extract_test_table(&zip_path)
+                .join("v6_empty")
                 .to_str()
                 .unwrap()
                 .to_string(),

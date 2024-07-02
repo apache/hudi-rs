@@ -115,11 +115,42 @@ impl Table {
     }
 
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            self.get_file_slices_as_of(timestamp).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         self.file_system_view
-            .load_latest_file_slices_stats()
+            .load_file_slices_stats_as_of(timestamp)
             .await
-            .expect("Successful loading of file slice stats.");
-        self.file_system_view.get_latest_file_slices()
+            .context("Fail to load file slice stats.")?;
+        self.file_system_view.get_file_slices_as_of(timestamp)
+    }
+
+    pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            self.read_snapshot_as_of(timestamp).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
+        let file_slices = self
+            .get_file_slices_as_of(timestamp)
+            .await
+            .context(format!("Failed to get file slices as of {}", timestamp))?;
+        let mut batches = Vec::new();
+        for f in file_slices {
+            match self.file_system_view.read_file_slice_unchecked(&f).await {
+                Ok(batch) => batches.extend(batch),
+                Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
+            }
+        }
+        Ok(batches)
     }
 
     #[cfg(test)]
@@ -133,12 +164,8 @@ impl Table {
 
     pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
         self.file_system_view
-            .read_file_slice_by_path(relative_path)
+            .read_file_slice_by_path_unchecked(relative_path)
             .await
-    }
-
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<Vec<RecordBatch>> {
-        self.file_system_view.read_file_slice(file_slice).await
     }
 }
 
@@ -240,7 +267,7 @@ mod tests {
     use crate::table::Table;
 
     #[tokio::test]
-    async fn hudi_table_get_latest_schema() {
+    async fn hudi_table_get_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         let fields: Vec<String> = hudi_table
@@ -308,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_latest_file_paths() {
+    async fn hudi_table_get_file_paths() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         assert_eq!(hudi_table.timeline.instants.len(), 2);
@@ -322,6 +349,57 @@ mod tests {
             .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
             .collect::<Vec<_>>());
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_as_of_timestamps() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+
+        let file_slices = hudi_table.get_file_slices().await.unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
+        );
+
+        // as of the latest timestamp
+        let file_slices = hudi_table
+            .get_file_slices_as_of("20240418173551906")
+            .await
+            .unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
+        );
+
+        // as of just smaller than the latest timestamp
+        let file_slices = hudi_table
+            .get_file_slices_as_of("20240418173551905")
+            .await
+            .unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-182-253_20240418173550988.parquet",]
+        );
+
+        // as of non-exist old timestamp
+        let file_slices = hudi_table.get_file_slices_as_of("0").await.unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]

@@ -72,14 +72,14 @@ impl Storage {
         }
     }
 
-    pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> ParquetMetaData {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path]).unwrap();
-        let obj_path = ObjPath::from_url_path(obj_url.path()).unwrap();
+    pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
-        let meta = obj_store.head(&obj_path).await.unwrap();
+        let meta = obj_store.head(&obj_path).await?;
         let reader = ParquetObjectReader::new(obj_store, meta);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
-        builder.metadata().as_ref().to_owned()
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        Ok(builder.metadata().as_ref().to_owned())
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Bytes {

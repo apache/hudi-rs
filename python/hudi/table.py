@@ -36,16 +36,22 @@ class HudiTable:
     ):
         self._table = BindingHudiTable(str(table_uri), storage_options)
 
-    def schema(self) -> "pyarrow.Schema":
-        return self._table.schema()
+    def get_schema(self) -> "pyarrow.Schema":
+        return self._table.get_schema()
 
-    def split_latest_file_slices(self, n) -> Iterator[List[HudiFileSlice]]:
-        file_slices = self.get_latest_file_slices()
+    def split_file_slices(self, n: int) -> Iterator[List[HudiFileSlice]]:
+        file_slices = self.get_file_slices()
         for split in split_list(file_slices, n):
             yield split
 
-    def get_latest_file_slices(self) -> List[HudiFileSlice]:
-        return self._table.get_latest_file_slices()
+    def get_file_slices(self) -> List[HudiFileSlice]:
+        return self._table.get_file_slices()
 
-    def read_file_slice(self, relative_path) -> List["pyarrow.RecordBatch"]:
-        return self._table.read_file_slice(relative_path)
+    def read_file_slice(self, base_file_relative_path: str) -> List["pyarrow.RecordBatch"]:
+        return self._table.read_file_slice(base_file_relative_path)
+
+    def read_snapshot(self) -> List["pyarrow.RecordBatch"]:
+        return self._table.read_snapshot()
+
+    def read_snapshot_as_of(self, timestamp: str) -> List["pyarrow.RecordBatch"]:
+        return self._table.read_snapshot_as_of(timestamp)

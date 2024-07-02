@@ -44,7 +44,7 @@ impl FileSystemView {
         props: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         let storage = Storage::new(base_url, storage_options)?;
-        let partition_paths = Self::get_partition_paths(&storage).await?;
+        let partition_paths = Self::load_partition_paths(&storage).await?;
         let partition_to_file_groups =
             Self::load_file_groups_for_partitions(&storage, partition_paths).await?;
         let partition_to_file_groups = Arc::new(DashMap::from_iter(partition_to_file_groups));
@@ -55,7 +55,7 @@ impl FileSystemView {
         })
     }
 
-    async fn get_partition_paths(storage: &Storage) -> Result<Vec<String>> {
+    async fn load_partition_paths(storage: &Storage) -> Result<Vec<String>> {
         let top_level_dirs: Vec<String> = storage
             .list_dirs(None)
             .await
@@ -120,24 +120,25 @@ impl FileSystemView {
         Ok(file_groups)
     }
 
-    pub fn get_latest_file_slices(&self) -> Result<Vec<FileSlice>> {
+    pub fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
         for fgs in self.partition_to_file_groups.iter() {
             let fgs_ref = fgs.value();
             for fg in fgs_ref {
-                if let Some(fsl) = fg.get_latest_file_slice() {
-                    file_slices.push(fsl.clone())
+                if let Some(fsl) = fg.get_file_slice_as_of(timestamp) {
+                    // TODO: pass ref instead of copying
+                    file_slices.push(fsl.clone());
                 }
             }
         }
         Ok(file_slices)
     }
 
-    pub async fn load_latest_file_slices_stats(&self) -> Result<()> {
+    pub async fn load_file_slices_stats_as_of(&self, timestamp: &str) -> Result<()> {
         for mut fgs in self.partition_to_file_groups.iter_mut() {
             let fgs_ref = fgs.value_mut();
             for fg in fgs_ref {
-                if let Some(file_slice) = fg.get_latest_file_slice_mut() {
+                if let Some(file_slice) = fg.get_file_slice_mut_as_of(timestamp) {
                     file_slice
                         .load_stats(&self.storage)
                         .await
@@ -148,11 +149,17 @@ impl FileSystemView {
         Ok(())
     }
 
-    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
+    pub async fn read_file_slice_by_path_unchecked(
+        &self,
+        relative_path: &str,
+    ) -> Result<Vec<RecordBatch>> {
         Ok(self.storage.get_parquet_file_data(relative_path).await)
     }
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<Vec<RecordBatch>> {
-        self.read_file_slice_by_path(&file_slice.base_file_relative_path())
+    pub async fn read_file_slice_unchecked(
+        &self,
+        file_slice: &FileSlice,
+    ) -> Result<Vec<RecordBatch>> {
+        self.read_file_slice_by_path_unchecked(&file_slice.base_file_relative_path())
             .await
     }
 }
@@ -171,7 +178,9 @@ mod tests {
     async fn get_partition_paths_for_nonpartitioned_table() {
         let base_url = TestTable::V6Nonpartitioned.url();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
-        let partition_paths = FileSystemView::get_partition_paths(&storage).await.unwrap();
+        let partition_paths = FileSystemView::load_partition_paths(&storage)
+            .await
+            .unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(partition_path_set, HashSet::from([""]))
@@ -181,7 +190,9 @@ mod tests {
     async fn get_partition_paths_for_complexkeygen_table() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
-        let partition_paths = FileSystemView::get_partition_paths(&storage).await.unwrap();
+        let partition_paths = FileSystemView::load_partition_paths(&storage)
+            .await
+            .unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(
@@ -204,7 +215,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let file_slices = fs_view.get_latest_file_slices().unwrap();
+
+        let file_slices = fs_view.get_file_slices_as_of("20240418173551906").unwrap();
         assert_eq!(file_slices.len(), 1);
         let fg_ids = file_slices
             .iter()

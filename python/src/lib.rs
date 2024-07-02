@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use anyhow::anyhow;
+use anyhow::Context;
 use arrow::pyarrow::ToPyArrow;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
@@ -51,15 +51,15 @@ struct HudiFileSlice {
 #[pymethods]
 impl HudiFileSlice {
     pub fn base_file_relative_path(&self) -> PyResult<String> {
-        let mut p = PathBuf::from(&self.partition_path);
-        p.push(&self.base_file_name);
-        match p.to_str() {
-            Some(s) => Ok(s.to_string()),
-            None => Err(PyErr::from(anyhow!(
+        PathBuf::from(&self.partition_path)
+            .join(&self.base_file_name)
+            .to_str()
+            .map(String::from)
+            .context(format!(
                 "Failed to get base file relative path for file slice: {:?}",
                 self
-            ))),
-        }
+            ))
+            .map_err(PyErr::from)
     }
 }
 
@@ -100,19 +100,28 @@ impl BindingHudiTable {
         Ok(BindingHudiTable { _table })
     }
 
-    pub fn schema(&self, py: Python) -> PyResult<PyObject> {
+    pub fn get_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self._table.get_schema())?.to_pyarrow(py)
     }
 
-    pub fn get_latest_file_slices(&mut self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
+    pub fn get_file_slices(&self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(self._table.get_file_slices())?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
 
-    pub fn read_file_slice(&mut self, relative_path: &str, py: Python) -> PyResult<PyObject> {
+    pub fn read_file_slice(&self, relative_path: &str, py: Python) -> PyResult<PyObject> {
         rt().block_on(self._table.read_file_slice_by_path(relative_path))?
+            .to_pyarrow(py)
+    }
+
+    pub fn read_snapshot(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self._table.read_snapshot())?.to_pyarrow(py)
+    }
+
+    pub fn read_snapshot_as_of(&self, timestamp: &str, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self._table.read_snapshot_as_of(timestamp))?
             .to_pyarrow(py)
     }
 }
