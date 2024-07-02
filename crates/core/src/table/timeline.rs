@@ -143,8 +143,9 @@ impl Timeline {
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
-        let parquet_path = commit_metadata["partitionToWriteStats"]
-            .as_object()
+        let parquet_path = commit_metadata
+            .get("partitionToWriteStats")
+            .and_then(|v| v.as_object())
             .and_then(|obj| obj.values().next())
             .and_then(|value| value.as_array())
             .and_then(|arr| arr.first())
@@ -181,7 +182,7 @@ mod tests {
     use crate::table::timeline::{Instant, State, Timeline};
 
     #[tokio::test]
-    async fn read_latest_schema() {
+    async fn timeline_read_latest_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
         let timeline = Timeline::new(
             Arc::new(base_url),
@@ -192,6 +193,24 @@ mod tests {
         .unwrap();
         let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 21)
+    }
+
+    #[tokio::test]
+    async fn timeline_read_latest_schema_from_empty_table() {
+        let base_url = TestTable::V6Empty.url();
+        let timeline = Timeline::new(
+            Arc::new(base_url),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        )
+        .await
+        .unwrap();
+        let table_schema = timeline.get_latest_schema().await;
+        assert!(table_schema.is_err());
+        assert_eq!(
+            table_schema.err().unwrap().to_string(),
+            "Failed to resolve the latest schema: no file path found"
+        )
     }
 
     #[tokio::test]
