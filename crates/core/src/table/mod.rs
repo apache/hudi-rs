@@ -267,7 +267,7 @@ mod tests {
     use crate::table::Table;
 
     #[tokio::test]
-    async fn hudi_table_get_latest_schema() {
+    async fn hudi_table_get_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         let fields: Vec<String> = hudi_table
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_latest_file_paths() {
+    async fn hudi_table_get_file_paths() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         assert_eq!(hudi_table.timeline.instants.len(), 2);
@@ -349,6 +349,33 @@ mod tests {
             .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
             .collect::<Vec<_>>());
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_as_of_timestamps() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+
+        let file_slices = hudi_table.get_file_slices().await.unwrap();
+        assert_eq!(file_slices.iter().map(|f| f.base_file_relative_path()).collect::<Vec<_>>(), vec![
+            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+        ]);
+
+        // as of the latest timestamp
+        let file_slices = hudi_table.get_file_slices_as_of("20240418173551906").await.unwrap();
+        assert_eq!(file_slices.iter().map(|f| f.base_file_relative_path()).collect::<Vec<_>>(), vec![
+            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+        ]);
+
+        // as of just smaller than the latest timestamp
+        let file_slices = hudi_table.get_file_slices_as_of("20240418173551905").await.unwrap();
+        assert_eq!(file_slices.iter().map(|f| f.base_file_relative_path()).collect::<Vec<_>>(), vec![
+            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-182-253_20240418173550988.parquet",
+        ]);
+
+        // as of non-exist old timestamp
+        let file_slices = hudi_table.get_file_slices_as_of("0").await.unwrap();
+        assert_eq!(file_slices.iter().map(|f| f.base_file_relative_path()).collect::<Vec<_>>(), Vec::<String>::new());
     }
 
     #[tokio::test]
