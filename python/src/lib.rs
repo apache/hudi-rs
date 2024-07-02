@@ -63,6 +63,7 @@ impl HudiFileSlice {
     }
 }
 
+#[cfg(not(tarpaulin))]
 fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
     let file_group_id = f.file_group_id().to_string();
     let partition_path = f.partition_path.as_deref().unwrap_or_default().to_string();
