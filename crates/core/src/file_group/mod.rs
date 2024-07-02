@@ -100,7 +100,7 @@ impl FileSlice {
         if self.base_file.stats.is_none() {
             let parquet_meta = storage
                 .get_parquet_file_metadata(&self.base_file_relative_path())
-                .await;
+                .await?;
             let num_records = parquet_meta.file_metadata().num_rows();
             let stats = FileStats { num_records };
             self.base_file.stats = Some(stats);
@@ -163,12 +163,22 @@ impl FileGroup {
         }
     }
 
-    pub fn get_latest_file_slice(&self) -> Option<&FileSlice> {
-        return self.file_slices.values().next_back();
+    pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {
+        let as_of = timestamp.to_string();
+        return if let Some((_, file_slice)) = self.file_slices.range(..=as_of).next_back() {
+            Some(file_slice)
+        } else {
+            None
+        };
     }
 
-    pub fn get_latest_file_slice_mut(&mut self) -> Option<&mut FileSlice> {
-        return self.file_slices.values_mut().next_back();
+    pub fn get_file_slice_mut_as_of(&mut self, timestamp: &str) -> Option<&mut FileSlice> {
+        let as_of = timestamp.to_string();
+        return if let Some((_, file_slice)) = self.file_slices.range_mut(..=as_of).next_back() {
+            Some(file_slice)
+        } else {
+            None
+        };
     }
 }
 
@@ -203,8 +213,11 @@ mod tests {
         let commit_times: Vec<&str> = fg.file_slices.keys().map(|k| k.as_str()).collect();
         assert_eq!(commit_times, vec!["20240402123035233", "20240402144910683"]);
         assert_eq!(
-            fg.get_latest_file_slice().unwrap().base_file.commit_time,
-            "20240402144910683"
+            fg.get_file_slice_as_of("20240402123035233")
+                .unwrap()
+                .base_file
+                .commit_time,
+            "20240402123035233"
         )
     }
 

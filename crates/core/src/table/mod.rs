@@ -115,11 +115,42 @@ impl Table {
     }
 
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            self.get_file_slices_as_of(timestamp).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         self.file_system_view
-            .load_latest_file_slices_stats()
+            .load_file_slices_stats_as_of(timestamp)
             .await
-            .expect("Successful loading of file slice stats.");
-        self.file_system_view.get_latest_file_slices()
+            .context("Fail to load file slice stats.")?;
+        self.file_system_view.get_file_slices_as_of(timestamp)
+    }
+
+    pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            self.read_snapshot_as_of(timestamp).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
+        let file_slices = self
+            .get_file_slices_as_of(timestamp)
+            .await
+            .context(format!("Failed to get file slices as of {}", timestamp))?;
+        let mut batches = Vec::new();
+        for f in file_slices {
+            match self.file_system_view.read_file_slice_unchecked(&f).await {
+                Ok(batch) => batches.extend(batch),
+                Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
+            }
+        }
+        Ok(batches)
     }
 
     #[cfg(test)]
@@ -133,12 +164,8 @@ impl Table {
 
     pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
         self.file_system_view
-            .read_file_slice_by_path(relative_path)
+            .read_file_slice_by_path_unchecked(relative_path)
             .await
-    }
-
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<Vec<RecordBatch>> {
-        self.file_system_view.read_file_slice(file_slice).await
     }
 }
 

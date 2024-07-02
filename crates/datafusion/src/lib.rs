@@ -65,17 +65,11 @@ impl HudiDataSource {
     }
 
     async fn get_record_batches(&mut self) -> datafusion_common::Result<Vec<RecordBatch>> {
-        let file_slices = self.table.get_file_slices().await.map_err(|e| {
-            DataFusionError::Execution(format!("Failed to load file slices from table: {}", e))
-        })?;
-
-        let mut record_batches = Vec::new();
-        for fsl in file_slices {
-            let batches = self.table.read_file_slice(&fsl).await.map_err(|e| {
-                DataFusionError::Execution(format!("Failed to read records from table: {}", e))
+        let record_batches =
+            self.table.read_snapshot().await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to read snapshot: {}", e))
             })?;
-            record_batches.extend(batches)
-        }
+
         Ok(record_batches)
     }
 }

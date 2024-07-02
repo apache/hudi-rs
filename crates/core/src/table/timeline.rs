@@ -23,7 +23,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_schema::Schema;
 use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
@@ -112,6 +112,13 @@ impl Timeline {
         Ok(completed_commits)
     }
 
+    pub fn get_latest_commit_timestamp(&self) -> Option<&str> {
+        self.instants
+            .iter()
+            .next_back()
+            .map(|instant| instant.timestamp.as_str())
+    }
+
     async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
         match self.instants.iter().next_back() {
             Some(instant) => {
@@ -120,8 +127,8 @@ impl Timeline {
                 let relative_path = commit_file_path.to_str().ok_or(anyhow!(
                     "Failed to get commit file path for instant: {:?}",
                     instant
-                ));
-                let bytes = self.storage.get_file_data(relative_path?).await;
+                ))?;
+                let bytes = self.storage.get_file_data(relative_path).await;
                 let json: Value = serde_json::from_slice(&bytes)?;
                 let commit_metadata = json
                     .as_object()
@@ -135,22 +142,28 @@ impl Timeline {
 
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
-        if let Some(partition_to_write_stats) = commit_metadata["partitionToWriteStats"].as_object()
-        {
-            if let Some((_, value)) = partition_to_write_stats.iter().next() {
-                if let Some(first_value) = value.as_array().and_then(|arr| arr.first()) {
-                    if let Some(path) = first_value["path"].as_str() {
-                        let parquet_meta = self.storage.get_parquet_file_metadata(path).await;
-                        let arrow_schema = parquet_to_arrow_schema(
-                            parquet_meta.file_metadata().schema_descr(),
-                            None,
-                        )?;
-                        return Ok(arrow_schema);
-                    }
-                }
-            }
+
+        let parquet_path = commit_metadata["partitionToWriteStats"]
+            .as_object()
+            .and_then(|obj| obj.values().next())
+            .and_then(|value| value.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first_value| first_value["path"].as_str());
+
+        if let Some(path) = parquet_path {
+            let parquet_meta = self
+                .storage
+                .get_parquet_file_metadata(path)
+                .await
+                .context("Failed to get parquet file metadata")?;
+
+            parquet_to_arrow_schema(parquet_meta.file_metadata().schema_descr(), None)
+                .context("Failed to resolve the latest schema")
+        } else {
+            Err(anyhow!(
+                "Failed to resolve the latest schema: no file path found"
+            ))
         }
-        Err(anyhow!("Failed to resolve schema."))
     }
 }
 
