@@ -47,7 +47,7 @@ class HudiTable:
     def get_file_slices(self) -> List[HudiFileSlice]:
         return self._table.get_file_slices()
 
-    def read_file_slice(self, base_file_relative_path: str) -> List["pyarrow.RecordBatch"]:
+    def read_file_slice(self, base_file_relative_path: str) -> "pyarrow.RecordBatch":
         return self._table.read_file_slice(base_file_relative_path)
 
     def read_snapshot(self) -> List["pyarrow.RecordBatch"]:

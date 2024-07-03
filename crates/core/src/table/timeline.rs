@@ -98,7 +98,7 @@ impl Timeline {
 
     async fn load_completed_commit_instants(storage: &Storage) -> Result<Vec<Instant>> {
         let mut completed_commits = Vec::new();
-        for file_info in storage.list_files(Some(".hoodie")).await {
+        for file_info in storage.list_files(Some(".hoodie")).await? {
             let (file_stem, file_ext) = split_filename(file_info.name.as_str())?;
             if file_ext == "commit" {
                 completed_commits.push(Instant {
@@ -128,7 +128,7 @@ impl Timeline {
                     "Failed to get commit file path for instant: {:?}",
                     instant
                 ))?;
-                let bytes = self.storage.get_file_data(relative_path).await;
+                let bytes = self.storage.get_file_data(relative_path).await?;
                 let json: Value = serde_json::from_slice(&bytes)?;
                 let commit_metadata = json
                     .as_object()

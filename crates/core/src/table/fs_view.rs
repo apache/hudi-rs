@@ -58,13 +58,13 @@ impl FileSystemView {
     async fn load_partition_paths(storage: &Storage) -> Result<Vec<String>> {
         let top_level_dirs: Vec<String> = storage
             .list_dirs(None)
-            .await
+            .await?
             .into_iter()
             .filter(|dir| dir != ".hoodie")
             .collect();
         let mut partition_paths = Vec::new();
         for dir in top_level_dirs {
-            partition_paths.extend(get_leaf_dirs(storage, Some(&dir)).await);
+            partition_paths.extend(get_leaf_dirs(storage, Some(&dir)).await?);
         }
         if partition_paths.is_empty() {
             partition_paths.push("".to_string())
@@ -94,7 +94,7 @@ impl FileSystemView {
     ) -> Result<Vec<FileGroup>> {
         let file_info: Vec<FileInfo> = storage
             .list_files(Some(partition_path))
-            .await
+            .await?
             .into_iter()
             .filter(|f| f.name.ends_with(".parquet"))
             .collect();
@@ -152,13 +152,10 @@ impl FileSystemView {
     pub async fn read_file_slice_by_path_unchecked(
         &self,
         relative_path: &str,
-    ) -> Result<Vec<RecordBatch>> {
-        Ok(self.storage.get_parquet_file_data(relative_path).await)
+    ) -> Result<RecordBatch> {
+        self.storage.get_parquet_file_data(relative_path).await
     }
-    pub async fn read_file_slice_unchecked(
-        &self,
-        file_slice: &FileSlice,
-    ) -> Result<Vec<RecordBatch>> {
+    pub async fn read_file_slice_unchecked(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
         self.read_file_slice_by_path_unchecked(&file_slice.base_file_relative_path())
             .await
     }

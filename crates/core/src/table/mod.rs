@@ -85,7 +85,7 @@ impl Table {
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<HashMap<String, String>> {
         let storage = Storage::new(base_url, storage_options)?;
-        let data = storage.get_file_data(".hoodie/hoodie.properties").await;
+        let data = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let cursor = std::io::Cursor::new(data);
         let lines = BufReader::new(cursor).lines();
         let mut properties: HashMap<String, String> = HashMap::new();
@@ -146,7 +146,7 @@ impl Table {
         let mut batches = Vec::new();
         for f in file_slices {
             match self.file_system_view.read_file_slice_unchecked(&f).await {
-                Ok(batch) => batches.extend(batch),
+                Ok(batch) => batches.push(batch),
                 Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
             }
         }
@@ -162,7 +162,7 @@ impl Table {
         Ok(file_paths)
     }
 
-    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<Vec<RecordBatch>> {
+    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<RecordBatch> {
         self.file_system_view
             .read_file_slice_by_path_unchecked(relative_path)
             .await
@@ -329,9 +329,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches.first().unwrap().num_rows(), 4);
-        assert_eq!(batches.first().unwrap().num_columns(), 21);
+        assert_eq!(batches.num_rows(), 4);
+        assert_eq!(batches.num_columns(), 21);
     }
 
     #[tokio::test]
