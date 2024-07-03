@@ -22,7 +22,7 @@ use crate::table::Table;
 pub mod file_group;
 pub mod table;
 pub type HudiTable = Table;
-mod storage;
+pub mod storage;
 
 pub fn crate_version() -> &'static str {
     env!("CARGO_PKG_VERSION")

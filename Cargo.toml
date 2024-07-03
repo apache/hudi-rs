@@ -30,27 +30,27 @@ rust-version = "1.75.0"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "50", features = ["pyarrow"] }
-arrow-arith = { version = "50" }
-arrow-array = { version = "50", features = ["chrono-tz"] }
-arrow-buffer = { version = "50" }
-arrow-cast = { version = "50" }
-arrow-ipc = { version = "50" }
-arrow-json = { version = "50" }
-arrow-ord = { version = "50" }
-arrow-row = { version = "50" }
-arrow-schema = { version = "50" }
-arrow-select = { version = "50" }
-object_store = { version = "0.9.1" }
-parquet = { version = "50" }
+arrow = { version = "52.0.0", features = ["pyarrow"]}
+arrow-arith = { version = "52.0.0" }
+arrow-array = { version = "52.0.0", features = ["chrono-tz"] }
+arrow-buffer = { version = "52.0.0" }
+arrow-cast = { version = "52.0.0" }
+arrow-ipc = { version = "52.0.0" }
+arrow-json = { version = "52.0.0" }
+arrow-ord = { version = "52.0.0" }
+arrow-row = { version = "52.0.0" }
+arrow-schema = { version = "52.0.0" }
+arrow-select = { version = "52.0.0" }
+object_store = { version = "0.10.1" }
+parquet = { version = "52.0.0" }
 
 # datafusion
-datafusion = { version = "35" }
-datafusion-expr = { version = "35" }
-datafusion-common = { version = "35" }
-datafusion-proto = { version = "35" }
-datafusion-sql = { version = "35" }
-datafusion-physical-expr = { version = "35" }
+datafusion = { version = "39.0.0" }
+datafusion-expr = { version = "39.0.0" }
+datafusion-common = { version = "39.0.0" }
+datafusion-proto = { version = "39.0.0" }
+datafusion-sql = { version = "39.0.0" }
+datafusion-physical-expr = { version = "39.0.0" }
 
 # serde
 serde = { version = "1.0.203", features = ["derive"] }

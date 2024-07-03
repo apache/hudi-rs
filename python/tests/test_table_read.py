@@ -36,7 +36,7 @@ def test_sample_table(get_sample_table):
     assert len(file_slices) == 5
     assert set(f.commit_time for f in file_slices) == {'20240402123035233', '20240402144910683'}
     assert all(f.num_records == 1 for f in file_slices)
-    file_slice_paths = [f.base_file_relative_path for f in file_slices]
+    file_slice_paths = [f.base_file_relative_path() for f in file_slices]
     assert set(file_slice_paths) == {'chennai/68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0_4-12-0_20240402123035233.parquet',
                                      'san_francisco/d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0_1-9-0_20240402123035233.parquet',
                                      'san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet',
