@@ -48,7 +48,7 @@ def test_sample_table(get_sample_table):
     assert t.num_rows == 1
     assert t.num_columns == 11
 
-    file_slices_gen = table.split_file_slices(2)
+    file_slices_gen = iter(table.split_file_slices(2))
     assert len(next(file_slices_gen)) == 3
     assert len(next(file_slices_gen)) == 2
 

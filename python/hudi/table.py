@@ -18,12 +18,10 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union, List, Iterator, Optional, Dict
+from typing import Union, List, Optional, Dict
 
 import pyarrow
-
 from hudi._internal import BindingHudiTable, HudiFileSlice
-from hudi._utils import split_list
 
 
 @dataclass(init=False)
@@ -39,10 +37,8 @@ class HudiTable:
     def get_schema(self) -> "pyarrow.Schema":
         return self._table.get_schema()
 
-    def split_file_slices(self, n: int) -> Iterator[List[HudiFileSlice]]:
-        file_slices = self.get_file_slices()
-        for split in split_list(file_slices, n):
-            yield split
+    def split_file_slices(self, n: int) -> List[List[HudiFileSlice]]:
+        return self._table.split_file_slices(n)
 
     def get_file_slices(self) -> List[HudiFileSlice]:
         return self._table.get_file_slices()

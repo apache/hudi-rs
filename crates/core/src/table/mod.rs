@@ -112,6 +112,17 @@ impl Table {
         self.timeline.get_latest_schema().await
     }
 
+    pub async fn split_file_slices(&self, n: usize) -> Result<Vec<Vec<FileSlice>>> {
+        let n = std::cmp::max(1, n);
+        let file_slices = self.get_file_slices().await?;
+        let chunk_size = (file_slices.len() + n - 1) / n;
+
+        Ok(file_slices
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect())
+    }
+
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
         if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
             self.get_file_slices_as_of(timestamp).await

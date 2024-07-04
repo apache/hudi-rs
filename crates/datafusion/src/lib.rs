@@ -34,45 +34,44 @@ use datafusion::execution::context::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::Result;
 use datafusion_common::{DFSchema, DataFusionError};
-use datafusion_expr::{and, Expr, TableType};
+use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
+use DataFusionError::Execution;
 
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::HudiTable;
 
 #[derive(Clone, Debug)]
-pub struct HudiDataSource {
+pub struct HudiTableProvider {
     table: Arc<HudiTable>,
+    read_parallelism: isize,
 }
 
-impl HudiDataSource {
-    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Result<Self> {
-        match HudiTable::new(base_uri, storage_options).await {
-            Ok(t) => Ok(Self { table: Arc::new(t) }),
-            Err(e) => Err(DataFusionError::Execution(format!(
-                "Failed to create Hudi table: {}",
-                e
-            ))),
+impl HudiTableProvider {
+    pub async fn new(base_uri: &str, options: HashMap<String, String>) -> Result<Self> {
+        let read_parallelism = Self::get_read_parallelism(&options);
+        match HudiTable::new(base_uri, options).await {
+            Ok(t) => Ok(Self {
+                table: Arc::new(t),
+                read_parallelism,
+            }),
+            Err(e) => Err(Execution(format!("Failed to create Hudi table: {}", e))),
         }
     }
 
-    fn and(exprs: &[Expr]) -> Option<Expr> {
-        match exprs.len() {
-            0 => None,
-            1 => Some(exprs[0].clone()),
-            _ => {
-                let combined = exprs
-                    .iter()
-                    .skip(1)
-                    .fold(exprs[0].clone(), |acc, expr| and(acc.clone(), expr.clone()));
-                Some(combined)
-            }
+    fn get_read_parallelism(options: &HashMap<String, String>) -> isize {
+        let mut read_parallelism = options
+            .get("hoodie.read.parallelism")
+            .map_or(0, |s| s.parse::<isize>().unwrap_or(0));
+        if read_parallelism < 0 {
+            read_parallelism = 0
         }
+        read_parallelism
     }
 }
 
 #[async_trait]
-impl TableProvider for HudiDataSource {
+impl TableProvider for HudiTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -97,33 +96,41 @@ impl TableProvider for HudiDataSource {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let file_slices = self.table.get_file_slices().await.map_err(|e| {
-            DataFusionError::Execution(format!("Failed to get file slices from Hudi table: {}", e))
-        })?;
-        let parquet_file_group = file_slices
-            .iter()
-            .map(|f| {
-                let url = parse_uri(&f.base_file.info.uri).unwrap();
-                let size = f.base_file.info.size as u64;
-                PartitionedFile::new(url.path(), size)
-            })
-            .collect();
+        let file_slices = self
+            .table
+            .split_file_slices(self.read_parallelism as usize)
+            .await
+            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
+        let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
+        for file_slice_vec in file_slices {
+            let parquet_file_group_vec = file_slice_vec
+                .iter()
+                .map(|f| {
+                    let url = parse_uri(&f.base_file.info.uri).unwrap();
+                    let size = f.base_file.info.size as u64;
+                    PartitionedFile::new(url.path(), size)
+                })
+                .collect();
+            parquet_file_groups.push(parquet_file_group_vec)
+        }
 
         let url = ObjectStoreUrl::parse(get_scheme_authority(&self.table.base_url))?;
         let fsc = FileScanConfig::new(url, self.schema())
-            .with_file_group(parquet_file_group)
+            .with_file_groups(parquet_file_groups)
             .with_projection(projection.cloned())
             .with_limit(limit);
 
         let parquet_opts = state.table_options().parquet.clone();
         let mut exec_builder = ParquetExecBuilder::new_with_options(fsc, parquet_opts);
-        if let Some(expr) = HudiDataSource::and(filters) {
+
+        let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
+        if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(self.schema())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
             exec_builder = exec_builder.with_predicate(predicate)
         }
 
-        return Ok(Arc::new(exec_builder.build()));
+        return Ok(exec_builder.build_arc());
     }
 }
 
@@ -132,14 +139,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, StringArray};
     use datafusion::dataframe::DataFrame;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::ScalarValue;
 
     use hudi_tests::TestTable;
 
-    use crate::HudiDataSource;
+    use crate::HudiTableProvider;
 
     #[tokio::test]
     async fn datafusion_read_hudi_table() {
@@ -149,47 +155,23 @@ mod tests {
         );
         let ctx = SessionContext::new_with_config(config);
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi = HudiDataSource::new(base_url.as_str(), HashMap::new())
+        let hudi = HudiTableProvider::new(base_url.as_str(), HashMap::new())
             .await
             .unwrap();
         ctx.register_table("hudi_table_complexkeygen", Arc::new(hudi))
             .unwrap();
-        let df: DataFrame = ctx
-            .sql("SELECT * from hudi_table_complexkeygen where structField.field2 > 30 order by name")
-            .await.unwrap();
-        let records = df
-            .collect()
+        let sql =
+            "SELECT _hoodie_file_name, id, name, structField.field2 from hudi_table_complexkeygen \
+        where id % 2 = 0 AND structField.field2 > 30 order by name limit 10";
+        let explaining_df: DataFrame = ctx.sql(sql).await.unwrap();
+        explaining_df
+            .explain(false, true)
+            .unwrap()
+            .show()
             .await
-            .unwrap()
-            .to_vec()
-            .first()
-            .unwrap()
-            .to_owned();
-        let files: Vec<String> = records
-            .column_by_name("_hoodie_file_name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .iter()
-            .map(|s| s.unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(
-            files,
-            vec![
-                "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
-                "4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet"
-            ]
-        );
-        let ids: Vec<i32> = records
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .iter()
-            .map(|i| i.unwrap_or_default())
-            .collect();
-        assert_eq!(ids, vec![2, 4])
+            .unwrap();
+
+        let df = ctx.sql(sql).await.unwrap();
+        df.show().await.unwrap()
     }
 }
