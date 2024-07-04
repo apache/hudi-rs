@@ -19,7 +19,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -29,6 +28,7 @@ use arrow_schema::Schema;
 use url::Url;
 
 use crate::file_group::FileSlice;
+use crate::storage::utils::parse_uri;
 use crate::storage::Storage;
 use crate::table::config::BaseFileFormat;
 use crate::table::config::{ConfigKey, TableType};
@@ -52,9 +52,7 @@ pub struct Table {
 
 impl Table {
     pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Result<Self> {
-        let base_url = Url::from_file_path(PathBuf::from(base_uri))
-            .map_err(|_| anyhow!("Failed to create table URL: {}", base_uri))?;
-        let base_url = Arc::new(base_url);
+        let base_url = Arc::new(parse_uri(base_uri)?);
         let storage_options = Arc::new(storage_options);
 
         let props = Self::load_properties(base_url.clone(), storage_options.clone())
@@ -112,6 +110,17 @@ impl Table {
 
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
+    }
+
+    pub async fn split_file_slices(&self, n: usize) -> Result<Vec<Vec<FileSlice>>> {
+        let n = std::cmp::max(1, n);
+        let file_slices = self.get_file_slices().await?;
+        let chunk_size = (file_slices.len() + n - 1) / n;
+
+        Ok(file_slices
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect())
     }
 
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {

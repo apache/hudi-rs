@@ -37,9 +37,9 @@ use url::Url;
 use crate::storage::file_info::FileInfo;
 use crate::storage::utils::join_url_segments;
 
-pub(crate) mod file_info;
-pub(crate) mod file_stats;
-pub(crate) mod utils;
+pub mod file_info;
+pub mod file_stats;
+pub mod utils;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(file_info.name, "a.parquet");
         assert_eq!(
             file_info.uri,
-            storage.base_url.join("a.parquet").unwrap().to_string()
+            storage.base_url.join("a.parquet").unwrap().as_ref()
         );
         assert_eq!(file_info.size, 866);
     }

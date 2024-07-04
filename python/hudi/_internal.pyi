@@ -33,7 +33,6 @@ class HudiFileSlice:
     base_file_size: int
     num_records: int
 
-    @property
     def base_file_relative_path(self) -> str: ...
 
 
@@ -46,6 +45,8 @@ class BindingHudiTable:
     ): ...
 
     def get_schema(self) -> "pyarrow.Schema": ...
+
+    def split_file_slices(self, n: int) -> List[List[HudiFileSlice]]: ...
 
     def get_file_slices(self) -> List[HudiFileSlice]: ...
 

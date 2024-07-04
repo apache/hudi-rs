@@ -104,6 +104,16 @@ impl BindingHudiTable {
         rt().block_on(self._table.get_schema())?.to_pyarrow(py)
     }
 
+    pub fn split_file_slices(&self, n: usize, py: Python) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        py.allow_threads(|| {
+            let file_slices = rt().block_on(self._table.split_file_slices(n))?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
+                .collect())
+        })
+    }
+
     pub fn get_file_slices(&self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(self._table.get_file_slices())?;
@@ -134,7 +144,7 @@ fn rust_core_version() -> &'static str {
 
 #[cfg(not(tarpaulin))]
 #[pymodule]
-fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
 
