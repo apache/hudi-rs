@@ -413,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_table_metadata() {
         let base_path =
-            canonicalize(Path::new("fixtures/table_metadata/sample_table_properties")).unwrap();
+            canonicalize(Path::new("tests/data/table_metadata/sample_table_properties")).unwrap();
         let table = Table::new(base_path.to_str().unwrap(), HashMap::new())
             .await
             .unwrap();
