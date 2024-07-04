@@ -38,40 +38,34 @@ use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
 use DataFusionError::Execution;
 
+use hudi_core::config::HudiConfig::ReadInputPartitions;
+use hudi_core::config::OptionsParser;
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::HudiTable;
 
 #[derive(Clone, Debug)]
-pub struct HudiTableProvider {
+pub struct HudiDataSource {
     table: Arc<HudiTable>,
-    read_parallelism: isize,
+    input_partitions: usize,
 }
 
-impl HudiTableProvider {
+impl HudiDataSource {
     pub async fn new(base_uri: &str, options: HashMap<String, String>) -> Result<Self> {
-        let read_parallelism = Self::get_read_parallelism(&options);
+        let input_partitions = ReadInputPartitions
+            .parse_value_or_default(&options)
+            .cast::<usize>();
         match HudiTable::new(base_uri, options).await {
             Ok(t) => Ok(Self {
                 table: Arc::new(t),
-                read_parallelism,
+                input_partitions,
             }),
             Err(e) => Err(Execution(format!("Failed to create Hudi table: {}", e))),
         }
     }
-
-    fn get_read_parallelism(options: &HashMap<String, String>) -> isize {
-        let mut read_parallelism = options
-            .get("hoodie.read.parallelism")
-            .map_or(0, |s| s.parse::<isize>().unwrap_or(0));
-        if read_parallelism < 0 {
-            read_parallelism = 0
-        }
-        read_parallelism
-    }
 }
 
 #[async_trait]
-impl TableProvider for HudiTableProvider {
+impl TableProvider for HudiDataSource {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -98,7 +92,7 @@ impl TableProvider for HudiTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let file_slices = self
             .table
-            .split_file_slices(self.read_parallelism as usize)
+            .split_file_slices(self.input_partitions)
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
@@ -139,39 +133,92 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use datafusion::dataframe::DataFrame;
+    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::ScalarValue;
+    use datafusion_common::{DataFusionError, Result, ScalarValue};
 
+    use hudi_core::config::HudiConfig;
     use hudi_tests::TestTable;
 
-    use crate::HudiTableProvider;
+    use crate::HudiDataSource;
 
     #[tokio::test]
-    async fn datafusion_read_hudi_table() {
+    async fn datafusion_read_hudi_table() -> Result<(), DataFusionError> {
         let config = SessionConfig::new().set(
             "datafusion.sql_parser.enable_ident_normalization",
             ScalarValue::from(false),
         );
         let ctx = SessionContext::new_with_config(config);
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi = HudiTableProvider::new(base_url.as_str(), HashMap::new())
-            .await
-            .unwrap();
-        ctx.register_table("hudi_table_complexkeygen", Arc::new(hudi))
-            .unwrap();
-        let sql =
-            "SELECT _hoodie_file_name, id, name, structField.field2 from hudi_table_complexkeygen \
-        where id % 2 = 0 AND structField.field2 > 30 order by name limit 10";
-        let explaining_df: DataFrame = ctx.sql(sql).await.unwrap();
-        explaining_df
-            .explain(false, true)
-            .unwrap()
-            .show()
-            .await
-            .unwrap();
+        let hudi = HudiDataSource::new(
+            base_url.as_str(),
+            HashMap::from([(
+                HudiConfig::ReadInputPartitions.as_ref().to_string(),
+                "2".to_string(),
+            )]),
+        )
+        .await?;
+        ctx.register_table("hudi_table_complexkeygen", Arc::new(hudi))?;
+        let sql = r#"
+        SELECT _hoodie_file_name, id, name, structField.field2
+        FROM hudi_table_complexkeygen WHERE id % 2 = 0
+        AND structField.field2 > 30 ORDER BY name LIMIT 10"#;
 
-        let df = ctx.sql(sql).await.unwrap();
-        df.show().await.unwrap()
+        // verify plan
+        let explaining_df = ctx.sql(sql).await?.explain(false, true).unwrap();
+        let explaining_rb = explaining_df.collect().await?;
+        let explaining_rb = explaining_rb.first().unwrap();
+        let plan = get_str_column(explaining_rb, "plan").join("");
+        let plan_lines: Vec<&str> = plan.lines().map(str::trim).collect();
+        assert!(plan_lines[2].starts_with("SortExec: TopK(fetch=10)"));
+        assert!(plan_lines[3].starts_with("ProjectionExec: expr=[_hoodie_file_name@0 as _hoodie_file_name, id@1 as id, name@2 as name, get_field(structField@3, field2) as hudi_table_complexkeygen.structField[field2]]"));
+        assert!(plan_lines[5].starts_with(
+            "FilterExec: CAST(id@1 AS Int64) % 2 = 0 AND get_field(structField@3, field2) > 30"
+        ));
+        assert!(plan_lines[6].contains("input_partitions=2"));
+
+        // verify data
+        let df = ctx.sql(sql).await?;
+        let rb = df.collect().await?;
+        let rb = rb.first().unwrap();
+        assert_eq!(
+            get_str_column(rb, "_hoodie_file_name"),
+            &[
+                "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+                "4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet"
+            ]
+        );
+        assert_eq!(get_i32_column(rb, "id"), &[2, 4]);
+        assert_eq!(get_str_column(rb, "name"), &["Bob", "Diana"]);
+        assert_eq!(
+            get_i32_column(rb, "hudi_table_complexkeygen.structField[field2]"),
+            &[40, 50]
+        );
+
+        Ok(())
+    }
+
+    fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
+        record_batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect::<Vec<_>>()
+    }
+
+    fn get_i32_column(record_batch: &RecordBatch, name: &str) -> Vec<i32> {
+        record_batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap())
+            .collect::<Vec<_>>()
     }
 }

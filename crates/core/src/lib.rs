@@ -22,6 +22,7 @@ use crate::table::Table;
 pub mod file_group;
 pub mod table;
 pub type HudiTable = Table;
+pub mod config;
 pub mod storage;
 
 pub fn crate_version() -> &'static str {
