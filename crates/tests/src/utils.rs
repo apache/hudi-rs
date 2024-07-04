@@ -17,6 +17,9 @@
  * under the License.
  */
 
+use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
+
 #[macro_export]
 macro_rules! assert_approx_eq {
     ($a:expr, $b:expr, $delta:expr) => {{
@@ -31,4 +34,40 @@ macro_rules! assert_approx_eq {
             a, b, delta
         );
     }};
+}
+
+pub fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
+    record_batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|s| s.unwrap())
+        .collect::<Vec<_>>()
+}
+
+pub fn get_i32_column(record_batch: &RecordBatch, name: &str) -> Vec<i32> {
+    record_batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .iter()
+        .map(|s| s.unwrap())
+        .collect::<Vec<_>>()
+}
+
+pub fn get_bool_column(record_batch: &RecordBatch, name: &str) -> Vec<bool> {
+    record_batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .iter()
+        .map(|s| s.unwrap())
+        .collect::<Vec<_>>()
 }

@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn storage_list_dirs() {
         let base_url = Url::from_directory_path(
-            canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
@@ -235,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn storage_list_dirs_as_paths() {
         let base_url = Url::from_directory_path(
-            canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
@@ -258,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn storage_list_files() {
         let base_url = Url::from_directory_path(
-            canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
@@ -317,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn use_storage_to_get_leaf_dirs() {
         let base_url = Url::from_directory_path(
-            canonicalize(Path::new("fixtures/timeline/commits_stub")).unwrap(),
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
@@ -331,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn use_storage_to_get_leaf_dirs_for_leaf_dir() {
         let base_url =
-            Url::from_directory_path(canonicalize(Path::new("fixtures/leaf_dir")).unwrap())
+            Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
@@ -345,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn storage_get_file_info() {
         let base_url =
-            Url::from_directory_path(canonicalize(Path::new("fixtures")).unwrap()).unwrap();
+            Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
         let file_info = storage.get_file_info("a.parquet").await.unwrap();
         assert_eq!(file_info.name, "a.parquet");
@@ -359,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn storage_get_parquet_file_data() {
         let base_url =
-            Url::from_directory_path(canonicalize(Path::new("fixtures")).unwrap()).unwrap();
+            Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
         let file_data = storage.get_parquet_file_data("a.parquet").await.unwrap();
         assert_eq!(file_data.num_rows(), 5);

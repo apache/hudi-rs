@@ -24,7 +24,6 @@ rust-version.workspace = true
 
 [dependencies]
 hudi-core = { path = "../core" }
-hudi-tests = { path = "../tests" }
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }
@@ -67,3 +66,6 @@ chrono = { workspace = true, default-features = false, features = ["clock"] }
 regex = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 url = { workspace = true }
+
+[dev-dependencies]
+hudi-tests = { path = "../tests" }

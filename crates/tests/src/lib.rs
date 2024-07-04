@@ -21,6 +21,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use strum_macros::{AsRefStr, EnumIter, EnumString};
 use tempfile::tempdir;
 use url::Url;
 
@@ -29,51 +30,54 @@ pub mod utils;
 pub fn extract_test_table(zip_path: &Path) -> PathBuf {
     let target_dir = tempdir().unwrap().path().to_path_buf();
     let archive = fs::read(zip_path).unwrap();
-    zip_extract::extract(Cursor::new(archive), &target_dir, true).unwrap();
+    zip_extract::extract(Cursor::new(archive), &target_dir, false).unwrap();
     target_dir
 }
 
+#[derive(Debug, EnumString, AsRefStr, EnumIter)]
+#[strum(serialize_all = "snake_case")]
 pub enum TestTable {
     V6ComplexkeygenHivestyle,
     V6Empty,
     V6Nonpartitioned,
+    V6SimplekeygenHivestyleNoMetafields,
+    V6SimplekeygenNonhivestyle,
+    V6TimebasedkeygenNonhivestyle,
 }
 
 impl TestTable {
     pub fn zip_path(&self) -> Box<Path> {
         let dir = env!("CARGO_MANIFEST_DIR");
-        let data_path = Path::new(dir).join("data/tables");
-        match self {
-            Self::V6ComplexkeygenHivestyle => data_path
-                .join("v6_complexkeygen_hivestyle.zip")
-                .into_boxed_path(),
-            Self::V6Empty => data_path.join("v6_empty.zip").into_boxed_path(),
-            Self::V6Nonpartitioned => data_path.join("v6_nonpartitioned.zip").into_boxed_path(),
-        }
+        let data_path = Path::new(dir)
+            .join("data/tables")
+            .join(format!("{}.zip", self.as_ref()));
+        data_path.into_boxed_path()
     }
 
     pub fn path(&self) -> String {
         let zip_path = self.zip_path();
-        match self {
-            Self::V6ComplexkeygenHivestyle => extract_test_table(&zip_path)
-                .join("v6_complexkeygen_hivestyle")
-                .to_str()
-                .unwrap()
-                .to_string(),
-            Self::V6Empty => extract_test_table(&zip_path)
-                .join("v6_empty")
-                .to_str()
-                .unwrap()
-                .to_string(),
-            Self::V6Nonpartitioned => extract_test_table(&zip_path)
-                .join("v6_nonpartitioned")
-                .to_str()
-                .unwrap()
-                .to_string(),
-        }
+        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+        path_buf.to_str().unwrap().to_string()
     }
 
     pub fn url(&self) -> Url {
-        Url::from_file_path(self.path()).unwrap()
+        let path = self.path();
+        Url::from_file_path(path).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use strum::IntoEnumIterator;
+
+    use crate::TestTable;
+
+    #[test]
+    fn test_table_zip_file_should_exist() {
+        for t in TestTable::iter() {
+            let path = t.zip_path();
+            assert!(path.exists());
+            assert!(path.is_file());
+        }
     }
 }
