@@ -215,9 +215,10 @@ mod tests {
 
     #[tokio::test]
     async fn init_commits_timeline() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap())
-                .unwrap();
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
+        )
+        .unwrap();
         let timeline = Timeline::new(
             Arc::new(base_url),
             Arc::new(HashMap::new()),

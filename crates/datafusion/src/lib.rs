@@ -133,92 +133,102 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{DataFusionError, Result, ScalarValue};
+    use datafusion_common::ScalarValue;
 
-    use hudi_core::config::HudiConfig;
-    use hudi_tests::TestTable;
+    use hudi_core::config::HudiConfig::ReadInputPartitions;
+    use hudi_tests::utils::get_bool_column;
+    use hudi_tests::TestTable::{
+        V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields, V6SimplekeygenNonhivestyle,
+        V6TimebasedkeygenNonhivestyle,
+    };
+    use hudi_tests::{utils, TestTable};
+    use utils::{get_i32_column, get_str_column};
+    use TestTable::V6ComplexkeygenHivestyle;
 
     use crate::HudiDataSource;
 
-    #[tokio::test]
-    async fn datafusion_read_hudi_table() -> Result<(), DataFusionError> {
+    async fn prepare_session_context(
+        test_table: &TestTable,
+        options: &[(String, String)],
+    ) -> SessionContext {
         let config = SessionConfig::new().set(
             "datafusion.sql_parser.enable_ident_normalization",
             ScalarValue::from(false),
         );
         let ctx = SessionContext::new_with_config(config);
-        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi = HudiDataSource::new(
-            base_url.as_str(),
-            HashMap::from([(
-                HudiConfig::ReadInputPartitions.as_ref().to_string(),
-                "2".to_string(),
-            )]),
-        )
-        .await?;
-        ctx.register_table("hudi_table_complexkeygen", Arc::new(hudi))?;
-        let sql = r#"
-        SELECT _hoodie_file_name, id, name, structField.field2
-        FROM hudi_table_complexkeygen WHERE id % 2 = 0
-        AND structField.field2 > 30 ORDER BY name LIMIT 10"#;
+        let base_url = test_table.url();
+        let options = HashMap::from_iter(options.iter().cloned().collect::<HashMap<_, _>>());
+        let hudi = HudiDataSource::new(base_url.as_str(), options)
+            .await
+            .unwrap();
+        ctx.register_table(test_table.as_ref(), Arc::new(hudi))
+            .unwrap();
+        ctx
+    }
 
-        // verify plan
-        let explaining_df = ctx.sql(sql).await?.explain(false, true).unwrap();
-        let explaining_rb = explaining_df.collect().await?;
+    async fn verify_plan(
+        ctx: &SessionContext,
+        sql: &str,
+        table_name: &str,
+        planned_input_partitioned: &i32,
+    ) {
+        let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
+        let explaining_rb = explaining_df.collect().await.unwrap();
         let explaining_rb = explaining_rb.first().unwrap();
         let plan = get_str_column(explaining_rb, "plan").join("");
         let plan_lines: Vec<&str> = plan.lines().map(str::trim).collect();
         assert!(plan_lines[2].starts_with("SortExec: TopK(fetch=10)"));
-        assert!(plan_lines[3].starts_with("ProjectionExec: expr=[_hoodie_file_name@0 as _hoodie_file_name, id@1 as id, name@2 as name, get_field(structField@3, field2) as hudi_table_complexkeygen.structField[field2]]"));
+        assert!(plan_lines[3].starts_with(&format!(
+            "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
+            get_field(structField@3, field2) as {}.structField[field2]]",
+            table_name
+        )));
         assert!(plan_lines[5].starts_with(
-            "FilterExec: CAST(id@1 AS Int64) % 2 = 0 AND get_field(structField@3, field2) > 30"
+            "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND get_field(structField@3, field2) > 30"
         ));
-        assert!(plan_lines[6].contains("input_partitions=2"));
+        assert!(plan_lines[6].contains(&format!("input_partitions={}", planned_input_partitioned)));
+    }
 
-        // verify data
-        let df = ctx.sql(sql).await?;
-        let rb = df.collect().await?;
+    async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
+        let df = ctx.sql(sql).await.unwrap();
+        let rb = df.collect().await.unwrap();
         let rb = rb.first().unwrap();
-        assert_eq!(
-            get_str_column(rb, "_hoodie_file_name"),
-            &[
-                "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
-                "4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet"
-            ]
-        );
         assert_eq!(get_i32_column(rb, "id"), &[2, 4]);
         assert_eq!(get_str_column(rb, "name"), &["Bob", "Diana"]);
+        assert_eq!(get_bool_column(rb, "isActive"), &[false, true]);
         assert_eq!(
-            get_i32_column(rb, "hudi_table_complexkeygen.structField[field2]"),
+            get_i32_column(rb, &format!("{}.structField[field2]", table_name)),
             &[40, 50]
         );
-
-        Ok(())
     }
 
-    fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
-        record_batch
-            .column_by_name(name)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .iter()
-            .map(|s| s.unwrap())
-            .collect::<Vec<_>>()
-    }
+    #[tokio::test]
+    async fn datafusion_read_hudi_table() {
+        for (test_table, planned_input_partitions) in &[
+            (V6ComplexkeygenHivestyle, 2),
+            (V6Nonpartitioned, 1),
+            (V6SimplekeygenNonhivestyle, 2),
+            (V6SimplekeygenHivestyleNoMetafields, 2),
+            (V6TimebasedkeygenNonhivestyle, 2),
+        ] {
+            println!(">>> testing for {}", test_table.as_ref());
+            let ctx = prepare_session_context(
+                test_table,
+                &[(ReadInputPartitions.as_ref().to_string(), "2".to_string())],
+            )
+            .await;
 
-    fn get_i32_column(record_batch: &RecordBatch, name: &str) -> Vec<i32> {
-        record_batch
-            .column_by_name(name)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .iter()
-            .map(|s| s.unwrap())
-            .collect::<Vec<_>>()
+            let sql = format!(
+                r#"
+            SELECT id, name, isActive, structField.field2
+            FROM {} WHERE id % 2 = 0
+            AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
+                test_table.as_ref()
+            );
+
+            verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
+            verify_data(&ctx, &sql, test_table.as_ref()).await
+        }
     }
 }

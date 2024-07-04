@@ -57,7 +57,7 @@ impl Table {
 
         let props = Self::load_properties(base_url.clone(), storage_options.clone())
             .await
-            .context("Failed to create a table")?;
+            .context("Failed to load table properties")?;
 
         let props = Arc::new(props);
         let timeline = Timeline::new(base_url.clone(), storage_options.clone(), props.clone())
@@ -412,8 +412,10 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_table_metadata() {
-        let base_path =
-            canonicalize(Path::new("tests/data/table_metadata/sample_table_properties")).unwrap();
+        let base_path = canonicalize(Path::new(
+            "tests/data/table_metadata/sample_table_properties",
+        ))
+        .unwrap();
         let table = Table::new(base_path.to_str().unwrap(), HashMap::new())
             .await
             .unwrap();
