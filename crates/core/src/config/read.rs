@@ -79,10 +79,7 @@ mod tests {
     #[test]
     fn parse_valid_config_value() {
         let options = HashMap::from([(InputPartitions.as_ref().to_string(), "100".to_string())]);
-        let value = InputPartitions
-            .parse_value(&options)
-            .unwrap()
-            .cast::<usize>();
+        let value = InputPartitions.parse_value(&options).unwrap().to::<usize>();
         assert_eq!(value, 100usize);
     }
 
@@ -97,7 +94,7 @@ mod tests {
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)
-                .cast::<usize>(),
+                .to::<usize>(),
             0
         );
     }

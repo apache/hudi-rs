@@ -53,7 +53,7 @@ impl HudiDataSource {
     pub async fn new(base_uri: &str, options: HashMap<String, String>) -> Result<Self> {
         let input_partitions = InputPartitions
             .parse_value_or_default(&options)
-            .cast::<usize>();
+            .to::<usize>();
         match HudiTable::new(base_uri, options).await {
             Ok(t) => Ok(Self {
                 table: Arc::new(t),

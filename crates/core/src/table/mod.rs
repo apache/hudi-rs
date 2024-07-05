@@ -406,20 +406,20 @@ mod tests {
         assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
         assert_eq!(
-            configs.get_or_default(DatabaseName).cast::<String>(),
+            configs.get_or_default(DatabaseName).to::<String>(),
             "default"
         );
-        assert_not!(configs.get_or_default(DropsPartitionFields).cast::<bool>());
+        assert_not!(configs.get_or_default(DropsPartitionFields).to::<bool>());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(PartitionFields)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
-        assert!(configs.get_or_default(PopulatesMetaFields).cast::<bool>());
+        assert!(configs.get_or_default(PopulatesMetaFields).to::<bool>());
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(TableName)).is_err());
         assert_eq!(
-            configs.get_or_default(TableType).cast::<String>(),
+            configs.get_or_default(TableType).to::<String>(),
             "COPY_ON_WRITE"
         );
         assert!(panic::catch_unwind(|| configs.get_or_default(TableVersion)).is_err());
@@ -434,40 +434,34 @@ mod tests {
         let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
         let configs = table.configs;
         assert_eq!(
-            configs.get(BaseFileFormat).unwrap().cast::<String>(),
+            configs.get(BaseFileFormat).unwrap().to::<String>(),
             "parquet"
         );
-        assert_eq!(configs.get(Checksum).unwrap().cast::<isize>(), 3761586722);
-        assert_eq!(configs.get(DatabaseName).unwrap().cast::<String>(), "db");
-        assert!(!configs.get(DropsPartitionFields).unwrap().cast::<bool>());
-        assert!(!configs.get(IsHiveStylePartitioning).unwrap().cast::<bool>());
-        assert!(!configs
-            .get(IsPartitionPathUrlencoded)
-            .unwrap()
-            .cast::<bool>());
+        assert_eq!(configs.get(Checksum).unwrap().to::<isize>(), 3761586722);
+        assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "db");
+        assert!(!configs.get(DropsPartitionFields).unwrap().to::<bool>());
+        assert!(!configs.get(IsHiveStylePartitioning).unwrap().to::<bool>());
+        assert!(!configs.get(IsPartitionPathUrlencoded).unwrap().to::<bool>());
         assert_eq!(
-            configs.get(KeyGeneratorClass).unwrap().cast::<String>(),
+            configs.get(KeyGeneratorClass).unwrap().to::<String>(),
             "org.apache.hudi.keygen.SimpleKeyGenerator"
         );
         assert_eq!(
-            configs.get(PartitionFields).unwrap().cast::<Vec<String>>(),
+            configs.get(PartitionFields).unwrap().to::<Vec<String>>(),
             vec!["city"]
         );
-        assert_eq!(configs.get(PrecombineField).unwrap().cast::<String>(), "ts");
-        assert!(configs.get(PopulatesMetaFields).unwrap().cast::<bool>());
+        assert_eq!(configs.get(PrecombineField).unwrap().to::<String>(), "ts");
+        assert!(configs.get(PopulatesMetaFields).unwrap().to::<bool>());
         assert_eq!(
-            configs.get(RecordKeyFields).unwrap().cast::<Vec<String>>(),
+            configs.get(RecordKeyFields).unwrap().to::<Vec<String>>(),
             vec!["uuid"]
         );
-        assert_eq!(configs.get(TableName).unwrap().cast::<String>(), "trips");
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
         assert_eq!(
-            configs.get(TableType).unwrap().cast::<String>(),
+            configs.get(TableType).unwrap().to::<String>(),
             "COPY_ON_WRITE"
         );
-        assert_eq!(configs.get(TableVersion).unwrap().cast::<isize>(), 6);
-        assert_eq!(
-            configs.get(TimelineLayoutVersion).unwrap().cast::<isize>(),
-            1
-        );
+        assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
+        assert_eq!(configs.get(TimelineLayoutVersion).unwrap().to::<isize>(), 1);
     }
 }

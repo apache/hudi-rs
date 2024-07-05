@@ -68,7 +68,7 @@ pub enum HudiConfigValue {
 }
 
 impl HudiConfigValue {
-    pub fn cast<T: 'static + std::fmt::Debug + From<HudiConfigValue>>(self) -> T {
+    pub fn to<T: 'static + std::fmt::Debug + From<HudiConfigValue>>(self) -> T {
         T::from(self)
     }
 }
