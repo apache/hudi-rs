@@ -321,6 +321,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_invalid_table_props() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
+                .unwrap();
+        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let configs = table.configs;
+        assert!(
+            configs.validate(BaseFileFormat).is_err(),
+            "required config is missing"
+        );
+        assert!(configs.validate(Checksum).is_err());
+        assert!(
+            configs.validate(DatabaseName).is_ok(),
+            "non-required config is missing"
+        );
+        assert!(configs.validate(DropsPartitionFields).is_err());
+        assert!(configs.validate(IsHiveStylePartitioning).is_err());
+        assert!(configs.validate(IsPartitionPathUrlencoded).is_err());
+        assert!(
+            configs.validate(KeyGeneratorClass).is_ok(),
+            "non-required config is missing"
+        );
+        assert!(
+            configs.validate(PartitionFields).is_ok(),
+            "non-required config is missing"
+        );
+        assert!(
+            configs.validate(PrecombineField).is_ok(),
+            "non-required config is missing"
+        );
+        assert!(
+            configs.validate(PopulatesMetaFields).is_ok(),
+            "non-required config is missing"
+        );
+        assert!(
+            configs.validate(RecordKeyFields).is_ok(),
+            "non-required config is missing"
+        );
+        assert!(
+            configs.validate(TableName).is_err(),
+            "required config is missing"
+        );
+        assert!(configs.validate(TableType).is_err());
+        assert!(configs.validate(TableVersion).is_err());
+        assert!(configs.validate(TimelineLayoutVersion).is_err());
+    }
+
+    #[tokio::test]
     async fn get_invalid_table_props() {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
