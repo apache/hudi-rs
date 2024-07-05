@@ -29,6 +29,7 @@ use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use url::Url;
 
+use crate::config::HudiConfigs;
 use crate::storage::utils::split_filename;
 use crate::storage::Storage;
 
@@ -76,7 +77,7 @@ impl Instant {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Timeline {
-    props: Arc<HashMap<String, String>>,
+    configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     pub instants: Vec<Instant>,
 }
@@ -85,13 +86,13 @@ impl Timeline {
     pub async fn new(
         base_url: Arc<Url>,
         storage_options: Arc<HashMap<String, String>>,
-        props: Arc<HashMap<String, String>>,
+        configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
         let storage = Storage::new(base_url, storage_options)?;
         let instants = Self::load_completed_commit_instants(&storage).await?;
         Ok(Self {
             storage,
-            props,
+            configs,
             instants,
         })
     }
@@ -179,6 +180,7 @@ mod tests {
 
     use hudi_tests::TestTable;
 
+    use crate::config::HudiConfigs;
     use crate::table::timeline::{Instant, State, Timeline};
 
     #[tokio::test]
@@ -187,7 +189,7 @@ mod tests {
         let timeline = Timeline::new(
             Arc::new(base_url),
             Arc::new(HashMap::new()),
-            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::empty()),
         )
         .await
         .unwrap();
@@ -201,7 +203,7 @@ mod tests {
         let timeline = Timeline::new(
             Arc::new(base_url),
             Arc::new(HashMap::new()),
-            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::empty()),
         )
         .await
         .unwrap();
@@ -222,7 +224,7 @@ mod tests {
         let timeline = Timeline::new(
             Arc::new(base_url),
             Arc::new(HashMap::new()),
-            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::empty()),
         )
         .await
         .unwrap();

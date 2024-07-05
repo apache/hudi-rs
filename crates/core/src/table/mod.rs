@@ -19,7 +19,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -27,14 +26,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use url::Url;
 
-use HudiTableConfig::{
-    BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
-    IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
-    PrecombineField, RecordKeyFields, TableName, TableType, TableVersion, TimelineLayoutVersion,
-};
-
-use crate::config::table::TablePropsProvider;
-use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
+use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
 use crate::storage::utils::parse_uri;
 use crate::storage::Storage;
@@ -44,11 +36,11 @@ use crate::table::timeline::Timeline;
 mod fs_view;
 mod timeline;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Table {
     pub base_url: Arc<Url>,
     pub storage_options: Arc<HashMap<String, String>>,
-    pub props: Arc<HashMap<String, String>>,
+    pub configs: Arc<HudiConfigs>,
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
 }
@@ -58,24 +50,24 @@ impl Table {
         let base_url = Arc::new(parse_uri(base_uri)?);
         let storage_options = Arc::new(storage_options);
 
-        let props = Self::load_properties(base_url.clone(), storage_options.clone())
+        let configs = Self::load_properties(base_url.clone(), storage_options.clone())
             .await
             .context("Failed to load table properties")?;
+        let configs = Arc::new(configs);
 
-        let props = Arc::new(props);
-        let timeline = Timeline::new(base_url.clone(), storage_options.clone(), props.clone())
+        let timeline = Timeline::new(base_url.clone(), storage_options.clone(), configs.clone())
             .await
             .context("Failed to load timeline")?;
 
         let file_system_view =
-            FileSystemView::new(base_url.clone(), storage_options.clone(), props.clone())
+            FileSystemView::new(base_url.clone(), storage_options.clone(), configs.clone())
                 .await
                 .context("Failed to load file system view")?;
 
         Ok(Table {
             base_url,
             storage_options,
-            props,
+            configs,
             timeline,
             file_system_view,
         })
@@ -84,7 +76,7 @@ impl Table {
     async fn load_properties(
         base_url: Arc<Url>,
         storage_options: Arc<HashMap<String, String>>,
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<HudiConfigs> {
         let storage = Storage::new(base_url, storage_options)?;
         let data = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let cursor = std::io::Cursor::new(data);
@@ -101,11 +93,7 @@ impl Table {
             let value = parts.next().unwrap_or("").to_owned();
             properties.insert(key, value);
         }
-        Ok(properties)
-    }
-
-    pub fn get_property(&self, key: &str) -> Option<&String> {
-        self.props.get(key)
+        Ok(HudiConfigs::new(properties))
     }
 
     pub async fn get_schema(&self) -> Result<Schema> {
@@ -178,126 +166,6 @@ impl Table {
     }
 }
 
-impl TablePropsProvider for Table {
-    fn base_file_format(&self) -> BaseFileFormatValue {
-        let v = self
-            .get_property(BaseFileFormat.as_ref())
-            .unwrap_or_else(|| panic!("Missing {}", BaseFileFormat.as_ref()));
-        BaseFileFormatValue::from_str(v)
-            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", BaseFileFormat.as_ref(), e))
-    }
-
-    fn checksum(&self) -> Option<i64> {
-        self.get_property(Checksum.as_ref()).map(|v| {
-            i64::from_str(v)
-                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", Checksum.as_ref(), e))
-        })
-    }
-
-    fn database_name(&self) -> Option<String> {
-        self.props.get(DatabaseName.as_ref()).cloned()
-    }
-
-    fn drops_partition_fields(&self) -> Option<bool> {
-        self.get_property(DropsPartitionFields.as_ref()).map(|v| {
-            bool::from_str(v).unwrap_or_else(|e| {
-                panic!("Failed to parse {}: {}", DropsPartitionFields.as_ref(), e)
-            })
-        })
-    }
-
-    fn is_hive_style_partitioning(&self) -> Option<bool> {
-        self.get_property(IsHiveStylePartitioning.as_ref())
-            .map(|v| {
-                bool::from_str(v).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to parse {}: {}",
-                        IsHiveStylePartitioning.as_ref(),
-                        e
-                    )
-                })
-            })
-    }
-
-    fn is_partition_path_urlencoded(&self) -> Option<bool> {
-        self.get_property(IsPartitionPathUrlencoded.as_ref())
-            .map(|v| {
-                bool::from_str(v).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to parse {}: {}",
-                        IsPartitionPathUrlencoded.as_ref(),
-                        e
-                    )
-                })
-            })
-    }
-
-    fn is_partitioned(&self) -> Option<bool> {
-        self.key_generator_class()
-            .map(|v| !v.ends_with("NonpartitionedKeyGenerator"))
-    }
-
-    fn key_generator_class(&self) -> Option<String> {
-        self.get_property(KeyGeneratorClass.as_ref()).cloned()
-    }
-
-    fn location(&self) -> String {
-        self.base_url.as_str().to_string()
-    }
-
-    fn partition_fields(&self) -> Option<Vec<String>> {
-        self.get_property(PartitionFields.as_ref())
-            .map(|s| s.split(',').map(str::to_string).collect())
-    }
-
-    fn precombine_field(&self) -> Option<String> {
-        self.get_property(PrecombineField.as_ref()).cloned()
-    }
-
-    fn populates_meta_fields(&self) -> Option<bool> {
-        self.get_property(PopulatesMetaFields.as_ref()).map(|v| {
-            bool::from_str(v).unwrap_or_else(|e| {
-                panic!("Failed to parse {}: {}", PopulatesMetaFields.as_ref(), e)
-            })
-        })
-    }
-
-    fn record_key_fields(&self) -> Option<Vec<String>> {
-        self.get_property(RecordKeyFields.as_ref())
-            .map(|s| s.split(',').map(str::to_string).collect())
-    }
-
-    fn table_name(&self) -> String {
-        self.get_property(TableName.as_ref())
-            .unwrap_or_else(|| panic!("Missing {}", TableName.as_ref()))
-            .clone()
-    }
-
-    fn table_type(&self) -> TableTypeValue {
-        let v = self
-            .get_property(TableType.as_ref())
-            .unwrap_or_else(|| panic!("Missing {}", TableType.as_ref()));
-        TableTypeValue::from_str(v)
-            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", TableType.as_ref(), e))
-    }
-
-    fn table_version(&self) -> i32 {
-        let v = self
-            .get_property(TableVersion.as_ref())
-            .unwrap_or_else(|| panic!("Missing {}", TableVersion.as_ref()));
-        i32::from_str(v)
-            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", TableVersion.as_ref(), e))
-    }
-
-    fn timeline_layout_version(&self) -> Option<i32> {
-        self.get_property(TimelineLayoutVersion.as_ref()).map(|v| {
-            i32::from_str(v).unwrap_or_else(|e| {
-                panic!("Failed to parse {}: {}", TimelineLayoutVersion.as_ref(), e)
-            })
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -308,9 +176,12 @@ mod tests {
 
     use hudi_tests::TestTable;
 
-    use crate::config::table::BaseFileFormatValue::Parquet;
-    use crate::config::table::TablePropsProvider;
-    use crate::config::table::TableTypeValue::CopyOnWrite;
+    use crate::config::table::HudiTableConfig::{
+        BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
+        IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
+        PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
+        TimelineLayoutVersion,
+    };
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
 
@@ -450,34 +321,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_table_props() {
-        let base_url = Url::from_file_path(
-            canonicalize(Path::new(
-                "tests/data/table_metadata/sample_table_properties",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
+    async fn get_invalid_table_props() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
+                .unwrap();
         let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
-        assert_eq!(table.base_file_format(), Parquet);
-        assert_eq!(table.checksum().unwrap(), 3761586722);
-        assert!(table.database_name().is_none());
-        assert!(!table.drops_partition_fields().unwrap());
-        assert!(!table.is_hive_style_partitioning().unwrap());
-        assert!(!table.is_partition_path_urlencoded().unwrap());
-        assert!(table.is_partitioned().unwrap());
+        let configs = table.configs;
+        assert!(configs.get(BaseFileFormat).is_err());
+        assert!(configs.get(Checksum).is_err());
+        assert!(configs.get(DatabaseName).is_err());
+        assert!(configs.get(DropsPartitionFields).is_err());
+        assert!(configs.get(IsHiveStylePartitioning).is_err());
+        assert!(configs.get(IsPartitionPathUrlencoded).is_err());
+        assert!(configs.get(KeyGeneratorClass).is_err());
+        assert!(configs.get(PartitionFields).is_err());
+        assert!(configs.get(PrecombineField).is_err());
+        assert!(configs.get(PopulatesMetaFields).is_err());
+        assert!(configs.get(RecordKeyFields).is_err());
+        assert!(configs.get(TableName).is_err());
+        assert!(configs.get(TableType).is_err());
+        assert!(configs.get(TableVersion).is_err());
+        assert!(configs.get(TimelineLayoutVersion).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_valid_table_props() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
+                .unwrap();
+        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let configs = table.configs;
         assert_eq!(
-            table.key_generator_class().unwrap(),
+            configs.get(BaseFileFormat).unwrap().cast::<String>(),
+            "parquet"
+        );
+        assert_eq!(configs.get(Checksum).unwrap().cast::<isize>(), 3761586722);
+        assert_eq!(configs.get(DatabaseName).unwrap().cast::<String>(), "db");
+        assert!(!configs.get(DropsPartitionFields).unwrap().cast::<bool>());
+        assert!(!configs.get(IsHiveStylePartitioning).unwrap().cast::<bool>());
+        assert!(!configs
+            .get(IsPartitionPathUrlencoded)
+            .unwrap()
+            .cast::<bool>());
+        assert_eq!(
+            configs.get(KeyGeneratorClass).unwrap().cast::<String>(),
             "org.apache.hudi.keygen.SimpleKeyGenerator"
         );
-        assert_eq!(table.location(), base_url.as_str());
-        assert_eq!(table.partition_fields().unwrap(), vec!["city"]);
-        assert_eq!(table.precombine_field().unwrap(), "ts");
-        assert!(table.populates_meta_fields().unwrap());
-        assert_eq!(table.record_key_fields().unwrap(), vec!["uuid"]);
-        assert_eq!(table.table_name(), "trips");
-        assert_eq!(table.table_type(), CopyOnWrite);
-        assert_eq!(table.table_version(), 6);
-        assert_eq!(table.timeline_layout_version().unwrap(), 1);
+        assert_eq!(
+            configs.get(PartitionFields).unwrap().cast::<Vec<String>>(),
+            vec!["city"]
+        );
+        assert_eq!(configs.get(PrecombineField).unwrap().cast::<String>(), "ts");
+        assert!(configs.get(PopulatesMetaFields).unwrap().cast::<bool>());
+        assert_eq!(
+            configs.get(RecordKeyFields).unwrap().cast::<Vec<String>>(),
+            vec!["uuid"]
+        );
+        assert_eq!(configs.get(TableName).unwrap().cast::<String>(), "trips");
+        assert_eq!(
+            configs.get(TableType).unwrap().cast::<String>(),
+            "COPY_ON_WRITE"
+        );
+        assert_eq!(configs.get(TableVersion).unwrap().cast::<isize>(), 6);
+        assert_eq!(
+            configs.get(TimelineLayoutVersion).unwrap().cast::<isize>(),
+            1
+        );
     }
 }

@@ -39,7 +39,7 @@ use datafusion_physical_expr::create_physical_expr;
 use DataFusionError::Execution;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
-use hudi_core::config::OptionsParser;
+use hudi_core::config::ConfigParser;
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::HudiTable;
 
@@ -137,14 +137,12 @@ mod tests {
     use datafusion_common::ScalarValue;
 
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
-    use hudi_tests::utils::get_bool_column;
     use hudi_tests::TestTable::{
-        V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields, V6SimplekeygenNonhivestyle,
-        V6TimebasedkeygenNonhivestyle,
+        V6ComplexkeygenHivestyle, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
+        V6SimplekeygenNonhivestyle, V6TimebasedkeygenNonhivestyle,
     };
     use hudi_tests::{utils, TestTable};
-    use utils::{get_i32_column, get_str_column};
-    use TestTable::V6ComplexkeygenHivestyle;
+    use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
 

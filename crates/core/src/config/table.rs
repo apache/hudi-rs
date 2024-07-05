@@ -17,10 +17,14 @@
  * under the License.
  */
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use strum_macros::AsRefStr;
+
+use crate::config::{ConfigParser, HudiConfigValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HudiTableConfig {
@@ -63,9 +67,76 @@ impl AsRef<str> for HudiTableConfig {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl ConfigParser for HudiTableConfig {
+    type Output = HudiConfigValue;
+
+    fn default_value(&self) -> Option<Self::Output> {
+        match self {
+            Self::DatabaseName => Some(HudiConfigValue::String("default".to_string())),
+            Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
+            Self::PopulatesMetaFields => Some(HudiConfigValue::Boolean(true)),
+            _ => None,
+        }
+    }
+
+    fn is_required(&self) -> bool {
+        matches!(
+            self,
+            Self::BaseFileFormat | Self::TableName | Self::TableType | Self::TableVersion
+        )
+    }
+
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
+        let get_result = configs
+            .get(self.as_ref())
+            .map(|v| v.as_str())
+            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+
+        match self {
+            Self::BaseFileFormat => get_result
+                .and_then(BaseFileFormatValue::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
+            Self::Checksum => get_result
+                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Integer),
+            Self::DatabaseName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::DropsPartitionFields => get_result
+                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Boolean),
+            Self::IsHiveStylePartitioning => get_result
+                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Boolean),
+            Self::IsPartitionPathUrlencoded => get_result
+                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Boolean),
+            Self::KeyGeneratorClass => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::PartitionFields => get_result
+                .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
+            Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::PopulatesMetaFields => get_result
+                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Boolean),
+            Self::RecordKeyFields => get_result
+                .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
+            Self::TableName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::TableType => get_result
+                .and_then(TableTypeValue::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
+            Self::TableVersion => get_result
+                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Integer),
+            Self::TimelineLayoutVersion => get_result
+                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .map(HudiConfigValue::Integer),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum TableTypeValue {
+    #[strum(serialize = "COPY_ON_WRITE")]
     CopyOnWrite,
+    #[strum(serialize = "MERGE_ON_READ")]
     MergeOnRead,
 }
 
@@ -81,8 +152,9 @@ impl FromStr for TableTypeValue {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum BaseFileFormatValue {
+    #[strum(serialize = "parquet")]
     Parquet,
 }
 
@@ -95,42 +167,6 @@ impl FromStr for BaseFileFormatValue {
             _ => Err(anyhow!("Unsupported base file format: {}", s)),
         }
     }
-}
-
-pub trait TablePropsProvider {
-    fn base_file_format(&self) -> BaseFileFormatValue;
-
-    fn checksum(&self) -> Option<i64>;
-
-    fn database_name(&self) -> Option<String>;
-
-    fn drops_partition_fields(&self) -> Option<bool>;
-
-    fn is_hive_style_partitioning(&self) -> Option<bool>;
-
-    fn is_partition_path_urlencoded(&self) -> Option<bool>;
-
-    fn is_partitioned(&self) -> Option<bool>;
-
-    fn key_generator_class(&self) -> Option<String>;
-
-    fn location(&self) -> String;
-
-    fn partition_fields(&self) -> Option<Vec<String>>;
-
-    fn precombine_field(&self) -> Option<String>;
-
-    fn populates_meta_fields(&self) -> Option<bool>;
-
-    fn record_key_fields(&self) -> Option<Vec<String>>;
-
-    fn table_name(&self) -> String;
-
-    fn table_type(&self) -> TableTypeValue;
-
-    fn table_version(&self) -> i32;
-
-    fn timeline_layout_version(&self) -> Option<i32>;
 }
 
 #[cfg(test)]

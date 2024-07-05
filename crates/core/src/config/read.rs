@@ -18,22 +18,15 @@
  */
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, Result};
 
-use crate::config::{HudiConfigValue, OptionsParser};
+use crate::config::{ConfigParser, HudiConfigValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HudiReadConfig {
     InputPartitions,
-}
-
-impl HudiReadConfig {
-    fn default_value(&self) -> Option<HudiConfigValue> {
-        match self {
-            Self::InputPartitions => Some(HudiConfigValue::Integer(0)),
-        }
-    }
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -44,29 +37,35 @@ impl AsRef<str> for HudiReadConfig {
     }
 }
 
-impl OptionsParser for HudiReadConfig {
+impl ConfigParser for HudiReadConfig {
     type Output = HudiConfigValue;
 
-    fn parse_value(&self, options: &HashMap<String, String>) -> anyhow::Result<Self::Output> {
+    fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
-            HudiReadConfig::InputPartitions => options.get(self.as_ref()).map_or_else(
-                || Err(anyhow!("Config '{}' not found", self.as_ref())),
-                |v| {
-                    v.parse::<isize>()
-                        .map(HudiConfigValue::Integer)
-                        .with_context(|| {
-                            format!("Failed to parse '{}' for config '{}'", v, self.as_ref())
-                        })
-                },
-            ),
+            HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
         }
     }
 
-    fn parse_value_or_default(&self, options: &HashMap<String, String>) -> Self::Output {
-        self.parse_value(options).unwrap_or_else(|_| {
-            self.default_value()
-                .unwrap_or_else(|| panic!("No default value for config '{}'", self.as_ref()))
-        })
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
+        let get_result = configs
+            .get(self.as_ref())
+            .map(|v| v.as_str())
+            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+
+        match self {
+            HudiReadConfig::InputPartitions => get_result
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| {
+                        anyhow!(
+                            "Failed to parse '{}' for config '{}': {}",
+                            v,
+                            self.as_ref(),
+                            e
+                        )
+                    })
+                })
+                .map(HudiConfigValue::UInteger),
+        }
     }
 }
 
@@ -75,7 +74,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::config::read::HudiReadConfig::InputPartitions;
-    use crate::config::OptionsParser;
+    use crate::config::ConfigParser;
 
     #[test]
     fn parse_valid_config_value() {
@@ -91,17 +90,14 @@ mod tests {
     fn parse_invalid_config_value() {
         let options = HashMap::from([(InputPartitions.as_ref().to_string(), "foo".to_string())]);
         let value = InputPartitions.parse_value(&options);
-        assert_eq!(
-            value.err().unwrap().to_string(),
-            format!(
-                "Failed to parse 'foo' for config '{}'",
-                InputPartitions.as_ref()
-            )
-        );
+        assert!(value.err().unwrap().to_string().starts_with(&format!(
+            "Failed to parse 'foo' for config '{}'",
+            InputPartitions.as_ref()
+        )));
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)
-                .cast::<isize>(),
+                .cast::<usize>(),
             0
         );
     }
