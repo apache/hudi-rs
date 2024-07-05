@@ -16,103 +16,144 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use std::any::type_name;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 
-pub trait OptionsParser {
+pub mod read;
+pub mod table;
+
+pub trait ConfigParser: AsRef<str> {
     type Output;
 
-    fn parse_value(&self, options: &HashMap<String, String>) -> Result<Self::Output>;
+    fn default_value(&self) -> Option<Self::Output>;
 
-    fn parse_value_or_default(&self, options: &HashMap<String, String>) -> Self::Output;
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum HudiConfig {
-    ReadInputPartitions,
-}
-
-#[derive(Debug)]
-pub enum HudiConfigValue {
-    Integer(isize),
-}
-
-impl HudiConfigValue {
-    pub fn cast<T: 'static + TryFrom<isize> + TryFrom<usize> + std::fmt::Debug>(&self) -> T {
-        match self {
-            HudiConfigValue::Integer(value) => T::try_from(*value).unwrap_or_else(|_| {
-                panic!("Failed to convert isize to {}", std::any::type_name::<T>())
-            }),
-        }
+    fn is_required(&self) -> bool {
+        false
     }
-}
 
-impl HudiConfig {
-    fn default_value(&self) -> Option<HudiConfigValue> {
-        match self {
-            Self::ReadInputPartitions => Some(HudiConfigValue::Integer(0)),
-        }
-    }
-}
-
-impl AsRef<str> for HudiConfig {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::ReadInputPartitions => "hoodie.read.input.partitions",
-        }
-    }
-}
-
-impl OptionsParser for HudiConfig {
-    type Output = HudiConfigValue;
-
-    fn parse_value(&self, options: &HashMap<String, String>) -> Result<Self::Output> {
-        match self {
-            HudiConfig::ReadInputPartitions => options.get(self.as_ref()).map_or_else(
-                || Err(anyhow!("Config '{}' not found", self.as_ref())),
-                |v| {
-                    v.parse::<isize>()
-                        .map(HudiConfigValue::Integer)
-                        .with_context(|| {
-                            format!("Failed to parse '{}' for config '{}'", v, self.as_ref())
-                        })
-                },
-            ),
+    fn validate(&self, configs: &HashMap<String, String>) -> Result<()> {
+        match self.parse_value(configs) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if !self.is_required() && e.to_string().ends_with("not found") {
+                    // TODO: introduce error type to avoid checking "not found"
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 
-    fn parse_value_or_default(&self, options: &HashMap<String, String>) -> Self::Output {
-        self.parse_value(options).unwrap_or_else(|_| {
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output>;
+
+    fn parse_value_or_default(&self, configs: &HashMap<String, String>) -> Self::Output {
+        self.parse_value(configs).unwrap_or_else(|_| {
             self.default_value()
                 .unwrap_or_else(|| panic!("No default value for config '{}'", self.as_ref()))
         })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::config::HudiConfig::ReadInputPartitions;
-    use crate::config::OptionsParser;
-    use std::collections::HashMap;
+#[derive(Debug)]
+pub enum HudiConfigValue {
+    Boolean(bool),
+    Integer(isize),
+    UInteger(usize),
+    String(String),
+    List(Vec<String>),
+}
 
-    #[test]
-    fn parse_invalid_config_value() {
-        let options =
-            HashMap::from([(ReadInputPartitions.as_ref().to_string(), "foo".to_string())]);
-        let value = ReadInputPartitions.parse_value(&options);
-        assert_eq!(
-            value.err().unwrap().to_string(),
-            format!(
-                "Failed to parse 'foo' for config '{}'",
-                ReadInputPartitions.as_ref()
-            )
-        );
-        assert_eq!(
-            ReadInputPartitions
-                .parse_value_or_default(&options)
-                .cast::<isize>(),
-            0
-        );
+impl HudiConfigValue {
+    pub fn to<T: 'static + std::fmt::Debug + From<HudiConfigValue>>(self) -> T {
+        T::from(self)
+    }
+}
+
+impl From<HudiConfigValue> for bool {
+    fn from(value: HudiConfigValue) -> Self {
+        match value {
+            HudiConfigValue::Boolean(v) => v,
+            _ => panic!("Cannot cast {:?} to {}", value, type_name::<Self>()),
+        }
+    }
+}
+
+impl From<HudiConfigValue> for isize {
+    fn from(value: HudiConfigValue) -> Self {
+        match value {
+            HudiConfigValue::Integer(v) => v,
+            _ => panic!("Cannot cast {:?} to {}", value, type_name::<Self>()),
+        }
+    }
+}
+
+impl From<HudiConfigValue> for usize {
+    fn from(value: HudiConfigValue) -> Self {
+        match value {
+            HudiConfigValue::UInteger(v) => v,
+            _ => panic!("Cannot cast {:?} to {}", value, type_name::<Self>()),
+        }
+    }
+}
+
+impl From<HudiConfigValue> for String {
+    fn from(value: HudiConfigValue) -> Self {
+        match value {
+            HudiConfigValue::Boolean(v) => v.to_string(),
+            HudiConfigValue::Integer(v) => v.to_string(),
+            HudiConfigValue::UInteger(v) => v.to_string(),
+            HudiConfigValue::String(v) => v,
+            _ => panic!("Cannot cast {:?} to {}", value, type_name::<Self>()),
+        }
+    }
+}
+
+impl From<HudiConfigValue> for Vec<String> {
+    fn from(value: HudiConfigValue) -> Self {
+        match value {
+            HudiConfigValue::List(v) => v,
+            _ => panic!("Cannot cast {:?} to {}", value, type_name::<Self>()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HudiConfigs {
+    pub raw_configs: Arc<HashMap<String, String>>,
+}
+
+impl HudiConfigs {
+    pub fn new(raw_configs: HashMap<String, String>) -> Self {
+        Self {
+            raw_configs: Arc::new(raw_configs),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            raw_configs: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub fn validate(&self, parser: impl ConfigParser<Output = HudiConfigValue>) -> Result<()> {
+        parser.validate(&self.raw_configs)
+    }
+
+    pub fn get(
+        &self,
+        parser: impl ConfigParser<Output = HudiConfigValue>,
+    ) -> Result<HudiConfigValue> {
+        parser.parse_value(&self.raw_configs)
+    }
+
+    pub fn get_or_default(
+        &self,
+        parser: impl ConfigParser<Output = HudiConfigValue>,
+    ) -> HudiConfigValue {
+        parser.parse_value_or_default(&self.raw_configs)
     }
 }

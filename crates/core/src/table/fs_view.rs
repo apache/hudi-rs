@@ -25,6 +25,7 @@ use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use url::Url;
 
+use crate::config::HudiConfigs;
 use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
@@ -32,7 +33,7 @@ use crate::storage::{get_leaf_dirs, Storage};
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct FileSystemView {
-    props: Arc<HashMap<String, String>>,
+    configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
 }
@@ -41,7 +42,7 @@ impl FileSystemView {
     pub async fn new(
         base_url: Arc<Url>,
         storage_options: Arc<HashMap<String, String>>,
-        props: Arc<HashMap<String, String>>,
+        configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
         let storage = Storage::new(base_url, storage_options)?;
         let partition_paths = Self::load_partition_paths(&storage).await?;
@@ -49,7 +50,7 @@ impl FileSystemView {
             Self::load_file_groups_for_partitions(&storage, partition_paths).await?;
         let partition_to_file_groups = Arc::new(DashMap::from_iter(partition_to_file_groups));
         Ok(FileSystemView {
-            props,
+            configs,
             storage,
             partition_to_file_groups,
         })
@@ -168,6 +169,7 @@ mod tests {
 
     use hudi_tests::TestTable;
 
+    use crate::config::HudiConfigs;
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
 
@@ -208,7 +210,7 @@ mod tests {
         let fs_view = FileSystemView::new(
             Arc::new(base_url),
             Arc::new(HashMap::new()),
-            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::empty()),
         )
         .await
         .unwrap();

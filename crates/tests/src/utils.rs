@@ -21,6 +21,20 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
 
 #[macro_export]
+macro_rules! assert_not {
+    ($cond:expr) => {
+        if $cond {
+            panic!("assertion failed: condition is true");
+        }
+    };
+    ($cond:expr, $($arg:tt)+) => {
+        if $cond {
+            panic!("assertion failed: condition is true: {}", format_args!($($arg)+));
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! assert_approx_eq {
     ($a:expr, $b:expr, $delta:expr) => {{
         let a = $a;

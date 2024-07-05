@@ -38,8 +38,8 @@ use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
 use DataFusionError::Execution;
 
-use hudi_core::config::HudiConfig::ReadInputPartitions;
-use hudi_core::config::OptionsParser;
+use hudi_core::config::read::HudiReadConfig::InputPartitions;
+use hudi_core::config::ConfigParser;
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::HudiTable;
 
@@ -51,9 +51,9 @@ pub struct HudiDataSource {
 
 impl HudiDataSource {
     pub async fn new(base_uri: &str, options: HashMap<String, String>) -> Result<Self> {
-        let input_partitions = ReadInputPartitions
+        let input_partitions = InputPartitions
             .parse_value_or_default(&options)
-            .cast::<usize>();
+            .to::<usize>();
         match HudiTable::new(base_uri, options).await {
             Ok(t) => Ok(Self {
                 table: Arc::new(t),
@@ -136,15 +136,13 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::ScalarValue;
 
-    use hudi_core::config::HudiConfig::ReadInputPartitions;
-    use hudi_tests::utils::get_bool_column;
+    use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_tests::TestTable::{
-        V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields, V6SimplekeygenNonhivestyle,
-        V6TimebasedkeygenNonhivestyle,
+        V6ComplexkeygenHivestyle, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
+        V6SimplekeygenNonhivestyle, V6TimebasedkeygenNonhivestyle,
     };
     use hudi_tests::{utils, TestTable};
-    use utils::{get_i32_column, get_str_column};
-    use TestTable::V6ComplexkeygenHivestyle;
+    use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
 
@@ -215,7 +213,7 @@ mod tests {
             println!(">>> testing for {}", test_table.as_ref());
             let ctx = prepare_session_context(
                 test_table,
-                &[(ReadInputPartitions.as_ref().to_string(), "2".to_string())],
+                &[(InputPartitions.as_ref().to_string(), "2".to_string())],
             )
             .await;
 
