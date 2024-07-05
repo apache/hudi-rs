@@ -170,11 +170,12 @@ impl Table {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs::canonicalize;
+    use std::panic;
     use std::path::Path;
 
     use url::Url;
 
-    use hudi_tests::TestTable;
+    use hudi_tests::{assert_not, TestTable};
 
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
@@ -363,7 +364,10 @@ mod tests {
             configs.validate(TableName).is_err(),
             "required config is missing"
         );
-        assert!(configs.validate(TableType).is_err());
+        assert!(
+            configs.validate(TableType).is_ok(),
+            "Valid table type value"
+        );
         assert!(configs.validate(TableVersion).is_err());
         assert!(configs.validate(TimelineLayoutVersion).is_err());
     }
@@ -387,9 +391,39 @@ mod tests {
         assert!(configs.get(PopulatesMetaFields).is_err());
         assert!(configs.get(RecordKeyFields).is_err());
         assert!(configs.get(TableName).is_err());
-        assert!(configs.get(TableType).is_err());
+        assert!(configs.get(TableType).is_ok(), "Valid table type value");
         assert!(configs.get(TableVersion).is_err());
         assert!(configs.get(TimelineLayoutVersion).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_default_for_invalid_table_props() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
+                .unwrap();
+        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let configs = table.configs;
+        assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
+        assert_eq!(
+            configs.get_or_default(DatabaseName).cast::<String>(),
+            "default"
+        );
+        assert_not!(configs.get_or_default(DropsPartitionFields).cast::<bool>());
+        assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(PartitionFields)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
+        assert!(configs.get_or_default(PopulatesMetaFields).cast::<bool>());
+        assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(TableName)).is_err());
+        assert_eq!(
+            configs.get_or_default(TableType).cast::<String>(),
+            "COPY_ON_WRITE"
+        );
+        assert!(panic::catch_unwind(|| configs.get_or_default(TableVersion)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(TimelineLayoutVersion)).is_err());
     }
 
     #[tokio::test]
