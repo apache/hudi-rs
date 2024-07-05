@@ -17,11 +17,13 @@
  * under the License.
  */
 
-use anyhow::anyhow;
-use anyhow::Result;
 use std::str::FromStr;
 
-pub enum ConfigKey {
+use anyhow::anyhow;
+use anyhow::Result;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HudiTableConfig {
     BaseFileFormat,
     Checksum,
     DatabaseName,
@@ -39,7 +41,7 @@ pub enum ConfigKey {
     TimelineLayoutVersion,
 }
 
-impl AsRef<str> for ConfigKey {
+impl AsRef<str> for HudiTableConfig {
     fn as_ref(&self) -> &str {
         match self {
             Self::BaseFileFormat => "hoodie.table.base.file.format",
@@ -62,12 +64,12 @@ impl AsRef<str> for ConfigKey {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum TableType {
+pub enum TableTypeValue {
     CopyOnWrite,
     MergeOnRead,
 }
 
-impl FromStr for TableType {
+impl FromStr for TableTypeValue {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
@@ -80,11 +82,11 @@ impl FromStr for TableType {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum BaseFileFormat {
+pub enum BaseFileFormatValue {
     Parquet,
 }
 
-impl FromStr for BaseFileFormat {
+impl FromStr for BaseFileFormatValue {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
@@ -94,50 +96,94 @@ impl FromStr for BaseFileFormat {
         }
     }
 }
+
+pub trait TablePropsProvider {
+    fn base_file_format(&self) -> BaseFileFormatValue;
+
+    fn checksum(&self) -> Option<i64>;
+
+    fn database_name(&self) -> Option<String>;
+
+    fn drops_partition_fields(&self) -> Option<bool>;
+
+    fn is_hive_style_partitioning(&self) -> Option<bool>;
+
+    fn is_partition_path_urlencoded(&self) -> Option<bool>;
+
+    fn is_partitioned(&self) -> Option<bool>;
+
+    fn key_generator_class(&self) -> Option<String>;
+
+    fn location(&self) -> String;
+
+    fn partition_fields(&self) -> Option<Vec<String>>;
+
+    fn precombine_field(&self) -> Option<String>;
+
+    fn populates_meta_fields(&self) -> Option<bool>;
+
+    fn record_key_fields(&self) -> Option<Vec<String>>;
+
+    fn table_name(&self) -> String;
+
+    fn table_type(&self) -> TableTypeValue;
+
+    fn table_version(&self) -> i32;
+
+    fn timeline_layout_version(&self) -> Option<i32>;
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::table::config::{BaseFileFormat, TableType};
     use std::str::FromStr;
+
+    use crate::config::table::{BaseFileFormatValue, TableTypeValue};
 
     #[test]
     fn create_table_type() {
-        assert_eq!(TableType::from_str("cow").unwrap(), TableType::CopyOnWrite);
         assert_eq!(
-            TableType::from_str("copy_on_write").unwrap(),
-            TableType::CopyOnWrite
+            TableTypeValue::from_str("cow").unwrap(),
+            TableTypeValue::CopyOnWrite
         );
         assert_eq!(
-            TableType::from_str("COPY-ON-WRITE").unwrap(),
-            TableType::CopyOnWrite
-        );
-        assert_eq!(TableType::from_str("MOR").unwrap(), TableType::MergeOnRead);
-        assert_eq!(
-            TableType::from_str("Merge_on_read").unwrap(),
-            TableType::MergeOnRead
+            TableTypeValue::from_str("copy_on_write").unwrap(),
+            TableTypeValue::CopyOnWrite
         );
         assert_eq!(
-            TableType::from_str("Merge-on-read").unwrap(),
-            TableType::MergeOnRead
+            TableTypeValue::from_str("COPY-ON-WRITE").unwrap(),
+            TableTypeValue::CopyOnWrite
         );
-        assert!(TableType::from_str("").is_err());
-        assert!(TableType::from_str("copyonwrite").is_err());
-        assert!(TableType::from_str("MERGEONREAD").is_err());
-        assert!(TableType::from_str("foo").is_err());
+        assert_eq!(
+            TableTypeValue::from_str("MOR").unwrap(),
+            TableTypeValue::MergeOnRead
+        );
+        assert_eq!(
+            TableTypeValue::from_str("Merge_on_read").unwrap(),
+            TableTypeValue::MergeOnRead
+        );
+        assert_eq!(
+            TableTypeValue::from_str("Merge-on-read").unwrap(),
+            TableTypeValue::MergeOnRead
+        );
+        assert!(TableTypeValue::from_str("").is_err());
+        assert!(TableTypeValue::from_str("copyonwrite").is_err());
+        assert!(TableTypeValue::from_str("MERGEONREAD").is_err());
+        assert!(TableTypeValue::from_str("foo").is_err());
     }
 
     #[test]
     fn create_base_file_format() {
         assert_eq!(
-            BaseFileFormat::from_str("parquet").unwrap(),
-            BaseFileFormat::Parquet
+            BaseFileFormatValue::from_str("parquet").unwrap(),
+            BaseFileFormatValue::Parquet
         );
         assert_eq!(
-            BaseFileFormat::from_str("PArquet").unwrap(),
-            BaseFileFormat::Parquet
+            BaseFileFormatValue::from_str("PArquet").unwrap(),
+            BaseFileFormatValue::Parquet
         );
-        assert!(TableType::from_str("").is_err());
+        assert!(TableTypeValue::from_str("").is_err());
         assert!(
-            TableType::from_str("orc").is_err(),
+            TableTypeValue::from_str("orc").is_err(),
             "orc is not yet supported."
         );
     }

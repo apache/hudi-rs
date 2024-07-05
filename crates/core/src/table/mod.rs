@@ -27,18 +27,21 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use url::Url;
 
+use HudiTableConfig::{
+    BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
+    IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
+    PrecombineField, RecordKeyFields, TableName, TableType, TableVersion, TimelineLayoutVersion,
+};
+
+use crate::config::table::TablePropsProvider;
+use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
 use crate::file_group::FileSlice;
 use crate::storage::utils::parse_uri;
 use crate::storage::Storage;
-use crate::table::config::BaseFileFormat;
-use crate::table::config::{ConfigKey, TableType};
 use crate::table::fs_view::FileSystemView;
-use crate::table::metadata::ProvidesTableMetadata;
 use crate::table::timeline::Timeline;
 
-mod config;
 mod fs_view;
-mod metadata;
 mod timeline;
 
 #[derive(Debug, Clone)]
@@ -101,11 +104,8 @@ impl Table {
         Ok(properties)
     }
 
-    pub fn get_property(&self, key: &str) -> &str {
-        match self.props.get(key) {
-            Some(value) => value,
-            None => panic!("Failed to retrieve property {}", key),
-        }
+    pub fn get_property(&self, key: &str) -> Option<&String> {
+        self.props.get(key)
     }
 
     pub async fn get_schema(&self) -> Result<Schema> {
@@ -178,86 +178,123 @@ impl Table {
     }
 }
 
-impl ProvidesTableMetadata for Table {
-    fn base_file_format(&self) -> BaseFileFormat {
-        BaseFileFormat::from_str(self.get_property(ConfigKey::BaseFileFormat.as_ref())).unwrap()
+impl TablePropsProvider for Table {
+    fn base_file_format(&self) -> BaseFileFormatValue {
+        let v = self
+            .get_property(BaseFileFormat.as_ref())
+            .unwrap_or_else(|| panic!("Missing {}", BaseFileFormat.as_ref()));
+        BaseFileFormatValue::from_str(v)
+            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", BaseFileFormat.as_ref(), e))
     }
 
-    fn checksum(&self) -> i64 {
-        i64::from_str(self.get_property(ConfigKey::Checksum.as_ref())).unwrap()
+    fn checksum(&self) -> Option<i64> {
+        self.get_property(Checksum.as_ref()).map(|v| {
+            i64::from_str(v)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", Checksum.as_ref(), e))
+        })
     }
 
-    fn database_name(&self) -> String {
-        match self.props.get(ConfigKey::DatabaseName.as_ref()) {
-            Some(value) => value.to_string(),
-            None => "default".to_string(),
-        }
+    fn database_name(&self) -> Option<String> {
+        self.props.get(DatabaseName.as_ref()).cloned()
     }
 
-    fn drops_partition_fields(&self) -> bool {
-        bool::from_str(self.get_property(ConfigKey::DropsPartitionFields.as_ref())).unwrap()
+    fn drops_partition_fields(&self) -> Option<bool> {
+        self.get_property(DropsPartitionFields.as_ref()).map(|v| {
+            bool::from_str(v).unwrap_or_else(|e| {
+                panic!("Failed to parse {}: {}", DropsPartitionFields.as_ref(), e)
+            })
+        })
     }
 
-    fn is_hive_style_partitioning(&self) -> bool {
-        bool::from_str(self.get_property(ConfigKey::IsHiveStylePartitioning.as_ref())).unwrap()
+    fn is_hive_style_partitioning(&self) -> Option<bool> {
+        self.get_property(IsHiveStylePartitioning.as_ref())
+            .map(|v| {
+                bool::from_str(v).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to parse {}: {}",
+                        IsHiveStylePartitioning.as_ref(),
+                        e
+                    )
+                })
+            })
     }
 
-    fn is_partition_path_urlencoded(&self) -> bool {
-        bool::from_str(self.get_property(ConfigKey::IsPartitionPathUrlencoded.as_ref())).unwrap()
+    fn is_partition_path_urlencoded(&self) -> Option<bool> {
+        self.get_property(IsPartitionPathUrlencoded.as_ref())
+            .map(|v| {
+                bool::from_str(v).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to parse {}: {}",
+                        IsPartitionPathUrlencoded.as_ref(),
+                        e
+                    )
+                })
+            })
     }
 
-    fn is_partitioned(&self) -> bool {
-        !self
-            .key_generator_class()
-            .ends_with("NonpartitionedKeyGenerator")
+    fn is_partitioned(&self) -> Option<bool> {
+        self.key_generator_class()
+            .map(|v| !v.ends_with("NonpartitionedKeyGenerator"))
     }
 
-    fn key_generator_class(&self) -> String {
-        self.get_property(ConfigKey::KeyGeneratorClass.as_ref())
-            .to_string()
+    fn key_generator_class(&self) -> Option<String> {
+        self.get_property(KeyGeneratorClass.as_ref()).cloned()
     }
 
     fn location(&self) -> String {
-        self.base_url.path().to_string()
+        self.base_url.as_str().to_string()
     }
 
-    fn partition_fields(&self) -> Vec<String> {
-        self.get_property(ConfigKey::PartitionFields.as_ref())
-            .split(',')
-            .map(str::to_string)
-            .collect()
+    fn partition_fields(&self) -> Option<Vec<String>> {
+        self.get_property(PartitionFields.as_ref())
+            .map(|s| s.split(',').map(str::to_string).collect())
     }
 
-    fn precombine_field(&self) -> String {
-        self.get_property(ConfigKey::PrecombineField.as_ref())
-            .to_string()
+    fn precombine_field(&self) -> Option<String> {
+        self.get_property(PrecombineField.as_ref()).cloned()
     }
 
-    fn populates_meta_fields(&self) -> bool {
-        bool::from_str(self.get_property(ConfigKey::PopulatesMetaFields.as_ref())).unwrap()
+    fn populates_meta_fields(&self) -> Option<bool> {
+        self.get_property(PopulatesMetaFields.as_ref()).map(|v| {
+            bool::from_str(v).unwrap_or_else(|e| {
+                panic!("Failed to parse {}: {}", PopulatesMetaFields.as_ref(), e)
+            })
+        })
     }
 
-    fn record_key_fields(&self) -> Vec<String> {
-        self.get_property(ConfigKey::RecordKeyFields.as_ref())
-            .split(',')
-            .map(str::to_string)
-            .collect()
+    fn record_key_fields(&self) -> Option<Vec<String>> {
+        self.get_property(RecordKeyFields.as_ref())
+            .map(|s| s.split(',').map(str::to_string).collect())
     }
 
     fn table_name(&self) -> String {
-        self.get_property(ConfigKey::TableName.as_ref()).to_string()
+        self.get_property(TableName.as_ref())
+            .unwrap_or_else(|| panic!("Missing {}", TableName.as_ref()))
+            .clone()
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::from_str(self.get_property(ConfigKey::TableType.as_ref())).unwrap()
+    fn table_type(&self) -> TableTypeValue {
+        let v = self
+            .get_property(TableType.as_ref())
+            .unwrap_or_else(|| panic!("Missing {}", TableType.as_ref()));
+        TableTypeValue::from_str(v)
+            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", TableType.as_ref(), e))
     }
 
-    fn table_version(&self) -> u32 {
-        u32::from_str(self.get_property(ConfigKey::TableVersion.as_ref())).unwrap()
+    fn table_version(&self) -> i32 {
+        let v = self
+            .get_property(TableVersion.as_ref())
+            .unwrap_or_else(|| panic!("Missing {}", TableVersion.as_ref()));
+        i32::from_str(v)
+            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", TableVersion.as_ref(), e))
     }
 
-    fn timeline_layout_version(&self) -> u32 {
-        u32::from_str(self.get_property(ConfigKey::TimelineLayoutVersion.as_ref())).unwrap()
+    fn timeline_layout_version(&self) -> Option<i32> {
+        self.get_property(TimelineLayoutVersion.as_ref()).map(|v| {
+            i32::from_str(v).unwrap_or_else(|e| {
+                panic!("Failed to parse {}: {}", TimelineLayoutVersion.as_ref(), e)
+            })
+        })
     }
 }
 
@@ -267,12 +304,14 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::Path;
 
+    use url::Url;
+
     use hudi_tests::TestTable;
 
+    use crate::config::table::BaseFileFormatValue::Parquet;
+    use crate::config::table::TablePropsProvider;
+    use crate::config::table::TableTypeValue::CopyOnWrite;
     use crate::storage::utils::join_url_segments;
-    use crate::table::config::BaseFileFormat::Parquet;
-    use crate::table::config::TableType::CopyOnWrite;
-    use crate::table::metadata::ProvidesTableMetadata;
     use crate::table::Table;
 
     #[tokio::test]
@@ -411,33 +450,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_table_metadata() {
-        let base_path = canonicalize(Path::new(
-            "tests/data/table_metadata/sample_table_properties",
-        ))
+    async fn hudi_table_get_table_props() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new(
+                "tests/data/table_metadata/sample_table_properties",
+            ))
+            .unwrap(),
+        )
         .unwrap();
-        let table = Table::new(base_path.to_str().unwrap(), HashMap::new())
-            .await
-            .unwrap();
+        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
         assert_eq!(table.base_file_format(), Parquet);
-        assert_eq!(table.checksum(), 3761586722);
-        assert_eq!(table.database_name(), "default");
-        assert!(!table.drops_partition_fields());
-        assert!(!table.is_hive_style_partitioning());
-        assert!(!table.is_partition_path_urlencoded());
-        assert!(table.is_partitioned());
+        assert_eq!(table.checksum().unwrap(), 3761586722);
+        assert!(table.database_name().is_none());
+        assert!(!table.drops_partition_fields().unwrap());
+        assert!(!table.is_hive_style_partitioning().unwrap());
+        assert!(!table.is_partition_path_urlencoded().unwrap());
+        assert!(table.is_partitioned().unwrap());
         assert_eq!(
-            table.key_generator_class(),
+            table.key_generator_class().unwrap(),
             "org.apache.hudi.keygen.SimpleKeyGenerator"
         );
-        assert_eq!(table.location(), base_path.to_str().unwrap());
-        assert_eq!(table.partition_fields(), vec!["city"]);
-        assert_eq!(table.precombine_field(), "ts");
-        assert!(table.populates_meta_fields());
-        assert_eq!(table.record_key_fields(), vec!["uuid"]);
+        assert_eq!(table.location(), base_url.as_str());
+        assert_eq!(table.partition_fields().unwrap(), vec!["city"]);
+        assert_eq!(table.precombine_field().unwrap(), "ts");
+        assert!(table.populates_meta_fields().unwrap());
+        assert_eq!(table.record_key_fields().unwrap(), vec!["uuid"]);
         assert_eq!(table.table_name(), "trips");
         assert_eq!(table.table_type(), CopyOnWrite);
         assert_eq!(table.table_version(), 6);
-        assert_eq!(table.timeline_layout_version(), 1);
+        assert_eq!(table.timeline_layout_version().unwrap(), 1);
     }
 }
