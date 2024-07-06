@@ -22,11 +22,11 @@ use std::str::FromStr;
 
 use anyhow::anyhow;
 use anyhow::Result;
-use strum_macros::AsRefStr;
+use strum_macros::{AsRefStr, EnumIter};
 
 use crate::config::{ConfigParser, HudiConfigValue};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiTableConfig {
     BaseFileFormat,
     Checksum,
@@ -80,10 +80,7 @@ impl ConfigParser for HudiTableConfig {
     }
 
     fn is_required(&self) -> bool {
-        matches!(
-            self,
-            Self::BaseFileFormat | Self::TableName | Self::TableType | Self::TableVersion
-        )
+        matches!(self, Self::TableName | Self::TableType | Self::TableVersion)
     }
 
     fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
