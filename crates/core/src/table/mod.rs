@@ -28,9 +28,11 @@ use arrow_schema::Schema;
 use strum::IntoEnumIterator;
 use url::Url;
 
+use HudiInternalConfig::SkipConfigValidation;
 use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
 use TableTypeValue::CopyOnWrite;
 
+use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
@@ -111,17 +113,13 @@ impl Table {
         }
         let hudi_configs = HudiConfigs::new(hudi_options);
 
-        Self::validate_configs(&hudi_configs, &extra_options).map(|_| (hudi_configs, extra_options))
+        Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, extra_options))
     }
 
-    fn validate_configs(
-        hudi_configs: &HudiConfigs,
-        extra_options: &HashMap<String, String>,
-    ) -> Result<()> {
-        if extra_options
-            .get("hoodie_internal.skip.config.validation")
-            .and_then(|v| bool::from_str(v).ok())
-            .unwrap_or(false)
+    fn validate_configs(hudi_configs: &HudiConfigs) -> Result<()> {
+        if hudi_configs
+            .get_or_default(SkipConfigValidation)
+            .to::<bool>()
         {
             return Ok(());
         }
@@ -389,7 +387,7 @@ mod tests {
         let table = Table::new(
             base_url.as_str(),
             HashMap::from_iter(vec![(
-                "hoodie_internal.skip.config.validation".to_string(),
+                "hoodie.internal.skip.config.validation".to_string(),
                 "true".to_string(),
             )]),
         )
@@ -448,7 +446,7 @@ mod tests {
         let table = Table::new(
             base_url.as_str(),
             HashMap::from_iter(vec![(
-                "hoodie_internal.skip.config.validation".to_string(),
+                "hoodie.internal.skip.config.validation".to_string(),
                 "true".to_string(),
             )]),
         )
@@ -480,7 +478,7 @@ mod tests {
         let table = Table::new(
             base_url.as_str(),
             HashMap::from_iter(vec![(
-                "hoodie_internal.skip.config.validation".to_string(),
+                "hoodie.internal.skip.config.validation".to_string(),
                 "true".to_string(),
             )]),
         )
@@ -518,7 +516,7 @@ mod tests {
         let table = Table::new(
             base_url.as_str(),
             HashMap::from_iter(vec![(
-                "hoodie_internal.skip.config.validation".to_string(),
+                "hoodie.internal.skip.config.validation".to_string(),
                 "true".to_string(),
             )]),
         )

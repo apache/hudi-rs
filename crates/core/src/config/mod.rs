@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+pub mod internal;
 pub mod read;
 pub mod table;
 
