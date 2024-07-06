@@ -19,13 +19,20 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
+use strum::IntoEnumIterator;
 use url::Url;
 
+use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
+use TableTypeValue::CopyOnWrite;
+
+use crate::config::read::HudiReadConfig;
+use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
 use crate::storage::utils::parse_uri;
@@ -39,49 +46,57 @@ mod timeline;
 #[derive(Clone, Debug)]
 pub struct Table {
     pub base_url: Arc<Url>,
-    pub storage_options: Arc<HashMap<String, String>>,
     pub configs: Arc<HudiConfigs>,
+    pub extra_options: Arc<HashMap<String, String>>,
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
 }
 
 impl Table {
-    pub async fn new(base_uri: &str, storage_options: HashMap<String, String>) -> Result<Self> {
+    pub async fn new(base_uri: &str, all_options: HashMap<String, String>) -> Result<Self> {
         let base_url = Arc::new(parse_uri(base_uri)?);
-        let storage_options = Arc::new(storage_options);
 
-        let configs = Self::load_properties(base_url.clone(), storage_options.clone())
+        let (configs, extra_options) = Self::load_configs(base_url.clone(), &all_options)
             .await
             .context("Failed to load table properties")?;
         let configs = Arc::new(configs);
+        let extra_options = Arc::new(extra_options);
 
-        let timeline = Timeline::new(base_url.clone(), storage_options.clone(), configs.clone())
+        let timeline = Timeline::new(base_url.clone(), extra_options.clone(), configs.clone())
             .await
             .context("Failed to load timeline")?;
 
         let file_system_view =
-            FileSystemView::new(base_url.clone(), storage_options.clone(), configs.clone())
+            FileSystemView::new(base_url.clone(), extra_options.clone(), configs.clone())
                 .await
                 .context("Failed to load file system view")?;
 
         Ok(Table {
             base_url,
-            storage_options,
             configs,
+            extra_options,
             timeline,
             file_system_view,
         })
     }
 
-    async fn load_properties(
+    async fn load_configs(
         base_url: Arc<Url>,
-        storage_options: Arc<HashMap<String, String>>,
-    ) -> Result<HudiConfigs> {
-        let storage = Storage::new(base_url, storage_options)?;
+        all_options: &HashMap<String, String>,
+    ) -> Result<(HudiConfigs, HashMap<String, String>)> {
+        let mut hudi_options = HashMap::new();
+        let mut extra_options = HashMap::new();
+        for (k, v) in all_options {
+            if k.starts_with("hoodie.") {
+                hudi_options.insert(k.clone(), v.clone());
+            } else {
+                extra_options.insert(k.clone(), v.clone());
+            }
+        }
+        let storage = Storage::new(base_url, &extra_options)?;
         let data = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let cursor = std::io::Cursor::new(data);
         let lines = BufReader::new(cursor).lines();
-        let mut properties: HashMap<String, String> = HashMap::new();
         for line in lines {
             let line = line?;
             let trimmed_line = line.trim();
@@ -91,9 +106,54 @@ impl Table {
             let mut parts = trimmed_line.splitn(2, '=');
             let key = parts.next().unwrap().to_owned();
             let value = parts.next().unwrap_or("").to_owned();
-            properties.insert(key, value);
+            // `hoodie.properties` takes precedence TODO handle conflicts where applicable
+            hudi_options.insert(key, value);
         }
-        Ok(HudiConfigs::new(properties))
+        let hudi_configs = HudiConfigs::new(hudi_options);
+
+        Self::validate_configs(&hudi_configs, &extra_options).map(|_| (hudi_configs, extra_options))
+    }
+
+    fn validate_configs(
+        hudi_configs: &HudiConfigs,
+        extra_options: &HashMap<String, String>,
+    ) -> Result<()> {
+        if extra_options
+            .get("hoodie_internal.skip.config.validation")
+            .and_then(|v| bool::from_str(v).ok())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        for conf in HudiTableConfig::iter() {
+            hudi_configs.validate(conf)?
+        }
+
+        for conf in HudiReadConfig::iter() {
+            hudi_configs.validate(conf)?
+        }
+
+        // additional validation
+        let table_type = hudi_configs.get(TableType)?.to::<String>();
+        if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
+            return Err(anyhow!("Only support copy-on-write table."));
+        }
+
+        let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
+        if !(5..=6).contains(&table_version) {
+            return Err(anyhow!("Only support table version 5 and 6."));
+        }
+
+        let drops_partition_cols = hudi_configs.get(DropsPartitionFields)?.to::<bool>();
+        if drops_partition_cols {
+            return Err(anyhow!(
+                "Only support when `{}` is disabled",
+                DropsPartitionFields.as_ref()
+            ));
+        }
+
+        Ok(())
     }
 
     pub async fn get_schema(&self) -> Result<Schema> {
@@ -326,7 +386,15 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
                 .unwrap();
-        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let table = Table::new(
+            base_url.as_str(),
+            HashMap::from_iter(vec![(
+                "hoodie_internal.skip.config.validation".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
         let configs = table.configs;
         assert!(
             configs.validate(BaseFileFormat).is_err(),
@@ -377,7 +445,15 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
                 .unwrap();
-        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let table = Table::new(
+            base_url.as_str(),
+            HashMap::from_iter(vec![(
+                "hoodie_internal.skip.config.validation".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
         let configs = table.configs;
         assert!(configs.get(BaseFileFormat).is_err());
         assert!(configs.get(Checksum).is_err());
@@ -401,7 +477,15 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
                 .unwrap();
-        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let table = Table::new(
+            base_url.as_str(),
+            HashMap::from_iter(vec![(
+                "hoodie_internal.skip.config.validation".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
         let configs = table.configs;
         assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
@@ -431,7 +515,15 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
                 .unwrap();
-        let table = Table::new(base_url.as_str(), HashMap::new()).await.unwrap();
+        let table = Table::new(
+            base_url.as_str(),
+            HashMap::from_iter(vec![(
+                "hoodie_internal.skip.config.validation".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
         let configs = table.configs;
         assert_eq!(
             configs.get(BaseFileFormat).unwrap().to::<String>(),

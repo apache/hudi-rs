@@ -20,11 +20,11 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
-
 use crate::config::{ConfigParser, HudiConfigValue};
+use anyhow::{anyhow, Result};
+use strum_macros::EnumIter;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiReadConfig {
     InputPartitions,
 }

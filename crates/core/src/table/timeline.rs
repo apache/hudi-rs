@@ -88,7 +88,7 @@ impl Timeline {
         storage_options: Arc<HashMap<String, String>>,
         configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
-        let storage = Storage::new(base_url, storage_options)?;
+        let storage = Storage::new(base_url, &storage_options)?;
         let instants = Self::load_completed_commit_instants(&storage).await?;
         Ok(Self {
             storage,

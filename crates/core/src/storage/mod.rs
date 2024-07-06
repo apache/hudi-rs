@@ -41,21 +41,18 @@ pub mod file_info;
 pub mod file_stats;
 pub mod utils;
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Storage {
     base_url: Arc<Url>,
-    options: Arc<HashMap<String, String>>,
     object_store: Arc<dyn ObjectStore>,
 }
 
 impl Storage {
-    pub fn new(base_url: Arc<Url>, options: Arc<HashMap<String, String>>) -> Result<Arc<Storage>> {
-        match parse_url_opts(&base_url, &*options) {
-            Ok(object_store) => Ok(Arc::new(Storage {
+    pub fn new(base_url: Arc<Url>, options: &HashMap<String, String>) -> Result<Arc<Storage>> {
+        match parse_url_opts(&base_url, options) {
+            Ok((object_store, _)) => Ok(Arc::new(Storage {
                 base_url,
-                options,
-                object_store: Arc::new(object_store.0),
+                object_store: Arc::new(object_store),
             })),
             Err(e) => Err(anyhow!("Failed to create storage: {}", e)),
         }
@@ -216,7 +213,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let first_level_dirs: HashSet<String> =
             storage.list_dirs(None).await.unwrap().into_iter().collect();
         assert_eq!(
@@ -238,7 +235,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let first_level_dirs: HashSet<ObjPath> = storage
             .list_dirs_as_obj_paths(None)
             .await
@@ -261,7 +258,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let file_info_1: Vec<FileInfo> = storage
             .list_files(None)
             .await
@@ -320,7 +317,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
         assert_eq!(
             leaf_dirs,
@@ -333,7 +330,7 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
         assert_eq!(
             leaf_dirs,
@@ -346,7 +343,7 @@ mod tests {
     async fn storage_get_file_info() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let file_info = storage.get_file_info("a.parquet").await.unwrap();
         assert_eq!(file_info.name, "a.parquet");
         assert_eq!(
@@ -360,7 +357,7 @@ mod tests {
     async fn storage_get_parquet_file_data() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new(Arc::new(base_url), Arc::new(HashMap::new())).unwrap();
+        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
         let file_data = storage.get_parquet_file_data("a.parquet").await.unwrap();
         assert_eq!(file_data.num_rows(), 5);
     }
