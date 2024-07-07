@@ -23,52 +23,37 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-hudi-tests = { path = "../tests" }
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }
-arrow-array = { workspace = true, features = ["chrono-tz"] }
+arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-json = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
-arrow-schema = { workspace = true, features = ["serde"] }
+arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 object_store = { workspace = true }
-parquet = { workspace = true, features = [
-    "async",
-    "object_store",
-] }
-pin-project-lite = "^0.2.7"
-
-# datafusion
-datafusion = { workspace = true, optional = true }
-datafusion-expr = { workspace = true, optional = true }
-datafusion-common = { workspace = true, optional = true }
-datafusion-proto = { workspace = true, optional = true }
-datafusion-sql = { workspace = true, optional = true }
-datafusion-physical-expr = { workspace = true, optional = true }
+parquet = { workspace = true }
 
 # serde
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 # "stdlib"
 anyhow = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, default-features = false, features = ["clock"] }
-hashbrown = "0.14.3"
-regex = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
-uuid = { workspace = true, features = ["serde", "v4"] }
 url = { workspace = true }
 
 # runtime / async
 async-recursion = { workspace = true }
-async-trait = { workspace = true }
 dashmap = { workspace = true }
-tokio = { workspace = true }
 futures = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+hudi-tests = { path = "../tests" }
