@@ -30,19 +30,19 @@ rust-version = "1.75.0"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "52.0.0", features = ["pyarrow"]}
+arrow = { version = "52.0.0", features = ["pyarrow"] }
 arrow-arith = { version = "52.0.0" }
-arrow-array = { version = "52.0.0", features = ["chrono-tz"] }
+arrow-array = { version = "52.0.0" }
 arrow-buffer = { version = "52.0.0" }
 arrow-cast = { version = "52.0.0" }
 arrow-ipc = { version = "52.0.0" }
 arrow-json = { version = "52.0.0" }
 arrow-ord = { version = "52.0.0" }
 arrow-row = { version = "52.0.0" }
-arrow-schema = { version = "52.0.0" }
+arrow-schema = { version = "52.0.0", features = ["serde"] }
 arrow-select = { version = "52.0.0" }
-object_store = { version = "0.10.1" }
-parquet = { version = "52.0.0" }
+object_store = { version = "0.10.1", features = ["aws", "azure", "gcp"] }
+parquet = { version = "52.0.0", features = ["async", "object_store"] }
 
 # datafusion
 datafusion = { version = "39.0.0" }
@@ -54,23 +54,18 @@ datafusion-physical-expr = { version = "39.0.0" }
 
 # serde
 serde = { version = "1.0.203", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1" }
 
 # "stdlib"
 anyhow = { version = "1.0.86" }
 bytes = { version = "1" }
-chrono = { version = "=0.4.34", default-features = false, features = ["clock"] }
 strum = { version = "0.26.3", features = ["derive"] }
 strum_macros = "0.26.4"
-tracing = { version = "0.1", features = ["log"] }
-regex = { version = "1" }
 url = { version = "2" }
-uuid = { version = "1" }
 
 # runtime / async
-async-trait = { version = "0.1" }
 async-recursion = { version = "1.1.1" }
+async-trait = { version = "0.1" }
 dashmap = { version = "6.0.1" }
 futures = { version = "0.3" }
-tokio = { version = "1", features = ["rt-multi-thread"]}
-num_cpus = { version = "1" }
+tokio = { version = "1" }

@@ -28,25 +28,15 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
-object_store = { workspace = true }
 # arrow
 arrow = { workspace = true }
-arrow-arith = { workspace = true }
-arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-ipc = { workspace = true }
-arrow-json = { workspace = true }
-arrow-ord = { workspace = true }
-arrow-row = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
 
+# "stdlib"
 anyhow = { workspace = true }
 
 # runtime / async
 futures = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dependencies.pyo3]
 version = "0.21.2"
