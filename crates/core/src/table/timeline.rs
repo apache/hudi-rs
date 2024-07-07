@@ -17,8 +17,8 @@
  * under the License.
  */
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::cmp::{Ordering, PartialOrd};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use serde_json::{Map, Value};
 use url::Url;
 
 use crate::config::HudiConfigs;
+use crate::file_group::FileGroup;
 use crate::storage::utils::split_filename;
 use crate::storage::Storage;
 
@@ -72,6 +73,19 @@ impl Instant {
     pub fn file_name(&self) -> String {
         format!("{}.{}{}", self.timestamp, self.action, self.state_suffix())
     }
+
+    pub fn relative_path(&self) -> Result<String> {
+        let mut commit_file_path = PathBuf::from(".hoodie");
+        commit_file_path.push(self.file_name());
+        commit_file_path
+            .to_str()
+            .ok_or(anyhow!("Failed to get file path for {:?}", self))
+            .map(|s| s.to_string())
+    }
+
+    pub fn is_replacecommit(&self) -> bool {
+        self.action == "replacecommit"
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,7 +103,7 @@ impl Timeline {
         configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
         let storage = Storage::new(base_url, &storage_options)?;
-        let instants = Self::load_completed_commit_instants(&storage).await?;
+        let instants = Self::load_completed_commits(&storage).await?;
         Ok(Self {
             storage,
             configs,
@@ -97,15 +111,15 @@ impl Timeline {
         })
     }
 
-    async fn load_completed_commit_instants(storage: &Storage) -> Result<Vec<Instant>> {
+    async fn load_completed_commits(storage: &Storage) -> Result<Vec<Instant>> {
         let mut completed_commits = Vec::new();
         for file_info in storage.list_files(Some(".hoodie")).await? {
             let (file_stem, file_ext) = split_filename(file_info.name.as_str())?;
-            if file_ext == "commit" {
+            if matches!(file_ext.as_str(), "commit" | "replacecommit") {
                 completed_commits.push(Instant {
                     state: State::Completed,
                     timestamp: file_stem,
-                    action: "commit".to_owned(),
+                    action: file_ext.to_owned(),
                 })
             }
         }
@@ -120,23 +134,22 @@ impl Timeline {
             .map(|instant| instant.timestamp.as_str())
     }
 
+    async fn get_commit_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
+        let bytes = self
+            .storage
+            .get_file_data(instant.relative_path()?.as_str())
+            .await?;
+        let json: Value = serde_json::from_slice(&bytes)?;
+        let commit_metadata = json
+            .as_object()
+            .ok_or_else(|| anyhow!("Expected JSON object"))?
+            .clone();
+        Ok(commit_metadata)
+    }
+
     async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
         match self.instants.iter().next_back() {
-            Some(instant) => {
-                let mut commit_file_path = PathBuf::from(".hoodie");
-                commit_file_path.push(instant.file_name());
-                let relative_path = commit_file_path.to_str().ok_or(anyhow!(
-                    "Failed to get commit file path for instant: {:?}",
-                    instant
-                ))?;
-                let bytes = self.storage.get_file_data(relative_path).await?;
-                let json: Value = serde_json::from_slice(&bytes)?;
-                let commit_metadata = json
-                    .as_object()
-                    .ok_or_else(|| anyhow!("Expected JSON object"))?
-                    .clone();
-                Ok(commit_metadata)
-            }
+            Some(instant) => self.get_commit_metadata(instant).await,
             None => Ok(Map::new()),
         }
     }
@@ -166,6 +179,35 @@ impl Timeline {
                 "Failed to resolve the latest schema: no file path found"
             ))
         }
+    }
+
+    pub async fn get_replaced_file_groups(&self) -> Result<HashSet<FileGroup>> {
+        let mut fgs: HashSet<FileGroup> = HashSet::new();
+        for instant in self.instants.iter().filter(|i| i.is_replacecommit()) {
+            let commit_metadata = self.get_commit_metadata(instant).await?;
+            if let Some(ptn_to_replaced) = commit_metadata.get("partitionToReplaceFileIds") {
+                for (ptn, fg_ids) in ptn_to_replaced
+                    .as_object()
+                    .expect("partitionToReplaceFileIds should be a map")
+                {
+                    let fg_ids = fg_ids
+                        .as_array()
+                        .expect("file group ids should be an array")
+                        .iter()
+                        .map(|fg_id| fg_id.as_str().expect("file group id should be a string"));
+
+                    let ptn = Some(ptn.to_string()).filter(|s| !s.is_empty());
+
+                    for fg_id in fg_ids {
+                        fgs.insert(FileGroup::new(fg_id.to_string(), ptn.clone()));
+                    }
+                }
+            }
+        }
+
+        // TODO: return file group and instants, and handle multi-writer fg id conflicts
+
+        Ok(fgs)
     }
 }
 

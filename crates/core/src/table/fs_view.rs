@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -121,11 +121,18 @@ impl FileSystemView {
         Ok(file_groups)
     }
 
-    pub fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
+    pub fn get_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        excluding_file_groups: &HashSet<FileGroup>,
+    ) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
         for fgs in self.partition_to_file_groups.iter() {
             let fgs_ref = fgs.value();
             for fg in fgs_ref {
+                if excluding_file_groups.contains(fg) {
+                    continue;
+                }
                 if let Some(fsl) = fg.get_file_slice_as_of(timestamp) {
                     // TODO: pass ref instead of copying
                     file_slices.push(fsl.clone());
@@ -135,10 +142,17 @@ impl FileSystemView {
         Ok(file_slices)
     }
 
-    pub async fn load_file_slices_stats_as_of(&self, timestamp: &str) -> Result<()> {
+    pub async fn load_file_slices_stats_as_of(
+        &self,
+        timestamp: &str,
+        exclude_file_groups: &HashSet<FileGroup>,
+    ) -> Result<()> {
         for mut fgs in self.partition_to_file_groups.iter_mut() {
             let fgs_ref = fgs.value_mut();
             for fg in fgs_ref {
+                if exclude_file_groups.contains(fg) {
+                    continue;
+                }
                 if let Some(file_slice) = fg.get_file_slice_mut_as_of(timestamp) {
                     file_slice
                         .load_stats(&self.storage)
@@ -215,7 +229,10 @@ mod tests {
         .await
         .unwrap();
 
-        let file_slices = fs_view.get_file_slices_as_of("20240418173551906").unwrap();
+        let excludes = HashSet::new();
+        let file_slices = fs_view
+            .get_file_slices_as_of("20240418173551906", &excludes)
+            .unwrap();
         assert_eq!(file_slices.len(), 1);
         let fg_ids = file_slices
             .iter()

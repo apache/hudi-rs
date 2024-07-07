@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -114,6 +115,21 @@ pub struct FileGroup {
     pub id: String,
     pub partition_path: Option<String>,
     pub file_slices: BTreeMap<String, FileSlice>,
+}
+
+impl PartialEq for FileGroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.partition_path == other.partition_path
+    }
+}
+
+impl Eq for FileGroup {}
+
+impl Hash for FileGroup {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.partition_path.hash(state);
+    }
 }
 
 impl fmt::Display for FileGroup {

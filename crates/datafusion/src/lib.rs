@@ -138,7 +138,8 @@ mod tests {
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_tests::TestTable::{
         V6ComplexkeygenHivestyle, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
-        V6SimplekeygenNonhivestyle, V6TimebasedkeygenNonhivestyle,
+        V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
+        V6TimebasedkeygenNonhivestyle,
     };
     use hudi_tests::{utils, TestTable};
     use utils::{get_bool_column, get_i32_column, get_str_column};
@@ -226,6 +227,44 @@ mod tests {
 
             verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
             verify_data(&ctx, &sql, test_table.as_ref()).await
+        }
+    }
+
+    async fn verify_data_with_replacecommits(ctx: &SessionContext, sql: &str, table_name: &str) {
+        let df = ctx.sql(sql).await.unwrap();
+        let rb = df.collect().await.unwrap();
+        let rb = rb.first().unwrap();
+        assert_eq!(get_i32_column(rb, "id"), &[4]);
+        assert_eq!(get_str_column(rb, "name"), &["Diana"]);
+        assert_eq!(get_bool_column(rb, "isActive"), &[false]);
+        assert_eq!(
+            get_i32_column(rb, &format!("{}.structField[field2]", table_name)),
+            &[50]
+        );
+    }
+
+    #[tokio::test]
+    async fn datafusion_read_hudi_table_with_replacecommits() {
+        for (test_table, planned_input_partitions) in
+            &[(V6SimplekeygenNonhivestyleOverwritetable, 1)]
+        {
+            println!(">>> testing for {}", test_table.as_ref());
+            let ctx = prepare_session_context(
+                test_table,
+                &[(InputPartitions.as_ref().to_string(), "2".to_string())],
+            )
+            .await;
+
+            let sql = format!(
+                r#"
+            SELECT id, name, isActive, structField.field2
+            FROM {} WHERE id % 2 = 0
+            AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
+                test_table.as_ref()
+            );
+
+            verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
+            verify_data_with_replacecommits(&ctx, &sql, test_table.as_ref()).await
         }
     }
 }

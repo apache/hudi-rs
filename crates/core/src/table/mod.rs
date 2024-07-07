@@ -182,11 +182,13 @@ impl Table {
     }
 
     async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
+        let excludes = self.timeline.get_replaced_file_groups().await?;
         self.file_system_view
-            .load_file_slices_stats_as_of(timestamp)
+            .load_file_slices_stats_as_of(timestamp, &excludes)
             .await
             .context("Fail to load file slice stats.")?;
-        self.file_system_view.get_file_slices_as_of(timestamp)
+        self.file_system_view
+            .get_file_slices_as_of(timestamp, &excludes)
     }
 
     pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
