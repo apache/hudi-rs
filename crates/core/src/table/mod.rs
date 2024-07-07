@@ -34,6 +34,7 @@ use TableTypeValue::CopyOnWrite;
 
 use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
+use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
@@ -170,14 +171,17 @@ impl Table {
     }
 
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
+            self.get_file_slices_as_of(timestamp.to::<String>().as_str())
+                .await
+        } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
             self.get_file_slices_as_of(timestamp).await
         } else {
             Ok(Vec::new())
         }
     }
 
-    pub async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
+    async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         self.file_system_view
             .load_file_slices_stats_as_of(timestamp)
             .await
@@ -186,14 +190,17 @@ impl Table {
     }
 
     pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
+            self.read_snapshot_as_of(timestamp.to::<String>().as_str())
+                .await
+        } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
             self.read_snapshot_as_of(timestamp).await
         } else {
             Ok(Vec::new())
         }
     }
 
-    pub async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
+    async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
         let file_slices = self
             .get_file_slices_as_of(timestamp)
             .await
@@ -233,8 +240,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_tests::{assert_not, TestTable};
-
+    use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
         IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
@@ -243,6 +249,7 @@ mod tests {
     };
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
+    use hudi_tests::{assert_not, TestTable};
 
     #[tokio::test]
     async fn hudi_table_get_schema() {
@@ -331,8 +338,8 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_file_slices_as_of_timestamps() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
 
+        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
         let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
@@ -343,10 +350,12 @@ mod tests {
         );
 
         // as of the latest timestamp
-        let file_slices = hudi_table
-            .get_file_slices_as_of("20240418173551906")
-            .await
-            .unwrap();
+        let opts = HashMap::from_iter(vec![(
+            AsOfTimestamp.as_ref().to_string(),
+            "20240418173551906".to_string(),
+        )]);
+        let hudi_table = Table::new(base_url.path(), opts).await.unwrap();
+        let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -356,10 +365,12 @@ mod tests {
         );
 
         // as of just smaller than the latest timestamp
-        let file_slices = hudi_table
-            .get_file_slices_as_of("20240418173551905")
-            .await
-            .unwrap();
+        let opts = HashMap::from_iter(vec![(
+            AsOfTimestamp.as_ref().to_string(),
+            "20240418173551905".to_string(),
+        )]);
+        let hudi_table = Table::new(base_url.path(), opts).await.unwrap();
+        let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -369,7 +380,9 @@ mod tests {
         );
 
         // as of non-exist old timestamp
-        let file_slices = hudi_table.get_file_slices_as_of("0").await.unwrap();
+        let opts = HashMap::from_iter(vec![(AsOfTimestamp.as_ref().to_string(), "0".to_string())]);
+        let hudi_table = Table::new(base_url.path(), opts).await.unwrap();
+        let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
                 .iter()

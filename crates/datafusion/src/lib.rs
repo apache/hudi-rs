@@ -39,28 +39,27 @@ use datafusion_physical_expr::create_physical_expr;
 use DataFusionError::Execution;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
-use hudi_core::config::ConfigParser;
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::HudiTable;
 
 #[derive(Clone, Debug)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
-    input_partitions: usize,
 }
 
 impl HudiDataSource {
     pub async fn new(base_uri: &str, options: HashMap<String, String>) -> Result<Self> {
-        let input_partitions = InputPartitions
-            .parse_value_or_default(&options)
-            .to::<usize>();
         match HudiTable::new(base_uri, options).await {
-            Ok(t) => Ok(Self {
-                table: Arc::new(t),
-                input_partitions,
-            }),
+            Ok(t) => Ok(Self { table: Arc::new(t) }),
             Err(e) => Err(Execution(format!("Failed to create Hudi table: {}", e))),
         }
+    }
+
+    fn get_input_partitions(&self) -> usize {
+        self.table
+            .configs
+            .get_or_default(InputPartitions)
+            .to::<usize>()
     }
 }
 
@@ -92,7 +91,7 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let file_slices = self
             .table
-            .split_file_slices(self.input_partitions)
+            .split_file_slices(self.get_input_partitions())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();

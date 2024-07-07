@@ -59,7 +59,7 @@ pub trait ConfigParser: AsRef<str> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum HudiConfigValue {
     Boolean(bool),
     Integer(isize),
@@ -156,5 +156,16 @@ impl HudiConfigs {
         parser: impl ConfigParser<Output = HudiConfigValue>,
     ) -> HudiConfigValue {
         parser.parse_value_or_default(&self.raw_configs)
+    }
+
+    pub fn try_get(
+        &self,
+        parser: impl ConfigParser<Output = HudiConfigValue>,
+    ) -> Option<HudiConfigValue> {
+        let res = parser.parse_value(&self.raw_configs);
+        match res {
+            Ok(v) => Some(v),
+            Err(_) => parser.default_value(),
+        }
     }
 }
