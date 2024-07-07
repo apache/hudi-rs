@@ -42,6 +42,7 @@ pub enum TestTable {
     V6Nonpartitioned,
     V6SimplekeygenHivestyleNoMetafields,
     V6SimplekeygenNonhivestyle,
+    V6SimplekeygenNonhivestyleOverwritetable,
     V6TimebasedkeygenNonhivestyle,
 }
 
