@@ -129,11 +129,6 @@ impl BindingHudiTable {
     pub fn read_snapshot(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self._table.read_snapshot())?.to_pyarrow(py)
     }
-
-    pub fn read_snapshot_as_of(&self, timestamp: &str, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.read_snapshot_as_of(timestamp))?
-            .to_pyarrow(py)
-    }
 }
 
 #[cfg(not(tarpaulin))]

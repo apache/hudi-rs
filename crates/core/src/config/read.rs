@@ -27,12 +27,14 @@ use strum_macros::EnumIter;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiReadConfig {
     InputPartitions,
+    AsOfTimestamp,
 }
 
 impl AsRef<str> for HudiReadConfig {
     fn as_ref(&self) -> &str {
         match self {
             Self::InputPartitions => "hoodie.read.input.partitions",
+            Self::AsOfTimestamp => "hoodie.read.as.of.timestamp",
         }
     }
 }
@@ -43,6 +45,7 @@ impl ConfigParser for HudiReadConfig {
     fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
+            _ => None,
         }
     }
 
@@ -53,28 +56,20 @@ impl ConfigParser for HudiReadConfig {
             .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
 
         match self {
-            HudiReadConfig::InputPartitions => get_result
-                .and_then(|v| {
-                    usize::from_str(v).map_err(|e| {
-                        anyhow!(
-                            "Failed to parse '{}' for config '{}': {}",
-                            v,
-                            self.as_ref(),
-                            e
-                        )
-                    })
-                })
+            Self::InputPartitions => get_result
+                .and_then(|v| usize::from_str(v).map_err(|e| anyhow!(e)))
                 .map(HudiConfigValue::UInteger),
+            Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use crate::config::read::HudiReadConfig::InputPartitions;
     use crate::config::ConfigParser;
+    use std::collections::HashMap;
+    use std::num::ParseIntError;
 
     #[test]
     fn parse_valid_config_value() {
@@ -87,10 +82,7 @@ mod tests {
     fn parse_invalid_config_value() {
         let options = HashMap::from([(InputPartitions.as_ref().to_string(), "foo".to_string())]);
         let value = InputPartitions.parse_value(&options);
-        assert!(value.err().unwrap().to_string().starts_with(&format!(
-            "Failed to parse 'foo' for config '{}'",
-            InputPartitions.as_ref()
-        )));
+        assert!(value.err().unwrap().is::<ParseIntError>());
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)

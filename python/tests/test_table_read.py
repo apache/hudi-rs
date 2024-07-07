@@ -65,7 +65,9 @@ def test_sample_table(get_sample_table):
                              {'_hoodie_commit_time': '20240402123035233', 'ts': 1695516137016,
                               'uuid': 'e3cf430c-889d-4015-bc98-59bdce1e530c', 'fare': 34.15}]
 
-    batches = table.read_snapshot_as_of("20240402123035233")
+    table = HudiTable(table_path, {
+        "hoodie.read.as.of.timestamp": "20240402123035233"})
+    batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [{'_hoodie_commit_time': '20240402123035233', 'ts': 1695046462179,
                               'uuid': '9909a8b1-2d15-4d3d-8ec9-efc48c536a00', 'fare': 33.9},
