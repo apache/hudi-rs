@@ -18,11 +18,11 @@
  */
 use pyo3::prelude::*;
 
-use crate::_file_group::HudiFileSlice;
-use crate::_table::HudiTable;
-
 mod _file_group;
 mod _table;
+
+use _file_group::HudiFileSlice;
+use _table::HudiTable;
 
 #[cfg(not(tarpaulin))]
 #[pymodule]
