@@ -18,6 +18,7 @@
  */
 
 use std::collections::HashMap;
+use std::env;
 use std::io::{BufRead, BufReader};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -87,8 +88,12 @@ impl Table {
         base_url: Arc<Url>,
         all_options: &HashMap<String, String>,
     ) -> Result<(HudiConfigs, HashMap<String, String>)> {
+        // TODO: load hudi global config
         let mut hudi_options = HashMap::new();
         let mut extra_options = HashMap::new();
+
+        Self::imbue_cloud_env_vars(&mut extra_options);
+
         for (k, v) in all_options {
             if k.starts_with("hoodie.") {
                 hudi_options.insert(k.clone(), v.clone());
@@ -115,6 +120,15 @@ impl Table {
         let hudi_configs = HudiConfigs::new(hudi_options);
 
         Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, extra_options))
+    }
+
+    fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
+        let prefixes = ["AWS_", "AZURE_", "GOOGLE_"];
+        options.extend(
+            env::vars()
+                .filter(|(key, _)| prefixes.iter().any(|prefix| key.starts_with(prefix)))
+                .map(|(k, v)| (k.to_ascii_lowercase(), v)),
+        );
     }
 
     fn validate_configs(hudi_configs: &HudiConfigs) -> Result<()> {
@@ -242,6 +256,8 @@ mod tests {
 
     use url::Url;
 
+    use hudi_tests::{assert_not, TestTable};
+
     use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
@@ -251,7 +267,6 @@ mod tests {
     };
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
-    use hudi_tests::{assert_not, TestTable};
 
     #[tokio::test]
     async fn hudi_table_get_schema() {
