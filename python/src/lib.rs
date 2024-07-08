@@ -18,15 +18,12 @@
  */
 use pyo3::prelude::*;
 
-mod _file_group;
-mod _table;
-
-use _file_group::HudiFileSlice;
-use _table::HudiTable;
+mod internal;
 
 #[cfg(not(tarpaulin))]
 #[pymodule]
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    use internal::{HudiFileSlice, HudiTable};
     m.add_class::<HudiFileSlice>()?;
     m.add_class::<HudiTable>()?;
     Ok(())

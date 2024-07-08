@@ -16,12 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context;
-use pyo3::{pyclass, pymethods, PyErr, PyResult};
+use arrow::pyarrow::ToPyArrow;
+use pyo3::{pyclass, pymethods, PyErr, PyObject, PyResult, Python};
+use tokio::runtime::Runtime;
 
 use hudi::file_group::FileSlice;
+use hudi::table::Table;
 
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
@@ -44,7 +49,7 @@ pub struct HudiFileSlice {
 #[cfg(not(tarpaulin))]
 #[pymethods]
 impl HudiFileSlice {
-    pub fn base_file_relative_path(&self) -> PyResult<String> {
+    fn base_file_relative_path(&self) -> PyResult<String> {
         PathBuf::from(&self.partition_path)
             .join(&self.base_file_name)
             .to_str()
@@ -58,7 +63,7 @@ impl HudiFileSlice {
 }
 
 #[cfg(not(tarpaulin))]
-pub fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
+fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
     let file_group_id = f.file_group_id().to_string();
     let partition_path = f.partition_path.as_deref().unwrap_or_default().to_string();
     let commit_time = f.base_file.commit_time.to_string();
@@ -73,4 +78,60 @@ pub fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
         base_file_size,
         num_records,
     }
+}
+
+#[cfg(not(tarpaulin))]
+#[pyclass]
+pub struct HudiTable {
+    _table: Table,
+}
+
+#[cfg(not(tarpaulin))]
+#[pymethods]
+impl HudiTable {
+    #[new]
+    #[pyo3(signature = (table_uri, options = None))]
+    fn new(table_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
+        let _table = rt().block_on(Table::new_with_options(
+            table_uri,
+            options.unwrap_or_default(),
+        ))?;
+        Ok(HudiTable { _table })
+    }
+
+    fn get_schema(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self._table.get_schema())?.to_pyarrow(py)
+    }
+
+    fn split_file_slices(&self, n: usize, py: Python) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        py.allow_threads(|| {
+            let file_slices = rt().block_on(self._table.split_file_slices(n))?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
+                .collect())
+        })
+    }
+
+    fn get_file_slices(&self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
+        py.allow_threads(|| {
+            let file_slices = rt().block_on(self._table.get_file_slices())?;
+            Ok(file_slices.iter().map(convert_file_slice).collect())
+        })
+    }
+
+    fn read_file_slice(&self, relative_path: &str, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self._table.read_file_slice_by_path(relative_path))?
+            .to_pyarrow(py)
+    }
+
+    fn read_snapshot(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self._table.read_snapshot())?.to_pyarrow(py)
+    }
+}
+
+#[cfg(not(tarpaulin))]
+fn rt() -> &'static Runtime {
+    static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
+    TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
 }
