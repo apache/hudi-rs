@@ -137,10 +137,13 @@ impl TableProvider for HudiDataSource {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::canonicalize;
+    use std::path::Path;
     use std::sync::Arc;
 
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::ScalarValue;
+    use url::Url;
 
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_tests::TestTable::{
@@ -152,6 +155,15 @@ mod tests {
     use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
+
+    #[tokio::test]
+    async fn get_default_input_partitions() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
+                .unwrap();
+        let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
+        assert_eq!(hudi.get_input_partitions(), 0)
+    }
 
     async fn prepare_session_context(
         test_table: &TestTable,

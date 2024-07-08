@@ -38,6 +38,7 @@ datafusion-physical-expr = { workspace = true }
 # runtime / async
 async-trait = { workspace = true }
 tokio = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 hudi-tests = { path = "../tests" }
