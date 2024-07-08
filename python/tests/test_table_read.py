@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(PYARROW_LE_8_0_0, reason="hudi only supported if
 
 def test_sample_table(get_sample_table):
     table_path = get_sample_table
-    table = HudiTable(table_path, {})
+    table = HudiTable(table_path)
 
     assert table.get_schema().names == ['_hoodie_commit_time', '_hoodie_commit_seqno', '_hoodie_record_key',
                                         '_hoodie_partition_path', '_hoodie_file_name', 'ts', 'uuid', 'rider', 'driver',

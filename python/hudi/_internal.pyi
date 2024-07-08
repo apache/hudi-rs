@@ -14,17 +14,13 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
-
-from typing import List, Dict, Optional
+from dataclasses import dataclass
+from typing import Optional, Dict, List
 
 import pyarrow
 
-__version__: str
 
-
-def rust_core_version() -> str: ...
-
-
+@dataclass(init=False)
 class HudiFileSlice:
     file_group_id: str
     partition_path: str
@@ -36,12 +32,13 @@ class HudiFileSlice:
     def base_file_relative_path(self) -> str: ...
 
 
-class BindingHudiTable:
+@dataclass(init=False)
+class HudiTable:
 
     def __init__(
             self,
             table_uri: str,
-            storage_options: Optional[Dict[str, str]] = None,
+            options: Optional[Dict[str, str]] = None,
     ): ...
 
     def get_schema(self) -> "pyarrow.Schema": ...

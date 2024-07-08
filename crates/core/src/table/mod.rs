@@ -39,7 +39,7 @@ use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
-use crate::storage::utils::parse_uri;
+use crate::storage::utils::{empty_options, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
@@ -57,10 +57,19 @@ pub struct Table {
 }
 
 impl Table {
-    pub async fn new(base_uri: &str, all_options: HashMap<String, String>) -> Result<Self> {
+    pub async fn new(base_uri: &str) -> Result<Self> {
+        Self::new_with_options(base_uri, empty_options()).await
+    }
+
+    pub async fn new_with_options<I, K, V>(base_uri: &str, all_options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
         let base_url = Arc::new(parse_uri(base_uri)?);
 
-        let (configs, extra_options) = Self::load_configs(base_url.clone(), &all_options)
+        let (configs, extra_options) = Self::load_configs(base_url.clone(), all_options)
             .await
             .context("Failed to load table properties")?;
         let configs = Arc::new(configs);
@@ -84,10 +93,15 @@ impl Table {
         })
     }
 
-    async fn load_configs(
+    async fn load_configs<I, K, V>(
         base_url: Arc<Url>,
-        all_options: &HashMap<String, String>,
-    ) -> Result<(HudiConfigs, HashMap<String, String>)> {
+        all_options: I,
+    ) -> Result<(HudiConfigs, HashMap<String, String>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
         // TODO: load hudi global config
         let mut hudi_options = HashMap::new();
         let mut extra_options = HashMap::new();
@@ -95,10 +109,10 @@ impl Table {
         Self::imbue_cloud_env_vars(&mut extra_options);
 
         for (k, v) in all_options {
-            if k.starts_with("hoodie.") {
-                hudi_options.insert(k.clone(), v.clone());
+            if k.as_ref().starts_with("hoodie.") {
+                hudi_options.insert(k.as_ref().to_string(), v.into());
             } else {
-                extra_options.insert(k.clone(), v.clone());
+                extra_options.insert(k.as_ref().to_string(), v.into());
             }
         }
         let storage = Storage::new(base_url, &extra_options)?;
@@ -249,7 +263,7 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::panic;
     use std::path::Path;
@@ -271,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fields: Vec<String> = hudi_table
             .get_schema()
             .await
@@ -324,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_read_file_slice() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
             .read_file_slice_by_path(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
@@ -338,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_file_paths() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
         assert_eq!(hudi_table.timeline.instants.len(), 2);
         let actual: HashSet<String> =
             HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
@@ -356,7 +370,7 @@ mod tests {
     async fn hudi_table_get_file_slices_as_of_timestamps() {
         let base_url = TestTable::V6Nonpartitioned.url();
 
-        let hudi_table = Table::new(base_url.path(), HashMap::new()).await.unwrap();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
         let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
@@ -367,11 +381,10 @@ mod tests {
         );
 
         // as of the latest timestamp
-        let opts = HashMap::from_iter(vec![(
-            AsOfTimestamp.as_ref().to_string(),
-            "20240418173551906".to_string(),
-        )]);
-        let hudi_table = Table::new(base_url.path(), opts).await.unwrap();
+        let opts = [(AsOfTimestamp.as_ref(), "20240418173551906")];
+        let hudi_table = Table::new_with_options(base_url.path(), opts)
+            .await
+            .unwrap();
         let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
@@ -382,11 +395,10 @@ mod tests {
         );
 
         // as of just smaller than the latest timestamp
-        let opts = HashMap::from_iter(vec![(
-            AsOfTimestamp.as_ref().to_string(),
-            "20240418173551905".to_string(),
-        )]);
-        let hudi_table = Table::new(base_url.path(), opts).await.unwrap();
+        let opts = [(AsOfTimestamp.as_ref(), "20240418173551905")];
+        let hudi_table = Table::new_with_options(base_url.path(), opts)
+            .await
+            .unwrap();
         let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
@@ -397,8 +409,10 @@ mod tests {
         );
 
         // as of non-exist old timestamp
-        let opts = HashMap::from_iter(vec![(AsOfTimestamp.as_ref().to_string(), "0".to_string())]);
-        let hudi_table = Table::new(base_url.path(), opts).await.unwrap();
+        let opts = [(AsOfTimestamp.as_ref(), "0")];
+        let hudi_table = Table::new_with_options(base_url.path(), opts)
+            .await
+            .unwrap();
         let file_slices = hudi_table.get_file_slices().await.unwrap();
         assert_eq!(
             file_slices
@@ -414,12 +428,9 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
                 .unwrap();
-        let table = Table::new(
+        let table = Table::new_with_options(
             base_url.as_str(),
-            HashMap::from_iter(vec![(
-                "hoodie.internal.skip.config.validation".to_string(),
-                "true".to_string(),
-            )]),
+            [("hoodie.internal.skip.config.validation", "true")],
         )
         .await
         .unwrap();
@@ -473,12 +484,9 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
                 .unwrap();
-        let table = Table::new(
+        let table = Table::new_with_options(
             base_url.as_str(),
-            HashMap::from_iter(vec![(
-                "hoodie.internal.skip.config.validation".to_string(),
-                "true".to_string(),
-            )]),
+            [("hoodie.internal.skip.config.validation", "true")],
         )
         .await
         .unwrap();
@@ -505,12 +513,9 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
                 .unwrap();
-        let table = Table::new(
+        let table = Table::new_with_options(
             base_url.as_str(),
-            HashMap::from_iter(vec![(
-                "hoodie.internal.skip.config.validation".to_string(),
-                "true".to_string(),
-            )]),
+            [("hoodie.internal.skip.config.validation", "true")],
         )
         .await
         .unwrap();
@@ -543,12 +548,9 @@ mod tests {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
                 .unwrap();
-        let table = Table::new(
+        let table = Table::new_with_options(
             base_url.as_str(),
-            HashMap::from_iter(vec![(
-                "hoodie.internal.skip.config.validation".to_string(),
-                "true".to_string(),
-            )]),
+            [("hoodie.internal.skip.config.validation", "true")],
         )
         .await
         .unwrap();

@@ -76,6 +76,10 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     Ok(url)
 }
 
+pub fn empty_options<'a>() -> std::iter::Empty<(&'a str, &'a str)> {
+    std::iter::empty::<(&str, &str)>()
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

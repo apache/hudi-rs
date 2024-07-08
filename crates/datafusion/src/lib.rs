@@ -18,7 +18,6 @@
  */
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::thread;
@@ -39,8 +38,8 @@ use datafusion_physical_expr::create_physical_expr;
 use DataFusionError::Execution;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
-use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
-use hudi_core::HudiTable;
+use hudi_core::storage::utils::{empty_options, get_scheme_authority, parse_uri};
+use hudi_core::table::Table as HudiTable;
 
 #[derive(Clone, Debug)]
 pub struct HudiDataSource {
@@ -48,8 +47,17 @@ pub struct HudiDataSource {
 }
 
 impl HudiDataSource {
-    pub async fn new(base_uri: &str, options: HashMap<String, String>) -> Result<Self> {
-        match HudiTable::new(base_uri, options).await {
+    pub async fn new(base_uri: &str) -> Result<Self> {
+        Self::new_with_options(base_uri, empty_options()).await
+    }
+
+    pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        match HudiTable::new_with_options(base_uri, options).await {
             Ok(t) => Ok(Self { table: Arc::new(t) }),
             Err(e) => Err(Execution(format!("Failed to create Hudi table: {}", e))),
         }
@@ -129,11 +137,13 @@ impl TableProvider for HudiDataSource {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::fs::canonicalize;
+    use std::path::Path;
     use std::sync::Arc;
 
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::ScalarValue;
+    use url::Url;
 
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_tests::TestTable::{
@@ -146,9 +156,18 @@ mod tests {
 
     use crate::HudiDataSource;
 
+    #[tokio::test]
+    async fn get_default_input_partitions() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
+                .unwrap();
+        let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
+        assert_eq!(hudi.get_input_partitions(), 0)
+    }
+
     async fn prepare_session_context(
         test_table: &TestTable,
-        options: &[(String, String)],
+        options: Vec<(&str, &str)>,
     ) -> SessionContext {
         let config = SessionConfig::new().set(
             "datafusion.sql_parser.enable_ident_normalization",
@@ -156,8 +175,7 @@ mod tests {
         );
         let ctx = SessionContext::new_with_config(config);
         let base_url = test_table.url();
-        let options = HashMap::from_iter(options.iter().cloned().collect::<HashMap<_, _>>());
-        let hudi = HudiDataSource::new(base_url.as_str(), options)
+        let hudi = HudiDataSource::new_with_options(base_url.as_str(), options)
             .await
             .unwrap();
         ctx.register_table(test_table.as_ref(), Arc::new(hudi))
@@ -211,11 +229,8 @@ mod tests {
             (V6TimebasedkeygenNonhivestyle, 2),
         ] {
             println!(">>> testing for {}", test_table.as_ref());
-            let ctx = prepare_session_context(
-                test_table,
-                &[(InputPartitions.as_ref().to_string(), "2".to_string())],
-            )
-            .await;
+            let options = vec![(InputPartitions.as_ref(), "2")];
+            let ctx = prepare_session_context(test_table, options).await;
 
             let sql = format!(
                 r#"
@@ -249,11 +264,8 @@ mod tests {
             &[(V6SimplekeygenNonhivestyleOverwritetable, 1)]
         {
             println!(">>> testing for {}", test_table.as_ref());
-            let ctx = prepare_session_context(
-                test_table,
-                &[(InputPartitions.as_ref().to_string(), "2".to_string())],
-            )
-            .await;
+            let ctx =
+                prepare_session_context(test_table, vec![(InputPartitions.as_ref(), "2")]).await;
 
             let sql = format!(
                 r#"
