@@ -18,13 +18,32 @@
  */
 use std::any::type_name;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
-
-use anyhow::Result;
 
 pub mod internal;
 pub mod read;
 pub mod table;
+
+#[derive(Debug)]
+pub enum ConfigError {
+    NotFound,
+    ParseError(String),
+    Other(String),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::NotFound => write!(f, "Configuration not found"),
+            ConfigError::ParseError(msg) => write!(f, "Parse error: {}", msg),
+            ConfigError::Other(msg) => write!(f, "Other error: {}", msg),
+        }
+    }
+}
+
+impl Error for ConfigError {}
 
 pub trait ConfigParser: AsRef<str> {
     type Output;
@@ -35,12 +54,11 @@ pub trait ConfigParser: AsRef<str> {
         false
     }
 
-    fn validate(&self, configs: &HashMap<String, String>) -> Result<()> {
+    fn validate(&self, configs: &HashMap<String, String>) -> Result<(), ConfigError> {
         match self.parse_value(configs) {
             Ok(_) => Ok(()),
             Err(e) => {
-                if !self.is_required() && e.to_string().ends_with("not found") {
-                    // TODO: introduce error type to avoid checking "not found"
+                if !self.is_required() && matches!(e, ConfigError::NotFound) {
                     Ok(())
                 } else {
                     Err(e)
@@ -49,7 +67,7 @@ pub trait ConfigParser: AsRef<str> {
         }
     }
 
-    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output>;
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output, ConfigError>;
 
     fn parse_value_or_default(&self, configs: &HashMap<String, String>) -> Self::Output {
         self.parse_value(configs).unwrap_or_else(|_| {
@@ -140,14 +158,17 @@ impl HudiConfigs {
         }
     }
 
-    pub fn validate(&self, parser: impl ConfigParser<Output = HudiConfigValue>) -> Result<()> {
+    pub fn validate(
+        &self,
+        parser: impl ConfigParser<Output = HudiConfigValue>,
+    ) -> Result<(), ConfigError> {
         parser.validate(&self.raw_configs)
     }
 
     pub fn get(
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
-    ) -> Result<HudiConfigValue> {
+    ) -> Result<HudiConfigValue, ConfigError> {
         parser.parse_value(&self.raw_configs)
     }
 
@@ -162,8 +183,7 @@ impl HudiConfigs {
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
     ) -> Option<HudiConfigValue> {
-        let res = parser.parse_value(&self.raw_configs);
-        match res {
+        match parser.parse_value(&self.raw_configs) {
             Ok(v) => Some(v),
             Err(_) => parser.default_value(),
         }

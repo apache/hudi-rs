@@ -17,13 +17,10 @@
  * under the License.
  */
 
+use crate::config::{ConfigError, ConfigParser, HudiConfigValue};
 use std::collections::HashMap;
 use std::str::FromStr;
-
-use anyhow::{anyhow, Result};
 use strum_macros::EnumIter;
-
-use crate::config::{ConfigParser, HudiConfigValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiInternalConfig {
@@ -47,15 +44,15 @@ impl ConfigParser for HudiInternalConfig {
         }
     }
 
-    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output, ConfigError> {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+            .ok_or(ConfigError::NotFound);
 
         match self {
             Self::SkipConfigValidation => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| bool::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string())))
                 .map(HudiConfigValue::Boolean),
         }
     }
