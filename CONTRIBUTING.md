@@ -30,18 +30,20 @@ the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_r
 ## Prepare for development
 
 - Install Rust, e.g. as described [here](https://doc.rust-lang.org/cargo/getting-started/installation.html)
-- Have a compatible Python version installed (check `python/pyproject.toml` for current requirement)
+- Have a compatible Python version installed (check [`python/pyproject.toml`](./python/pyproject.toml) for current requirement)
 
 ## Commonly used dev commands
 
-For most of the time, use dev commands specified in `python/Makefile`, it applies to both Python and Rust modules. You
+For most of the time, use dev commands specified in [`python/Makefile`](./python/Makefile), it applies to both Python and Rust modules. You
 don't need to
-CD to the root directory and run `cargo` commands.
+CD to the root directory and run `cargo` commands. Note that the Makefile runs `python` command to setup virtual environment.
+You can either change that to `python3` or simply alias `python` to your local `python3` installation, for example:
+`echo "alias python=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" >> ~/.zshrc`
 
 To setup python virtual env, run
 
 ```shell
-make setup-env
+make setup-venv
 ```
 
 Once activate virtual env, build the project for development by
