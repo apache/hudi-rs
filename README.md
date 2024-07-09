@@ -17,13 +17,77 @@
   ~ under the License.
 -->
 
-# hudi-rs
+<p align="center">
+  <a href="https://hudi.apache.org/">
+    <img src="https://hudi.apache.org/assets/images/hudi-logo-medium.png" alt="Hudi logo" height="80px">
+  </a>
+</p>
+<p align="center">
+  A native Rust library for Apache Hudi, with bindings to Python
+  <br>
+  <br>
+  <a href="https://github.com/apache/hudi-rs/actions/workflows/ci.yml">
+    <img alt="hudi-rs ci" src="https://github.com/apache/hudi-rs/actions/workflows/ci.yml/badge.svg">
+  </a>
+  <a href="https://codecov.io/github/apache/hudi-rs">
+    <img alt="hudi-rs codecov" src="https://codecov.io/github/apache/hudi-rs/graph/badge.svg">
+  </a>
+  <a href="https://join.slack.com/t/apache-hudi/shared_invite/zt-2ggm1fub8-_yt4Reu9djwqqVRFC7X49g">
+    <img alt="join hudi slack" src="https://img.shields.io/badge/slack-%23hudi-72eff8?logo=slack&color=48c628">
+  </a>
+  <a href="https://x.com/apachehudi">
+    <img alt="follow hudi x/twitter" src="https://img.shields.io/twitter/follow/apachehudi?label=apachehudi">
+  </a>
+  <a href="https://www.linkedin.com/company/apache-hudi">
+    <img alt="follow hudi linkedin" src="https://img.shields.io/badge/apache%E2%80%93hudi-0077B5?logo=linkedin">
+  </a>
+</p>
 
-[![codecov](https://codecov.io/github/apache/hudi-rs/graph/badge.svg?token=E8CSWKJXLE)](https://codecov.io/github/apache/hudi-rs)
+The `hudi-rs` project aims to broaden the use of [Apache Hudi](https://github.com/apache/hudi) for a diverse range of
+users and projects.
 
-## Quick Start
+| Source        | Installation Command |
+|---------------|----------------------|
+| **PyPi**      | `pip install hudi`   |
+| **Crates.io** | `cargo add hudi`     |
 
-### Apache DataFusion
+*Note: not yet available until the first release.*
+
+## Example usage
+
+### Python
+
+Add `python/hudi` as a dependency to your Python application.
+
+For example, use these commands to setup a virtualenv.
+
+```shell
+cd python
+python3 -m venv my_venv
+source my_venv/bin/activate
+pip install -e .
+```
+
+Then query a Hudi table.
+
+```python
+from hudi import HudiTable
+
+hudi_table = HudiTable("/tmp/trips_table")
+records = hudi_table.read_snapshot()
+
+import pyarrow as pa
+
+arrow_table = pa.Table.from_batches(records)
+result = arrow_table.select(
+    ["rider", "ts", "fare"]).filter(
+    pa.compute.field("fare") > 20.0)
+print(result)
+```
+
+### Rust
+
+Add `hudi-datafusion` as a dependency to your Rust application, and query a Hudi table.
 
 ```rust
 use std::sync::Arc;
@@ -43,3 +107,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+### Work with cloud storage
+
+Ensure cloud storage credentials are set properly as environment variables, e.g., `AWS_*`, `AZURE_*`, or `GOOGLE_*`.
+Relevant storage environment variables will then be picked up. The target table's base uri with schemes such
+as `s3://`, `az://`, or `gs://` will be processed accordingly.
+
+## Contributing
+
+Check out the [contributing guide](./CONTRIBUTING.md) for all the details about making contributions to the project.

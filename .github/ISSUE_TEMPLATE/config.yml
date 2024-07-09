@@ -1,0 +1,19 @@
+contact_links:
+  - name: LinkedIn updates
+    url: https://www.linkedin.com/company/apache-hudi
+    about: Get the latest updates about Hudi from LinkedIn
+  - name: X/Twitter updates
+    url: https://x.com/apachehudi
+    about: Get the latest updates about Hudi from X/Twitter
+  - name: YouTube channel
+    url: https://www.youtube.com/@apachehudi
+    about: Watch talks and guides about Hudi from YouTube
+  - name: Slack support
+    url: https://join.slack.com/t/apache-hudi/shared_invite/zt-2ggm1fub8-_yt4Reu9djwqqVRFC7X49g
+    about: Ask questions and have discussions about Hudi on Slack
+  - name: 微信公众号 WeChat updates (Chinese)
+    url: 微信公众号搜索关注 "apachehudi"
+    about: Get the latest updates about Hudi from WeChat
+  - name: 钉钉群 DingTalk support (Chinese)
+    url: Apache Hudi交流群 - 钉钉群号 35087066
+    about: Ask questions and have discussions about Hudi on DingTalk
