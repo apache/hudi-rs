@@ -37,21 +37,7 @@ jobs:
       - name: Check license header
         uses: apache/skywalking-eyes/header@v0.6.0
       - name: Check code style
-        run: make check
-
-  build:
-    runs-on: ${{ matrix.os }}
-    if: false # disable OS build matrix until needs arise
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build
+        run: cd python && make check-rust
 
   test:
     runs-on: ubuntu-latest
