@@ -40,3 +40,20 @@ build: setup ## Build Python binding of delta-rs
 develop: setup ## Install Python binding of delta-rs
 	$(info --- Develop with Python binding ---)
 	maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS)
+
+.PHONY: check-rust
+check-rust: ## Run check on Rust
+	$(info --- Check Rust clippy ---)
+	cargo clippy --all-targets --all-features --workspace -- -D warnings
+	$(info --- Check Rust format ---)
+	cargo fmt --all -- --check
+
+.PHONY: test-rust
+test-rust: ## Run tests on Rust
+	$(info --- Run Rust tests ---)
+	cargo test --no-fail-fast --all-targets --all-features --workspace
+
+.PHONY: test-python
+test-python: ## Run tests on Python
+	$(info --- Run Python tests ---)
+	pytest -s

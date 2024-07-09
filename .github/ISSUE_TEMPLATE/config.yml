@@ -1,0 +1,36 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+contact_links:
+  - name: LinkedIn updates
+    url: https://www.linkedin.com/company/apache-hudi
+    about: Get the latest updates about Hudi from LinkedIn
+  - name: X/Twitter updates
+    url: https://x.com/apachehudi
+    about: Get the latest updates about Hudi from X/Twitter
+  - name: YouTube channel
+    url: https://www.youtube.com/@apachehudi
+    about: Watch talks and guides about Hudi from YouTube
+  - name: Slack support
+    url: https://join.slack.com/t/apache-hudi/shared_invite/zt-2ggm1fub8-_yt4Reu9djwqqVRFC7X49g
+    about: Ask questions and have discussions about Hudi on Slack
+  - name: 微信公众号 WeChat updates (Chinese)
+    url: 微信公众号搜索关注 "apachehudi"
+    about: Get the latest updates about Hudi from WeChat
+  - name: 钉钉群 DingTalk support (Chinese)
+    url: Apache Hudi交流群 - 钉钉群号 35087066
+    about: Ask questions and have discussions about Hudi on DingTalk
