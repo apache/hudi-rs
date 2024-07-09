@@ -25,24 +25,31 @@ platform. This guide will walk you through the process of making your first cont
 ## File an issue
 
 Testing and reporting bugs are also valueable contributions. Please follow
-the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_report.md) to file bug reports.
+the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_report.yml) to file bug reports.
 
 ## Prepare for development
 
 - Install Rust, e.g. as described [here](https://doc.rust-lang.org/cargo/getting-started/installation.html)
-- Have a compatible Python version installed (check `python/pyproject.toml` for current requirement)
+- Have a compatible Python version installed (check [`python/pyproject.toml`](./python/pyproject.toml) for current
+  requirement)
 
 ## Commonly used dev commands
 
-For most of the time, use dev commands specified in `python/Makefile`, it applies to both Python and Rust modules. You
-don't need to
-CD to the root directory and run `cargo` commands.
+For most of the time, use dev commands specified in [`python/Makefile`](./python/Makefile), it applies to both Python
+and Rust modules. You don't need to `cd` to the root directory and run `cargo` commands.
 
 To setup python virtual env, run
 
 ```shell
-make setup-env
+make setup-venv
 ```
+
+> [!NOTE]
+> This will run `python` command to setup the virtual environment. You can either change that to `python3.X`,
+> or simply alias `python` to your local `python3.X` installation, for example:
+> ```shell
+> echo "alias python=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" >> ~/.zshrc`
+> ```
 
 Once activate virtual env, build the project for development by
 
