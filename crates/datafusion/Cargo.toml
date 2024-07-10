@@ -31,8 +31,6 @@ arrow-schema = { workspace = true }
 datafusion = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-common = { workspace = true }
-datafusion-proto = { workspace = true }
-datafusion-sql = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 
 # runtime / async

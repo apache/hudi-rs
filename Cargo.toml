@@ -53,8 +53,6 @@ parquet = { version = "52.0.0", features = ["async", "object_store"] }
 datafusion = { version = "39.0.0" }
 datafusion-expr = { version = "39.0.0" }
 datafusion-common = { version = "39.0.0" }
-datafusion-proto = { version = "39.0.0" }
-datafusion-sql = { version = "39.0.0" }
 datafusion-physical-expr = { version = "39.0.0" }
 
 # serde

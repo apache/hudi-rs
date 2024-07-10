@@ -26,16 +26,16 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
 use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_common::DataFusionError::Execution;
+use datafusion_common::DFSchema;
 use datafusion_common::Result;
-use datafusion_common::{DFSchema, DataFusionError};
 use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
-use DataFusionError::Execution;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::storage::utils::{empty_options, get_scheme_authority, parse_uri};
@@ -146,12 +146,12 @@ mod tests {
     use url::Url;
 
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
+    use hudi_tests::{TestTable, utils};
     use hudi_tests::TestTable::{
         V6ComplexkeygenHivestyle, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
         V6TimebasedkeygenNonhivestyle,
     };
-    use hudi_tests::{utils, TestTable};
     use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
