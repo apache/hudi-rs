@@ -21,6 +21,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "Native Python binding for Apache Hudi, based on hudi-rs."
+homepage.workspace = true
+repository = "https://github.com/apache/hudi-rs/tree/main/python/"
 
 [lib]
 name = "hudi"
@@ -28,8 +33,10 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
+hudi = { path = "../crates/hudi" }
 # arrow
 arrow = { workspace = true }
+arrow-schema = { workspace = true }
 
 # "stdlib"
 anyhow = { workspace = true }
@@ -40,7 +47,4 @@ tokio = { workspace = true }
 
 [dependencies.pyo3]
 version = "0.21.2"
-features = ["extension-module", "abi3", "abi3-py38", "anyhow"]
-
-[dependencies.hudi]
-path = "../crates/hudi"
+features = ["extension-module", "abi3", "abi3-py38", "gil-refs", "anyhow"]

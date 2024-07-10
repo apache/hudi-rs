@@ -21,9 +21,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [dependencies]
-hudi-core = { path = "../core" }
+hudi-core = { version = "0.1.0", path = "../core" }
 # arrow
 arrow-schema = { workspace = true }
 
