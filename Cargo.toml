@@ -27,6 +27,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.75.0"
+keywords = ["apachehudi", "hudi", "datalake", "arrow"]
+readme = "README.md"
+description = "A native Rust library for Apache Hudi"
+homepage = "https://github.com/apache/hudi-rs"
+repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow
@@ -48,8 +53,6 @@ parquet = { version = "52.0.0", features = ["async", "object_store"] }
 datafusion = { version = "39.0.0" }
 datafusion-expr = { version = "39.0.0" }
 datafusion-common = { version = "39.0.0" }
-datafusion-proto = { version = "39.0.0" }
-datafusion-sql = { version = "39.0.0" }
 datafusion-physical-expr = { version = "39.0.0" }
 
 # serde
