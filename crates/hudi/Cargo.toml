@@ -25,6 +25,21 @@ rust-version.workspace = true
 [dependencies]
 hudi-core = { path = "../core" }
 hudi-datafusion = { path = "../datafusion", optional = true }
+# datafusion
+datafusion = { workspace = true, optional = true }
+datafusion-expr = { workspace = true, optional = true }
+datafusion-common = { workspace = true, optional = true }
+datafusion-proto = { workspace = true, optional = true }
+datafusion-sql = { workspace = true, optional = true }
+datafusion-physical-expr = { workspace = true, optional = true }
 
 [features]
-datafusion = ["hudi-datafusion"]
+datafusion = [
+    "hudi-datafusion",
+    "dep:datafusion",
+    "datafusion-expr",
+    "datafusion-common",
+    "datafusion-proto",
+    "datafusion-sql",
+    "datafusion-physical-expr",
+]
