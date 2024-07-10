@@ -24,3 +24,7 @@ rust-version.workspace = true
 
 [dependencies]
 hudi-core = { path = "../core" }
+hudi-datafusion = { path = "../datafusion", optional = true }
+
+[features]
+datafusion = ["hudi-datafusion"]

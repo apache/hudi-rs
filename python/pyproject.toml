@@ -25,6 +25,7 @@ description = "Native Hudi Python binding based on hudi-rs"
 urls = { repository = "https://github.com/apache/hudi-rs/tree/main/python/" }
 readme = "README.md"
 requires-python = ">=3.8"
+keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 license = "Apache License 2.0"
 classifiers = [
     "License :: OSI Approved :: Apache Software License",

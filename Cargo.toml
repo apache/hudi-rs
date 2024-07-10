@@ -27,6 +27,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.75.0"
+keywords = ["apachehudi", "hudi", "datalake", "arrow"]
+readme = "README.md"
+description = "A native Rust library for Apache Hudi"
+homepage = "https://github.com/apache/hudi-rs"
+repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow

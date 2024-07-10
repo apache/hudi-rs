@@ -18,3 +18,6 @@
  */
 
 pub use hudi_core::*;
+
+#[cfg(feature = "datafusion")]
+pub use hudi_datafusion::*;

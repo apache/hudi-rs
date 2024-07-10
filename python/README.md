@@ -21,3 +21,26 @@
 
 Native [Apache Hudi](https://github.com/apache/hudi) Python binding based
 on [hudi-rs](https://github.com/apache/hudi-rs).
+
+## Installation
+
+```shell
+pip install hudi
+```
+
+## Example
+
+```python
+from hudi import HudiTable
+
+hudi_table = HudiTable("/tmp/trips_table")
+records = hudi_table.read_snapshot()
+
+import pyarrow as pa
+
+arrow_table = pa.Table.from_batches(records)
+result = arrow_table.select(
+    ["rider", "ts", "fare"]).filter(
+    pa.compute.field("fare") > 20.0)
+print(result)
+```

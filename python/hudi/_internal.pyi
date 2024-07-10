@@ -19,6 +19,8 @@ from typing import Optional, Dict, List
 
 import pyarrow
 
+__version__: str
+
 
 @dataclass(init=False)
 class HudiFileSlice:
