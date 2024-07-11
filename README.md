@@ -51,24 +51,11 @@ users and projects.
 | **PyPi**      | `pip install hudi`   |
 | **Crates.io** | `cargo add hudi`     |
 
-*Note: not yet available until the first release.*
-
 ## Example usage
 
 ### Python
 
-Add `python/hudi` as a dependency to your Python application.
-
-For example, use these commands to setup a virtualenv.
-
-```shell
-cd python
-python3 -m venv my_venv
-source my_venv/bin/activate
-pip install -e .
-```
-
-Then query a Hudi table.
+Read a Hudi table into a PyArrow table.
 
 ```python
 from hudi import HudiTable
@@ -77,30 +64,39 @@ hudi_table = HudiTable("/tmp/trips_table")
 records = hudi_table.read_snapshot()
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 arrow_table = pa.Table.from_batches(records)
 result = arrow_table.select(
     ["rider", "ts", "fare"]).filter(
-    pa.compute.field("fare") > 20.0)
+    pc.field("fare") > 20.0)
 print(result)
 ```
 
 ### Rust
 
-Add `hudi-datafusion` as a dependency to your Rust application, and query a Hudi table.
+<details>
+<summary>Add crate `hudi` with `datafusion` feature to your application to query a Hudi table.</summary>
+
+```yaml
+[dependencies]
+hudi = { version = "0" , features = ["datafusion"] }
+tokio = "1"
+datafusion = "39.0.0"
+```
+</details>
 
 ```rust
 use std::sync::Arc;
 
 use datafusion::error::Result;
 use datafusion::prelude::{DataFrame, SessionContext};
-
-use hudi_datafusion::HudiDataSource;
+use hudi::HudiDataSource;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = SessionContext::new();
-    let hudi = HudiDataSource::new("/tmp/trips_table");
+    let hudi = HudiDataSource::new("/tmp/trips_table").await?;
     ctx.register_table("trips_table", Arc::new(hudi))?;
     let df: DataFrame = ctx.sql("SELECT * from trips_table where fare > 20.0").await?;
     df.show().await?;

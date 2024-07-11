@@ -25,4 +25,5 @@ rustflags = [
 rustflags = [
   "-C", "link-arg=-undefined",
   "-C", "link-arg=dynamic_lookup",
+  "-C", "target-cpu=apple-m1",
 ]

@@ -21,9 +21,8 @@ build-backend = "maturin"
 
 [project]
 name = "hudi"
-description = "Native Hudi Python binding based on hudi-rs"
+description = "Native Python binding for Apache Hudi, based on hudi-rs."
 urls = { repository = "https://github.com/apache/hudi-rs/tree/main/python/" }
-readme = "README.md"
 requires-python = ">=3.8"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 license = "Apache License 2.0"
@@ -36,7 +35,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12"
 ]
 dependencies = [
-    "pyarrow>=8"
+    "pyarrow>=8",
+    "pyarrow-hotfix",
 ]
 
 optional-dependencies = { devel = [
@@ -47,7 +47,6 @@ dynamic = ["version"]
 
 [tool.maturin]
 module-name = "hudi._internal"
-features = ["pyo3/extension-module"]
 
 [tool.mypy]
 files = "hudi/*.py"
