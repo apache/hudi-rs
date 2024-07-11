@@ -32,16 +32,17 @@ fi
 # check release version
 hudi_version=${HUDI_VERSION}
 if [ -z "${hudi_version}" ]; then
-	echo "HUDI_VERSION is not set; Please specify the target hudi version to release, e.g., 0.1.0-rc.1"
-	exit 1
+  echo "HUDI_VERSION is not set; Please specify the target hudi version to release, e.g., 0.1.0-rc.1"
+  exit 1
 else
-	echo "❗️  Releasing Hudi version $hudi_version"
+    echo "❗️  Releasing Hudi version $hudi_version"
 fi
 
 # check release version against git tag
 curr_tag=$(git describe --exact-match --tags)
-if [ ! "$curr_tag" == "release-$hudi_version" ]; then
-  echo "Tag '$curr_tag' does not match with release version $hudi_version"
+if [[ ! "$curr_tag" == "release-$hudi_version" ]]; then
+  echo "Tag '$curr_tag' does not match with release version release-$hudi_version"
+  exit 1
 else
   echo "❗️  On tag $curr_tag"
 fi
@@ -97,11 +98,19 @@ popd
 svn_dev_url="https://dist.apache.org/repos/dist/dev/hudi"
 svn_dir="$work_dir/svn_dev"
 echo ">>> Checking out svn dev to $svn_dir"
-svn checkout $svn_dev_url --depth=immediates "$svn_dir"
+svn co -q $svn_dev_url --depth=immediates "$svn_dir"
+echo ">>> Checking if the same version dir exists in svn"
+hudi_src_rel_svn_dir="$svn_dir/$(basename $hudi_src_rel_dir)"
+if [ -d $hudi_src_rel_svn_dir ]; then
+    echo "❌  Version $(basename $hudi_src_rel_svn_dir) already exists!"
+    exit 1
+fi
 echo ">>> Copying source release files to $svn_dir"
-cp "$hudi_src_rel_dir" "$svn_dir/"
+cp -r "$hudi_src_rel_dir" "$svn_dir/"
+echo "✅  SUCCESS! Placed source release at $hudi_src_rel_svn_dir"
+for i in $(ls -a "$hudi_src_rel_svn_dir"); do echo "|___$i"; done;
 
-echo "❗️  [ACTION REQUIRED] Manually commit the source release to SVN."
+echo "❗️  [ACTION REQUIRED] Manually inspect and commit the source release to SVN."
 echo "1️⃣  cd $svn_dir"
-echo "2️⃣  svn add hudi-rs-$hudi_version"
-echo "3️⃣  svn commit"
+echo "2️⃣  svn add $(basename $hudi_src_rel_svn_dir)"
+echo "3️⃣  svn commit -m 'add $(basename $hudi_src_rel_svn_dir)'"
