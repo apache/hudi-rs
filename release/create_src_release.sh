@@ -35,7 +35,7 @@ if [ -z "${hudi_version}" ]; then
   echo "HUDI_VERSION is not set; Please specify the target hudi version to release, e.g., 0.1.0-rc.1"
   exit 1
 else
-    echo "❗️  Releasing Hudi version $hudi_version"
+  echo "❗️  Releasing Hudi version $hudi_version"
 fi
 
 # check release version against git tag
@@ -50,12 +50,11 @@ fi
 # make sure a desired key is specified
 gpg_user_id=${GPG_USER_ID}
 if [ -z "${gpg_user_id}" ]; then
-	echo "GPG_USER_ID is not set; run 'gpg --list-secret-keys --keyid-format=long' to choose a key."
-	exit 1
+  echo "GPG_USER_ID is not set; run 'gpg --list-secret-keys --keyid-format=long' to choose a key."
+  exit 1
 else
-	echo "❗️  Signing using key '$gpg_user_id'"
+  echo "❗️  Signing using key '$gpg_user_id'"
 fi
-
 
 work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')"
 hudi_src_rel_dir="$work_dir/hudi-rs-$hudi_version"
@@ -67,32 +66,32 @@ echo "Done archiving."
 pushd "$hudi_src_rel_dir"
 echo ">>> Generating signature"
 for i in *.tar.gz; do
-	echo "$i"
-	gpg --local-user "$gpg_user_id" --armor --output "$i.asc" --detach-sig "$i"
+  echo "$i"
+  gpg --local-user "$gpg_user_id" --armor --output "$i.asc" --detach-sig "$i"
 done
 echo ">>> Checking signature"
 for i in *.tar.gz; do
-	echo "$i"
-	gpg --local-user "$gpg_user_id" --verify "$i.asc" "$i"
+  echo "$i"
+  gpg --local-user "$gpg_user_id" --verify "$i.asc" "$i"
 done
 echo ">>> Generating sha512sum"
 if [ "$(uname)" == "Darwin" ]; then
-    SHASUM="shasum -a 512"
+  SHASUM="shasum -a 512"
 else
-    SHASUM="sha512sum"
+  SHASUM="sha512sum"
 fi
 for i in *.tar.gz; do
-	echo "$i"
-	$SHASUM "$i" >"$i.sha512"
+  echo "$i"
+  $SHASUM "$i" >"$i.sha512"
 done
 echo ">>> Checking sha512sum"
 for i in *.tar.gz; do
-	echo "$i"
-	$SHASUM --check "$i.sha512"
+  echo "$i"
+  $SHASUM --check "$i.sha512"
 done
 
 echo "✅  SUCCESS! Created source release at $hudi_src_rel_dir"
-for i in $(ls -a "$hudi_src_rel_dir"); do echo "|___$i"; done;
+for i in $(ls -a "$hudi_src_rel_dir"); do echo "|___$i"; done
 popd
 
 svn_dev_url="https://dist.apache.org/repos/dist/dev/hudi"
@@ -102,13 +101,13 @@ svn co -q $svn_dev_url --depth=immediates "$svn_dir"
 echo ">>> Checking if the same version dir exists in svn"
 hudi_src_rel_svn_dir="$svn_dir/$(basename $hudi_src_rel_dir)"
 if [ -d $hudi_src_rel_svn_dir ]; then
-    echo "❌  Version $(basename $hudi_src_rel_svn_dir) already exists!"
-    exit 1
+  echo "❌  Version $(basename $hudi_src_rel_svn_dir) already exists!"
+  exit 1
 fi
 echo ">>> Copying source release files to $svn_dir"
 cp -r "$hudi_src_rel_dir" "$svn_dir/"
 echo "✅  SUCCESS! Placed source release at $hudi_src_rel_svn_dir"
-for i in $(ls -a "$hudi_src_rel_svn_dir"); do echo "|___$i"; done;
+for i in $(ls -a "$hudi_src_rel_svn_dir"); do echo "|___$i"; done
 
 echo "❗️  [ACTION REQUIRED] Manually inspect and commit the source release to SVN."
 echo "1️⃣  cd $svn_dir"
