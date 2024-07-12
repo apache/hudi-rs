@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="https://hudi.apache.org/">
-    <img src="https://hudi.apache.org/assets/images/hudi_logo_transparent_1400x600.png" alt="Hudi logo" height="80px">
+    <img src="https://hudi.apache.org/assets/images/hudi_logo_transparent_1400x600.png" alt="Hudi logo" height="120px">
   </a>
 </p>
 <p align="center">
