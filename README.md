@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="https://hudi.apache.org/">
-    <img src="https://hudi.apache.org/assets/images/hudi-logo-medium.png" alt="Hudi logo" height="80px">
+    <img src="https://hudi.apache.org/assets/images/hudi_logo_transparent_1400x600.png" alt="Hudi logo" height="80px">
   </a>
 </p>
 <p align="center">
@@ -53,6 +53,10 @@ users and projects.
 
 ## Example usage
 
+> ![NOTE]
+> These examples expect a Hudi table exists at `/tmp/trips_table`, created using
+> the [quick start guide](https://hudi.apache.org/docs/quick-start-guide).
+
 ### Python
 
 Read a Hudi table into a PyArrow table.
@@ -76,14 +80,16 @@ print(result)
 ### Rust
 
 <details>
-<summary>Add crate `hudi` with `datafusion` feature to your application to query a Hudi table.</summary>
+<summary>Add crate hudi with datafusion feature to your application to query a Hudi table.</summary>
 
-```yaml
-[dependencies]
-hudi = { version = "0" , features = ["datafusion"] }
-tokio = "1"
-datafusion = "39.0.0"
+```shell
+cargo new my_project --bin && cd my_project
+cargo add tokio@1 datafusion@39
+cargo add hudi --features datafusion
 ```
+
+Update `src/main.rs` with the code snippet below then `cargo run`.
+
 </details>
 
 ```rust
