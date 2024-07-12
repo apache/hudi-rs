@@ -53,7 +53,7 @@ users and projects.
 
 ## Example usage
 
-> ![NOTE]
+> [!NOTE]
 > These examples expect a Hudi table exists at `/tmp/trips_table`, created using
 > the [quick start guide](https://hudi.apache.org/docs/quick-start-guide).
 
