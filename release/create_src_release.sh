@@ -18,7 +18,8 @@
 # under the License.
 #
 
-set -e
+set -o errexit
+set -o nounset
 
 # check git branch
 curr_branch=$(git rev-parse --abbrev-ref HEAD)
@@ -60,17 +61,17 @@ work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')"
 hudi_src_rel_dir="$work_dir/hudi-rs-$hudi_version"
 echo ">>> Archiving branch $curr_branch to $hudi_src_rel_dir"
 mkdir -p "$hudi_src_rel_dir"
-git archive --format=tar.gz --output="$hudi_src_rel_dir/hudi-rs-$hudi_version.src.tar.gz" "$curr_branch"
+git archive --format=tgz --output="$hudi_src_rel_dir/hudi-rs-$hudi_version.src.tgz" "$curr_branch"
 echo "Done archiving."
 
 pushd "$hudi_src_rel_dir"
 echo ">>> Generating signature"
-for i in *.tar.gz; do
+for i in *.tgz; do
   echo "$i"
   gpg --local-user "$gpg_user_id" --armor --output "$i.asc" --detach-sig "$i"
 done
 echo ">>> Checking signature"
-for i in *.tar.gz; do
+for i in *.tgz; do
   echo "$i"
   gpg --local-user "$gpg_user_id" --verify "$i.asc" "$i"
 done
@@ -80,12 +81,12 @@ if [ "$(uname)" == "Darwin" ]; then
 else
   SHASUM="sha512sum"
 fi
-for i in *.tar.gz; do
+for i in *.tgz; do
   echo "$i"
   $SHASUM "$i" >"$i.sha512"
 done
 echo ">>> Checking sha512sum"
-for i in *.tar.gz; do
+for i in *.tgz; do
   echo "$i"
   $SHASUM --check "$i.sha512"
 done
