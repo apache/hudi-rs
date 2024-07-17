@@ -22,29 +22,18 @@ set -o errexit
 set -o nounset
 
 if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 <dev|release> <hudi_version>"
+  echo "Usage: $0 <hudi_version> <dev|release>"
   exit 1
 fi
 
-repo=$1
-hudi_version=$2
+hudi_version=$1
+repo=$2
 
-dev_pattern="^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)\.[0-9]+$"
-release_pattern="^[0-9]+\.[0-9]+\.[0-9]+$"
+version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$"
 
-if [[ "$repo" == "dev" ]]; then
-  if [[ ! "$hudi_version" =~ $dev_pattern ]]; then
-    echo "ERROR: For 'dev' repo, version must be in format X.Y.Z-[alpha|beta|rc].N (e.g., 0.1.0-rc.1)"
+if [[ ! "$hudi_version" =~ $version_pattern ]]; then
+    echo "ERROR: version must be in format X.Y.Z or X.Y.Z-rc.W"
     exit 1
-  fi
-elif [[ "$repo" == "release" ]]; then
-  if [[ ! "$hudi_version" =~ $release_pattern ]]; then
-    echo "ERROR: For 'release' repo, version must be in format X.Y.Z (e.g., 0.1.0)"
-    exit 1
-  fi
-else
-  echo "ERROR: Invalid repository type. Use 'dev' or 'release'."
-  exit 1
 fi
 
 work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')/svn_dir"
