@@ -17,11 +17,13 @@
 
 rust:
   - changed-files:
-      - any-glob-to-any-file: 'crates/**'
+      - any-glob-to-any-file:
+          - 'crates/**'
 
 python:
   - changed-files:
-      - any-glob-to-any-file: 'python/**'
+      - any-glob-to-any-file:
+          - 'python/**'
 
 documentation:
   - changed-files:
@@ -30,7 +32,7 @@ documentation:
 
 ci:
   - changed-files:
-      - any-globs-to-all-files:
+      - any-glob-to-any-file:
           - '.github/workflows/ci.yml'
           - '.github/workflows/release.yml'
 
