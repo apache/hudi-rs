@@ -23,6 +23,12 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+  checks: write
+
 jobs:
   check-title:
     runs-on: ubuntu-latest
@@ -35,8 +41,11 @@ jobs:
           npm i -g conventional-changelog-conventionalcommits
           npm i -g commitlint@latest
           echo ${{ github.event.pull_request.title }} | npx commitlint
+
   labeler:
     needs: check-title
     runs-on: ubuntu-latest
     steps:
       - uses: fuxingloh/multi-labeler@v4
+        with:
+          config-path: .github/labeler.yml
