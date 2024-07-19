@@ -30,7 +30,7 @@ documentation:
 
 ci:
   - changed-files:
-      - any-globs-to-all-files:
+      - any-globs-to-any-files:
           - '.github/workflows/ci.yml'
           - '.github/workflows/release.yml'
 
