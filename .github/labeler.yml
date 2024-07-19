@@ -15,27 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-version: v1
+rust:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/**'
 
-labels:
-  - label: 'feature'
-    matcher:
-      title: '^feat:.*'
-  - label: 'bug'
-    matcher:
-      title: '^fix:.*'
-  - label: 'documentation'
-    matcher:
-      title: '^docs:.*'
-  - label: 'ci'
-    matcher:
-      title: '^ci:.*'
-  - label: 'test'
-    matcher:
-      title: '^test:.*'
-  - label: 'p0'
-    matcher:
-      title: '^fix:.*'
-  - label: 'dev-x'
-    matcher:
-      title: '^(chore|style):.*'
+python:
+  - changed-files:
+      - any-glob-to-any-file: 'python/**'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+        - 'README.md'
+        - 'CONTRIBUTING.md'

@@ -22,12 +22,14 @@ on:
     types: [ opened, edited, reopened, synchronize ]
     branches:
       - main
+  pull_request_target:
+    types: [ opened, edited, reopened, synchronize ]
+    branches:
+      - main
 
 permissions:
   contents: read
   pull-requests: write
-  statuses: write
-  checks: write
 
 jobs:
   check-title:
@@ -42,6 +44,4 @@ jobs:
           npm i -g commitlint@latest
           echo ${{ github.event.pull_request.title }} | npx commitlint
       - name: Labeling
-        uses: fuxingloh/multi-labeler@v4
-        with:
-          config-path: .github/labeler.yml
+        uses: actions/labeler@v5
