@@ -24,7 +24,7 @@ on:
       - main
 
 jobs:
-  check_title:
+  check-title:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,8 +36,7 @@ jobs:
           npm i -g commitlint@latest
           echo ${{ github.event.pull_request.title }} | npx commitlint
   labeler:
-    name: Labeler
-    needs: [ check_title ]
+    needs: check-title
     runs-on: ubuntu-latest
     steps:
       - uses: fuxingloh/multi-labeler@v4
