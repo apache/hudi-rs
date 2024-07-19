@@ -43,6 +43,7 @@ To setup python virtual env, run
 ```shell
 make setup-venv
 ```
+<!-- tmp -->
 
 > [!NOTE]
 > This will run `python` command to setup the virtual environment. You can either change that to `python3.X`,

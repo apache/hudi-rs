@@ -22,6 +22,7 @@ import pyarrow
 __version__: str
 
 
+# tmp
 @dataclass(init=False)
 class HudiFileSlice:
     file_group_id: str
