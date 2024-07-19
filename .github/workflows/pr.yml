@@ -18,10 +18,6 @@
 name: PR
 
 on:
-  pull_request:
-    types: [ opened, edited, reopened, synchronize ]
-    branches:
-      - main
   pull_request_target:
     types: [ opened, edited, reopened, synchronize ]
     branches:

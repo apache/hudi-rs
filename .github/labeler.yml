@@ -28,8 +28,17 @@ documentation:
       - any-glob-to-any-file:
           - '*.md'
 
+ci:
+  - changed-files:
+      - any-globs-to-all-files:
+          - '.github/workflows/ci.yml'
+          - '.github/workflows/release.yml'
+
 dev-x:
   - changed-files:
       - any-glob-to-any-file:
           - '.github/**'
-      - all-globs-to-all-files: '!.github/workflows/ci.yml'
+          - '*.yaml'
+      - all-globs-to-all-files:
+          - '!.github/workflows/ci.yml'
+          - '!.github/workflows/release.yml'
