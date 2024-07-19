@@ -26,5 +26,10 @@ python:
 documentation:
   - changed-files:
       - any-glob-to-any-file:
-        - 'README.md'
-        - 'CONTRIBUTING.md'
+          - '*.md'
+
+dev-x:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+      - all-globs-to-all-files: '!.github/workflows/ci.yml'
