@@ -19,27 +19,21 @@ version: v1
 
 labels:
   - label: 'feature'
-    sync: true
     matcher:
       title: '^feat:.*'
   - label: 'bug'
-    sync: true
     matcher:
       title: '^fix:.*'
   - label: 'documentation'
-    sync: true
     matcher:
       title: '^docs:.*'
   - label: 'ci'
-    sync: true
     matcher:
       title: '^ci:.*'
   - label: 'test'
-    sync: true
     matcher:
       title: '^test:.*'
   - label: 'p0'
-    sync: true
     matcher:
       title: '^fix:.*'
   - label: 'dev-x'
