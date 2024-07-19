@@ -61,7 +61,6 @@ This will install `hudi` dependency built from your local repo to the virtual en
 
 ## Run tests locally
 
-
 For Rust,
 
 ```shell
