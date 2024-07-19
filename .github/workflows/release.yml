@@ -35,6 +35,7 @@ jobs:
             echo "Pushed tag ${GITHUB_REF_NAME} does not match with the Cargo package version ${CURR_VER}."
             exit 1
           fi
+          # tmp
 
   release-crates:
     name: Release to crates.io
