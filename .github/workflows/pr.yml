@@ -23,6 +23,14 @@ on:
     branches:
       - main
 
+permissions:
+  # Setting up permissions in the workflow to limit the scope of what it can do. Optional!
+  contents: read # the config file
+  issues: write # for labeling issues (on: issues)
+  pull-requests: write # for labeling pull requests (on: pull_request_target or on: pull_request)
+  statuses: write # to generate status
+  checks: write # to generate status
+
 jobs:
   check_title:
     runs-on: ubuntu-latest
@@ -35,3 +43,9 @@ jobs:
           npm i -g conventional-changelog-conventionalcommits
           npm i -g commitlint@latest
           echo ${{ github.event.pull_request.title }} | npx commitlint
+  labeler:
+    name: Labeler
+    needs: [ check_title ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: fuxingloh/multi-labeler@v4
