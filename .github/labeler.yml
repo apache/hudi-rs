@@ -39,8 +39,4 @@ ci:
 dev-x:
   - changed-files:
       - any-glob-to-any-file:
-          - '.github/**'
           - '*.yaml'
-      - all-globs-to-all-files:
-          - '!.github/workflows/ci.yml'
-          - '!.github/workflows/release.yml'
