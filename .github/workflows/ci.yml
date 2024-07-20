@@ -99,7 +99,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
-          path: ./python/cov-reports
+          path: ./cov-reports
           if-no-files-found: 'error'
 
 
