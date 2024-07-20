@@ -40,7 +40,8 @@ dependencies = [
 ]
 
 optional-dependencies = { devel = [
-    "pytest"
+    "pytest",
+    "coverage",
 ] }
 
 dynamic = ["version"]

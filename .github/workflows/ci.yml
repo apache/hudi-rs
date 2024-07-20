@@ -40,19 +40,82 @@ jobs:
       - name: Check code style
         run: cd python && make check-rust
 
-  test:
-    runs-on: ubuntu-latest
+  rust-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add windows which does not support container
+        os: [ ubuntu-22.04 ]
+    runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.29.1
+      image: xd009642/tarpaulin:0.30.0
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      - name: Unit test with code coverage
+      - name: Rust unit tests with coverage report
         # https://github.com/xd009642/tarpaulin/issues/1092#issuecomment-1407739176
-        run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace --out xml
-      - name: Upload coverage reports to Codecov
+        run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace -o xml --output-dir ./cov-reports
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cov-report-rust-tests-${{ runner.os }}
+          path: ./cov-reports
+          if-no-files-found: 'error'
+
+  python-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add windows
+        os: [ ubuntu-22.04, macos-14 ]
+        python-version: [ '3.8', '3.12' ]
+        exclude:
+          - os: macos-14
+            python-version: '3.8'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Setup Python venv
+        working-directory: ./python
+        run: |
+          make setup-venv
+          source venv/bin/activate
+          make develop
+      - name: Python unit tests with coverage report
+        run: |
+          pushd python
+          source venv/bin/activate
+          coverage run --include 'hudi/*' -m pytest -v
+          # move to parent so the reported file paths will match the actual repo paths
+          popd
+          coverage xml --data-file=python/.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cov-report-python-tests-${{ join(matrix.*, '-') }}
+          path: ./cov-reports
+          if-no-files-found: 'error'
+
+
+  publish-coverage:
+    name: Publish coverage reports to codecov.io
+    runs-on: ubuntu-latest
+    needs: [ rust-tests, python-tests ]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cov-report-*
+          merge-multiple: true
+          path: ./cov-reports
+      - name: Upload coverage reports to codecov.io
         uses: codecov/codecov-action@v4
         with:
           fail_ci_if_error: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./cov-reports/*
