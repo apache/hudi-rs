@@ -87,6 +87,7 @@ jobs:
           make develop
       - name: Python unit tests with coverage report
         run: |
+          source venv/bin/activate
           coverage run --include 'hudi/*' -m pytest -v
           coverage lcov -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.lcov
       - name: Upload coverage report
