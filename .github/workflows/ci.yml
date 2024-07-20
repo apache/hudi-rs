@@ -60,6 +60,7 @@ jobs:
         with:
           name: cov-report-rust-tests-${{ runner.os }}
           path: ./cov-reports
+          if-no-files-found: 'error'
 
   python-tests:
     strategy:
@@ -68,9 +69,6 @@ jobs:
         os: [ ubuntu-22.04, macos-latest ]
         python-version: ['3.8', '3.12']
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: ./python
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -80,12 +78,13 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Setup Python venv
-        run: make setup-venv
-      - name: Install Python dependencies
+        working-directory: ./python
         run: |
+          make setup-venv
           source venv/bin/activate
           make develop
       - name: Python unit tests with coverage report
+        working-directory: ./python
         run: |
           source venv/bin/activate
           coverage run --include 'hudi/*' -m pytest -v
@@ -94,7 +93,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
-          path: ./cov-reports
+          path: ./python/cov-reports
+          if-no-files-found: 'error'
 
 
   publish-coverage:
