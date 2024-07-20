@@ -88,11 +88,13 @@ jobs:
           source venv/bin/activate
           make develop
       - name: Python unit tests with coverage report
-        working-directory: ./python
         run: |
+          pushd python
           source venv/bin/activate
           coverage run --include 'hudi/*' -m pytest -v
-          coverage xml -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
+          # move to parent so the reported file paths will match the actual repo paths
+          popd
+          coverage xml --data-file=python/.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
