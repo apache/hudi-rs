@@ -22,9 +22,17 @@ on:
     branches:
       - main
       - release/**
+    paths:
+      - 'python/**'
+      - '!python/Makefile'
+      - 'crates/**'
   pull_request:
     branches:
       - main
+    paths:
+      - 'python/**'
+      - '!python/Makefile'
+      - 'crates/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
