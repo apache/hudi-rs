@@ -24,6 +24,7 @@ header:
     - 'LICENSE'
     - 'NOTICE'
     - '**/data/**'
+    - '.github/PULL_REQUEST_TEMPLATE.md'
 
   comment: on-failure
 
