@@ -2,10 +2,9 @@
 
 <!--- Describe your changes in detail -->
 
-## Context
-
-<!--- Why is this change required? What problem does it solve? -->
 <!--- If it fixes an open issue, please link to the issue here. -->
+
+<!--- Please link any related issues and PRs as well. -->
 
 ## How are the changes test-covered
 
