@@ -9,7 +9,7 @@
 
 ## How are the changes test-covered
 
-- [ ] Unit test
-- [ ] Integration test
-- [ ] Manual test
+- [ ] N/A
+- [ ] Automated tests (unit and/or integration tests)
+- [ ] Manual tests
   - [ ] Details are described below
