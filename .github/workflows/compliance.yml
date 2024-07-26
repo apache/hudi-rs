@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: PR
+name: Compliance
 
 on:
   pull_request_target:
@@ -28,7 +28,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  compliance:
+  check-pr:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,3 +41,11 @@ jobs:
           echo ${{ github.event.pull_request.title }} | npx commitlint
       - name: Labeling
         uses: actions/labeler@v5
+  check-changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check license header
+        uses: apache/skywalking-eyes/header@v0.6.0
+      - name: Check code style
+        run: cd python && make check-rust
