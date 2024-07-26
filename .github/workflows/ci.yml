@@ -22,29 +22,27 @@ on:
     branches:
       - main
       - release/**
-    paths:
-      - 'Cargo.toml'
-      - 'codecov.yml'
-      - 'rust-toolchain.toml'
-      - 'python/**'
-      - 'crates/**'
     paths-ignore:
       - '**.md'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.asf.yaml'
+      - '.licenserc.yaml'
+      - '.commitlintrc.yaml'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
     branches:
       - main
-    paths:
-      - 'Cargo.toml'
-      - 'codecov.yml'
-      - 'rust-toolchain.toml'
-      - 'python/**'
-      - 'crates/**'
     paths-ignore:
       - '**.md'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.asf.yaml'
+      - '.licenserc.yaml'
+      - '.commitlintrc.yaml'
+      - 'LICENSE'
+      - 'NOTICE'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
