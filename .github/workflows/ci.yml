@@ -22,24 +22,33 @@ on:
     branches:
       - main
       - release/**
+    paths-ignore:
+      - '**.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.asf.yaml'
+      - '.licenserc.yaml'
+      - '.commitlintrc.yaml'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.asf.yaml'
+      - '.licenserc.yaml'
+      - '.commitlintrc.yaml'
+      - 'LICENSE'
+      - 'NOTICE'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check license header
-        uses: apache/skywalking-eyes/header@v0.6.0
-      - name: Check code style
-        run: cd python && make check-rust
-
   rust-tests:
     strategy:
       fail-fast: false
