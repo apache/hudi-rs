@@ -17,14 +17,10 @@
  * under the License.
  */
 
+use crate::config::{ConfigError, ConfigParser, HudiConfigValue};
 use std::collections::HashMap;
 use std::str::FromStr;
-
-use anyhow::anyhow;
-use anyhow::Result;
 use strum_macros::{AsRefStr, EnumIter};
-
-use crate::config::{ConfigParser, HudiConfigValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiTableConfig {
@@ -83,47 +79,58 @@ impl ConfigParser for HudiTableConfig {
         matches!(self, Self::TableName | Self::TableType | Self::TableVersion)
     }
 
-    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output, ConfigError> {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+            .ok_or(ConfigError::NotFound);
 
         match self {
             Self::BaseFileFormat => get_result
-                .and_then(BaseFileFormatValue::from_str)
+                .and_then(|v| {
+                    BaseFileFormatValue::from_str(v)
+                        .map_err(|e| ConfigError::ParseError(e.to_string()))
+                })
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::Checksum => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string()))
+                })
                 .map(HudiConfigValue::Integer),
             Self::DatabaseName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::DropsPartitionFields => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| bool::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string())))
                 .map(HudiConfigValue::Boolean),
             Self::IsHiveStylePartitioning => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| bool::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string())))
                 .map(HudiConfigValue::Boolean),
             Self::IsPartitionPathUrlencoded => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| bool::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string())))
                 .map(HudiConfigValue::Boolean),
             Self::KeyGeneratorClass => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
             Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PopulatesMetaFields => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| bool::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string())))
                 .map(HudiConfigValue::Boolean),
             Self::RecordKeyFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
             Self::TableName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::TableType => get_result
-                .and_then(TableTypeValue::from_str)
+                .and_then(|v| {
+                    TableTypeValue::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string()))
+                })
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::TableVersion => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string()))
+                })
                 .map(HudiConfigValue::Integer),
             Self::TimelineLayoutVersion => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string()))
+                })
                 .map(HudiConfigValue::Integer),
         }
     }
@@ -138,13 +145,16 @@ pub enum TableTypeValue {
 }
 
 impl FromStr for TableTypeValue {
-    type Err = anyhow::Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
-            _ => Err(anyhow!("Unsupported table type: {}", s)),
+            _ => Err(ConfigError::ParseError(format!(
+                "Unsupported table type: {}",
+                s
+            ))),
         }
     }
 }
@@ -156,21 +166,23 @@ pub enum BaseFileFormatValue {
 }
 
 impl FromStr for BaseFileFormatValue {
-    type Err = anyhow::Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
-            _ => Err(anyhow!("Unsupported base file format: {}", s)),
+            _ => Err(ConfigError::ParseError(format!(
+                "Unsupported base file format: {}",
+                s
+            ))),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use crate::config::table::{BaseFileFormatValue, TableTypeValue};
+    use std::str::FromStr;
 
     #[test]
     fn create_table_type() {
@@ -214,9 +226,9 @@ mod tests {
             BaseFileFormatValue::from_str("PArquet").unwrap(),
             BaseFileFormatValue::Parquet
         );
-        assert!(TableTypeValue::from_str("").is_err());
+        assert!(BaseFileFormatValue::from_str("").is_err());
         assert!(
-            TableTypeValue::from_str("orc").is_err(),
+            BaseFileFormatValue::from_str("orc").is_err(),
             "orc is not yet supported."
         );
     }

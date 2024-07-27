@@ -17,11 +17,9 @@
  * under the License.
  */
 
+use crate::config::{ConfigError, ConfigParser, HudiConfigValue};
 use std::collections::HashMap;
 use std::str::FromStr;
-
-use crate::config::{ConfigParser, HudiConfigValue};
-use anyhow::{anyhow, Result};
 use strum_macros::EnumIter;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
@@ -49,15 +47,17 @@ impl ConfigParser for HudiReadConfig {
         }
     }
 
-    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
+    fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output, ConfigError> {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+            .ok_or(ConfigError::NotFound);
 
         match self {
             Self::InputPartitions => get_result
-                .and_then(|v| usize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| ConfigError::ParseError(e.to_string()))
+                })
                 .map(HudiConfigValue::UInteger),
             Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
         }
@@ -67,9 +67,8 @@ impl ConfigParser for HudiReadConfig {
 #[cfg(test)]
 mod tests {
     use crate::config::read::HudiReadConfig::InputPartitions;
-    use crate::config::ConfigParser;
+    use crate::config::{ConfigError, ConfigParser};
     use std::collections::HashMap;
-    use std::num::ParseIntError;
 
     #[test]
     fn parse_valid_config_value() {
@@ -82,7 +81,7 @@ mod tests {
     fn parse_invalid_config_value() {
         let options = HashMap::from([(InputPartitions.as_ref().to_string(), "foo".to_string())]);
         let value = InputPartitions.parse_value(&options);
-        assert!(value.err().unwrap().is::<ParseIntError>());
+        assert!(matches!(value, Err(ConfigError::ParseError(_))));
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)
