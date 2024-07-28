@@ -30,6 +30,8 @@ setup-venv: ## Setup the virtualenv
 setup: ## Setup the requirements
 	$(info --- Setup dependencies ---)
 	pip install "$(MATURIN_VERSION)"
+    pip install pre-commit
+    pre-commit install
 
 .PHONY: build
 build: setup ## Build Python binding of delta-rs
