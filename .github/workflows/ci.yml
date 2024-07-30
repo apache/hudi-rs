@@ -61,6 +61,12 @@ jobs:
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
+      - name: Install minimal stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
       - name: Rust unit tests with coverage report
         # https://github.com/xd009642/tarpaulin/issues/1092#issuecomment-1407739176
         run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace -o xml --output-dir ./cov-reports
