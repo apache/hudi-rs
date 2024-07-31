@@ -97,6 +97,17 @@ impl TableProvider for HudiDataSource {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // register object store
+        state.runtime_env().clone().register_object_store(
+            &self.table.base_url,
+            self.table
+                .file_system_view
+                .storage
+                .clone()
+                .object_store
+                .clone(),
+        );
+
         let file_slices = self
             .table
             .split_file_slices(self.get_input_partitions())
