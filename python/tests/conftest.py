@@ -23,18 +23,18 @@ import pytest
 
 
 def _extract_testing_table(zip_file_path, target_path) -> str:
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
         zip_ref.extractall(target_path)
-    return os.path.join(target_path, 'trips_table')
+    return os.path.join(target_path, "trips_table")
 
 
 @pytest.fixture(
     params=[
-        '0.x_cow_partitioned',
+        "0.x_cow_partitioned",
     ]
 )
 def get_sample_table(request, tmp_path) -> str:
-    fixture_path = 'tests/table'
+    fixture_path = "tests/table"
     table_name = request.param
-    zip_file_path = Path(fixture_path).joinpath(f'{table_name}.zip')
+    zip_file_path = Path(fixture_path).joinpath(f"{table_name}.zip")
     return _extract_testing_table(zip_file_path, tmp_path)

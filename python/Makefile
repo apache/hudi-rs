@@ -50,10 +50,11 @@ check-rust: ## Run check on Rust
 
 .PHONY: check-python
 check-python: ## Run check on Python
-	$(info --- Check Python code quality ---)
-	pip install ruff mypy
+	$(info --- Check Python format ---)
+	ruff format --check --diff .
+	$(info --- Check Python linting ---)
 	ruff check .
-	ruff format .
+	$(info --- Check Python typing ---)
 	mypy .
 
 .PHONY: test-rust
