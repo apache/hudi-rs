@@ -42,6 +42,7 @@ jobs:
       - name: Labeling
         uses: actions/labeler@v5
   check-changes:
+    if: github.event.pull_request_target.type != 'edited'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
