@@ -15,12 +15,11 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Dict, List, Optional
 
-import pyarrow
+import pyarrow  # type: ignore
 
 __version__: str
-
 
 @dataclass(init=False)
 class HudiFileSlice:
@@ -33,24 +32,16 @@ class HudiFileSlice:
 
     def base_file_relative_path(self) -> str: ...
 
-
 @dataclass(init=False)
 class HudiTable:
-
     def __init__(
-            self,
-            table_uri: str,
-            options: Optional[Dict[str, str]] = None,
+        self,
+        table_uri: str,
+        options: Optional[Dict[str, str]] = None,
     ): ...
-
     def get_schema(self) -> "pyarrow.Schema": ...
-
     def split_file_slices(self, n: int) -> List[List[HudiFileSlice]]: ...
-
     def get_file_slices(self) -> List[HudiFileSlice]: ...
-
-    def read_file_slice(self, base_file_relative_path) -> pyarrow.RecordBatch: ...
-
+    def read_file_slice(self, base_file_relative_path: str) -> pyarrow.RecordBatch: ...
     def read_snapshot(self) -> List["pyarrow.RecordBatch"]: ...
-
     def read_snapshot_as_of(self, timestamp: str) -> List["pyarrow.RecordBatch"]: ...
