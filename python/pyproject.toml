@@ -51,30 +51,22 @@ module-name = "hudi._internal"
 
 [tool.ruff]
 target-version = 'py38'
-lint.mccabe = { max-complexity = 14 }
-lint.flake8-quotes = {inline-quotes = 'single', multiline-quotes = 'double'}
-lint.pydocstyle = { convention = 'google' }
-format.quote-style = 'single'
-lint.ignore = [
-    "Q000",
-    "Q001",
-    "Q002",
-    "Q003",
-    "COM812",
-    "COM819",
-    "D104",
-    "I001",
-    "UP006",
-    "UP007",
-    "UP037",
-    "E501", # Formatted code may exceed the line length, leading to line-too-long (E501) errors.
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
+lint.select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    # isort
+    "I",
 ]
+# don't ignore any rule unless it becomes imperative
+lint.ignore = []
+lint.isort.known-first-party = ["hudi"]
 
 [tool.mypy]
 files = "hudi/*.py"
 exclude = "^tests"
-warn_unused_configs = true
-ignore_missing_imports = true
 strict = true
 
 [tool.pytest.ini_options]
