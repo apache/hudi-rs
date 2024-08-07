@@ -49,16 +49,20 @@ jobs:
         uses: apache/skywalking-eyes/header@v0.6.0
       - name: Check rust code style
         run: cd python && make check-rust
-      - name: Setup Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: 3.8
+          python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: ./python/pyproject.toml
-      - name: Check python
+          cache-dependency-path: pyproject.toml
+      - name: Install python linter dependencies
         working-directory: ./python
         run: |
           make setup-env
           source venv/bin/activate
-          make develop
+          pip install ruff mypy
+      - name: Run python linter
+        working-directory: ./python
+        run: |
+          source venv/bin/activate
           make check-python
