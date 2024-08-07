@@ -53,14 +53,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # TODO: add windows which does not support container
-        os: [ ubuntu-22.04 ]
+        os:
+          - ubuntu-22.04
+          - windows-2022
     runs-on: ${{ matrix.os }}
-    container:
-      image: xd009642/tarpaulin:0.30.0
-      options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install tarpaulin
+        run: cargo binstall -y cargo-tarpaulin
       - name: Rust unit tests with coverage report
         # https://github.com/xd009642/tarpaulin/issues/1092#issuecomment-1407739176
         run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace -o xml --output-dir ./cov-reports
