@@ -44,7 +44,7 @@ pub mod utils;
 #[derive(Clone, Debug)]
 pub struct Storage {
     base_url: Arc<Url>,
-    object_store: Arc<dyn ObjectStore>,
+    pub object_store: Arc<dyn ObjectStore>,
 }
 
 impl Storage {
