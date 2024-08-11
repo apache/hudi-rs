@@ -92,7 +92,7 @@ impl Instant {
 #[allow(dead_code)]
 pub struct Timeline {
     configs: Arc<HudiConfigs>,
-    storage: Arc<Storage>,
+    pub(crate) storage: Arc<Storage>,
     pub instants: Vec<Instant>,
 }
 

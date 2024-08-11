@@ -44,7 +44,7 @@ pub mod utils;
 #[derive(Clone, Debug)]
 pub struct Storage {
     base_url: Arc<Url>,
-    pub object_store: Arc<dyn ObjectStore>,
+    object_store: Arc<dyn ObjectStore>,
 }
 
 impl Storage {
@@ -56,6 +56,11 @@ impl Storage {
             })),
             Err(e) => Err(anyhow!("Failed to create storage: {}", e)),
         }
+    }
+
+    #[cfg(feature = "datafusion")]
+    pub fn register_object_store(&self, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>) {
+        runtime_env.register_object_store(self.base_url.as_ref(), self.object_store.clone());
     }
 
     #[cfg(test)]

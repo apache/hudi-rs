@@ -60,5 +60,19 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 
+# datafusion
+datafusion = { workspace = true, optional = true }
+datafusion-expr = { workspace = true, optional = true }
+datafusion-common = { workspace = true, optional = true }
+datafusion-physical-expr = { workspace = true, optional = true }
+
 [dev-dependencies]
 hudi-tests = { path = "../tests" }
+
+[features]
+datafusion = [
+    "dep:datafusion",
+    "datafusion-expr",
+    "datafusion-common",
+    "datafusion-physical-expr",
+]
