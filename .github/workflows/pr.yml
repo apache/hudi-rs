@@ -32,13 +32,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - name: Linting commit
         run: |
           npm i -g conventional-changelog-conventionalcommits
           npm i -g commitlint@latest
           echo ${{ github.event.pull_request.title }} | npx commitlint
+
       - name: Labeling
         uses: actions/labeler@v5
