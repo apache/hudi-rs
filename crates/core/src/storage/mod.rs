@@ -59,7 +59,10 @@ impl Storage {
     }
 
     #[cfg(feature = "datafusion")]
-    pub fn register_object_store(&self, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>) {
+    pub fn register_object_store(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) {
         runtime_env.register_object_store(self.base_url.as_ref(), self.object_store.clone());
     }
 

@@ -94,9 +94,16 @@ impl Table {
     }
 
     #[cfg(feature = "datafusion")]
-    pub fn register_storage(&self, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>) {
-        self.timeline.storage.register_object_store(runtime_env.clone());
-        self.file_system_view.storage.register_object_store(runtime_env.clone());
+    pub fn register_storage(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) {
+        self.timeline
+            .storage
+            .register_object_store(runtime_env.clone());
+        self.file_system_view
+            .storage
+            .register_object_store(runtime_env.clone());
     }
 
     async fn load_configs<I, K, V>(
