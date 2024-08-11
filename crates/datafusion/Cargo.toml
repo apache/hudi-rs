@@ -28,7 +28,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-hudi-core = { version = "0.2.0", path = "../core" }
+hudi-core = { version = "0.2.0", path = "../core", features = ["datafusion"] }
 # arrow
 arrow-schema = { workspace = true }
 
