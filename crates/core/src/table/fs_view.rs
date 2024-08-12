@@ -34,7 +34,7 @@ use crate::storage::{get_leaf_dirs, Storage};
 #[allow(dead_code)]
 pub struct FileSystemView {
     configs: Arc<HudiConfigs>,
-    storage: Arc<Storage>,
+    pub(crate) storage: Arc<Storage>,
     partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
 }
 
