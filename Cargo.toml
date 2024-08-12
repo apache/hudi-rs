@@ -50,7 +50,7 @@ object_store = { version = "= 0.10.1", features = ["aws", "azure", "gcp"] }
 parquet = { version = "= 52.0.0", features = ["async", "object_store"] }
 
 # datafusion
-datafusion = { version = "= 39.0.0" }
+datafusion = { version = "= 41.0.0" }
 datafusion-expr = { version = "= 39.0.0" }
 datafusion-common = { version = "= 39.0.0" }
 datafusion-physical-expr = { version = "= 39.0.0" }
