@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  minio:
+    image: quay.io/minio/minio
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    env_file:
+      - s3.env
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: mc ready local
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 2s
+      
+
+  mc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file:
+      - s3.env
+    volumes:
+      - ../crates/tests/data/tables:/opt/data:ro
+      - ./copy_tables.sh:/opt/copy_tables.sh
+    entrypoint: /opt/copy_tables.sh
+
