@@ -70,6 +70,19 @@ jobs:
           name: cov-report-rust-tests-${{ runner.os }}
           path: ./cov-reports
           if-no-files-found: 'error'
+  
+  rust-integration-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spin up minio
+        run: docker-comppose -f docker/docker-compose.yaml up -d
+      - name: Run Rust integration tests
+        run: cd integration_test && cargo test --config env.toml
 
   python-tests:
     strategy:

@@ -15,8 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
+[workspace]
+members = []
+
 [package]
+version = "0.1.0"
 name = "integration_test"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75.0"
+description = "Integration tests for hudi-rs"
 
 
 [dependencies]
