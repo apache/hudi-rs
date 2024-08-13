@@ -110,13 +110,13 @@ where
         .await
         .expect("Failed to collect result");
     let values = result
-        .get(0)
+        .first()
         .unwrap()
         .column(0)
         .as_primitive::<T>()
         .values();
 
-    values.get(0).unwrap().clone()
+    *values.first().unwrap()
 }
 
 #[tokio::test]
@@ -208,16 +208,15 @@ async fn test_datafusion_read_tables() {
                 actual_data.push(Record {
                     id: *id,
                     name: name.unwrap().to_string(),
-                    is_active: is_active,
+                    is_active
                 });
             }
         });
 
-        assert_eq!(
+        assert!(
             actual_data
                 .iter()
-                .all(|record| expected_data.contains(record)),
-            true
+                .all(|record| expected_data.contains(record))
         );
 
         let df_schema = ctx
