@@ -79,8 +79,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.75.0
       - name: Spin up minio
         run: docker compose -f docker/docker-compose.yaml up -d
       - name: Run Rust integration tests
