@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Hudi internal configuration
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -25,6 +26,23 @@ use strum_macros::EnumIter;
 
 use crate::config::{ConfigParser, HudiConfigValue};
 
+/// Hudi internal configuration
+///
+/// this conf will controll the read action when reading
+///
+/// **Example**
+///
+/// ```rust
+/// use url::Url;
+/// use hudi_core::config::HudiConfigValue;
+/// use hudi_core::config::internal::HudiInternalConfig::SkipConfigValidation;
+/// use hudi_core::table::Table as HudiTable;
+///
+/// let options = vec![(SkipConfigValidation.as_ref(), HudiConfigValue::Boolean(true))];
+/// let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+/// HudiTable::new_with_options(base_uri.as_ref(), options);
+/// ```
+///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiInternalConfig {
     SkipConfigValidation,

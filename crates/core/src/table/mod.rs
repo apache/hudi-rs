@@ -16,6 +16,73 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Hudi Table implementation
+//!
+//! It provides a quick entry point for reading Hudi table metadata and data,
+//! facilitating adaptation and compatibility across various engines.
+//!
+//! **Example**
+//! 1. create hudi table
+//! ```rust
+//! use url::Url;
+//! use hudi_core::table::Table;
+//!
+//! pub async fn test() {
+//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+//! }
+//! ```
+//! 2. get hudi table schema(arrow_schema::Schema)
+//! ```rust
+//! use url::Url;
+//! use hudi_core::table::Table;
+//!
+//! pub async fn test() {
+//!     use arrow_schema::Schema;
+//! let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+//!     let schema = hudi_table.get_schema().await.unwrap();
+//! }
+//! ```
+//! 3. read hudi table
+//! ```rust
+//! use url::Url;
+//! use hudi_core::table::Table;
+//!
+//! pub async fn test() {
+//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+//!     let record_read = hudi_table.read_snapshot().await.unwrap();
+//! }
+//! ```
+//! 4. get file slice
+//! Users can obtain metadata to customize reading methods, read in batches, perform parallel reads, and more.
+//! ```rust
+//! use url::Url;
+//! use hudi_core::table::Table;
+//! use hudi_core::storage::utils::parse_uri;
+//!
+//! pub async fn test() {
+//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+//!     let file_slices = hudi_table
+//!             .split_file_slices(2)
+//!             .await.unwrap();
+//!     // define every parquet task reader how many slice
+//!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
+//!         for file_slice_vec in file_slices {
+//!             let file_group_vec = file_slice_vec
+//!                 .iter()
+//!                 .map(|f| {
+//!                     let url = parse_uri(&f.base_file.info.uri).unwrap();
+//!                     let size = f.base_file.info.size as u64;
+//!                     url.path().to_string()
+//!                 })
+//!                 .collect();
+//!             parquet_file_groups.push(file_group_vec)
+//!         }
+//! }
+//! ```
 
 use std::collections::HashMap;
 use std::env;
@@ -48,6 +115,7 @@ use crate::table::timeline::Timeline;
 mod fs_view;
 mod timeline;
 
+/// Hudi Table in-memory
 #[derive(Clone, Debug)]
 pub struct Table {
     pub base_url: Arc<Url>,
@@ -58,10 +126,12 @@ pub struct Table {
 }
 
 impl Table {
+    /// Create hudi table by base_uri
     pub async fn new(base_uri: &str) -> Result<Self> {
         Self::new_with_options(base_uri, empty_options()).await
     }
 
+    /// Create hudi table with options
     pub async fn new_with_options<I, K, V>(base_uri: &str, all_options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -230,10 +300,12 @@ impl Table {
         Ok(())
     }
 
+    /// Get hudi table Arrow [Schema]
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
 
+    /// Split the file into a specified number of parts
     pub async fn split_file_slices(&self, n: usize) -> Result<Vec<Vec<FileSlice>>> {
         let n = std::cmp::max(1, n);
         let file_slices = self.get_file_slices().await?;
@@ -245,6 +317,10 @@ impl Table {
             .collect())
     }
 
+    /// Get hudi table all [FileSlice]
+    ///
+    /// different table configurations can result in a different number of file slices being returned.
+    /// look at [HudiReadConfig]
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
         if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
             self.get_file_slices_as_of(timestamp.to::<String>().as_str())
@@ -256,6 +332,7 @@ impl Table {
         }
     }
 
+    /// Get hudi table file slices with timestamp, it used to time travel
     async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         self.file_system_view
@@ -266,6 +343,7 @@ impl Table {
             .get_file_slices_as_of(timestamp, &excludes)
     }
 
+    /// Read hudi table latest data
     pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
         if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
             self.read_snapshot_as_of(timestamp.to::<String>().as_str())
@@ -277,6 +355,7 @@ impl Table {
         }
     }
 
+    /// Read hudi table with timestamp, it's time travel
     async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
         let file_slices = self
             .get_file_slices_as_of(timestamp)
@@ -301,6 +380,22 @@ impl Table {
         Ok(file_paths)
     }
 
+    /// Read hudi data file with relative_path
+    /// ```rust
+    /// use url::Url;
+    /// use hudi_core::table::Table;
+    ///
+    /// pub async fn test() {
+    ///     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+    ///     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+    ///     let batches = hudi_table
+    ///         .read_file_slice_by_path(
+    ///             "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+    ///         )
+    ///         .await
+    ///         .unwrap();
+    /// }
+    /// ```
     pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<RecordBatch> {
         self.file_system_view
             .read_file_slice_by_path_unchecked(relative_path)

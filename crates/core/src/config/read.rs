@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Hudi read configuration
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -24,9 +25,34 @@ use crate::config::{ConfigParser, HudiConfigValue};
 use anyhow::{anyhow, Result};
 use strum_macros::EnumIter;
 
+/// Hudi read configuration
+///
+/// this conf will controll the read action when reading
+///
+/// **Example**
+///
+/// ```rust
+/// use url::Url;
+/// use hudi_core::config::read::HudiReadConfig::{AsOfTimestamp, InputPartitions};
+/// use hudi_core::table::Table as HudiTable;
+///
+/// let options = vec![(InputPartitions.as_ref(), "2"),
+///     (AsOfTimestamp.as_ref(), "20240101010100000")];
+/// let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+/// HudiTable::new_with_options(base_uri.as_ref(), options);
+/// ```
+///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiReadConfig {
+    /// Define input splits
+    /// - Hoodie Key : hoodie.read.input.partitions
+    ///
+    /// If has 100 files, [InputPartitions] is 5, will product 5 chunk,
+    /// every iter or task process 20 files
     InputPartitions,
+
+    /// The query instant for time travel. Without specified this option, we query the latest snapshot.
+    /// - Hoodie Key : hoodie.read.as.of.timestamp
     AsOfTimestamp,
 }
 

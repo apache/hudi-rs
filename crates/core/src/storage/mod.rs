@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Hudi storage implementation
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -185,6 +186,15 @@ impl Storage {
     }
 }
 
+/// Get relative path
+///
+/// **Example**
+/// - /usr/hudi/table_name
+/// - /usr/hudi/table_name/.hoodie
+/// - /usr/hudi/table_name/dt=2024/month=01/day=01
+/// - /usr/hudi/table_name/dt=2025/month=02
+///
+/// the result is \[".hoodie", "dt=2024/mont=01/day=01", "dt=2025/month=02"\]
 #[async_recursion]
 pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Vec<String>> {
     let mut leaf_dirs = Vec::new();

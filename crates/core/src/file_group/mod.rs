@@ -16,6 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Hudi file group implementation
+//!
+//! A set of data/base files + set of log files, that make up a unit for all operations.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -29,15 +32,27 @@ use crate::storage::file_info::FileInfo;
 use crate::storage::file_stats::FileStats;
 use crate::storage::Storage;
 
+/// Represents common metadata about base-file.
+/// A base file can be Hudi base file or even an external (non-hudi) base file too.
 #[derive(Clone, Debug)]
 pub struct BaseFile {
+    /// The group file belong to
     pub file_group_id: String,
+
+    /// The file commit time
     pub commit_time: String,
+
+    /// Base file info
     pub info: FileInfo,
+
+    /// Base file stats
     pub stats: Option<FileStats>,
 }
 
 impl BaseFile {
+    /// Parse file name
+    ///
+    /// return (file_group_id, commit_time)
     fn parse_file_name(file_name: &str) -> Result<(String, String)> {
         let err_msg = format!("Failed to parse file name '{}' for base file.", file_name);
         let (name, _) = file_name.rsplit_once('.').ok_or(anyhow!(err_msg.clone()))?;
@@ -47,6 +62,7 @@ impl BaseFile {
         Ok((file_group_id, commit_time))
     }
 
+    /// Construct [BaseFile] with file_name
     pub fn from_file_name(file_name: &str) -> Result<Self> {
         let (file_group_id, commit_time) = Self::parse_file_name(file_name)?;
         Ok(Self {
@@ -57,6 +73,7 @@ impl BaseFile {
         })
     }
 
+    /// Construct [BaseFile] by [FileInfo]
     pub fn from_file_info(info: FileInfo) -> Result<Self> {
         let (file_group_id, commit_time) = Self::parse_file_name(&info.name)?;
         Ok(Self {
@@ -68,6 +85,8 @@ impl BaseFile {
     }
 }
 
+/// Within a file group, a slice is a combination of data file written at a commit time and list of log files,
+/// containing changes to the data file from that commit time.
 #[derive(Clone, Debug)]
 pub struct FileSlice {
     pub base_file: BaseFile,
