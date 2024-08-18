@@ -28,7 +28,7 @@ use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as ObjPath;
-use object_store::{parse_url_opts, ObjectStore};
+use object_store::{parse_url, parse_url_opts, ObjectStore};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
@@ -199,6 +199,18 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
         }
     }
     Ok(leaf_dirs)
+}
+
+pub async fn get_file_data(location: &str) -> Result<Bytes> {
+    let url = Url::from_file_path(location).unwrap();
+    match parse_url(&url) {
+        Ok((object_store, _)) => {
+            let obj_path = ObjPath::from_url_path(url.path()).unwrap();
+            let result = object_store.get(&obj_path).await?;
+            Ok(result.bytes().await?)
+        }
+        Err(e) => Err(anyhow!("Failed to create storage: {}", e)),
+    }
 }
 
 #[cfg(test)]

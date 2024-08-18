@@ -20,12 +20,14 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
+use bytes::Bytes;
 use strum::IntoEnumIterator;
 use url::Url;
 
@@ -38,9 +40,10 @@ use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
+use crate::config::HUDI_CONF_DIR;
 use crate::file_group::FileSlice;
 use crate::storage::utils::{empty_options, parse_uri};
-use crate::storage::Storage;
+use crate::storage::{get_file_data, Storage};
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
 
@@ -93,6 +96,42 @@ impl Table {
         })
     }
 
+    async fn parse_config_file(
+        data: &Bytes,
+        split_chars: &str,
+        hudi_options: &mut HashMap<String, String>,
+    ) {
+        let cursor = std::io::Cursor::new(data);
+        let lines = BufReader::new(cursor).lines();
+        for line in lines {
+            let line = line.unwrap();
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
+                continue;
+            }
+            let mut parts = trimmed_line.splitn(2, |c| split_chars.contains(c));
+            let key = parts.next().unwrap().to_owned();
+            let value = parts.next().unwrap_or("").trim().to_owned();
+            hudi_options.insert(key, value);
+        }
+    }
+
+    async fn get_global_config_data() -> Option<Bytes> {
+        match env::var(HUDI_CONF_DIR) {
+            Ok(hudi_conf_dir) => {
+                let path_buf = PathBuf::new()
+                    .join(hudi_conf_dir)
+                    .join("hudi-defaults.conf");
+                let file_path = path_buf.to_str().unwrap();
+                match get_file_data(file_path).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
     #[cfg(feature = "datafusion")]
     pub fn register_storage(
         &self,
@@ -115,7 +154,6 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        // TODO: load hudi global config
         let mut hudi_options = HashMap::new();
         let mut extra_options = HashMap::new();
 
@@ -128,22 +166,16 @@ impl Table {
                 extra_options.insert(k.as_ref().to_string(), v.into());
             }
         }
-        let storage = Storage::new(base_url, &extra_options)?;
-        let data = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let cursor = std::io::Cursor::new(data);
-        let lines = BufReader::new(cursor).lines();
-        for line in lines {
-            let line = line?;
-            let trimmed_line = line.trim();
-            if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
-                continue;
-            }
-            let mut parts = trimmed_line.splitn(2, '=');
-            let key = parts.next().unwrap().to_owned();
-            let value = parts.next().unwrap_or("").to_owned();
-            // `hoodie.properties` takes precedence TODO handle conflicts where applicable
-            hudi_options.insert(key, value);
+
+        let global_config_data = Self::get_global_config_data().await;
+        if let Some(global_config_data) = global_config_data {
+            Self::parse_config_file(&global_config_data, " \t=", &mut hudi_options).await;
         }
+
+        let storage = Storage::new(base_url, &extra_options)?;
+        let hoodie_properties_data = storage.get_file_data(".hoodie/hoodie.properties").await?;
+        Self::parse_config_file(&hoodie_properties_data, "=", &mut hudi_options).await;
+
         let hudi_configs = HudiConfigs::new(hudi_options);
 
         Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, extra_options))
@@ -278,8 +310,8 @@ impl Table {
 mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
-    use std::panic;
     use std::path::Path;
+    use std::{env, panic};
 
     use url::Url;
 
@@ -292,6 +324,7 @@ mod tests {
         PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion,
     };
+    use crate::config::HUDI_CONF_DIR;
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
 
@@ -598,5 +631,63 @@ mod tests {
         );
         assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
         assert_eq!(configs.get(TimelineLayoutVersion).unwrap().to::<isize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_global_table_props() {
+        // Without the environment variable HUDI_CONF_DIR
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_partial")).unwrap())
+                .unwrap();
+        let table = Table::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        )
+        .await
+        .unwrap();
+        let configs = table.configs;
+        assert!(configs.get(DatabaseName).is_err());
+        assert!(configs.get(TableType).is_err());
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+
+        // Environment variable HUDI_CONF_DIR points to nothing
+        let base_path = env::current_dir().unwrap();
+        let hudi_conf_dir = base_path.join("random/wrong/dir");
+        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_partial")).unwrap())
+                .unwrap();
+        let table = Table::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        )
+        .await
+        .unwrap();
+        let configs = table.configs;
+        assert!(configs.get(DatabaseName).is_err());
+        assert!(configs.get(TableType).is_err());
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+
+        // With global config
+        let base_path = env::current_dir().unwrap();
+        let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
+        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_partial")).unwrap())
+                .unwrap();
+        let table = Table::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        )
+        .await
+        .unwrap();
+        let configs = table.configs;
+        assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "tmpdb");
+        assert_eq!(
+            configs.get(TableType).unwrap().to::<String>(),
+            "MERGE_ON_READ"
+        );
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
     }
 }
