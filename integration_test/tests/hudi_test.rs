@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     arrow::{
@@ -28,52 +28,13 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use hudi::HudiDataSource;
-use strum::IntoEnumIterator;
-use strum_macros::{AsRefStr, EnumIter, EnumString};
-use url::Url;
+use hudi_tests::TestTable;
 
 #[derive(PartialEq, Debug)]
 struct Record {
     id: i32,
     name: String,
     is_active: bool,
-}
-
-#[derive(Debug, EnumString, EnumIter, AsRefStr, PartialEq)]
-#[strum(serialize_all = "snake_case")]
-pub enum IntegrationTestTable {
-    V6ComplexkeygenHivestyle,
-    V6Empty,
-    V6Nonpartitioned,
-    V6SimplekeygenHivestyleNoMetafields,
-    V6SimplekeygenNonhivestyle,
-    V6SimplekeygenNonhivestyleOverwritetable, // 1, 21
-    V6TimebasedkeygenNonhivestyle,
-}
-
-impl IntegrationTestTable {
-    pub fn path(&self) -> String {
-        let bucket = std::env::var("INTEGRATION_TEST_S3_BUCKET")
-            .expect("INTEGRATION_TEST_S3_BUCKET not set");
-        let data_path = Path::new(format!("s3://{}", bucket).as_str()).join(self.as_ref());
-        data_path.to_str().unwrap().to_string()
-    }
-
-    pub fn url(&self) -> Url {
-        let path = self.path();
-        Url::parse(&path).unwrap()
-    }
-}
-
-#[test]
-fn test_table_path() {
-    for t in IntegrationTestTable::iter() {
-        let path = t.path();
-        let url = t.url();
-
-        assert_eq!(path, url.as_str());
-        assert_eq!(url.scheme(), "s3");
-    }
 }
 
 async fn prepare_session_context(
@@ -122,17 +83,13 @@ where
 #[tokio::test]
 async fn test_datafusion_read_tables() {
     for (t, n_cols, n_rows) in &[
-        (IntegrationTestTable::V6ComplexkeygenHivestyle, 21, 4),
-        (IntegrationTestTable::V6Nonpartitioned, 21, 4),
-        (
-            IntegrationTestTable::V6SimplekeygenHivestyleNoMetafields,
-            21,
-            4,
-        ),
-        (IntegrationTestTable::V6SimplekeygenNonhivestyle, 21, 4),
-        (IntegrationTestTable::V6TimebasedkeygenNonhivestyle, 22, 4),
+        (TestTable::V6ComplexkeygenHivestyle, 21, 4),
+        (TestTable::V6Nonpartitioned, 21, 4),
+        (TestTable::V6SimplekeygenHivestyleNoMetafields, 21, 4),
+        (TestTable::V6SimplekeygenNonhivestyle, 21, 4),
+        (TestTable::V6TimebasedkeygenNonhivestyle, 22, 4),
     ] {
-        let ctx = prepare_session_context(&t.path(), vec![], t.as_ref()).await;
+        let ctx = prepare_session_context(&t.s3_path(), vec![], t.as_ref()).await;
         let df_rows = ctx
             .sql(&format!("select count(*) from {}", t.as_ref()))
             .await
@@ -208,16 +165,14 @@ async fn test_datafusion_read_tables() {
                 actual_data.push(Record {
                     id: *id,
                     name: name.unwrap().to_string(),
-                    is_active
+                    is_active,
                 });
             }
         });
 
-        assert!(
-            actual_data
-                .iter()
-                .all(|record| expected_data.contains(record))
-        );
+        assert!(actual_data
+            .iter()
+            .all(|record| expected_data.contains(record)));
 
         let df_schema = ctx
             .sql(&format!(

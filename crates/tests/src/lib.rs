@@ -61,6 +61,13 @@ impl TestTable {
         path_buf.to_str().unwrap().to_string()
     }
 
+    pub fn s3_path(&self) -> String {
+        let bucket = std::env::var("INTEGRATION_TEST_S3_BUCKET")
+            .expect("INTEGRATION_TEST_S3_BUCKET not set");
+        let data_path = Path::new(format!("s3://{}", bucket).as_str()).join(self.as_ref());
+        data_path.to_str().unwrap().to_string()
+    }
+
     pub fn url(&self) -> Url {
         let path = self.path();
         Url::from_file_path(path).unwrap()

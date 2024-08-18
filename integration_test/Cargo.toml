@@ -29,6 +29,7 @@ description = "Integration tests for hudi-rs"
 
 [dependencies]
 hudi = { features=["datafusion"], path="../crates/hudi" }
+hudi-tests = { path="../crates/tests" }
 datafusion = { version = "= 39.0.0" }
 datafusion-expr = { version = "= 39.0.0" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
