@@ -18,8 +18,6 @@
 
 set -eux
 
-echo ">>> Copying tables to Minio"
-
 echo ">>> Creating Minio store"
 mc config host add store http://minio:9000 $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
 
