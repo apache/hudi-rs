@@ -46,3 +46,5 @@ jobs:
 
       - name: Labeling
         uses: actions/labeler@v5
+        # disable until figuring out a way to do this without pull_request_target
+        if: false
