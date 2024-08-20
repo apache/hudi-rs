@@ -46,11 +46,6 @@
 The `hudi-rs` project aims to broaden the use of [Apache Hudi](https://github.com/apache/hudi) for a diverse range of
 users and projects.
 
-| Source        | Installation Command |
-|---------------|----------------------|
-| **PyPi**      | `pip install hudi`   |
-| **Crates.io** | `cargo add hudi`     |
-
 ## Example usage
 
 > [!NOTE]
