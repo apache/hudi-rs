@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::fs::read_to_string;
 use std::io::{BufRead, BufReader};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -115,9 +116,31 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        // TODO: load hudi global config
         let mut hudi_options = HashMap::new();
         let mut extra_options = HashMap::new();
+
+        let mut conf = String::from("/etc/hudi/conf");
+        if let Ok(path) = std::env::var("HUDI_CONF_DIR") {
+            conf = path;
+        }
+        if let Ok(data) = read_to_string(format!("{conf}/hudi-defaults.conf")) {
+            for mut line in data.lines() {
+                line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some(off) = line.find(&[' ', '=']) {
+                    let key = line[..off].to_string();
+                    let value = line[off + 1..]
+                        .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+                        .to_string();
+                    if key.is_empty() || value.is_empty() {
+                        continue;
+                    }
+                    hudi_options.insert(key, value);
+                }
+            }
+        }
 
         Self::imbue_cloud_env_vars(&mut extra_options);
 
@@ -279,7 +302,6 @@ mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::panic;
-    use std::path::Path;
 
     use url::Url;
 
@@ -294,6 +316,17 @@ mod tests {
     };
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
+
+    async fn new_table_without_validation(file: &str) -> Table {
+        let base_url =
+            Url::from_file_path(canonicalize(format!("tests/data/{file}")).unwrap()).unwrap();
+        Table::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn hudi_table_get_schema() {
@@ -438,15 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_invalid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = new_table_without_validation("table_props_invalid").await;
         let configs = table.configs;
         assert!(
             configs.validate(BaseFileFormat).is_err(),
@@ -494,15 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_invalid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = new_table_without_validation("table_props_invalid").await;
         let configs = table.configs;
         assert!(configs.get(BaseFileFormat).is_err());
         assert!(configs.get(Checksum).is_err());
@@ -523,15 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_default_for_invalid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = new_table_without_validation("table_props_invalid").await;
         let configs = table.configs;
         assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
@@ -558,15 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_valid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = new_table_without_validation("table_props_valid").await;
         let configs = table.configs;
         assert_eq!(
             configs.get(BaseFileFormat).unwrap().to::<String>(),
@@ -596,7 +597,21 @@ mod tests {
             configs.get(TableType).unwrap().to::<String>(),
             "COPY_ON_WRITE"
         );
-        assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
         assert_eq!(configs.get(TimelineLayoutVersion).unwrap().to::<isize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn support_external_config_file() {
+        std::env::set_var(
+            "HUDI_CONF_DIR",
+            canonicalize(format!("tests/data/config")).unwrap(),
+        );
+        let table = new_table_without_validation("table_props_valid").await;
+        let configs = table.configs;
+        assert_eq!(
+            configs.get(BaseFileFormat).unwrap().to::<String>(),
+            "parquet"
+        );
+        assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
     }
 }
