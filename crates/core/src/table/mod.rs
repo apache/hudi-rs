@@ -689,5 +689,6 @@ mod tests {
             "MERGE_ON_READ"
         );
         assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+        env::remove_var(HUDI_CONF_DIR)
     }
 }
