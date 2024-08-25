@@ -84,7 +84,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -92,7 +92,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{Field, Fields, Schema};
 use strum::IntoEnumIterator;
 use url::Url;
 
@@ -103,6 +103,7 @@ use TableTypeValue::CopyOnWrite;
 use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
+use crate::config::table::HudiTableConfig::{IsHiveStylePartitioning, PartitionFields};
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
@@ -110,9 +111,11 @@ use crate::file_group::FileSlice;
 use crate::storage::utils::{empty_options, parse_config_data, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
+use crate::table::partitions::PartitionFilter;
 use crate::table::timeline::Timeline;
 
 mod fs_view;
+pub mod partitions;
 mod timeline;
 
 /// Hudi Table in-memory
@@ -123,6 +126,7 @@ pub struct Table {
     pub extra_options: Arc<HashMap<String, String>>,
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
+    pub partition_filters: Vec<PartitionFilter>,
 }
 
 impl Table {
@@ -161,6 +165,7 @@ impl Table {
             extra_options,
             timeline,
             file_system_view,
+            partition_filters: Vec::new(),
         })
     }
 
@@ -307,6 +312,24 @@ impl Table {
         self.timeline.get_latest_schema().await
     }
 
+    /// Get the latest partition [Schema] of the table
+    pub async fn get_partition_schema(&self) -> Result<Schema> {
+        let schema = self.get_schema().await;
+        let partition_str_vec = self
+            .configs
+            .get_or_default(PartitionFields)
+            .to::<Vec<String>>();
+        let partition_set: HashSet<String> = partition_str_vec.into_iter().collect();
+        let partition_fields: Vec<Arc<Field>> = schema
+            .unwrap()
+            .fields
+            .into_iter()
+            .filter(|col| partition_set.contains(col.name()))
+            .cloned()
+            .collect();
+        Ok(Schema::new(Fields::from(partition_fields)))
+    }
+
     /// Split the file into a specified number of parts
     pub async fn split_file_slices(&self, n: usize) -> Result<Vec<Vec<FileSlice>>> {
         let n = std::cmp::max(1, n);
@@ -337,11 +360,13 @@ impl Table {
     async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         self.file_system_view
-            .load_file_slices_stats_as_of(timestamp, &excludes)
+            .get_file_slices_as_of(
+                timestamp,
+                &excludes,
+                &self.partition_filters,
+                self.get_partition_schema().await?,
+            )
             .await
-            .context("Fail to load file slice stats.")?;
-        self.file_system_view
-            .get_file_slices_as_of(timestamp, &excludes)
     }
 
     /// Get all the latest records in the table.
@@ -407,6 +432,16 @@ impl Table {
             .read_file_slice_by_path_unchecked(relative_path)
             .await
     }
+
+    pub fn partition_filter_replace(&mut self, partition_filters: Vec<PartitionFilter>) {
+        if self.configs.get_or_default(IsHiveStylePartitioning).to() {
+            self.partition_filters = partition_filters;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.file_system_view.reset()
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +463,7 @@ mod tests {
     };
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::utils::join_url_segments;
+    use crate::table::partitions::PartitionFilter;
     use crate::table::Table;
 
     /// Test helper to create a new `Table` instance without validating the configuration.
@@ -529,6 +565,237 @@ mod tests {
         ]
             .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
             .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_paths_by_partitions() {
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
+        let mut hudi_table = Table::new(base_url.path()).await.unwrap();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let byte_field_data_type = partition_schema
+            .field_with_name("byteField")
+            .unwrap()
+            .data_type();
+        let short_field_data_type = partition_schema
+            .field_with_name("shortField")
+            .unwrap()
+            .data_type();
+        assert_eq!(hudi_table.timeline.instants.len(), 2);
+
+        // none
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // eq
+        hudi_table.reset();
+        let short_eq_100 =
+            PartitionFilter::try_from(("shortField", "=", "100", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_eq_100]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // multi eq
+        hudi_table.reset();
+        let byte_eq_20 =
+            PartitionFilter::try_from(("byteField", "=", "20", byte_field_data_type)).unwrap();
+        let short_eq_10 =
+            PartitionFilter::try_from(("shortField", "=", "100", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![byte_eq_20, short_eq_10]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // not eq
+        hudi_table.reset();
+        let short_not_eq_100 =
+            PartitionFilter::try_from(("shortField", "!=", "100", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_not_eq_100]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // gt
+        hudi_table.reset();
+        let short_gt_100 =
+            PartitionFilter::try_from(("shortField", ">", "100", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_gt_100]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // ge
+        hudi_table.reset();
+        let short_ge_100 =
+            PartitionFilter::try_from(("shortField", ">=", "100", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_ge_100]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+                "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+                "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+                "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // lt
+        hudi_table.reset();
+        let short_lt_300 =
+            PartitionFilter::try_from(("shortField", "<", "300", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_lt_300]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // le
+        hudi_table.reset();
+        let short_le_300 =
+            PartitionFilter::try_from(("shortField", "<=", "300", short_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_le_300]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // gt, lt
+        hudi_table.reset();
+        let byte_lt_30 =
+            PartitionFilter::try_from(("byteField", "<", "30", byte_field_data_type)).unwrap();
+        let byte_gt_10 =
+            PartitionFilter::try_from(("byteField", ">", "10", byte_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![byte_lt_30, byte_gt_10]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // in
+        hudi_table.reset();
+        let byte_in_20_30 =
+            PartitionFilter::try_from(("byteField", "in", &["20", "30"][..], byte_field_data_type))
+                .unwrap();
+        hudi_table.partition_filter_replace(vec![byte_in_20_30]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        // not in
+        hudi_table.reset();
+        let byte_not_in_20_30 = PartitionFilter::try_from((
+            "byteField",
+            "not in",
+            &["20", "30"][..],
+            byte_field_data_type,
+        ))
+        .unwrap();
+        hudi_table.partition_filter_replace(vec![byte_not_in_20_30]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_paths_by_partitions_no_hive_style() {
+        let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
+        let mut hudi_table = Table::new(base_url.path()).await.unwrap();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let byte_field_data_type = partition_schema
+            .field_with_name("byteField")
+            .unwrap()
+            .data_type();
+        assert_eq!(hudi_table.timeline.instants.len(), 2);
+
+        // none
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(
+            vec![
+                "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
+                "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
+                "30/6db57019-98ee-480e-8eb1-fb3de48e1c24-0_1-119-167_20240418172804498.parquet",
+            ]
+            .into_iter()
+            .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
+            .collect::<Vec<_>>(),
+        );
+        assert_eq!(actual, expected);
+
+        // eq
+        hudi_table.reset();
+        let short_eq_100 =
+            PartitionFilter::try_from(("shortField", "=", "100", byte_field_data_type)).unwrap();
+        hudi_table.partition_filter_replace(vec![short_eq_100]);
+        let actual: HashSet<String> =
+            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
+        let expected: HashSet<String> = HashSet::from_iter(
+            vec![
+                "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
+                "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
+                "30/6db57019-98ee-480e-8eb1-fb3de48e1c24-0_1-119-167_20240418172804498.parquet",
+            ]
+            .into_iter()
+            .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
+            .collect::<Vec<_>>(),
+        );
         assert_eq!(actual, expected);
     }
 
@@ -672,7 +939,10 @@ mod tests {
         assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
-        assert!(panic::catch_unwind(|| configs.get_or_default(PartitionFields)).is_err());
+        assert_eq!(
+            configs.get_or_default(PartitionFields).to::<Vec<String>>(),
+            vec![""]
+        );
         assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
         assert!(configs.get_or_default(PopulatesMetaFields).to::<bool>());
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());

@@ -63,8 +63,9 @@ tokio = { workspace = true }
 # datafusion
 datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
-datafusion-common = { workspace = true, optional = true }
+datafusion-common = { workspace = true }
 datafusion-physical-expr = { workspace = true, optional = true }
+log = "0.4.22"
 
 [dev-dependencies]
 hudi-tests = { path = "../tests" }
@@ -73,6 +74,5 @@ hudi-tests = { path = "../tests" }
 datafusion = [
     "dep:datafusion",
     "datafusion-expr",
-    "datafusion-common",
     "datafusion-physical-expr",
 ]
