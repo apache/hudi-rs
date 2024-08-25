@@ -50,6 +50,15 @@ check-rust: ## Run check on Rust
 	$(info --- Check Rust format ---)
 	cargo fmt --all -- --check
 
+.PHONY: check-python
+check-python: ## Run check on Python
+	$(info --- Check Python format ---)
+	ruff format --check --diff .
+	$(info --- Check Python linting ---)
+	ruff check .
+	$(info --- Check Python typing ---)
+	mypy .
+
 .PHONY: test-rust
 test-rust: ## Run tests on Rust
 	$(info --- Run Rust tests ---)

@@ -58,6 +58,14 @@ impl Storage {
         }
     }
 
+    #[cfg(feature = "datafusion")]
+    pub fn register_object_store(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) {
+        runtime_env.register_object_store(self.base_url.as_ref(), self.object_store.clone());
+    }
+
     #[cfg(test)]
     async fn get_file_info(&self, relative_path: &str) -> Result<FileInfo> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
