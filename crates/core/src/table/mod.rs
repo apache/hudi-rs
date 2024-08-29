@@ -303,7 +303,7 @@ mod tests {
             .get_schema()
             .await
             .unwrap()
-            .all_fields()
+            .flattened_fields()
             .into_iter()
             .map(|f| f.name().to_string())
             .collect();
