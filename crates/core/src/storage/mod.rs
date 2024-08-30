@@ -22,11 +22,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::table::HudiTableConfig;
-use crate::config::HudiConfigs;
-use crate::storage::file_info::FileInfo;
-use crate::storage::utils::join_url_segments;
-use anyhow::{anyhow, Context, Result};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use async_recursion::async_recursion;
@@ -38,6 +33,12 @@ use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
+
+use crate::config::table::HudiTableConfig;
+use crate::config::HudiConfigs;
+use crate::storage::file_info::FileInfo;
+use crate::storage::utils::join_url_segments;
+use crate::{Error, Result};
 
 pub mod file_info;
 pub mod file_stats;
@@ -60,10 +61,10 @@ impl Storage {
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
         if !hudi_configs.contains(HudiTableConfig::BasePath) {
-            return Err(anyhow!(
+            return Err(Error::Internal(format!(
                 "Failed to create storage: {} is required.",
                 HudiTableConfig::BasePath.as_ref()
-            ));
+            )));
         }
 
         let base_url = hudi_configs.get(HudiTableConfig::BasePath)?.to_url()?;
@@ -75,7 +76,7 @@ impl Storage {
                 options,
                 hudi_configs,
             })),
-            Err(e) => Err(anyhow!("Failed to create storage: {}", e)),
+            Err(e) => Err(Error::Store(e)),
         }
     }
 
@@ -100,15 +101,23 @@ impl Storage {
         runtime_env.register_object_store(self.base_url.as_ref(), self.object_store.clone());
     }
 
-    #[cfg(test)]
-    async fn get_file_info(&self, relative_path: &str) -> Result<FileInfo> {
+    fn get_relative_path(&self, relative_path: &str) -> Result<(Url, ObjPath)> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        Ok((obj_url, obj_path))
+    }
+
+    #[cfg(test)]
+    async fn get_file_info(&self, relative_path: &str) -> Result<FileInfo> {
+        let (obj_url, obj_path) = self.get_relative_path(relative_path)?;
         let meta = self.object_store.head(&obj_path).await?;
         let uri = obj_url.to_string();
         let name = obj_path
             .filename()
-            .ok_or(anyhow!("Failed to get file name for {}", obj_path))?
+            .ok_or(Error::InvalidPath {
+                name: obj_path.to_string(),
+                detail: "failed to get file name".to_string(),
+            })?
             .to_string();
         Ok(FileInfo {
             uri,
@@ -118,8 +127,7 @@ impl Storage {
     }
 
     pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let (_, obj_path) = self.get_relative_path(relative_path)?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
         let reader = ParquetObjectReader::new(obj_store, meta);
@@ -128,8 +136,7 @@ impl Storage {
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let (_, obj_path) = self.get_relative_path(relative_path)?;
         let result = self.object_store.get(&obj_path).await?;
         let bytes = result.bytes().await?;
         Ok(bytes)
@@ -143,8 +150,7 @@ impl Storage {
     }
 
     pub async fn get_parquet_file_data(&self, relative_path: &str) -> Result<RecordBatch> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let (_, obj_path) = self.get_relative_path(relative_path)?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
 
@@ -156,16 +162,14 @@ impl Storage {
         let mut batches = Vec::new();
 
         while let Some(r) = stream.next().await {
-            let batch = r.context("Failed to read record batch.")?;
-            batches.push(batch)
+            batches.push(r?)
         }
 
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }
 
-        concat_batches(&schema, &batches)
-            .map_err(|e| anyhow!("Failed to concat record batches: {}", e))
+        Ok(concat_batches(&schema, &batches)?)
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
@@ -174,7 +178,10 @@ impl Storage {
         for dir in dir_paths {
             dirs.push(
                 dir.filename()
-                    .ok_or(anyhow!("Failed to get file name for {}", dir))?
+                    .ok_or(Error::InvalidPath {
+                        name: dir.to_string(),
+                        detail: "failed to get file name".to_string(),
+                    })?
                     .to_string(),
             )
         }
@@ -203,10 +210,10 @@ impl Storage {
             let name = obj_meta
                 .location
                 .filename()
-                .ok_or(anyhow!(
-                    "Failed to get file name for {:?}",
-                    obj_meta.location
-                ))?
+                .ok_or(Error::InvalidPath {
+                    name: obj_meta.location.to_string(),
+                    detail: "failed to get file name".to_string(),
+                })?
                 .to_string();
             let uri = join_url_segments(&prefix_url, &[&name])?.to_string();
             file_info.push(FileInfo {
@@ -241,9 +248,10 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
                 next_subdir.push(curr);
             }
             next_subdir.push(child_dir);
-            let next_subdir = next_subdir
-                .to_str()
-                .ok_or(anyhow!("Failed to convert path: {:?}", next_subdir))?;
+            let next_subdir = next_subdir.to_str().ok_or(Error::InvalidPath {
+                name: format!("{:?}", next_subdir),
+                detail: "failed to convert path".to_string(),
+            })?;
             let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }

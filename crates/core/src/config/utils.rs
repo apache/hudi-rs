@@ -18,10 +18,11 @@
  */
 //! Config utilities.
 
-use anyhow::{Context, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor};
+
+use crate::{Error, Result};
 
 /// Returns an empty iterator to represent an empty set of options.
 pub fn empty_options<'a>() -> std::iter::Empty<(&'a str, &'a str)> {
@@ -57,7 +58,7 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
     let mut options = HashMap::new();
 
     for line in lines {
-        let line = line.context("Failed to read line")?;
+        let line = line.map_err(|e| Error::Internal(format!("Failed to read line {e}")))?;
         let trimmed_line = line.trim();
         if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
             continue;
@@ -65,7 +66,7 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
         let mut parts = trimmed_line.splitn(2, |c| split_chars.contains(c));
         let key = parts
             .next()
-            .context("Missing key in config line")?
+            .ok_or(Error::Internal("Missing key in config line".to_string()))?
             .trim()
             .to_owned();
         let value = parts.next().unwrap_or("").trim().to_owned();

@@ -23,7 +23,6 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
 use arrow_schema::Schema;
 use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
@@ -32,6 +31,7 @@ use crate::config::HudiConfigs;
 use crate::file_group::FileGroup;
 use crate::storage::utils::split_filename;
 use crate::storage::Storage;
+use crate::{Error, Result};
 
 /// The [State] of an [Instant] represents the status of the action performed on the table.
 #[allow(dead_code)]
@@ -80,7 +80,10 @@ impl Instant {
         commit_file_path.push(self.file_name());
         commit_file_path
             .to_str()
-            .ok_or(anyhow!("Failed to get file path for {:?}", self))
+            .ok_or(Error::Internal(format!(
+                "Failed to get file path for {:?}",
+                self
+            )))
             .map(|s| s.to_string())
     }
 
@@ -140,10 +143,11 @@ impl Timeline {
             .storage
             .get_file_data(instant.relative_path()?.as_str())
             .await?;
-        let json: Value = serde_json::from_slice(&bytes)?;
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Internal(format!("Invalid instant {:?}", e)))?;
         let commit_metadata = json
             .as_object()
-            .ok_or_else(|| anyhow!("Expected JSON object"))?
+            .ok_or_else(|| Error::Internal("Expected JSON object".to_string()))?
             .clone();
         Ok(commit_metadata)
     }
@@ -167,17 +171,15 @@ impl Timeline {
             .and_then(|first_value| first_value["path"].as_str());
 
         if let Some(path) = parquet_path {
-            let parquet_meta = self
-                .storage
-                .get_parquet_file_metadata(path)
-                .await
-                .context("Failed to get parquet file metadata")?;
+            let parquet_meta = self.storage.get_parquet_file_metadata(path).await?;
 
-            parquet_to_arrow_schema(parquet_meta.file_metadata().schema_descr(), None)
-                .context("Failed to resolve the latest schema")
+            Ok(parquet_to_arrow_schema(
+                parquet_meta.file_metadata().schema_descr(),
+                None,
+            )?)
         } else {
-            Err(anyhow!(
-                "Failed to resolve the latest schema: no file path found"
+            Err(Error::Internal(
+                "Failed to resolve the latest schema: no file path found".to_string(),
             ))
         }
     }

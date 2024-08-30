@@ -87,7 +87,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use url::Url;
@@ -102,6 +101,7 @@ use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
+use crate::{Error, Result};
 
 pub mod builder;
 mod fs_view;
@@ -161,7 +161,6 @@ impl Table {
             .register_object_store(runtime_env.clone());
     }
 
-    /// Get the latest [Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
@@ -259,16 +258,18 @@ impl Table {
         timestamp: &str,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<RecordBatch>> {
-        let file_slices = self
-            .get_file_slices_as_of(timestamp, filters)
-            .await
-            .context(format!("Failed to get file slices as of {}", timestamp))?;
+        let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let mut batches = Vec::new();
         let fg_reader = self.create_file_group_reader();
         for f in file_slices {
             match fg_reader.read_file_slice(&f).await {
                 Ok(batch) => batches.push(batch),
-                Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
+                Err(e) => {
+                    return Err(Error::Internal(format!(
+                        "Failed to read file slice {:?} - {}",
+                        f, e
+                    )))
+                }
             }
         }
         Ok(batches)

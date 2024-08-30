@@ -18,8 +18,7 @@
  */
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
-use anyhow::Result;
-use anyhow::{anyhow, Context};
+use crate::{Error, Result};
 use arrow_array::{ArrayRef, Scalar, StringArray};
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -120,11 +119,11 @@ impl PartitionPruner {
         let parts: Vec<&str> = partition_path.split('/').collect();
 
         if parts.len() != self.schema.fields().len() {
-            return Err(anyhow!(
+            return Err(Error::Internal(format!(
                 "Partition path should have {} part(s) but got {}",
                 self.schema.fields().len(),
                 parts.len()
-            ));
+            )));
         }
 
         self.schema
@@ -134,14 +133,17 @@ impl PartitionPruner {
             .map(|(field, part)| {
                 let value = if self.is_hive_style {
                     let (name, value) = part.split_once('=').ok_or_else(|| {
-                        anyhow!("Partition path should be hive-style but got {}", part)
+                        Error::Internal(format!(
+                            "Partition path should be hive-style but got {}",
+                            part
+                        ))
                     })?;
                     if name != field.name() {
-                        return Err(anyhow!(
+                        return Err(Error::Internal(format!(
                             "Partition path should contain {} but got {}",
                             field.name(),
                             name
-                        ));
+                        )));
                     }
                     value
                 } else {
@@ -177,13 +179,13 @@ impl Operator {
 }
 
 impl FromStr for Operator {
-    type Err = anyhow::Error;
+    type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self> {
         Operator::TOKEN_OP_PAIRS
             .iter()
             .find_map(|&(token, op)| if token == s { Some(op) } else { None })
-            .ok_or_else(|| anyhow!("Unsupported operator: {}", s))
+            .ok_or_else(|| Error::Internal(format!("Unsupported operator: {}", s)))
     }
 }
 
@@ -196,21 +198,17 @@ pub struct PartitionFilter {
 }
 
 impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
-    type Error = anyhow::Error;
+    type Error = crate::Error;
 
     fn try_from((filter, partition_schema): ((&str, &str, &str), &Schema)) -> Result<Self> {
         let (field_name, operator_str, value_str) = filter;
 
-        let field: &Field = partition_schema
-            .field_with_name(field_name)
-            .with_context(|| format!("Field '{}' not found in partition schema", field_name))?;
+        let field: &Field = partition_schema.field_with_name(field_name)?;
 
-        let operator = Operator::from_str(operator_str)
-            .with_context(|| format!("Unsupported operator: {}", operator_str))?;
+        let operator = Operator::from_str(operator_str)?;
 
         let value = &[value_str];
-        let value = Self::cast_value(value, field.data_type())
-            .with_context(|| format!("Unable to cast {:?} as {:?}", value, field.data_type()))?;
+        let value = Self::cast_value(value, field.data_type())?;
 
         let field = field.clone();
         Ok(PartitionFilter {
