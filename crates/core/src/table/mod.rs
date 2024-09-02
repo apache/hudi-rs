@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -30,13 +29,12 @@ use strum::IntoEnumIterator;
 use url::Url;
 
 use HudiInternalConfig::SkipConfigValidation;
-use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
-use TableTypeValue::CopyOnWrite;
+use HudiTableConfig::{DropsPartitionFields, TableVersion};
 
 use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
 use crate::storage::utils::{empty_options, parse_uri};
@@ -172,12 +170,6 @@ impl Table {
 
         for conf in HudiReadConfig::iter() {
             hudi_configs.validate(conf)?
-        }
-
-        // additional validation
-        let table_type = hudi_configs.get(TableType)?.to::<String>();
-        if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(anyhow!("Only support copy-on-write table."));
         }
 
         let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
