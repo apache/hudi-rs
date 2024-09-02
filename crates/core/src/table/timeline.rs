@@ -21,6 +21,7 @@ use std::cmp::{Ordering, PartialOrd};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -29,6 +30,10 @@ use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use url::Url;
 
+use crate::config::table::{
+    HudiTableConfig::TableType,
+    TableTypeValue::{self, CopyOnWrite, MergeOnRead},
+};
 use crate::config::HudiConfigs;
 use crate::file_group::FileGroup;
 use crate::storage::utils::split_filename;
@@ -91,6 +96,7 @@ impl Instant {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Timeline {
+    table_type: TableTypeValue,
     configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
     pub instants: Vec<Instant>,
@@ -103,24 +109,42 @@ impl Timeline {
         configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
         let storage = Storage::new(base_url, &storage_options)?;
-        let instants = Self::load_completed_commits(&storage).await?;
+        let table_type_value = configs.get(TableType)?.to::<String>();
+        let table_type = TableTypeValue::from_str(&table_type_value)?;
+        let instants = Self::load_completed_commits(&storage, &table_type).await?;
         Ok(Self {
+            table_type,
             storage,
             configs,
             instants,
         })
     }
 
-    async fn load_completed_commits(storage: &Storage) -> Result<Vec<Instant>> {
+    async fn load_completed_commits(
+        storage: &Storage,
+        table_type: &TableTypeValue,
+    ) -> Result<Vec<Instant>> {
         let mut completed_commits = Vec::new();
         for file_info in storage.list_files(Some(".hoodie")).await? {
             let (file_stem, file_ext) = split_filename(file_info.name.as_str())?;
-            if matches!(file_ext.as_str(), "commit" | "replacecommit") {
-                completed_commits.push(Instant {
-                    state: State::Completed,
-                    timestamp: file_stem,
-                    action: file_ext.to_owned(),
-                })
+            match file_ext.as_str() {
+                "commit" | "replacecommit" if *table_type == CopyOnWrite => {
+                    completed_commits.push(Instant {
+                        state: State::Completed,
+                        timestamp: file_stem,
+                        action: file_ext.to_owned(),
+                    });
+                }
+                "commit" | "deltacommit" | "compaction" | "logcompaction" | "replacecommit"
+                    if *table_type == MergeOnRead =>
+                {
+                    completed_commits.push(Instant {
+                        state: State::Completed,
+                        timestamp: file_stem,
+                        action: file_ext.to_owned(),
+                    });
+                }
+                _ => {}
             }
         }
         completed_commits.sort();
@@ -163,7 +187,13 @@ impl Timeline {
             .and_then(|obj| obj.values().next())
             .and_then(|value| value.as_array())
             .and_then(|arr| arr.first())
-            .and_then(|first_value| first_value["path"].as_str());
+            .and_then(|first_value| {
+                if self.table_type == CopyOnWrite {
+                    first_value["path"].as_str()
+                } else {
+                    first_value["baseFile"].as_str()
+                }
+            });
 
         if let Some(path) = parquet_path {
             let parquet_meta = self
@@ -218,6 +248,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use anyhow::Result;
     use url::Url;
 
     use hudi_tests::TestTable;
@@ -225,16 +256,21 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::table::timeline::{Instant, State, Timeline};
 
+    async fn get_basic_timeline(base_url: Url, table_type: &str) -> Result<Timeline> {
+        let mut config = HashMap::new();
+        config.insert("hoodie.table.type".to_string(), table_type.to_string());
+        Ok(Timeline::new(
+            Arc::new(base_url),
+            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::new(config)),
+        )
+        .await?)
+    }
+
     #[tokio::test]
     async fn timeline_read_latest_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let timeline = Timeline::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let timeline = get_basic_timeline(base_url, "COPY_ON_WRITE").await.unwrap();
         let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 21)
     }
@@ -242,13 +278,7 @@ mod tests {
     #[tokio::test]
     async fn timeline_read_latest_schema_from_empty_table() {
         let base_url = TestTable::V6Empty.url();
-        let timeline = Timeline::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let timeline = get_basic_timeline(base_url, "COPY_ON_WRITE").await.unwrap();
         let table_schema = timeline.get_latest_schema().await;
         assert!(table_schema.is_err());
         assert_eq!(
@@ -263,13 +293,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let timeline = Timeline::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let timeline = get_basic_timeline(base_url, "COPY_ON_WRITE").await.unwrap();
         assert_eq!(
             timeline.instants,
             vec![
@@ -282,6 +306,30 @@ mod tests {
                     state: State::Completed,
                     action: "commit".to_owned(),
                     timestamp: "20240402144910683".to_owned(),
+                },
+            ]
+        )
+    }
+
+    #[tokio::test]
+    async fn init_commits_timeline_mor() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new("tests/data/timeline/mor")).unwrap(),
+        )
+        .unwrap();
+        let timeline = get_basic_timeline(base_url, "MERGE_ON_READ").await.unwrap();
+        assert_eq!(
+            timeline.instants,
+            vec![
+                Instant {
+                    state: State::Completed,
+                    action: "deltacommit".to_owned(),
+                    timestamp: "20240902114809775".to_owned(),
+                },
+                Instant {
+                    state: State::Completed,
+                    action: "deltacommit".to_owned(),
+                    timestamp: "20240902123341435".to_owned(),
                 },
             ]
         )
