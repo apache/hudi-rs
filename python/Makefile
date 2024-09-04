@@ -32,12 +32,12 @@ setup: ## Setup the requirements
 	pip install "$(MATURIN_VERSION)"
 
 .PHONY: build
-build: setup ## Build Python binding of delta-rs
+build: setup ## Build Python binding of hudi-rs
 	$(info --- Build Python binding ---)
 	maturin build $(MATURIN_EXTRA_ARGS)
 
 .PHONY: develop
-develop: setup ## Install Python binding of delta-rs
+develop: setup ## Install Python binding of hudi-rs
 	$(info --- Develop with Python binding ---)
 	maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS)
 
