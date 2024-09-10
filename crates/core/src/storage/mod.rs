@@ -101,6 +101,13 @@ impl Storage {
         Ok(bytes)
     }
 
+    pub async fn get_file_data_from_absolute_path(&self, absolute_path: &str) -> Result<Bytes> {
+        let obj_path = ObjPath::from_absolute_path(PathBuf::from(absolute_path))?;
+        let result = self.object_store.get(&obj_path).await?;
+        let bytes = result.bytes().await?;
+        Ok(bytes)
+    }
+
     pub async fn get_parquet_file_data(&self, relative_path: &str) -> Result<RecordBatch> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
