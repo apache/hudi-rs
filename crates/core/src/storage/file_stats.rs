@@ -17,7 +17,8 @@
  * under the License.
  */
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct FileStats {
     pub num_records: i64,
+    pub size_bytes: i64,
 }

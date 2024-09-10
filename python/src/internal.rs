@@ -44,6 +44,8 @@ pub struct HudiFileSlice {
     base_file_size: usize,
     #[pyo3(get)]
     num_records: i64,
+    #[pyo3(get)]
+    size_bytes: i64,
 }
 
 #[cfg(not(tarpaulin))]
@@ -69,7 +71,9 @@ fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
     let commit_time = f.base_file.commit_time.to_string();
     let base_file_name = f.base_file.info.name.clone();
     let base_file_size = f.base_file.info.size;
-    let num_records = f.base_file.stats.clone().unwrap_or_default().num_records;
+    let stats = f.base_file.stats.clone().unwrap_or_default();
+    let num_records = stats.num_records;
+    let size_bytes = stats.size_bytes;
     HudiFileSlice {
         file_group_id,
         partition_path,
@@ -77,6 +81,7 @@ fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
         base_file_name,
         base_file_size,
         num_records,
+        size_bytes,
     }
 }
 
