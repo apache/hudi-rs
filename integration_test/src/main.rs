@@ -16,3 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+fn main() {
+    println!("hudi-rs integration tests")
+}

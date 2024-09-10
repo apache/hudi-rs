@@ -21,10 +21,14 @@ services:
   minio:
     image: quay.io/minio/minio
     container_name: minio
+    profiles:
+      - s3
     ports:
       - "9000:9000"
+    networks:
+      - hudi_network
     env_file:
-      - s3.env
+      - hudi.env
     command: server /data
     healthcheck:
       test: mc ready local
@@ -36,16 +40,53 @@ services:
 
   mc:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ./
+      dockerfile: ./Dockerfile.minio
     container_name: mc
+    networks:
+      - hudi_network
+    profiles:
+      - s3
     depends_on:
       minio:
         condition: service_healthy
     env_file:
-      - s3.env
+      - hudi.env
     volumes:
       - ../crates/tests/data/tables:/opt/data:ro
-      - ./copy_tables.sh:/opt/copy_tables.sh
-    entrypoint: /opt/copy_tables.sh
+    entrypoint: >
+      /bin/bash -c '
+        set -eux
+        mc config host add store http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY
+        mc mb store/$$MINIO_TEST_BUCKET
+        find /opt/data -name "*.zip" -exec unzip {} -d /tmp/data/ \;
+        find /tmp/data -type d -mindepth 1 -maxdepth 1 -exec mc cp --recursive {} store/$$MINIO_TEST_BUCKET \;
+        mc ls store/$$MINIO_TEST_BUCKET
+      '
+  
+  integration_test_rust:
+    image: rust:1.75
+    container_name: integration_test_rust
+    networks:
+      - hudi_network
+    profiles:
+      - integration_test
+    env_file:
+      - hudi.env
+    volumes:
+      - ../crates:/app/crates:ro
+      - ../python:/app/python:ro
+      - ../integration_test:/app/integration_test
+      - ../Cargo.toml:/app/Cargo.toml:ro
+    entrypoint: >
+      /bin/sh -c "
+        set -eux
+        apt update && apt install -y --no-install-recommends libpython3.11-dev
+        cd /app/integration_test
+        cargo test
+      "
 
+
+networks:
+  hudi_network:
+    driver: bridge

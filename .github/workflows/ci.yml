@@ -79,10 +79,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Spin up minio
-        run: docker compose -f docker/docker-compose.yaml up -d
+      - name: Spin up minio for s3 tests
+        run: docker compose -f docker/docker-compose.yaml --profile s3 up -d
       - name: Run Rust integration tests
-        run: cd integration_test && cargo test --config env.toml
+        run: docker compose -f docker/docker-compose.yaml run integration_test_rust
 
   python-tests:
     strategy:
