@@ -26,6 +26,8 @@ pub mod internal;
 pub mod read;
 pub mod table;
 
+pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
+
 pub trait ConfigParser: AsRef<str> {
     type Output;
 

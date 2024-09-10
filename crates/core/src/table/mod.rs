@@ -19,8 +19,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::read_to_string;
-use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -39,8 +38,9 @@ use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
+use crate::config::HUDI_CONF_DIR;
 use crate::file_group::FileSlice;
-use crate::storage::utils::{empty_options, parse_uri};
+use crate::storage::utils::{empty_options, parse_config_data, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
@@ -119,29 +119,6 @@ impl Table {
         let mut hudi_options = HashMap::new();
         let mut extra_options = HashMap::new();
 
-        let mut conf = String::from("/etc/hudi/conf");
-        if let Ok(path) = std::env::var("HUDI_CONF_DIR") {
-            conf = path;
-        }
-        if let Ok(data) = read_to_string(format!("{conf}/hudi-defaults.conf")) {
-            for mut line in data.lines() {
-                line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(off) = line.find([' ', '=']) {
-                    let key = line[..off].to_string();
-                    let value = line[off + 1..]
-                        .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
-                        .to_string();
-                    if key.is_empty() || value.is_empty() {
-                        continue;
-                    }
-                    hudi_options.insert(key, value);
-                }
-            }
-        }
-
         Self::imbue_cloud_env_vars(&mut extra_options);
 
         for (k, v) in all_options {
@@ -151,34 +128,68 @@ impl Table {
                 extra_options.insert(k.as_ref().to_string(), v.into());
             }
         }
+
         let storage = Storage::new(base_url, &extra_options)?;
-        let data = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let cursor = std::io::Cursor::new(data);
-        let lines = BufReader::new(cursor).lines();
-        for line in lines {
-            let line = line?;
-            let trimmed_line = line.trim();
-            if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
-                continue;
-            }
-            let mut parts = trimmed_line.splitn(2, '=');
-            let key = parts.next().unwrap().to_owned();
-            let value = parts.next().unwrap_or("").to_owned();
-            // `hoodie.properties` takes precedence TODO handle conflicts where applicable
-            hudi_options.insert(key, value);
-        }
+
+        Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
+
+        Self::imbue_global_hudi_configs(&mut hudi_options, storage.clone()).await?;
+
         let hudi_configs = HudiConfigs::new(hudi_options);
 
         Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, extra_options))
     }
 
     fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
-        let prefixes = ["AWS_", "AZURE_", "GOOGLE_"];
-        options.extend(
-            env::vars()
-                .filter(|(key, _)| prefixes.iter().any(|prefix| key.starts_with(prefix)))
-                .map(|(k, v)| (k.to_ascii_lowercase(), v)),
-        );
+        const PREFIXES: [&str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
+
+        for (key, value) in env::vars() {
+            if PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+                && !options.contains_key(&key.to_ascii_lowercase())
+            {
+                options.insert(key.to_ascii_lowercase(), value);
+            }
+        }
+    }
+
+    async fn imbue_table_properties(
+        options: &mut HashMap<String, String>,
+        storage: Arc<Storage>,
+    ) -> Result<()> {
+        let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
+        let table_properties = parse_config_data(&bytes, "=").await?;
+
+        // TODO: handle the case where the same key is present in both table properties and options
+        for (k, v) in table_properties {
+            options.insert(k.to_string(), v.to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn imbue_global_hudi_configs(
+        options: &mut HashMap<String, String>,
+        storage: Arc<Storage>,
+    ) -> Result<()> {
+        let global_config_path = env::var(HUDI_CONF_DIR)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
+            .join("hudi-defaults.conf");
+
+        if let Ok(bytes) = storage
+            .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
+            .await
+        {
+            if let Ok(global_configs) = parse_config_data(&bytes, " \t=").await {
+                for (key, value) in global_configs {
+                    if key.starts_with("hoodie.") && !options.contains_key(&key) {
+                        options.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_configs(hudi_configs: &HudiConfigs) -> Result<()> {
@@ -301,7 +312,7 @@ impl Table {
 mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
-    use std::panic;
+    use std::{env, panic};
 
     use url::Url;
 
@@ -314,6 +325,7 @@ mod tests {
         PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion,
     };
+    use crate::config::HUDI_CONF_DIR;
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
 
@@ -336,7 +348,7 @@ mod tests {
             .get_schema()
             .await
             .unwrap()
-            .all_fields()
+            .flattened_fields()
             .into_iter()
             .map(|f| f.name().to_string())
             .collect();
@@ -601,14 +613,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn support_external_config_file() {
-        std::env::set_var("HUDI_CONF_DIR", canonicalize("tests/data/config").unwrap());
-        let table = new_table_without_validation("table_props_valid").await;
+    async fn get_global_table_props() {
+        // Without the environment variable HUDI_CONF_DIR
+        let table = new_table_without_validation("table_props_partial").await;
         let configs = table.configs;
+        assert!(configs.get(DatabaseName).is_err());
+        assert!(configs.get(TableType).is_err());
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+
+        // Environment variable HUDI_CONF_DIR points to nothing
+        let base_path = env::current_dir().unwrap();
+        let hudi_conf_dir = base_path.join("random/wrong/dir");
+        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        let table = new_table_without_validation("table_props_partial").await;
+        let configs = table.configs;
+        assert!(configs.get(DatabaseName).is_err());
+        assert!(configs.get(TableType).is_err());
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+
+        // With global config
+        let base_path = env::current_dir().unwrap();
+        let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
+        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        let table = new_table_without_validation("table_props_partial").await;
+        let configs = table.configs;
+        assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "tmpdb");
         assert_eq!(
-            configs.get(BaseFileFormat).unwrap().to::<String>(),
-            "parquet"
+            configs.get(TableType).unwrap().to::<String>(),
+            "MERGE_ON_READ"
         );
-        assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
+        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+        env::remove_var(HUDI_CONF_DIR)
     }
 }

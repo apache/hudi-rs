@@ -24,13 +24,14 @@ use std::thread;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::TableProvider;
-use datafusion::execution::context::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::Result;
@@ -92,7 +93,7 @@ impl TableProvider for HudiDataSource {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -123,7 +124,11 @@ impl TableProvider for HudiDataSource {
             .with_projection(projection.cloned())
             .with_limit(limit);
 
-        let parquet_opts = state.table_options().parquet.clone();
+        let parquet_opts = TableParquetOptions {
+            global: state.config_options().execution.parquet.clone(),
+            column_specific_options: Default::default(),
+            key_value_metadata: Default::default(),
+        };
         let mut exec_builder = ParquetExecBuilder::new_with_options(fsc, parquet_opts);
 
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
