@@ -25,6 +25,7 @@
 # python
 .env
 venv
+.venv
 **/.python-version
 __pycache__
 
