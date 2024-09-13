@@ -312,9 +312,8 @@ impl Table {
 mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
-    use std::path::Path;
+    use std::path::PathBuf;
     use std::{env, panic};
-
     use url::Url;
 
     use hudi_tests::{assert_not, TestTable};
@@ -329,6 +328,24 @@ mod tests {
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::utils::join_url_segments;
     use crate::table::Table;
+
+    /// Test helper to create a new `Table` instance without validating the configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_dir_name` - Name of the table root directory; all under `crates/core/tests/data/`.
+    async fn get_test_table_without_validation(table_dir_name: &str) -> Table {
+        let base_url = Url::from_file_path(
+            canonicalize(PathBuf::from("tests").join("data").join(table_dir_name)).unwrap(),
+        )
+        .unwrap();
+        Table::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn hudi_table_get_schema() {
@@ -473,15 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_invalid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_invalid").await;
         let configs = table.configs;
         assert!(
             configs.validate(BaseFileFormat).is_err(),
@@ -529,15 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_invalid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_invalid").await;
         let configs = table.configs;
         assert!(configs.get(BaseFileFormat).is_err());
         assert!(configs.get(Checksum).is_err());
@@ -558,15 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_default_for_invalid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_invalid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_invalid").await;
         let configs = table.configs;
         assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
@@ -593,15 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_valid_table_props() {
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_valid").await;
         let configs = table.configs;
         assert_eq!(
             configs.get(BaseFileFormat).unwrap().to::<String>(),
@@ -638,15 +623,7 @@ mod tests {
     #[tokio::test]
     async fn get_global_table_props() {
         // Without the environment variable HUDI_CONF_DIR
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_partial")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_partial").await;
         let configs = table.configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
@@ -656,15 +633,7 @@ mod tests {
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("random/wrong/dir");
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_partial")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_partial").await;
         let configs = table.configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
@@ -674,16 +643,7 @@ mod tests {
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
-
-        let base_url =
-            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_partial")).unwrap())
-                .unwrap();
-        let table = Table::new_with_options(
-            base_url.as_str(),
-            [("hoodie.internal.skip.config.validation", "true")],
-        )
-        .await
-        .unwrap();
+        let table = get_test_table_without_validation("table_props_partial").await;
         let configs = table.configs;
         assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "tmpdb");
         assert_eq!(
