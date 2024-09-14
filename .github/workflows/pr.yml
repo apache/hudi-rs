@@ -42,7 +42,7 @@ jobs:
         run: |
           npm i -g conventional-changelog-conventionalcommits
           npm i -g commitlint@latest
-          echo ${{ github.event.pull_request.title }} | npx commitlint
+          echo "${{ github.event.pull_request.title }}" | npx commitlint
 
       - name: Labeling
         uses: actions/labeler@v5
