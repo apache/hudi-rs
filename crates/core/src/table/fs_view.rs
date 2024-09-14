@@ -58,7 +58,7 @@ impl FileSystemView {
     async fn load_partition_paths(
         storage: &Storage,
         partition_filters: &[PartitionFilter],
-        partition_schema: Schema,
+        partition_schema: &Schema,
     ) -> Result<Vec<String>> {
         let top_level_dirs: Vec<String> = storage
             .list_dirs(None)
@@ -74,36 +74,30 @@ impl FileSystemView {
             partition_paths.push("".to_string())
         }
         if partition_filters.is_empty() {
-            Ok(partition_paths)
-        } else {
-            // fields data type
-            let field_data_type: HashMap<_, _> = partition_schema
-                .fields
-                .iter()
-                .map(|field| (field.name().clone(), field.data_type().clone()))
-                .collect();
-
-            Ok(partition_paths
-                .into_iter()
-                .filter(|path_str| {
-                    let partitions: Result<Vec<HudiTablePartition>> = path_str
-                        .split('/')
-                        .map(|s| HudiTablePartition::try_from((s, &field_data_type)))
-                        .collect();
-                    match partitions {
-                        Ok(parts) => {
-                            partition_filters
-                                .iter()
-                                .all(|filter| filter.match_partitions(&parts))
-                        },
-                        Err(e) => {
-                            warn!("transform {} HudiTablePartition error, contain this partition default: {}", path_str, e);
-                            true
-                        },
-                    }
-                })
-                .collect())
+            return Ok(partition_paths);
         }
+        let field_and_data_type: HashMap<_, _> = partition_schema
+            .fields()
+            .iter()
+            .map(|field| (field.name().to_string(), field.data_type().clone()))
+            .collect();
+
+        Ok(partition_paths
+            .into_iter()
+            .filter(|path_str| {
+                match path_str
+                    .split('/')
+                    .map(|s| HudiTablePartition::try_from((s, &field_and_data_type)))
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(parts) => partition_filters.iter().all(|filter| filter.match_partitions(&parts)),
+                    Err(e) => {
+                        warn!("Failed to parse partitions for path {}: {}. Including this partition by default.", path_str, e);
+                        true // include the partition despite the error
+                    },
+                }
+            })
+            .collect())
     }
 
     async fn load_file_groups_for_partitions(
@@ -159,18 +153,15 @@ impl FileSystemView {
         timestamp: &str,
         excluding_file_groups: &HashSet<FileGroup>,
         partition_filter: &[PartitionFilter],
-        partition_schema: Schema,
+        partition_schema: &Schema,
     ) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
         if self.partition_to_file_groups.is_empty() {
             let partition_paths =
                 Self::load_partition_paths(&self.storage, partition_filter, partition_schema)
-                    .await
-                    .unwrap();
+                    .await?;
             let partition_to_file_groups =
-                Self::load_file_groups_for_partitions(&self.storage, partition_paths)
-                    .await
-                    .unwrap();
+                Self::load_file_groups_for_partitions(&self.storage, partition_paths).await?;
             partition_to_file_groups.into_iter().for_each(|pair| {
                 self.partition_to_file_groups.insert(pair.0, pair.1);
             });
@@ -183,9 +174,7 @@ impl FileSystemView {
                 }
                 if let Some(fsl) = fg.get_file_slice_mut_as_of(timestamp) {
                     // TODO: pass ref instead of copying
-                    fsl.load_stats(&self.storage)
-                        .await
-                        .expect("Fail to load file slice stats.");
+                    fsl.load_stats(&self.storage).await?;
                     let immut_fsl: &FileSlice = fsl;
                     file_slices.push(immut_fsl.clone());
                 }
@@ -231,7 +220,7 @@ mod tests {
         let partition_paths = FileSystemView::load_partition_paths(
             &storage,
             &hudi_table.partition_filters,
-            hudi_table.get_partition_schema().await.unwrap(),
+            &hudi_table.get_partition_schema().await.unwrap(),
         )
         .await
         .unwrap();
@@ -248,7 +237,7 @@ mod tests {
         let partition_paths = FileSystemView::load_partition_paths(
             &storage,
             &hudi_table.partition_filters,
-            hudi_table.get_partition_schema().await.unwrap(),
+            &hudi_table.get_partition_schema().await.unwrap(),
         )
         .await
         .unwrap();
@@ -283,7 +272,7 @@ mod tests {
                 "20240418173551906",
                 &excludes,
                 &hudi_table.partition_filters,
-                hudi_table.get_partition_schema().await.unwrap(),
+                &hudi_table.get_partition_schema().await.unwrap(),
             )
             .await
             .unwrap();
@@ -322,7 +311,7 @@ mod tests {
                 "20240707001303088",
                 excludes,
                 &hudi_table.partition_filters,
-                hudi_table.get_partition_schema().await.unwrap(),
+                &hudi_table.get_partition_schema().await.unwrap(),
             )
             .await
             .unwrap();
@@ -367,7 +356,7 @@ mod tests {
                 "20240707001303088",
                 excludes,
                 &[short_eq_10],
-                hudi_table.get_partition_schema().await.unwrap(),
+                &hudi_table.get_partition_schema().await.unwrap(),
             )
             .await
             .unwrap();

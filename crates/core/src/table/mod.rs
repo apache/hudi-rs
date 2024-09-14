@@ -92,7 +92,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Fields, Schema};
+use arrow_schema::{Field, Schema};
 use strum::IntoEnumIterator;
 use url::Url;
 
@@ -314,20 +314,22 @@ impl Table {
 
     /// Get the latest partition [Schema] of the table
     pub async fn get_partition_schema(&self) -> Result<Schema> {
-        let schema = self.get_schema().await;
-        let partition_str_vec = self
+        let partition_fields: HashSet<String> = self
             .configs
             .get_or_default(PartitionFields)
-            .to::<Vec<String>>();
-        let partition_set: HashSet<String> = partition_str_vec.into_iter().collect();
-        let partition_fields: Vec<Arc<Field>> = schema
-            .unwrap()
-            .fields
+            .to::<Vec<String>>()
             .into_iter()
-            .filter(|col| partition_set.contains(col.name()))
+            .collect();
+
+        let schema = self.get_schema().await?;
+        let partition_fields: Vec<Arc<Field>> = schema
+            .fields()
+            .iter()
+            .filter(|field| partition_fields.contains(field.name()))
             .cloned()
             .collect();
-        Ok(Schema::new(Fields::from(partition_fields)))
+
+        Ok(Schema::new(partition_fields))
     }
 
     /// Split the file into a specified number of parts
@@ -359,12 +361,13 @@ impl Table {
     /// Get all the [FileSlice]s at a given timestamp, as a time travel query.
     async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         let excludes = self.timeline.get_replaced_file_groups().await?;
+        let partition_schema = self.get_partition_schema().await?;
         self.file_system_view
             .get_file_slices_as_of(
                 timestamp,
                 &excludes,
                 &self.partition_filters,
-                self.get_partition_schema().await?,
+                &partition_schema,
             )
             .await
     }
