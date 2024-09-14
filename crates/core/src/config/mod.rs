@@ -20,7 +20,7 @@ use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use crate::Result;
 
 pub mod internal;
 pub mod read;

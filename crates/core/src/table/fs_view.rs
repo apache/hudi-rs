@@ -20,7 +20,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use url::Url;
@@ -29,6 +28,7 @@ use crate::config::HudiConfigs;
 use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
+use crate::{Error::Internal, Result};
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -83,7 +83,7 @@ impl FileSystemView {
                 Ok(file_groups) => {
                     partition_to_file_groups.insert(p, file_groups);
                 }
-                Err(e) => return Err(anyhow!("Failed to load partitions: {}", e)),
+                Err(e) => return Err(Internal(format!("Failed to load partitions: {}", e))),
             }
         }
         Ok(partition_to_file_groups)

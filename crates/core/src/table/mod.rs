@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use strum::IntoEnumIterator;
@@ -44,6 +43,7 @@ use crate::storage::utils::{empty_options, parse_config_data, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
+use crate::{Error, Result};
 
 mod fs_view;
 mod timeline;
@@ -70,20 +70,15 @@ impl Table {
     {
         let base_url = Arc::new(parse_uri(base_uri)?);
 
-        let (configs, extra_options) = Self::load_configs(base_url.clone(), all_options)
-            .await
-            .context("Failed to load table properties")?;
+        let (configs, extra_options) = Self::load_configs(base_url.clone(), all_options).await?;
         let configs = Arc::new(configs);
         let extra_options = Arc::new(extra_options);
 
-        let timeline = Timeline::new(base_url.clone(), extra_options.clone(), configs.clone())
-            .await
-            .context("Failed to load timeline")?;
+        let timeline =
+            Timeline::new(base_url.clone(), extra_options.clone(), configs.clone()).await?;
 
         let file_system_view =
-            FileSystemView::new(base_url.clone(), extra_options.clone(), configs.clone())
-                .await
-                .context("Failed to load file system view")?;
+            FileSystemView::new(base_url.clone(), extra_options.clone(), configs.clone()).await?;
 
         Ok(Table {
             base_url,
@@ -211,20 +206,24 @@ impl Table {
         // additional validation
         let table_type = hudi_configs.get(TableType)?.to::<String>();
         if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(anyhow!("Only support copy-on-write table."));
+            return Err(Error::Unsupported(
+                "Only support copy-on-write table".to_string(),
+            ));
         }
 
         let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
         if !(5..=6).contains(&table_version) {
-            return Err(anyhow!("Only support table version 5 and 6."));
+            return Err(Error::Unsupported(
+                "Only support table version 5 and 6".to_string(),
+            ));
         }
 
         let drops_partition_cols = hudi_configs.get(DropsPartitionFields)?.to::<bool>();
         if drops_partition_cols {
-            return Err(anyhow!(
+            return Err(Error::Unsupported(format!(
                 "Only support when `{}` is disabled",
                 DropsPartitionFields.as_ref()
-            ));
+            )));
         }
 
         Ok(())
@@ -260,8 +259,7 @@ impl Table {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         self.file_system_view
             .load_file_slices_stats_as_of(timestamp, &excludes)
-            .await
-            .context("Fail to load file slice stats.")?;
+            .await?;
         self.file_system_view
             .get_file_slices_as_of(timestamp, &excludes)
     }
@@ -278,15 +276,17 @@ impl Table {
     }
 
     async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
-        let file_slices = self
-            .get_file_slices_as_of(timestamp)
-            .await
-            .context(format!("Failed to get file slices as of {}", timestamp))?;
+        let file_slices = self.get_file_slices_as_of(timestamp).await?;
         let mut batches = Vec::new();
         for f in file_slices {
             match self.file_system_view.read_file_slice_unchecked(&f).await {
                 Ok(batch) => batches.push(batch),
-                Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
+                Err(e) => {
+                    return Err(Error::Internal(format!(
+                        "Failed to read file slice {:?} - {}",
+                        f, e
+                    )))
+                }
             }
         }
         Ok(batches)

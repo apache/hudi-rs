@@ -48,7 +48,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # "stdlib"
-anyhow = { workspace = true }
 bytes = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
@@ -65,6 +64,7 @@ datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
 datafusion-common = { workspace = true, optional = true }
 datafusion-physical-expr = { workspace = true, optional = true }
+thiserror = "1.0.63"
 
 [dev-dependencies]
 hudi-tests = { path = "../tests" }

@@ -20,11 +20,13 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use anyhow::anyhow;
-use anyhow::Result;
 use strum_macros::{AsRefStr, EnumIter};
 
-use crate::config::{ConfigParser, HudiConfigValue};
+use crate::{
+    config::{ConfigParser, HudiConfigValue},
+    Error::{self, ConfNotFound, InvalidConf, Unsupported},
+    Result,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiTableConfig {
@@ -87,31 +89,56 @@ impl ConfigParser for HudiTableConfig {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+            .ok_or(ConfNotFound(self.as_ref().to_string()));
 
         match self {
             Self::BaseFileFormat => get_result
                 .and_then(BaseFileFormatValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::Checksum => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::Checksum.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Integer),
             Self::DatabaseName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::DropsPartitionFields => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::DropsPartitionFields.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Boolean),
             Self::IsHiveStylePartitioning => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::IsHiveStylePartitioning.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Boolean),
             Self::IsPartitionPathUrlencoded => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::IsPartitionPathUrlencoded.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Boolean),
             Self::KeyGeneratorClass => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
             Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PopulatesMetaFields => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::PopulatesMetaFields.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Boolean),
             Self::RecordKeyFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
@@ -120,10 +147,20 @@ impl ConfigParser for HudiTableConfig {
                 .and_then(TableTypeValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::TableVersion => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::TableVersion.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Integer),
             Self::TimelineLayoutVersion => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| InvalidConf {
+                        item: Self::TimelineLayoutVersion.as_ref(),
+                        source: Box::new(e),
+                    })
+                })
                 .map(HudiConfigValue::Integer),
         }
     }
@@ -138,13 +175,13 @@ pub enum TableTypeValue {
 }
 
 impl FromStr for TableTypeValue {
-    type Err = anyhow::Error;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
-            _ => Err(anyhow!("Unsupported table type: {}", s)),
+            v => Err(Unsupported(format!("unsupported table type {}", v))),
         }
     }
 }
@@ -156,12 +193,12 @@ pub enum BaseFileFormatValue {
 }
 
 impl FromStr for BaseFileFormatValue {
-    type Err = anyhow::Error;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
-            _ => Err(anyhow!("Unsupported base file format: {}", s)),
+            v => Err(Unsupported(format!("unsupported base file format {}", v))),
         }
     }
 }

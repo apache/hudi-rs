@@ -17,16 +17,32 @@
  * under the License.
  */
 use std::collections::HashMap;
+use std::convert::From;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::Context;
 use arrow::pyarrow::ToPyArrow;
-use pyo3::{pyclass, pymethods, PyErr, PyObject, PyResult, Python};
+use pyo3::{exceptions::PyOSError, pyclass, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
 use hudi::file_group::FileSlice;
 use hudi::table::Table;
+use hudi::Error::Internal;
+
+struct HoodieError(hudi::Error);
+
+impl From<HoodieError> for PyErr {
+    fn from(err: HoodieError) -> PyErr {
+        PyOSError::new_err(err.0.to_string())
+    }
+}
+
+impl From<hudi::Error> for HoodieError {
+    fn from(err: hudi::Error) -> Self {
+        Self(err)
+    }
+}
 
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
@@ -91,7 +107,7 @@ pub struct HudiTable {
 impl HudiTable {
     #[new]
     #[pyo3(signature = (table_uri, options = None))]
-    fn new(table_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
+    fn new(table_uri: &str, options: Option<HashMap<String, String>>) -> Result<Self, HoodieError> {
         let _table = rt().block_on(Table::new_with_options(
             table_uri,
             options.unwrap_or_default(),
@@ -99,11 +115,17 @@ impl HudiTable {
         Ok(HudiTable { _table })
     }
 
-    fn get_schema(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.get_schema())?.to_pyarrow(py)
+    fn get_schema(&self, py: Python) -> Result<PyObject, HoodieError> {
+        rt().block_on(self._table.get_schema())?
+            .to_pyarrow(py)
+            .map_err(|e| HoodieError(Internal(e.to_string())))
     }
 
-    fn split_file_slices(&self, n: usize, py: Python) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+    fn split_file_slices(
+        &self,
+        n: usize,
+        py: Python,
+    ) -> Result<Vec<Vec<HudiFileSlice>>, HoodieError> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(self._table.split_file_slices(n))?;
             Ok(file_slices
@@ -113,20 +135,23 @@ impl HudiTable {
         })
     }
 
-    fn get_file_slices(&self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
+    fn get_file_slices(&self, py: Python) -> Result<Vec<HudiFileSlice>, HoodieError> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(self._table.get_file_slices())?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
 
-    fn read_file_slice(&self, relative_path: &str, py: Python) -> PyResult<PyObject> {
+    fn read_file_slice(&self, relative_path: &str, py: Python) -> Result<PyObject, HoodieError> {
         rt().block_on(self._table.read_file_slice_by_path(relative_path))?
             .to_pyarrow(py)
+            .map_err(|e| HoodieError(Internal(e.to_string())))
     }
 
-    fn read_snapshot(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.read_snapshot())?.to_pyarrow(py)
+    fn read_snapshot(&self, py: Python) -> Result<PyObject, HoodieError> {
+        rt().block_on(self._table.read_snapshot())?
+            .to_pyarrow(py)
+            .map_err(|e| HoodieError(Internal(e.to_string())))
     }
 }
 
