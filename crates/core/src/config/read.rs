@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi read configuration
+//! Hudi read configurations.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -25,9 +25,7 @@ use crate::config::{ConfigParser, HudiConfigValue};
 use anyhow::{anyhow, Result};
 use strum_macros::EnumIter;
 
-/// Hudi read configuration
-///
-/// this conf will controll the read action when reading
+/// Configurations for reading Hudi tables.
 ///
 /// **Example**
 ///

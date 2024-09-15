@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi Configuration
+//! Hudi Configurations.
 use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,24 +29,20 @@ pub mod table;
 
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
-/// This trait defines the implementation approach for different categories of configurations in Hudi.
+/// This defines some common APIs for working with configurations in Hudi.
 pub trait ConfigParser: AsRef<str> {
-    /// Configuration value type
+    /// Configuration value type.
     type Output;
 
-    /// Initialize a [HudiConfigValue] with default value
+    /// Supplies the default value of the configuration.
     fn default_value(&self) -> Option<Self::Output>;
 
-    /// Verify whether the configuration is required.
+    /// To indicate if the configuration is required or not, this helps in validation.
     fn is_required(&self) -> bool {
         false
     }
 
-    /// Validate whether the current value is provided
-    ///
-    /// if value is not provied
-    /// - [`Self::is_required`] is true, return [OK(())]
-    /// - [`Self::is_required`] is true, return [Err()]
+    /// Validate the configuration by parsing the given [String] value and check if it is required.
     fn validate(&self, configs: &HashMap<String, String>) -> Result<()> {
         match self.parse_value(configs) {
             Ok(_) => Ok(()),
@@ -61,12 +57,12 @@ pub trait ConfigParser: AsRef<str> {
         }
     }
 
-    /// Cover source configuration to [Output]
+    /// Parse the [String] value to [Self::Output].
     fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output>;
 
-    /// Covert source configuration to [Output] with default value
+    /// Parse the [String] value to [Self::Output], or return the default value.
     ///
-    /// if default value not define, panic!
+    /// Panic if the default value is not defined.
     fn parse_value_or_default(&self, configs: &HashMap<String, String>) -> Self::Output {
         self.parse_value(configs).unwrap_or_else(|_| {
             self.default_value()
@@ -75,9 +71,7 @@ pub trait ConfigParser: AsRef<str> {
     }
 }
 
-/// Hudi Configuration value dataType
-///
-/// only support `Boolean` `Integer` `UInteger` `String` `List`
+/// All possible data types for Hudi Configuration values.
 #[derive(Clone, Debug)]
 pub enum HudiConfigValue {
     Boolean(bool),
@@ -88,7 +82,7 @@ pub enum HudiConfigValue {
 }
 
 impl HudiConfigValue {
-    /// Covert [HudiConfigValue] logical type to real rust data type
+    /// Covert [HudiConfigValue] logical type to the representing data type in Rust.
     ///
     /// - [`HudiConfigValue::Boolean`] -> [bool]
     /// - [`HudiConfigValue::Integer`] -> [isize]
@@ -148,21 +142,21 @@ impl From<HudiConfigValue> for Vec<String> {
     }
 }
 
-/// Hudi raw configs storage
+/// Hudi configuration container.
 #[derive(Clone, Debug)]
 pub struct HudiConfigs {
     pub raw_configs: Arc<HashMap<String, String>>,
 }
 
 impl HudiConfigs {
-    /// Create [HudiConfigs] with [HashMap] configs
+    /// Create [HudiConfigs] with key-value pairs of [String]s.
     pub fn new(raw_configs: HashMap<String, String>) -> Self {
         Self {
             raw_configs: Arc::new(raw_configs),
         }
     }
 
-    /// Create empty [HudiConfigs]
+    /// Create empty [HudiConfigs].
     pub fn empty() -> Self {
         Self {
             raw_configs: Arc::new(HashMap::new()),
@@ -180,7 +174,7 @@ impl HudiConfigs {
         parser.parse_value(&self.raw_configs)
     }
 
-    /// Will panic if value and default_value all not exist
+    /// Get value or default value. If the config has no default value, this will panic.
     pub fn get_or_default(
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
@@ -188,10 +182,7 @@ impl HudiConfigs {
         parser.parse_value_or_default(&self.raw_configs)
     }
 
-    /// Safe get value
-    ///
-    /// - if value exist, will return [Some()]
-    /// - if value not exist, will return default_value, it depends on impl [ConfigParser::default_value]
+    /// Get value or default value. If the config has no default value, this will return [None].
     pub fn try_get(
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,

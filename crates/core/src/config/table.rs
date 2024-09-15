@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi table configuration
+//! Hudi table configurations.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -27,7 +27,7 @@ use strum_macros::{AsRefStr, EnumIter};
 
 use crate::config::{ConfigParser, HudiConfigValue};
 
-/// Hudi table configuration
+/// Configurations for Hudi tables, persisted in `hoodie.properties`.
 ///
 /// **Example**
 ///
@@ -43,76 +43,61 @@ use crate::config::{ConfigParser, HudiConfigValue};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiTableConfig {
     /// Base file format
-    /// - Hoodie Key : hoodie.table.base.file.format
     ///
-    /// support: parquet
+    /// Currently only parquet is supported.
     BaseFileFormat,
 
     /// Table checksum is used to guard against partial writes in HDFS.
     /// It is added as the last entry in hoodie.properties and then used to validate while reading table config.
-    /// - Hoodie Key : hoodie.table.checksum
     Checksum,
 
     /// Database name that will be used for incremental query.
     /// If different databases have the same table name during incremental query,
     /// we can set it to limit the table name under a specific database
-    /// - Hoodie Key : hoodie.database.name
     DatabaseName,
 
     /// When set to true, will not write the partition columns into hudi. By default, false.
-    /// - Hoodie Key : hoodie.datasource.write.drop.partition.columns
     DropsPartitionFields,
 
     /// Flag to indicate whether to use Hive style partitioning.
     /// If set true, the names of partition folders follow <partition_column_name>=<partition_value> format.
     /// By default false (the names of partition folders are only partition values)
-    /// - Hoodie Key : hoodie.datasource.write.hive_style_partitioning
     IsHiveStylePartitioning,
 
     /// Should we url encode the partition path value, before creating the folder structure.
-    /// - Hoodie Key : hoodie.datasource.write.partitionpath.urlencode
     IsPartitionPathUrlencoded,
 
     /// Key Generator class property for the hoodie table
-    /// - Hoodie Key : hoodie.table.keygenerator.class
     KeyGeneratorClass,
 
     /// Fields used to partition the table. Concatenated values of these fields are used as
     /// the partition path, by invoking toString().
     /// These fields also include the partition type which is used by custom key generators
-    /// - Hoodie Key : hoodie.table.partition.fields
     PartitionFields,
 
     /// Field used in preCombining before actual write. By default, when two records have the same key value,
     /// the largest value for the precombine field determined by Object.compareTo(..), is picked.
-    /// - Hoodie Key : hoodie.table.precombine.field
     PrecombineField,
 
     /// When enabled, populates all meta fields. When disabled, no meta fields are populated
     /// and incremental queries will not be functional. This is only meant to be used for append only/immutable data for batch processing
-    /// - Hoodie Key : hoodie.populate.meta.fields
     PopulatesMetaFields,
 
     /// Columns used to uniquely identify the table.
     /// Concatenated values of these fields are used as the record key component of HoodieKey.
-    /// - Hoodie Key : hoodie.table.recordkey.fields
     RecordKeyFields,
 
     /// Table name that will be used for registering with Hive. Needs to be same across runs.
-    /// - Hoodie Key : hoodie.table.name
     TableName,
 
     /// The table type for the underlying data, for this write. This can’t change between writes.
-    /// - Hoodie Key : hoodie.table.type
     TableType,
 
     /// Version of table, used for running upgrade/downgrade steps between releases with potentially
     /// breaking/backwards compatible changes.
-    /// - Hoodie Key : hoodie.table.version
     TableVersion,
 
     /// Version of timeline used, by the table.
-    /// - Hoodie Key : hoodie.timeline.layout.version
     TimelineLayoutVersion,
 }
 
@@ -200,7 +185,7 @@ impl ConfigParser for HudiTableConfig {
     }
 }
 
-/// Hudi table type
+/// Config value for [HudiTableConfig::TableType].
 #[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum TableTypeValue {
     #[strum(serialize = "COPY_ON_WRITE")]
@@ -221,9 +206,7 @@ impl FromStr for TableTypeValue {
     }
 }
 
-/// Hudi base file format
-///
-/// only support parquet now
+/// Config value for [HudiTableConfig::BaseFileFormat].
 #[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum BaseFileFormatValue {
     #[strum(serialize = "parquet")]
