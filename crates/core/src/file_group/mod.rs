@@ -103,8 +103,15 @@ impl FileSlice {
                 .get_parquet_file_metadata(&self.base_file_relative_path())
                 .await?;
             let num_records = parquet_meta.file_metadata().num_rows();
-            let size_bytes = parquet_meta.row_groups().iter().map(|rg| rg.total_byte_size()).sum::<i64>();
-            let stats = FileStats { num_records, size_bytes };
+            let size_bytes = parquet_meta
+                .row_groups()
+                .iter()
+                .map(|rg| rg.total_byte_size())
+                .sum::<i64>();
+            let stats = FileStats {
+                num_records,
+                size_bytes,
+            };
             self.base_file.stats = Some(stats);
         }
         Ok(())
