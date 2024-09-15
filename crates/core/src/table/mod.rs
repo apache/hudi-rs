@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi Table implementation
+//! This module is responsible for Hudi table APIs.
 //!
 //! It provides a quick entry point for reading Hudi table metadata and data,
 //! facilitating adaptation and compatibility across various engines.
@@ -300,7 +300,7 @@ impl Table {
         Ok(())
     }
 
-    /// Get hudi table Arrow [Schema]
+    /// Get the latest [Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
@@ -317,10 +317,9 @@ impl Table {
             .collect())
     }
 
-    /// Get hudi table all [FileSlice]
+    /// Get all the [FileSlice]s in the table.
     ///
-    /// different table configurations can result in a different number of file slices being returned.
-    /// look at [HudiReadConfig]
+    /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
     pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
         if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
             self.get_file_slices_as_of(timestamp.to::<String>().as_str())
@@ -332,7 +331,7 @@ impl Table {
         }
     }
 
-    /// Get hudi table file slices with timestamp, it used to time travel
+    /// Get all the [FileSlice]s at a given timestamp, as a time travel query.
     async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         self.file_system_view
@@ -343,7 +342,9 @@ impl Table {
             .get_file_slices_as_of(timestamp, &excludes)
     }
 
-    /// Read hudi table latest data
+    /// Get all the latest records in the table.
+    ///
+    /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
     pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
         if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
             self.read_snapshot_as_of(timestamp.to::<String>().as_str())
@@ -355,7 +356,7 @@ impl Table {
         }
     }
 
-    /// Read hudi table with timestamp, it's time travel
+    /// Get all the records in the table at a given timestamp, as a time travel query.
     async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
         let file_slices = self
             .get_file_slices_as_of(timestamp)
@@ -380,7 +381,10 @@ impl Table {
         Ok(file_paths)
     }
 
-    /// Read hudi data file with relative_path
+    /// Read records from a [FileSlice] by its relative path.
+    ///
+    /// **Example**
+    ///
     /// ```rust
     /// use url::Url;
     /// use hudi_core::table::Table;

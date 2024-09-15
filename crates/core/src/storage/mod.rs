@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi storage implementation
+//! This module is responsible for interacting with the storage layer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -186,7 +186,7 @@ impl Storage {
     }
 }
 
-/// Get relative path
+/// Get relative paths of leaf directories under a given directory.
 ///
 /// **Example**
 /// - /usr/hudi/table_name

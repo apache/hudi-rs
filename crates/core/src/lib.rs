@@ -16,12 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi core implementation
+//! Crate `hudi-core`.
 //!
-//! In user side, just pay attention to [config], [table]
-//!
-//! # For [config]
-//! can control the behavior of reading and writing data
+//! # The [config] module is responsible for managing configurations.
 //!
 //! **Example**
 //!
@@ -36,9 +33,7 @@
 //! HudiTable::new_with_options(base_uri.as_ref(), options);
 //! ```
 //!
-//! # For [table]
-//! It provides a quick entry point for reading Hudi table metadata and data,
-//! facilitating adaptation and compatibility across various engines.
+//! # The [table] module is responsible for managing Hudi tables.
 //!
 //! **Example**
 //!
