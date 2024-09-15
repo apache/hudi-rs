@@ -289,7 +289,9 @@ impl Table {
             return Err(anyhow!("Only support table version 5 and 6."));
         }
 
-        let drops_partition_cols = hudi_configs.get(DropsPartitionFields)?.to::<bool>();
+        let drops_partition_cols = hudi_configs
+            .get_or_default(DropsPartitionFields)
+            .to::<bool>();
         if drops_partition_cols {
             return Err(anyhow!(
                 "Only support when `{}` is disabled",
