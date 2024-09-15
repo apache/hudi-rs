@@ -55,6 +55,7 @@ def test_sample_table(get_sample_table):
         "20240402144910683",
     }
     assert all(f.num_records == 1 for f in file_slices)
+    assert all(f.size_bytes > 0 for f in file_slices)
     file_slice_paths = [f.base_file_relative_path() for f in file_slices]
     assert set(file_slice_paths) == {
         "chennai/68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0_4-12-0_20240402123035233.parquet",

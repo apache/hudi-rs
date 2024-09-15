@@ -29,6 +29,7 @@ class HudiFileSlice:
     base_file_name: str
     base_file_size: int
     num_records: int
+    size_bytes: int
 
     def base_file_relative_path(self) -> str: ...
 
