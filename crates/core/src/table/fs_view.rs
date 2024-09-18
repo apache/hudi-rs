@@ -180,7 +180,6 @@ impl FileSystemView {
                 }
             }
         }
-        assert!(!self.partition_to_file_groups.is_empty());
         Ok(file_slices)
     }
 

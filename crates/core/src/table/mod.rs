@@ -442,6 +442,7 @@ impl Table {
         }
     }
 
+    #[cfg(test)]
     pub fn reset(&mut self) {
         self.file_system_view.reset()
     }

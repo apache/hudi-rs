@@ -18,38 +18,40 @@
  */
 use anyhow::anyhow;
 use anyhow::Result;
+use arrow_array::{ArrayRef, BooleanArray, Scalar, StringArray};
+use arrow_cast::{cast_with_options, CastOptions};
+use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::DataType;
-use datafusion_common::ScalarValue;
-use serde::{Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::iter::repeat;
 
 /// A special value used in Hive to represent the null partition in partitioned tables
 pub const NULL_PARTITION_VALUE_DATA_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// A Enum used for selecting the partition value operation when filtering a HudiTable partition.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum PartitionValue {
     /// The partition value with the equal operator
-    Equal(ScalarValue),
+    Equal(Scalar<ArrayRef>),
     /// The partition value with the not equal operator
-    NotEqual(ScalarValue),
+    NotEqual(Scalar<ArrayRef>),
     /// The partition value with the greater than operator
-    GreaterThan(ScalarValue),
+    GreaterThan(Scalar<ArrayRef>),
     /// The partition value with the greater than or equal operator
-    GreaterThanOrEqual(ScalarValue),
+    GreaterThanOrEqual(Scalar<ArrayRef>),
     /// The partition value with the less than operator
-    LessThan(ScalarValue),
+    LessThan(Scalar<ArrayRef>),
     /// The partition value with the less than or equal operator
-    LessThanOrEqual(ScalarValue),
+    LessThanOrEqual(Scalar<ArrayRef>),
     /// The partition values with the in operator
-    In(Vec<ScalarValue>),
+    In(Vec<Scalar<ArrayRef>>),
     /// The partition values with the not in operator
-    NotIn(Vec<ScalarValue>),
+    NotIn(Vec<Scalar<ArrayRef>>),
 }
 
 /// A Struct used for filtering a HudiTable partition by key and value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PartitionFilter {
     /// The key of the PartitionFilter
     pub key: String,
@@ -59,20 +61,30 @@ pub struct PartitionFilter {
 
 impl PartitionFilter {
     /// Indicates if a HudiTable partition matches with the partition filter by key and value.
-    pub fn match_partition(&self, partition: &HudiTablePartition) -> bool {
+    pub fn match_partition(&self, partition: &HudiTablePartition) -> BooleanArray {
         if self.key != partition.key {
-            return false;
+            return BooleanArray::new_scalar(false).into_inner();
         }
 
         match &self.value {
-            PartitionValue::Equal(value) => value.eq(&partition.value),
-            PartitionValue::NotEqual(value) => !value.eq(&partition.value),
-            PartitionValue::GreaterThan(value) => partition.value.gt(value),
-            PartitionValue::GreaterThanOrEqual(value) => partition.value.ge(value),
-            PartitionValue::LessThan(value) => partition.value.lt(value),
-            PartitionValue::LessThanOrEqual(value) => partition.value.le(value),
-            PartitionValue::In(value) => value.contains(&partition.value),
-            PartitionValue::NotIn(value) => !value.contains(&partition.value),
+            PartitionValue::Equal(value) => eq(&partition.value, value).unwrap(),
+            PartitionValue::NotEqual(value) => neq(&partition.value, value).unwrap(),
+            PartitionValue::GreaterThan(value) => gt(&partition.value, value).unwrap(),
+            PartitionValue::GreaterThanOrEqual(value) => gt_eq(&partition.value, value).unwrap(),
+            PartitionValue::LessThan(value) => lt(&partition.value, value).unwrap(),
+            PartitionValue::LessThanOrEqual(value) => lt_eq(&partition.value, value).unwrap(),
+            PartitionValue::In(value) => BooleanArray::new_scalar(
+                value
+                    .iter()
+                    .any(|s| eq(&partition.value, s).unwrap().value(0)),
+            )
+            .into_inner(),
+            PartitionValue::NotIn(value) => BooleanArray::new_scalar(
+                !value
+                    .iter()
+                    .any(|s| eq(&partition.value, s).unwrap().value(0)),
+            )
+            .into_inner(),
         }
     }
 
@@ -81,36 +93,7 @@ impl PartitionFilter {
     pub fn match_partitions(&self, partitions: &[HudiTablePartition]) -> bool {
         partitions
             .iter()
-            .any(|partition| self.match_partition(partition))
-    }
-}
-
-/// Create desired string representation for PartitionFilter.
-/// Used in places like predicate in operationParameters, etc.
-impl Serialize for PartitionFilter {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let s = match &self.value {
-            PartitionValue::Equal(value) => format!("{} = '{}'", self.key, value),
-            PartitionValue::NotEqual(value) => format!("{} != '{}'", self.key, value),
-            PartitionValue::GreaterThan(value) => format!("{} > '{}'", self.key, value),
-            PartitionValue::GreaterThanOrEqual(value) => format!("{} >= '{}'", self.key, value),
-            PartitionValue::LessThan(value) => format!("{} < '{}'", self.key, value),
-            PartitionValue::LessThanOrEqual(value) => format!("{} <= '{}'", self.key, value),
-            PartitionValue::In(values) => {
-                let quoted_values: Vec<String> =
-                    values.iter().map(|v| format!("'{}'", v)).collect();
-                format!("{} IN ({})", self.key, quoted_values.join(", "))
-            }
-            PartitionValue::NotIn(values) => {
-                let quoted_values: Vec<String> =
-                    values.iter().map(|v| format!("'{}'", v)).collect();
-                format!("{} NOT IN ({})", self.key, quoted_values.join(", "))
-            }
-        };
-        serializer.serialize_str(&s)
+            .any(|partition| self.match_partition(partition).value(0))
     }
 }
 
@@ -124,49 +107,47 @@ impl TryFrom<(&str, &str, &str, &DataType)> for PartitionFilter {
         match filter {
             (key, "=", value, data_type) if !key.is_empty() => Ok(PartitionFilter {
                 key: key.to_owned(),
-                value: PartitionValue::Equal(ScalarValue::try_from_string(
-                    value.to_string(),
-                    data_type,
-                )?),
+                value: PartitionValue::Equal(try_from_string(value.to_string(), data_type)),
             }),
             (key, "!=", value, data_type) if !key.is_empty() => Ok(PartitionFilter {
                 key: key.to_owned(),
-                value: PartitionValue::NotEqual(ScalarValue::try_from_string(
-                    value.to_string(),
-                    data_type,
-                )?),
+                value: PartitionValue::NotEqual(try_from_string(value.to_string(), data_type)),
             }),
             (key, ">", value, data_type) if !key.is_empty() => Ok(PartitionFilter {
                 key: key.to_owned(),
-                value: PartitionValue::GreaterThan(ScalarValue::try_from_string(
-                    value.to_string(),
-                    data_type,
-                )?),
+                value: PartitionValue::GreaterThan(try_from_string(value.to_string(), data_type)),
             }),
             (key, ">=", value, data_type) if !key.is_empty() => Ok(PartitionFilter {
                 key: key.to_owned(),
-                value: PartitionValue::GreaterThanOrEqual(ScalarValue::try_from_string(
+                value: PartitionValue::GreaterThanOrEqual(try_from_string(
                     value.to_string(),
                     data_type,
-                )?),
+                )),
             }),
             (key, "<", value, data_type) if !key.is_empty() => Ok(PartitionFilter {
                 key: key.to_owned(),
-                value: PartitionValue::LessThan(ScalarValue::try_from_string(
-                    value.to_string(),
-                    data_type,
-                )?),
+                value: PartitionValue::LessThan(try_from_string(value.to_string(), data_type)),
             }),
             (key, "<=", value, data_type) if !key.is_empty() => Ok(PartitionFilter {
                 key: key.to_owned(),
-                value: PartitionValue::LessThanOrEqual(ScalarValue::try_from_string(
+                value: PartitionValue::LessThanOrEqual(try_from_string(
                     value.to_string(),
                     data_type,
-                )?),
+                )),
             }),
             (_, _, _, _) => Err(anyhow!("Invalid partition filter found: {}.", filter.1)),
         }
     }
+}
+
+fn try_from_string(value: String, target_type: &DataType) -> Scalar<ArrayRef> {
+    let cast_options = CastOptions {
+        safe: false,
+        format_options: Default::default(),
+    };
+    let value = StringArray::from_iter_values(repeat(value).take(1));
+    let array_ref = cast_with_options(&value, target_type, &cast_options).unwrap();
+    Scalar::new(array_ref)
 }
 
 /// Create a PartitionFilter from a filter Tuple with the structure (key, operation, list(value)).
@@ -182,7 +163,7 @@ impl TryFrom<(&str, &str, &[&str], &DataType)> for PartitionFilter {
                 value: PartitionValue::In(
                     value
                         .iter()
-                        .map(|x| ScalarValue::try_from_string(x.to_string(), data_type).unwrap())
+                        .map(|x| try_from_string(x.to_string(), data_type))
                         .collect(),
                 ),
             }),
@@ -191,7 +172,7 @@ impl TryFrom<(&str, &str, &[&str], &DataType)> for PartitionFilter {
                 value: PartitionValue::NotIn(
                     value
                         .iter()
-                        .map(|x| ScalarValue::try_from_string(x.to_string(), data_type).unwrap())
+                        .map(|x| try_from_string(x.to_string(), data_type))
                         .collect(),
                 ),
             }),
@@ -201,10 +182,10 @@ impl TryFrom<(&str, &str, &[&str], &DataType)> for PartitionFilter {
 }
 
 /// A Struct HudiTablePartition used to represent a partition of a HudiTable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct HudiTablePartition {
     pub key: String,
-    pub value: ScalarValue,
+    pub value: Scalar<ArrayRef>,
 }
 
 impl HudiTablePartition {
@@ -212,7 +193,7 @@ impl HudiTablePartition {
     pub fn new<K, V>(key: K, value: V) -> Self
     where
         K: Into<String>,
-        V: Into<ScalarValue>,
+        V: Into<Scalar<ArrayRef>>,
     {
         HudiTablePartition {
             key: key.into(),
@@ -223,7 +204,7 @@ impl HudiTablePartition {
     pub fn from_partition_value<'a, K, V>(partition_value: (K, V)) -> Self
     where
         K: Into<Cow<'a, str>>,
-        V: Into<ScalarValue>,
+        V: Into<Scalar<ArrayRef>>,
     {
         let (k, v) = partition_value;
         HudiTablePartition {
@@ -236,7 +217,7 @@ impl HudiTablePartition {
         &self.key
     }
 
-    pub fn value(&self) -> &ScalarValue {
+    pub fn value(&self) -> &Scalar<ArrayRef> {
         &self.value
     }
 }
@@ -252,10 +233,7 @@ impl TryFrom<(&str, &DataType)> for HudiTablePartition {
         match partition_splitted {
             partition_splitted if partition_splitted.len() == 2 => Ok(HudiTablePartition {
                 key: partition_splitted[0].to_owned(),
-                value: ScalarValue::try_from_string(
-                    partition_splitted[1].to_owned().to_owned(),
-                    partition.1,
-                )?,
+                value: try_from_string(partition_splitted[1].to_string(), partition.1),
             }),
             _ => Err(anyhow!(
                 "This partition is not formatted with key=value: {}",
@@ -273,10 +251,10 @@ impl TryFrom<(&str, &HashMap<String, DataType>)> for HudiTablePartition {
         match partition_splitted {
             partition_splitted if partition_splitted.len() == 2 => Ok(HudiTablePartition {
                 key: partition_splitted[0].to_owned(),
-                value: ScalarValue::try_from_string(
-                    partition_splitted[1].to_owned().to_owned(),
+                value: try_from_string(
+                    partition_splitted[1].to_string(),
                     partition.1.get(partition_splitted[0]).unwrap(),
-                )?,
+                ),
             }),
             _ => Err(anyhow!(
                 "This partition is not formatted with key=value: {}",
@@ -289,59 +267,6 @@ impl TryFrom<(&str, &HashMap<String, DataType>)> for HudiTablePartition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn check_json_serialize(filter: PartitionFilter, expected_json: &str) {
-        assert_eq!(serde_json::to_value(filter).unwrap(), json!(expected_json))
-    }
-
-    #[test]
-    fn test_serialize_partition_filter() {
-        check_json_serialize(
-            PartitionFilter::try_from(("date", "=", "2022-05-22", &DataType::Utf8)).unwrap(),
-            "date = '2022-05-22'",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from(("date", "!=", "2022-05-22", &DataType::Utf8)).unwrap(),
-            "date != '2022-05-22'",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from(("date", ">", "2022-05-22", &DataType::Utf8)).unwrap(),
-            "date > '2022-05-22'",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from(("date", ">=", "2022-05-22", &DataType::Utf8)).unwrap(),
-            "date >= '2022-05-22'",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from(("date", "<", "2022-05-22", &DataType::Utf8)).unwrap(),
-            "date < '2022-05-22'",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from(("date", "<=", "2022-05-22", &DataType::Utf8)).unwrap(),
-            "date <= '2022-05-22'",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from((
-                "date",
-                "in",
-                vec!["2023-11-04", "2023-06-07"].as_slice(),
-                &DataType::Utf8,
-            ))
-            .unwrap(),
-            "date IN ('2023-11-04', '2023-06-07')",
-        );
-        check_json_serialize(
-            PartitionFilter::try_from((
-                "date",
-                "not in",
-                vec!["2023-11-04", "2023-06-07"].as_slice(),
-                &DataType::Utf8,
-            ))
-            .unwrap(),
-            "date NOT IN ('2023-11-04', '2023-06-07')",
-        );
-    }
 
     #[test]
     fn tryfrom_invalid() {
@@ -357,6 +282,14 @@ mod tests {
         assert!(partition.is_ok());
         let partition = partition.unwrap();
         assert_eq!(partition.key, "ds");
-        assert_eq!(partition.value, ScalarValue::new_utf8("2024"));
+        let cast_options = CastOptions {
+            safe: false,
+            format_options: Default::default(),
+        };
+        let target = StringArray::from_iter_values(repeat("2024").take(1));
+        let array_ref = cast_with_options(&target, &DataType::Utf8, &cast_options).unwrap();
+        assert!(eq(&partition.value, &Scalar::new(array_ref))
+            .unwrap()
+            .value(0));
     }
 }
