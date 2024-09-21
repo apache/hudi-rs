@@ -46,5 +46,5 @@ futures = { workspace = true }
 tokio = { workspace = true }
 
 [dependencies.pyo3]
-version = "0.21.2"
-features = ["extension-module", "abi3", "abi3-py38", "gil-refs", "anyhow"]
+version = "0.22.2"
+features = ["extension-module", "abi3", "abi3-py39", "anyhow"]
