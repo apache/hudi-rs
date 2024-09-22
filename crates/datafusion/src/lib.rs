@@ -178,7 +178,7 @@ mod tests {
     ) -> SessionContext {
         let config = SessionConfig::new().set(
             "datafusion.sql_parser.enable_ident_normalization",
-            ScalarValue::from(false),
+            &ScalarValue::from(false),
         );
         let ctx = SessionContext::new_with_config(config);
         let base_url = test_table.url();
@@ -201,16 +201,16 @@ mod tests {
         let explaining_rb = explaining_rb.first().unwrap();
         let plan = get_str_column(explaining_rb, "plan").join("");
         let plan_lines: Vec<&str> = plan.lines().map(str::trim).collect();
-        assert!(plan_lines[2].starts_with("SortExec: TopK(fetch=10)"));
-        assert!(plan_lines[3].starts_with(&format!(
+        assert!(plan_lines[1].starts_with("SortExec: TopK(fetch=10)"));
+        assert!(plan_lines[2].starts_with(&format!(
             "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
             get_field(structField@3, field2) as {}.structField[field2]]",
             table_name
         )));
-        assert!(plan_lines[5].starts_with(
+        assert!(plan_lines[4].starts_with(
             "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND get_field(structField@3, field2) > 30"
         ));
-        assert!(plan_lines[6].contains(&format!("input_partitions={}", planned_input_partitioned)));
+        assert!(plan_lines[5].contains(&format!("input_partitions={}", planned_input_partitioned)));
     }
 
     async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
