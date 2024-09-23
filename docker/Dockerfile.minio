@@ -15,23 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-**/Cargo.lock
-/target
-**/target
+FROM alpine:3.18
+RUN apk update && apk add --no-cache wget ca-certificates bash findutils
 
-/.idea
-.vscode
-
-# python
-.env
-venv
-**/.python-version
-__pycache__
-
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
+RUN cd /usr/local/bin && \
+    wget -q --show-progress https://dl.min.io/client/mc/release/linux-amd64/mc && \
+    chmod +x mc

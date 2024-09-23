@@ -70,6 +70,19 @@ jobs:
           name: cov-report-rust-tests-${{ runner.os }}
           path: ./cov-reports
           if-no-files-found: 'error'
+  
+  rust-integration-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spin up minio for s3 tests
+        run: docker compose -f docker/docker-compose.yaml --profile s3 up -d
+      - name: Run Rust integration tests
+        run: docker compose -f docker/docker-compose.yaml run integration_test_rust
 
   python-tests:
     strategy:
