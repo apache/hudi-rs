@@ -34,7 +34,7 @@ homepage = "https://github.com/apache/hudi-rs"
 repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
-log = "^0.4"
+log = { version = "= 0.4.22" }
 
 # arrow
 arrow = { version = "= 52.2.0", features = ["pyarrow"] }

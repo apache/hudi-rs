@@ -943,10 +943,10 @@ mod tests {
         assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
-        assert_eq!(
-            configs.get_or_default(PartitionFields).to::<Vec<String>>(),
-            vec![""]
-        );
+        assert!(configs
+            .get_or_default(PartitionFields)
+            .to::<Vec<String>>()
+            .is_empty());
         assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
         assert!(configs.get_or_default(PopulatesMetaFields).to::<bool>());
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());

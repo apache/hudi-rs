@@ -74,5 +74,6 @@ hudi-tests = { path = "../tests" }
 datafusion = [
     "dep:datafusion",
     "datafusion-expr",
+    "datafusion-common",
     "datafusion-physical-expr",
 ]
