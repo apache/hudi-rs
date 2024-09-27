@@ -26,6 +26,7 @@ use crate::{
     Result,
 };
 
+/// Splits a filename into a stem and an extension.
 pub fn split_filename(filename: &str) -> Result<(String, String)> {
     let path = Path::new(filename);
 

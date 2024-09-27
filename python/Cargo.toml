@@ -39,7 +39,6 @@ arrow = { workspace = true }
 arrow-schema = { workspace = true }
 
 # "stdlib"
-anyhow = { workspace = true }
 
 # runtime / async
 futures = { workspace = true }

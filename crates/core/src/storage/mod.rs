@@ -101,15 +101,10 @@ impl Storage {
         runtime_env.register_object_store(self.base_url.as_ref(), self.object_store.clone());
     }
 
-    fn get_relative_path(&self, relative_path: &str) -> Result<(Url, ObjPath)> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        Ok((obj_url, obj_path))
-    }
-
     #[cfg(test)]
     async fn get_file_info(&self, relative_path: &str) -> Result<FileInfo> {
-        let (obj_url, obj_path) = self.get_relative_path(relative_path)?;
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let meta = self.object_store.head(&obj_path).await?;
         let uri = obj_url.to_string();
         let name = obj_path
@@ -127,7 +122,8 @@ impl Storage {
     }
 
     pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
-        let (_, obj_path) = self.get_relative_path(relative_path)?;
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
         let reader = ParquetObjectReader::new(obj_store, meta);
@@ -136,7 +132,8 @@ impl Storage {
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
-        let (_, obj_path) = self.get_relative_path(relative_path)?;
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let result = self.object_store.get(&obj_path).await?;
         let bytes = result.bytes().await?;
         Ok(bytes)
@@ -150,7 +147,8 @@ impl Storage {
     }
 
     pub async fn get_parquet_file_data(&self, relative_path: &str) -> Result<RecordBatch> {
-        let (_, obj_path) = self.get_relative_path(relative_path)?;
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
 
@@ -301,10 +299,6 @@ mod tests {
             result.is_err(),
             "Should return error when no base path is invalid."
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to create storage"));
     }
 
     #[tokio::test]

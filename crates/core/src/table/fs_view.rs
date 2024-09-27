@@ -28,7 +28,7 @@ use crate::storage::{get_leaf_dirs, Storage};
 use crate::table::partition::PartitionPruner;
 use crate::{Error, Result};
 use dashmap::DashMap;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 
 /// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and
 /// access the file groups and file slices.

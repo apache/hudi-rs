@@ -54,14 +54,8 @@ impl BaseFile {
             .rsplit_once('.')
             .ok_or(Internal(err_msg.clone()))?;
         let parts: Vec<&str> = name.split('_').collect();
-        let file_group_id = parts
-            .first()
-            .ok_or(Internal(err_msg.clone()))?
-            .to_string();
-        let commit_time = parts
-            .get(2)
-            .ok_or(Internal(err_msg.clone()))?
-            .to_string();
+        let file_group_id = parts.first().ok_or(Internal(err_msg.clone()))?.to_string();
+        let commit_time = parts.get(2).ok_or(Internal(err_msg.clone()))?.to_string();
         Ok((file_group_id, commit_time))
     }
 

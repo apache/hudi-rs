@@ -288,7 +288,7 @@ mod tests {
         assert!(filter
             .unwrap_err()
             .to_string()
-            .contains("not found in partition schema"));
+            .contains("Unable to get field named"));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
         let filter_tuple = ("count", "=", "not_a_number");
         let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_err());
-        assert!(filter.unwrap_err().to_string().contains("Unable to cast"));
+        assert!(filter.unwrap_err().to_string().contains("Cannot cast string"));
     }
 
     #[test]
