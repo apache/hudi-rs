@@ -152,11 +152,11 @@ impl TableProviderFactory for HudiTableProvider {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
         let table_provider = match cmd.options.is_empty() {
-            true => HudiDataSource::new(cmd.to_owned().location.as_str()).await?,
+            true => HudiDataSource::new(cmd.location.to_owned().as_str()).await?,
             false => {
                 HudiDataSource::new_with_options(
-                    cmd.to_owned().location.as_str(),
-                    cmd.to_owned().options,
+                    cmd.location.to_owned().as_str(),
+                    cmd.options.to_owned(),
                 )
                 .await?
             }
