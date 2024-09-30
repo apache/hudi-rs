@@ -24,7 +24,7 @@ use std::thread;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::Session;
+use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
@@ -35,7 +35,7 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::Result;
-use datafusion_expr::{Expr, TableType};
+use datafusion_expr::{CreateExternalTable, Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
@@ -139,6 +139,19 @@ impl TableProvider for HudiDataSource {
         }
 
         return Ok(exec_builder.build_arc());
+    }
+}
+
+pub struct HudiTableProvider;
+
+#[async_trait]
+impl TableProviderFactory for HudiTableProvider {
+    async fn create(&self, _state: &dyn Session, cmd: &CreateExternalTable) -> Result<Arc<dyn TableProvider>> {
+        let table_provider = match cmd.options.is_empty() {
+            true => HudiTable::new(cmd.location()).await?,
+            false => HudiTable::new_with_options(cmd.location(), cmd.options()).await?,
+        };
+        Ok(Arc::new(table_provider))
     }
 }
 
