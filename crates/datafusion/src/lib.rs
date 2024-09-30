@@ -154,10 +154,14 @@ pub struct HudiTableProvider;
 
 #[async_trait]
 impl TableProviderFactory for HudiTableProvider {
-    async fn create(&self, _state: &dyn Session, cmd: &CreateExternalTable) -> Result<Arc<dyn TableProvider>> {
+    async fn create(
+        &self,
+        _state: &dyn Session,
+        cmd: &CreateExternalTable,
+    ) -> Result<Arc<dyn TableProvider>> {
         let table_provider = match cmd.options.is_empty() {
-            true => HudiDataSource::new(&*cmd.location).await?,
-            false => HudiDataSource::new_with_options(&*cmd.location, &cmd.options).await?,
+            true => HudiDataSource::new(&cmd.location).await?,
+            false => HudiDataSource::new_with_options(&cmd.location, &cmd.options).await?,
         };
         Ok(Arc::new(table_provider))
     }
