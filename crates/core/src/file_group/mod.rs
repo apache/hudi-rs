@@ -257,7 +257,8 @@ mod tests {
                 .base_file
                 .commit_time,
             "20240402123035233"
-        )
+        );
+        assert!(fg.get_file_slice_as_of("-1").is_none());
     }
 
     #[test]

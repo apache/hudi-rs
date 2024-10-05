@@ -130,6 +130,7 @@ impl ConfigParser for HudiTableConfig {
         match self {
             Self::DatabaseName => Some(HudiConfigValue::String("default".to_string())),
             Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
+            Self::PartitionFields => Some(HudiConfigValue::List(vec![])),
             Self::PopulatesMetaFields => Some(HudiConfigValue::Boolean(true)),
             _ => None,
         }

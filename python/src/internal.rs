@@ -109,8 +109,9 @@ impl HudiTable {
     }
 
     fn split_file_slices(&self, n: usize, py: Python) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        // TODO: support passing filters
         py.allow_threads(|| {
-            let file_slices = rt().block_on(self._table.split_file_slices(n))?;
+            let file_slices = rt().block_on(self._table.split_file_slices(n, &[]))?;
             Ok(file_slices
                 .iter()
                 .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
@@ -119,8 +120,9 @@ impl HudiTable {
     }
 
     fn get_file_slices(&self, py: Python) -> PyResult<Vec<HudiFileSlice>> {
+        // TODO: support passing filters
         py.allow_threads(|| {
-            let file_slices = rt().block_on(self._table.get_file_slices())?;
+            let file_slices = rt().block_on(self._table.get_file_slices(&[]))?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
@@ -131,7 +133,9 @@ impl HudiTable {
     }
 
     fn read_snapshot(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.read_snapshot())?.to_pyarrow(py)
+        // TODO: support passing filters
+        rt().block_on(self._table.read_snapshot(&[]))?
+            .to_pyarrow(py)
     }
 }
 

@@ -52,7 +52,7 @@
 //! pub async fn test() {
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let record_read = hudi_table.read_snapshot().await.unwrap();
+//!     let record_read = hudi_table.read_snapshot(&[]).await.unwrap();
 //! }
 //! ```
 //! 4. get file slice
@@ -66,7 +66,7 @@
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
 //!     let file_slices = hudi_table
-//!             .split_file_slices(2)
+//!             .split_file_slices(2, &[])
 //!             .await.unwrap();
 //!     // define every parquet task reader how many slice
 //!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
@@ -84,7 +84,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -92,7 +92,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{Field, Schema};
 use strum::IntoEnumIterator;
 use url::Url;
 
@@ -103,6 +103,7 @@ use TableTypeValue::CopyOnWrite;
 use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
+use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
@@ -110,9 +111,11 @@ use crate::file_group::FileSlice;
 use crate::storage::utils::{empty_options, parse_config_data, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
+use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
 
 mod fs_view;
+mod partition;
 mod timeline;
 
 /// Hudi Table in-memory
@@ -307,10 +310,34 @@ impl Table {
         self.timeline.get_latest_schema().await
     }
 
+    /// Get the latest partition [Schema] of the table
+    pub async fn get_partition_schema(&self) -> Result<Schema> {
+        let partition_fields: HashSet<String> = self
+            .configs
+            .get_or_default(PartitionFields)
+            .to::<Vec<String>>()
+            .into_iter()
+            .collect();
+
+        let schema = self.get_schema().await?;
+        let partition_fields: Vec<Arc<Field>> = schema
+            .fields()
+            .iter()
+            .filter(|field| partition_fields.contains(field.name()))
+            .cloned()
+            .collect();
+
+        Ok(Schema::new(partition_fields))
+    }
+
     /// Split the file into a specified number of parts
-    pub async fn split_file_slices(&self, n: usize) -> Result<Vec<Vec<FileSlice>>> {
+    pub async fn split_file_slices(
+        &self,
+        n: usize,
+        filters: &[&str],
+    ) -> Result<Vec<Vec<FileSlice>>> {
         let n = std::cmp::max(1, n);
-        let file_slices = self.get_file_slices().await?;
+        let file_slices = self.get_file_slices(filters).await?;
         let chunk_size = (file_slices.len() + n - 1) / n;
 
         Ok(file_slices
@@ -322,46 +349,54 @@ impl Table {
     /// Get all the [FileSlice]s in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
-    pub async fn get_file_slices(&self) -> Result<Vec<FileSlice>> {
+    pub async fn get_file_slices(&self, filters: &[&str]) -> Result<Vec<FileSlice>> {
         if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
-            self.get_file_slices_as_of(timestamp.to::<String>().as_str())
+            self.get_file_slices_as_of(timestamp.to::<String>().as_str(), filters)
                 .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.get_file_slices_as_of(timestamp).await
+            self.get_file_slices_as_of(timestamp, filters).await
         } else {
             Ok(Vec::new())
         }
     }
 
     /// Get all the [FileSlice]s at a given timestamp, as a time travel query.
-    async fn get_file_slices_as_of(&self, timestamp: &str) -> Result<Vec<FileSlice>> {
+    async fn get_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        filters: &[&str],
+    ) -> Result<Vec<FileSlice>> {
         let excludes = self.timeline.get_replaced_file_groups().await?;
+        let partition_schema = self.get_partition_schema().await?;
+        let partition_pruner =
+            PartitionPruner::new(filters, &partition_schema, self.configs.as_ref())?;
         self.file_system_view
-            .load_file_slices_stats_as_of(timestamp, &excludes)
+            .get_file_slices_as_of(timestamp, &partition_pruner, &excludes)
             .await
-            .context("Fail to load file slice stats.")?;
-        self.file_system_view
-            .get_file_slices_as_of(timestamp, &excludes)
     }
 
     /// Get all the latest records in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
-    pub async fn read_snapshot(&self) -> Result<Vec<RecordBatch>> {
+    pub async fn read_snapshot(&self, filters: &[&str]) -> Result<Vec<RecordBatch>> {
         if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
-            self.read_snapshot_as_of(timestamp.to::<String>().as_str())
+            self.read_snapshot_as_of(timestamp.to::<String>().as_str(), filters)
                 .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.read_snapshot_as_of(timestamp).await
+            self.read_snapshot_as_of(timestamp, filters).await
         } else {
             Ok(Vec::new())
         }
     }
 
     /// Get all the records in the table at a given timestamp, as a time travel query.
-    async fn read_snapshot_as_of(&self, timestamp: &str) -> Result<Vec<RecordBatch>> {
+    async fn read_snapshot_as_of(
+        &self,
+        timestamp: &str,
+        filters: &[&str],
+    ) -> Result<Vec<RecordBatch>> {
         let file_slices = self
-            .get_file_slices_as_of(timestamp)
+            .get_file_slices_as_of(timestamp, filters)
             .await
             .context(format!("Failed to get file slices as of {}", timestamp))?;
         let mut batches = Vec::new();
@@ -375,9 +410,9 @@ impl Table {
     }
 
     #[cfg(test)]
-    async fn get_file_paths(&self) -> Result<Vec<String>> {
+    async fn get_file_paths_with_filters(&self, filters: &[&str]) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
-        for f in self.get_file_slices().await? {
+        for f in self.get_file_slices(filters).await? {
             file_paths.push(f.base_file_path().to_string());
         }
         Ok(file_paths)
@@ -411,6 +446,7 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::StringArray;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -462,7 +498,7 @@ mod tests {
             .collect();
         assert_eq!(
             fields,
-            Vec::from([
+            vec![
                 "_hoodie_commit_time",
                 "_hoodie_commit_seqno",
                 "_hoodie_record_key",
@@ -497,96 +533,23 @@ mod tests {
                 "child_struct",
                 "child_field1",
                 "child_field2"
-            ])
+            ]
         );
     }
 
     #[tokio::test]
-    async fn hudi_table_read_file_slice() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+    async fn hudi_table_get_partition_schema() {
+        let base_url = TestTable::V6TimebasedkeygenNonhivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let batches = hudi_table
-            .read_file_slice_by_path(
-                "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
-            )
+        let fields: Vec<String> = hudi_table
+            .get_partition_schema()
             .await
-            .unwrap();
-        assert_eq!(batches.num_rows(), 4);
-        assert_eq!(batches.num_columns(), 21);
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_paths() {
-        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        assert_eq!(hudi_table.timeline.instants.len(), 2);
-        let actual: HashSet<String> =
-            HashSet::from_iter(hudi_table.get_file_paths().await.unwrap());
-        let expected: HashSet<String> = HashSet::from_iter(vec![
-            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
-            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
-            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
-        ]
-            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
-            .collect::<Vec<_>>());
-        assert_eq!(actual, expected);
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_as_of_timestamps() {
-        let base_url = TestTable::V6Nonpartitioned.url();
-
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices = hudi_table.get_file_slices().await.unwrap();
-        assert_eq!(
-            file_slices
-                .iter()
-                .map(|f| f.base_file_relative_path())
-                .collect::<Vec<_>>(),
-            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
-        );
-
-        // as of the latest timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "20240418173551906")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
-            .await
-            .unwrap();
-        let file_slices = hudi_table.get_file_slices().await.unwrap();
-        assert_eq!(
-            file_slices
-                .iter()
-                .map(|f| f.base_file_relative_path())
-                .collect::<Vec<_>>(),
-            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
-        );
-
-        // as of just smaller than the latest timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "20240418173551905")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
-            .await
-            .unwrap();
-        let file_slices = hudi_table.get_file_slices().await.unwrap();
-        assert_eq!(
-            file_slices
-                .iter()
-                .map(|f| f.base_file_relative_path())
-                .collect::<Vec<_>>(),
-            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-182-253_20240418173550988.parquet",]
-        );
-
-        // as of non-exist old timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "0")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
-            .await
-            .unwrap();
-        let file_slices = hudi_table.get_file_slices().await.unwrap();
-        assert_eq!(
-            file_slices
-                .iter()
-                .map(|f| f.base_file_relative_path())
-                .collect::<Vec<_>>(),
-            Vec::<String>::new()
-        );
+            .unwrap()
+            .flattened_fields()
+            .into_iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        assert_eq!(fields, vec!["ts_str"]);
     }
 
     #[tokio::test]
@@ -672,7 +635,10 @@ mod tests {
         assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
-        assert!(panic::catch_unwind(|| configs.get_or_default(PartitionFields)).is_err());
+        assert!(configs
+            .get_or_default(PartitionFields)
+            .to::<Vec<String>>()
+            .is_empty());
         assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
         assert!(configs.get_or_default(PopulatesMetaFields).to::<bool>());
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());
@@ -753,5 +719,197 @@ mod tests {
         );
         assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
         env::remove_var(HUDI_CONF_DIR)
+    }
+
+    #[tokio::test]
+    async fn hudi_table_read_file_slice() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let batches = hudi_table
+            .read_file_slice_by_path(
+                "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+            )
+            .await
+            .unwrap();
+        assert_eq!(batches.num_rows(), 4);
+        assert_eq!(batches.num_columns(), 21);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_as_of_timestamps() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
+        );
+
+        // as of the latest timestamp
+        let opts = [(AsOfTimestamp.as_ref(), "20240418173551906")];
+        let hudi_table = Table::new_with_options(base_url.path(), opts)
+            .await
+            .unwrap();
+        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
+        );
+
+        // as of just smaller than the latest timestamp
+        let opts = [(AsOfTimestamp.as_ref(), "20240418173551905")];
+        let hudi_table = Table::new_with_options(base_url.path(), opts)
+            .await
+            .unwrap();
+        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-182-253_20240418173550988.parquet",]
+        );
+
+        // as of non-exist old timestamp
+        let opts = [(AsOfTimestamp.as_ref(), "0")];
+        let hudi_table = Table::new_with_options(base_url.path(), opts)
+            .await
+            .unwrap();
+        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        assert_eq!(
+            file_slices
+                .iter()
+                .map(|f| f.base_file_relative_path())
+                .collect::<Vec<_>>(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_paths_for_simple_key_and_non_hive_style() {
+        let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        assert_eq!(hudi_table.timeline.instants.len(), 2);
+
+        let partition_filters = &[];
+        let actual: HashSet<String> = HashSet::from_iter(
+            hudi_table
+                .get_file_paths_with_filters(partition_filters)
+                .await
+                .unwrap(),
+        );
+        let expected: HashSet<String> = HashSet::from_iter(
+            vec![
+                "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
+                "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
+                "30/6db57019-98ee-480e-8eb1-fb3de48e1c24-0_1-119-167_20240418172804498.parquet",
+            ]
+            .into_iter()
+            .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
+            .collect::<Vec<_>>(),
+        );
+        assert_eq!(actual, expected);
+
+        let partition_filters = &["byteField >= 10", "byteField < 30"];
+        let actual: HashSet<String> = HashSet::from_iter(
+            hudi_table
+                .get_file_paths_with_filters(partition_filters)
+                .await
+                .unwrap(),
+        );
+        let expected: HashSet<String> = HashSet::from_iter(
+            vec![
+                "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
+                "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
+            ]
+            .into_iter()
+            .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
+            .collect::<Vec<_>>(),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_paths_for_complex_keygen_and_hive_style() {
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        assert_eq!(hudi_table.timeline.instants.len(), 2);
+
+        let partition_filters = &[];
+        let actual: HashSet<String> = HashSet::from_iter(
+            hudi_table
+                .get_file_paths_with_filters(partition_filters)
+                .await
+                .unwrap(),
+        );
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+            "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
+            "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+
+        let partition_filters = &["byteField >= 10", "byteField < 20", "shortField != 100"];
+        let actual: HashSet<String> = HashSet::from_iter(
+            hudi_table
+                .get_file_paths_with_filters(partition_filters)
+                .await
+                .unwrap(),
+        );
+        let expected: HashSet<String> = HashSet::from_iter(vec![
+            "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+        ]
+            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .collect::<Vec<_>>());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_read_snapshot_for_complex_keygen_and_hive_style() {
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let partition_filters = &["byteField >= 10", "byteField < 20", "shortField != 100"];
+        let records = hudi_table.read_snapshot(partition_filters).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].num_rows(), 2);
+        let actual_partition_paths: HashSet<&str> = HashSet::from_iter(
+            records[0]
+                .column_by_name("_hoodie_partition_path")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let expected_partition_paths: HashSet<&str> =
+            HashSet::from_iter(vec!["byteField=10/shortField=300"]);
+        assert_eq!(actual_partition_paths, expected_partition_paths);
+
+        let actual_file_names: HashSet<&str> = HashSet::from_iter(
+            records[0]
+                .column_by_name("_hoodie_file_name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let expected_file_names: HashSet<&str> = HashSet::from_iter(vec![
+            "a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
+        ]);
+        assert_eq!(actual_file_names, expected_file_names);
     }
 }

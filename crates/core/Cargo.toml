@@ -65,6 +65,8 @@ datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
 datafusion-common = { workspace = true, optional = true }
 datafusion-physical-expr = { workspace = true, optional = true }
+percent-encoding = { workspace = true }
+once_cell = { workspace = true }
 
 [dev-dependencies]
 hudi-tests = { path = "../tests" }
