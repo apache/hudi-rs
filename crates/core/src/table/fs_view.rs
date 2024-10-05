@@ -24,12 +24,10 @@ use crate::config::HudiConfigs;
 use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
-use crate::table::partitions::{HudiTablePartition, PartitionFilter};
+use crate::table::partition::PartitionPruner;
 use anyhow::{anyhow, Result};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::Schema;
 use dashmap::DashMap;
-use log::warn;
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -57,8 +55,7 @@ impl FileSystemView {
 
     async fn load_partition_paths(
         storage: &Storage,
-        partition_filters: &[PartitionFilter],
-        partition_schema: &Schema,
+        partition_pruner: &PartitionPruner,
     ) -> Result<Vec<String>> {
         let top_level_dirs: Vec<String> = storage
             .list_dirs(None)
@@ -73,30 +70,13 @@ impl FileSystemView {
         if partition_paths.is_empty() {
             partition_paths.push("".to_string())
         }
-        if partition_filters.is_empty() {
+        if partition_pruner.is_empty() {
             return Ok(partition_paths);
         }
-        let field_and_data_type: HashMap<_, _> = partition_schema
-            .fields()
-            .iter()
-            .map(|field| (field.name().to_string(), field.data_type().clone()))
-            .collect();
 
         Ok(partition_paths
             .into_iter()
-            .filter(|path_str| {
-                match path_str
-                    .split('/')
-                    .map(|s| HudiTablePartition::try_from((s, &field_and_data_type)))
-                    .collect::<Result<Vec<_>>>()
-                {
-                    Ok(parts) => partition_filters.iter().all(|filter| filter.match_partitions(&parts)),
-                    Err(e) => {
-                        warn!("Failed to parse partitions for path {}: {}. Including this partition by default.", path_str, e);
-                        true // include the partition despite the error
-                    },
-                }
-            })
+            .filter(|path_str| partition_pruner.should_include(path_str))
             .collect())
     }
 
@@ -151,22 +131,24 @@ impl FileSystemView {
     pub async fn get_file_slices_as_of(
         &self,
         timestamp: &str,
+        partition_pruner: &PartitionPruner,
         excluding_file_groups: &HashSet<FileGroup>,
-        partition_filter: &[PartitionFilter],
-        partition_schema: &Schema,
     ) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
         if self.partition_to_file_groups.is_empty() {
             let partition_paths =
-                Self::load_partition_paths(&self.storage, partition_filter, partition_schema)
-                    .await?;
+                Self::load_partition_paths(&self.storage, partition_pruner).await?;
             let partition_to_file_groups =
                 Self::load_file_groups_for_partitions(&self.storage, partition_paths).await?;
             partition_to_file_groups.into_iter().for_each(|pair| {
                 self.partition_to_file_groups.insert(pair.0, pair.1);
             });
         }
-        for mut fgs in self.partition_to_file_groups.iter_mut() {
+        for mut fgs in self
+            .partition_to_file_groups
+            .iter_mut()
+            .filter(|item| partition_pruner.should_include(item.key()))
+        {
             let fgs_ref = fgs.value_mut();
             for fg in fgs_ref {
                 if excluding_file_groups.contains(fg) {
@@ -189,13 +171,10 @@ impl FileSystemView {
     ) -> Result<RecordBatch> {
         self.storage.get_parquet_file_data(relative_path).await
     }
+
     pub async fn read_file_slice_unchecked(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
         self.read_file_slice_by_path_unchecked(&file_slice.base_file_relative_path())
             .await
-    }
-
-    pub fn reset(&mut self) {
-        self.partition_to_file_groups = Arc::new(DashMap::new())
     }
 }
 
@@ -208,21 +187,17 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
-    use crate::table::partitions::PartitionFilter;
+    use crate::table::partition::PartitionPruner;
     use crate::table::Table;
 
     #[tokio::test]
     async fn get_partition_paths_for_nonpartitioned_table() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
         let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
-        let partition_paths = FileSystemView::load_partition_paths(
-            &storage,
-            &hudi_table.partition_filters,
-            &hudi_table.get_partition_schema().await.unwrap(),
-        )
-        .await
-        .unwrap();
+        let partition_pruner = PartitionPruner::empty();
+        let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
+            .await
+            .unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(partition_path_set, HashSet::from([""]))
@@ -231,15 +206,11 @@ mod tests {
     #[tokio::test]
     async fn get_partition_paths_for_complexkeygen_table() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
         let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
-        let partition_paths = FileSystemView::load_partition_paths(
-            &storage,
-            &hudi_table.partition_filters,
-            &hudi_table.get_partition_schema().await.unwrap(),
-        )
-        .await
-        .unwrap();
+        let partition_pruner = PartitionPruner::empty();
+        let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
+            .await
+            .unwrap();
         let partition_path_set: HashSet<&str> =
             HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
         assert_eq!(
@@ -255,7 +226,6 @@ mod tests {
     #[tokio::test]
     async fn fs_view_get_latest_file_slices() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fs_view = FileSystemView::new(
             Arc::new(base_url),
             Arc::new(HashMap::new()),
@@ -265,14 +235,10 @@ mod tests {
         .unwrap();
 
         assert!(fs_view.partition_to_file_groups.is_empty());
+        let partition_pruner = PartitionPruner::empty();
         let excludes = HashSet::new();
         let file_slices = fs_view
-            .get_file_slices_as_of(
-                "20240418173551906",
-                &excludes,
-                &hudi_table.partition_filters,
-                &hudi_table.get_partition_schema().await.unwrap(),
-            )
+            .get_file_slices_as_of("20240418173551906", &partition_pruner, &excludes)
             .await
             .unwrap();
         assert_eq!(fs_view.partition_to_file_groups.len(), 1);
@@ -300,18 +266,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
+        let partition_pruner = PartitionPruner::empty();
         let excludes = &hudi_table
             .timeline
             .get_replaced_file_groups()
             .await
             .unwrap();
         let file_slices = fs_view
-            .get_file_slices_as_of(
-                "20240707001303088",
-                excludes,
-                &hudi_table.partition_filters,
-                &hudi_table.get_partition_schema().await.unwrap(),
-            )
+            .get_file_slices_as_of("20240707001303088", &partition_pruner, excludes)
             .await
             .unwrap();
         assert_eq!(fs_view.partition_to_file_groups.len(), 3);
@@ -327,8 +289,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fs_view_get_latest_file_slices_no_hive_style_filter() {
-        let base_url = TestTable::V6SimplekeygenNonhivestyleOverwritetable.url();
+    async fn fs_view_get_latest_file_slices_with_partition_filters() {
+        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fs_view = FileSystemView::new(
             Arc::new(base_url),
@@ -344,30 +306,25 @@ mod tests {
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
-        let byte_field_data_type = partition_schema
-            .field_with_name("byteField")
-            .unwrap()
-            .data_type();
-        let short_eq_10 =
-            PartitionFilter::try_from(("byteField", "=", "10", byte_field_data_type)).unwrap();
+        let partition_pruner = PartitionPruner::new(
+            &["byteField < 20", "shortField = 300"],
+            &partition_schema,
+            hudi_table.configs.as_ref(),
+        )
+        .unwrap();
         let file_slices = fs_view
-            .get_file_slices_as_of(
-                "20240707001303088",
-                excludes,
-                &[short_eq_10],
-                &hudi_table.get_partition_schema().await.unwrap(),
-            )
+            .get_file_slices_as_of("20240418173235694", &partition_pruner, excludes)
             .await
             .unwrap();
-        assert_eq!(fs_view.partition_to_file_groups.len(), 3);
+        assert_eq!(fs_view.partition_to_file_groups.len(), 1);
         assert_eq!(file_slices.len(), 1);
         let fg_ids = file_slices
             .iter()
             .map(|fsl| fsl.file_group_id())
             .collect::<Vec<_>>();
-        assert_eq!(fg_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
+        assert_eq!(fg_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.stats.as_ref().unwrap().num_records, 1);
+            assert_eq!(fsl.base_file.stats.as_ref().unwrap().num_records, 2);
         }
     }
 }
