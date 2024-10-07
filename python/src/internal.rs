@@ -164,7 +164,7 @@ impl HudiTable {
             self._table
                 .read_snapshot(vec_string_to_slice!(filters.unwrap_or_default())),
         )?
-            .to_pyarrow(py)
+        .to_pyarrow(py)
     }
 }
 
