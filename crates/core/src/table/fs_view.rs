@@ -25,9 +25,10 @@ use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
 use crate::table::partition::PartitionPruner;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -51,6 +52,10 @@ impl FileSystemView {
             storage,
             partition_to_file_groups,
         })
+    }
+
+    async fn load_all_partition_paths(storage: &Storage) -> Result<Vec<String>> {
+        Self::load_partition_paths(storage, &PartitionPruner::empty()).await
     }
 
     async fn load_partition_paths(
@@ -78,22 +83,6 @@ impl FileSystemView {
             .into_iter()
             .filter(|path_str| partition_pruner.should_include(path_str))
             .collect())
-    }
-
-    async fn load_file_groups_for_partitions(
-        storage: &Storage,
-        partition_paths: Vec<String>,
-    ) -> Result<HashMap<String, Vec<FileGroup>>> {
-        let mut partition_to_file_groups = HashMap::new();
-        for p in partition_paths {
-            match Self::load_file_groups_for_partition(storage, p.as_str()).await {
-                Ok(file_groups) => {
-                    partition_to_file_groups.insert(p, file_groups);
-                }
-                Err(e) => return Err(anyhow!("Failed to load partitions: {}", e)),
-            }
-        }
-        Ok(partition_to_file_groups)
     }
 
     async fn load_file_groups_for_partition(
@@ -134,31 +123,51 @@ impl FileSystemView {
         partition_pruner: &PartitionPruner,
         excluding_file_groups: &HashSet<FileGroup>,
     ) -> Result<Vec<FileSlice>> {
+        let all_partition_paths = Self::load_all_partition_paths(&self.storage).await?;
+
+        let partition_paths_to_load = all_partition_paths
+            .into_iter()
+            .filter(|p| !self.partition_to_file_groups.contains_key(p))
+            .filter(|p| partition_pruner.should_include(p))
+            .collect::<HashSet<_>>();
+
+        stream::iter(partition_paths_to_load)
+            .map(|path| async move {
+                let file_groups =
+                    Self::load_file_groups_for_partition(&self.storage, &path).await?;
+                Ok::<_, anyhow::Error>((path, file_groups))
+            })
+            // TODO parameterize the parallelism for partition loading
+            .buffer_unordered(10)
+            .try_for_each(|(path, file_groups)| async move {
+                self.partition_to_file_groups.insert(path, file_groups);
+                Ok(())
+            })
+            .await?;
+
+        self.collect_file_slices_as_of(timestamp, partition_pruner, excluding_file_groups)
+            .await
+    }
+
+    async fn collect_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        partition_pruner: &PartitionPruner,
+        excluding_file_groups: &HashSet<FileGroup>,
+    ) -> Result<Vec<FileSlice>> {
         let mut file_slices = Vec::new();
-        if self.partition_to_file_groups.is_empty() {
-            let partition_paths =
-                Self::load_partition_paths(&self.storage, partition_pruner).await?;
-            let partition_to_file_groups =
-                Self::load_file_groups_for_partitions(&self.storage, partition_paths).await?;
-            partition_to_file_groups.into_iter().for_each(|pair| {
-                self.partition_to_file_groups.insert(pair.0, pair.1);
-            });
-        }
-        for mut fgs in self
-            .partition_to_file_groups
-            .iter_mut()
-            .filter(|item| partition_pruner.should_include(item.key()))
-        {
-            let fgs_ref = fgs.value_mut();
-            for fg in fgs_ref {
+        for mut partition_entry in self.partition_to_file_groups.iter_mut() {
+            if !partition_pruner.should_include(partition_entry.key()) {
+                continue;
+            }
+            let file_groups = partition_entry.value_mut();
+            for fg in file_groups.iter_mut() {
                 if excluding_file_groups.contains(fg) {
                     continue;
                 }
                 if let Some(fsl) = fg.get_file_slice_mut_as_of(timestamp) {
-                    // TODO: pass ref instead of copying
                     fsl.load_stats(&self.storage).await?;
-                    let immut_fsl: &FileSlice = fsl;
-                    file_slices.push(immut_fsl.clone());
+                    file_slices.push(fsl.clone());
                 }
             }
         }
