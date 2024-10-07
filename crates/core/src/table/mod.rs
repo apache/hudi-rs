@@ -793,88 +793,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_file_paths_for_simple_key_and_non_hive_style() {
+    async fn hudi_table_get_file_paths_for_simple_keygen_non_hive_style() {
         let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         assert_eq!(hudi_table.timeline.instants.len(), 2);
 
         let partition_filters = &[];
-        let actual: HashSet<String> = HashSet::from_iter(
-            hudi_table
-                .get_file_paths_with_filters(partition_filters)
-                .await
-                .unwrap(),
-        );
-        let expected: HashSet<String> = HashSet::from_iter(
-            vec![
-                "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
-                "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
-                "30/6db57019-98ee-480e-8eb1-fb3de48e1c24-0_1-119-167_20240418172804498.parquet",
-            ]
+        let actual = hudi_table
+            .get_file_paths_with_filters(partition_filters)
+            .await
+            .unwrap()
             .into_iter()
-            .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
-            .collect::<Vec<_>>(),
-        );
+            .collect::<HashSet<_>>();
+        let expected = [
+            "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
+            "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
+            "30/6db57019-98ee-480e-8eb1-fb3de48e1c24-0_1-119-167_20240418172804498.parquet",
+        ]
+        .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
+        .into_iter()
+        .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
         let partition_filters = &["byteField >= 10", "byteField < 30"];
-        let actual: HashSet<String> = HashSet::from_iter(
-            hudi_table
-                .get_file_paths_with_filters(partition_filters)
-                .await
-                .unwrap(),
-        );
-        let expected: HashSet<String> = HashSet::from_iter(
-            vec![
-                "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
-                "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
-            ]
+        let actual = hudi_table
+            .get_file_paths_with_filters(partition_filters)
+            .await
+            .unwrap()
             .into_iter()
-            .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
-            .collect::<Vec<_>>(),
-        );
+            .collect::<HashSet<_>>();
+        let expected = [
+            "10/97de74b1-2a8e-4bb7-874c-0a74e1f42a77-0_0-119-166_20240418172804498.parquet",
+            "20/76e0556b-390d-4249-b7ad-9059e2bc2cbd-0_0-98-141_20240418172802262.parquet",
+        ]
+        .map(|f| join_url_segments(&base_url, &[f]).unwrap().to_string())
+        .into_iter()
+        .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+
+        let partition_filters = &["byteField > 30"];
+        let actual = hudi_table
+            .get_file_paths_with_filters(partition_filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected = HashSet::new();
         assert_eq!(actual, expected);
     }
 
     #[tokio::test]
-    async fn hudi_table_get_file_paths_for_complex_keygen_and_hive_style() {
+    async fn hudi_table_get_file_paths_for_complex_keygen_hive_style() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         assert_eq!(hudi_table.timeline.instants.len(), 2);
 
         let partition_filters = &[];
-        let actual: HashSet<String> = HashSet::from_iter(
-            hudi_table
-                .get_file_paths_with_filters(partition_filters)
-                .await
-                .unwrap(),
-        );
-        let expected: HashSet<String> = HashSet::from_iter(vec![
+        let actual = hudi_table
+            .get_file_paths_with_filters(partition_filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected= [
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
             "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet",
             "byteField=30/shortField=100/4668e35e-bff8-4be9-9ff2-e7fb17ecb1a7-0_1-161-224_20240418173235694.parquet",
         ]
-            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
-            .collect::<Vec<_>>());
+            .map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .into_iter()
+            .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
         let partition_filters = &["byteField >= 10", "byteField < 20", "shortField != 100"];
-        let actual: HashSet<String> = HashSet::from_iter(
-            hudi_table
-                .get_file_paths_with_filters(partition_filters)
-                .await
-                .unwrap(),
-        );
-        let expected: HashSet<String> = HashSet::from_iter(vec![
+        let actual = hudi_table
+            .get_file_paths_with_filters(partition_filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected = [
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
         ]
-            .into_iter().map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
-            .collect::<Vec<_>>());
+            .map(|f| { join_url_segments(&base_url, &[f]).unwrap().to_string() })
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+
+        let partition_filters = &["byteField > 20", "shortField = 300"];
+        let actual = hudi_table
+            .get_file_paths_with_filters(partition_filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected = HashSet::new();
         assert_eq!(actual, expected);
     }
 
     #[tokio::test]
-    async fn hudi_table_read_snapshot_for_complex_keygen_and_hive_style() {
+    async fn hudi_table_read_snapshot_for_complex_keygen_hive_style() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let partition_filters = &["byteField >= 10", "byteField < 20", "shortField != 100"];
