@@ -49,7 +49,7 @@ def test_sample_table(get_sample_table):
     ]
     assert table.get_partition_schema().names == ["city"]
 
-    file_slices = table.get_file_slices([])
+    file_slices = table.get_file_slices()
     assert len(file_slices) == 5
     assert set(f.commit_time for f in file_slices) == {
         "20240402123035233",
@@ -71,11 +71,11 @@ def test_sample_table(get_sample_table):
     assert t.num_rows == 1
     assert t.num_columns == 11
 
-    file_slices_gen = iter(table.split_file_slices(2, []))
+    file_slices_gen = iter(table.split_file_slices(2))
     assert len(next(file_slices_gen)) == 3
     assert len(next(file_slices_gen)) == 2
 
-    batches = table.read_snapshot([])
+    batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {
@@ -134,7 +134,7 @@ def test_sample_table(get_sample_table):
     ]
 
     table = HudiTable(table_path, {"hoodie.read.as.of.timestamp": "20240402123035233"})
-    batches = table.read_snapshot([])
+    batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {
