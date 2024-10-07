@@ -47,6 +47,7 @@ def test_sample_table(get_sample_table):
         "fare",
         "city",
     ]
+    assert table.get_partition_schema().names == ["city"]
 
     file_slices = table.get_file_slices()
     assert len(file_slices) == 5
@@ -106,6 +107,29 @@ def test_sample_table(get_sample_table):
             "ts": 1695516137016,
             "uuid": "e3cf430c-889d-4015-bc98-59bdce1e530c",
             "fare": 34.15,
+        },
+    ]
+
+    batches = table.read_snapshot(["city = san_francisco"])
+    t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
+    assert t.to_pylist() == [
+        {
+            "_hoodie_commit_time": "20240402144910683",
+            "ts": 1695046462179,
+            "uuid": "9909a8b1-2d15-4d3d-8ec9-efc48c536a00",
+            "fare": 339.0,
+        },
+        {
+            "_hoodie_commit_time": "20240402123035233",
+            "ts": 1695091554788,
+            "uuid": "e96c4396-3fad-413a-a942-4cb36106d721",
+            "fare": 27.7,
+        },
+        {
+            "_hoodie_commit_time": "20240402123035233",
+            "ts": 1695159649087,
+            "uuid": "334e26e9-8355-45cc-97c6-c31daf0df330",
+            "fare": 19.1,
         },
     ]
 
