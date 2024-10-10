@@ -179,9 +179,6 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    // use datafusion::catalog::TableProviderFactory;
-    // use datafusion::execution::context::SessionState;
-    // use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::ScalarValue;
