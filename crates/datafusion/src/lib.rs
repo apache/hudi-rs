@@ -24,7 +24,7 @@ use std::thread;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::Session;
+use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
@@ -35,7 +35,7 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::Result;
-use datafusion_expr::{Expr, TableType};
+use datafusion_expr::{CreateExternalTable, Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
@@ -143,12 +143,36 @@ impl TableProvider for HudiDataSource {
     }
 }
 
+pub struct HudiTableFactory;
+
+#[async_trait]
+impl TableProviderFactory for HudiTableFactory {
+    async fn create(
+        &self,
+        _state: &dyn Session,
+        cmd: &CreateExternalTable,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let table_provider = match cmd.options.is_empty() {
+            true => HudiDataSource::new(cmd.location.to_owned().as_str()).await?,
+            false => {
+                HudiDataSource::new_with_options(
+                    cmd.location.to_owned().as_str(),
+                    cmd.options.to_owned(),
+                )
+                .await?
+            }
+        };
+        Ok(Arc::new(table_provider))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::canonicalize;
     use std::path::Path;
     use std::sync::Arc;
 
+    use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::ScalarValue;
     use url::Url;
@@ -163,6 +187,7 @@ mod tests {
     use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
+    use crate::HudiTableFactory;
 
     #[tokio::test]
     async fn get_default_input_partitions() {
@@ -189,6 +214,24 @@ mod tests {
         ctx.register_table(test_table.as_ref(), Arc::new(hudi))
             .unwrap();
         ctx
+    }
+
+    async fn prepare_session_context_with_table_factory() -> SessionContext {
+        let config = SessionConfig::new().set(
+            "datafusion.sql_parser.enable_ident_normalization",
+            &ScalarValue::from(false),
+        );
+
+        let mut session_state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .build();
+
+        session_state
+            .table_factories_mut()
+            .insert("HUDITABLE".to_string(), Arc::new(HudiTableFactory {}));
+
+        SessionContext::new_with_state(session_state)
     }
 
     async fn verify_plan(
@@ -285,6 +328,42 @@ mod tests {
 
             verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
             verify_data_with_replacecommits(&ctx, &sql, test_table.as_ref()).await
+        }
+    }
+
+    #[tokio::test]
+    async fn datafusion_read_external_hudi_table() {
+        for test_table in &[
+            V6ComplexkeygenHivestyle,
+            V6Nonpartitioned,
+            V6SimplekeygenNonhivestyle,
+            V6SimplekeygenHivestyleNoMetafields,
+            V6TimebasedkeygenNonhivestyle,
+        ] {
+            println!(">>> testing for {}", test_table.as_ref());
+            let ctx = prepare_session_context_with_table_factory().await;
+            let base_path = test_table.path();
+
+            let create_table_sql = format!(
+                "CREATE EXTERNAL TABLE {} STORED AS HUDITABLE LOCATION '{}'",
+                test_table.as_ref(),
+                base_path
+            );
+
+            let _ = ctx
+                .sql(create_table_sql.as_str())
+                .await
+                .expect("Failed to register table");
+
+            let sql = format!(
+                r#"
+            SELECT id, name, isActive, structField.field2
+            FROM {} WHERE id % 2 = 0
+            AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
+                test_table.as_ref()
+            );
+
+            verify_data(&ctx, &sql, test_table.as_ref()).await
         }
     }
 }
