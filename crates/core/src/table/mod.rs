@@ -117,6 +117,7 @@ use crate::table::timeline::Timeline;
 mod fs_view;
 mod partition;
 mod timeline;
+mod builder;
 
 /// Hudi Table in-memory
 #[derive(Clone, Debug)]
