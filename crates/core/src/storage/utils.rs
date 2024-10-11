@@ -91,16 +91,16 @@ where
     V: Into<String>,
 {
     let mut hudi_options = HashMap::new();
-    let mut extra_options = HashMap::new();
+    let mut others = HashMap::new();
     for (k, v) in all_options {
         if k.as_ref().starts_with("hoodie.") {
             hudi_options.insert(k.as_ref().to_string(), v.into());
         } else {
-            extra_options.insert(k.as_ref().to_string(), v.into());
+            others.insert(k.as_ref().to_string(), v.into());
         }
     }
 
-    (hudi_options, extra_options)
+    (hudi_options, others)
 }
 
 pub async fn parse_config_data(data: &Bytes, split_chars: &str) -> Result<HashMap<String, String>> {

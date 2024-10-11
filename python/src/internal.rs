@@ -130,7 +130,10 @@ pub struct HudiTable {
 impl HudiTable {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
-    fn new_with_options(base_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
+    fn new_with_options(
+        base_uri: &str,
+        options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
         let inner: Table = rt().block_on(Table::new_with_options(
             base_uri,
             options.unwrap_or_default(),
