@@ -109,7 +109,9 @@ use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
-use crate::storage::utils::{empty_options, parse_config_data, parse_uri};
+use crate::storage::utils::{
+    empty_options, parse_config_data, parse_uri, split_hudi_options_from_others,
+};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -136,13 +138,13 @@ impl Table {
     }
 
     /// Create hudi table with options
-    pub async fn new_with_options<I, K, V>(base_uri: &str, all_options: I) -> Result<Self>
+    pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
-        let (base_url, configs, extra_options) = Self::load_configs(base_uri, all_options)
+        let (base_url, configs, extra_options) = Self::load_configs(base_uri, options)
             .await
             .context("Failed to load table properties")?;
         let configs = Arc::new(configs);
@@ -191,21 +193,17 @@ impl Table {
         let base_url = Arc::new(parse_uri(base_uri)?);
 
         let mut hudi_options = HashMap::new();
-        let mut extra_options = HashMap::new();
+        let mut other_options = HashMap::new();
 
-        Self::imbue_cloud_env_vars(&mut extra_options);
+        Self::imbue_cloud_env_vars(&mut other_options);
 
-        for (k, v) in all_options {
-            if k.as_ref().starts_with("hoodie.") {
-                hudi_options.insert(k.as_ref().to_string(), v.into());
-            } else {
-                extra_options.insert(k.as_ref().to_string(), v.into());
-            }
-        }
+        let (hudi_opts, others) = split_hudi_options_from_others(all_options);
+        hudi_options.extend(hudi_opts);
+        other_options.extend(others);
 
-        let storage = Storage::new_with_properties(
+        let storage = Storage::new(
             base_url.clone(),
-            Arc::new(extra_options.clone()),
+            Arc::new(other_options.clone()),
             Arc::new(HudiConfigs::empty()),
         )?;
 
@@ -221,7 +219,7 @@ impl Table {
 
         let hudi_configs = HudiConfigs::new(hudi_options);
 
-        Self::validate_configs(&hudi_configs).map(|_| (base_url, hudi_configs, extra_options))
+        Self::validate_configs(&hudi_configs).map(|_| (base_url, hudi_configs, other_options))
     }
 
     fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
@@ -413,7 +411,7 @@ impl Table {
         let mut batches = Vec::new();
         let fg_reader = self.create_file_group_reader();
         for f in file_slices {
-            match fg_reader.read_file_slice_unchecked(&f).await {
+            match fg_reader.read_file_slice(&f).await {
                 Ok(batch) => batches.push(batch),
                 Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
             }
@@ -459,7 +457,7 @@ impl Table {
     )]
     pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<RecordBatch> {
         self.create_file_group_reader()
-            .read_file_slice_by_path_unchecked(relative_path)
+            .read_file_slice_by_base_file_path(relative_path)
             .await
     }
 }
@@ -746,7 +744,8 @@ mod tests {
         let base_url = TestTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
-            .read_file_slice_by_path(
+            .create_file_group_reader()
+            .read_file_slice_by_base_file_path(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
             )
             .await

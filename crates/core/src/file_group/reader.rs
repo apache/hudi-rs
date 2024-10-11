@@ -16,13 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
+use crate::storage::utils::{parse_uri, split_hudi_options_from_others};
 use crate::storage::Storage;
 use anyhow::Result;
 use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,24 +36,35 @@ impl FileGroupReader {
         Self { storage }
     }
 
-    pub fn new_with_properties(
-        base_url: Arc<url::Url>,
-        options: Arc<HashMap<String, String>>,
-        hudi_configs: Arc<HudiConfigs>,
-    ) -> Result<Self> {
-        let storage = Storage::new_with_properties(base_url.clone(), options, hudi_configs)?;
+    pub fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let base_url = Arc::new(parse_uri(base_uri)?);
+
+        let (mut hudi_opts, others) = split_hudi_options_from_others(options);
+        hudi_opts.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_uri.to_string(),
+        );
+
+        let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
+
+        let storage = Storage::new(base_url, Arc::new(others), hudi_configs)?;
         Ok(Self { storage })
     }
 
-    pub async fn read_file_slice_by_path_unchecked(
+    pub async fn read_file_slice_by_base_file_path(
         &self,
         relative_path: &str,
     ) -> Result<RecordBatch> {
         self.storage.get_parquet_file_data(relative_path).await
     }
 
-    pub async fn read_file_slice_unchecked(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        self.read_file_slice_by_path_unchecked(&file_slice.base_file_relative_path())
+    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+        self.read_file_slice_by_base_file_path(&file_slice.base_file_relative_path())
             .await
     }
 }
@@ -72,7 +84,7 @@ mod tests {
             HudiTableConfig::BasePath.as_ref().to_string(),
             base_uri.to_string(),
         )]));
-        Storage::new_with_properties(base_url, Arc::new(options), Arc::new(hudi_configs)).unwrap()
+        Storage::new(base_url, Arc::new(options), Arc::new(hudi_configs)).unwrap()
     }
 
     #[test]

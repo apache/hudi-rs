@@ -44,7 +44,7 @@ impl FileSystemView {
         storage_options: Arc<HashMap<String, String>>,
         configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
-        let storage = Storage::new_with_properties(base_url, storage_options, configs.clone())?;
+        let storage = Storage::new(base_url, storage_options, configs.clone())?;
         let partition_to_file_groups = Arc::new(DashMap::new());
         Ok(FileSystemView {
             configs,
@@ -189,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn get_partition_paths_for_nonpartitioned_table() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let storage = Storage::new(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
             .await
@@ -202,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn get_partition_paths_for_complexkeygen_table() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let storage = Storage::new(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
             .await

@@ -66,7 +66,9 @@ def test_sample_table(get_sample_table):
         "sao_paulo/ee915c68-d7f8-44f6-9759-e691add290d8-0_3-11-0_20240402123035233.parquet",
     }
 
-    batch = table.read_file_slice(file_slice_paths[0])
+    batch = table.create_file_group_reader().read_file_slice_by_base_file_path(
+        file_slice_paths[0]
+    )
     t = pa.Table.from_batches([batch])
     assert t.num_rows == 1
     assert t.num_columns == 11
