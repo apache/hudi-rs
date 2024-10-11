@@ -431,35 +431,6 @@ impl Table {
     pub fn create_file_group_reader(&self) -> FileGroupReader {
         FileGroupReader::new(self.file_system_view.storage.clone())
     }
-
-    /// Read records from a [FileSlice] by its relative path.
-    ///
-    /// **Example**
-    ///
-    /// ```rust
-    /// use url::Url;
-    /// use hudi_core::table::Table;
-    ///
-    /// pub async fn test() {
-    ///     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-    ///     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-    ///     let batches = hudi_table
-    ///         .read_file_slice_by_path(
-    ///             "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
-    ///         )
-    ///         .await
-    ///         .unwrap();
-    /// }
-    /// ```
-    #[deprecated(
-        since = "0.2.0",
-        note = "Please use `Table::create_file_group_reader::read_file_slice_by_path` instead"
-    )]
-    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<RecordBatch> {
-        self.create_file_group_reader()
-            .read_file_slice_by_base_file_path(relative_path)
-            .await
-    }
 }
 
 #[cfg(test)]
