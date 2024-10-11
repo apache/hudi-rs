@@ -39,7 +39,7 @@
 //!
 //! pub async fn test() {
 //!     use arrow_schema::Schema;
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+//! let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
 //!     let schema = hudi_table.get_schema().await.unwrap();
 //! }
@@ -95,6 +95,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use strum::IntoEnumIterator;
 use url::Url;
+
 use HudiInternalConfig::SkipConfigValidation;
 use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
 use TableTypeValue::CopyOnWrite;
@@ -152,13 +153,15 @@ impl Table {
             .await
             .context("Failed to load timeline")?;
 
-        let file_system_view = FileSystemView::new(hudi_configs.clone(), storage_options.clone())
-            .await
-            .context("Failed to load file system view")?;
+        let file_system_view =
+            FileSystemView::new(base_url.clone(), extra_options.clone(), configs.clone())
+                .await
+                .context("Failed to load file system view")?;
 
         Ok(Table {
-            hudi_configs,
-            storage_options,
+            base_url,
+            configs,
+            extra_options,
             timeline,
             file_system_view,
         })
