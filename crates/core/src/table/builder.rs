@@ -3,15 +3,10 @@ use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use anyhow::{anyhow, Context};
+use anyhow::{Context};
 use strum::IntoEnumIterator;
 use url::Url;
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
-use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
-use crate::config::read::HudiReadConfig;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::config::table::HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
-use crate::config::table::TableTypeValue::CopyOnWrite;
 use crate::storage::Storage;
 use crate::storage::utils::{parse_config_data, parse_uri};
 use crate::table::fs_view::FileSystemView;
@@ -86,8 +81,6 @@ impl TableBuilder {
         storage_configs: &HashMap<String, String>,
     ) -> anyhow::Result<HudiConfigs>
     {
-        // let mut hudi_options = HashMap::new();
-
         let storage = Storage::new(base_url, &storage_configs)?;
 
         Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
@@ -96,7 +89,7 @@ impl TableBuilder {
 
         let hudi_configs = HudiConfigs::new(hudi_options);
 
-        Self::validate_configs(&hudi_configs).expect("Hudi configs are not valid.");
+        Table::validate_configs(&hudi_configs).expect("Hudi configs are not valid.");
         Ok(hudi_configs)
     }
 
@@ -147,46 +140,6 @@ impl TableBuilder {
                     }
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    fn validate_configs(hudi_configs: &HudiConfigs) -> anyhow::Result<()> {
-        if hudi_configs
-            .get_or_default(SkipConfigValidation)
-            .to::<bool>()
-        {
-            return Ok(());
-        }
-
-        for conf in HudiTableConfig::iter() {
-            hudi_configs.validate(conf)?
-        }
-
-        for conf in HudiReadConfig::iter() {
-            hudi_configs.validate(conf)?
-        }
-
-        // additional validation
-        let table_type = hudi_configs.get(TableType)?.to::<String>();
-        if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(anyhow!("Only support copy-on-write table."));
-        }
-
-        let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
-        if !(5..=6).contains(&table_version) {
-            return Err(anyhow!("Only support table version 5 and 6."));
-        }
-
-        let drops_partition_cols = hudi_configs
-            .get_or_default(DropsPartitionFields)
-            .to::<bool>();
-        if drops_partition_cols {
-            return Err(anyhow!(
-                "Only support when `{}` is disabled",
-                DropsPartitionFields.as_ref()
-            ));
         }
 
         Ok(())
