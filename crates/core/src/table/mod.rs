@@ -110,6 +110,7 @@ use crate::config::utils::{empty_options, split_hudi_options_from_others};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
 use crate::file_group::FileSlice;
+use crate::storage::utils::{parse_config_data};
 use crate::storage::Storage;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
@@ -153,18 +154,6 @@ impl Table {
             .await
             .context("Failed to load timeline")?;
 
-        let file_system_view =
-            FileSystemView::new(base_url.clone(), extra_options.clone(), configs.clone())
-                .await
-                .context("Failed to load file system view")?;
-
-        Ok(Table {
-            base_url,
-            configs,
-            extra_options,
-            timeline,
-            file_system_view,
-        })
     }
 
     pub fn base_url(&self) -> Result<Url> {
