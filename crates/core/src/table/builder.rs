@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use anyhow::{Context};
-use strum::IntoEnumIterator;
 use url::Url;
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
 use crate::storage::Storage;
@@ -162,6 +160,7 @@ mod tests {
     /// # Arguments
     ///
     /// * `table_dir_name` - Name of the table root directory; all under `crates/core/tests/data/`.
+    #[cfg(test)]
     async fn build_test_table_without_validation(table_dir_name: &str) -> Table {
         let base_url = Url::from_file_path(
             canonicalize(PathBuf::from("tests").join("data").join(table_dir_name)).unwrap(),
