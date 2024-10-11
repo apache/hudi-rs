@@ -169,6 +169,10 @@ impl HudiConfigs {
         parser.validate(&self.raw_configs)
     }
 
+    pub fn contains(&self, key: impl AsRef<str>) -> bool {
+        self.raw_configs.contains_key(key.as_ref())
+    }
+
     pub fn get(
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,

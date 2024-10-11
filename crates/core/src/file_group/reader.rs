@@ -82,8 +82,8 @@ mod tests {
         let base_url = Arc::new(Url::parse(base_uri).unwrap());
         let options = HashMap::from([("foo".to_string(), "bar".to_string())]);
         let hudi_configs = HudiConfigs::new(HashMap::from_iter(vec![(
-            HudiTableConfig::BasePath.as_ref().to_string(),
-            base_uri.to_string(),
+            HudiTableConfig::BaseFileFormat.as_ref().to_string(),
+            "parquet".to_string(),
         )]));
         Storage::new(base_url, Arc::new(options), Arc::new(hudi_configs)).unwrap()
     }

@@ -103,6 +103,23 @@ impl Storage {
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
+        let hudi_configs = if hudi_configs.contains(HudiTableConfig::BasePath) {
+            hudi_configs
+        } else {
+            let mut raw_configs = HashMap::new();
+            raw_configs.extend(
+                hudi_configs
+                    .raw_configs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            raw_configs.insert(
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                base_url.as_str().to_string(),
+            );
+            Arc::new(HudiConfigs::new(raw_configs))
+        };
+
         match parse_url_opts(&base_url, options.as_ref()) {
             Ok((object_store, _)) => Ok(Arc::new(Storage {
                 base_url,
@@ -114,6 +131,7 @@ impl Storage {
         }
     }
 
+    #[cfg(test)]
     pub fn new_with_empty_options(base_url: Arc<Url>) -> Result<Arc<Storage>> {
         Self::new(
             base_url,
