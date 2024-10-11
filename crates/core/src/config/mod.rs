@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::storage::utils::parse_uri;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub mod internal;
@@ -157,7 +158,7 @@ impl From<HudiConfigValue> for Vec<String> {
 }
 
 /// Hudi configuration container.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HudiConfigs {
     raw_options: Arc<HashMap<String, String>>,
 }

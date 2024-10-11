@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::storage::file_info::FileInfo;
-use crate::storage::utils::join_url_segments;
+use crate::storage::utils::{join_url_segments, parse_uri};
 use anyhow::{anyhow, Context, Result};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -37,19 +37,64 @@ use object_store::{parse_url_opts, ObjectStore};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 pub mod file_info;
 pub mod file_stats;
 pub mod utils;
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Storage {
+    #[serde(skip)]
     pub(crate) base_url: Arc<Url>,
+    #[serde(skip)]
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
+}
+
+impl<'de> Deserialize<'de> for Storage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializableStorage {
+            options: Arc<HashMap<String, String>>,
+            hudi_configs: Arc<HudiConfigs>,
+        }
+
+        let serializable_storage = SerializableStorage::deserialize(deserializer)?;
+
+        let base_uri = serializable_storage
+            .hudi_configs
+            .get(HudiTableConfig::BasePath)
+            .map_err(|e| {
+                serde::de::Error::custom(format!(
+                    "Failed to get {}: {}",
+                    HudiTableConfig::BasePath.as_ref(),
+                    e
+                ))
+            })?
+            .to::<String>();
+
+        let base_url = Arc::new(parse_uri(&base_uri).map_err(|e| {
+            serde::de::Error::custom(format!("Failed to parse {}: {}", &base_uri, e))
+        })?);
+
+        let (object_store, _) =
+            parse_url_opts(base_url.as_ref(), serializable_storage.options.as_ref()).map_err(
+                |e| serde::de::Error::custom(format!("Failed to reconstruct object store: {}", e)),
+            )?;
+
+        Ok(Storage {
+            base_url,
+            object_store: Arc::new(object_store),
+            options: serializable_storage.options,
+            hudi_configs: serializable_storage.hudi_configs,
+        })
+    }
 }
 
 impl Storage {
