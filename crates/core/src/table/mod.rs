@@ -105,13 +105,12 @@ use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::config::utils::{empty_options, split_hudi_options_from_others};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
-use crate::storage::utils::{
-    empty_options, parse_config_data, parse_uri, split_hudi_options_from_others,
-};
+use crate::storage::utils::{parse_config_data, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;

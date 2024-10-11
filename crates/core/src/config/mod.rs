@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 pub mod internal;
 pub mod read;
 pub mod table;
+pub mod utils;
 
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 

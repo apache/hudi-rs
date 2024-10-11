@@ -78,31 +78,6 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     Ok(url)
 }
 
-pub fn empty_options<'a>() -> std::iter::Empty<(&'a str, &'a str)> {
-    std::iter::empty::<(&str, &str)>()
-}
-
-pub fn split_hudi_options_from_others<I, K, V>(
-    all_options: I,
-) -> (HashMap<String, String>, HashMap<String, String>)
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: AsRef<str>,
-    V: Into<String>,
-{
-    let mut hudi_options = HashMap::new();
-    let mut others = HashMap::new();
-    for (k, v) in all_options {
-        if k.as_ref().starts_with("hoodie.") {
-            hudi_options.insert(k.as_ref().to_string(), v.into());
-        } else {
-            others.insert(k.as_ref().to_string(), v.into());
-        }
-    }
-
-    (hudi_options, others)
-}
-
 pub async fn parse_config_data(data: &Bytes, split_chars: &str) -> Result<HashMap<String, String>> {
     let cursor = Cursor::new(data);
     let lines = BufReader::new(cursor).lines();

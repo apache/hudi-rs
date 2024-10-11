@@ -17,9 +17,10 @@
  * under the License.
  */
 use crate::config::table::HudiTableConfig;
+use crate::config::utils::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
-use crate::storage::utils::{parse_uri, split_hudi_options_from_others};
+use crate::storage::utils::parse_uri;
 use crate::storage::Storage;
 use anyhow::Result;
 use arrow_array::RecordBatch;
