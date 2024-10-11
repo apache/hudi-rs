@@ -110,6 +110,7 @@ use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
 use crate::file_group::FileSlice;
 use crate::storage::Storage;
+use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
@@ -131,7 +132,7 @@ pub struct Table {
 impl Table {
     /// Create hudi table by base_uri
     pub async fn new(base_uri: &str) -> Result<Self> {
-        Self::new_with_options(base_uri, empty_options()).await
+        TableBuilder::from_uri(base_uri).build().await
     }
 
     /// Create hudi table with options

@@ -43,7 +43,7 @@ impl TableBuilder {
     pub async fn build(self) -> anyhow::Result<Table> {
         let base_url = Arc::new(self.base_url);
 
-        let hudi_options = self.hudi_options.unwrap().clone();
+        let hudi_options = self.hudi_options.unwrap_or(Default::default()).clone();
         let mut storage_options = self.storage_options.unwrap_or(Default::default()).clone();
 
         Self::load_storage_configs(&mut storage_options);
