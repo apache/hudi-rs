@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 pub mod internal;
 pub mod read;
@@ -143,7 +144,7 @@ impl From<HudiConfigValue> for Vec<String> {
 }
 
 /// Hudi configuration container.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HudiConfigs {
     pub raw_configs: Arc<HashMap<String, String>>,
 }

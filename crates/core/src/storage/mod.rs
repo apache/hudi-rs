@@ -22,6 +22,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::table::HudiTableConfig;
+use crate::config::HudiConfigs;
+use crate::storage::file_info::FileInfo;
+use crate::storage::utils::{join_url_segments, parse_uri};
 use anyhow::{anyhow, Context, Result};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -33,27 +37,86 @@ use object_store::{parse_url_opts, ObjectStore};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-
-use crate::storage::file_info::FileInfo;
-use crate::storage::utils::join_url_segments;
 
 pub mod file_info;
 pub mod file_stats;
 pub mod utils;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Storage {
-    base_url: Arc<Url>,
-    object_store: Arc<dyn ObjectStore>,
+    #[serde(skip)]
+    pub(crate) base_url: Arc<Url>,
+    #[serde(skip)]
+    pub(crate) object_store: Arc<dyn ObjectStore>,
+    pub(crate) options: Arc<HashMap<String, String>>,
+    pub(crate) hudi_configs: Arc<HudiConfigs>,
+}
+
+impl<'de> Deserialize<'de> for Storage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializableStorage {
+            options: Arc<HashMap<String, String>>,
+            hudi_configs: Arc<HudiConfigs>,
+        }
+
+        let serializable_storage = SerializableStorage::deserialize(deserializer)?;
+
+        let base_uri = serializable_storage
+            .hudi_configs
+            .get(HudiTableConfig::BasePath)
+            .map_err(|e| {
+                serde::de::Error::custom(format!(
+                    "Failed to get {}: {}",
+                    HudiTableConfig::BasePath.as_ref(),
+                    e
+                ))
+            })?
+            .to::<String>();
+
+        let base_url = Arc::new(parse_uri(&base_uri).map_err(|e| {
+            serde::de::Error::custom(format!("Failed to parse {}: {}", &base_uri, e))
+        })?);
+
+        let (object_store, _) =
+            parse_url_opts(base_url.as_ref(), serializable_storage.options.as_ref()).map_err(
+                |e| serde::de::Error::custom(format!("Failed to reconstruct object store: {}", e)),
+            )?;
+
+        Ok(Storage {
+            base_url,
+            object_store: Arc::new(object_store),
+            options: serializable_storage.options,
+            hudi_configs: serializable_storage.hudi_configs,
+        })
+    }
 }
 
 impl Storage {
-    pub fn new(base_url: Arc<Url>, options: &HashMap<String, String>) -> Result<Arc<Storage>> {
-        match parse_url_opts(&base_url, options) {
+    pub fn new(base_url: Arc<Url>) -> Result<Arc<Storage>> {
+        Self::new_with_properties(
+            base_url,
+            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::empty()),
+        )
+    }
+
+    pub fn new_with_properties(
+        base_url: Arc<Url>,
+        options: Arc<HashMap<String, String>>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Result<Arc<Storage>> {
+        match parse_url_opts(&base_url, options.as_ref()) {
             Ok((object_store, _)) => Ok(Arc::new(Storage {
                 base_url,
                 object_store: Arc::new(object_store),
+                options,
+                hudi_configs,
             })),
             Err(e) => Err(anyhow!("Failed to create storage: {}", e)),
         }
@@ -225,12 +288,12 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use object_store::path::Path as ObjPath;
-    use url::Url;
-
+    use crate::config::HudiConfigs;
     use crate::storage::file_info::FileInfo;
     use crate::storage::utils::join_url_segments;
     use crate::storage::{get_leaf_dirs, Storage};
+    use object_store::path::Path as ObjPath;
+    use url::Url;
 
     #[tokio::test]
     async fn storage_list_dirs() {
@@ -238,7 +301,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let first_level_dirs: HashSet<String> =
             storage.list_dirs(None).await.unwrap().into_iter().collect();
         assert_eq!(
@@ -260,7 +323,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let first_level_dirs: HashSet<ObjPath> = storage
             .list_dirs_as_obj_paths(None)
             .await
@@ -283,7 +346,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let file_info_1: Vec<FileInfo> = storage
             .list_files(None)
             .await
@@ -342,7 +405,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
         assert_eq!(
             leaf_dirs,
@@ -355,7 +418,7 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
         assert_eq!(
             leaf_dirs,
@@ -368,7 +431,7 @@ mod tests {
     async fn storage_get_file_info() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let file_info = storage.get_file_info("a.parquet").await.unwrap();
         assert_eq!(file_info.name, "a.parquet");
         assert_eq!(
@@ -382,7 +445,7 @@ mod tests {
     async fn storage_get_parquet_file_data() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let file_data = storage.get_parquet_file_data("a.parquet").await.unwrap();
         assert_eq!(file_data.num_rows(), 5);
     }

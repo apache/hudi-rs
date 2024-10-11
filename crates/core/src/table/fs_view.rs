@@ -26,7 +26,6 @@ use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
 use crate::table::partition::PartitionPruner;
 use anyhow::Result;
-use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use url::Url;
@@ -45,7 +44,7 @@ impl FileSystemView {
         storage_options: Arc<HashMap<String, String>>,
         configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
-        let storage = Storage::new(base_url, &storage_options)?;
+        let storage = Storage::new_with_properties(base_url, storage_options, configs.clone())?;
         let partition_to_file_groups = Arc::new(DashMap::new());
         Ok(FileSystemView {
             configs,
@@ -173,18 +172,6 @@ impl FileSystemView {
         }
         Ok(file_slices)
     }
-
-    pub async fn read_file_slice_by_path_unchecked(
-        &self,
-        relative_path: &str,
-    ) -> Result<RecordBatch> {
-        self.storage.get_parquet_file_data(relative_path).await
-    }
-
-    pub async fn read_file_slice_unchecked(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        self.read_file_slice_by_path_unchecked(&file_slice.base_file_relative_path())
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -202,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn get_partition_paths_for_nonpartitioned_table() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
             .await
@@ -215,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn get_partition_paths_for_complexkeygen_table() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let storage = Storage::new(Arc::new(base_url), &HashMap::new()).unwrap();
+        let storage = Storage::new(Arc::new(base_url)).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
             .await

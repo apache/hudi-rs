@@ -107,6 +107,7 @@ use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
+use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
 use crate::storage::utils::{empty_options, parse_config_data, parse_uri};
 use crate::storage::Storage;
@@ -141,9 +142,7 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let base_url = Arc::new(parse_uri(base_uri)?);
-
-        let (configs, extra_options) = Self::load_configs(base_url.clone(), all_options)
+        let (base_url, configs, extra_options) = Self::load_configs(base_uri, all_options)
             .await
             .context("Failed to load table properties")?;
         let configs = Arc::new(configs);
@@ -181,14 +180,16 @@ impl Table {
     }
 
     async fn load_configs<I, K, V>(
-        base_url: Arc<Url>,
+        base_uri: &str,
         all_options: I,
-    ) -> Result<(HudiConfigs, HashMap<String, String>)>
+    ) -> Result<(Arc<Url>, HudiConfigs, HashMap<String, String>)>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
+        let base_url = Arc::new(parse_uri(base_uri)?);
+
         let mut hudi_options = HashMap::new();
         let mut extra_options = HashMap::new();
 
@@ -202,15 +203,25 @@ impl Table {
             }
         }
 
-        let storage = Storage::new(base_url, &extra_options)?;
+        let storage = Storage::new_with_properties(
+            base_url.clone(),
+            Arc::new(extra_options.clone()),
+            Arc::new(HudiConfigs::empty()),
+        )?;
 
         Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
 
-        Self::imbue_global_hudi_configs(&mut hudi_options, storage.clone()).await?;
+        Self::imbue_global_hudi_configs_if_not_present(&mut hudi_options, storage.clone()).await?;
+
+        // lastly, insert the base path config
+        hudi_options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_uri.to_string(),
+        );
 
         let hudi_configs = HudiConfigs::new(hudi_options);
 
-        Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, extra_options))
+        Self::validate_configs(&hudi_configs).map(|_| (base_url, hudi_configs, extra_options))
     }
 
     fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
@@ -240,7 +251,7 @@ impl Table {
         Ok(())
     }
 
-    async fn imbue_global_hudi_configs(
+    async fn imbue_global_hudi_configs_if_not_present(
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
     ) -> Result<()> {
@@ -400,8 +411,9 @@ impl Table {
             .await
             .context(format!("Failed to get file slices as of {}", timestamp))?;
         let mut batches = Vec::new();
+        let fg_reader = self.create_file_group_reader();
         for f in file_slices {
-            match self.file_system_view.read_file_slice_unchecked(&f).await {
+            match fg_reader.read_file_slice_unchecked(&f).await {
                 Ok(batch) => batches.push(batch),
                 Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
             }
@@ -416,6 +428,10 @@ impl Table {
             file_paths.push(f.base_file_path().to_string());
         }
         Ok(file_paths)
+    }
+
+    pub fn create_file_group_reader(&self) -> FileGroupReader {
+        FileGroupReader::new(self.file_system_view.storage.clone())
     }
 
     /// Read records from a [FileSlice] by its relative path.
@@ -437,8 +453,12 @@ impl Table {
     ///         .unwrap();
     /// }
     /// ```
+    #[deprecated(
+        since = "0.2.0",
+        note = "Please use `Table::create_file_group_reader::read_file_slice_by_path` instead"
+    )]
     pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<RecordBatch> {
-        self.file_system_view
+        self.create_file_group_reader()
             .read_file_slice_by_path_unchecked(relative_path)
             .await
     }
