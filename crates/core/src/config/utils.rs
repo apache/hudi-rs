@@ -16,16 +16,19 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Config utilities.
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor};
 
+/// Returns an empty iterator to represent an empty set of options.
 pub fn empty_options<'a>() -> std::iter::Empty<(&'a str, &'a str)> {
     std::iter::empty::<(&str, &str)>()
 }
 
+/// Splits the given options into two maps: one for Hudi options, and the other for others, which could be storage options for example.
 pub fn split_hudi_options_from_others<I, K, V>(
     all_options: I,
 ) -> (HashMap<String, String>, HashMap<String, String>)
@@ -47,6 +50,7 @@ where
     (hudi_options, others)
 }
 
+/// Parses the given data into a map of options.
 pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap<String, String>> {
     let cursor = Cursor::new(data);
     let lines = BufReader::new(cursor).lines();

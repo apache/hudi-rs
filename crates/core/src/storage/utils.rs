@@ -16,12 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Utility functions for storage.
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use url::{ParseError, Url};
 
+/// Splits a filename into a stem and an extension.
 pub fn split_filename(filename: &str) -> Result<(String, String)> {
     let path = Path::new(filename);
 
@@ -40,6 +42,7 @@ pub fn split_filename(filename: &str) -> Result<(String, String)> {
     Ok((stem, extension))
 }
 
+/// Parses a URI string into a URL.
 pub fn parse_uri(uri: &str) -> Result<Url> {
     let mut url = Url::parse(uri)
         .or(Url::from_file_path(PathBuf::from_str(uri)?))
@@ -54,10 +57,12 @@ pub fn parse_uri(uri: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// Returns the scheme and authority of a URL in the form of `scheme://authority`.
 pub fn get_scheme_authority(url: &Url) -> String {
     format!("{}://{}", url.scheme(), url.authority())
 }
 
+/// Joins a base URL with a list of segments.
 pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     let mut url = base_url.clone();
 

@@ -17,6 +17,7 @@
  * under the License.
  */
 
+/// File info that can be retrieved by listing operations without reading the file.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileInfo {
     pub uri: String,

@@ -114,6 +114,7 @@ impl FileSlice {
         self.base_file = base_file
     }
 
+    /// Load stats from storage layer for the base file if not already loaded.
     pub async fn load_stats(&mut self, storage: &Storage) -> Result<()> {
         if self.base_file.stats.is_none() {
             let parquet_meta = storage
@@ -135,6 +136,7 @@ impl FileSlice {
     }
 }
 
+/// Hudi File Group.
 #[derive(Clone, Debug)]
 pub struct FileGroup {
     pub id: String,

@@ -31,14 +31,11 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// **Example**
 ///
 /// ```rust
-/// use url::Url;
-/// use hudi_core::config::HudiConfigValue;
 /// use hudi_core::config::internal::HudiInternalConfig::SkipConfigValidation;
 /// use hudi_core::table::Table as HudiTable;
 ///
-/// let options = vec![(SkipConfigValidation.as_ref(), HudiConfigValue::Boolean(true))];
-/// let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-/// HudiTable::new_with_options(base_uri.as_ref(), options);
+/// let options = [(SkipConfigValidation, "true")];
+/// HudiTable::new_with_options("/tmp/hudi_data", options)
 /// ```
 ///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]

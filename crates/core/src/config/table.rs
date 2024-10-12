@@ -32,13 +32,11 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// **Example**
 ///
 /// ```rust
-/// use url::Url;
 /// use hudi_core::config::table::HudiTableConfig::BaseFileFormat;
 /// use hudi_core::table::Table as HudiTable;
 ///
-/// let options = vec![(BaseFileFormat.as_ref(), "parquet")];
-/// let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-/// HudiTable::new_with_options(base_uri.as_ref(), options);
+/// let options = [(BaseFileFormat, "parquet")];
+/// HudiTable::new_with_options("/tmp/hudi_data", options);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiTableConfig {
