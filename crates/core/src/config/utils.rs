@@ -38,9 +38,9 @@ where
     let mut others = HashMap::new();
     for (k, v) in all_options {
         if k.as_ref().starts_with("hoodie.") {
-            hudi_options.insert(k.as_ref().to_string(), v.into());
+            hudi_options.insert(k.as_ref().into(), v.into());
         } else {
-            others.insert(k.as_ref().to_string(), v.into());
+            others.insert(k.as_ref().into(), v.into());
         }
     }
 

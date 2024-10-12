@@ -25,6 +25,7 @@ use arrow::pyarrow::ToPyArrow;
 use pyo3::{pyclass, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
+use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::table::Table;
 use hudi::table::builder::TableBuilder;
@@ -33,6 +34,33 @@ macro_rules! vec_string_to_slice {
     ($vec:expr) => {
         &$vec.iter().map(AsRef::as_ref).collect::<Vec<_>>()
     };
+}
+
+#[cfg(not(tarpaulin))]
+#[derive(Clone, Debug)]
+#[pyclass]
+pub struct HudiFileGroupReader {
+    inner: FileGroupReader,
+}
+
+#[cfg(not(tarpaulin))]
+#[pymethods]
+impl HudiFileGroupReader {
+    #[new]
+    #[pyo3(signature = (base_uri, options=None))]
+    fn new(base_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
+        let inner = FileGroupReader::new_with_options(base_uri, options.unwrap_or_default())?;
+        Ok(HudiFileGroupReader { inner })
+    }
+
+    fn read_file_slice_by_base_file_path(
+        &self,
+        relative_path: &str,
+        py: Python,
+    ) -> PyResult<PyObject> {
+        rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))?
+            .to_pyarrow(py)
+    }
 }
 
 #[cfg(not(tarpaulin))]
@@ -157,9 +185,9 @@ impl HudiTable {
         })
     }
 
-    fn read_file_slice(&self, relative_path: &str, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self.inner.read_file_slice_by_path(relative_path))?
-            .to_pyarrow(py)
+    fn create_file_group_reader(&self) -> PyResult<HudiFileGroupReader> {
+        let fg_reader = self.inner.create_file_group_reader();
+        Ok(HudiFileGroupReader { inner: fg_reader })
     }
 
     #[pyo3(signature = (filters=None))]

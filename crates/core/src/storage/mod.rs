@@ -278,6 +278,25 @@ mod tests {
             .contains("Failed to create storage"));
     }
 
+    #[test]
+    fn test_storage_new_error_invalid_url() {
+        let options = Arc::new(HashMap::new());
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath,
+            "http://invalid_url",
+        )]));
+        let result = Storage::new(options, hudi_configs);
+
+        assert!(
+            result.is_err(),
+            "Should return error when no base path is invalid."
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to create storage"));
+    }
+
     #[tokio::test]
     async fn storage_list_dirs() {
         let base_url = Url::from_directory_path(
