@@ -47,7 +47,7 @@ impl TableBuilder {
         }
     }
 
-    pub fn with_options<I, K, V>(mut self,  all_options: I) -> Self
+    pub fn with_options<I, K, V>(self,  all_options: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
@@ -63,19 +63,23 @@ impl TableBuilder {
                 storage_options.insert(k.as_ref().to_string(), v.into());
             }
         }
-
-        self.storage_options = Some(storage_options);
-        self.hudi_options = Some(hudi_options);
-        self
+        self.with_hudi_options(hudi_options)
+            .with_storage_options(storage_options)
     }
 
     pub fn with_hudi_options(mut self, hudi_options: HashMap<String, String>) -> Self {
-        self.hudi_options = Some(hudi_options);
+        match self.hudi_options {
+            None => self.hudi_options = Some(hudi_options),
+            Some(options) => self.hudi_options = Some(Self::merge(options, hudi_options)),
+        }
         self
     }
 
     pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
-        self.storage_options = Some(storage_options);
+        match self.storage_options {
+            None => self.storage_options = Some(storage_options),
+            Some(options) => self.storage_options = Some(Self::merge(options, storage_options)),
+        }
         self
     }
 
@@ -191,5 +195,9 @@ impl TableBuilder {
         }
 
         Ok(())
+    }
+
+    fn merge(map1: HashMap<String, String>, map2: HashMap<String, String>) -> HashMap<String, String> {
+        map1.into_iter().chain(map2).collect()
     }
 }
