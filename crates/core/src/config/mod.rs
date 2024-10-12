@@ -163,25 +163,17 @@ pub struct HudiConfigs {
     raw_options: Arc<HashMap<String, String>>,
 }
 
-impl From<HashMap<String, String>> for HudiConfigs {
-    fn from(options: HashMap<String, String>) -> Self {
-        Self {
-            raw_options: Arc::new(options),
-        }
-    }
-}
-
 impl HudiConfigs {
     /// Create [HudiConfigs] using opitons in the form of key-value pairs.
     pub fn new<I, K, V>(options: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
-        V: AsRef<str>,
+        V: Into<String>,
     {
         let raw_options = options
             .into_iter()
-            .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+            .map(|(k, v)| (k.as_ref().into(), v.into()))
             .collect();
         Self {
             raw_options: Arc::new(raw_options),
@@ -243,12 +235,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_from_hashmap() {
+    fn test_new_using_hashmap() {
         let mut options = HashMap::new();
         options.insert("key1".to_string(), "value1".to_string());
         options.insert("key2".to_string(), "value2".to_string());
 
-        let config = HudiConfigs::from(options.clone());
+        let config = HudiConfigs::new(options.clone());
 
         assert_eq!(*config.raw_options, options);
     }
@@ -282,7 +274,7 @@ mod tests {
         options.insert("key1".to_string(), "value1".to_string());
         options.insert("key2".to_string(), "value2".to_string());
 
-        let config = HudiConfigs::from(options.clone());
+        let config = HudiConfigs::new(options.clone());
 
         let result = config.as_options();
 

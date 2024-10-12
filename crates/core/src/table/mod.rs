@@ -200,7 +200,7 @@ impl Table {
         other_options.extend(others);
 
         hudi_options.insert(
-            HudiTableConfig::BasePath.as_ref().to_string(),
+            HudiTableConfig::BasePath.as_ref().into(),
             base_uri.to_string(),
         );
 

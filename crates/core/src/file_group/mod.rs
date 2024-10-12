@@ -225,7 +225,7 @@ impl FileGroup {
 
 #[cfg(test)]
 mod tests {
-    use crate::file_group::{BaseFile, FileGroup};
+    use super::*;
 
     #[test]
     fn create_a_base_file_successfully() {
@@ -275,5 +275,34 @@ mod tests {
         );
         assert!(res2.is_err());
         assert_eq!(res2.unwrap_err().to_string(), "Commit time 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
+    }
+
+    #[test]
+    fn test_file_group_display() {
+        let file_group = FileGroup {
+            id: "group123".to_string(),
+            partition_path: Some("part/2023-01-01".to_string()),
+            file_slices: BTreeMap::new(),
+        };
+
+        let display_string = format!("{}", file_group);
+
+        assert_eq!(
+            display_string,
+            "File Group: partition Some(\"part/2023-01-01\") id group123"
+        );
+
+        let file_group_no_partition = FileGroup {
+            id: "group456".to_string(),
+            partition_path: None,
+            file_slices: BTreeMap::new(),
+        };
+
+        let display_string_no_partition = format!("{}", file_group_no_partition);
+
+        assert_eq!(
+            display_string_no_partition,
+            "File Group: partition None id group456"
+        );
     }
 }

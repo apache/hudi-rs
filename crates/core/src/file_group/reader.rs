@@ -23,10 +23,9 @@ use crate::file_group::FileSlice;
 use crate::storage::Storage;
 use anyhow::Result;
 use arrow_array::RecordBatch;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct FileGroupReader {
     storage: Arc<Storage>,
 }
@@ -70,34 +69,25 @@ impl FileGroupReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::table::HudiTableConfig;
-    use std::collections::HashMap;
+    use url::Url;
 
-    fn create_test_storage() -> Arc<Storage> {
-        let options = HashMap::from([("foo".to_string(), "bar".to_string())]);
-        let hudi_configs = HudiConfigs::new([
-            (HudiTableConfig::BasePath, "file:///tmp/table"),
-            (HudiTableConfig::BaseFileFormat, "parquet"),
-        ]);
-        Storage::new(Arc::new(options), Arc::new(hudi_configs)).unwrap()
+    #[test]
+    fn test_new() {
+        let base_url = Url::parse("file:///tmp/hudi_data").unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let fg_reader = FileGroupReader::new(storage.clone());
+        assert!(Arc::ptr_eq(&fg_reader.storage, &storage));
     }
 
     #[test]
-    fn test_file_group_reader_json_serialization() {
-        let storage = create_test_storage();
-        let reader = FileGroupReader { storage };
-
-        // Serialize to JSON
-        let serialized = serde_json::to_string(&reader).unwrap();
-
-        // Deserialize from JSON
-        let deserialized: FileGroupReader = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(reader.storage.base_url, deserialized.storage.base_url);
-        assert_eq!(reader.storage.options, deserialized.storage.options);
-        assert_eq!(
-            reader.storage.hudi_configs,
-            deserialized.storage.hudi_configs
-        );
+    fn test_new_with_options() -> Result<()> {
+        let options = vec![("key1", "value1"), ("key2", "value2")];
+        let reader = FileGroupReader::new_with_options("/tmp/hudi_data", options)?;
+        assert!(!reader.storage.options.is_empty());
+        assert!(reader
+            .storage
+            .hudi_configs
+            .contains(HudiTableConfig::BasePath));
+        Ok(())
     }
 }

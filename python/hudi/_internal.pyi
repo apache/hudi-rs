@@ -22,6 +22,13 @@ import pyarrow  # type: ignore
 __version__: str
 
 @dataclass(init=False)
+class HudiFileGroupReader:
+    def __init__(self, base_uri: str, options: Optional[Dict[str, str]] = None): ...
+    def read_file_slice_by_base_file_path(
+        self, relative_path: str
+    ) -> "pyarrow.RecordBatch": ...
+
+@dataclass(init=False)
 class HudiFileSlice:
     file_group_id: str
     partition_path: str
@@ -32,13 +39,6 @@ class HudiFileSlice:
     size_bytes: int
 
     def base_file_relative_path(self) -> str: ...
-
-@dataclass(init=False)
-class HudiFileGroupReader:
-    def __init__(self, base_uri: str, options: Optional[Dict[str, str]] = None): ...
-    def read_file_slice_by_base_file_path(
-        self, relative_path: str
-    ) -> pyarrow.RecordBatch: ...
 
 @dataclass(init=False)
 class HudiTable:
