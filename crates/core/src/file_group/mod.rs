@@ -20,8 +20,6 @@
 //!
 //! A set of data/base files + set of log files, that make up a unit for all operations.
 
-pub mod reader;
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;

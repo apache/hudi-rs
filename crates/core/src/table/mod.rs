@@ -107,7 +107,6 @@ use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::utils::{empty_options, split_hudi_options_from_others};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
-use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
 use crate::storage::utils::parse_config_data;
 use crate::storage::Storage;
@@ -401,9 +400,8 @@ impl Table {
             .await
             .context(format!("Failed to get file slices as of {}", timestamp))?;
         let mut batches = Vec::new();
-        let fg_reader = self.create_file_group_reader();
         for f in file_slices {
-            match fg_reader.read_file_slice(&f).await {
+            match self.file_system_view.read_file_slice_unchecked(&f).await {
                 Ok(batch) => batches.push(batch),
                 Err(e) => return Err(anyhow!("Failed to read file slice {:?} - {}", f, e)),
             }
@@ -420,8 +418,29 @@ impl Table {
         Ok(file_paths)
     }
 
-    pub fn create_file_group_reader(&self) -> FileGroupReader {
-        FileGroupReader::new(self.file_system_view.storage.clone())
+    /// Read records from a [FileSlice] by its relative path.
+    ///
+    /// **Example**
+    ///
+    /// ```rust
+    /// use url::Url;
+    /// use hudi_core::table::Table;
+    ///
+    /// pub async fn test() {
+    ///     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+    ///     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+    ///     let batches = hudi_table
+    ///         .read_file_slice_by_path(
+    ///             "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+    ///         )
+    ///         .await
+    ///         .unwrap();
+    /// }
+    /// ```
+    pub async fn read_file_slice_by_path(&self, relative_path: &str) -> Result<RecordBatch> {
+        self.file_system_view
+            .read_file_slice_by_path_unchecked(relative_path)
+            .await
     }
 }
 
@@ -707,8 +726,7 @@ mod tests {
         let base_url = TestTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
-            .create_file_group_reader()
-            .read_file_slice_by_base_file_path(
+            .read_file_slice_by_path(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
             )
             .await
