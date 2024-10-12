@@ -37,7 +37,7 @@ class HudiFileSlice:
 class HudiTable:
     def __init__(
         self,
-        table_uri: str,
+        base_uri: str,
         options: Optional[Dict[str, str]] = None,
     ): ...
     def get_schema(self) -> "pyarrow.Schema": ...

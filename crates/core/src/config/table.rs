@@ -27,7 +27,7 @@ use strum_macros::{AsRefStr, EnumIter};
 
 use crate::config::{ConfigParser, HudiConfigValue};
 
-/// Configurations for Hudi tables, persisted in `hoodie.properties`.
+/// Configurations for Hudi tables, most of them are persisted in `hoodie.properties`.
 ///
 /// **Example**
 ///
@@ -46,6 +46,9 @@ pub enum HudiTableConfig {
     ///
     /// Currently only parquet is supported.
     BaseFileFormat,
+
+    /// Base path to the table.
+    BasePath,
 
     /// Table checksum is used to guard against partial writes in HDFS.
     /// It is added as the last entry in hoodie.properties and then used to validate while reading table config.
@@ -105,6 +108,7 @@ impl AsRef<str> for HudiTableConfig {
     fn as_ref(&self) -> &str {
         match self {
             Self::BaseFileFormat => "hoodie.table.base.file.format",
+            Self::BasePath => "hoodie.base.path",
             Self::Checksum => "hoodie.table.checksum",
             Self::DatabaseName => "hoodie.database.name",
             Self::DropsPartitionFields => "hoodie.datasource.write.drop.partition.columns",
@@ -150,6 +154,7 @@ impl ConfigParser for HudiTableConfig {
             Self::BaseFileFormat => get_result
                 .and_then(BaseFileFormatValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
+            Self::BasePath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::Checksum => get_result
                 .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
                 .map(HudiConfigValue::Integer),

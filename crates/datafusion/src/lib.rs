@@ -39,7 +39,8 @@ use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
-use hudi_core::storage::utils::{empty_options, get_scheme_authority, parse_uri};
+use hudi_core::config::utils::empty_options;
+use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::table::Table as HudiTable;
 
 #[derive(Clone, Debug)]
@@ -66,7 +67,7 @@ impl HudiDataSource {
 
     fn get_input_partitions(&self) -> usize {
         self.table
-            .configs
+            .hudi_configs
             .get_or_default(InputPartitions)
             .to::<usize>()
     }
@@ -119,7 +120,13 @@ impl TableProvider for HudiDataSource {
             parquet_file_groups.push(parquet_file_group_vec)
         }
 
-        let url = ObjectStoreUrl::parse(get_scheme_authority(&self.table.base_url))?;
+        let base_url = self.table.base_url().map_err(|e| {
+            Execution(format!(
+                "Failed to get base path config from Hudi table: {}",
+                e
+            ))
+        })?;
+        let url = ObjectStoreUrl::parse(get_scheme_authority(&base_url))?;
         let fsc = FileScanConfig::new(url, self.schema())
             .with_file_groups(parquet_file_groups)
             .with_projection(projection.cloned())

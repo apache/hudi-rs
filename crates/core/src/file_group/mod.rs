@@ -204,20 +204,20 @@ impl FileGroup {
 
     pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {
         let as_of = timestamp.to_string();
-        return if let Some((_, file_slice)) = self.file_slices.range(..=as_of).next_back() {
+        if let Some((_, file_slice)) = self.file_slices.range(..=as_of).next_back() {
             Some(file_slice)
         } else {
             None
-        };
+        }
     }
 
     pub fn get_file_slice_mut_as_of(&mut self, timestamp: &str) -> Option<&mut FileSlice> {
         let as_of = timestamp.to_string();
-        return if let Some((_, file_slice)) = self.file_slices.range_mut(..=as_of).next_back() {
+        if let Some((_, file_slice)) = self.file_slices.range_mut(..=as_of).next_back() {
             Some(file_slice)
         } else {
             None
-        };
+        }
     }
 }
 

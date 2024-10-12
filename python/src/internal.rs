@@ -28,6 +28,12 @@ use tokio::runtime::Runtime;
 use hudi::file_group::FileSlice;
 use hudi::table::Table;
 
+macro_rules! vec_string_to_slice {
+    ($vec:expr) => {
+        &$vec.iter().map(AsRef::as_ref).collect::<Vec<_>>()
+    };
+}
+
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
 #[pyclass]
@@ -85,37 +91,34 @@ fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
     }
 }
 
-macro_rules! vec_string_to_slice {
-    ($vec:expr) => {
-        &$vec.iter().map(AsRef::as_ref).collect::<Vec<_>>()
-    };
-}
-
 #[cfg(not(tarpaulin))]
 #[pyclass]
 pub struct HudiTable {
-    _table: Table,
+    inner: Table,
 }
 
 #[cfg(not(tarpaulin))]
 #[pymethods]
 impl HudiTable {
     #[new]
-    #[pyo3(signature = (table_uri, options = None))]
-    fn new(table_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
-        let _table = rt().block_on(Table::new_with_options(
-            table_uri,
+    #[pyo3(signature = (base_uri, options=None))]
+    fn new_with_options(
+        base_uri: &str,
+        options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let inner: Table = rt().block_on(Table::new_with_options(
+            base_uri,
             options.unwrap_or_default(),
         ))?;
-        Ok(HudiTable { _table })
+        Ok(HudiTable { inner })
     }
 
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.get_schema())?.to_pyarrow(py)
+        rt().block_on(self.inner.get_schema())?.to_pyarrow(py)
     }
 
     fn get_partition_schema(&self, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.get_partition_schema())?
+        rt().block_on(self.inner.get_partition_schema())?
             .to_pyarrow(py)
     }
 
@@ -128,7 +131,7 @@ impl HudiTable {
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(
-                self._table
+                self.inner
                     .split_file_slices(n, vec_string_to_slice!(filters.unwrap_or_default())),
             )?;
             Ok(file_slices
@@ -146,7 +149,7 @@ impl HudiTable {
     ) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(
-                self._table
+                self.inner
                     .get_file_slices(vec_string_to_slice!(filters.unwrap_or_default())),
             )?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
@@ -154,14 +157,14 @@ impl HudiTable {
     }
 
     fn read_file_slice(&self, relative_path: &str, py: Python) -> PyResult<PyObject> {
-        rt().block_on(self._table.read_file_slice_by_path(relative_path))?
+        rt().block_on(self.inner.read_file_slice_by_path(relative_path))?
             .to_pyarrow(py)
     }
 
     #[pyo3(signature = (filters=None))]
     fn read_snapshot(&self, filters: Option<Vec<String>>, py: Python) -> PyResult<PyObject> {
         rt().block_on(
-            self._table
+            self.inner
                 .read_snapshot(vec_string_to_slice!(filters.unwrap_or_default())),
         )?
         .to_pyarrow(py)

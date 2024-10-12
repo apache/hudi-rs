@@ -16,13 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
+use anyhow::{anyhow, Result};
 use url::{ParseError, Url};
 
 pub fn split_filename(filename: &str) -> Result<(String, String)> {
@@ -76,34 +73,6 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     }
 
     Ok(url)
-}
-
-pub fn empty_options<'a>() -> std::iter::Empty<(&'a str, &'a str)> {
-    std::iter::empty::<(&str, &str)>()
-}
-
-pub async fn parse_config_data(data: &Bytes, split_chars: &str) -> Result<HashMap<String, String>> {
-    let cursor = Cursor::new(data);
-    let lines = BufReader::new(cursor).lines();
-    let mut configs = HashMap::new();
-
-    for line in lines {
-        let line = line.context("Failed to read line")?;
-        let trimmed_line = line.trim();
-        if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
-            continue;
-        }
-        let mut parts = trimmed_line.splitn(2, |c| split_chars.contains(c));
-        let key = parts
-            .next()
-            .context("Missing key in config line")?
-            .trim()
-            .to_owned();
-        let value = parts.next().unwrap_or("").trim().to_owned();
-        configs.insert(key, value);
-    }
-
-    Ok(configs)
 }
 
 #[cfg(test)]
