@@ -29,6 +29,8 @@ use anyhow::Result;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
+/// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and
+/// access the file groups and file slices.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct FileSystemView {

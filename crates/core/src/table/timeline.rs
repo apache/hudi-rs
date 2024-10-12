@@ -33,6 +33,7 @@ use crate::file_group::FileGroup;
 use crate::storage::utils::split_filename;
 use crate::storage::Storage;
 
+/// The [State] of an [Instant] represents the status of the action performed on the table.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum State {
@@ -41,6 +42,7 @@ pub enum State {
     Completed,
 }
 
+/// An [Instant] represents a point in time when an action was performed on the table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Instant {
     state: State,
@@ -87,6 +89,7 @@ impl Instant {
     }
 }
 
+/// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Timeline {

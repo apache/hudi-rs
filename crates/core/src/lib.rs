@@ -23,14 +23,11 @@
 //! **Example**
 //!
 //! ```rust
-//! use url::Url;
 //! use hudi_core::config::read::HudiReadConfig::{AsOfTimestamp, InputPartitions};
 //! use hudi_core::table::Table as HudiTable;
 //!
-//! let options = vec![(InputPartitions.as_ref(), "2"),
-//!     (AsOfTimestamp.as_ref(), "20240101010100000")];
-//! let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//! HudiTable::new_with_options(base_uri.as_ref(), options);
+//! let options = [(InputPartitions, "2"), (AsOfTimestamp, "20240101010100000")];
+//! HudiTable::new_with_options("/tmp/hudi_data", options);
 //! ```
 //!
 //! # The [table] module is responsible for managing Hudi tables.
@@ -39,12 +36,10 @@
 //!
 //! create hudi table
 //! ```rust
-//! use url::Url;
 //! use hudi_core::table::Table;
 //!
 //! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
+//!     let hudi_table = Table::new("/tmp/hudi_data").await.unwrap();
 //! }
 //! ```
 

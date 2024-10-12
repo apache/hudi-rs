@@ -25,6 +25,7 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
+/// File group reader handles all read operations against a file group.
 #[derive(Clone, Debug)]
 pub struct FileGroupReader {
     storage: Arc<Storage>,

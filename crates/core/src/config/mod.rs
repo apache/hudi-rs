@@ -97,6 +97,8 @@ impl HudiConfigValue {
         T::from(self)
     }
 
+    /// A convenience method to convert [HudiConfigValue] to [Url] when the value is a [String] and is intended to be a URL.
+    /// Panic if the value is not a [String].
     pub fn to_url(self) -> Result<Url> {
         match self {
             HudiConfigValue::String(v) => parse_uri(&v),
@@ -192,10 +194,12 @@ impl HudiConfigs {
         self.raw_options.as_ref().clone()
     }
 
+    /// Validate the associated config using the given parser by execute the [ConfigParser::validate] method.
     pub fn validate(&self, parser: impl ConfigParser<Output = HudiConfigValue>) -> Result<()> {
         parser.validate(&self.raw_options)
     }
 
+    /// Check if the given key exists in the configs.
     pub fn contains(&self, key: impl AsRef<str>) -> bool {
         self.raw_options.contains_key(key.as_ref())
     }

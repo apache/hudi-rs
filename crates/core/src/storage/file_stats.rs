@@ -17,6 +17,7 @@
  * under the License.
  */
 
+/// File stats that can be retrieved by reading the file's metadata.
 #[derive(Clone, Debug, Default)]
 pub struct FileStats {
     pub num_records: i64,
