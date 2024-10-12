@@ -17,8 +17,9 @@
  * under the License.
  */
 
+use crate::config::table::HudiTableConfig;
+use crate::config::utils::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
-use crate::storage::utils::{parse_config_data, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
@@ -28,26 +29,24 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use url::Url;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableBuilder {
-    base_url: Url,
+    base_uri: String,
     hudi_options: Option<HashMap<String, String>>,
     storage_options: Option<HashMap<String, String>>,
 }
 
 impl TableBuilder {
     pub fn from_uri(uri: &str) -> Self {
-        let base_url = parse_uri(uri).unwrap(); // TODO: handle err
         TableBuilder {
-            base_url,
+            base_uri: uri.to_string(),
             storage_options: None,
             hudi_options: None,
         }
     }
 
-    pub fn with_options<I, K, V>(self,  all_options: I) -> Self
+    pub fn with_options<I, K, V>(self, all_options: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
@@ -56,13 +55,10 @@ impl TableBuilder {
         let mut hudi_options = HashMap::new();
         let mut storage_options = HashMap::new();
 
-        for (k, v) in all_options {
-            if k.as_ref().starts_with("hoodie.") {
-                hudi_options.insert(k.as_ref().to_string(), v.into());
-            } else {
-                storage_options.insert(k.as_ref().to_string(), v.into());
-            }
-        }
+        let (hudi_opts, others) = split_hudi_options_from_others(all_options);
+        hudi_options.extend(hudi_opts);
+        storage_options.extend(others);
+
         self.with_hudi_options(hudi_options)
             .with_storage_options(storage_options)
     }
@@ -84,41 +80,30 @@ impl TableBuilder {
     }
 
     pub async fn build(self) -> anyhow::Result<Table> {
-        let base_url = Arc::new(self.base_url);
-
         let hudi_options = self.hudi_options.unwrap_or_default().clone();
         let mut storage_options = self.storage_options.unwrap_or_default().clone();
 
         Self::load_storage_options(&mut storage_options);
 
         let hudi_configs =
-            Self::load_hudi_configs(base_url.clone(), hudi_options, &storage_options)
+            Self::load_hudi_configs(self.base_uri.clone(), hudi_options, &storage_options)
                 .await
                 .context("Failed to load table properties")?;
 
         let hudi_configs = Arc::from(hudi_configs);
         let storage_options = Arc::from(storage_options);
 
-        let timeline = Timeline::new(
-            base_url.clone(),
-            storage_options.clone(),
-            hudi_configs.clone(),
-        )
-        .await
-        .context("Failed to load timeline")?;
+        let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone())
+            .await
+            .context("Failed to load timeline")?;
 
-        let file_system_view = FileSystemView::new(
-            base_url.clone(),
-            storage_options.clone(),
-            hudi_configs.clone(),
-        )
-        .await
-        .context("Failed to load file system view")?;
+        let file_system_view = FileSystemView::new(hudi_configs.clone(), storage_options.clone())
+            .await
+            .context("Failed to load file system view")?;
 
         Ok(Table {
-            base_url,
-            configs: hudi_configs,
-            extra_options: storage_options,
+            hudi_configs,
+            storage_options,
             timeline,
             file_system_view,
         })
@@ -129,15 +114,24 @@ impl TableBuilder {
     }
 
     async fn load_hudi_configs(
-        base_url: Arc<Url>,
+        base_uri: String,
         mut hudi_options: HashMap<String, String>,
-        storage_configs: &HashMap<String, String>,
+        storage_options: &HashMap<String, String>,
     ) -> anyhow::Result<HudiConfigs> {
-        let storage = Storage::new(base_url, storage_configs)?;
+        hudi_options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_uri.to_string(),
+        );
+
+        // create a [Storage] instance to load properties from storage layer.
+        let storage = Storage::new(
+            Arc::new(storage_options.clone()),
+            Arc::new(HudiConfigs::new(&hudi_options)),
+        )?;
 
         Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
 
-        Self::imbue_global_hudi_configs(&mut hudi_options, storage.clone()).await?;
+        Self::imbue_global_hudi_configs_if_not_present(&mut hudi_options, storage.clone()).await?;
 
         let hudi_configs = HudiConfigs::new(hudi_options);
 
@@ -162,7 +156,7 @@ impl TableBuilder {
         storage: Arc<Storage>,
     ) -> anyhow::Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let table_properties = parse_config_data(&bytes, "=").await?;
+        let table_properties = parse_data_for_options(&bytes, "=")?;
 
         // TODO: handle the case where the same key is present in both table properties and options
         for (k, v) in table_properties {
@@ -172,7 +166,7 @@ impl TableBuilder {
         Ok(())
     }
 
-    async fn imbue_global_hudi_configs(
+    async fn imbue_global_hudi_configs_if_not_present(
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
     ) -> anyhow::Result<()> {
@@ -185,7 +179,7 @@ impl TableBuilder {
             .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
             .await
         {
-            if let Ok(global_configs) = parse_config_data(&bytes, " \t=").await {
+            if let Ok(global_configs) = parse_data_for_options(&bytes, " \t=") {
                 for (key, value) in global_configs {
                     if key.starts_with("hoodie.") && !options.contains_key(&key) {
                         options.insert(key.to_string(), value.to_string());
@@ -197,7 +191,10 @@ impl TableBuilder {
         Ok(())
     }
 
-    fn merge(map1: HashMap<String, String>, map2: HashMap<String, String>) -> HashMap<String, String> {
+    fn merge(
+        map1: HashMap<String, String>,
+        map2: HashMap<String, String>,
+    ) -> HashMap<String, String> {
         map1.into_iter().chain(map2).collect()
     }
 }

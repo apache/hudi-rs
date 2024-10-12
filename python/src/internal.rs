@@ -27,6 +27,7 @@ use tokio::runtime::Runtime;
 
 use hudi::file_group::FileSlice;
 use hudi::table::Table;
+use hudi::table::builder::TableBuilder;
 
 macro_rules! vec_string_to_slice {
     ($vec:expr) => {
@@ -168,6 +169,57 @@ impl HudiTable {
                 .read_snapshot(vec_string_to_slice!(filters.unwrap_or_default())),
         )?
         .to_pyarrow(py)
+    }
+}
+
+#[cfg(not(tarpaulin))]
+#[pyclass]
+pub struct HudiTableBuilder {
+    inner: TableBuilder,
+}
+
+#[cfg(not(tarpaulin))]
+impl HudiTableBuilder {
+
+    fn from_uri(
+        base_uri: &str
+    ) -> PyResult<Self> {
+        let inner: TableBuilder = TableBuilder::from_uri(base_uri);
+        Ok(HudiTableBuilder { inner })
+    }
+
+    fn with_options(
+        &mut self,
+        options: Option<HashMap<String, String>>
+    ) -> PyResult<&Self> {
+        let inner = self.inner.clone().with_options(options.unwrap_or_default());
+        self.inner = inner;
+        Ok(self)
+    }
+
+    fn with_hudi_options(
+        &mut self,
+        hudi_options: Option<HashMap<String, String>>
+    ) -> PyResult<&Self> {
+        let inner = self.inner.clone().with_options(hudi_options.unwrap_or_default());
+        self.inner = inner;
+        Ok(self)
+    }
+
+    fn with_storage_options(
+        &mut self,
+        storage_options: Option<HashMap<String, String>>
+    ) -> PyResult<&Self> {
+        let inner = self.inner.clone().with_options(storage_options.unwrap_or_default());
+        self.inner = inner;
+        Ok(self)
+    }
+
+    fn build(
+        &mut self,
+    ) -> PyResult<HudiTable> {
+        let table = rt().block_on(self.inner.clone().build())?;
+        Ok(HudiTable { inner: table })
     }
 }
 
