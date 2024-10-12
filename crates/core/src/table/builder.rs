@@ -46,6 +46,29 @@ impl TableBuilder {
             hudi_options: None,
         }
     }
+
+    pub fn with_options<I, K, V>(mut self,  all_options: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut hudi_options = HashMap::new();
+        let mut storage_options = HashMap::new();
+
+        for (k, v) in all_options {
+            if k.as_ref().starts_with("hoodie.") {
+                hudi_options.insert(k.as_ref().to_string(), v.into());
+            } else {
+                storage_options.insert(k.as_ref().to_string(), v.into());
+            }
+        }
+
+        self.storage_options = Some(storage_options);
+        self.hudi_options = Some(hudi_options);
+        self
+    }
+
     pub fn with_hudi_options(mut self, hudi_options: HashMap<String, String>) -> Self {
         self.hudi_options = Some(hudi_options);
         self
