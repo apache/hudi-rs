@@ -26,7 +26,6 @@ use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
 use crate::table::partition::PartitionPruner;
 use anyhow::Result;
-use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -170,18 +169,6 @@ impl FileSystemView {
             }
         }
         Ok(file_slices)
-    }
-
-    pub async fn read_file_slice_by_path_unchecked(
-        &self,
-        relative_path: &str,
-    ) -> Result<RecordBatch> {
-        self.storage.get_parquet_file_data(relative_path).await
-    }
-
-    pub async fn read_file_slice_unchecked(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        self.read_file_slice_by_path_unchecked(&file_slice.base_file_relative_path())
-            .await
     }
 }
 
