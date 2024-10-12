@@ -20,7 +20,6 @@ use crate::config::table::HudiTableConfig;
 use crate::config::utils::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
-use crate::storage::utils::parse_uri;
 use crate::storage::Storage;
 use anyhow::Result;
 use arrow_array::RecordBatch;
@@ -43,8 +42,6 @@ impl FileGroupReader {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let base_url = Arc::new(parse_uri(base_uri)?);
-
         let (mut hudi_opts, others) = split_hudi_options_from_others(options);
         hudi_opts.insert(
             HudiTableConfig::BasePath.as_ref().to_string(),
@@ -53,7 +50,7 @@ impl FileGroupReader {
 
         let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
 
-        let storage = Storage::new(base_url, Arc::new(others), hudi_configs)?;
+        let storage = Storage::new(Arc::new(others), hudi_configs)?;
         Ok(Self { storage })
     }
 
@@ -75,17 +72,14 @@ mod tests {
     use super::*;
     use crate::config::table::HudiTableConfig;
     use std::collections::HashMap;
-    use url::Url;
 
     fn create_test_storage() -> Arc<Storage> {
-        let base_uri = "file:///tmp/table";
-        let base_url = Arc::new(Url::parse(base_uri).unwrap());
         let options = HashMap::from([("foo".to_string(), "bar".to_string())]);
-        let hudi_configs = HudiConfigs::new(HashMap::from_iter(vec![(
-            HudiTableConfig::BaseFileFormat.as_ref().to_string(),
-            "parquet".to_string(),
-        )]));
-        Storage::new(base_url, Arc::new(options), Arc::new(hudi_configs)).unwrap()
+        let hudi_configs = HudiConfigs::new([
+            (HudiTableConfig::BasePath, "file:///tmp/table"),
+            (HudiTableConfig::BaseFileFormat, "parquet"),
+        ]);
+        Storage::new(Arc::new(options), Arc::new(hudi_configs)).unwrap()
     }
 
     #[test]

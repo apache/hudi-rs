@@ -39,7 +39,7 @@
 //!
 //! pub async fn test() {
 //!     use arrow_schema::Schema;
-//! let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
+//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
 //!     let schema = hudi_table.get_schema().await.unwrap();
 //! }
@@ -94,7 +94,6 @@ use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use strum::IntoEnumIterator;
-use url::Url;
 
 use HudiInternalConfig::SkipConfigValidation;
 use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
@@ -110,7 +109,7 @@ use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
-use crate::storage::utils::{parse_config_data, parse_uri};
+use crate::storage::utils::parse_config_data;
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -123,9 +122,8 @@ mod timeline;
 /// Hudi Table in-memory
 #[derive(Clone, Debug)]
 pub struct Table {
-    pub base_url: Arc<Url>,
-    pub configs: Arc<HudiConfigs>,
-    pub extra_options: Arc<HashMap<String, String>>,
+    pub hudi_configs: Arc<HudiConfigs>,
+    pub storage_options: Arc<HashMap<String, String>>,
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
 }
@@ -143,25 +141,23 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let (base_url, configs, extra_options) = Self::load_configs(base_uri, options)
+        let (hudi_configs, storage_options) = Self::load_configs(base_uri, options)
             .await
             .context("Failed to load table properties")?;
-        let configs = Arc::new(configs);
-        let extra_options = Arc::new(extra_options);
+        let hudi_configs = Arc::new(hudi_configs);
+        let storage_options = Arc::new(storage_options);
 
-        let timeline = Timeline::new(base_url.clone(), extra_options.clone(), configs.clone())
+        let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone())
             .await
             .context("Failed to load timeline")?;
 
-        let file_system_view =
-            FileSystemView::new(base_url.clone(), extra_options.clone(), configs.clone())
-                .await
-                .context("Failed to load file system view")?;
+        let file_system_view = FileSystemView::new(hudi_configs.clone(), storage_options.clone())
+            .await
+            .context("Failed to load file system view")?;
 
         Ok(Table {
-            base_url,
-            configs,
-            extra_options,
+            hudi_configs,
+            storage_options,
             timeline,
             file_system_view,
         })
@@ -183,14 +179,12 @@ impl Table {
     async fn load_configs<I, K, V>(
         base_uri: &str,
         all_options: I,
-    ) -> Result<(Arc<Url>, HudiConfigs, HashMap<String, String>)>
+    ) -> Result<(HudiConfigs, HashMap<String, String>)>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
-        let base_url = Arc::new(parse_uri(base_uri)?);
-
         let mut hudi_options = HashMap::new();
         let mut other_options = HashMap::new();
 
@@ -200,25 +194,24 @@ impl Table {
         hudi_options.extend(hudi_opts);
         other_options.extend(others);
 
+        hudi_options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_uri.to_string(),
+        );
+
+        // create a [Storage] instance to load properties from storage layer.
         let storage = Storage::new(
-            base_url.clone(),
             Arc::new(other_options.clone()),
-            Arc::new(HudiConfigs::empty()),
+            Arc::new(HudiConfigs::new(&hudi_options)),
         )?;
 
         Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
 
         Self::imbue_global_hudi_configs_if_not_present(&mut hudi_options, storage.clone()).await?;
 
-        // lastly, insert the base path config
-        hudi_options.insert(
-            HudiTableConfig::BasePath.as_ref().to_string(),
-            base_uri.to_string(),
-        );
-
         let hudi_configs = HudiConfigs::new(hudi_options);
 
-        Self::validate_configs(&hudi_configs).map(|_| (base_url, hudi_configs, other_options))
+        Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, other_options))
     }
 
     fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
@@ -321,7 +314,7 @@ impl Table {
     /// Get the latest partition [Schema] of the table
     pub async fn get_partition_schema(&self) -> Result<Schema> {
         let partition_fields: HashSet<String> = self
-            .configs
+            .hudi_configs
             .get_or_default(PartitionFields)
             .to::<Vec<String>>()
             .into_iter()
@@ -358,7 +351,7 @@ impl Table {
     ///
     /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
     pub async fn get_file_slices(&self, filters: &[&str]) -> Result<Vec<FileSlice>> {
-        if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
+        if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
             self.get_file_slices_as_of(timestamp.to::<String>().as_str(), filters)
                 .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
@@ -377,7 +370,7 @@ impl Table {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
-            PartitionPruner::new(filters, &partition_schema, self.configs.as_ref())?;
+            PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
         self.file_system_view
             .get_file_slices_as_of(timestamp, &partition_pruner, &excludes)
             .await
@@ -387,7 +380,7 @@ impl Table {
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
     pub async fn read_snapshot(&self, filters: &[&str]) -> Result<Vec<RecordBatch>> {
-        if let Some(timestamp) = self.configs.try_get(AsOfTimestamp) {
+        if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
             self.read_snapshot_as_of(timestamp.to::<String>().as_str(), filters)
                 .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
@@ -543,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn validate_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert!(
             configs.validate(BaseFileFormat).is_err(),
             "required config is missing"
@@ -591,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn get_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert!(configs.get(BaseFileFormat).is_err());
         assert!(configs.get(Checksum).is_err());
         assert!(configs.get(DatabaseName).is_err());
@@ -612,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn get_default_for_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
         assert_eq!(
@@ -642,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn get_valid_table_props() {
         let table = get_test_table_without_validation("table_props_valid").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert_eq!(
             configs.get(BaseFileFormat).unwrap().to::<String>(),
             "parquet"
@@ -679,7 +672,7 @@ mod tests {
     async fn get_global_table_props() {
         // Without the environment variable HUDI_CONF_DIR
         let table = get_test_table_without_validation("table_props_partial").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
         assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
@@ -689,7 +682,7 @@ mod tests {
         let hudi_conf_dir = base_path.join("random/wrong/dir");
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
         let table = get_test_table_without_validation("table_props_partial").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
         assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
@@ -699,7 +692,7 @@ mod tests {
         let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
         let table = get_test_table_without_validation("table_props_partial").await;
-        let configs = table.configs;
+        let configs = table.hudi_configs;
         assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "tmpdb");
         assert_eq!(
             configs.get(TableType).unwrap().to::<String>(),

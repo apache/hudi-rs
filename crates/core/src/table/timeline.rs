@@ -27,7 +27,6 @@ use anyhow::{anyhow, Context, Result};
 use arrow_schema::Schema;
 use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
-use url::Url;
 
 use crate::config::HudiConfigs;
 use crate::file_group::FileGroup;
@@ -91,22 +90,21 @@ impl Instant {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct Timeline {
-    configs: Arc<HudiConfigs>,
+    hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
     pub instants: Vec<Instant>,
 }
 
 impl Timeline {
     pub async fn new(
-        base_url: Arc<Url>,
+        hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,
-        configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
-        let storage = Storage::new(base_url, storage_options, configs.clone())?;
+        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         let instants = Self::load_completed_commits(&storage).await?;
         Ok(Self {
             storage,
-            configs,
+            hudi_configs,
             instants,
         })
     }
@@ -222,19 +220,23 @@ mod tests {
 
     use hudi_tests::TestTable;
 
+    use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
     use crate::table::timeline::{Instant, State, Timeline};
+
+    async fn create_test_timeline(base_url: Url) -> Timeline {
+        Timeline::new(
+            Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_url)])),
+            Arc::new(HashMap::new()),
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn timeline_read_latest_schema() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let timeline = Timeline::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 21)
     }
@@ -242,13 +244,7 @@ mod tests {
     #[tokio::test]
     async fn timeline_read_latest_schema_from_empty_table() {
         let base_url = TestTable::V6Empty.url();
-        let timeline = Timeline::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await;
         assert!(table_schema.is_err());
         assert_eq!(
@@ -263,13 +259,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let timeline = Timeline::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
         assert_eq!(
             timeline.instants,
             vec![

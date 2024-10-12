@@ -99,30 +99,21 @@ impl<'de> Deserialize<'de> for Storage {
 
 impl Storage {
     pub fn new(
-        base_url: Arc<Url>,
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
-        let hudi_configs = if hudi_configs.contains(HudiTableConfig::BasePath) {
-            hudi_configs
-        } else {
-            let mut raw_configs = HashMap::new();
-            raw_configs.extend(
-                hudi_configs
-                    .raw_configs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-            raw_configs.insert(
-                HudiTableConfig::BasePath.as_ref().to_string(),
-                base_url.as_str().to_string(),
-            );
-            Arc::new(HudiConfigs::new(raw_configs))
-        };
+        if !hudi_configs.contains(HudiTableConfig::BasePath) {
+            return Err(anyhow!(
+                "Failed to create storage: {} is required.",
+                HudiTableConfig::BasePath.as_ref()
+            ));
+        }
+
+        let base_url = hudi_configs.get(HudiTableConfig::BasePath)?.to_url()?;
 
         match parse_url_opts(&base_url, options.as_ref()) {
             Ok((object_store, _)) => Ok(Arc::new(Storage {
-                base_url,
+                base_url: Arc::new(base_url),
                 object_store: Arc::new(object_store),
                 options,
                 hudi_configs,
@@ -132,11 +123,15 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub fn new_with_empty_options(base_url: Arc<Url>) -> Result<Arc<Storage>> {
+    pub fn new_with_base_url(base_url: Url) -> Result<Arc<Storage>> {
+        let mut hudi_options = HashMap::new();
+        hudi_options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_url.as_str().to_string(),
+        );
         Self::new(
-            base_url,
             Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
+            Arc::new(HudiConfigs::new(hudi_options)),
         )
     }
 
@@ -304,7 +299,6 @@ mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
-    use std::sync::Arc;
 
     use crate::storage::file_info::FileInfo;
     use crate::storage::utils::join_url_segments;
@@ -318,7 +312,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let first_level_dirs: HashSet<String> =
             storage.list_dirs(None).await.unwrap().into_iter().collect();
         assert_eq!(
@@ -340,7 +334,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let first_level_dirs: HashSet<ObjPath> = storage
             .list_dirs_as_obj_paths(None)
             .await
@@ -363,7 +357,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let file_info_1: Vec<FileInfo> = storage
             .list_files(None)
             .await
@@ -373,7 +367,9 @@ mod tests {
         assert_eq!(
             file_info_1,
             vec![FileInfo {
-                uri: storage.base_url.join("a.parquet").unwrap().to_string(),
+                uri: join_url_segments(&storage.base_url, &["a.parquet"])
+                    .unwrap()
+                    .to_string(),
                 name: "a.parquet".to_string(),
                 size: 0,
             }]
@@ -387,9 +383,7 @@ mod tests {
         assert_eq!(
             file_info_2,
             vec![FileInfo {
-                uri: storage
-                    .base_url
-                    .join("part1/b.parquet")
+                uri: join_url_segments(&storage.base_url, &["part1/b.parquet"])
                     .unwrap()
                     .to_string(),
                 name: "b.parquet".to_string(),
@@ -405,9 +399,7 @@ mod tests {
         assert_eq!(
             file_info_3,
             vec![FileInfo {
-                uri: storage
-                    .base_url
-                    .join("part2/part22/c.parquet")
+                uri: join_url_segments(&storage.base_url, &["part2/part22/c.parquet"])
                     .unwrap()
                     .to_string(),
                 name: "c.parquet".to_string(),
@@ -422,7 +414,7 @@ mod tests {
             canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
         )
         .unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
         assert_eq!(
             leaf_dirs,
@@ -435,7 +427,7 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
         assert_eq!(
             leaf_dirs,
@@ -448,12 +440,14 @@ mod tests {
     async fn storage_get_file_info() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let file_info = storage.get_file_info("a.parquet").await.unwrap();
         assert_eq!(file_info.name, "a.parquet");
         assert_eq!(
             file_info.uri,
-            storage.base_url.join("a.parquet").unwrap().as_ref()
+            join_url_segments(&storage.base_url, &["a.parquet"])
+                .unwrap()
+                .to_string()
         );
         assert_eq!(file_info.size, 866);
     }
@@ -462,7 +456,7 @@ mod tests {
     async fn storage_get_parquet_file_data() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let file_data = storage.get_parquet_file_data("a.parquet").await.unwrap();
         assert_eq!(file_data.num_rows(), 5);
     }

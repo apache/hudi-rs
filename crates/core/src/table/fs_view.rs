@@ -28,26 +28,24 @@ use crate::table::partition::PartitionPruner;
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use url::Url;
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct FileSystemView {
-    configs: Arc<HudiConfigs>,
+    hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
     partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
 }
 
 impl FileSystemView {
     pub async fn new(
-        base_url: Arc<Url>,
+        hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,
-        configs: Arc<HudiConfigs>,
     ) -> Result<Self> {
-        let storage = Storage::new(base_url, storage_options, configs.clone())?;
+        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         let partition_to_file_groups = Arc::new(DashMap::new());
         Ok(FileSystemView {
-            configs,
+            hudi_configs,
             storage,
             partition_to_file_groups,
         })
@@ -176,20 +174,30 @@ impl FileSystemView {
 
 #[cfg(test)]
 mod tests {
-    use hudi_tests::TestTable;
-    use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
-
+    use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
     use crate::table::partition::PartitionPruner;
     use crate::table::Table;
+    use hudi_tests::TestTable;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use url::Url;
+
+    async fn create_test_fs_view(base_url: Url) -> FileSystemView {
+        FileSystemView::new(
+            Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_url)])),
+            Arc::new(HashMap::new()),
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn get_partition_paths_for_nonpartitioned_table() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
             .await
@@ -202,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn get_partition_paths_for_complexkeygen_table() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-        let storage = Storage::new_with_empty_options(Arc::new(base_url)).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
             .await
@@ -222,13 +230,7 @@ mod tests {
     #[tokio::test]
     async fn fs_view_get_latest_file_slices() {
         let base_url = TestTable::V6Nonpartitioned.url();
-        let fs_view = FileSystemView::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let fs_view = create_test_fs_view(base_url).await;
 
         assert!(fs_view.partition_to_file_groups.is_empty());
         let partition_pruner = PartitionPruner::empty();
@@ -253,13 +255,7 @@ mod tests {
     async fn fs_view_get_latest_file_slices_with_replace_commit() {
         let base_url = TestTable::V6SimplekeygenNonhivestyleOverwritetable.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let fs_view = FileSystemView::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let fs_view = create_test_fs_view(base_url).await;
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
         let partition_pruner = PartitionPruner::empty();
@@ -288,14 +284,10 @@ mod tests {
     async fn fs_view_get_latest_file_slices_with_partition_filters() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let fs_view = FileSystemView::new(
-            Arc::new(base_url),
-            Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::empty()),
-        )
-        .await
-        .unwrap();
+        let fs_view = create_test_fs_view(base_url).await;
+
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
+
         let excludes = &hudi_table
             .timeline
             .get_replaced_file_groups()
@@ -305,7 +297,7 @@ mod tests {
         let partition_pruner = PartitionPruner::new(
             &["byteField < 20", "shortField = 300"],
             &partition_schema,
-            hudi_table.configs.as_ref(),
+            hudi_table.hudi_configs.as_ref(),
         )
         .unwrap();
         let file_slices = fs_view
@@ -314,6 +306,7 @@ mod tests {
             .unwrap();
         assert_eq!(fs_view.partition_to_file_groups.len(), 1);
         assert_eq!(file_slices.len(), 1);
+
         let fg_ids = file_slices
             .iter()
             .map(|fsl| fsl.file_group_id())

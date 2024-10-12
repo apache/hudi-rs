@@ -21,8 +21,10 @@ use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::storage::utils::parse_uri;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 pub mod internal;
 pub mod read;
@@ -94,6 +96,17 @@ impl HudiConfigValue {
     pub fn to<T: 'static + std::fmt::Debug + From<HudiConfigValue>>(self) -> T {
         T::from(self)
     }
+
+    pub fn to_url(self) -> Result<Url> {
+        match self {
+            HudiConfigValue::String(v) => parse_uri(&v),
+            _ => panic!(
+                "Cannot cast {:?} to {}",
+                type_name::<Self>(),
+                type_name::<Url>()
+            ),
+        }
+    }
 }
 
 impl From<HudiConfigValue> for bool {
@@ -147,37 +160,61 @@ impl From<HudiConfigValue> for Vec<String> {
 /// Hudi configuration container.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HudiConfigs {
-    pub raw_configs: Arc<HashMap<String, String>>,
+    raw_options: Arc<HashMap<String, String>>,
+}
+
+impl From<HashMap<String, String>> for HudiConfigs {
+    fn from(options: HashMap<String, String>) -> Self {
+        Self {
+            raw_options: Arc::new(options),
+        }
+    }
 }
 
 impl HudiConfigs {
-    /// Create [HudiConfigs] with key-value pairs of [String]s.
-    pub fn new(raw_configs: HashMap<String, String>) -> Self {
+    /// Create [HudiConfigs] using opitons in the form of key-value pairs.
+    pub fn new<I, K, V>(options: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let raw_options = options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+            .collect();
         Self {
-            raw_configs: Arc::new(raw_configs),
+            raw_options: Arc::new(raw_options),
         }
     }
 
-    /// Create empty [HudiConfigs].
+    /// Create an empty [HudiConfigs].
     pub fn empty() -> Self {
         Self {
-            raw_configs: Arc::new(HashMap::new()),
+            raw_options: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Create a deep-copy of the configs as [String] options in the form of key-value pairs.
+    pub fn as_options(&self) -> HashMap<String, String> {
+        self.raw_options.as_ref().clone()
     }
 
     pub fn validate(&self, parser: impl ConfigParser<Output = HudiConfigValue>) -> Result<()> {
-        parser.validate(&self.raw_configs)
+        parser.validate(&self.raw_options)
     }
 
     pub fn contains(&self, key: impl AsRef<str>) -> bool {
-        self.raw_configs.contains_key(key.as_ref())
+        self.raw_options.contains_key(key.as_ref())
     }
 
+    /// Get value for the given config. Return [Result] with the value.
+    /// If the config is not found or value was not parsed properly, return [Err].
     pub fn get(
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
     ) -> Result<HudiConfigValue> {
-        parser.parse_value(&self.raw_configs)
+        parser.parse_value(&self.raw_options)
     }
 
     /// Get value or default value. If the config has no default value, this will panic.
@@ -185,7 +222,7 @@ impl HudiConfigs {
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
     ) -> HudiConfigValue {
-        parser.parse_value_or_default(&self.raw_configs)
+        parser.parse_value_or_default(&self.raw_options)
     }
 
     /// Get value or default value. If the config has no default value, this will return [None].
@@ -193,7 +230,7 @@ impl HudiConfigs {
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
     ) -> Option<HudiConfigValue> {
-        let res = parser.parse_value(&self.raw_configs);
+        let res = parser.parse_value(&self.raw_options);
         match res {
             Ok(v) => Some(v),
             Err(_) => parser.default_value(),

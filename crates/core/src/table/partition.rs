@@ -406,16 +406,10 @@ mod tests {
     }
 
     fn create_hudi_configs(is_hive_style: bool, is_url_encoded: bool) -> HudiConfigs {
-        HudiConfigs::new(HashMap::from([
-            (
-                IsHiveStylePartitioning.as_ref().to_string(),
-                is_hive_style.to_string(),
-            ),
-            (
-                IsPartitionPathUrlencoded.as_ref().to_string(),
-                is_url_encoded.to_string(),
-            ),
-        ]))
+        HudiConfigs::new([
+            (IsHiveStylePartitioning, is_hive_style.to_string()),
+            (IsPartitionPathUrlencoded, is_url_encoded.to_string()),
+        ])
     }
     #[test]
     fn test_partition_pruner_new() {
