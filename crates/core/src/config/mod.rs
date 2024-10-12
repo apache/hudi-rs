@@ -236,3 +236,55 @@ impl HudiConfigs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_hashmap() {
+        let mut options = HashMap::new();
+        options.insert("key1".to_string(), "value1".to_string());
+        options.insert("key2".to_string(), "value2".to_string());
+
+        let config = HudiConfigs::from(options.clone());
+
+        assert_eq!(*config.raw_options, options);
+    }
+
+    #[test]
+    fn test_new() {
+        let options = vec![("key1", "value1"), ("key2", "value2")];
+
+        let config = HudiConfigs::new(options);
+
+        let expected: HashMap<String, String> = vec![
+            ("key1".to_string(), "value1".to_string()),
+            ("key2".to_string(), "value2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(*config.raw_options, expected);
+    }
+
+    #[test]
+    fn test_empty() {
+        let config = HudiConfigs::empty();
+
+        assert!(config.raw_options.is_empty());
+    }
+
+    #[test]
+    fn test_as_options() {
+        let mut options = HashMap::new();
+        options.insert("key1".to_string(), "value1".to_string());
+        options.insert("key2".to_string(), "value2".to_string());
+
+        let config = HudiConfigs::from(options.clone());
+
+        let result = config.as_options();
+
+        assert_eq!(result, options);
+    }
+}

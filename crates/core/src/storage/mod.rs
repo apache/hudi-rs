@@ -251,6 +251,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
@@ -260,6 +261,22 @@ mod tests {
     use crate::storage::{get_leaf_dirs, Storage};
     use object_store::path::Path as ObjPath;
     use url::Url;
+
+    #[test]
+    fn test_storage_new_error_no_base_path() {
+        let options = Arc::new(HashMap::new());
+        let hudi_configs = Arc::new(HudiConfigs::empty());
+        let result = Storage::new(options, hudi_configs);
+
+        assert!(
+            result.is_err(),
+            "Should return error when no base path is provided."
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to create storage"));
+    }
 
     #[tokio::test]
     async fn storage_list_dirs() {

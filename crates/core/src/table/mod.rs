@@ -94,7 +94,7 @@ use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use strum::IntoEnumIterator;
-
+use url::Url;
 use HudiInternalConfig::SkipConfigValidation;
 use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
 use TableTypeValue::CopyOnWrite;
@@ -104,11 +104,11 @@ use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::config::utils::parse_data_for_options;
 use crate::config::utils::{empty_options, split_hudi_options_from_others};
 use crate::config::HudiConfigs;
 use crate::config::HUDI_CONF_DIR;
 use crate::file_group::FileSlice;
-use crate::storage::utils::parse_config_data;
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -160,6 +160,10 @@ impl Table {
             timeline,
             file_system_view,
         })
+    }
+
+    pub fn base_url(&self) -> Result<Url> {
+        self.hudi_configs.get(HudiTableConfig::BasePath)?.to_url()
     }
 
     #[cfg(feature = "datafusion")]
@@ -230,7 +234,7 @@ impl Table {
         storage: Arc<Storage>,
     ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let table_properties = parse_config_data(&bytes, "=").await?;
+        let table_properties = parse_data_for_options(&bytes, "=")?;
 
         // TODO: handle the case where the same key is present in both table properties and options
         for (k, v) in table_properties {
@@ -253,7 +257,7 @@ impl Table {
             .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
             .await
         {
-            if let Ok(global_configs) = parse_config_data(&bytes, " \t=").await {
+            if let Ok(global_configs) = parse_data_for_options(&bytes, " \t=") {
                 for (key, value) in global_configs {
                     if key.starts_with("hoodie.") && !options.contains_key(&key) {
                         options.insert(key.to_string(), value.to_string());
