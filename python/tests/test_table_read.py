@@ -165,11 +165,10 @@ def test_read_table_for_partition(get_sample_table):
 
 def test_read_table_as_of_timestamp(get_sample_table):
     table_path = get_sample_table
-    table = HudiTable(table_path)
-
     table = HudiTable(
         table_path, options={"hoodie.read.as.of.timestamp": "20240402123035233"}
     )
+
     batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
