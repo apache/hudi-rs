@@ -42,5 +42,5 @@ body:
     id: additional-context
     attributes:
       label: Additional context
-      description: Do you want to share any additional context about this bug?
-      placeholder: Add any other context about the problem here.
+      description: Do you want to share any additional context about this improvement?
+      placeholder: Add any other context about the improvement here.
