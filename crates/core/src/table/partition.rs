@@ -265,13 +265,36 @@ impl PartitionFilter {
             safe: false,
             format_options: Default::default(),
         };
+
+        let value = match data_type {
+            DataType::Date32 => Self::trim_single_quotes(value),
+            DataType::Date64 => Self::trim_single_quotes(value),
+            DataType::Utf8 => Self::trim_single_quotes(value),
+            DataType::LargeUtf8 => Self::trim_single_quotes(value),
+            DataType::Utf8View => Self::trim_single_quotes(value),
+            _ => *value
+        };
+
         let value = StringArray::from(Vec::from(value));
+
         Ok(Scalar::new(cast_with_options(
             &value,
             data_type,
             &cast_options,
         )?))
     }
+
+    fn trim_single_quotes<'a>(s: &'a[&'a str; 1]) -> [&'a str; 1] {
+        let trimmed = s[0]
+            .strip_prefix("'")
+            .unwrap_or(s[0])
+            .strip_suffix("'")
+            .unwrap_or(s[0]);
+
+        [trimmed]
+    }
+
+
 }
 
 #[cfg(test)]
@@ -281,7 +304,7 @@ mod tests {
         IsHiveStylePartitioning, IsPartitionPathUrlencoded,
     };
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::Datum;
+    use arrow_array::{Array, Datum};
     use hudi_tests::assert_not;
     use std::str::FromStr;
 
@@ -505,5 +528,46 @@ mod tests {
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
         assert!(pruner.parse_segments("invalid/path").is_err());
+    }
+
+    #[test]
+    fn test_strip_single_quote_for_date_filter() {
+        let schema = create_test_schema();
+        let cast_options = CastOptions {
+            safe: false,
+            format_options: Default::default(),
+        };
+        let value = StringArray::from(vec!["2023-01-01"]);
+        // StringArray::from(vec!["foo", "bar", "baz"]);
+
+        let value = cast_with_options(
+            &value,
+            &DataType::Date32,
+            &cast_options,
+        ).unwrap();
+        let filter_str = "date = '2023-01-01'";
+        let filter = PartitionFilter::try_from((filter_str, &schema));
+        assert!(filter.is_ok());
+        let filter = filter.unwrap();
+        assert_eq!(filter.field.name(), "date");
+        assert_eq!(filter.operator, Operator::Eq);
+        assert_eq!(filter.value.get().0.len(), 1);
+        assert_eq!(filter.value.get().0, value.get().0);
+    }
+
+    #[test]
+    fn test_strip_single_quote_for_string_filter() {
+        let schema = create_test_schema();
+        let filter_str = "category!='foo'";
+        let filter = PartitionFilter::try_from((filter_str, &schema));
+        assert!(filter.is_ok());
+        let filter = filter.unwrap();
+        assert_eq!(filter.field.name(), "category");
+        assert_eq!(filter.operator, Operator::Ne);
+        assert_eq!(filter.value.get().0.len(), 1);
+        assert_eq!(
+            StringArray::from(filter.value.into_inner().to_data()).value(0),
+            "foo"
+        )
     }
 }
