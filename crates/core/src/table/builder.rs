@@ -53,8 +53,7 @@ macro_rules! impl_with_options {
         impl $struct_name {
             $(
                 paste! {
-                    /// Add options to the builder.
-                    /// Subsequent calls overwrite the previous values if the key already exists.
+                    #[doc = "Add " $field " to the builder. Subsequent calls overwrite the previous values if the key already exists."]
                     pub fn [<with_ $field>]<I, K, V>(mut self, options: I) -> Self
                     where
                         I: IntoIterator<Item = (K, V)>,
