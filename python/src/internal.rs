@@ -210,16 +210,18 @@ impl HudiTable {
 
 #[cfg(not(tarpaulin))]
 #[pyfunction]
-#[pyo3(signature = (base_uri, hudi_options=None, storage_options=None))]
+#[pyo3(signature = (base_uri, hudi_options=None, storage_options=None, options=None))]
 pub fn build_hudi_table(
     base_uri: String,
     hudi_options: Option<HashMap<String, String>>,
     storage_options: Option<HashMap<String, String>>,
+    options: Option<HashMap<String, String>>,
 ) -> PyResult<HudiTable> {
     let inner = rt().block_on(
-        TableBuilder::from_uri(&base_uri)
+        TableBuilder::from_base_uri(&base_uri)
             .with_hudi_options(hudi_options.unwrap_or_default())
             .with_storage_options(storage_options.unwrap_or_default())
+            .with_options(options.unwrap_or_default())
             .build(),
     )?;
     Ok(HudiTable { inner })

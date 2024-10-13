@@ -38,9 +38,9 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
-    pub fn from_uri(uri: &str) -> Self {
+    pub fn from_base_uri(base_uri: &str) -> Self {
         TableBuilder {
-            base_uri: uri.to_string(),
+            base_uri: base_uri.to_string(),
             storage_options: None,
             hudi_options: None,
         }

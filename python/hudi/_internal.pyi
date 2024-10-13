@@ -64,4 +64,5 @@ def build_hudi_table(
     base_uri: str,
     hudi_options: Optional[Dict[str, str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    options: Optional[Dict[str, str]] = None,
 ) -> HudiTable: ...

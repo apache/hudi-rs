@@ -128,7 +128,7 @@ pub struct Table {
 impl Table {
     /// Create hudi table by base_uri
     pub async fn new(base_uri: &str) -> Result<Self> {
-        TableBuilder::from_uri(base_uri).build().await
+        TableBuilder::from_base_uri(base_uri).build().await
     }
 
     /// Create hudi table with options
@@ -138,7 +138,7 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        TableBuilder::from_uri(base_uri)
+        TableBuilder::from_base_uri(base_uri)
             .with_options(options)
             .build()
             .await
