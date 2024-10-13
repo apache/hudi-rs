@@ -89,7 +89,7 @@ class HudiTableBuilder:
         Returns:
             HudiTableBuilder: The builder instance.
         """
-        self.options = options
+        self.options.update(options)
         return self
 
     def build(self) -> "HudiTable":
