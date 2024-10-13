@@ -71,10 +71,10 @@ class HudiTableBuilder:
         Adds Hudi options to the builder.
 
         Parameters:
-        - hudi_options (Dict[str, str]): Hudi options to be applied.
+            hudi_options (Dict[str, str]): Hudi options to be applied.
 
         Returns:
-        - HudiTableBuilder: The builder instance.
+            HudiTableBuilder: The builder instance.
         """
         if self.hudi_options is None:
             self.hudi_options = {}
@@ -88,10 +88,10 @@ class HudiTableBuilder:
         Adds storage-related options for configuring the table.
 
         Parameters:
-        - storage_options (Dict[str, str]): Storage-related options to be applied.
+            storage_options (Dict[str, str]): Storage-related options to be applied.
 
         Returns:
-        - HudiTableBuilder: The builder instance.
+            HudiTableBuilder: The builder instance.
         """
         if self.storage_options is None:
             self.storage_options = {}
@@ -103,7 +103,7 @@ class HudiTableBuilder:
         Constructs and returns a HudiTable object with the specified options.
 
         Returns:
-        - HudiTable: The constructed HudiTable object.
+            HudiTable: The constructed HudiTable object.
         """
         return build_hudi_table(
             self.base_uri, self.hudi_options, self.storage_options, self.options
