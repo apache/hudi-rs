@@ -198,3 +198,91 @@ impl TableBuilder {
         map1.into_iter().chain(map2).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::table::TableBuilder;
+    use std::collections::HashMap;
+    #[test]
+    fn test_build_from_mixed_options() {
+        let options = vec![
+            ("hoodie.option1", "value1"),
+            ("AWS_REGION", "us-east-1"),
+            ("hoodie.option3", "value3"),
+            ("AWS_ENDPOINT", "s3.us-east-1.amazonaws.com"),
+        ];
+        let builder = TableBuilder::from_base_uri("./tmp").with_options(options);
+        let hudi_options = builder.hudi_options.clone().unwrap();
+        let storage_options = builder.storage_options.clone().unwrap();
+        assert_eq!(hudi_options.len(), 2);
+        assert_eq!(hudi_options["hoodie.option1"], "value1");
+        assert_eq!(hudi_options["hoodie.option3"], "value3");
+        assert_eq!(storage_options.len(), 2);
+        assert_eq!(storage_options["AWS_REGION"], "us-east-1");
+        assert_eq!(
+            storage_options["AWS_ENDPOINT"],
+            "s3.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn test_build_from_explicit_options() {
+        let hudi_options = HashMap::from([
+            ("hoodie.option1".to_string(), "value1".to_string()),
+            ("hoodie.option3".to_string(), "value3".to_string()),
+        ]);
+        let storage_options = HashMap::from([
+            ("AWS_REGION".to_string(), "us-east-1".to_string()),
+            (
+                "AWS_ENDPOINT".to_string(),
+                "s3.us-east-1.amazonaws.com".to_string(),
+            ),
+        ]);
+        let builder = TableBuilder::from_base_uri("./tmp")
+            .with_hudi_options(hudi_options)
+            .with_storage_options(storage_options);
+        let hudi_options = builder.hudi_options.clone().unwrap();
+        let storage_options = builder.storage_options.clone().unwrap();
+        assert_eq!(hudi_options.len(), 2);
+        assert_eq!(hudi_options["hoodie.option1"], "value1");
+        assert_eq!(hudi_options["hoodie.option3"], "value3");
+        assert_eq!(storage_options.len(), 2);
+        assert_eq!(storage_options["AWS_REGION"], "us-east-1");
+        assert_eq!(
+            storage_options["AWS_ENDPOINT"],
+            "s3.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn test_build_from_explicit_options_chained() {
+        let builder = TableBuilder::from_base_uri("./tmp")
+            .with_hudi_options(HashMap::from([(
+                "hoodie.option1".to_string(),
+                "value1".to_string(),
+            )]))
+            .with_hudi_options(HashMap::from([(
+                "hoodie.option3".to_string(),
+                "value3".to_string(),
+            )]))
+            .with_storage_options(HashMap::from([(
+                "AWS_REGION".to_string(),
+                "us-east-1".to_string(),
+            )]))
+            .with_storage_options(HashMap::from([(
+                "AWS_ENDPOINT".to_string(),
+                "s3.us-east-1.amazonaws.com".to_string(),
+            )]));
+        let hudi_options = builder.hudi_options.clone().unwrap();
+        let storage_options = builder.storage_options.clone().unwrap();
+        assert_eq!(hudi_options.len(), 2);
+        assert_eq!(hudi_options["hoodie.option1"], "value1");
+        assert_eq!(hudi_options["hoodie.option3"], "value3");
+        assert_eq!(storage_options.len(), 2);
+        assert_eq!(storage_options["AWS_REGION"], "us-east-1");
+        assert_eq!(
+            storage_options["AWS_ENDPOINT"],
+            "s3.us-east-1.amazonaws.com"
+        );
+    }
+}
