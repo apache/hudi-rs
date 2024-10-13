@@ -148,6 +148,14 @@ impl Table {
         self.hudi_configs.get(HudiTableConfig::BasePath)?.to_url()
     }
 
+    pub fn hudi_options(&self) -> HashMap<String, String> {
+        self.hudi_configs.as_options()
+    }
+
+    pub fn storage_options(&self) -> HashMap<String, String> {
+        self.storage_options.as_ref().clone()
+    }
+
     #[cfg(feature = "datafusion")]
     pub fn register_storage(
         &self,

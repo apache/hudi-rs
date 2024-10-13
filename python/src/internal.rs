@@ -142,6 +142,14 @@ impl HudiTable {
         Ok(HudiTable { inner })
     }
 
+    fn hudi_options(&self) -> HashMap<String, String> {
+        self.inner.hudi_options()
+    }
+
+    fn storage_options(&self) -> HashMap<String, String> {
+        self.inner.storage_options()
+    }
+
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_schema())?.to_pyarrow(py)
     }
