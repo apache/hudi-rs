@@ -272,7 +272,7 @@ impl PartitionFilter {
             DataType::Utf8 => Self::trim_single_quotes(value),
             DataType::LargeUtf8 => Self::trim_single_quotes(value),
             DataType::Utf8View => Self::trim_single_quotes(value),
-            _ => *value
+            _ => *value,
         };
 
         let value = StringArray::from(Vec::from(value));
@@ -284,17 +284,15 @@ impl PartitionFilter {
         )?))
     }
 
-    fn trim_single_quotes<'a>(s: &'a[&'a str; 1]) -> [&'a str; 1] {
+    fn trim_single_quotes<'a>(s: &'a [&'a str; 1]) -> [&'a str; 1] {
         let trimmed = s[0]
-            .strip_prefix("'")
+            .strip_prefix('\'')
             .unwrap_or(s[0])
-            .strip_suffix("'")
+            .strip_suffix('\'')
             .unwrap_or(s[0]);
 
         [trimmed]
     }
-
-
 }
 
 #[cfg(test)]
@@ -538,13 +536,8 @@ mod tests {
             format_options: Default::default(),
         };
         let value = StringArray::from(vec!["2023-01-01"]);
-        // StringArray::from(vec!["foo", "bar", "baz"]);
 
-        let value = cast_with_options(
-            &value,
-            &DataType::Date32,
-            &cast_options,
-        ).unwrap();
+        let value = cast_with_options(&value, &DataType::Date32, &cast_options).unwrap();
         let filter_str = "date = '2023-01-01'";
         let filter = PartitionFilter::try_from((filter_str, &schema));
         assert!(filter.is_ok());
