@@ -27,16 +27,16 @@ class HudiFileGroupReader:
     A reader for a group of Hudi file slices. Allows reading of records from the base file in a Hudi table.
 
     Attributes:
-    - base_uri (str): The base URI of the Hudi table.
-    - options (Optional[Dict[str, str]]): Additional options for reading the file group.
+        base_uri (str): The base URI of the Hudi table.
+        options (Optional[Dict[str, str]]): Additional options for reading the file group.
     """
     def __init__(self, base_uri: str, options: Optional[Dict[str, str]] = None):
         """
         Initializes the HudiFileGroupReader.
 
         Parameters:
-        - base_uri (str): The base URI of the Hudi table.
-        - options (Optional[Dict[str, str]]): Additional configuration options (optional).
+            base_uri (str): The base URI of the Hudi table.
+            options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
     def read_file_slice_by_base_file_path(
@@ -46,10 +46,10 @@ class HudiFileGroupReader:
         Reads the data from the base file given a relative path.
 
         Parameters:
-        - relative_path (str): The relative path to the base file.
+            relative_path (str): The relative path to the base file.
 
         Returns:
-        - pyarrow.RecordBatch: A batch of records read from the base file.
+            pyarrow.RecordBatch: A batch of records read from the base file.
         """
         ...
 
@@ -60,13 +60,13 @@ class HudiFileSlice:
     the partition it belongs to, and associated metadata.
 
     Attributes:
-    - file_group_id (str): The ID of the file group this slice belongs to.
-    - partition_path (str): The path of the partition containing this file slice.
-    - commit_time (str): The commit time of this file slice.
-    - base_file_name (str): The name of the base file.
-    - base_file_size (int): The size of the base file.
-    - num_records (int): The number of records in the base file.
-    - size_bytes (int): The size of the file slice in bytes.
+        file_group_id (str): The ID of the file group this slice belongs to.
+        partition_path (str): The path of the partition containing this file slice.
+        commit_time (str): The commit time of this file slice.
+        base_file_name (str): The name of the base file.
+        base_file_size (int): The size of the base file.
+        num_records (int): The number of records in the base file.
+        size_bytes (int): The size of the file slice in bytes.
     """
 
     file_group_id: str
@@ -82,19 +82,18 @@ class HudiFileSlice:
         Returns the relative path of the base file for this file slice.
 
         Returns:
-        - str: The relative path of the base file.
+            str: The relative path of the base file.
         """
         ...
 
 @dataclass(init=False)
 class HudiTable:
     """
-    Represents a Hudi table and provides methods for accessing its schema, partitions,
-    and file slices, as well as reading data from it.
+    Represents a Hudi table and provides methods to interact with it.
 
     Attributes:
-    - base_uri (str): The base URI of the Hudi table.
-    - options (Optional[Dict[str, str]]): Additional options for table operations.
+        base_uri (str): The base URI of the Hudi table.
+        options (Optional[Dict[str, str]]): Additional options for table operations.
     """
 
     def __init__(
@@ -106,8 +105,8 @@ class HudiTable:
         Initializes the HudiTable.
 
         Parameters:
-        - base_uri (str): The base URI of the Hudi table.
-        - options (Optional[Dict[str, str]]): Additional configuration options (optional).
+            base_uri (str): The base URI of the Hudi table.
+            options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
     def get_schema(self) -> "pyarrow.Schema":
@@ -115,7 +114,7 @@ class HudiTable:
         Returns the schema of the Hudi table.
 
         Returns:
-        - pyarrow.Schema: The schema of the table.
+            pyarrow.Schema: The schema of the table.
         """
         ...
     def get_partition_schema(self) -> "pyarrow.Schema":
@@ -123,7 +122,7 @@ class HudiTable:
         Returns the partition schema of the Hudi table.
 
         Returns:
-        - pyarrow.Schema: The schema used for partitioning the table.
+            pyarrow.Schema: The schema used for partitioning the table.
         """
         ...
     def split_file_slices(
@@ -133,11 +132,11 @@ class HudiTable:
         Splits the file slices into 'n' parts, optionally filtered by given filters.
 
         Parameters:
-        - n (int): The number of parts to split the file slices into.
-        - filters (Optional[List[str]]): Optional filters for selecting file slices.
+            n (int): The number of parts to split the file slices into.
+            filters (Optional[List[str]]): Optional filters for selecting file slices.
 
         Returns:
-        - List[List[HudiFileSlice]]: A list of file slice groups, each group being a list of HudiFileSlice objects.
+            List[List[HudiFileSlice]]: A list of file slice groups, each group being a list of HudiFileSlice objects.
         """
         ...
     def get_file_slices(self, filters: Optional[List[str]]) -> List[HudiFileSlice]:
@@ -145,10 +144,10 @@ class HudiTable:
         Retrieves all file slices in the Hudi table, optionally filtered by the provided filters.
 
         Parameters:
-        - filters (Optional[List[str]]): Optional filters for selecting file slices.
+            filters (Optional[List[str]]): Optional filters for selecting file slices.
 
         Returns:
-        - List[HudiFileSlice]: A list of file slices matching the filters.
+            List[HudiFileSlice]: A list of file slices matching the filters.
         """
         ...
     def create_file_group_reader(self) -> HudiFileGroupReader:
@@ -156,7 +155,7 @@ class HudiTable:
         Creates a HudiFileGroupReader for reading records from file groups in the Hudi table.
 
         Returns:
-        - HudiFileGroupReader: A reader object for reading file groups.
+            HudiFileGroupReader: A reader object for reading file groups.
         """
         ...
     def read_snapshot(
@@ -166,9 +165,9 @@ class HudiTable:
         Reads the latest snapshot of the Hudi table, optionally filtered by the provided filters.
 
         Parameters:
-        - filters (Optional[List[str]]): Optional filters for selecting file slices.
+            filters (Optional[List[str]]): Optional filters for selecting file slices.
 
         Returns:
-        - List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
+            List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
         """
         ...
