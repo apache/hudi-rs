@@ -24,80 +24,67 @@ use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
 use crate::table::Table;
-use anyhow::Context;
+use anyhow::{Context, Result};
+use paste::paste;
 use std::collections::HashMap;
 use std::env;
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Hudi Table builder
+/// Builder for creating a [Table] instance.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     base_uri: String,
-    hudi_options: Option<HashMap<String, String>>,
-    storage_options: Option<HashMap<String, String>>,
+    hudi_options: HashMap<String, String>,
+    storage_options: HashMap<String, String>,
+    options: HashMap<String, String>,
 }
+
+macro_rules! impl_with_options {
+    ($struct_name:ident, $($field:ident),+) => {
+        impl $struct_name {
+            $(
+                paste! {
+                    /// Add options to the builder.
+                    /// Subsequent calls overwrite the previous values if the key already exists.
+                    pub fn [<with_ $field>]<I, K, V>(mut self, options: I) -> Self
+                    where
+                        I: IntoIterator<Item = (K, V)>,
+                        K: AsRef<str>,
+                        V: Into<String>,
+                    {
+                        self.$field.extend(options.into_iter().map(|(k, v)| (k.as_ref().to_string(), v.into())));
+                        self
+                    }
+                }
+            )+
+        }
+    };
+}
+
+impl_with_options!(TableBuilder, hudi_options, storage_options, options);
 
 impl TableBuilder {
     /// Create Hudi table builder from base table uri
     pub fn from_base_uri(base_uri: &str) -> Self {
         TableBuilder {
             base_uri: base_uri.to_string(),
-            storage_options: None,
-            hudi_options: None,
+            storage_options: HashMap::new(),
+            hudi_options: HashMap::new(),
+            options: HashMap::new(),
         }
     }
 
-    /// Add hudi and/or storage options for configuring the TableBuilder.
-    pub fn with_options<I, K, V>(self, all_options: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let mut hudi_options = HashMap::new();
-        let mut storage_options = HashMap::new();
+    pub async fn build(&mut self) -> Result<Table> {
+        self.resolve_options().await?;
 
-        let (hudi_opts, others) = split_hudi_options_from_others(all_options);
-        hudi_options.extend(hudi_opts);
-        storage_options.extend(others);
+        let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
 
-        self.with_hudi_options(hudi_options)
-            .with_storage_options(storage_options)
-    }
-
-    /// Add hudi options for configuring the TableBuilder.
-    pub fn with_hudi_options(mut self, hudi_options: HashMap<String, String>) -> Self {
-        match self.hudi_options {
-            None => self.hudi_options = Some(hudi_options),
-            Some(options) => self.hudi_options = Some(Self::merge(options, hudi_options)),
-        }
-        self
-    }
-
-    /// Add hudi options for configuring the TableBuilder.
-    pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
-        match self.storage_options {
-            None => self.storage_options = Some(storage_options),
-            Some(options) => self.storage_options = Some(Self::merge(options, storage_options)),
-        }
-        self
-    }
-
-    /// Construct and return a Table object with the specified options.
-    pub async fn build(self) -> anyhow::Result<Table> {
-        let hudi_options = self.hudi_options.unwrap_or_default().clone();
-        let mut storage_options = self.storage_options.unwrap_or_default().clone();
-
-        Self::load_storage_options(&mut storage_options);
-
-        let hudi_configs =
-            Self::load_hudi_configs(self.base_uri.clone(), hudi_options, &storage_options)
-                .await
-                .context("Failed to load table properties")?;
+        Table::validate_configs(&hudi_configs).expect("Hudi configs are not valid.");
 
         let hudi_configs = Arc::from(hudi_configs);
-        let storage_options = Arc::from(storage_options);
+        let storage_options = Arc::from(self.storage_options.clone());
 
         let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone())
             .await
@@ -115,37 +102,42 @@ impl TableBuilder {
         })
     }
 
-    fn load_storage_options(storage_options: &mut HashMap<String, String>) {
-        Self::imbue_cloud_env_vars(storage_options);
-    }
-
-    async fn load_hudi_configs(
-        base_uri: String,
-        mut hudi_options: HashMap<String, String>,
-        storage_options: &HashMap<String, String>,
-    ) -> anyhow::Result<HudiConfigs> {
-        hudi_options.insert(
+    /// Resolve all options by combining the ones from hoodie.properties, user-provided options,
+    /// env vars, and global Hudi configs. The precedence order is as follows:
+    ///
+    /// 1. hoodie.properties
+    /// 2. Explicit options provided by the user
+    /// 3. Generic options provided by the user
+    /// 4. Env vars
+    /// 5. Global Hudi configs
+    ///
+    /// [note] Error may occur when 1 and 2 have conflicts.
+    async fn resolve_options(&mut self) -> Result<()> {
+        // Insert the base path into hudi options since it is explicitly provided
+        self.hudi_options.insert(
             HudiTableConfig::BasePath.as_ref().to_string(),
-            base_uri.to_string(),
+            self.base_uri.clone(),
         );
 
-        // create a [Storage] instance to load properties from storage layer.
-        let storage = Storage::new(
-            Arc::new(storage_options.clone()),
-            Arc::new(HudiConfigs::new(&hudi_options)),
-        )?;
+        let (generic_hudi_opts, generic_other_opts) =
+            split_hudi_options_from_others(self.options.iter());
 
-        Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
+        // Combine generic options (lower precedence) with explicit options.
+        // Note that we treat all non-Hudi options as storage options
+        Self::extend_if_absent(&mut self.hudi_options, &generic_hudi_opts);
+        Self::extend_if_absent(&mut self.storage_options, &generic_other_opts);
 
-        Self::imbue_global_hudi_configs_if_not_present(&mut hudi_options, storage.clone()).await?;
+        // if any user-provided options are intended for cloud storage and in uppercase,
+        // convert them to lowercase. This is to allow `object_store` to pick them up.
+        // Note that we do not need to look up env vars for storage as `object_store` does that for us.
+        Self::format_cloud_env_vars(&mut self.storage_options);
 
-        let hudi_configs = HudiConfigs::new(hudi_options);
-
-        Table::validate_configs(&hudi_configs).expect("Hudi configs are not valid.");
-        Ok(hudi_configs)
+        // At this point, we have resolved the storage options needed for accessing the storage layer.
+        // We can now resolve the hudi options
+        Self::resolve_hudi_options(&self.storage_options, &mut self.hudi_options).await
     }
 
-    fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
+    fn format_cloud_env_vars(options: &mut HashMap<String, String>) {
         const PREFIXES: [&str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
 
         for (key, value) in env::vars() {
@@ -157,13 +149,31 @@ impl TableBuilder {
         }
     }
 
+    async fn resolve_hudi_options(
+        storage_options: &HashMap<String, String>,
+        hudi_options: &mut HashMap<String, String>,
+    ) -> Result<()> {
+        // create a [Storage] instance to load properties from storage layer.
+        let storage = Storage::new(
+            Arc::new(storage_options.clone()),
+            Arc::new(HudiConfigs::new(hudi_options.iter())),
+        )?;
+
+        Self::imbue_table_properties(hudi_options, storage.clone()).await?;
+
+        // TODO load Hudi configs from env vars here before loading global configs
+
+        Self::imbue_global_hudi_configs_if_absent(hudi_options, storage.clone()).await
+    }
+
     async fn imbue_table_properties(
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let table_properties = parse_data_for_options(&bytes, "=")?;
 
+        // We currently treat all table properties as the highest precedence, which is valid for most cases.
         // TODO: handle the case where the same key is present in both table properties and options
         for (k, v) in table_properties {
             options.insert(k.to_string(), v.to_string());
@@ -172,10 +182,10 @@ impl TableBuilder {
         Ok(())
     }
 
-    async fn imbue_global_hudi_configs_if_not_present(
+    async fn imbue_global_hudi_configs_if_absent(
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let global_config_path = env::var(HUDI_CONF_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
@@ -197,11 +207,14 @@ impl TableBuilder {
         Ok(())
     }
 
-    fn merge(
-        map1: HashMap<String, String>,
-        map2: HashMap<String, String>,
-    ) -> HashMap<String, String> {
-        map1.into_iter().chain(map2).collect()
+    fn extend_if_absent<K, V>(target: &mut HashMap<K, V>, source: &HashMap<K, V>)
+    where
+        K: Eq + Hash + Clone,
+        V: Clone,
+    {
+        for (key, value) in source {
+            target.entry(key.clone()).or_insert_with(|| value.clone());
+        }
     }
 }
 

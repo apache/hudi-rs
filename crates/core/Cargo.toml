@@ -50,6 +50,7 @@ serde_json = { workspace = true }
 # "stdlib"
 anyhow = { workspace = true }
 bytes = { workspace = true }
+paste = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 url = { workspace = true }

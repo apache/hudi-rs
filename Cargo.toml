@@ -63,6 +63,7 @@ serde_json = { version = "1" }
 # "stdlib"
 anyhow = { version = "1.0.86" }
 bytes = { version = "1" }
+paste = { version = "1.0.15" }
 once_cell = { version = "1.19.0" }
 strum = { version = "0.26.3", features = ["derive"] }
 strum_macros = "0.26.4"
