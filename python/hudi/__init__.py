@@ -19,3 +19,4 @@ from ._internal import HudiFileGroupReader as HudiFileGroupReader
 from ._internal import HudiFileSlice as HudiFileSlice
 from ._internal import HudiTable as HudiTable
 from ._internal import __version__ as __version__
+from .table.builder import HudiTableBuilder as HudiTableBuilder
