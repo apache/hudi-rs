@@ -30,6 +30,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Hudi Table builder
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     base_uri: String,
@@ -38,6 +39,7 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
+    /// Create Hudi table builder from base table uri
     pub fn from_base_uri(base_uri: &str) -> Self {
         TableBuilder {
             base_uri: base_uri.to_string(),
@@ -46,6 +48,7 @@ impl TableBuilder {
         }
     }
 
+    /// Add hudi and/or storage options for configuring the TableBuilder.
     pub fn with_options<I, K, V>(self, all_options: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -63,6 +66,7 @@ impl TableBuilder {
             .with_storage_options(storage_options)
     }
 
+    /// Add hudi options for configuring the TableBuilder.
     pub fn with_hudi_options(mut self, hudi_options: HashMap<String, String>) -> Self {
         match self.hudi_options {
             None => self.hudi_options = Some(hudi_options),
@@ -71,6 +75,7 @@ impl TableBuilder {
         self
     }
 
+    /// Add hudi options for configuring the TableBuilder.
     pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
         match self.storage_options {
             None => self.storage_options = Some(storage_options),
@@ -79,6 +84,7 @@ impl TableBuilder {
         self
     }
 
+    /// Construct and return a Table object with the specified options.
     pub async fn build(self) -> anyhow::Result<Table> {
         let hudi_options = self.hudi_options.unwrap_or_default().clone();
         let mut storage_options = self.storage_options.unwrap_or_default().clone();
