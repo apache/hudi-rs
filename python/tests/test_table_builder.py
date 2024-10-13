@@ -18,7 +18,7 @@
 import pyarrow as pa
 import pytest
 
-from hudi import build_hudi_table
+from hudi import HudiTableBuilder
 
 PYARROW_LE_8_0_0 = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric()) < (
     8,
@@ -29,9 +29,10 @@ pytestmark = pytest.mark.skipif(
     PYARROW_LE_8_0_0, reason="hudi only supported if pyarrow >= 8.0.0"
 )
 
+
 def test_read_table_returns_correct_data(get_sample_table):
     table_path = get_sample_table
-    table = build_hudi_table(table_path)
+    table = HudiTableBuilder.from_base_uri(table_path).build()
 
     batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
@@ -68,15 +69,25 @@ def test_read_table_returns_correct_data(get_sample_table):
         },
     ]
 
-@pytest.mark.parametrize("hudi_options,storage_options,options", [
-({"hoodie.read.as.of.timestamp": "20240402123035233"}, None, None),
-(None, None, {"hoodie.read.as.of.timestamp": "20240402123035233"})])
-def test_read_table_as_of_timestamp(get_sample_table, hudi_options, storage_options, options):
+
+@pytest.mark.parametrize(
+    "hudi_options,storage_options,options",
+    [
+        ({"hoodie.read.as.of.timestamp": "20240402123035233"}, {}, {}),
+        ({}, {}, {"hoodie.read.as.of.timestamp": "20240402123035233"}),
+    ],
+)
+def test_read_table_as_of_timestamp(
+    get_sample_table, hudi_options, storage_options, options
+):
     table_path = get_sample_table
-    table = build_hudi_table(base_uri=table_path,
-                             hudi_options=hudi_options,
-                             storage_options=storage_options,
-                             options=options)
+    table = (
+        HudiTableBuilder.from_base_uri(table_path)
+        .with_hudi_options(hudi_options)
+        .with_storage_options(storage_options)
+        .with_options(options)
+        .build()
+    )
 
     batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")

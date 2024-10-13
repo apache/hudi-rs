@@ -48,10 +48,12 @@ def test_read_table_has_correct_schema(get_sample_table):
         "city",
     ]
 
+
 def test_read_table_has_correct_partition_schema(get_sample_table):
     table_path = get_sample_table
     table = HudiTable(table_path)
     assert table.get_partition_schema().names == ["city"]
+
 
 def test_read_table_returns_correct_file_slices(get_sample_table):
     table_path = get_sample_table
@@ -74,6 +76,7 @@ def test_read_table_returns_correct_file_slices(get_sample_table):
         "sao_paulo/ee915c68-d7f8-44f6-9759-e691add290d8-0_3-11-0_20240402123035233.parquet",
     }
 
+
 def test_read_table_can_read_from_batches(get_sample_table):
     table_path = get_sample_table
     table = HudiTable(table_path)
@@ -90,6 +93,7 @@ def test_read_table_can_read_from_batches(get_sample_table):
     file_slices_gen = iter(table.split_file_slices(2))
     assert len(next(file_slices_gen)) == 3
     assert len(next(file_slices_gen)) == 2
+
 
 def test_read_table_returns_correct_data(get_sample_table):
     table_path = get_sample_table
@@ -130,6 +134,7 @@ def test_read_table_returns_correct_data(get_sample_table):
         },
     ]
 
+
 def test_read_table_for_partition(get_sample_table):
     table_path = get_sample_table
     table = HudiTable(table_path)
@@ -156,6 +161,7 @@ def test_read_table_for_partition(get_sample_table):
             "fare": 19.1,
         },
     ]
+
 
 def test_read_table_as_of_timestamp(get_sample_table):
     table_path = get_sample_table
