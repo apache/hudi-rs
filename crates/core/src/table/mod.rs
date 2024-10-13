@@ -85,13 +85,11 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
-use strum::IntoEnumIterator;
 use url::Url;
 
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
