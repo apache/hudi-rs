@@ -18,5 +18,4 @@
 from ._internal import HudiFileGroupReader as HudiFileGroupReader
 from ._internal import HudiFileSlice as HudiFileSlice
 from ._internal import HudiTable as HudiTable
-from ._internal import HudiTableBuilder as HudiTableBuilder
 from ._internal import __version__ as __version__

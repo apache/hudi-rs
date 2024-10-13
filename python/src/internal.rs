@@ -22,13 +22,13 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use arrow::pyarrow::ToPyArrow;
-use pyo3::{pyclass, pymethods, PyErr, PyObject, PyResult, Python};
+use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
-use hudi::table::Table;
 use hudi::table::builder::TableBuilder;
+use hudi::table::Table;
 
 macro_rules! vec_string_to_slice {
     ($vec:expr) => {
@@ -201,54 +201,20 @@ impl HudiTable {
 }
 
 #[cfg(not(tarpaulin))]
-#[pyclass]
-pub struct HudiTableBuilder {
-    inner: TableBuilder,
-}
-
-#[cfg(not(tarpaulin))]
-impl HudiTableBuilder {
-
-    fn from_uri(
-        base_uri: &str
-    ) -> PyResult<Self> {
-        let inner: TableBuilder = TableBuilder::from_uri(base_uri);
-        Ok(HudiTableBuilder { inner })
-    }
-
-    fn with_options(
-        &mut self,
-        options: Option<HashMap<String, String>>
-    ) -> PyResult<&Self> {
-        let inner = self.inner.clone().with_options(options.unwrap_or_default());
-        self.inner = inner;
-        Ok(self)
-    }
-
-    fn with_hudi_options(
-        &mut self,
-        hudi_options: Option<HashMap<String, String>>
-    ) -> PyResult<&Self> {
-        let inner = self.inner.clone().with_options(hudi_options.unwrap_or_default());
-        self.inner = inner;
-        Ok(self)
-    }
-
-    fn with_storage_options(
-        &mut self,
-        storage_options: Option<HashMap<String, String>>
-    ) -> PyResult<&Self> {
-        let inner = self.inner.clone().with_options(storage_options.unwrap_or_default());
-        self.inner = inner;
-        Ok(self)
-    }
-
-    fn build(
-        &mut self,
-    ) -> PyResult<HudiTable> {
-        let table = rt().block_on(self.inner.clone().build())?;
-        Ok(HudiTable { inner: table })
-    }
+#[pyfunction]
+#[pyo3(signature = (base_uri, hudi_options=None, storage_options=None))]
+pub fn build_hudi_table(
+    base_uri: String,
+    hudi_options: Option<HashMap<String, String>>,
+    storage_options: Option<HashMap<String, String>>,
+) -> PyResult<HudiTable> {
+    let inner = rt().block_on(
+        TableBuilder::from_uri(&base_uri)
+            .with_hudi_options(hudi_options.unwrap_or_default())
+            .with_storage_options(storage_options.unwrap_or_default())
+            .build(),
+    )?;
+    Ok(HudiTable { inner })
 }
 
 #[cfg(not(tarpaulin))]

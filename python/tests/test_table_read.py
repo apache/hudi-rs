@@ -135,7 +135,9 @@ def test_sample_table(get_sample_table):
         },
     ]
 
-    table = HudiTable(table_path, options={"hoodie.read.as.of.timestamp": "20240402123035233"})
+    table = HudiTable(
+        table_path, options={"hoodie.read.as.of.timestamp": "20240402123035233"}
+    )
     batches = table.read_snapshot()
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [

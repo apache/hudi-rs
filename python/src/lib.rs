@@ -25,10 +25,12 @@ mod internal;
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
-    use internal::{HudiFileGroupReader, HudiFileSlice, HudiTable, HudiTableBuilder};
+    use internal::{HudiFileGroupReader, HudiFileSlice, HudiTable};
     m.add_class::<HudiFileGroupReader>()?;
     m.add_class::<HudiFileSlice>()?;
     m.add_class::<HudiTable>()?;
-    m.add_class::<HudiTableBuilder>()?;
+
+    use internal::build_hudi_table;
+    m.add_function(wrap_pyfunction!(build_hudi_table, m)?)?;
     Ok(())
 }
