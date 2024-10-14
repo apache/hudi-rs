@@ -267,6 +267,9 @@ impl PartitionFilter {
         };
 
         let value = match data_type {
+            DataType::Time32(_) => Self::trim_single_quotes(value),
+            DataType::Time64(_) => Self::trim_single_quotes(value),
+            DataType::Timestamp(_, _) => Self::trim_single_quotes(value),
             DataType::Date32 => Self::trim_single_quotes(value),
             DataType::Date64 => Self::trim_single_quotes(value),
             DataType::Utf8 => Self::trim_single_quotes(value),
@@ -301,6 +304,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Array, Datum};
+    use arrow_schema::TimeUnit;
     use hudi_tests::assert_not;
     use std::str::FromStr;
 
@@ -548,6 +552,56 @@ mod tests {
             assert_eq!(filter.value.get().0.len(), 1);
             assert_eq!(filter.value.get().0, value.get().0);
         }
+    }
+
+    #[test]
+    fn test_strip_single_quote_for_time_filter() {
+        for data_type in [
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time64(TimeUnit::Microsecond),
+        ] {
+            let schema = Schema::new(vec![Field::new("time", data_type.clone(), false)]);
+
+            let cast_options = CastOptions {
+                safe: false,
+                format_options: Default::default(),
+            };
+
+            let value = StringArray::from(vec![Some("08:08:35.091323414")]);
+            let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
+
+            let filter_str = "time = '08:08:35.091323414'";
+            let filter = PartitionFilter::try_from((filter_str, &schema));
+            assert!(filter.is_ok());
+            let filter = filter.unwrap();
+            assert_eq!(filter.field.name(), "time");
+            assert_eq!(filter.operator, Operator::Eq);
+            assert_eq!(filter.value.get().0.len(), 1);
+            assert_eq!(filter.value.get().0, value.get().0);
+        }
+    }
+
+    #[test]
+    fn test_strip_single_quote_for_timestamp_filter() {
+        let data_type = DataType::Timestamp(TimeUnit::Second, None);
+        let schema = Schema::new(vec![Field::new("ts", data_type.clone(), false)]);
+
+        let cast_options = CastOptions {
+            safe: false,
+            format_options: Default::default(),
+        };
+
+        let value = StringArray::from(vec![Some("2020-09-08T12:00:00.123456789+00:00")]);
+        let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
+
+        let filter_str = "ts = '2020-09-08T12:00:00.123456789+00:00'";
+        let filter = PartitionFilter::try_from((filter_str, &schema));
+        assert!(filter.is_ok());
+        let filter = filter.unwrap();
+        assert_eq!(filter.field.name(), "ts");
+        assert_eq!(filter.operator, Operator::Eq);
+        assert_eq!(filter.value.get().0.len(), 1);
+        assert_eq!(filter.value.get().0, value.get().0);
     }
 
     #[test]
