@@ -530,37 +530,60 @@ mod tests {
 
     #[test]
     fn test_strip_single_quote_for_date_filter() {
-        let schema = create_test_schema();
-        let cast_options = CastOptions {
-            safe: false,
-            format_options: Default::default(),
-        };
-        let value = StringArray::from(vec!["2023-01-01"]);
+        for (field_name, data_type) in vec![
+            ("date", DataType::Date32),
+            ("date", DataType::Date64),
+        ] {
+            let schema = Schema::new(vec![
+                Field::new(field_name, data_type.clone(), false)
+            ]);
 
-        let value = cast_with_options(&value, &DataType::Date32, &cast_options).unwrap();
-        let filter_str = "date = '2023-01-01'";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
-        assert!(filter.is_ok());
-        let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "date");
-        assert_eq!(filter.operator, Operator::Eq);
-        assert_eq!(filter.value.get().0.len(), 1);
-        assert_eq!(filter.value.get().0, value.get().0);
+            let cast_options = CastOptions {
+                safe: false,
+                format_options: Default::default(),
+            };
+
+            let value = StringArray::from(vec!["2023-01-01"]);
+            let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
+
+            let filter_str = "date = '2023-01-01'";
+            let filter = PartitionFilter::try_from((filter_str, &schema));
+            assert!(filter.is_ok());
+            let filter = filter.unwrap();
+            assert_eq!(filter.field.name(), "date");
+            assert_eq!(filter.operator, Operator::Eq);
+            assert_eq!(filter.value.get().0.len(), 1);
+            assert_eq!(filter.value.get().0, value.get().0);
+        }
     }
 
     #[test]
     fn test_strip_single_quote_for_string_filter() {
-        let schema = create_test_schema();
-        let filter_str = "category!='foo'";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
-        assert!(filter.is_ok());
-        let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "category");
-        assert_eq!(filter.operator, Operator::Ne);
-        assert_eq!(filter.value.get().0.len(), 1);
-        assert_eq!(
-            StringArray::from(filter.value.into_inner().to_data()).value(0),
-            "foo"
-        )
+        for (field_name, data_type) in vec![
+            ("category", DataType::Utf8),
+            ("category", DataType::Utf8View),
+            ("category", DataType::LargeUtf8)
+        ] {
+            let schema = Schema::new(vec![
+                Field::new(field_name, data_type.clone(), false)
+            ]);
+
+            let cast_options = CastOptions {
+                safe: false,
+                format_options: Default::default(),
+            };
+
+            let value = StringArray::from(vec!["foo"]);
+            let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
+
+            let filter_str = "category!='foo'";
+            let filter = PartitionFilter::try_from((filter_str, &schema));
+            assert!(filter.is_ok());
+            let filter = filter.unwrap();
+            assert_eq!(filter.field.name(), "category");
+            assert_eq!(filter.operator, Operator::Ne);
+            assert_eq!(filter.value.get().0.len(), 1);
+            assert_eq!(filter.value.get().0, value.get().0)
+        }
     }
 }
