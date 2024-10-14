@@ -15,7 +15,7 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 from hudi._internal import HudiTable, build_hudi_table
 
@@ -33,9 +33,9 @@ class HudiTableBuilder:
     """
 
     base_uri: str
-    options: Dict[str, str] = field(default_factory=dict)
     hudi_options: Dict[str, str] = field(default_factory=dict)
     storage_options: Dict[str, str] = field(default_factory=dict)
+    options: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_base_uri(cls, base_uri: str) -> "HudiTableBuilder":
@@ -51,6 +51,26 @@ class HudiTableBuilder:
         builder = cls(base_uri)
         return builder
 
+    def _add_options(
+        self, options: Dict[str, str], category: Optional[str] = None
+    ) -> None:
+        target_attr = getattr(self, f"{category}_options") if category else self.options
+        target_attr.update(options)
+
+    def with_hudi_option(self, k: str, v: str) -> "HudiTableBuilder":
+        """
+        Adds a Hudi option to the builder.
+
+        Parameters:
+            k (str): The key of the option.
+            v (str): The value of the option.
+
+        Returns:
+            HudiTableBuilder: The builder instance.
+        """
+        self._add_options({k: v}, "hudi")
+        return self
+
     def with_hudi_options(self, hudi_options: Dict[str, str]) -> "HudiTableBuilder":
         """
         Adds Hudi options to the builder.
@@ -61,7 +81,21 @@ class HudiTableBuilder:
         Returns:
             HudiTableBuilder: The builder instance.
         """
-        self.hudi_options.update(hudi_options)
+        self._add_options(hudi_options, "hudi")
+        return self
+
+    def with_storage_option(self, k: str, v: str) -> "HudiTableBuilder":
+        """
+        Adds a storage option to the builder.
+
+        Parameters:
+            k (str): The key of the option.
+            v (str): The value of the option.
+
+        Returns:
+            HudiTableBuilder: The builder instance.
+        """
+        self._add_options({k: v}, "storage")
         return self
 
     def with_storage_options(
@@ -76,7 +110,21 @@ class HudiTableBuilder:
         Returns:
             HudiTableBuilder: The builder instance.
         """
-        self.storage_options.update(storage_options)
+        self._add_options(storage_options, "storage")
+        return self
+
+    def with_option(self, k: str, v: str) -> "HudiTableBuilder":
+        """
+        Adds a generic option to the builder.
+
+        Parameters:
+            k (str): The key of the option.
+            v (str): The value of the option.
+
+        Returns:
+            HudiTableBuilder: The builder instance.
+        """
+        self._add_options({k: v})
         return self
 
     def with_options(self, options: Dict[str, str]) -> "HudiTableBuilder":
@@ -89,7 +137,7 @@ class HudiTableBuilder:
         Returns:
             HudiTableBuilder: The builder instance.
         """
-        self.options.update(options)
+        self._add_options(options)
         return self
 
     def build(self) -> "HudiTable":

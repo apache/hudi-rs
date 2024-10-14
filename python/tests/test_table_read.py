@@ -16,18 +16,8 @@
 #  under the License.
 
 import pyarrow as pa
-import pytest
 
 from hudi import HudiTable
-
-PYARROW_LE_8_0_0 = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric()) < (
-    8,
-    0,
-    0,
-)
-pytestmark = pytest.mark.skipif(
-    PYARROW_LE_8_0_0, reason="hudi only supported if pyarrow >= 8.0.0"
-)
 
 
 def test_read_table_has_correct_schema(get_sample_table):

@@ -20,14 +20,54 @@ import pytest
 
 from hudi import HudiTableBuilder
 
-PYARROW_LE_8_0_0 = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric()) < (
-    8,
-    0,
-    0,
+
+@pytest.fixture
+def base_uri():
+    return "test://base/uri"
+
+
+@pytest.fixture
+def builder(base_uri):
+    return HudiTableBuilder(base_uri)
+
+
+def test_initialization(builder, base_uri):
+    assert builder.base_uri == base_uri
+    assert builder.hudi_options == {}
+    assert builder.storage_options == {}
+    assert builder.options == {}
+
+
+def test_from_base_uri(base_uri):
+    builder = HudiTableBuilder.from_base_uri(base_uri)
+    assert builder.base_uri == base_uri
+
+
+@pytest.mark.parametrize(
+    "method,attr",
+    [
+        ("with_hudi_option", "hudi_options"),
+        ("with_storage_option", "storage_options"),
+        ("with_option", "options"),
+    ],
 )
-pytestmark = pytest.mark.skipif(
-    PYARROW_LE_8_0_0, reason="hudi only supported if pyarrow >= 8.0.0"
+def test_with_single_option(builder, method, attr):
+    getattr(builder, method)("key1", "value1")
+    assert getattr(builder, attr) == {"key1": "value1"}
+
+
+@pytest.mark.parametrize(
+    "method,attr",
+    [
+        ("with_hudi_options", "hudi_options"),
+        ("with_storage_options", "storage_options"),
+        ("with_options", "options"),
+    ],
 )
+def test_with_multiple_options(builder, method, attr):
+    options = {"key1": "value1", "key2": "value2"}
+    getattr(builder, method)(options)
+    assert getattr(builder, attr) == options
 
 
 def test_read_table_returns_correct_data(get_sample_table):
