@@ -53,6 +53,8 @@ pub struct Storage {
 }
 
 impl Storage {
+    pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
+
     pub fn new(
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
