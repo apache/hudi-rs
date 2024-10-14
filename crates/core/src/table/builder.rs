@@ -135,19 +135,18 @@ impl TableBuilder {
 
         // if any user-provided options are intended for cloud storage and in uppercase,
         // convert them to lowercase. This is to allow `object_store` to pick them up.
-        // Note that we do not need to look up env vars for storage as `object_store` does that for us.
-        Self::format_cloud_env_vars(&mut self.storage_options);
+        Self::imbue_cloud_env_vars(&mut self.storage_options);
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
         // We can now resolve the hudi options
         Self::resolve_hudi_options(&self.storage_options, &mut self.hudi_options).await
     }
 
-    fn format_cloud_env_vars(options: &mut HashMap<String, String>) {
-        const PREFIXES: [&str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
-
+    fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
         for (key, value) in env::vars() {
-            if PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+            if Storage::CLOUD_STORAGE_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
                 && !options.contains_key(&key.to_ascii_lowercase())
             {
                 options.insert(key.to_ascii_lowercase(), value);

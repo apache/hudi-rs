@@ -300,6 +300,7 @@ mod tests {
     };
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::utils::join_url_segments;
+    use crate::storage::Storage;
     use crate::table::Table;
 
     /// Test helper to create a new `Table` instance without validating the configuration.
@@ -318,6 +319,44 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_hudi_table_get_hudi_options() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_options = hudi_table.hudi_options();
+        for (k, v) in hudi_options.iter() {
+            assert!(k.starts_with("hoodie."));
+            assert!(!v.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hudi_table_get_storage_options() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let cloud_prefixes: HashSet<_> = Storage::CLOUD_STORAGE_PREFIXES
+            .iter()
+            .map(|prefix| prefix.to_lowercase())
+            .collect();
+
+        for (key, value) in hudi_table.storage_options.iter() {
+            let key_lower = key.to_lowercase();
+            assert!(
+                cloud_prefixes
+                    .iter()
+                    .any(|prefix| key_lower.starts_with(prefix)),
+                "Storage option key '{}' should start with a cloud storage prefix",
+                key
+            );
+            assert!(
+                !value.is_empty(),
+                "Storage option value for key '{}' should not be empty",
+                key
+            );
+        }
     }
 
     #[tokio::test]
