@@ -22,11 +22,12 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use arrow::pyarrow::ToPyArrow;
-use pyo3::{pyclass, pymethods, PyErr, PyObject, PyResult, Python};
+use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
+use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 
 macro_rules! vec_string_to_slice {
@@ -141,6 +142,14 @@ impl HudiTable {
         Ok(HudiTable { inner })
     }
 
+    fn hudi_options(&self) -> HashMap<String, String> {
+        self.inner.hudi_options()
+    }
+
+    fn storage_options(&self) -> HashMap<String, String> {
+        self.inner.storage_options()
+    }
+
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_schema())?.to_pyarrow(py)
     }
@@ -197,6 +206,25 @@ impl HudiTable {
         )?
         .to_pyarrow(py)
     }
+}
+
+#[cfg(not(tarpaulin))]
+#[pyfunction]
+#[pyo3(signature = (base_uri, hudi_options=None, storage_options=None, options=None))]
+pub fn build_hudi_table(
+    base_uri: String,
+    hudi_options: Option<HashMap<String, String>>,
+    storage_options: Option<HashMap<String, String>>,
+    options: Option<HashMap<String, String>>,
+) -> PyResult<HudiTable> {
+    let inner = rt().block_on(
+        TableBuilder::from_base_uri(&base_uri)
+            .with_hudi_options(hudi_options.unwrap_or_default())
+            .with_storage_options(storage_options.unwrap_or_default())
+            .with_options(options.unwrap_or_default())
+            .build(),
+    )?;
+    Ok(HudiTable { inner })
 }
 
 #[cfg(not(tarpaulin))]

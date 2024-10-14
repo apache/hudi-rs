@@ -29,5 +29,8 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HudiFileGroupReader>()?;
     m.add_class::<HudiFileSlice>()?;
     m.add_class::<HudiTable>()?;
+
+    use internal::build_hudi_table;
+    m.add_function(wrap_pyfunction!(build_hudi_table, m)?)?;
     Ok(())
 }

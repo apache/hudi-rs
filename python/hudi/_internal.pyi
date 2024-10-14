@@ -100,7 +100,7 @@ class HudiTable:
         self,
         base_uri: str,
         options: Optional[Dict[str, str]] = None,
-    ):
+        ):
         """
         Initializes the HudiTable.
 
@@ -125,6 +125,8 @@ class HudiTable:
             pyarrow.Schema: The schema used for partitioning the table.
         """
         ...
+    def hudi_options(self) -> Dict[str, str]: ...
+    def storage_options(self) -> Dict[str, str]: ...
     def split_file_slices(
         self, n: int, filters: Optional[List[str]]
     ) -> List[List[HudiFileSlice]]:
@@ -160,7 +162,7 @@ class HudiTable:
         ...
     def read_snapshot(
         self, filters: Optional[List[str]]
-    ) -> List["pyarrow.RecordBatch"]:
+        ) -> List["pyarrow.RecordBatch"]:
         """
         Reads the latest snapshot of the Hudi table, optionally filtered by the provided filters.
 
@@ -171,3 +173,10 @@ class HudiTable:
             List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
         """
         ...
+
+def build_hudi_table(
+    base_uri: str,
+    hudi_options: Optional[Dict[str, str]] = None,
+    storage_options: Optional[Dict[str, str]] = None,
+    options: Optional[Dict[str, str]] = None,
+) -> HudiTable: ...
