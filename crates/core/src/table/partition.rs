@@ -285,12 +285,10 @@ impl PartitionFilter {
     }
 
     fn trim_single_quotes<'a>(s: &'a [&'a str; 1]) -> [&'a str; 1] {
-        let trimmed = s[0]
-            .strip_prefix('\'')
-            .unwrap_or(s[0])
-            .strip_suffix('\'')
-            .unwrap_or(s[0]);
-
+        let mut trimmed = s[0];
+        if trimmed.starts_with("'") && trimmed.ends_with("'") {
+            trimmed = &trimmed[1..trimmed.len() - 1]
+        }
         [trimmed]
     }
 }
@@ -574,5 +572,28 @@ mod tests {
             assert_eq!(filter.value.get().0.len(), 1);
             assert_eq!(filter.value.get().0, value.get().0)
         }
+    }
+
+    #[test]
+    fn test_do_not_strip_one_side_single_quoted_value_for_filter() {
+        let data_type = DataType::Utf8;
+        let schema = Schema::new(vec![Field::new("category", data_type.clone(), false)]);
+
+        let cast_options = CastOptions {
+            safe: false,
+            format_options: Default::default(),
+        };
+
+        let value = StringArray::from(vec!["'foo"]);
+        let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
+
+        let filter_str = "category!='foo";
+        let filter = PartitionFilter::try_from((filter_str, &schema));
+        assert!(filter.is_ok());
+        let filter = filter.unwrap();
+        assert_eq!(filter.field.name(), "category");
+        assert_eq!(filter.operator, Operator::Ne);
+        assert_eq!(filter.value.get().0.len(), 1);
+        assert_eq!(filter.value.get().0, value.get().0)
     }
 }
