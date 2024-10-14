@@ -286,7 +286,7 @@ impl PartitionFilter {
 
     fn trim_single_quotes<'a>(s: &'a [&'a str; 1]) -> [&'a str; 1] {
         let mut trimmed = s[0];
-        if trimmed.starts_with("'") && trimmed.ends_with("'") {
+        if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
             trimmed = &trimmed[1..trimmed.len() - 1]
         }
         [trimmed]
