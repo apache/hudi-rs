@@ -100,7 +100,7 @@ class HudiTable:
         self,
         base_uri: str,
         options: Optional[Dict[str, str]] = None,
-        ):
+    ):
         """
         Initializes the HudiTable.
 
@@ -125,8 +125,22 @@ class HudiTable:
             pyarrow.Schema: The schema used for partitioning the table.
         """
         ...
-    def hudi_options(self) -> Dict[str, str]: ...
-    def storage_options(self) -> Dict[str, str]: ...
+    def hudi_options(self) -> Dict[str, str]:
+        """
+        Get hudi options for table.
+
+        Returns:
+            Dict[str, str]: A dictionary of hudi options.
+        """
+        ...
+    def storage_options(self) -> Dict[str, str]:
+        """
+        Get storage options set for table instance.
+
+        Returns:
+            Dict[str, str]: A dictionary of storage options.
+        """
+        ...
     def split_file_slices(
         self, n: int, filters: Optional[List[str]]
     ) -> List[List[HudiFileSlice]]:
@@ -162,7 +176,7 @@ class HudiTable:
         ...
     def read_snapshot(
         self, filters: Optional[List[str]]
-        ) -> List["pyarrow.RecordBatch"]:
+    ) -> List["pyarrow.RecordBatch"]:
         """
         Reads the latest snapshot of the Hudi table, optionally filtered by the provided filters.
 
@@ -179,4 +193,17 @@ def build_hudi_table(
     hudi_options: Optional[Dict[str, str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     options: Optional[Dict[str, str]] = None,
-) -> HudiTable: ...
+) -> HudiTable:
+    """
+    Builds hudi table from base_uri and options.
+
+    Parameters:
+        base_uri (str): location of a hudi table.
+        hudi_options (Optional[Dict[str, str]]): hudi options.
+        storage_options (Optional[Dict[str, str]]): storage_options.
+        options (Optional[Dict[str, str]]): hudi or storage options.
+
+    Returns:
+        HudiTable: An instance of hudi table.
+    """
+    ...
