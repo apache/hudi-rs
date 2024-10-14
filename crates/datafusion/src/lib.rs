@@ -147,17 +147,11 @@ impl TableProvider for HudiDataSource {
             exec_builder = exec_builder.with_predicate(predicate)
         }
 
-        return Ok(exec_builder.build_arc());
+        Ok(exec_builder.build_arc())
     }
 }
 
 pub struct HudiTableFactory {}
-
-impl Default for HudiTableFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl HudiTableFactory {
     pub fn new() -> Self {
@@ -182,6 +176,12 @@ impl HudiTableFactory {
         options.extend(cmd.options.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         Ok(options)
+    }
+}
+
+impl Default for HudiTableFactory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -263,13 +263,13 @@ mod tests {
             "datafusion.sql_parser.enable_ident_normalization",
             &ScalarValue::from(false),
         );
-        let mut session_state = SessionStateBuilder::new()
+        let table_factory: Arc<dyn TableProviderFactory> = Arc::new(HudiTableFactory::default());
+
+        let session_state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
+            .with_table_factories(HashMap::from([("HUDI".to_string(), table_factory)]))
             .build();
-        session_state
-            .table_factories_mut()
-            .insert("HUDI".to_string(), Arc::new(HudiTableFactory::new()));
 
         SessionContext::new_with_state(session_state)
     }
