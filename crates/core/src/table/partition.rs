@@ -530,8 +530,8 @@ mod tests {
 
     #[test]
     fn test_strip_single_quote_for_date_filter() {
-        for (field_name, data_type) in [("date", DataType::Date32), ("date", DataType::Date64)] {
-            let schema = Schema::new(vec![Field::new(field_name, data_type.clone(), false)]);
+        for data_type in [DataType::Date32, DataType::Date64] {
+            let schema = Schema::new(vec![Field::new("date", data_type.clone(), false)]);
 
             let cast_options = CastOptions {
                 safe: false,
@@ -554,12 +554,8 @@ mod tests {
 
     #[test]
     fn test_strip_single_quote_for_string_filter() {
-        for (field_name, data_type) in [
-            ("category", DataType::Utf8),
-            ("category", DataType::Utf8View),
-            ("category", DataType::LargeUtf8),
-        ] {
-            let schema = Schema::new(vec![Field::new(field_name, data_type.clone(), false)]);
+        for data_type in [DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8] {
+            let schema = Schema::new(vec![Field::new("category", data_type.clone(), false)]);
 
             let cast_options = CastOptions {
                 safe: false,
