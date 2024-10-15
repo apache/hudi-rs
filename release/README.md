@@ -59,10 +59,18 @@
 
 ## GitHub work
 
-### Bump version
-
 > ![NOTE]
 > We adhere to [Semantic Versioning](https://semver.org/), and create a release branch for each major or minor release.
+
+### Bump version in main branch
+
+Execute the below script that creates a branch with the new version changes committed. Submit a PR using that.
+
+```shell
+./release/bump_version_in_main.sh
+```
+
+### Bump version in release branch
 
 For a major or minor release, create a release branch in the format of `release/[0-9]+.[0-9]+.x` matching the target
 release version. For example, if it's `0.2.0`, cut a branch named `release/0.2.x`, if it's `1.0.0`, cut a branch
@@ -79,6 +87,10 @@ On the release branch, bump the version to indicate pre-release by pushing a com
 - If it is meant for internal testing, go with `alpha.1`, `alpha.2`, etc
 - If it is meant for public testing, go with `beta.1`, `beta.2`, etc
 - If it is ready for voting, go with `rc.1`, `rc.2`, etc
+
+```shell
+cargo set-version 0.2.0-rc.1 --manifest-path crates/hudi/Cargo.toml
+```
 
 ### Testing
 
@@ -112,7 +124,9 @@ Run the below script to create source release artifacts.
 
 Upload source release artifacts to SVN (dev).
 
-TODO: WIP
+```shell
+./release/upload_src_release_to_dev.sh
+```
 
 ### Start a `[VOTE]` thread
 
@@ -152,3 +166,6 @@ Release Manager
 [7] https://pypi.org/project/hudi/0.1.0rc2/
 [8] https://crates.io/crates/hudi/0.1.0-rc.2
 ```
+
+### After VOTE passes
+
