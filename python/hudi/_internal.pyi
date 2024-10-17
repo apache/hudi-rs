@@ -15,7 +15,7 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pyarrow  # type: ignore
 
@@ -142,25 +142,27 @@ class HudiTable:
         """
         ...
     def split_file_slices(
-        self, n: int, filters: Optional[List[str]]
+        self, n: int, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[List[HudiFileSlice]]:
         """
         Splits the file slices into 'n' parts, optionally filtered by given filters.
 
         Parameters:
             n (int): The number of parts to split the file slices into.
-            filters (Optional[List[str]]): Optional filters for selecting file slices.
+            filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
 
         Returns:
             List[List[HudiFileSlice]]: A list of file slice groups, each group being a list of HudiFileSlice objects.
         """
         ...
-    def get_file_slices(self, filters: Optional[List[str]]) -> List[HudiFileSlice]:
+    def get_file_slices(
+        self, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List[HudiFileSlice]:
         """
         Retrieves all file slices in the Hudi table, optionally filtered by the provided filters.
 
         Parameters:
-            filters (Optional[List[str]]): Optional filters for selecting file slices.
+            filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
 
         Returns:
             List[HudiFileSlice]: A list of file slices matching the filters.
@@ -175,13 +177,13 @@ class HudiTable:
         """
         ...
     def read_snapshot(
-        self, filters: Optional[List[str]]
+        self, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List["pyarrow.RecordBatch"]:
         """
         Reads the latest snapshot of the Hudi table, optionally filtered by the provided filters.
 
         Parameters:
-            filters (Optional[List[str]]): Optional filters for selecting file slices.
+            filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
 
         Returns:
             List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
