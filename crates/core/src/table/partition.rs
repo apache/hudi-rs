@@ -24,7 +24,6 @@ use arrow_array::{ArrayRef, Scalar, StringArray};
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
-use once_cell::sync::Lazy;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -41,7 +40,7 @@ pub struct PartitionPruner {
 
 impl PartitionPruner {
     pub fn new(
-        and_filters: &[&str],
+        and_filters: &[(&str, &str, &str)],
         partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
     ) -> Result<Self> {
@@ -175,19 +174,6 @@ impl Operator {
         (">", Operator::Gt),
         (">=", Operator::Gte),
     ];
-
-    /// Returns the supported operator tokens. Note that the tokens are sorted by length in descending order to facilitate parsing.
-    fn supported_tokens() -> &'static [&'static str] {
-        static TOKENS: Lazy<Vec<&'static str>> = Lazy::new(|| {
-            let mut tokens: Vec<&'static str> = Operator::TOKEN_OP_PAIRS
-                .iter()
-                .map(|&(token, _)| token)
-                .collect();
-            tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
-            tokens
-        });
-        &TOKENS
-    }
 }
 
 impl FromStr for Operator {
@@ -209,11 +195,11 @@ pub struct PartitionFilter {
     value: Scalar<ArrayRef>,
 }
 
-impl TryFrom<(&str, &Schema)> for PartitionFilter {
+impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
     type Error = anyhow::Error;
 
-    fn try_from((s, partition_schema): (&str, &Schema)) -> Result<Self> {
-        let (field_name, operator_str, value_str) = Self::parse_to_parts(s)?;
+    fn try_from((filter, partition_schema): ((&str, &str, &str), &Schema)) -> Result<Self> {
+        let (field_name, operator_str, value_str) = filter;
 
         let field: &Field = partition_schema
             .field_with_name(field_name)
@@ -236,46 +222,10 @@ impl TryFrom<(&str, &Schema)> for PartitionFilter {
 }
 
 impl PartitionFilter {
-    fn parse_to_parts(s: &str) -> Result<(&str, &str, &str)> {
-        let s = s.trim();
-
-        let (index, op) = Operator::supported_tokens()
-            .iter()
-            .filter_map(|&op| s.find(op).map(|index| (index, op)))
-            .min_by_key(|(index, _)| *index)
-            .ok_or_else(|| anyhow!("No valid operator found in the filter string"))?;
-
-        let (field, rest) = s.split_at(index);
-        let (_, value) = rest.split_at(op.len());
-
-        let field = field.trim();
-        let value = value.trim();
-
-        if field.is_empty() || value.is_empty() {
-            return Err(anyhow!(
-                "Invalid filter format: missing field name or value"
-            ));
-        }
-
-        Ok((field, op, value))
-    }
-
     fn cast_value(value: &[&str; 1], data_type: &DataType) -> Result<Scalar<ArrayRef>> {
         let cast_options = CastOptions {
             safe: false,
             format_options: Default::default(),
-        };
-
-        let value = match data_type {
-            DataType::Time32(_) => Self::trim_single_quotes(value),
-            DataType::Time64(_) => Self::trim_single_quotes(value),
-            DataType::Timestamp(_, _) => Self::trim_single_quotes(value),
-            DataType::Date32 => Self::trim_single_quotes(value),
-            DataType::Date64 => Self::trim_single_quotes(value),
-            DataType::Utf8 => Self::trim_single_quotes(value),
-            DataType::LargeUtf8 => Self::trim_single_quotes(value),
-            DataType::Utf8View => Self::trim_single_quotes(value),
-            _ => *value,
         };
 
         let value = StringArray::from(Vec::from(value));
@@ -285,14 +235,6 @@ impl PartitionFilter {
             data_type,
             &cast_options,
         )?))
-    }
-
-    fn trim_single_quotes<'a>(s: &'a [&'a str; 1]) -> [&'a str; 1] {
-        let mut trimmed = s[0];
-        if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-            trimmed = &trimmed[1..trimmed.len() - 1]
-        }
-        [trimmed]
     }
 }
 
@@ -304,7 +246,6 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Array, Datum};
-    use arrow_schema::TimeUnit;
     use hudi_tests::assert_not;
     use std::str::FromStr;
 
@@ -319,16 +260,16 @@ mod tests {
     #[test]
     fn test_partition_filter_try_from_valid() {
         let schema = create_test_schema();
-        let filter_str = "date = 2023-01-01";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
+        let filter_tuple = ("date", "=", "2023-01-01");
+        let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_ok());
         let filter = filter.unwrap();
         assert_eq!(filter.field.name(), "date");
         assert_eq!(filter.operator, Operator::Eq);
         assert_eq!(filter.value.get().0.len(), 1);
 
-        let filter_str = "category!=foo";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
+        let filter_tuple = ("category", "!=", "foo");
+        let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_ok());
         let filter = filter.unwrap();
         assert_eq!(filter.field.name(), "category");
@@ -343,8 +284,8 @@ mod tests {
     #[test]
     fn test_partition_filter_try_from_invalid_field() {
         let schema = create_test_schema();
-        let filter_str = "invalid_field = 2023-01-01";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
+        let filter_tuple = ("invalid_field", "=", "2023-01-01");
+        let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_err());
         assert!(filter
             .unwrap_err()
@@ -355,60 +296,30 @@ mod tests {
     #[test]
     fn test_partition_filter_try_from_invalid_operator() {
         let schema = create_test_schema();
-        let filter_str = "date ?? 2023-01-01";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
+        let filter_tuple = ("date", "??", "2023-01-01");
+        let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_err());
         assert!(filter
             .unwrap_err()
             .to_string()
-            .contains("No valid operator found"));
+            .contains("Unsupported operator: ??"));
     }
 
     #[test]
     fn test_partition_filter_try_from_invalid_value() {
         let schema = create_test_schema();
-        let filter_str = "count = not_a_number";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
+        let filter_tuple = ("count", "=", "not_a_number");
+        let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_err());
         assert!(filter.unwrap_err().to_string().contains("Unable to cast"));
     }
 
     #[test]
-    fn test_parse_to_parts_valid() {
-        let result = PartitionFilter::parse_to_parts("date = 2023-01-01");
-        assert!(result.is_ok());
-        let (field, operator, value) = result.unwrap();
-        assert_eq!(field, "date");
-        assert_eq!(operator, "=");
-        assert_eq!(value, "2023-01-01");
-    }
-
-    #[test]
-    fn test_parse_to_parts_no_operator() {
-        let result = PartitionFilter::parse_to_parts("date 2023-01-01");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No valid operator found"));
-    }
-
-    #[test]
-    fn test_parse_to_parts_multiple_operators() {
-        let result = PartitionFilter::parse_to_parts("count >= 10 <= 20");
-        assert!(result.is_ok());
-        let (field, operator, value) = result.unwrap();
-        assert_eq!(field, "count");
-        assert_eq!(operator, ">=");
-        assert_eq!(value, "10 <= 20");
-    }
-
-    #[test]
     fn test_partition_filter_try_from_all_operators() {
         let schema = create_test_schema();
-        for &op in Operator::supported_tokens() {
-            let filter_str = format!("count {} 10", op);
-            let filter = PartitionFilter::try_from((filter_str.as_str(), &schema));
+        for (op, _) in Operator::TOKEN_OP_PAIRS {
+            let filter_tuple = ("count", op, "10");
+            let filter = PartitionFilter::try_from((filter_tuple, &schema));
             assert!(filter.is_ok(), "Failed for operator: {}", op);
             let filter = filter.unwrap();
             assert_eq!(filter.field.name(), "count");
@@ -427,14 +338,6 @@ mod tests {
         assert!(Operator::from_str("??").is_err());
     }
 
-    #[test]
-    fn test_operator_supported_tokens() {
-        assert_eq!(
-            Operator::supported_tokens(),
-            &["!=", "<=", ">=", "=", "<", ">"]
-        );
-    }
-
     fn create_hudi_configs(is_hive_style: bool, is_url_encoded: bool) -> HudiConfigs {
         HudiConfigs::new([
             (IsHiveStylePartitioning, is_hive_style.to_string()),
@@ -445,7 +348,7 @@ mod tests {
     fn test_partition_pruner_new() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters = vec!["date > 2023-01-01", "category = A"];
+        let filters = vec![("date", ">", "2023-01-01"), ("category", "=", "A")];
 
         let pruner = PartitionPruner::new(&filters, &schema, &configs);
         assert!(pruner.is_ok());
@@ -473,7 +376,7 @@ mod tests {
         assert!(pruner_empty.is_empty());
 
         let pruner_non_empty =
-            PartitionPruner::new(&["date > 2023-01-01"], &schema, &configs).unwrap();
+            PartitionPruner::new(&[("date", ">", "2023-01-01")], &schema, &configs).unwrap();
         assert_not!(pruner_non_empty.is_empty());
     }
 
@@ -481,7 +384,11 @@ mod tests {
     fn test_partition_pruner_should_include() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters = vec!["date > 2023-01-01", "category = A", "count <= 100"];
+        let filters = vec![
+            ("date", ">", "2023-01-01"),
+            ("category", "=", "A"),
+            ("count", "<=", "100"),
+        ];
 
         let pruner = PartitionPruner::new(&filters, &schema, &configs).unwrap();
 
@@ -528,126 +435,5 @@ mod tests {
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
         assert!(pruner.parse_segments("invalid/path").is_err());
-    }
-
-    #[test]
-    fn test_strip_single_quote_for_date_filter() {
-        for data_type in [DataType::Date32, DataType::Date64] {
-            let schema = Schema::new(vec![Field::new("date", data_type.clone(), false)]);
-
-            let cast_options = CastOptions {
-                safe: false,
-                format_options: Default::default(),
-            };
-
-            let value = StringArray::from(vec!["2023-01-01"]);
-            let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
-
-            let filter_str = "date = '2023-01-01'";
-            let filter = PartitionFilter::try_from((filter_str, &schema));
-            assert!(filter.is_ok());
-            let filter = filter.unwrap();
-            assert_eq!(filter.field.name(), "date");
-            assert_eq!(filter.operator, Operator::Eq);
-            assert_eq!(filter.value.get().0.len(), 1);
-            assert_eq!(filter.value.get().0, value.get().0);
-        }
-    }
-
-    #[test]
-    fn test_strip_single_quote_for_time_filter() {
-        for data_type in [
-            DataType::Time32(TimeUnit::Second),
-            DataType::Time64(TimeUnit::Microsecond),
-        ] {
-            let schema = Schema::new(vec![Field::new("time", data_type.clone(), false)]);
-
-            let cast_options = CastOptions {
-                safe: false,
-                format_options: Default::default(),
-            };
-
-            let value = StringArray::from(vec![Some("08:08:35.091323414")]);
-            let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
-
-            let filter_str = "time = '08:08:35.091323414'";
-            let filter = PartitionFilter::try_from((filter_str, &schema));
-            assert!(filter.is_ok());
-            let filter = filter.unwrap();
-            assert_eq!(filter.field.name(), "time");
-            assert_eq!(filter.operator, Operator::Eq);
-            assert_eq!(filter.value.get().0.len(), 1);
-            assert_eq!(filter.value.get().0, value.get().0);
-        }
-    }
-
-    #[test]
-    fn test_strip_single_quote_for_timestamp_filter() {
-        let data_type = DataType::Timestamp(TimeUnit::Second, None);
-        let schema = Schema::new(vec![Field::new("ts", data_type.clone(), false)]);
-
-        let cast_options = CastOptions {
-            safe: false,
-            format_options: Default::default(),
-        };
-
-        let value = StringArray::from(vec![Some("2020-09-08T12:00:00.123456789+00:00")]);
-        let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
-
-        let filter_str = "ts = '2020-09-08T12:00:00.123456789+00:00'";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
-        assert!(filter.is_ok());
-        let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "ts");
-        assert_eq!(filter.operator, Operator::Eq);
-        assert_eq!(filter.value.get().0.len(), 1);
-        assert_eq!(filter.value.get().0, value.get().0);
-    }
-
-    #[test]
-    fn test_strip_single_quote_for_string_filter() {
-        for data_type in [DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8] {
-            let schema = Schema::new(vec![Field::new("category", data_type.clone(), false)]);
-
-            let cast_options = CastOptions {
-                safe: false,
-                format_options: Default::default(),
-            };
-
-            let value = StringArray::from(vec!["foo"]);
-            let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
-
-            let filter_str = "category!='foo'";
-            let filter = PartitionFilter::try_from((filter_str, &schema));
-            assert!(filter.is_ok());
-            let filter = filter.unwrap();
-            assert_eq!(filter.field.name(), "category");
-            assert_eq!(filter.operator, Operator::Ne);
-            assert_eq!(filter.value.get().0.len(), 1);
-            assert_eq!(filter.value.get().0, value.get().0)
-        }
-    }
-
-    #[test]
-    fn test_do_not_strip_one_side_single_quoted_value_for_filter() {
-        let data_type = DataType::Utf8;
-        let schema = Schema::new(vec![Field::new("category", data_type.clone(), false)]);
-
-        let cast_options = CastOptions {
-            safe: false,
-            format_options: Default::default(),
-        };
-
-        let value = StringArray::from(vec!["'foo"]);
-        let value = cast_with_options(&value, &data_type, &cast_options).unwrap();
-
-        let filter_str = "category!='foo";
-        let filter = PartitionFilter::try_from((filter_str, &schema));
-        assert!(filter.is_ok());
-        let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "category");
-        assert_eq!(filter.operator, Operator::Ne);
-        assert_eq!(filter.value.get().0.len(), 1);
-        assert_eq!(filter.value.get().0, value.get().0)
     }
 }

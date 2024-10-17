@@ -29,12 +29,17 @@ use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::table::Table;
 
-macro_rules! vec_string_to_slice {
-    ($vec:expr) => {
-        &$vec.iter().map(AsRef::as_ref).collect::<Vec<_>>()
-    };
+fn convert_vec_to_slice(vec: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
+    vec.iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect()
 }
 
+macro_rules! vec_to_slice {
+    ($vec:expr) => {
+        &convert_vec_to_slice(&$vec)[..]
+    };
+}
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
 #[pyclass]
@@ -154,13 +159,13 @@ impl HudiTable {
     fn split_file_slices(
         &self,
         n: usize,
-        filters: Option<Vec<String>>,
+        filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(
                 self.inner
-                    .split_file_slices(n, vec_string_to_slice!(filters.unwrap_or_default())),
+                    .split_file_slices(n, vec_to_slice!(filters.unwrap_or_default())),
             )?;
             Ok(file_slices
                 .iter()
@@ -172,13 +177,13 @@ impl HudiTable {
     #[pyo3(signature = (filters=None))]
     fn get_file_slices(
         &self,
-        filters: Option<Vec<String>>,
+        filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
             let file_slices = rt().block_on(
                 self.inner
-                    .get_file_slices(vec_string_to_slice!(filters.unwrap_or_default())),
+                    .get_file_slices(vec_to_slice!(filters.unwrap_or_default())),
             )?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
@@ -190,10 +195,14 @@ impl HudiTable {
     }
 
     #[pyo3(signature = (filters=None))]
-    fn read_snapshot(&self, filters: Option<Vec<String>>, py: Python) -> PyResult<PyObject> {
+    fn read_snapshot(
+        &self,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<PyObject> {
         rt().block_on(
             self.inner
-                .read_snapshot(vec_string_to_slice!(filters.unwrap_or_default())),
+                .read_snapshot(vec_to_slice!(filters.unwrap_or_default())),
         )?
         .to_pyarrow(py)
     }
