@@ -85,37 +85,25 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::env;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
-use strum::IntoEnumIterator;
 use url::Url;
 
-use HudiInternalConfig::SkipConfigValidation;
-use HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
-use TableTypeValue::CopyOnWrite;
-
-use crate::config::internal::HudiInternalConfig;
-use crate::config::read::HudiReadConfig;
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
+use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::config::utils::parse_data_for_options;
-use crate::config::utils::{empty_options, split_hudi_options_from_others};
 use crate::config::HudiConfigs;
-use crate::config::HUDI_CONF_DIR;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
-use crate::storage::Storage;
+use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
 
+pub mod builder;
 mod fs_view;
 mod partition;
 mod timeline;
@@ -132,7 +120,7 @@ pub struct Table {
 impl Table {
     /// Create hudi table by base_uri
     pub async fn new(base_uri: &str) -> Result<Self> {
-        Self::new_with_options(base_uri, empty_options()).await
+        TableBuilder::from_base_uri(base_uri).build().await
     }
 
     /// Create hudi table with options
@@ -142,30 +130,22 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let (hudi_configs, storage_options) = Self::load_configs(base_uri, options)
+        TableBuilder::from_base_uri(base_uri)
+            .with_options(options)
+            .build()
             .await
-            .context("Failed to load table properties")?;
-        let hudi_configs = Arc::new(hudi_configs);
-        let storage_options = Arc::new(storage_options);
-
-        let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone())
-            .await
-            .context("Failed to load timeline")?;
-
-        let file_system_view = FileSystemView::new(hudi_configs.clone(), storage_options.clone())
-            .await
-            .context("Failed to load file system view")?;
-
-        Ok(Table {
-            hudi_configs,
-            storage_options,
-            timeline,
-            file_system_view,
-        })
     }
 
     pub fn base_url(&self) -> Result<Url> {
         self.hudi_configs.get(HudiTableConfig::BasePath)?.to_url()
+    }
+
+    pub fn hudi_options(&self) -> HashMap<String, String> {
+        self.hudi_configs.as_options()
+    }
+
+    pub fn storage_options(&self) -> HashMap<String, String> {
+        self.storage_options.as_ref().clone()
     }
 
     #[cfg(feature = "datafusion")]
@@ -179,136 +159,6 @@ impl Table {
         self.file_system_view
             .storage
             .register_object_store(runtime_env.clone());
-    }
-
-    async fn load_configs<I, K, V>(
-        base_uri: &str,
-        all_options: I,
-    ) -> Result<(HudiConfigs, HashMap<String, String>)>
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let mut hudi_options = HashMap::new();
-        let mut other_options = HashMap::new();
-
-        Self::imbue_cloud_env_vars(&mut other_options);
-
-        let (hudi_opts, others) = split_hudi_options_from_others(all_options);
-        hudi_options.extend(hudi_opts);
-        other_options.extend(others);
-
-        hudi_options.insert(
-            HudiTableConfig::BasePath.as_ref().into(),
-            base_uri.to_string(),
-        );
-
-        // create a [Storage] instance to load properties from storage layer.
-        let storage = Storage::new(
-            Arc::new(other_options.clone()),
-            Arc::new(HudiConfigs::new(&hudi_options)),
-        )?;
-
-        Self::imbue_table_properties(&mut hudi_options, storage.clone()).await?;
-
-        Self::imbue_global_hudi_configs_if_not_present(&mut hudi_options, storage.clone()).await?;
-
-        let hudi_configs = HudiConfigs::new(hudi_options);
-
-        Self::validate_configs(&hudi_configs).map(|_| (hudi_configs, other_options))
-    }
-
-    fn imbue_cloud_env_vars(options: &mut HashMap<String, String>) {
-        const PREFIXES: [&str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
-
-        for (key, value) in env::vars() {
-            if PREFIXES.iter().any(|prefix| key.starts_with(prefix))
-                && !options.contains_key(&key.to_ascii_lowercase())
-            {
-                options.insert(key.to_ascii_lowercase(), value);
-            }
-        }
-    }
-
-    async fn imbue_table_properties(
-        options: &mut HashMap<String, String>,
-        storage: Arc<Storage>,
-    ) -> Result<()> {
-        let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let table_properties = parse_data_for_options(&bytes, "=")?;
-
-        // TODO: handle the case where the same key is present in both table properties and options
-        for (k, v) in table_properties {
-            options.insert(k.to_string(), v.to_string());
-        }
-
-        Ok(())
-    }
-
-    async fn imbue_global_hudi_configs_if_not_present(
-        options: &mut HashMap<String, String>,
-        storage: Arc<Storage>,
-    ) -> Result<()> {
-        let global_config_path = env::var(HUDI_CONF_DIR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
-            .join("hudi-defaults.conf");
-
-        if let Ok(bytes) = storage
-            .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
-            .await
-        {
-            if let Ok(global_configs) = parse_data_for_options(&bytes, " \t=") {
-                for (key, value) in global_configs {
-                    if key.starts_with("hoodie.") && !options.contains_key(&key) {
-                        options.insert(key.to_string(), value.to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_configs(hudi_configs: &HudiConfigs) -> Result<()> {
-        if hudi_configs
-            .get_or_default(SkipConfigValidation)
-            .to::<bool>()
-        {
-            return Ok(());
-        }
-
-        for conf in HudiTableConfig::iter() {
-            hudi_configs.validate(conf)?
-        }
-
-        for conf in HudiReadConfig::iter() {
-            hudi_configs.validate(conf)?
-        }
-
-        // additional validation
-        let table_type = hudi_configs.get(TableType)?.to::<String>();
-        if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(anyhow!("Only support copy-on-write table."));
-        }
-
-        let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
-        if !(5..=6).contains(&table_version) {
-            return Err(anyhow!("Only support table version 5 and 6."));
-        }
-
-        let drops_partition_cols = hudi_configs
-            .get_or_default(DropsPartitionFields)
-            .to::<bool>();
-        if drops_partition_cols {
-            return Err(anyhow!(
-                "Only support when `{}` is disabled",
-                DropsPartitionFields.as_ref()
-            ));
-        }
-
-        Ok(())
     }
 
     /// Get the latest [Schema] of the table.
@@ -453,6 +303,7 @@ mod tests {
     };
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::utils::join_url_segments;
+    use crate::storage::Storage;
     use crate::table::Table;
 
     /// Test helper to create a new `Table` instance without validating the configuration.
@@ -471,6 +322,44 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_hudi_table_get_hudi_options() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_options = hudi_table.hudi_options();
+        for (k, v) in hudi_options.iter() {
+            assert!(k.starts_with("hoodie."));
+            assert!(!v.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hudi_table_get_storage_options() {
+        let base_url = TestTable::V6Nonpartitioned.url();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let cloud_prefixes: HashSet<_> = Storage::CLOUD_STORAGE_PREFIXES
+            .iter()
+            .map(|prefix| prefix.to_lowercase())
+            .collect();
+
+        for (key, value) in hudi_table.storage_options.iter() {
+            let key_lower = key.to_lowercase();
+            assert!(
+                cloud_prefixes
+                    .iter()
+                    .any(|prefix| key_lower.starts_with(prefix)),
+                "Storage option key '{}' should start with a cloud storage prefix",
+                key
+            );
+            assert!(
+                !value.is_empty(),
+                "Storage option value for key '{}' should not be empty",
+                key
+            );
+        }
     }
 
     #[tokio::test]
