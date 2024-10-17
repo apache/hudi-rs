@@ -297,7 +297,7 @@ mod tests {
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
         let partition_pruner = PartitionPruner::new(
-            &["byteField < 20", "shortField = 300"],
+            &[("byteField", "<", "20"), ("shortField", "=", "300")],
             &partition_schema,
             hudi_table.hudi_configs.as_ref(),
         )
