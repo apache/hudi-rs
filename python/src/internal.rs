@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::util::convert_vec_to_slice;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -25,22 +26,12 @@ use arrow::pyarrow::ToPyArrow;
 use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
+use crate::util::vec_to_slice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 
-fn convert_vec_to_slice(vec: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
-    vec.iter()
-        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
-        .collect()
-}
-
-macro_rules! vec_to_slice {
-    ($vec:expr) => {
-        &convert_vec_to_slice(&$vec)[..]
-    };
-}
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
 #[pyclass]

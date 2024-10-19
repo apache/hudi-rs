@@ -19,6 +19,7 @@
 use pyo3::prelude::*;
 
 mod internal;
+mod util;
 
 #[cfg(not(tarpaulin))]
 #[pymodule]
