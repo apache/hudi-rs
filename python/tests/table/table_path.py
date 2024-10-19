@@ -16,27 +16,9 @@
 #  under the License.
 
 import os
-import zipfile
-from pathlib import Path, PosixPath
-
-import pytest
-from _pytest.fixtures import SubRequest
-
-from tests.table.table_path import get_table_path
+from pathlib import Path
 
 
-def _extract_testing_table(zip_file_path: Path, target_path: PosixPath) -> str:
-    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-        zip_ref.extractall(target_path)
-    return os.path.join(target_path, "trips_table")
-
-
-@pytest.fixture(
-    params=[
-        "0.x_cow_partitioned",
-    ]
-)
-def get_sample_table(request: SubRequest, tmp_path: PosixPath) -> str:
-    table_name = request.param
-    zip_file_path = get_table_path(table_name)
-    return _extract_testing_table(zip_file_path, tmp_path)
+def get_table_path(table_name: str) -> Path:
+    absolute_cwd = os.path.abspath(os.path.dirname(__file__))
+    return Path(absolute_cwd).joinpath(f"{table_name}.zip")
