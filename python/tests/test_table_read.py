@@ -129,7 +129,7 @@ def test_read_table_for_partition(get_sample_table):
     table_path = get_sample_table
     table = HudiTable(table_path)
 
-    batches = table.read_snapshot(["city = san_francisco"])
+    batches = table.read_snapshot([("city", "=", "san_francisco")])
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {

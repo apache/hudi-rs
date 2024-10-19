@@ -47,3 +47,4 @@ pub mod config;
 pub mod file_group;
 pub mod storage;
 pub mod table;
+pub mod util;
