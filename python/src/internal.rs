@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use hudi::util::convert_vec_to_slice;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -30,6 +30,7 @@ use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
+use hudi::util::convert_vec_to_slice;
 use hudi::util::vec_to_slice;
 
 #[cfg(not(tarpaulin))]
