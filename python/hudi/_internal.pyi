@@ -39,6 +39,7 @@ class HudiFileGroupReader:
             options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
+
     def read_file_slice_by_base_file_path(
         self, relative_path: str
     ) -> "pyarrow.RecordBatch":
