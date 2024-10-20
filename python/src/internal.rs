@@ -23,21 +23,22 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use arrow::pyarrow::ToPyArrow;
-use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
-use tokio::runtime::Runtime;
-
+use hudi::config::table::HudiTableConfig;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::util::convert_vec_to_slice;
 use hudi::util::vec_to_slice;
+use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
+use tokio::runtime::Runtime;
 
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
 #[pyclass]
 pub struct HudiFileGroupReader {
-    inner: FileGroupReader,
+    base_uri: String,
+    options: HashMap<String, String>,
 }
 
 #[cfg(not(tarpaulin))]
@@ -45,9 +46,11 @@ pub struct HudiFileGroupReader {
 impl HudiFileGroupReader {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
-    fn new(base_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
-        let inner = FileGroupReader::new_with_options(base_uri, options.unwrap_or_default())?;
-        Ok(HudiFileGroupReader { inner })
+    fn new(base_uri: &str, options: Option<HashMap<String, String>>) -> Self {
+        HudiFileGroupReader {
+            base_uri: base_uri.to_string(),
+            options: options.unwrap_or_default(),
+        }
     }
 
     fn read_file_slice_by_base_file_path(
@@ -55,8 +58,11 @@ impl HudiFileGroupReader {
         relative_path: &str,
         py: Python,
     ) -> PyResult<PyObject> {
-        rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))?
-            .to_pyarrow(py)
+        rt().block_on({
+            FileGroupReader::new_with_options(&self.base_uri, &self.options)?
+                .read_file_slice_by_base_file_path(relative_path)
+        })?
+        .to_pyarrow(py)
     }
 }
 
@@ -191,8 +197,14 @@ impl HudiTable {
     }
 
     fn create_file_group_reader(&self) -> PyResult<HudiFileGroupReader> {
-        let fg_reader = self.inner.create_file_group_reader();
-        Ok(HudiFileGroupReader { inner: fg_reader })
+        let mut options = self.inner.storage_options();
+        options.extend(self.inner.hudi_options());
+        let base_uri = self
+            .inner
+            .hudi_configs
+            .get(HudiTableConfig::BasePath)?
+            .to::<String>();
+        Ok(HudiFileGroupReader::new(&base_uri, Some(options)))
     }
 
     #[pyo3(signature = (filters=None))]
