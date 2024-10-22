@@ -225,7 +225,7 @@ impl Table {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
-            PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+            PartitionPruner::try_from((filters, &partition_schema, self.hudi_configs.as_ref()))?;
         self.file_system_view
             .get_file_slices_as_of(timestamp, &partition_pruner, &excludes)
             .await

@@ -296,11 +296,13 @@ mod tests {
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
-        let partition_pruner = PartitionPruner::new(
-            &[("byteField", "<", "20"), ("shortField", "=", "300")],
+        let filters: &[(&str, &str, &str)] =
+            &[("byteField", "<", "20"), ("shortField", "=", "300")];
+        let partition_pruner = PartitionPruner::try_from((
+            filters,
             &partition_schema,
             hudi_table.hudi_configs.as_ref(),
-        )
+        ))
         .unwrap();
         let file_slices = fs_view
             .get_file_slices_as_of("20240418173235694", &partition_pruner, excludes)

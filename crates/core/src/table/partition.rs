@@ -38,16 +38,78 @@ pub struct PartitionPruner {
     and_filters: Vec<PartitionFilter>,
 }
 
-impl PartitionPruner {
-    pub fn new(
-        and_filters: &[(&str, &str, &str)],
-        partition_schema: &Schema,
-        hudi_configs: &HudiConfigs,
+impl TryFrom<(&[(&str, &str, &str)], &Schema, &HudiConfigs)> for PartitionPruner {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        (and_filters, partition_schema, hudi_configs): (
+            &[(&str, &str, &str)],
+            &Schema,
+            &HudiConfigs,
+        ),
     ) -> Result<Self> {
         let and_filters = and_filters
             .iter()
             .map(|filter| PartitionFilter::try_from((*filter, partition_schema)))
             .collect::<Result<Vec<PartitionFilter>>>()?;
+
+        let schema = Arc::new(partition_schema.clone());
+        let is_hive_style: bool = hudi_configs
+            .get_or_default(HudiTableConfig::IsHiveStylePartitioning)
+            .to();
+        let is_url_encoded: bool = hudi_configs
+            .get_or_default(HudiTableConfig::IsPartitionPathUrlencoded)
+            .to();
+        Ok(PartitionPruner {
+            schema,
+            is_hive_style,
+            is_url_encoded,
+            and_filters,
+        })
+    }
+}
+
+impl TryFrom<(&[(&str, &str, &[&str])], &Schema, &HudiConfigs)> for PartitionPruner {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        (and_filters, partition_schema, hudi_configs): (
+            &[(&str, &str, &[&str])],
+            &Schema,
+            &HudiConfigs,
+        ),
+    ) -> Result<Self> {
+        let and_filters = and_filters
+            .iter()
+            .map(|filter| PartitionFilter::try_from((*filter, partition_schema)))
+            .collect::<Result<Vec<PartitionFilter>>>()?;
+
+        let schema = Arc::new(partition_schema.clone());
+        let is_hive_style: bool = hudi_configs
+            .get_or_default(HudiTableConfig::IsHiveStylePartitioning)
+            .to();
+        let is_url_encoded: bool = hudi_configs
+            .get_or_default(HudiTableConfig::IsPartitionPathUrlencoded)
+            .to();
+        Ok(PartitionPruner {
+            schema,
+            is_hive_style,
+            is_url_encoded,
+            and_filters,
+        })
+    }
+}
+
+impl PartitionPruner {
+    pub fn new(
+        and_filters: Vec<PartitionFilter>,
+        partition_schema: &Schema,
+        hudi_configs: &HudiConfigs,
+    ) -> Result<Self> {
+        // let and_filters = and_filters
+        //     .iter()
+        //     .map(|filter| PartitionFilter::try_from((*filter, partition_schema)))
+        //     .collect::<Result<Vec<PartitionFilter>>>()?;
 
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs
@@ -87,23 +149,87 @@ impl PartitionPruner {
         };
 
         self.and_filters.iter().all(|filter| {
-            match segments.get(filter.field.name()) {
-                Some(segment_value) => {
-                    let comparison_result = match filter.operator {
-                        Operator::Eq => eq(segment_value, &filter.value),
-                        Operator::Ne => neq(segment_value, &filter.value),
-                        Operator::Lt => lt(segment_value, &filter.value),
-                        Operator::Lte => lt_eq(segment_value, &filter.value),
-                        Operator::Gt => gt(segment_value, &filter.value),
-                        Operator::Gte => gt_eq(segment_value, &filter.value),
-                    };
-
-                    match comparison_result {
-                        Ok(scalar) => scalar.value(0),
-                        Err(_) => true, // Include the partition when comparison error occurs
+            match filter {
+                PartitionFilter::Eq { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        match eq(segment_value, value) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        }
+                    } else {
+                        true // Field not found, include partition
                     }
                 }
-                None => true, // Include the partition when filtering field does not match any field in the partition
+                PartitionFilter::Ne { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        match neq(segment_value, value) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        }
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
+                PartitionFilter::Lt { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        match lt(segment_value, value) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        }
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
+                PartitionFilter::Lte { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        match lt_eq(segment_value, value) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        }
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
+                PartitionFilter::Gt { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        match gt(segment_value, value) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        }
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
+                PartitionFilter::Gte { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        match gt_eq(segment_value, value) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        }
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
+                PartitionFilter::In { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        !value.iter().any(|val| match eq(segment_value, val) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        })
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
+                PartitionFilter::NotIn { field, value } => {
+                    if let Some(segment_value) = segments.get(field.name()) {
+                        value.iter().any(|val| match eq(segment_value, val) {
+                            Ok(scalar) => scalar.value(0),
+                            Err(_) => true, // Include the partition when comparison error occurs
+                        })
+                    } else {
+                        true // Field not found, include partition
+                    }
+                }
             }
         })
     }
@@ -163,16 +289,20 @@ enum Operator {
     Lte,
     Gt,
     Gte,
+    In,
+    NotIn,
 }
 
 impl Operator {
-    const TOKEN_OP_PAIRS: [(&'static str, Operator); 6] = [
+    const TOKEN_OP_PAIRS: [(&'static str, Operator); 8] = [
         ("=", Operator::Eq),
         ("!=", Operator::Ne),
         ("<", Operator::Lt),
         ("<=", Operator::Lte),
         (">", Operator::Gt),
         (">=", Operator::Gte),
+        ("in", Operator::In),
+        ("not in", Operator::NotIn),
     ];
 }
 
@@ -189,10 +319,39 @@ impl FromStr for Operator {
 
 /// A partition filter that represents a filter expression for partition pruning.
 #[derive(Debug, Clone)]
-pub struct PartitionFilter {
-    field: Field,
-    operator: Operator,
-    value: Scalar<ArrayRef>,
+pub enum PartitionFilter {
+    Eq {
+        field: Field,
+        value: Scalar<ArrayRef>,
+    },
+    Ne {
+        field: Field,
+        value: Scalar<ArrayRef>,
+    },
+    Lt {
+        field: Field,
+        value: Scalar<ArrayRef>,
+    },
+    Lte {
+        field: Field,
+        value: Scalar<ArrayRef>,
+    },
+    Gt {
+        field: Field,
+        value: Scalar<ArrayRef>,
+    },
+    Gte {
+        field: Field,
+        value: Scalar<ArrayRef>,
+    },
+    In {
+        field: Field,
+        value: Vec<Scalar<ArrayRef>>,
+    },
+    NotIn {
+        field: Field,
+        value: Vec<Scalar<ArrayRef>>,
+    },
 }
 
 impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
@@ -213,11 +372,55 @@ impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
             .with_context(|| format!("Unable to cast {:?} as {:?}", value, field.data_type()))?;
 
         let field = field.clone();
-        Ok(PartitionFilter {
-            field,
-            operator,
-            value,
-        })
+
+        let partition_filter = match operator {
+            Operator::Eq => PartitionFilter::Eq { field, value },
+            Operator::Ne => PartitionFilter::Ne { field, value },
+            Operator::Lt => PartitionFilter::Lt { field, value },
+            Operator::Lte => PartitionFilter::Lte { field, value },
+            Operator::Gt => PartitionFilter::Gt { field, value },
+            Operator::Gte => PartitionFilter::Gte { field, value },
+            _ => panic!("Not supported"),
+        };
+        Ok(partition_filter)
+    }
+}
+
+impl TryFrom<((&str, &str, &[&str]), &Schema)> for PartitionFilter {
+    type Error = anyhow::Error;
+
+    fn try_from((filter, partition_schema): ((&str, &str, &[&str]), &Schema)) -> Result<Self> {
+        let (field_name, operator_str, value_vec) = filter;
+
+        let field: &Field = partition_schema
+            .field_with_name(field_name)
+            .with_context(|| format!("Field '{}' not found in partition schema", field_name))?;
+
+        let operator = Operator::from_str(operator_str)
+            .with_context(|| format!("Unsupported operator: {}", operator_str))?;
+
+        let value_vec = value_vec
+            .iter()
+            .map(|value| {
+                Self::cast_value(&[value], field.data_type()).with_context(|| {
+                    format!("Unable to cast {:?} as {:?}", value, field.data_type())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let field = field.clone();
+        let partition_filter = match operator {
+            Operator::In => PartitionFilter::In {
+                field,
+                value: value_vec,
+            },
+            Operator::NotIn => PartitionFilter::NotIn {
+                field,
+                value: value_vec,
+            },
+            _ => panic!("Not supported"),
+        };
+        Ok(partition_filter)
     }
 }
 
@@ -245,7 +448,7 @@ mod tests {
         IsHiveStylePartitioning, IsPartitionPathUrlencoded,
     };
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::{Array, Datum};
+    use arrow_array::Datum;
     use hudi_tests::assert_not;
     use std::str::FromStr;
 
@@ -264,21 +467,33 @@ mod tests {
         let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_ok());
         let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "date");
-        assert_eq!(filter.operator, Operator::Eq);
-        assert_eq!(filter.value.get().0.len(), 1);
+        let (field, value) = match filter {
+            PartitionFilter::Eq {
+                ref field,
+                ref value,
+            } => (field, value),
+            _ => panic!("Cannot unpack partition filter to values"),
+        };
+        assert!(matches!(filter, PartitionFilter::Eq { .. }));
+        assert_eq!(field.name(), "date");
+        assert_eq!(value.get().0.len(), 1);
 
         let filter_tuple = ("category", "!=", "foo");
         let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_ok());
         let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "category");
-        assert_eq!(filter.operator, Operator::Ne);
-        assert_eq!(filter.value.get().0.len(), 1);
-        assert_eq!(
-            StringArray::from(filter.value.into_inner().to_data()).value(0),
-            "foo"
-        )
+        let (field, value) = match filter {
+            PartitionFilter::Ne {
+                ref field,
+                ref value,
+            } => (field, value),
+            _ => panic!("Cannot unpack partition filter to values"),
+        };
+        assert!(matches!(filter, PartitionFilter::Ne { .. }));
+        assert_eq!(field.name(), "category");
+
+        assert_eq!(value.get().0.len(), 1);
+        assert_eq!(StringArray::from(value.get().0.to_data()).value(0), "foo")
     }
 
     #[test]
@@ -315,15 +530,44 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_filter_try_from_all_operators() {
+    fn test_partition_filter_try_from_scalar_operators() {
         let schema = create_test_schema();
-        for (op, _) in Operator::TOKEN_OP_PAIRS {
-            let filter_tuple = ("count", op, "10");
+
+        for (op_str, op) in &Operator::TOKEN_OP_PAIRS[0..6] {
+            let filter_tuple = ("count", *op_str, "10");
             let filter = PartitionFilter::try_from((filter_tuple, &schema));
-            assert!(filter.is_ok(), "Failed for operator: {}", op);
+            assert!(filter.is_ok(), "Failed for operator: {}", op_str);
             let filter = filter.unwrap();
-            assert_eq!(filter.field.name(), "count");
-            assert_eq!(filter.operator, Operator::from_str(op).unwrap());
+            let (field, operator) = match filter {
+                PartitionFilter::Eq { field, value: _ } => (field, Operator::Eq),
+                PartitionFilter::Ne { field, value: _ } => (field, Operator::Ne),
+                PartitionFilter::Lt { field, value: _ } => (field, Operator::Lt),
+                PartitionFilter::Lte { field, value: _ } => (field, Operator::Lte),
+                PartitionFilter::Gt { field, value: _ } => (field, Operator::Gt),
+                PartitionFilter::Gte { field, value: _ } => (field, Operator::Gte),
+                _ => panic!(),
+            };
+            assert_eq!(field.name(), "count");
+            assert_eq!(operator, *op);
+        }
+    }
+
+    #[test]
+    fn test_partition_filter_try_from_list_operators() {
+        let schema = create_test_schema();
+        // let tokens =
+        for (op_str, op) in &Operator::TOKEN_OP_PAIRS[6..8] {
+            let filter_tuple = ("count", *op_str, &["10"] as &[&str]);
+            let filter = PartitionFilter::try_from((filter_tuple, &schema));
+            assert!(filter.is_ok(), "Failed for operator: {}", op_str);
+            let filter = filter.unwrap();
+            let (field, operator) = match filter {
+                PartitionFilter::In { field, value: _ } => (field, Operator::In),
+                PartitionFilter::NotIn { field, value: _ } => (field, Operator::NotIn),
+                _ => panic!(),
+            };
+            assert_eq!(field.name(), "count");
+            assert_eq!(operator, *op);
         }
     }
 
@@ -348,13 +592,28 @@ mod tests {
     fn test_partition_pruner_new() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters = vec![("date", ">", "2023-01-01"), ("category", "=", "A")];
+        let filters: &[(&str, &str, &str)] = &[("date", ">", "2023-01-01"), ("category", "=", "A")];
 
-        let pruner = PartitionPruner::new(&filters, &schema, &configs);
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs));
         assert!(pruner.is_ok());
 
         let pruner = pruner.unwrap();
         assert_eq!(pruner.and_filters.len(), 2);
+        assert!(pruner.is_hive_style);
+        assert_not!(pruner.is_url_encoded);
+    }
+
+    #[test]
+    fn test_partition_pruner_in_filter() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+        let filters: &[(&str, &str, &[&str])] = &[("date", "in", &["2023-01-01", "2023-01-02"])];
+
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs));
+        assert!(pruner.is_ok());
+
+        let pruner = pruner.unwrap();
+        assert_eq!(pruner.and_filters.len(), 1);
         assert!(pruner.is_hive_style);
         assert_not!(pruner.is_url_encoded);
     }
@@ -371,12 +630,12 @@ mod tests {
     fn test_partition_pruner_is_empty() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(false, false);
-
-        let pruner_empty = PartitionPruner::new(&[], &schema, &configs).unwrap();
+        let filters: &[(&str, &str, &str)] = &[];
+        let pruner_empty = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
         assert!(pruner_empty.is_empty());
 
-        let pruner_non_empty =
-            PartitionPruner::new(&[("date", ">", "2023-01-01")], &schema, &configs).unwrap();
+        let filters: &[(&str, &str, &str)] = &[("date", ">", "2023-01-01")];
+        let pruner_non_empty = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
         assert_not!(pruner_non_empty.is_empty());
     }
 
@@ -384,13 +643,13 @@ mod tests {
     fn test_partition_pruner_should_include() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters = vec![
+        let filters: &[(&str, &str, &str)] = &[
             ("date", ">", "2023-01-01"),
             ("category", "=", "A"),
             ("count", "<=", "100"),
         ];
 
-        let pruner = PartitionPruner::new(&filters, &schema, &configs).unwrap();
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
 
         assert!(pruner.should_include("date=2023-02-01/category=A/count=10"));
         assert!(pruner.should_include("date=2023-02-01/category=A/count=100"));
@@ -402,7 +661,8 @@ mod tests {
     fn test_partition_pruner_parse_segments() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+        let filters: &[(&str, &str, &str)] = &[];
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
 
         let segments = pruner
             .parse_segments("date=2023-02-01/category=A/count=10")
@@ -417,7 +677,8 @@ mod tests {
     fn test_partition_pruner_url_encoded() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, true);
-        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+        let filters: &[(&str, &str, &str)] = &[];
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
 
         let segments = pruner
             .parse_segments("date%3D2023-02-01%2Fcategory%3DA%2Fcount%3D10")
@@ -432,7 +693,8 @@ mod tests {
     fn test_partition_pruner_invalid_path() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+        let filters: &[(&str, &str, &str)] = &[];
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
 
         assert!(pruner.parse_segments("invalid/path").is_err());
     }
