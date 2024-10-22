@@ -661,9 +661,7 @@ mod tests {
     fn test_partition_pruner_should_include_values_in() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters: &[(&str, &str, &[&str])] = &[
-            ("date", "in", &["2023-02-01", "2022-12-31"]),
-        ];
+        let filters: &[(&str, &str, &[&str])] = &[("date", "in", &["2023-02-01", "2022-12-31"])];
 
         let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
 
@@ -676,9 +674,8 @@ mod tests {
     fn test_partition_pruner_should_include_values_not_in() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters: &[(&str, &str, &[&str])] = &[
-            ("date", "not in", &["2023-02-01", "2022-12-31"]),
-        ];
+        let filters: &[(&str, &str, &[&str])] =
+            &[("date", "not in", &["2023-02-01", "2022-12-31"])];
 
         let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
 
