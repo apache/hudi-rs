@@ -212,7 +212,7 @@ impl PartitionPruner {
                 }
                 PartitionFilter::In { field, value } => {
                     if let Some(segment_value) = segments.get(field.name()) {
-                        !value.iter().any(|val| match eq(segment_value, val) {
+                        value.iter().any(|val| match eq(segment_value, val) {
                             Ok(scalar) => scalar.value(0),
                             Err(_) => true, // Include the partition when comparison error occurs
                         })
@@ -222,7 +222,7 @@ impl PartitionPruner {
                 }
                 PartitionFilter::NotIn { field, value } => {
                     if let Some(segment_value) = segments.get(field.name()) {
-                        value.iter().any(|val| match eq(segment_value, val) {
+                        !value.iter().any(|val| match eq(segment_value, val) {
                             Ok(scalar) => scalar.value(0),
                             Err(_) => true, // Include the partition when comparison error occurs
                         })
@@ -655,6 +655,36 @@ mod tests {
         assert!(pruner.should_include("date=2023-02-01/category=A/count=100"));
         assert_not!(pruner.should_include("date=2022-12-31/category=A/count=10"));
         assert_not!(pruner.should_include("date=2023-02-01/category=B/count=10"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_values_in() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+        let filters: &[(&str, &str, &[&str])] = &[
+            ("date", "in", &["2023-02-01", "2022-12-31"]),
+        ];
+
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
+
+        assert!(pruner.should_include("date=2023-02-01/category=A/count=10"));
+        assert!(pruner.should_include("date=2022-12-31/category=A/count=10"));
+        assert_not!(pruner.should_include("date=2021-12-31/category=A/count=10"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_values_not_in() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+        let filters: &[(&str, &str, &[&str])] = &[
+            ("date", "not in", &["2023-02-01", "2022-12-31"]),
+        ];
+
+        let pruner = PartitionPruner::try_from((filters, &schema, &configs)).unwrap();
+
+        assert_not!(pruner.should_include("date=2023-02-01/category=A/count=10"));
+        assert_not!(pruner.should_include("date=2022-12-31/category=A/count=10"));
+        assert!(pruner.should_include("date=2021-12-31/category=A/count=10"));
     }
 
     #[test]
