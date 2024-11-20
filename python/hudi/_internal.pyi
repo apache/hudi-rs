@@ -141,11 +141,11 @@ class HudiTable:
             Dict[str, str]: A dictionary of storage options.
         """
         ...
-    def split_file_slices(
+    def get_file_slices_splits(
         self, n: int, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[List[HudiFileSlice]]:
         """
-        Splits the file slices into 'n' parts, optionally filtered by given filters.
+        Retrieves all file slices in the Hudi table in 'n' splits, optionally filtered by given filters.
 
         Parameters:
             n (int): The number of parts to split the file slices into.
