@@ -80,7 +80,7 @@ def test_read_table_can_read_from_batches(get_sample_table):
     assert t.num_rows == 1
     assert t.num_columns == 11
 
-    file_slices_gen = iter(table.split_file_slices(2))
+    file_slices_gen = iter(table.get_file_slices_splits(2))
     assert len(next(file_slices_gen)) == 3
     assert len(next(file_slices_gen)) == 2
 
