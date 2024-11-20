@@ -157,7 +157,7 @@ impl HudiTable {
     }
 
     #[pyo3(signature = (n, filters=None))]
-    fn split_file_slices(
+    fn get_file_slices_splits(
         &self,
         n: usize,
         filters: Option<Vec<(String, String, String)>>,
@@ -166,7 +166,7 @@ impl HudiTable {
         py.allow_threads(|| {
             let file_slices = rt().block_on(
                 self.inner
-                    .split_file_slices(n, vec_to_slice!(filters.unwrap_or_default())),
+                    .get_file_slices_splits(n, vec_to_slice!(filters.unwrap_or_default())),
             )?;
             Ok(file_slices
                 .iter()

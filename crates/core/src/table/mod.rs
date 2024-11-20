@@ -66,7 +66,7 @@
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
 //!     let file_slices = hudi_table
-//!             .split_file_slices(2, &[])
+//!             .get_file_slices_splits(2, &[])
 //!             .await.unwrap();
 //!     // define every parquet task reader how many slice
 //!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
@@ -186,14 +186,22 @@ impl Table {
         Ok(Schema::new(partition_fields))
     }
 
-    /// Split the file into a specified number of parts
-    pub async fn split_file_slices(
+    /// Get all the [FileSlice]s in the table.
+    ///
+    /// The file slices are split into `n` chunks.
+    ///
+    /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
+    pub async fn get_file_slices_splits(
         &self,
         n: usize,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
-        let n = std::cmp::max(1, n);
         let file_slices = self.get_file_slices(filters).await?;
+        if file_slices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let n = std::cmp::max(1, n);
         let chunk_size = (file_slices.len() + n - 1) / n;
 
         Ok(file_slices
@@ -612,6 +620,26 @@ mod tests {
             .unwrap();
         assert_eq!(batches.num_rows(), 4);
         assert_eq!(batches.num_columns(), 21);
+    }
+
+    #[tokio::test]
+    async fn empty_hudi_table_get_file_slices_splits() {
+        let base_url = TestTable::V6Empty.url();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices_splits = hudi_table.get_file_slices_splits(2, &[]).await.unwrap();
+        assert!(file_slices_splits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_splits() {
+        let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices_splits = hudi_table.get_file_slices_splits(2, &[]).await.unwrap();
+        assert_eq!(file_slices_splits.len(), 2);
+        assert_eq!(file_slices_splits[0].len(), 2);
+        assert_eq!(file_slices_splits[1].len(), 1);
     }
 
     #[tokio::test]

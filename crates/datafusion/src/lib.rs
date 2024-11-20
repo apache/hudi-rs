@@ -105,7 +105,7 @@ impl TableProvider for HudiDataSource {
         let file_slices = self
             .table
             // TODO: implement supports_filters_pushdown() to pass filters to Hudi table API
-            .split_file_slices(self.get_input_partitions(), &[])
+            .get_file_slices_splits(self.get_input_partitions(), &[])
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
