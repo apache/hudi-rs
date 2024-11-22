@@ -21,17 +21,18 @@
 
 ## Start a tracking issue
 
-```markdown
-*This issue is for tracking tasks of releasing `hudi-rs` {version}.*
+Create a tracking issue for the release with title `Tracking issue for release <release version>`. Add the issue to the
+corresponding milestone for the release, and edit the issue description as below.
 
+```markdown
 ## Tasks
 
 ### Issues
 
 - [ ] All remaining issues in the [milestone](https://github.com/apache/hudi-rs/milestone/1) should be closed.
 
-> ![IMPORTANT]
-> Blockers to highlight
+> [!IMPORTANT]
+> Highlight blocker issues if any
 
 - [ ] https://github.com/apache/hudi-rs/issues/41
 - [ ] https://github.com/apache/hudi-rs/issues/42
@@ -47,7 +48,7 @@
 - [ ] Upload artifacts to the SVN dist repo
 - [ ] Start VOTE in dev email list
 
-> ![IMPORTANT]
+> [!IMPORTANT]
 > Proceed from here only after VOTE passes.
 
 ### Official release
@@ -59,7 +60,7 @@
 
 ## GitHub work
 
-> ![NOTE]
+> [!NOTE]
 > We adhere to [Semantic Versioning](https://semver.org/), and create a release branch for each major or minor release.
 
 ### Bump version in main branch
@@ -92,13 +93,37 @@ On the release branch, bump the version to indicate pre-release by pushing a com
 cargo set-version 0.2.0-rc.1 --manifest-path crates/hudi/Cargo.toml
 ```
 
+### Generate changelog
+
+We use [cliff](https://git-cliff.org/) to generate changelogs. Install it by running the below command.
+
+```shell
+cargo install git-cliff
+```
+
+Switch to the release branch (org: apache/hudi-rs), generate a changelog for the release by running the below script.
+
+```shell
+# specify the previous release version
+
+# for mac
+git cliff release-{previous_release_version}..HEAD | pbcopy
+
+# for linux
+git cliff release-{previous_release_version}..HEAD | xclip
+```
+
+Paste the changelog output as a comment on the tracking issue.
+
 ### Testing
 
 Once the "bump version" commit is pushed, CI will be triggered and all tests need to pass before proceed to the next.
 
+Perform any release related tests, such as integration tests, before proceeding to the next step.
+
 ### Push tag
 
-> ![IMPORTANT]
+> [!IMPORTANT]
 > The version in the code should be the target release version.
 
 Push a tag to the commit that matches to the version in the form of `release-*`. For example,
@@ -106,9 +131,13 @@ Push a tag to the commit that matches to the version in the form of `release-*`.
 - If the release is `0.1.0-rc.1`, the tag should `release-0.1.0-rc.1`
 - If the release is `2.0.0-beta.2`, the tag should `release-2.0.0-beta.2`
 
-> ![CAUTION]
+> [!CAUTION]
 > Pushing a matching tag to the upstream (apache) branch will trigger CI to publish the artifacts to crates.io and
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
+
+```shell
+git push origin release-0.1.0-rc.1
+```
 
 Once the CI completes, check crates.io and pypi.org for the new release artifacts.
 
@@ -167,5 +196,71 @@ Release Manager
 [8] https://crates.io/crates/hudi/0.1.0-rc.2
 ```
 
-### After VOTE passes
+## After VOTE passes
 
+### Bump version in the release branch
+
+Remove the pre-release suffix from the version in the release branch.
+
+```shell
+cargo set-version 0.2.0 --manifest-path crates/hudi/Cargo.toml
+```
+
+### Push the release tag
+
+> [!CAUTION]
+> Pushing a matching tag to the upstream (apache) branch will trigger CI to publish the artifacts to crates.io and
+> pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
+
+```shell
+git push origin release-0.2.0
+```
+
+Once the CI completes, check crates.io and pypi.org for the new release artifacts.
+
+### Update the change log
+
+Use `git cliff` to prepend the current release's change to `changelog.md` in the main branch.
+
+Close the tracking issue.
+
+### Send `ANNOUNCE` email
+
+```text
+subject: [ANNOUNCE] hudi-rs 0.1.0 released
+
+Hi all,
+
+The Apache Hudi community is pleased to announce the release 0.1.0 of
+hudi-rs <https://github.com/apache/hudi-rs>, a native Rust library for
+Apache Hudi, with bindings into Python.
+
+Highlights for this release:
+
+<insert highlights here based on the changelog>
+
+The release notes can be found here
+https://github.com/apache/hudi-rs/releases/tag/release-0.1.0
+
+The source releases are available here
+https://dist.apache.org/repos/dist/release/hudi/hudi-rs-0.1.0/
+
+Please refer to the readme for installation and usage examples
+https://github.com/apache/hudi-rs/blob/main/README.md
+
+The Hudi community is active on these channels - we welcome you to engage 
+with us!
+
+- LinkedIn <https://www.linkedin.com/company/apache-hudi/>
+- X/Twitter <ht...@apachehudi>
+- YouTube <ht...@apachehudi>
+- Slack support
+<https://join.slack.com/t/apache-hudi/shared_invite/zt-2ggm1fub8-_yt4Reu9djwqqVRFC7X49g>
+
+For users in China, follow WeChat "ApacheHudi" 微信公众号 for news and blogs,
+and join DingTalk group 钉钉群 35087066 for questions.
+
+Cheers,
+
+<name>, Release manager
+```
