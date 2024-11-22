@@ -62,29 +62,30 @@ users and projects.
 Read a Hudi table into a PyArrow table.
 
 ```python
-from hudi import HudiTable
-
-hudi_table = HudiTable("/tmp/trips_table")
-records = hudi_table.read_snapshot()
-
+from hudi import HudiTableBuilder
 import pyarrow as pa
-import pyarrow.compute as pc
+
+hudi_table = (
+    HudiTableBuilder
+    .from_base_uri("/tmp/trips_table")
+    .with_option("hoodie.read.as.of.timestamp", "0")
+    .build()
+)
+records = hudi_table.read_snapshot(filters=[("city", "=", "san_francisco")])
 
 arrow_table = pa.Table.from_batches(records)
-result = arrow_table.select(
-    ["rider", "ts", "fare"]).filter(
-    pc.field("fare") > 20.0)
+result = arrow_table.select(["rider", "city", "ts", "fare"])
 print(result)
 ```
 
-### Rust
+### Rust (DataFusion)
 
 <details>
 <summary>Add crate hudi with datafusion feature to your application to query a Hudi table.</summary>
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@39
+cargo add tokio@1 datafusion@42
 cargo add hudi --features datafusion
 ```
 
@@ -102,9 +103,11 @@ use hudi::HudiDataSource;
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = SessionContext::new();
-    let hudi = HudiDataSource::new("/tmp/trips_table").await?;
+    let hudi = HudiDataSource::new_with_options(
+        "/tmp/trips_table",
+        [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
     ctx.register_table("trips_table", Arc::new(hudi))?;
-    let df: DataFrame = ctx.sql("SELECT * from trips_table where fare > 20.0").await?;
+    let df: DataFrame = ctx.sql("SELECT * from trips_table where city = 'san_francisco'").await?;
     df.show().await?;
     Ok(())
 }
@@ -115,6 +118,35 @@ async fn main() -> Result<()> {
 Ensure cloud storage credentials are set properly as environment variables, e.g., `AWS_*`, `AZURE_*`, or `GOOGLE_*`.
 Relevant storage environment variables will then be picked up. The target table's base uri with schemes such
 as `s3://`, `az://`, or `gs://` will be processed accordingly.
+
+Alternatively, you can pass the storage configuration as options to the `HudiTableBuilder` or `HudiDataSource`.
+
+### Python
+
+```python
+from hudi import HudiTableBuilder
+
+hudi_table = (
+    HudiTableBuilder
+    .from_base_uri("s3://bucket/trips_table")
+    .with_option("aws_region", "us-west-2")
+    .build()
+)
+```
+
+### Rust (DataFusion)
+
+```rust
+use hudi::HudiDataSource;
+
+async fn main() -> Result<()> {
+    let hudi = HudiDataSource::new_with_options(
+        "s3://bucket/trips_table",
+        [("aws_region", "us-west-2")]
+    ).await?;
+}
+
+```
 
 ## Contributing
 
