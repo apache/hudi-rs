@@ -68,7 +68,7 @@ import pyarrow as pa
 hudi_table = (
     HudiTableBuilder
     .from_base_uri("/tmp/trips_table")
-    .with_option("hoodie.read.as.of.timestamp", "0")
+    .with_option("hoodie.read.as.of.timestamp", "20241122010827898")
     .build()
 )
 records = hudi_table.read_snapshot(filters=[("city", "=", "san_francisco")])

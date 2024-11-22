@@ -85,15 +85,21 @@ make test-python
 pytest -s
 
 # for a specific test case
-pytest tests/test_table_read.py -s -k "test_sample_table"
+pytest tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
 ```
 
 ## Before creating a pull request
 
-Run check command and follow the suggestions to fix the code.
+Run test commands to make sure the code is working as expected.
 
 ```shell
-make check-rust
+make test-rust test-python
+```
+
+Run check commands and follow the suggestions to fix the code.
+
+```shell
+make check-rust check-python
 ```
 
 ## Create a pull request

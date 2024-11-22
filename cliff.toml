@@ -90,6 +90,7 @@ commit_parsers = [
   { message = "^chore\\(pr\\)", skip = true },
   { message = "^chore\\(pull\\)", skip = true },
   { message = "^build: bump version", skip = true },
+  { message = "^build\\(release\\): bump version", skip = true },
   { message = "^build", group = "<!-- 06 -->🛠️ Build" },
   { message = "^chore|^ci", group = "<!-- 08 -->⚙️ Miscellaneous Tasks" },
   { body = ".*security", group = "<!-- 09 -->🛡️ Security" },
