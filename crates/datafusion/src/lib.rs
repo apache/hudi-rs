@@ -152,6 +152,7 @@ impl TableProvider for HudiDataSource {
     }
 }
 
+#[derive(Debug)]
 pub struct HudiTableFactory {}
 
 impl HudiTableFactory {
