@@ -34,8 +34,8 @@ corresponding milestone for the release, and edit the issue description as below
 > [!IMPORTANT]
 > Highlight blocker issues if any
 
-- [ ] https://github.com/apache/hudi-rs/issues/41
-- [ ] https://github.com/apache/hudi-rs/issues/42
+- [ ] https://github.com/apache/hudi-rs/issues/xxx
+- [ ] https://github.com/apache/hudi-rs/issues/xxx
 
 ### GitHub
 
@@ -55,6 +55,7 @@ corresponding milestone for the release, and edit the issue description as below
 
 - [ ] Push the release git tag
 - [ ] Publish artifacts to SVN RELEASE branch
+- [ ] Merge the PR to update the changelog
 - [ ] Send `ANNOUNCE` email to dev and user email lists
 ```
 
@@ -91,6 +92,7 @@ On the release branch, bump the version to indicate pre-release by pushing a com
 
 ```shell
 cargo set-version 0.2.0-rc.1 --manifest-path crates/hudi/Cargo.toml
+git commit -am "build(release): bump version to 0.2.0-rc.1"
 ```
 
 ### Generate changelog
@@ -136,6 +138,7 @@ Push a tag to the commit that matches to the version in the form of `release-*`.
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
 
 ```shell
+git tag release-0.1.0-rc.1
 git push origin release-0.1.0-rc.1
 ```
 
@@ -143,19 +146,21 @@ Once the CI completes, check crates.io and pypi.org for the new release artifact
 
 ## ASF work
 
-### Upload source release
+### Upload source release to SVN dev
 
-Run the below script to create source release artifacts.
-
-```shell
-./release/create_src_release.sh
-```
-
-Upload source release artifacts to SVN (dev).
+Run the below script to create and upload the source release artifacts.
 
 ```shell
 ./release/upload_src_release_to_dev.sh
 ```
+
+Run the below script to verify the source release.
+
+```shell
+./release/verify_src_release.sh 0.1.0-rc.1 dev
+```
+
+Fix any issues if found before proceeding to the next step.
 
 ### Start a `[VOTE]` thread
 
@@ -204,7 +209,27 @@ Remove the pre-release suffix from the version in the release branch.
 
 ```shell
 cargo set-version 0.2.0 --manifest-path crates/hudi/Cargo.toml
+git commit -am "build(release): bump version to 0.2.0"
 ```
+
+Wait for the CI to pass before proceeding to the next step.
+
+### Upload source release to SVN release
+
+Run the below script to create and upload the source release artifacts.
+
+```shell
+./release/publish_src_release.sh
+```
+
+Run the below script to verify the source release.
+
+```shell
+./release/verify_src_release.sh 0.2.0 release
+```
+
+There shouldn't be any issue in verifying the source release at this step. But if any error came out from it, 
+revert the last version bump commit, fix the reported error, and start a new release candidate.
 
 ### Push the release tag
 
@@ -213,6 +238,7 @@ cargo set-version 0.2.0 --manifest-path crates/hudi/Cargo.toml
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
 
 ```shell
+git tag release-0.2.0
 git push origin release-0.2.0
 ```
 
