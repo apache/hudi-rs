@@ -27,38 +27,39 @@ if [ "$#" -lt 1 ]; then
 fi
 
 hudi_version=$1
-dist_repo_subpath=hudi-rs-$hudi_version
+dist_dirname=hudi-rs-$hudi_version
 
-echo "❗️  Publishing $dist_repo_subpath"
+echo "❗️  Publishing $dist_dirname"
 
 work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')"
 
-svn_dev_url="https://dist.apache.org/repos/dist/dev/hudi/$dist_repo_subpath"
-svn_dev_dir="$work_dir/$dist_repo_subpath"
-echo ">>> Checking out dev src dist to $svn_dev_dir"
+svn_dev_url="https://dist.apache.org/repos/dist/dev/hudi/$dist_dirname"
+svn_dev_dir="$work_dir/$dist_dirname"
+echo ">>> Checking out dev src dist '/$dist_dirname' to $svn_dev_dir"
 svn co -q "$svn_dev_url" "$svn_dev_dir"
 
 svn_release_url="https://dist.apache.org/repos/dist/release/hudi"
 svn_release_dir="$work_dir/svn_release"
 echo ">>> Checking out release src dist to $svn_release_dir"
 svn co -q $svn_release_url --depth=immediates "$svn_release_dir"
-echo ">>> Checking if $dist_repo_subpath already exists"
-subpath="$svn_release_dir/$dist_repo_subpath"
-if [ -d "$subpath" ]; then
-  echo "❌  Version $dist_repo_subpath already exists!"
+echo ">>> Checking if $dist_dirname already exists"
+release_dist_dir="$svn_release_dir/$dist_dirname"
+if [ -d "$release_dist_dir" ]; then
+  echo "❌  Version $dist_dirname already exists in the src release repo!"
   exit 1
 fi
 
-echo ">>> Copying $dist_repo_subpath to $subpath"
+echo ">>> Copying $dist_dirname to $release_dist_dir"
 pushd "$svn_dev_dir"
-find . -name "$dist_repo_subpath.src.*" -exec cp '{}' "$subpath" \;
-echo "✅  SUCCESS! Placed source release at $subpath"
-for i in $(ls -a "$subpath"); do echo "|___$i"; done
+mkdir "$release_dist_dir"
+find . -type f -name "$dist_dirname.src.*" -exec cp {} "$release_dist_dir" \;
+echo "✅  SUCCESS! Placed source release at $release_dist_dir"
+for i in $(ls -a "$release_dist_dir"); do echo "|___$i"; done
 popd
 
 echo ">>> Publishing to $svn_release_url"
 pushd "$svn_release_dir"
-svn add "$dist_repo_subpath"
-svn commit -m "add $dist_repo_subpath"
-echo "✅  SUCCESS! Published $dist_repo_subpath to $svn_release_url"
+svn add "$dist_dirname"
+svn commit -m "add $dist_dirname"
+echo "✅  SUCCESS! Published $dist_dirname to $svn_release_url"
 popd
