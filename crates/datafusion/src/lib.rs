@@ -44,6 +44,32 @@ use hudi_core::config::utils::empty_options;
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
 use hudi_core::table::Table as HudiTable;
 
+/// Create a `HudiDataSource`.
+/// Used for Datafusion to query Hudi tables
+///
+/// # Examples
+///
+/// ```rust
+/// use std::sync::Arc;
+///
+/// use datafusion::error::Result;
+/// use datafusion::prelude::{DataFrame, SessionContext};
+/// use hudi::HudiDataSource;
+///
+/// // Initialize a new DataFusion session context
+/// let ctx = SessionContext::new();
+///
+/// // Create a new HudiDataSource with specific read options
+/// let hudi = HudiDataSource::new_with_options(
+///     "/tmp/trips_table",
+/// [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
+///
+/// // Register the Hudi table with the session context
+/// ctx.register_table("trips_table", Arc::new(hudi))?;
+/// let df: DataFrame = ctx.sql("SELECT * from trips_table where city = 'san_francisco'").await?;
+/// df.show().await?;
+///
+/// ```
 #[derive(Clone, Debug)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
@@ -152,6 +178,25 @@ impl TableProvider for HudiDataSource {
     }
 }
 
+/// `HudiTableFactory` is responsible for creating and configuring Hudi tables.
+///
+/// This factory handles the initialization of Hudi tables by creating configuration
+/// options from both session state and table creation commands.
+///
+/// # Examples
+///
+/// Creating a new `HudiTableFactory` instance:
+///
+/// ```rust
+/// use hudi::HudiTableFactory;
+///
+/// // Initialize a new HudiTableFactory
+/// let factory = HudiTableFactory::new();
+///     
+/// // The factory can now be used to create Hudi tables
+/// let table = factory.create_table(...)?;
+///
+/// ```
 #[derive(Debug)]
 pub struct HudiTableFactory {}
 
