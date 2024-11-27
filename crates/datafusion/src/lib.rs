@@ -56,23 +56,19 @@ use hudi_core::table::Table as HudiTable;
 /// use datafusion::prelude::{DataFrame, SessionContext};
 /// use hudi::HudiDataSource;
 ///
-/// #[tokio::main]
-/// async fn main() -> Result<()> {
-///     // Initialize a new DataFusion session context
-///     let ctx = SessionContext::new();
+/// // Initialize a new DataFusion session context
+/// let ctx = SessionContext::new();
 ///
-///     // Create a new HudiDataSource with specific read options
-///     let hudi = HudiDataSource::new_with_options(
-///         "/tmp/trips_table",
-///         [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
+/// // Create a new HudiDataSource with specific read options
+/// let hudi = HudiDataSource::new_with_options(
+///     "/tmp/trips_table",
+/// [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
 ///
-///     // Register the Hudi table with the session context
-///     ctx.register_table("trips_table", Arc::new(hudi))?;
-///     let df: DataFrame = ctx.sql("SELECT * from trips_table where city = 'san_francisco'").await?;
-///     df.show().await?;
+/// // Register the Hudi table with the session context
+/// ctx.register_table("trips_table", Arc::new(hudi))?;
+/// let df: DataFrame = ctx.sql("SELECT * from trips_table where city = 'san_francisco'").await?;
+/// df.show().await?;
 ///
-///     Ok(())
-/// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct HudiDataSource {
@@ -194,13 +190,12 @@ impl TableProvider for HudiDataSource {
 /// ```rust
 /// use hudi::HudiTableFactory;
 ///
-/// fn main() {
-///     // Initialize a new HudiTableFactory
-///     let factory = HudiTableFactory::new();
+/// // Initialize a new HudiTableFactory
+/// let factory = HudiTableFactory::new();
 ///     
-///     // The factory can now be used to create Hudi tables
-///     let table = factory.create_table(...)?;
-/// }
+/// // The factory can now be used to create Hudi tables
+/// let table = factory.create_table(...)?;
+///
 /// ```
 #[derive(Debug)]
 pub struct HudiTableFactory {}
