@@ -202,6 +202,7 @@ impl TableProvider for HudiDataSource {
 ///     let table = factory.create_table(...)?;
 /// }
 /// ```
+#[derive(Debug)]
 pub struct HudiTableFactory {}
 
 impl HudiTableFactory {
