@@ -64,39 +64,39 @@ This will install `hudi` dependency built from your local repo to the virtual en
 For Rust,
 
 ```shell
-# for all tests
+# For all tests
 make test-rust
 # or
 cargo test --workspace
 
-# for all tests in a crate / package
+# For all tests in a crate / package
 cargo test -p hudi-core
 
-# for a specific test case
+# For a specific test case
 cargo test -p hudi-core table::tests::hudi_table_get_schema
 ```
 
 For Python,
 
 ```shell
-# for all tests
+# For all tests
 make test-python
 # or
 pytest -s
 
-# for a specific test case
+# For a specific test case
 pytest tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
 ```
 
 ## Before creating a pull request
 
-Run test commands to make sure the code is working as expected.
+Run test commands to make sure the code is working as expected:
 
 ```shell
 make test-rust test-python
 ```
 
-Run check commands and follow the suggestions to fix the code.
+Run check commands and follow the suggestions to fix the code:
 
 ```shell
 make check-rust check-python
@@ -104,14 +104,12 @@ make check-rust check-python
 
 ## Create a pull request
 
-### Title
+Pull requests should align with the following:
 
-The pull request title must follow the format outlined in
-the [conventional commits spec](https://www.conventionalcommits.org). [Conventional commits](https://www.conventionalcommits.org)
-is a standardized format for commit messages, and also allows us to auto-generate change logs and release notes. Since
-only the `main` branch requires this format, and we always squash commits and then merge the PR, incremental commits'
-messages
-do not need to conform to it.
+1. **Title Format**: The pull request title must follow the format outlined in the [conventional commits spec](https://www.conventionalcommits.org). This is a standardized format for commit messages, and also allows us to auto-generate change logs and release notes. Since only the `main` branch requires this format, and we always squash commits and then merge the PR, incremental commits' messages do not need to conform to it. 
+2. **Line Count**: Submit PRs that are **no longer than 400-500 lines**. Keeping PRs concise makes it easier for reviewers to thoroughly examine changes without experiencing fatigue. If your changes exceed this limit, consider breaking them down into smaller, logical PRs that address specific aspects of the feature or bug fix.
+3. **Coverage Requirements**: All new features and bug fixes **must** include appropriate unit tests to ensure functionality and prevent regressions. Tests should cover both typical use cases and edge cases. Ensure that new tests pass locally before submitting the PR.
+4. **Code Comments**: Provide clear and concise comments in your code where necessary. Comments should explain the purpose of complex logic or non-obvious implementations.
 
 ### Code coverage
 
@@ -122,3 +120,7 @@ coverage change for PRs, with a 5% lenacy.
 
 We expect all community members to follow
 our [Code of Conduct](https://www.apache.org/foundation/policies/conduct.html).
+
+## Learning Hudi's Architecture
+
+To help with contributing to the project, hudi-rs has [documentation](https://hudi.apache.org/docs/overview) and [rust crates](https://crates.io/crates/hudi) to help understand the underlying architecture.
