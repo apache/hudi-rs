@@ -33,6 +33,7 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
@@ -95,11 +96,41 @@ impl HudiDataSource {
         }
     }
 
+    // Helper functions until all exprs are supported
     fn get_input_partitions(&self) -> usize {
         self.table
             .hudi_configs
             .get_or_default(InputPartitions)
             .to::<usize>()
+    }
+
+    fn can_push_down(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary_expr) => {
+                let left = &binary_expr.left;
+                let op = &binary_expr.op;
+                let right = &binary_expr.right;
+                self.is_supported_operator(op)
+                    && self.is_supported_operand(left)
+                    && self.is_supported_operand(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_supported_operator(&self, op: &Operator) -> bool {
+        matches!(
+            op,
+            Operator::Eq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq
+        )
+    }
+
+    fn is_supported_operand(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(col) => self.schema().field_with_name(&col.name).is_ok(),
+            Expr::Literal(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -185,10 +216,16 @@ impl TableProvider for HudiDataSource {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        filters
+            .iter()
+            .map(|expr| {
+                if self.can_push_down(expr) {
+                    Ok(TableProviderFilterPushDown::Exact)
+                } else {
+                    Ok(TableProviderFilterPushDown::Unsupported)
+                }
+            })
+            .collect()
     }
 }
 

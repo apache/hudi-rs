@@ -51,7 +51,7 @@ impl Display for HudiOperator {
     }
 }
 
-// TODO: Add more operators 
+// TODO: Add more operators
 impl HudiOperator {
     pub const TOKEN_OP_PAIRS: [(&'static str, HudiOperator); 6] = [
         ("=", HudiOperator::Eq),
