@@ -181,11 +181,21 @@ mod tests {
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
     use crate::table::partition::PartitionPruner;
-    use crate::table::Table;
+    use crate::table::{PartitionFilter, Table};
+
+    use anyhow::anyhow;
+    use arrow::datatypes::{DataType, Field, Schema};
     use hudi_tests::TestTable;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use url::Url;
+
+    fn create_test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("byteField", DataType::Int32, false),
+            Field::new("shortField", DataType::Int32, false),
+        ])
+    }
 
     async fn create_test_fs_view(base_url: Url) -> FileSystemView {
         FileSystemView::new(
@@ -296,8 +306,16 @@ mod tests {
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+
+        let schema = create_test_schema();
+        let filter_lt_20 = PartitionFilter::try_from((("byteField", "<", "20"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+        let filter_eq_300 = PartitionFilter::try_from((("shortField", "=", "300"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
         let partition_pruner = PartitionPruner::new(
-            &[("byteField", "<", "20"), ("shortField", "=", "300")],
+            &[filter_lt_20, filter_eq_300],
             &partition_schema,
             hudi_table.hudi_configs.as_ref(),
         )

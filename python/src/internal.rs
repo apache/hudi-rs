@@ -23,15 +23,16 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use arrow::pyarrow::ToPyArrow;
+use arrow_schema::Schema;
+use pyo3::exceptions::PyValueError;
 use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
+use hudi::exprs::PartitionFilter;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
-use hudi::util::convert_vec_to_slice;
-use hudi::util::vec_to_slice;
 
 #[cfg(not(tarpaulin))]
 #[derive(Clone, Debug)]
@@ -163,10 +164,13 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        let schema: Schema = rt().block_on(self.inner.get_schema())?;
+        let partition_filters = convert_filters(filters, &schema)?;
+
         py.allow_threads(|| {
             let file_slices = rt().block_on(
                 self.inner
-                    .get_file_slices_splits(n, vec_to_slice!(filters.unwrap_or_default())),
+                    .get_file_slices_splits(n, partition_filters.as_slice()),
             )?;
             Ok(file_slices
                 .iter()
@@ -181,11 +185,12 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
+        let schema: Schema = rt().block_on(self.inner.get_schema())?;
+        let partition_filters = convert_filters(filters, &schema)?;
+
         py.allow_threads(|| {
-            let file_slices = rt().block_on(
-                self.inner
-                    .get_file_slices(vec_to_slice!(filters.unwrap_or_default())),
-            )?;
+            let file_slices =
+                rt().block_on(self.inner.get_file_slices(partition_filters.as_slice()))?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
@@ -201,12 +206,35 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<PyObject> {
-        rt().block_on(
-            self.inner
-                .read_snapshot(vec_to_slice!(filters.unwrap_or_default())),
-        )?
-        .to_pyarrow(py)
+        let schema: Schema = rt().block_on(self.inner.get_schema())?;
+        let partition_filters = convert_filters(filters, &schema)?;
+
+        rt().block_on(self.inner.read_snapshot(partition_filters.as_slice()))?
+            .to_pyarrow(py)
     }
+}
+
+// Temporary fix
+fn convert_filters(
+    filters: Option<Vec<(String, String, String)>>,
+    partition_schema: &Schema,
+) -> PyResult<Vec<PartitionFilter>> {
+    filters
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(field, op, value)| {
+            PartitionFilter::try_from((
+                (field.as_str(), op.as_str(), value.as_str()),
+                partition_schema,
+            ))
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "Invalid filter ({}, {}, {}): {}",
+                    field, op, value, e
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(not(tarpaulin))]

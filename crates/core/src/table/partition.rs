@@ -18,15 +18,14 @@
  */
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
+use crate::exprs::{HudiOperator, PartitionFilter};
+use anyhow::anyhow;
 use anyhow::Result;
-use anyhow::{anyhow, Context};
-use arrow_array::{ArrayRef, Scalar, StringArray};
-use arrow_cast::{cast_with_options, CastOptions};
+use arrow_array::{ArrayRef, Scalar};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::{DataType, Field, Schema};
-use std::cmp::PartialEq;
+use arrow_schema::Schema;
+
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 /// A partition pruner that filters partitions based on the partition path and its filters.
@@ -40,14 +39,11 @@ pub struct PartitionPruner {
 
 impl PartitionPruner {
     pub fn new(
-        and_filters: &[(&str, &str, &str)],
+        and_filters: &[PartitionFilter],
         partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
     ) -> Result<Self> {
-        let and_filters = and_filters
-            .iter()
-            .map(|filter| PartitionFilter::try_from((*filter, partition_schema)))
-            .collect::<Result<Vec<PartitionFilter>>>()?;
+        let and_filters = and_filters.to_vec();
 
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs
@@ -90,12 +86,12 @@ impl PartitionPruner {
             match segments.get(filter.field.name()) {
                 Some(segment_value) => {
                     let comparison_result = match filter.operator {
-                        Operator::Eq => eq(segment_value, &filter.value),
-                        Operator::Ne => neq(segment_value, &filter.value),
-                        Operator::Lt => lt(segment_value, &filter.value),
-                        Operator::Lte => lt_eq(segment_value, &filter.value),
-                        Operator::Gt => gt(segment_value, &filter.value),
-                        Operator::Gte => gt_eq(segment_value, &filter.value),
+                        HudiOperator::Eq => eq(segment_value, &filter.value),
+                        HudiOperator::Ne => neq(segment_value, &filter.value),
+                        HudiOperator::Lt => lt(segment_value, &filter.value),
+                        HudiOperator::Lte => lt_eq(segment_value, &filter.value),
+                        HudiOperator::Gt => gt(segment_value, &filter.value),
+                        HudiOperator::Gte => gt_eq(segment_value, &filter.value),
                     };
 
                     match comparison_result {
@@ -154,90 +150,6 @@ impl PartitionPruner {
     }
 }
 
-/// An operator that represents a comparison operation used in a partition filter expression.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Operator {
-    Eq,
-    Ne,
-    Lt,
-    Lte,
-    Gt,
-    Gte,
-}
-
-impl Operator {
-    const TOKEN_OP_PAIRS: [(&'static str, Operator); 6] = [
-        ("=", Operator::Eq),
-        ("!=", Operator::Ne),
-        ("<", Operator::Lt),
-        ("<=", Operator::Lte),
-        (">", Operator::Gt),
-        (">=", Operator::Gte),
-    ];
-}
-
-impl FromStr for Operator {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        Operator::TOKEN_OP_PAIRS
-            .iter()
-            .find_map(|&(token, op)| if token == s { Some(op) } else { None })
-            .ok_or_else(|| anyhow!("Unsupported operator: {}", s))
-    }
-}
-
-/// A partition filter that represents a filter expression for partition pruning.
-#[derive(Debug, Clone)]
-pub struct PartitionFilter {
-    field: Field,
-    operator: Operator,
-    value: Scalar<ArrayRef>,
-}
-
-impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
-    type Error = anyhow::Error;
-
-    fn try_from((filter, partition_schema): ((&str, &str, &str), &Schema)) -> Result<Self> {
-        let (field_name, operator_str, value_str) = filter;
-
-        let field: &Field = partition_schema
-            .field_with_name(field_name)
-            .with_context(|| format!("Field '{}' not found in partition schema", field_name))?;
-
-        let operator = Operator::from_str(operator_str)
-            .with_context(|| format!("Unsupported operator: {}", operator_str))?;
-
-        let value = &[value_str];
-        let value = Self::cast_value(value, field.data_type())
-            .with_context(|| format!("Unable to cast {:?} as {:?}", value, field.data_type()))?;
-
-        let field = field.clone();
-        Ok(PartitionFilter {
-            field,
-            operator,
-            value,
-        })
-    }
-}
-
-impl PartitionFilter {
-    fn cast_value(value: &[&str; 1], data_type: &DataType) -> Result<Scalar<ArrayRef>> {
-        let cast_options = CastOptions {
-            safe: false,
-            format_options: Default::default(),
-        };
-
-        let value = StringArray::from(Vec::from(value));
-
-        Ok(Scalar::new(cast_with_options(
-            &value,
-            data_type,
-            &cast_options,
-        )?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,9 +157,7 @@ mod tests {
         IsHiveStylePartitioning, IsPartitionPathUrlencoded,
     };
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::{Array, Datum};
     use hudi_tests::assert_not;
-    use std::str::FromStr;
 
     fn create_test_schema() -> Schema {
         Schema::new(vec![
@@ -255,87 +165,6 @@ mod tests {
             Field::new("category", DataType::Utf8, false),
             Field::new("count", DataType::Int32, false),
         ])
-    }
-
-    #[test]
-    fn test_partition_filter_try_from_valid() {
-        let schema = create_test_schema();
-        let filter_tuple = ("date", "=", "2023-01-01");
-        let filter = PartitionFilter::try_from((filter_tuple, &schema));
-        assert!(filter.is_ok());
-        let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "date");
-        assert_eq!(filter.operator, Operator::Eq);
-        assert_eq!(filter.value.get().0.len(), 1);
-
-        let filter_tuple = ("category", "!=", "foo");
-        let filter = PartitionFilter::try_from((filter_tuple, &schema));
-        assert!(filter.is_ok());
-        let filter = filter.unwrap();
-        assert_eq!(filter.field.name(), "category");
-        assert_eq!(filter.operator, Operator::Ne);
-        assert_eq!(filter.value.get().0.len(), 1);
-        assert_eq!(
-            StringArray::from(filter.value.into_inner().to_data()).value(0),
-            "foo"
-        )
-    }
-
-    #[test]
-    fn test_partition_filter_try_from_invalid_field() {
-        let schema = create_test_schema();
-        let filter_tuple = ("invalid_field", "=", "2023-01-01");
-        let filter = PartitionFilter::try_from((filter_tuple, &schema));
-        assert!(filter.is_err());
-        assert!(filter
-            .unwrap_err()
-            .to_string()
-            .contains("not found in partition schema"));
-    }
-
-    #[test]
-    fn test_partition_filter_try_from_invalid_operator() {
-        let schema = create_test_schema();
-        let filter_tuple = ("date", "??", "2023-01-01");
-        let filter = PartitionFilter::try_from((filter_tuple, &schema));
-        assert!(filter.is_err());
-        assert!(filter
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported operator: ??"));
-    }
-
-    #[test]
-    fn test_partition_filter_try_from_invalid_value() {
-        let schema = create_test_schema();
-        let filter_tuple = ("count", "=", "not_a_number");
-        let filter = PartitionFilter::try_from((filter_tuple, &schema));
-        assert!(filter.is_err());
-        assert!(filter.unwrap_err().to_string().contains("Unable to cast"));
-    }
-
-    #[test]
-    fn test_partition_filter_try_from_all_operators() {
-        let schema = create_test_schema();
-        for (op, _) in Operator::TOKEN_OP_PAIRS {
-            let filter_tuple = ("count", op, "10");
-            let filter = PartitionFilter::try_from((filter_tuple, &schema));
-            assert!(filter.is_ok(), "Failed for operator: {}", op);
-            let filter = filter.unwrap();
-            assert_eq!(filter.field.name(), "count");
-            assert_eq!(filter.operator, Operator::from_str(op).unwrap());
-        }
-    }
-
-    #[test]
-    fn test_operator_from_str() {
-        assert_eq!(Operator::from_str("=").unwrap(), Operator::Eq);
-        assert_eq!(Operator::from_str("!=").unwrap(), Operator::Ne);
-        assert_eq!(Operator::from_str("<").unwrap(), Operator::Lt);
-        assert_eq!(Operator::from_str("<=").unwrap(), Operator::Lte);
-        assert_eq!(Operator::from_str(">").unwrap(), Operator::Gt);
-        assert_eq!(Operator::from_str(">=").unwrap(), Operator::Gte);
-        assert!(Operator::from_str("??").is_err());
     }
 
     fn create_hudi_configs(is_hive_style: bool, is_url_encoded: bool) -> HudiConfigs {
@@ -348,9 +177,15 @@ mod tests {
     fn test_partition_pruner_new() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters = vec![("date", ">", "2023-01-01"), ("category", "=", "A")];
 
-        let pruner = PartitionPruner::new(&filters, &schema, &configs);
+        let filter_gt_date = PartitionFilter::try_from((("date", ">", "2023-01-01"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+        let filter_eq_a = PartitionFilter::try_from((("category", "=", "A"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+
+        let pruner = PartitionPruner::new(&[filter_gt_date, filter_eq_a], &schema, &configs);
         assert!(pruner.is_ok());
 
         let pruner = pruner.unwrap();
@@ -375,8 +210,10 @@ mod tests {
         let pruner_empty = PartitionPruner::new(&[], &schema, &configs).unwrap();
         assert!(pruner_empty.is_empty());
 
-        let pruner_non_empty =
-            PartitionPruner::new(&[("date", ">", "2023-01-01")], &schema, &configs).unwrap();
+        let filter_gt_date = PartitionFilter::try_from((("date", ">", "2023-01-01"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+        let pruner_non_empty = PartitionPruner::new(&[filter_gt_date], &schema, &configs).unwrap();
         assert_not!(pruner_non_empty.is_empty());
     }
 
@@ -384,13 +221,23 @@ mod tests {
     fn test_partition_pruner_should_include() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filters = vec![
-            ("date", ">", "2023-01-01"),
-            ("category", "=", "A"),
-            ("count", "<=", "100"),
-        ];
 
-        let pruner = PartitionPruner::new(&filters, &schema, &configs).unwrap();
+        let filter_gt_date = PartitionFilter::try_from((("date", ">", "2023-01-01"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+        let filter_eq_a = PartitionFilter::try_from((("category", "=", "A"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+        let filter_lte_100 = PartitionFilter::try_from((("count", "<=", "100"), &schema))
+            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
+            .unwrap();
+
+        let pruner = PartitionPruner::new(
+            &[filter_gt_date, filter_eq_a, filter_lte_100],
+            &schema,
+            &configs,
+        )
+        .unwrap();
 
         assert!(pruner.should_include("date=2023-02-01/category=A/count=10"));
         assert!(pruner.should_include("date=2023-02-01/category=A/count=100"));

@@ -17,6 +17,8 @@
  * under the License.
  */
 
+pub mod utils;
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -36,9 +38,10 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::Result;
-use datafusion_expr::{CreateExternalTable, Expr, TableType};
+use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
+use crate::utils::exprs_to_filter::convert_exprs_to_filter;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::utils::empty_options;
 use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
@@ -129,10 +132,11 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
+        // Convert Datafusion `Expr` to `PartitionFilter`
+        let partition_filters = convert_exprs_to_filter(filters, &self.schema());
         let file_slices = self
             .table
-            // TODO: implement supports_filters_pushdown() to pass filters to Hudi table API
-            .get_file_slices_splits(self.get_input_partitions(), &[])
+            .get_file_slices_splits(self.get_input_partitions(), partition_filters.as_slice())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
@@ -175,6 +179,16 @@ impl TableProvider for HudiDataSource {
         }
 
         Ok(exec_builder.build_arc())
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
     }
 }
 
