@@ -40,16 +40,12 @@ pub fn convert_exprs_to_filter(
             Expr::BinaryExpr(binary_expr) => {
                 if let Some(partition_filter) = convert_binary_expr(binary_expr, partition_schema) {
                     partition_filters.push(partition_filter);
-                } else {
-                    continue;
                 }
             }
             Expr::Not(not_expr) => {
                 // Handle NOT expressions
                 if let Some(partition_filter) = convert_not_expr(not_expr, partition_schema) {
                     partition_filters.push(partition_filter);
-                } else {
-                    continue;
                 }
             }
             _ => {
@@ -327,5 +323,24 @@ mod tests {
                 expected_filter.value.into_inner()
             );
         }
+    }
+
+    #[test]
+    fn test_convert_expr_with_unsupported_operator() {
+        let partition_schema = Arc::new(Schema::new(vec![Field::new(
+            "partition_col",
+            DataType::Int32,
+            false,
+        )]));
+
+        let expr = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("partition_col")),
+            Operator::And,
+            Box::new(lit("value")),
+        ));
+
+        let filters = vec![expr];
+        let result = convert_exprs_to_filter(&filters, &partition_schema);
+        assert!(result.is_empty());
     }
 }

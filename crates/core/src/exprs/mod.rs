@@ -94,4 +94,14 @@ mod tests {
         assert_eq!(HudiOperator::from_str(">=").unwrap(), HudiOperator::Gte);
         assert!(HudiOperator::from_str("??").is_err());
     }
+
+    #[test]
+    fn test_operator_display() {
+        assert_eq!(HudiOperator::Eq.to_string(), "=");
+        assert_eq!(HudiOperator::Ne.to_string(), "!=");
+        assert_eq!(HudiOperator::Lt.to_string(), "<");
+        assert_eq!(HudiOperator::Lte.to_string(), "<=");
+        assert_eq!(HudiOperator::Gt.to_string(), ">");
+        assert_eq!(HudiOperator::Gte.to_string(), ">=");
+    }
 }

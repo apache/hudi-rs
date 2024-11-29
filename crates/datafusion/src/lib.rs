@@ -302,12 +302,13 @@ mod tests {
     use super::*;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{DataFusionError, ScalarValue};
+    use datafusion_common::{Column, DataFusionError, ScalarValue};
     use std::fs::canonicalize;
     use std::path::Path;
     use std::sync::Arc;
     use url::Url;
 
+    use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_tests::TestTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
@@ -515,5 +516,51 @@ mod tests {
             verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
             verify_data_with_replacecommits(&ctx, &sql, test_table.as_ref()).await
         }
+    }
+
+    #[tokio::test]
+    async fn test_supports_filters_pushdown() {
+        let table_provider =
+            HudiDataSource::new_with_options(V6Nonpartitioned.path().as_str(), empty_options())
+                .await
+                .unwrap();
+
+        let expr1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())))),
+        });
+
+        let expr2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+        });
+
+        let expr3 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name(
+                "nonexistent_column".to_string(),
+            ))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+        });
+
+        let expr4 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::NotEq,
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())))),
+        });
+
+        let expr5 = Expr::Literal(ScalarValue::Int32(Some(10)));
+
+        let filters = vec![&expr1, &expr2, &expr3, &expr4, &expr5];
+        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact); // expr1 should be pushed down
+        assert_eq!(result[1], TableProviderFilterPushDown::Exact); // expr2 should be pushed down
+        assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[3], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
     }
 }
