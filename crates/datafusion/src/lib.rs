@@ -114,6 +114,10 @@ impl HudiDataSource {
                     && self.is_supported_operand(left)
                     && self.is_supported_operand(right)
             }
+            Expr::Not(inner_expr) => {
+                // Recursively check if the inner expression can be pushed down
+                self.can_push_down(inner_expr)
+            }
             _ => false,
         }
     }
@@ -553,14 +557,21 @@ mod tests {
 
         let expr5 = Expr::Literal(ScalarValue::Int32(Some(10)));
 
-        let filters = vec![&expr1, &expr2, &expr3, &expr4, &expr5];
+        let expr6 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+        })));
+
+        let filters = vec![&expr1, &expr2, &expr3, &expr4, &expr5, &expr6];
         let result = table_provider.supports_filters_pushdown(&filters).unwrap();
 
-        assert_eq!(result.len(), 5);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact); // expr1 should be pushed down
-        assert_eq!(result[1], TableProviderFilterPushDown::Exact); // expr2 should be pushed down
+        assert_eq!(result.len(), 6);
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Exact);
         assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[3], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[5], TableProviderFilterPushDown::Exact);
     }
 }
