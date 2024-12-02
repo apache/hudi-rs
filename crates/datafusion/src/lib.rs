@@ -224,7 +224,7 @@ impl TableProvider for HudiDataSource {
             .iter()
             .map(|expr| {
                 if self.can_push_down(expr) {
-                    Ok(TableProviderFilterPushDown::Exact)
+                    Ok(TableProviderFilterPushDown::Inexact)
                 } else {
                     Ok(TableProviderFilterPushDown::Unsupported)
                 }

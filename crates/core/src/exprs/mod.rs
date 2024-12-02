@@ -24,11 +24,9 @@ use std::cmp::PartialEq;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
 
-pub use filter::*;
-
 /// An operator that represents a comparison operation used in a partition filter expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HudiOperator {
+pub enum ExprOperator {
     Eq,
     Ne,
     Lt,
@@ -37,37 +35,37 @@ pub enum HudiOperator {
     Gte,
 }
 
-impl Display for HudiOperator {
+impl Display for ExprOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             // Binary Operators
-            HudiOperator::Eq => write!(f, "="),
-            HudiOperator::Ne => write!(f, "!="),
-            HudiOperator::Lt => write!(f, "<"),
-            HudiOperator::Lte => write!(f, "<="),
-            HudiOperator::Gt => write!(f, ">"),
-            HudiOperator::Gte => write!(f, ">="),
+            ExprOperator::Eq => write!(f, "="),
+            ExprOperator::Ne => write!(f, "!="),
+            ExprOperator::Lt => write!(f, "<"),
+            ExprOperator::Lte => write!(f, "<="),
+            ExprOperator::Gt => write!(f, ">"),
+            ExprOperator::Gte => write!(f, ">="),
         }
     }
 }
 
 // TODO: Add more operators
-impl HudiOperator {
-    pub const TOKEN_OP_PAIRS: [(&'static str, HudiOperator); 6] = [
-        ("=", HudiOperator::Eq),
-        ("!=", HudiOperator::Ne),
-        ("<", HudiOperator::Lt),
-        ("<=", HudiOperator::Lte),
-        (">", HudiOperator::Gt),
-        (">=", HudiOperator::Gte),
+impl ExprOperator {
+    pub const TOKEN_OP_PAIRS: [(&'static str, ExprOperator); 6] = [
+        ("=", ExprOperator::Eq),
+        ("!=", ExprOperator::Ne),
+        ("<", ExprOperator::Lt),
+        ("<=", ExprOperator::Lte),
+        (">", ExprOperator::Gt),
+        (">=", ExprOperator::Gte),
     ];
 }
 
-impl FromStr for HudiOperator {
+impl FromStr for ExprOperator {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        HudiOperator::TOKEN_OP_PAIRS
+        ExprOperator::TOKEN_OP_PAIRS
             .iter()
             .find_map(|&(token, op)| {
                 if token.eq_ignore_ascii_case(s) {
@@ -86,22 +84,22 @@ mod tests {
 
     #[test]
     fn test_operator_from_str() {
-        assert_eq!(HudiOperator::from_str("=").unwrap(), HudiOperator::Eq);
-        assert_eq!(HudiOperator::from_str("!=").unwrap(), HudiOperator::Ne);
-        assert_eq!(HudiOperator::from_str("<").unwrap(), HudiOperator::Lt);
-        assert_eq!(HudiOperator::from_str("<=").unwrap(), HudiOperator::Lte);
-        assert_eq!(HudiOperator::from_str(">").unwrap(), HudiOperator::Gt);
-        assert_eq!(HudiOperator::from_str(">=").unwrap(), HudiOperator::Gte);
-        assert!(HudiOperator::from_str("??").is_err());
+        assert_eq!(ExprOperator::from_str("=").unwrap(), ExprOperator::Eq);
+        assert_eq!(ExprOperator::from_str("!=").unwrap(), ExprOperator::Ne);
+        assert_eq!(ExprOperator::from_str("<").unwrap(), ExprOperator::Lt);
+        assert_eq!(ExprOperator::from_str("<=").unwrap(), ExprOperator::Lte);
+        assert_eq!(ExprOperator::from_str(">").unwrap(), ExprOperator::Gt);
+        assert_eq!(ExprOperator::from_str(">=").unwrap(), ExprOperator::Gte);
+        assert!(ExprOperator::from_str("??").is_err());
     }
 
     #[test]
     fn test_operator_display() {
-        assert_eq!(HudiOperator::Eq.to_string(), "=");
-        assert_eq!(HudiOperator::Ne.to_string(), "!=");
-        assert_eq!(HudiOperator::Lt.to_string(), "<");
-        assert_eq!(HudiOperator::Lte.to_string(), "<=");
-        assert_eq!(HudiOperator::Gt.to_string(), ">");
-        assert_eq!(HudiOperator::Gte.to_string(), ">=");
+        assert_eq!(ExprOperator::Eq.to_string(), "=");
+        assert_eq!(ExprOperator::Ne.to_string(), "!=");
+        assert_eq!(ExprOperator::Lt.to_string(), "<");
+        assert_eq!(ExprOperator::Lte.to_string(), "<=");
+        assert_eq!(ExprOperator::Gt.to_string(), ">");
+        assert_eq!(ExprOperator::Gte.to_string(), ">=");
     }
 }

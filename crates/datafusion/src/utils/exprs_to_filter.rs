@@ -19,9 +19,11 @@
 
 use arrow_array::{Array, Scalar};
 use arrow_schema::SchemaRef;
+use datafusion_common::DataFusionError;
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{BinaryExpr, Expr};
-use hudi_core::exprs::{HudiOperator, PartitionFilter};
+use hudi_core::exprs::ExprOperator;
+use hudi_core::table::partition::PartitionFilter;
 use std::sync::Arc;
 
 // TODO: Handle other Datafusion `Expr`
@@ -71,16 +73,17 @@ fn convert_binary_expr(
 
     let field = partition_schema
         .field_with_name(column.name())
+        .map_err(|e| DataFusionError::Plan(format!("Error finding field with name '{}': {}", column.name(), e)))
         .unwrap()
         .clone();
 
     let operator = match binary_expr.op {
-        Operator::Eq => HudiOperator::Eq,
-        Operator::NotEq => HudiOperator::Ne,
-        Operator::Lt => HudiOperator::Lt,
-        Operator::LtEq => HudiOperator::Lte,
-        Operator::Gt => HudiOperator::Gt,
-        Operator::GtEq => HudiOperator::Gte,
+        Operator::Eq => ExprOperator::Eq,
+        Operator::NotEq => ExprOperator::Ne,
+        Operator::Lt => ExprOperator::Lt,
+        Operator::LtEq => ExprOperator::Lte,
+        Operator::Gt => ExprOperator::Gt,
+        Operator::GtEq => ExprOperator::Gte,
         _ => return None,
     };
 
@@ -112,14 +115,14 @@ fn convert_not_expr(not_expr: &Expr, partition_schema: &SchemaRef) -> Option<Par
 }
 
 /// Negates a given operator
-fn negate_operator(op: HudiOperator) -> Option<HudiOperator> {
+fn negate_operator(op: ExprOperator) -> Option<ExprOperator> {
     match op {
-        HudiOperator::Eq => Some(HudiOperator::Ne),
-        HudiOperator::Ne => Some(HudiOperator::Eq),
-        HudiOperator::Lt => Some(HudiOperator::Gte),
-        HudiOperator::Lte => Some(HudiOperator::Gt),
-        HudiOperator::Gt => Some(HudiOperator::Lte),
-        HudiOperator::Gte => Some(HudiOperator::Lt),
+        ExprOperator::Eq => Some(ExprOperator::Ne),
+        ExprOperator::Ne => Some(ExprOperator::Eq),
+        ExprOperator::Lt => Some(ExprOperator::Gte),
+        ExprOperator::Lte => Some(ExprOperator::Gt),
+        ExprOperator::Gt => Some(ExprOperator::Lte),
+        ExprOperator::Gte => Some(ExprOperator::Lt),
     }
 }
 
@@ -130,7 +133,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
     use datafusion_expr::{BinaryExpr, Expr};
-    use hudi_core::exprs::{HudiOperator, PartitionFilter};
+    use hudi_core::exprs::ExprOperator;
     use std::f64::consts::PI;
     use std::sync::Arc;
 
@@ -156,7 +159,7 @@ mod tests {
 
         let expected_filter = PartitionFilter {
             field: partition_schema.field(0).clone(),
-            operator: HudiOperator::Eq,
+            operator: ExprOperator::Eq,
             value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
         };
 
@@ -192,7 +195,7 @@ mod tests {
 
         let expected_filter = PartitionFilter {
             field: partition_schema.field(0).clone(),
-            operator: HudiOperator::Ne,
+            operator: ExprOperator::Ne,
             value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
         };
 
@@ -223,7 +226,7 @@ mod tests {
                         .field_with_name("int32_col")
                         .unwrap()
                         .clone(),
-                    operator: HudiOperator::Eq,
+                    operator: ExprOperator::Eq,
                     value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
                 }),
             ),
@@ -234,7 +237,7 @@ mod tests {
                         .field_with_name("int64_col")
                         .unwrap()
                         .clone(),
-                    operator: HudiOperator::Gte,
+                    operator: ExprOperator::Gte,
                     value: Scalar::new(Arc::new(Int64Array::from(vec![100])) as ArrayRef),
                 }),
             ),
@@ -245,7 +248,7 @@ mod tests {
                         .field_with_name("float64_col")
                         .unwrap()
                         .clone(),
-                    operator: HudiOperator::Lt,
+                    operator: ExprOperator::Lt,
                     value: Scalar::new(Arc::new(Float64Array::from(vec![PI])) as ArrayRef),
                 }),
             ),
@@ -256,7 +259,7 @@ mod tests {
                         .field_with_name("string_col")
                         .unwrap()
                         .clone(),
-                    operator: HudiOperator::Ne,
+                    operator: ExprOperator::Ne,
                     value: Scalar::new(Arc::new(StringArray::from(vec!["test"])) as ArrayRef),
                 }),
             ),
@@ -291,10 +294,10 @@ mod tests {
         )]));
 
         let operators = vec![
-            (Operator::Lt, HudiOperator::Lt),
-            (Operator::LtEq, HudiOperator::Lte),
-            (Operator::Gt, HudiOperator::Gt),
-            (Operator::GtEq, HudiOperator::Gte),
+            (Operator::Lt, ExprOperator::Lt),
+            (Operator::LtEq, ExprOperator::Lte),
+            (Operator::Gt, ExprOperator::Gt),
+            (Operator::GtEq, ExprOperator::Gte),
         ];
 
         for (op, expected_op) in operators {

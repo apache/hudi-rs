@@ -214,7 +214,6 @@ impl HudiTable {
     }
 }
 
-// Temporary fix
 fn convert_filters(
     filters: Option<Vec<(String, String, String)>>,
     partition_schema: &Schema,

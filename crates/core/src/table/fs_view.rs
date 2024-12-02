@@ -309,10 +309,8 @@ mod tests {
 
         let schema = create_test_schema();
         let filter_lt_20 = PartitionFilter::try_from((("byteField", "<", "20"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let filter_eq_300 = PartitionFilter::try_from((("shortField", "=", "300"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let partition_pruner = PartitionPruner::new(
             &[filter_lt_20, filter_eq_300],

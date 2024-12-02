@@ -96,17 +96,16 @@ use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::HudiConfigs;
-use crate::exprs::PartitionFilter;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
-use crate::table::partition::PartitionPruner;
+use crate::table::partition::{PartitionFilter, PartitionPruner};
 use crate::table::timeline::Timeline;
 
 pub mod builder;
 mod fs_view;
-mod partition;
+pub mod partition;
 mod timeline;
 
 /// Hudi Table in-memory
@@ -301,10 +300,8 @@ mod tests {
     use std::path::PathBuf;
     use std::{env, panic};
     use url::Url;
-
-    use crate::exprs::PartitionFilter;
-
     use hudi_tests::{assert_not, TestTable};
+    use crate::table::PartitionFilter;
 
     use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
@@ -735,11 +732,9 @@ mod tests {
 
         let schema = create_test_schema();
         let filter_ge_10 = PartitionFilter::try_from((("byteField", ">=", "10"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
 
         let filter_lt_30 = PartitionFilter::try_from((("byteField", "<", "30"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
 
         let actual = hudi_table
@@ -758,7 +753,6 @@ mod tests {
         assert_eq!(actual, expected);
 
         let filter_gt_30 = PartitionFilter::try_from((("byteField", ">", "30"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let actual = hudi_table
             .get_file_paths_with_filters(&[filter_gt_30])
@@ -795,13 +789,10 @@ mod tests {
 
         let schema = create_test_schema();
         let filter_gte_10 = PartitionFilter::try_from((("byteField", ">=", "10"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let filter_lt_20 = PartitionFilter::try_from((("byteField", "<", "20"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let filter_ne_100 = PartitionFilter::try_from((("shortField", "!=", "100"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
 
         let actual = hudi_table
@@ -818,10 +809,8 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
         let filter_lt_20 = PartitionFilter::try_from((("byteField", ">", "20"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let filter_eq_300 = PartitionFilter::try_from((("shortField", "=", "300"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
 
         let actual = hudi_table
@@ -841,13 +830,10 @@ mod tests {
 
         let schema = create_test_schema();
         let filter_gte_10 = PartitionFilter::try_from((("byteField", ">=", "10"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let filter_lt_20 = PartitionFilter::try_from((("byteField", "<", "20"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
         let filter_ne_100 = PartitionFilter::try_from((("shortField", "!=", "100"), &schema))
-            .map_err(|e| anyhow!("Failed to create PartitionFilter: {}", e))
             .unwrap();
 
         let records = hudi_table
