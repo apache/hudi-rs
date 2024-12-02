@@ -24,7 +24,7 @@ platform. This guide will walk you through the process of making your first cont
 
 ## File an issue
 
-Testing and reporting bugs are also valueable contributions. Please follow
+Testing and reporting bugs are also valuable contributions. Please follow
 the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_report.yml) to file bug reports.
 
 ## Prepare for development
@@ -41,6 +41,7 @@ and Rust modules. You don't need to `cd` to the root directory and run `cargo` c
 To setup python virtual env, run
 
 ```shell
+cd python
 make setup-venv
 ```
 
@@ -87,6 +88,61 @@ pytest -s
 # for a specific test case
 pytest tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
 ```
+
+## Debugging on VSCode
+
+Debugging is a crucial part of developing/maintaining the project. This tutorial will guide you through setting up Visual Studio Code for debugging hudi-rs using the CodeLLDB extension. Assuming you have Visual Studio Code installed:
+
+1. Download the CodeLLDB VSCode extension.
+
+2. Open the **hudi-rs** project in VSCode.
+
+3. Add a `.launch` file (seen below) in your `.vscode` (if it does not appear in your root directory, consult [here] (https://code.visualstudio.com/docs/editor/debugging#_launch-configurations)):
+
+<details><summary><code><b>launch.json</b></code></summary>
+
+    ```json
+    {
+        "configurations": [
+            {
+                "name": "Debug Rust/Python",
+                "type": "debugpy",
+                "request": "launch",
+                "program": "${workspaceFolder}/tools/attach_debugger.py",
+                "args": [
+                    "${file}"
+                ],
+                "console": "internalConsole",
+                "serverReadyAction": {
+                    "pattern": "pID = ([0-9]+)",
+                    "action": "startDebugging",
+                    "name": "Rust LLDB"
+                }
+            },
+            {
+                "name": "Rust LLDB",
+                "pid": "0",
+                "type": "lldb",
+                "request": "attach",
+                "program": "${command:python.interpreterPath}",
+                "sourceLanguages": [
+                    "rust"
+                ],
+            }
+        ]
+    }
+    ```
+
+    </details>
+
+### Using the Debugger
+
+1. Create a Python file in your python environment which imports code from the hudi module. 
+
+2. On the left of VSCode, there should be '**Run and Debug**' option. At the top-left of your screen, 
+you can select '**Debug Rust/Python**' in the dropdown options.
+
+Breakpoints can be added in the code to pinpoint debugging instances
 
 ## Before creating a pull request
 
