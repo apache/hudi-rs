@@ -104,23 +104,35 @@ make check-rust check-python
 
 ## Create a pull request
 
-Pull requests should align with the following:
+When submitting a pull request, please follow these guidelines:
 
-1. **Title Format**: The pull request title must follow the format outlined in the [conventional commits spec](https://www.conventionalcommits.org). This is a standardized format for commit messages, and also allows us to auto-generate change logs and release notes. Since only the `main` branch requires this format, and we always squash commits and then merge the PR, incremental commits' messages do not need to conform to it. 
-2. **Line Count**: Submit PRs that are **no longer than 400-500 lines**. Keeping PRs concise makes it easier for reviewers to thoroughly examine changes without experiencing fatigue. If your changes exceed this limit, consider breaking them down into smaller, logical PRs that address specific aspects of the feature or bug fix.
-3. **Coverage Requirements**: All new features and bug fixes **must** include appropriate unit tests to ensure functionality and prevent regressions. Tests should cover both typical use cases and edge cases. Ensure that new tests pass locally before submitting the PR.
-4. **Code Comments**: Provide clear and concise comments in your code where necessary. Comments should explain the purpose of complex logic or non-obvious implementations.
+1. **Title Format**: The pull request title must follow the format outlined in
+   the [conventional commits spec](https://www.conventionalcommits.org). This is a standardized format for commit
+   messages, and also allows us to auto-generate change logs and release notes. Since only the `main` branch requires
+   this format, and we always squash commits and then merge the PR, incremental commits' messages do not need to conform
+   to it.
+2. **Line Count**: A general guideline is to keep the PR's diff, i.e., max(added lines, deleted lines), **less than 1000
+   lines**. Keeping PRs concise makes it easier for reviewers to thoroughly examine changes without experiencing
+   fatigue. If your changes exceed this limit, consider breaking them down into smaller, logical PRs that address
+   specific aspects of the feature or bug fix.
+3. **Coverage Requirements**: All new features and bug fixes **must** include appropriate unit tests to ensure
+   functionality and prevent regressions. Tests should cover both typical use cases and edge cases. Ensure that new
+   tests pass locally before submitting the PR.
+4. **Code Comments**: Properly designed APIs and code should be self-explanatory and make in-code comments redundant. In
+   case that complex logic or non-obvious implementations are absolutely unavoidable, please add comments to explain the
+   code's purpose and behavior.
 
 ### Code coverage
 
 We use [codecov](https://app.codecov.io/github/apache/hudi-rs) to generate code coverage report and enforce net positive
 coverage change for PRs, with a 5% lenacy.
 
+## Learning
+
+To help with contributing to the project, please explore [Hudi's documentation](https://hudi.apache.org/docs/overview)
+for further learning.
+
 ## Code of Conduct
 
 We expect all community members to follow
 our [Code of Conduct](https://www.apache.org/foundation/policies/conduct.html).
-
-## Learning Hudi's Architecture
-
-To help with contributing to the project, hudi-rs has [documentation](https://hudi.apache.org/docs/overview) and [rust crates](https://crates.io/crates/hudi) to help understand the underlying architecture.
