@@ -17,37 +17,30 @@
  * under the License.
  */
 
-use arrow_array::{Array, Scalar};
-use arrow_schema::SchemaRef;
-use datafusion_common::DataFusionError;
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{BinaryExpr, Expr};
+use hudi_core::exprs::filter::Filter;
 use hudi_core::exprs::ExprOperator;
-use hudi_core::table::partition::PartitionFilter;
-use std::sync::Arc;
 
 // TODO: Handle other Datafusion `Expr`
 
-/// Converts a slice of DataFusion expressions (`Expr`) into a vector of `PartitionFilter`.
-/// Returns `Some(Vec<PartitionFilter>)` if at least one filter is successfully converted,
+/// Converts a slice of DataFusion expressions (`Expr`) into a vector of `Filter`.
+/// Returns `Some(Vec<Filter>)` if at least one filter is successfully converted,
 /// otherwise returns `None`.
-pub fn convert_exprs_to_filter(
-    filters: &[Expr],
-    partition_schema: &SchemaRef,
-) -> Vec<PartitionFilter> {
-    let mut partition_filters = Vec::new();
+pub fn convert_exprs_to_filter(exprs: &[Expr]) -> Vec<Filter> {
+    let mut filters: Vec<Filter> = Vec::new();
 
-    for expr in filters {
+    for expr in exprs {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
-                if let Some(partition_filter) = convert_binary_expr(binary_expr, partition_schema) {
-                    partition_filters.push(partition_filter);
+                if let Some(filter) = convert_binary_expr(binary_expr) {
+                    filters.push(filter);
                 }
             }
             Expr::Not(not_expr) => {
                 // Handle NOT expressions
-                if let Some(partition_filter) = convert_not_expr(not_expr, partition_schema) {
-                    partition_filters.push(partition_filter);
+                if let Some(filter) = convert_not_expr(not_expr) {
+                    filters.push(filter);
                 }
             }
             _ => {
@@ -56,14 +49,11 @@ pub fn convert_exprs_to_filter(
         }
     }
 
-    partition_filters
+    filters
 }
 
-/// Converts a binary expression (`Expr::BinaryExpr`) into a `PartitionFilter`.
-fn convert_binary_expr(
-    binary_expr: &BinaryExpr,
-    partition_schema: &SchemaRef,
-) -> Option<PartitionFilter> {
+/// Converts a binary expression (`Expr::BinaryExpr`) into a `Filter`.
+fn convert_binary_expr(binary_expr: &BinaryExpr) -> Option<Filter> {
     // extract the column and literal from the binary expression
     let (column, literal) = match (&*binary_expr.left, &*binary_expr.right) {
         (Expr::Column(col), Expr::Literal(lit)) => (col, lit),
@@ -71,11 +61,7 @@ fn convert_binary_expr(
         _ => return None,
     };
 
-    let field = partition_schema
-        .field_with_name(column.name())
-        .map_err(|e| DataFusionError::Plan(format!("Error finding field with name '{}': {}", column.name(), e)))
-        .unwrap()
-        .clone();
+    let field_name = column.name().to_string();
 
     let operator = match binary_expr.op {
         Operator::Eq => ExprOperator::Eq,
@@ -87,28 +73,22 @@ fn convert_binary_expr(
         _ => return None,
     };
 
-    let value = match literal.cast_to(field.data_type()) {
-        Ok(value) => {
-            let array_ref: Arc<dyn Array> = value.to_array().unwrap();
-            Scalar::new(array_ref)
-        }
-        Err(_) => return None,
-    };
+    let value = literal.to_string();
 
-    Some(PartitionFilter {
-        field,
+    Some(Filter {
+        field_name,
         operator,
         value,
     })
 }
 
 /// Converts a NOT expression (`Expr::Not`) into a `PartitionFilter`.
-fn convert_not_expr(not_expr: &Expr, partition_schema: &SchemaRef) -> Option<PartitionFilter> {
+fn convert_not_expr(not_expr: &Expr) -> Option<Filter> {
     match not_expr {
         Expr::BinaryExpr(ref binary_expr) => {
-            let mut partition_filter = convert_binary_expr(binary_expr, partition_schema)?;
-            partition_filter.operator = negate_operator(partition_filter.operator)?;
-            Some(partition_filter)
+            let mut filter = convert_binary_expr(binary_expr)?;
+            filter.operator = negate_operator(filter.operator)?;
+            Some(filter)
         }
         _ => None,
     }
@@ -129,59 +109,47 @@ fn negate_operator(op: ExprOperator) -> Option<ExprOperator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
     use datafusion_expr::{BinaryExpr, Expr};
     use hudi_core::exprs::ExprOperator;
-    use std::f64::consts::PI;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     #[test]
     fn test_convert_simple_binary_expr() {
-        let partition_schema = Arc::new(Schema::new(vec![Field::new(
-            "partition_col",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
 
         let expr = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(col("partition_col")),
+            Box::new(col("col")),
             Operator::Eq,
             Box::new(lit(42i32)),
         ));
 
         let filters = vec![expr];
 
-        let result = convert_exprs_to_filter(&filters, &partition_schema);
+        let result = convert_exprs_to_filter(&filters);
 
         assert_eq!(result.len(), 1);
 
-        let expected_filter = PartitionFilter {
-            field: partition_schema.field(0).clone(),
+        let expected_filter = Filter {
+            field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Eq,
-            value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+            value: "42".to_string(),
         };
 
-        assert_eq!(result[0].field, expected_filter.field);
+        assert_eq!(result[0].field_name, expected_filter.field_name);
         assert_eq!(result[0].operator, expected_filter.operator);
-        assert_eq!(
-            *result[0].value.clone().into_inner(),
-            expected_filter.value.into_inner()
-        );
+        assert_eq!(*result[0].value.clone(), expected_filter.value);
     }
 
     // Tests the conversion of a NOT expression
     #[test]
     fn test_convert_not_expr() {
-        let partition_schema = Arc::new(Schema::new(vec![Field::new(
-            "partition_col",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
 
         let inner_expr = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(col("partition_col")),
+            Box::new(col("col")),
             Operator::Eq,
             Box::new(lit(42i32)),
         ));
@@ -189,109 +157,79 @@ mod tests {
 
         let filters = vec![expr];
 
-        let result = convert_exprs_to_filter(&filters, &partition_schema);
+        let result = convert_exprs_to_filter(&filters);
 
         assert_eq!(result.len(), 1);
 
-        let expected_filter = PartitionFilter {
-            field: partition_schema.field(0).clone(),
+        let expected_filter = Filter {
+            field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Ne,
-            value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+            value: "42".to_string(),
         };
 
-        assert_eq!(result[0].field, expected_filter.field);
+        assert_eq!(result[0].field_name, expected_filter.field_name);
         assert_eq!(result[0].operator, expected_filter.operator);
-        assert_eq!(
-            *result[0].value.clone().into_inner(),
-            expected_filter.value.into_inner()
-        );
+        assert_eq!(*result[0].value.clone(), expected_filter.value);
     }
 
     #[test]
     fn test_convert_binary_expr_extensive() {
-        // partition schema with multiple fields of different data types
-        let partition_schema = Arc::new(Schema::new(vec![
-            Field::new("int32_col", DataType::Int32, false),
-            Field::new("int64_col", DataType::Int64, false),
-            Field::new("float64_col", DataType::Float64, false),
-            Field::new("string_col", DataType::Utf8, false),
-        ]));
-
         // list of test cases with different operators and data types
         let test_cases = vec![
             (
                 col("int32_col").eq(lit(42i32)),
-                Some(PartitionFilter {
-                    field: partition_schema
-                        .field_with_name("int32_col")
-                        .unwrap()
-                        .clone(),
+                Some(Filter {
+                    field_name: String::from("int32_col"),
                     operator: ExprOperator::Eq,
-                    value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+                    value: String::from("42"),
                 }),
             ),
             (
                 col("int64_col").gt_eq(lit(100i64)),
-                Some(PartitionFilter {
-                    field: partition_schema
-                        .field_with_name("int64_col")
-                        .unwrap()
-                        .clone(),
+                Some(Filter {
+                    field_name: String::from("int64_col"),
                     operator: ExprOperator::Gte,
-                    value: Scalar::new(Arc::new(Int64Array::from(vec![100])) as ArrayRef),
+                    value: String::from("100"),
                 }),
             ),
             (
-                col("float64_col").lt(lit(PI)),
-                Some(PartitionFilter {
-                    field: partition_schema
-                        .field_with_name("float64_col")
-                        .unwrap()
-                        .clone(),
+                col("float64_col").lt(lit(32.666)),
+                Some(Filter {
+                    field_name: String::from("float64_col"),
                     operator: ExprOperator::Lt,
-                    value: Scalar::new(Arc::new(Float64Array::from(vec![PI])) as ArrayRef),
+                    value: "32.666".to_string(),
                 }),
             ),
             (
                 col("string_col").not_eq(lit("test")),
-                Some(PartitionFilter {
-                    field: partition_schema
-                        .field_with_name("string_col")
-                        .unwrap()
-                        .clone(),
+                Some(Filter {
+                    field_name: String::from("string_col"),
                     operator: ExprOperator::Ne,
-                    value: Scalar::new(Arc::new(StringArray::from(vec!["test"])) as ArrayRef),
+                    value: String::from("test"),
                 }),
             ),
         ];
 
         let filters: Vec<Expr> = test_cases.iter().map(|(expr, _)| expr.clone()).collect();
-        let result = convert_exprs_to_filter(&filters, &partition_schema);
-        let expected_filters: Vec<&PartitionFilter> = test_cases
+        let result = convert_exprs_to_filter(&filters);
+        let expected_filters: Vec<&Filter> = test_cases
             .iter()
             .filter_map(|(_, opt_filter)| opt_filter.as_ref())
             .collect();
 
         assert_eq!(result.len(), expected_filters.len());
 
-        for (converted_filter, expected_filter) in result.iter().zip(expected_filters.iter()) {
-            assert_eq!(converted_filter.field.name(), expected_filter.field.name());
-            assert_eq!(converted_filter.operator, expected_filter.operator);
-            assert_eq!(
-                *converted_filter.value.clone().into_inner(),
-                expected_filter.value.clone().into_inner()
-            );
+        for (result, expected_filter) in result.iter().zip(expected_filters.iter()) {
+            assert_eq!(result.field_name, expected_filter.field_name);
+            assert_eq!(result.operator, expected_filter.operator);
+            assert_eq!(*result.value.clone(), expected_filter.value);
         }
     }
 
     // Tests conversion with different operators (e.g., <, <=, >, >=)
     #[test]
     fn test_convert_various_operators() {
-        let partition_schema = Arc::new(Schema::new(vec![Field::new(
-            "partition_col",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
 
         let operators = vec![
             (Operator::Lt, ExprOperator::Lt),
@@ -302,48 +240,51 @@ mod tests {
 
         for (op, expected_op) in operators {
             let expr = Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("partition_col")),
+                Box::new(col("col")),
                 op,
                 Box::new(lit(42i32)),
             ));
 
             let filters = vec![expr];
 
-            let result = convert_exprs_to_filter(&filters, &partition_schema);
+            let result = convert_exprs_to_filter(&filters);
 
             assert_eq!(result.len(), 1);
 
-            let expected_filter = PartitionFilter {
-                field: partition_schema.field(0).clone(),
+            let expected_filter = Filter {
+                field_name: schema.field(0).name().to_string(),
                 operator: expected_op,
-                value: Scalar::new(Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+                value: String::from("42"),
             };
 
-            assert_eq!(result[0].field, expected_filter.field);
+            assert_eq!(result[0].field_name, expected_filter.field_name);
             assert_eq!(result[0].operator, expected_filter.operator);
-            assert_eq!(
-                *result[0].value.clone().into_inner(),
-                expected_filter.value.into_inner()
-            );
+            assert_eq!(*result[0].value.clone(), expected_filter.value);
         }
     }
 
     #[test]
     fn test_convert_expr_with_unsupported_operator() {
-        let partition_schema = Arc::new(Schema::new(vec![Field::new(
-            "partition_col",
-            DataType::Int32,
-            false,
-        )]));
-
         let expr = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(col("partition_col")),
+            Box::new(col("col")),
             Operator::And,
             Box::new(lit("value")),
         ));
 
         let filters = vec![expr];
-        let result = convert_exprs_to_filter(&filters, &partition_schema);
+        let result = convert_exprs_to_filter(&filters);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_negate_operator_for_all_ops() {
+        for (op, _) in ExprOperator::TOKEN_OP_PAIRS {
+            if let Some(negated_op) = negate_operator(ExprOperator::from_str(op).unwrap()) {
+                let double_negated_op = negate_operator(negated_op)
+                    .expect("Negation should be defined for all operators");
+
+                assert_eq!(double_negated_op, ExprOperator::from_str(op).unwrap());
+            }
+        }
     }
 }

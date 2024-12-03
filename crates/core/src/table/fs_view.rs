@@ -178,24 +178,16 @@ impl FileSystemView {
 mod tests {
     use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
+    use crate::exprs::filter::Filter;
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
     use crate::table::partition::PartitionPruner;
-    use crate::table::{PartitionFilter, Table};
+    use crate::table::Table;
 
-    use anyhow::anyhow;
-    use arrow::datatypes::{DataType, Field, Schema};
     use hudi_tests::TestTable;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use url::Url;
-
-    fn create_test_schema() -> Schema {
-        Schema::new(vec![
-            Field::new("byteField", DataType::Int32, false),
-            Field::new("shortField", DataType::Int32, false),
-        ])
-    }
 
     async fn create_test_fs_view(base_url: Url) -> FileSystemView {
         FileSystemView::new(
@@ -307,17 +299,15 @@ mod tests {
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
 
-        let schema = create_test_schema();
-        let filter_lt_20 = PartitionFilter::try_from((("byteField", "<", "20"), &schema))
-            .unwrap();
-        let filter_eq_300 = PartitionFilter::try_from((("shortField", "=", "300"), &schema))
-            .unwrap();
+        let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
+        let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
         let partition_pruner = PartitionPruner::new(
             &[filter_lt_20, filter_eq_300],
             &partition_schema,
             hudi_table.hudi_configs.as_ref(),
         )
         .unwrap();
+
         let file_slices = fs_view
             .get_file_slices_as_of("20240418173235694", &partition_pruner, excludes)
             .await

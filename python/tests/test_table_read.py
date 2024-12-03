@@ -193,3 +193,17 @@ def test_read_table_as_of_timestamp(get_sample_table):
             "fare": 34.15,
         },
     ]
+
+def test_convert_filters_valid(get_sample_table):
+    table_path = get_sample_table
+    table = HudiTable(table_path)
+
+    filters = [
+        ("city", "=", "san_francisco"),
+        ("fare", ">", "50"),
+        ("driver", "!=", "john_doe"),
+    ]
+
+    file_slices = table.get_file_slices(filters=filters)
+
+    assert len(file_slices) > 0

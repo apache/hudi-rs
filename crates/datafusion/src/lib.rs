@@ -167,11 +167,11 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
-        // Convert Datafusion `Expr` to `PartitionFilter`
-        let partition_filters = convert_exprs_to_filter(filters, &self.schema());
+        // Convert Datafusion `Expr` to `Filter`
+        let pushdown_filters = convert_exprs_to_filter(filters);
         let file_slices = self
             .table
-            .get_file_slices_splits(self.get_input_partitions(), partition_filters.as_slice())
+            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters.as_slice())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
@@ -567,11 +567,11 @@ mod tests {
         let result = table_provider.supports_filters_pushdown(&filters).unwrap();
 
         assert_eq!(result.len(), 6);
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
-        assert_eq!(result[1], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[3], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
-        assert_eq!(result[5], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[5], TableProviderFilterPushDown::Inexact);
     }
 }

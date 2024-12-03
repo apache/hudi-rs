@@ -16,3 +16,56 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::exprs::ExprOperator;
+use anyhow::{Context, Result};
+use arrow_array::StringArray;
+use arrow_array::{ArrayRef, Scalar};
+use arrow_cast::{cast_with_options, CastOptions};
+use arrow_schema::DataType;
+use std::str::FromStr;
+
+#[derive(Debug, Clone)]
+pub struct Filter {
+    pub field_name: String,
+    pub operator: ExprOperator,
+    pub value: String,
+}
+
+impl Filter {
+    pub fn cast_value(value: &[&str; 1], data_type: &DataType) -> Result<Scalar<ArrayRef>> {
+        let cast_options = CastOptions {
+            safe: false,
+            format_options: Default::default(),
+        };
+
+        let value = StringArray::from(Vec::from(value));
+
+        Ok(Scalar::new(cast_with_options(
+            &value,
+            data_type,
+            &cast_options,
+        )?))
+    }
+}
+
+impl TryFrom<(&str, &str, &str)> for Filter {
+    type Error = anyhow::Error;
+
+    fn try_from(filter: (&str, &str, &str)) -> Result<Self> {
+        let (field_name, operator_str, value_str) = filter;
+
+        let field_name = field_name.to_string();
+
+        let operator = ExprOperator::from_str(operator_str)
+            .with_context(|| format!("Unsupported operator: {}", operator_str))?;
+
+        let value = value_str.to_string();
+
+        Ok(Filter {
+            field_name,
+            operator,
+            value,
+        })
+    }
+}
