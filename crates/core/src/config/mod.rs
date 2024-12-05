@@ -21,8 +21,7 @@ use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::storage::utils::parse_uri;
-use anyhow::Result;
+use crate::{storage::utils::parse_uri, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 

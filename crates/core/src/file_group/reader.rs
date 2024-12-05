@@ -21,7 +21,7 @@ use crate::config::utils::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
 use crate::file_group::FileSlice;
 use crate::storage::Storage;
-use anyhow::Result;
+use crate::Result;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
