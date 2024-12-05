@@ -28,11 +28,10 @@ use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
-
 use crate::storage::file_info::FileInfo;
 use crate::storage::file_stats::FileStats;
 use crate::storage::Storage;
+use crate::{CoreError::Internal, Result};
 
 /// Represents common metadata about a Hudi Base File.
 #[derive(Clone, Debug)]
@@ -51,10 +50,12 @@ impl BaseFile {
     /// Parse file name and extract file_group_id and commit_time.
     fn parse_file_name(file_name: &str) -> Result<(String, String)> {
         let err_msg = format!("Failed to parse file name '{}' for base file.", file_name);
-        let (name, _) = file_name.rsplit_once('.').ok_or(anyhow!(err_msg.clone()))?;
+        let (name, _) = file_name
+            .rsplit_once('.')
+            .ok_or(Internal(err_msg.clone()))?;
         let parts: Vec<&str> = name.split('_').collect();
-        let file_group_id = parts.first().ok_or(anyhow!(err_msg.clone()))?.to_string();
-        let commit_time = parts.get(2).ok_or(anyhow!(err_msg.clone()))?.to_string();
+        let file_group_id = parts.first().ok_or(Internal(err_msg.clone()))?.to_string();
+        let commit_time = parts.get(2).ok_or(Internal(err_msg.clone()))?.to_string();
         Ok((file_group_id, commit_time))
     }
 
@@ -189,11 +190,11 @@ impl FileGroup {
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
         let commit_time = base_file.commit_time.as_str();
         if self.file_slices.contains_key(commit_time) {
-            Err(anyhow!(
+            Err(Internal(format!(
                 "Commit time {0} is already present in File Group {1}",
                 commit_time.to_owned(),
                 self.id,
-            ))
+            )))
         } else {
             self.file_slices.insert(
                 commit_time.to_owned(),

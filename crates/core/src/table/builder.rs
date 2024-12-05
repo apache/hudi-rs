@@ -17,7 +17,6 @@
  * under the License.
  */
 
-use anyhow::{anyhow, Context, Result};
 use paste::paste;
 use std::collections::HashMap;
 use std::env;
@@ -38,6 +37,7 @@ use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
 use crate::table::Table;
+use crate::{CoreError, Result};
 
 /// Builder for creating a [Table] instance.
 #[derive(Debug, Clone)]
@@ -112,13 +112,10 @@ impl TableBuilder {
         let hudi_configs = Arc::from(hudi_configs);
         let storage_options = Arc::from(self.storage_options.clone());
 
-        let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone())
-            .await
-            .context("Failed to load timeline")?;
+        let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone()).await?;
 
-        let file_system_view = FileSystemView::new(hudi_configs.clone(), storage_options.clone())
-            .await
-            .context("Failed to load file system view")?;
+        let file_system_view =
+            FileSystemView::new(hudi_configs.clone(), storage_options.clone()).await?;
 
         Ok(Table {
             hudi_configs,
@@ -253,22 +250,26 @@ impl TableBuilder {
         // additional validation
         let table_type = hudi_configs.get(TableType)?.to::<String>();
         if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(anyhow!("Only support copy-on-write table."));
+            return Err(CoreError::Unsupported(
+                "Only support copy-on-write table.".to_string(),
+            ));
         }
 
         let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
         if !(5..=6).contains(&table_version) {
-            return Err(anyhow!("Only support table version 5 and 6."));
+            return Err(CoreError::Unsupported(
+                "Only support table version 5 and 6.".to_string(),
+            ));
         }
 
         let drops_partition_cols = hudi_configs
             .get_or_default(DropsPartitionFields)
             .to::<bool>();
         if drops_partition_cols {
-            return Err(anyhow!(
+            return Err(CoreError::Unsupported(format!(
                 "Only support when `{}` is disabled",
                 DropsPartitionFields.as_ref()
-            ));
+            )));
         }
 
         Ok(())
