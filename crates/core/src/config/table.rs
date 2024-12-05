@@ -25,7 +25,7 @@ use strum_macros::{AsRefStr, EnumIter};
 
 use crate::{
     config::{ConfigParser, HudiConfigValue},
-    Error::{self, ConfNotFound, InvalidConf, Unsupported},
+    CoreError::{self, ConfigNotFound, InvalidConfig, Unsupported},
     Result,
 };
 
@@ -148,7 +148,7 @@ impl ConfigParser for HudiTableConfig {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(ConfNotFound(self.as_ref().to_string()));
+            .ok_or(ConfigNotFound(self.as_ref().to_string()));
 
         match self {
             Self::BaseFileFormat => get_result
@@ -157,7 +157,7 @@ impl ConfigParser for HudiTableConfig {
             Self::BasePath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::Checksum => get_result
                 .and_then(|v| {
-                    isize::from_str(v).map_err(|e| InvalidConf {
+                    isize::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::Checksum.as_ref(),
                         source: Box::new(e),
                     })
@@ -166,7 +166,7 @@ impl ConfigParser for HudiTableConfig {
             Self::DatabaseName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::DropsPartitionFields => get_result
                 .and_then(|v| {
-                    bool::from_str(v).map_err(|e| InvalidConf {
+                    bool::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::DropsPartitionFields.as_ref(),
                         source: Box::new(e),
                     })
@@ -174,7 +174,7 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Boolean),
             Self::IsHiveStylePartitioning => get_result
                 .and_then(|v| {
-                    bool::from_str(v).map_err(|e| InvalidConf {
+                    bool::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::IsHiveStylePartitioning.as_ref(),
                         source: Box::new(e),
                     })
@@ -182,7 +182,7 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Boolean),
             Self::IsPartitionPathUrlencoded => get_result
                 .and_then(|v| {
-                    bool::from_str(v).map_err(|e| InvalidConf {
+                    bool::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::IsPartitionPathUrlencoded.as_ref(),
                         source: Box::new(e),
                     })
@@ -194,7 +194,7 @@ impl ConfigParser for HudiTableConfig {
             Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PopulatesMetaFields => get_result
                 .and_then(|v| {
-                    bool::from_str(v).map_err(|e| InvalidConf {
+                    bool::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::PopulatesMetaFields.as_ref(),
                         source: Box::new(e),
                     })
@@ -208,7 +208,7 @@ impl ConfigParser for HudiTableConfig {
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::TableVersion => get_result
                 .and_then(|v| {
-                    isize::from_str(v).map_err(|e| InvalidConf {
+                    isize::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::TableVersion.as_ref(),
                         source: Box::new(e),
                     })
@@ -216,7 +216,7 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Integer),
             Self::TimelineLayoutVersion => get_result
                 .and_then(|v| {
-                    isize::from_str(v).map_err(|e| InvalidConf {
+                    isize::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::TimelineLayoutVersion.as_ref(),
                         source: Box::new(e),
                     })
@@ -236,13 +236,13 @@ pub enum TableTypeValue {
 }
 
 impl FromStr for TableTypeValue {
-    type Err = Error;
+    type Err = CoreError;
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
-            v => Err(Unsupported(format!("unsupported table type {}", v))),
+            v => Err(Unsupported(format!("Unsupported table type {}", v))),
         }
     }
 }
@@ -255,12 +255,12 @@ pub enum BaseFileFormatValue {
 }
 
 impl FromStr for BaseFileFormatValue {
-    type Err = Error;
+    type Err = CoreError;
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
-            v => Err(Unsupported(format!("unsupported base file format {}", v))),
+            v => Err(Unsupported(format!("Unsupported base file format {}", v))),
         }
     }
 }

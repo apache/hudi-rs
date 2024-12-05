@@ -101,7 +101,7 @@ use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
-use crate::{Error, Result};
+use crate::{CoreError, Result};
 
 pub mod builder;
 mod fs_view;
@@ -265,7 +265,7 @@ impl Table {
             match fg_reader.read_file_slice(&f).await {
                 Ok(batch) => batches.push(batch),
                 Err(e) => {
-                    return Err(Error::Internal(format!(
+                    return Err(CoreError::Internal(format!(
                         "Failed to read file slice {:?} - {}",
                         f, e
                     )))

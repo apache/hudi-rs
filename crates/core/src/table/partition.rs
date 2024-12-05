@@ -18,7 +18,7 @@
  */
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
-use crate::{Error, Result};
+use crate::{CoreError, Result};
 use arrow_array::{ArrayRef, Scalar, StringArray};
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -119,7 +119,7 @@ impl PartitionPruner {
         let parts: Vec<&str> = partition_path.split('/').collect();
 
         if parts.len() != self.schema.fields().len() {
-            return Err(Error::Internal(format!(
+            return Err(CoreError::Internal(format!(
                 "Partition path should have {} part(s) but got {}",
                 self.schema.fields().len(),
                 parts.len()
@@ -133,13 +133,13 @@ impl PartitionPruner {
             .map(|(field, part)| {
                 let value = if self.is_hive_style {
                     let (name, value) = part.split_once('=').ok_or_else(|| {
-                        Error::Internal(format!(
+                        CoreError::Internal(format!(
                             "Partition path should be hive-style but got {}",
                             part
                         ))
                     })?;
                     if name != field.name() {
-                        return Err(Error::Internal(format!(
+                        return Err(CoreError::Internal(format!(
                             "Partition path should contain {} but got {}",
                             field.name(),
                             name
@@ -179,13 +179,13 @@ impl Operator {
 }
 
 impl FromStr for Operator {
-    type Err = crate::Error;
+    type Err = crate::CoreError;
 
     fn from_str(s: &str) -> Result<Self> {
         Operator::TOKEN_OP_PAIRS
             .iter()
             .find_map(|&(token, op)| if token == s { Some(op) } else { None })
-            .ok_or_else(|| Error::Internal(format!("Unsupported operator: {}", s)))
+            .ok_or_else(|| CoreError::Internal(format!("Unsupported operator: {}", s)))
     }
 }
 
@@ -198,7 +198,7 @@ pub struct PartitionFilter {
 }
 
 impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
-    type Error = crate::Error;
+    type Error = crate::CoreError;
 
     fn try_from((filter, partition_schema): ((&str, &str, &str), &Schema)) -> Result<Self> {
         let (field_name, operator_str, value_str) = filter;
@@ -309,7 +309,10 @@ mod tests {
         let filter_tuple = ("count", "=", "not_a_number");
         let filter = PartitionFilter::try_from((filter_tuple, &schema));
         assert!(filter.is_err());
-        assert!(filter.unwrap_err().to_string().contains("Cannot cast string"));
+        assert!(filter
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot cast string"));
     }
 
     #[test]

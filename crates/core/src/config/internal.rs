@@ -25,7 +25,7 @@ use strum_macros::EnumIter;
 
 use crate::{
     config::{ConfigParser, HudiConfigValue},
-    Error::{ConfNotFound, InvalidConf},
+    CoreError::{ConfigNotFound, InvalidConfig},
     Result,
 };
 
@@ -67,12 +67,12 @@ impl ConfigParser for HudiInternalConfig {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(ConfNotFound(self.as_ref().to_string()));
+            .ok_or(ConfigNotFound(self.as_ref().to_string()));
 
         match self {
             Self::SkipConfigValidation => get_result
                 .and_then(|v| {
-                    bool::from_str(v).map_err(|e| InvalidConf {
+                    bool::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::SkipConfigValidation.as_ref(),
                         source: Box::new(e),
                     })

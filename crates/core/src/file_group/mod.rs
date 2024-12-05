@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use crate::storage::file_info::FileInfo;
 use crate::storage::file_stats::FileStats;
 use crate::storage::Storage;
-use crate::{Error::Internal, Result};
+use crate::{CoreError::Internal, Result};
 
 /// Represents common metadata about a Hudi Base File.
 #[derive(Clone, Debug)]

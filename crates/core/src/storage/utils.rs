@@ -22,7 +22,7 @@ use std::path::Path;
 use url::{ParseError, Url};
 
 use crate::{
-    Error::{InvalidPath, UrlParse},
+    CoreError::{InvalidPath, UrlParse},
     Result,
 };
 

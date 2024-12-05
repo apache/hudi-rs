@@ -52,12 +52,12 @@ pub mod util;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum Error {
+pub enum CoreError {
     #[error("Config '{0}' not found")]
-    ConfNotFound(String),
+    ConfigNotFound(String),
 
     #[error("Invalid config item '{item}', {source:?}")]
-    InvalidConf {
+    InvalidConfig {
         item: &'static str,
         source: Box<dyn std::error::Error + Sync + Send + 'static>,
     },
@@ -81,10 +81,10 @@ pub enum Error {
     Utf8Error(#[from] std::str::Utf8Error),
 
     #[error(transparent)]
-    Store(#[from] object_store::Error),
+    ObjectStore(#[from] object_store::Error),
 
     #[error(transparent)]
-    StorePath(#[from] object_store::path::Error),
+    ObjectStorePath(#[from] object_store::path::Error),
 
     #[error(transparent)]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -93,4 +93,4 @@ pub enum Error {
     Arrow(#[from] arrow::error::ArrowError),
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = CoreError> = std::result::Result<T, E>;

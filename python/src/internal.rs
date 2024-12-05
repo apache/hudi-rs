@@ -23,9 +23,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use arrow::pyarrow::ToPyArrow;
-use pyo3::{
-    exceptions::PyOSError, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python,
-};
+use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
 use hudi::file_group::reader::FileGroupReader;
@@ -34,24 +32,28 @@ use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::util::convert_vec_to_slice;
 use hudi::util::vec_to_slice;
+use hudi::CoreError;
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
 
-pub struct HoodieError(hudi::Error);
+create_exception!(_internal, HudiCoreError, PyException);
 
-impl From<HoodieError> for PyErr {
-    fn from(err: HoodieError) -> PyErr {
-        PyOSError::new_err(err.0.to_string())
-    }
+fn convert_to_py_err(err: CoreError) -> PyErr {
+    // TODO(xushiyan): match and map all sub types
+    HudiCoreError::new_err(err.to_string())
 }
 
-impl From<hudi::Error> for HoodieError {
-    fn from(err: hudi::Error) -> Self {
-        Self(err)
-    }
+#[derive(thiserror::Error, Debug)]
+pub enum PythonError {
+    #[error("Error in Hudi core")]
+    HudiCore(#[from] CoreError),
 }
 
-impl From<pyo3::PyErr> for HoodieError {
-    fn from(err: pyo3::PyErr) -> Self {
-        Self(hudi::Error::Internal(err.to_string()))
+impl From<PythonError> for PyErr {
+    fn from(err: PythonError) -> PyErr {
+        match err {
+            PythonError::HudiCore(err) => convert_to_py_err(err),
+        }
     }
 }
 
@@ -67,8 +69,9 @@ pub struct HudiFileGroupReader {
 impl HudiFileGroupReader {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
-    fn new(base_uri: &str, options: Option<HashMap<String, String>>) -> Result<Self, HoodieError> {
-        let inner = FileGroupReader::new_with_options(base_uri, options.unwrap_or_default())?;
+    fn new(base_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
+        let inner = FileGroupReader::new_with_options(base_uri, options.unwrap_or_default())
+            .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner })
     }
 
@@ -76,10 +79,10 @@ impl HudiFileGroupReader {
         &self,
         relative_path: &str,
         py: Python,
-    ) -> Result<PyObject, HoodieError> {
-        rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))?
+    ) -> PyResult<PyObject> {
+        rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
+            .map_err(PythonError::from)?
             .to_pyarrow(py)
-            .map_err(HoodieError::from)
     }
 }
 
@@ -106,15 +109,18 @@ pub struct HudiFileSlice {
 #[cfg(not(tarpaulin))]
 #[pymethods]
 impl HudiFileSlice {
-    fn base_file_relative_path(&self) -> Result<String, HoodieError> {
-        PathBuf::from(&self.partition_path)
+    fn base_file_relative_path(&self) -> PyResult<String> {
+        Ok(PathBuf::from(&self.partition_path)
             .join(&self.base_file_name)
             .to_str()
             .map(String::from)
-            .ok_or(HoodieError(hudi::Error::Internal(format!(
-                "Failed to get base file relative path for file slice: {:?}",
-                self
-            ))))
+            .ok_or_else(|| {
+                CoreError::Internal(format!(
+                    "Failed to get base file relative path for file slice: {:?}",
+                    self
+                ))
+            })
+            .map_err(PythonError::from)?)
     }
 }
 
@@ -153,11 +159,13 @@ impl HudiTable {
     fn new_with_options(
         base_uri: &str,
         options: Option<HashMap<String, String>>,
-    ) -> Result<Self, HoodieError> {
-        let inner: Table = rt().block_on(Table::new_with_options(
-            base_uri,
-            options.unwrap_or_default(),
-        ))?;
+    ) -> PyResult<Self> {
+        let inner: Table = rt()
+            .block_on(Table::new_with_options(
+                base_uri,
+                options.unwrap_or_default(),
+            ))
+            .map_err(PythonError::from)?;
         Ok(HudiTable { inner })
     }
 
@@ -169,16 +177,16 @@ impl HudiTable {
         self.inner.storage_options()
     }
 
-    fn get_schema(&self, py: Python) -> Result<PyObject, HoodieError> {
-        rt().block_on(self.inner.get_schema())?
+    fn get_schema(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self.inner.get_schema())
+            .map_err(PythonError::from)?
             .to_pyarrow(py)
-            .map_err(HoodieError::from)
     }
 
-    fn get_partition_schema(&self, py: Python) -> Result<PyObject, HoodieError> {
-        rt().block_on(self.inner.get_partition_schema())?
+    fn get_partition_schema(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self.inner.get_partition_schema())
+            .map_err(PythonError::from)?
             .to_pyarrow(py)
-            .map_err(HoodieError::from)
     }
 
     #[pyo3(signature = (n, filters=None))]
@@ -187,12 +195,14 @@ impl HudiTable {
         n: usize,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
-    ) -> Result<Vec<Vec<HudiFileSlice>>, HoodieError> {
+    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
         py.allow_threads(|| {
-            let file_slices = rt().block_on(
-                self.inner
-                    .get_file_slices_splits(n, vec_to_slice!(filters.unwrap_or_default())),
-            )?;
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_splits(n, vec_to_slice!(filters.unwrap_or_default())),
+                )
+                .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
                 .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
@@ -205,12 +215,14 @@ impl HudiTable {
         &self,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
-    ) -> Result<Vec<HudiFileSlice>, HoodieError> {
+    ) -> PyResult<Vec<HudiFileSlice>> {
         py.allow_threads(|| {
-            let file_slices = rt().block_on(
-                self.inner
-                    .get_file_slices(vec_to_slice!(filters.unwrap_or_default())),
-            )?;
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices(vec_to_slice!(filters.unwrap_or_default())),
+                )
+                .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
     }
@@ -225,13 +237,13 @@ impl HudiTable {
         &self,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
-    ) -> Result<PyObject, HoodieError> {
+    ) -> PyResult<PyObject> {
         rt().block_on(
             self.inner
                 .read_snapshot(vec_to_slice!(filters.unwrap_or_default())),
-        )?
+        )
+        .map_err(PythonError::from)?
         .to_pyarrow(py)
-        .map_err(HoodieError::from)
     }
 }
 
@@ -243,14 +255,16 @@ pub fn build_hudi_table(
     hudi_options: Option<HashMap<String, String>>,
     storage_options: Option<HashMap<String, String>>,
     options: Option<HashMap<String, String>>,
-) -> Result<HudiTable, HoodieError> {
-    let inner = rt().block_on(
-        TableBuilder::from_base_uri(&base_uri)
-            .with_hudi_options(hudi_options.unwrap_or_default())
-            .with_storage_options(storage_options.unwrap_or_default())
-            .with_options(options.unwrap_or_default())
-            .build(),
-    )?;
+) -> PyResult<HudiTable> {
+    let inner = rt()
+        .block_on(
+            TableBuilder::from_base_uri(&base_uri)
+                .with_hudi_options(hudi_options.unwrap_or_default())
+                .with_storage_options(storage_options.unwrap_or_default())
+                .with_options(options.unwrap_or_default())
+                .build(),
+        )
+        .map_err(PythonError::from)?;
     Ok(HudiTable { inner })
 }
 

@@ -37,7 +37,7 @@ use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
 use crate::table::Table;
-use crate::{Error, Result};
+use crate::{CoreError, Result};
 
 /// Builder for creating a [Table] instance.
 #[derive(Debug, Clone)]
@@ -250,14 +250,14 @@ impl TableBuilder {
         // additional validation
         let table_type = hudi_configs.get(TableType)?.to::<String>();
         if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(Error::Unsupported(
+            return Err(CoreError::Unsupported(
                 "Only support copy-on-write table.".to_string(),
             ));
         }
 
         let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
         if !(5..=6).contains(&table_version) {
-            return Err(Error::Unsupported(
+            return Err(CoreError::Unsupported(
                 "Only support table version 5 and 6.".to_string(),
             ));
         }
@@ -266,7 +266,7 @@ impl TableBuilder {
             .get_or_default(DropsPartitionFields)
             .to::<bool>();
         if drops_partition_cols {
-            return Err(Error::Unsupported(format!(
+            return Err(CoreError::Unsupported(format!(
                 "Only support when `{}` is disabled",
                 DropsPartitionFields.as_ref()
             )));

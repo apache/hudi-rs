@@ -38,7 +38,7 @@ use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::storage::file_info::FileInfo;
 use crate::storage::utils::join_url_segments;
-use crate::{Error, Result};
+use crate::{CoreError, Result};
 
 pub mod file_info;
 pub mod file_stats;
@@ -61,7 +61,7 @@ impl Storage {
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
         if !hudi_configs.contains(HudiTableConfig::BasePath) {
-            return Err(Error::Internal(format!(
+            return Err(CoreError::Internal(format!(
                 "Failed to create storage: {} is required.",
                 HudiTableConfig::BasePath.as_ref()
             )));
@@ -76,7 +76,7 @@ impl Storage {
                 options,
                 hudi_configs,
             })),
-            Err(e) => Err(Error::Store(e)),
+            Err(e) => Err(CoreError::ObjectStore(e)),
         }
     }
 
@@ -109,7 +109,7 @@ impl Storage {
         let uri = obj_url.to_string();
         let name = obj_path
             .filename()
-            .ok_or(Error::InvalidPath {
+            .ok_or(CoreError::InvalidPath {
                 name: obj_path.to_string(),
                 detail: "failed to get file name".to_string(),
             })?
@@ -176,7 +176,7 @@ impl Storage {
         for dir in dir_paths {
             dirs.push(
                 dir.filename()
-                    .ok_or(Error::InvalidPath {
+                    .ok_or(CoreError::InvalidPath {
                         name: dir.to_string(),
                         detail: "failed to get file name".to_string(),
                     })?
@@ -208,7 +208,7 @@ impl Storage {
             let name = obj_meta
                 .location
                 .filename()
-                .ok_or(Error::InvalidPath {
+                .ok_or(CoreError::InvalidPath {
                     name: obj_meta.location.to_string(),
                     detail: "failed to get file name".to_string(),
                 })?
@@ -246,7 +246,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
                 next_subdir.push(curr);
             }
             next_subdir.push(child_dir);
-            let next_subdir = next_subdir.to_str().ok_or(Error::InvalidPath {
+            let next_subdir = next_subdir.to_str().ok_or(CoreError::InvalidPath {
                 name: format!("{:?}", next_subdir),
                 detail: "failed to convert path".to_string(),
             })?;
@@ -299,6 +299,7 @@ mod tests {
             result.is_err(),
             "Should return error when no base path is invalid."
         );
+        assert!(matches!(result.unwrap_err(), CoreError::ObjectStore(_)));
     }
 
     #[tokio::test]

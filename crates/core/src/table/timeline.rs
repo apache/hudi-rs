@@ -31,7 +31,7 @@ use crate::config::HudiConfigs;
 use crate::file_group::FileGroup;
 use crate::storage::utils::split_filename;
 use crate::storage::Storage;
-use crate::{Error, Result};
+use crate::{CoreError, Result};
 
 /// The [State] of an [Instant] represents the status of the action performed on the table.
 #[allow(dead_code)]
@@ -80,7 +80,7 @@ impl Instant {
         commit_file_path.push(self.file_name());
         commit_file_path
             .to_str()
-            .ok_or(Error::Internal(format!(
+            .ok_or(CoreError::Internal(format!(
                 "Failed to get file path for {:?}",
                 self
             )))
@@ -144,10 +144,10 @@ impl Timeline {
             .get_file_data(instant.relative_path()?.as_str())
             .await?;
         let json: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Internal(format!("Invalid instant {:?}", e)))?;
+            .map_err(|e| CoreError::Internal(format!("Invalid instant {:?}", e)))?;
         let commit_metadata = json
             .as_object()
-            .ok_or_else(|| Error::Internal("Expected JSON object".to_string()))?
+            .ok_or_else(|| CoreError::Internal("Expected JSON object".to_string()))?
             .clone();
         Ok(commit_metadata)
     }
@@ -178,7 +178,7 @@ impl Timeline {
                 None,
             )?)
         } else {
-            Err(Error::Internal(
+            Err(CoreError::Internal(
                 "Failed to resolve the latest schema: no file path found".to_string(),
             ))
         }

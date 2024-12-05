@@ -25,7 +25,7 @@ use strum_macros::EnumIter;
 
 use crate::{
     config::{ConfigParser, HudiConfigValue},
-    Error::{ConfNotFound, InvalidConf},
+    CoreError::{ConfigNotFound, InvalidConfig},
     Result,
 };
 
@@ -79,12 +79,12 @@ impl ConfigParser for HudiReadConfig {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(ConfNotFound(self.as_ref().to_string()));
+            .ok_or(ConfigNotFound(self.as_ref().to_string()));
 
         match self {
             Self::InputPartitions => get_result
                 .and_then(|v| {
-                    usize::from_str(v).map_err(|e| InvalidConf {
+                    usize::from_str(v).map_err(|e| InvalidConfig {
                         item: Self::InputPartitions.as_ref(),
                         source: Box::new(e),
                     })
@@ -99,6 +99,7 @@ impl ConfigParser for HudiReadConfig {
 mod tests {
     use crate::config::read::HudiReadConfig::InputPartitions;
     use crate::config::ConfigParser;
+    use crate::CoreError::InvalidConfig;
     use std::collections::HashMap;
 
     #[test]
@@ -112,7 +113,10 @@ mod tests {
     fn parse_invalid_config_value() {
         let options = HashMap::from([(InputPartitions.as_ref().to_string(), "foo".to_string())]);
         let value = InputPartitions.parse_value(&options);
-        assert!(value.is_err());
+        assert!(matches!(
+            value.unwrap_err(),
+            InvalidConfig { item: _, source: _ }
+        ));
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)
