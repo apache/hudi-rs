@@ -36,13 +36,15 @@ use url::Url;
 
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
+use crate::storage::error::Result;
+use crate::storage::error::StorageError::{Creation, InvalidPath};
 use crate::storage::file_info::FileInfo;
-use crate::storage::utils::join_url_segments;
-use crate::{CoreError, Result};
+use crate::storage::util::join_url_segments;
 
+pub mod error;
 pub mod file_info;
 pub mod file_stats;
-pub mod utils;
+pub mod util;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -60,14 +62,15 @@ impl Storage {
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
-        if !hudi_configs.contains(HudiTableConfig::BasePath) {
-            return Err(CoreError::Internal(format!(
-                "Failed to create storage: {} is required.",
-                HudiTableConfig::BasePath.as_ref()
-            )));
-        }
-
-        let base_url = hudi_configs.get(HudiTableConfig::BasePath)?.to_url()?;
+        let base_url = match hudi_configs.try_get(HudiTableConfig::BasePath) {
+            Some(v) => v.to_url()?,
+            None => {
+                return Err(Creation(format!(
+                    "{} is required.",
+                    HudiTableConfig::BasePath.as_ref()
+                )))
+            }
+        };
 
         match parse_url_opts(&base_url, options.as_ref()) {
             Ok((object_store, _)) => Ok(Arc::new(Storage {
@@ -76,7 +79,7 @@ impl Storage {
                 options,
                 hudi_configs,
             })),
-            Err(e) => Err(CoreError::ObjectStore(e)),
+            Err(e) => Err(Creation(format!("Failed to create storage: {}", e))),
         }
     }
 
@@ -109,10 +112,10 @@ impl Storage {
         let uri = obj_url.to_string();
         let name = obj_path
             .filename()
-            .ok_or(CoreError::InvalidPath {
-                name: obj_path.to_string(),
-                detail: "failed to get file name".to_string(),
-            })?
+            .ok_or(InvalidPath(format!(
+                "Failed to get file name from {:?}",
+                obj_path
+            )))?
             .to_string();
         Ok(FileInfo {
             uri,
@@ -176,10 +179,10 @@ impl Storage {
         for dir in dir_paths {
             dirs.push(
                 dir.filename()
-                    .ok_or(CoreError::InvalidPath {
-                        name: dir.to_string(),
-                        detail: "failed to get file name".to_string(),
-                    })?
+                    .ok_or(InvalidPath(format!(
+                        "Failed to get file name from: {:?}",
+                        dir
+                    )))?
                     .to_string(),
             )
         }
@@ -208,10 +211,10 @@ impl Storage {
             let name = obj_meta
                 .location
                 .filename()
-                .ok_or(CoreError::InvalidPath {
-                    name: obj_meta.location.to_string(),
-                    detail: "failed to get file name".to_string(),
-                })?
+                .ok_or(InvalidPath(format!(
+                    "Failed to get file name from {:?}",
+                    obj_meta.location
+                )))?
                 .to_string();
             let uri = join_url_segments(&prefix_url, &[&name])?.to_string();
             file_info.push(FileInfo {
@@ -246,10 +249,10 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
                 next_subdir.push(curr);
             }
             next_subdir.push(child_dir);
-            let next_subdir = next_subdir.to_str().ok_or(CoreError::InvalidPath {
-                name: format!("{:?}", next_subdir),
-                detail: "failed to convert path".to_string(),
-            })?;
+            let next_subdir = next_subdir.to_str().ok_or(InvalidPath(format!(
+                "Failed to convert path: {:?}",
+                next_subdir
+            )))?;
             let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }
@@ -263,12 +266,6 @@ mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
-
-    use crate::storage::file_info::FileInfo;
-    use crate::storage::utils::join_url_segments;
-    use crate::storage::{get_leaf_dirs, Storage};
-    use object_store::path::Path as ObjPath;
-    use url::Url;
 
     #[test]
     fn test_storage_new_error_no_base_path() {
@@ -299,7 +296,7 @@ mod tests {
             result.is_err(),
             "Should return error when no base path is invalid."
         );
-        assert!(matches!(result.unwrap_err(), CoreError::ObjectStore(_)));
+        assert!(matches!(result.unwrap_err(), Creation(_)));
     }
 
     #[tokio::test]

@@ -44,8 +44,8 @@ use datafusion_physical_expr::create_physical_expr;
 
 use crate::utils::exprs_to_filter::convert_exprs_to_filter;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
-use hudi_core::config::utils::empty_options;
-use hudi_core::storage::utils::{get_scheme_authority, parse_uri};
+use hudi_core::config::util::empty_options;
+use hudi_core::storage::util::{get_scheme_authority, parse_uri};
 use hudi_core::table::Table as HudiTable;
 
 /// Create a `HudiDataSource`.

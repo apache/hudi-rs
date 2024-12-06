@@ -60,7 +60,7 @@
 //! ```rust
 //! use url::Url;
 //! use hudi_core::table::Table;
-//! use hudi_core::storage::utils::parse_uri;
+//! use hudi_core::storage::util::parse_uri;
 //!
 //! pub async fn test() {
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
@@ -84,17 +84,16 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
-use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Schema};
-use url::Url;
+pub mod builder;
+mod fs_view;
+pub mod partition;
+mod timeline;
 
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::HudiConfigs;
+use crate::error::CoreError;
 use crate::exprs::filter::Filter;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
@@ -102,12 +101,13 @@ use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
-use crate::{CoreError, Result};
+use crate::Result;
 
-pub mod builder;
-mod fs_view;
-pub mod partition;
-mod timeline;
+use arrow::record_batch::RecordBatch;
+use arrow_schema::{Field, Schema};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use url::Url;
 
 /// Hudi Table in-memory
 #[derive(Clone, Debug)]
@@ -138,7 +138,10 @@ impl Table {
     }
 
     pub fn base_url(&self) -> Result<Url> {
-        self.hudi_configs.get(HudiTableConfig::BasePath)?.to_url()
+        self.hudi_configs
+            .get(HudiTableConfig::BasePath)?
+            .to_url()
+            .map_err(CoreError::from)
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -162,6 +165,7 @@ impl Table {
             .register_object_store(runtime_env.clone());
     }
 
+    /// Get the latest [Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
@@ -261,19 +265,10 @@ impl Table {
         filters: &[Filter],
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
-        let mut batches = Vec::new();
         let fg_reader = self.create_file_group_reader();
-        for f in file_slices {
-            match fg_reader.read_file_slice(&f).await {
-                Ok(batch) => batches.push(batch),
-                Err(e) => {
-                    return Err(CoreError::Internal(format!(
-                        "Failed to read file slice {:?} - {}",
-                        f, e
-                    )))
-                }
-            }
-        }
+        let batches =
+            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
+                .await?;
         Ok(batches)
     }
 
@@ -293,14 +288,13 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
-    use crate::table::Filter;
+    use super::*;
     use arrow_array::StringArray;
     use hudi_tests::{assert_not, TestTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
     use std::{env, panic};
-    use url::Url;
 
     use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
@@ -310,9 +304,9 @@ mod tests {
         TimelineLayoutVersion,
     };
     use crate::config::HUDI_CONF_DIR;
-    use crate::storage::utils::join_url_segments;
+    use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
-    use crate::table::Table;
+    use crate::table::Filter;
 
     /// Test helper to create a new `Table` instance without validating the configuration.
     ///

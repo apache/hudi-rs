@@ -21,14 +21,18 @@ use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{storage::utils::parse_uri, Result};
+use crate::config::error::{ConfigError, Result};
+use crate::storage::error::Result as StorageResult;
+use crate::storage::util::parse_uri;
 use serde::{Deserialize, Serialize};
 use url::Url;
+use ConfigError::NotFound;
 
+pub mod error;
 pub mod internal;
 pub mod read;
 pub mod table;
-pub mod utils;
+pub mod util;
 
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
@@ -40,6 +44,10 @@ pub trait ConfigParser: AsRef<str> {
     /// Supplies the default value of the configuration.
     fn default_value(&self) -> Option<Self::Output>;
 
+    fn key(&self) -> String {
+        self.as_ref().to_string()
+    }
+
     /// To indicate if the configuration is required or not, this helps in validation.
     fn is_required(&self) -> bool {
         false
@@ -50,8 +58,7 @@ pub trait ConfigParser: AsRef<str> {
         match self.parse_value(configs) {
             Ok(_) => Ok(()),
             Err(e) => {
-                if !self.is_required() && e.to_string().ends_with("not found") {
-                    // TODO: introduce error type to avoid checking "not found"
+                if !self.is_required() && matches!(e, NotFound(_)) {
                     Ok(())
                 } else {
                     Err(e)
@@ -98,7 +105,7 @@ impl HudiConfigValue {
 
     /// A convenience method to convert [HudiConfigValue] to [Url] when the value is a [String] and is intended to be a URL.
     /// Panic if the value is not a [String].
-    pub fn to_url(self) -> Result<Url> {
+    pub fn to_url(self) -> StorageResult<Url> {
         match self {
             HudiConfigValue::String(v) => parse_uri(&v),
             _ => panic!(
