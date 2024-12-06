@@ -196,11 +196,11 @@ impl TableProvider for HudiDataSource {
 /// // The factory can be used to create Hudi tables
 /// let table = factory.create_table(...)?;
 ///
-/// 
+///
 /// // Using `CREATE EXTERNAL TABLE` to register Hudi table:
 /// let test_table =  factory.create_table(...)?; // Table with path + url
 /// let ctx = SessionContext::new();
-/// 
+///
 /// // Register table in session using `CREATE EXTERNAL TABLE` command
 /// let create_table_sql = format!(
 ///     "CREATE EXTERNAL TABLE {} STORED AS HUDI LOCATION '{}' {}",
