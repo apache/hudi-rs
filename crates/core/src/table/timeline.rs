@@ -28,10 +28,12 @@ use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 
 use crate::config::HudiConfigs;
+use crate::error::CoreError;
 use crate::file_group::FileGroup;
-use crate::storage::utils::split_filename;
+use crate::storage::error::StorageError;
+use crate::storage::util::split_filename;
 use crate::storage::Storage;
-use crate::{CoreError, Result};
+use crate::Result;
 
 /// The [State] of an [Instant] represents the status of the action performed on the table.
 #[allow(dead_code)]
@@ -80,10 +82,11 @@ impl Instant {
         commit_file_path.push(self.file_name());
         commit_file_path
             .to_str()
-            .ok_or(CoreError::Internal(format!(
+            .ok_or(StorageError::InvalidPath(format!(
                 "Failed to get file path for {:?}",
                 self
             )))
+            .map_err(CoreError::Storage)
             .map(|s| s.to_string())
     }
 
@@ -143,11 +146,15 @@ impl Timeline {
             .storage
             .get_file_data(instant.relative_path()?.as_str())
             .await?;
+        let err_msg = format!("Failed to get commit metadata for {:?}", instant);
         let json: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| CoreError::Internal(format!("Invalid instant {:?}", e)))?;
+            .map_err(|e| CoreError::Timeline(format!("{}: {:?}", err_msg, e)))?;
         let commit_metadata = json
             .as_object()
-            .ok_or_else(|| CoreError::Internal("Expected JSON object".to_string()))?
+            .ok_or(CoreError::Timeline(format!(
+                "{}: Unexpected JSON object",
+                err_msg
+            )))?
             .clone();
         Ok(commit_metadata)
     }
@@ -178,7 +185,7 @@ impl Timeline {
                 None,
             )?)
         } else {
-            Err(CoreError::Internal(
+            Err(CoreError::Timeline(
                 "Failed to resolve the latest schema: no file path found".to_string(),
             ))
         }
@@ -254,7 +261,7 @@ mod tests {
         assert!(table_schema.is_err());
         assert_eq!(
             table_schema.err().unwrap().to_string(),
-            "Failed to resolve the latest schema: no file path found"
+            "Timeline error: Failed to resolve the latest schema: no file path found"
         )
     }
 

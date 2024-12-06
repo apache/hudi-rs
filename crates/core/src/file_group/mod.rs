@@ -22,16 +22,16 @@
 
 pub mod reader;
 
+use crate::error::CoreError;
+use crate::storage::file_info::FileInfo;
+use crate::storage::file_stats::FileStats;
+use crate::storage::Storage;
+use crate::Result;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-
-use crate::storage::file_info::FileInfo;
-use crate::storage::file_stats::FileStats;
-use crate::storage::Storage;
-use crate::{CoreError::Internal, Result};
 
 /// Represents common metadata about a Hudi Base File.
 #[derive(Clone, Debug)]
@@ -52,10 +52,16 @@ impl BaseFile {
         let err_msg = format!("Failed to parse file name '{}' for base file.", file_name);
         let (name, _) = file_name
             .rsplit_once('.')
-            .ok_or(Internal(err_msg.clone()))?;
+            .ok_or(CoreError::FileGroup(err_msg.clone()))?;
         let parts: Vec<&str> = name.split('_').collect();
-        let file_group_id = parts.first().ok_or(Internal(err_msg.clone()))?.to_string();
-        let commit_time = parts.get(2).ok_or(Internal(err_msg.clone()))?.to_string();
+        let file_group_id = parts
+            .first()
+            .ok_or(CoreError::FileGroup(err_msg.clone()))?
+            .to_string();
+        let commit_time = parts
+            .get(2)
+            .ok_or(CoreError::FileGroup(err_msg.clone()))?
+            .to_string();
         Ok((file_group_id, commit_time))
     }
 
@@ -190,7 +196,7 @@ impl FileGroup {
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
         let commit_time = base_file.commit_time.as_str();
         if self.file_slices.contains_key(commit_time) {
-            Err(Internal(format!(
+            Err(CoreError::FileGroup(format!(
                 "Commit time {0} is already present in File Group {1}",
                 commit_time.to_owned(),
                 self.id,
@@ -277,7 +283,7 @@ mod tests {
             "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402144910683.parquet",
         );
         assert!(res2.is_err());
-        assert_eq!(res2.unwrap_err().to_string(), "Commit time 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
+        assert_eq!(res2.unwrap_err().to_string(), "File group error: Commit time 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
     }
 
     #[test]

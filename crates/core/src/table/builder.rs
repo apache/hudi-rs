@@ -31,13 +31,14 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
 use crate::config::table::TableTypeValue::CopyOnWrite;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::config::utils::{parse_data_for_options, split_hudi_options_from_others};
+use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
+use crate::error::CoreError;
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::timeline::Timeline;
 use crate::table::Table;
-use crate::{CoreError, Result};
+use crate::Result;
 
 /// Builder for creating a [Table] instance.
 #[derive(Debug, Clone)]
@@ -185,7 +186,9 @@ impl TableBuilder {
         let hudi_options = &mut self.hudi_options;
         Self::imbue_table_properties(hudi_options, storage.clone()).await?;
 
-        // TODO load Hudi configs from env vars here before loading global configs
+        // TODO support imbuing Hudi options from env vars HOODIE_ENV.*
+        // (see https://hudi.apache.org/docs/next/s3_hoodie)
+        // before loading global configs
 
         Self::imbue_global_hudi_configs_if_absent(hudi_options, storage.clone()).await
     }
