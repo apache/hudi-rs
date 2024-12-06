@@ -250,6 +250,15 @@ mod tests {
     }
 
     #[test]
+    fn create_a_base_file_returns_error() {
+        let result = BaseFile::from_file_name("no_file_extension");
+        assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
+
+        let result = BaseFile::from_file_name("no-valid-delimiter.parquet");
+        assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
+    }
+
+    #[test]
     fn load_a_valid_file_group() {
         let mut fg = FileGroup::new("5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(), None);
         let _ = fg.add_base_file_from_name(

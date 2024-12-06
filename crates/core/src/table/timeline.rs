@@ -223,6 +223,7 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashMap;
     use std::fs::canonicalize;
     use std::path::Path;
@@ -233,8 +234,6 @@ mod tests {
     use hudi_tests::TestTable;
 
     use crate::config::table::HudiTableConfig;
-    use crate::config::HudiConfigs;
-    use crate::table::timeline::{Instant, State, Timeline};
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
         Timeline::new(
@@ -287,5 +286,44 @@ mod tests {
                 },
             ]
         )
+    }
+
+    #[tokio::test]
+    async fn get_commit_metadata_returns_error() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_invalid_content",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
+        let instant = Instant {
+            state: State::Completed,
+            action: "commit".to_owned(),
+            timestamp: "20240402123035233".to_owned(),
+        };
+        let result = timeline.get_commit_metadata(&instant).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CoreError::Timeline(_)));
+        assert!(
+            err.to_string().contains("EOF while parsing a value"),
+            "Expect an error for reading empty commit metadata file."
+        );
+
+        let instant = Instant {
+            state: State::Completed,
+            action: "commit".to_owned(),
+            timestamp: "20240402144910683".to_owned(),
+        };
+        let result = timeline.get_commit_metadata(&instant).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CoreError::Timeline(_)));
+        assert!(
+            err.to_string().contains("key must be a string"),
+            "Expect an error for reading a commit metadata file with invalid JSON."
+        );
     }
 }

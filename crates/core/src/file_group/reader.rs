@@ -101,4 +101,16 @@ mod tests {
             .contains(HudiTableConfig::BasePath));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_read_file_slice_returns_error() {
+        let storage =
+            Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())
+                .unwrap();
+        let reader = FileGroupReader::new(storage);
+        let result = reader
+            .read_file_slice_by_base_file_path("non_existent_file")
+            .await;
+        assert!(matches!(result.unwrap_err(), ReadFileSliceError(_, _)));
+    }
 }
