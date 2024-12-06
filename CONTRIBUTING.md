@@ -93,13 +93,13 @@ pytest tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
 Run test commands to make sure the code is working as expected:
 
 ```shell
-make test-rust test-python
+make test
 ```
 
 Run check commands and follow the suggestions to fix the code:
 
 ```shell
-make check-rust check-python
+make check
 ```
 
 ## Create a pull request
