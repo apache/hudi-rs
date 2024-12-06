@@ -134,12 +134,9 @@ impl PartitionPruner {
             .zip(parts)
             .map(|(field, part)| {
                 let value = if self.is_hive_style {
-                    let (name, value) = part.split_once('=').ok_or_else(|| {
-                        InvalidPartitionPath(format!(
-                            "Partition path should be hive-style but got {}",
-                            part
-                        ))
-                    })?;
+                    let (name, value) = part.split_once('=').ok_or(InvalidPartitionPath(
+                        format!("Partition path should be hive-style but got {}", part),
+                    ))?;
                     if name != field.name() {
                         return Err(InvalidPartitionPath(format!(
                             "Partition path should contain {} but got {}",
@@ -439,6 +436,13 @@ mod tests {
         let configs = create_hudi_configs(true, false);
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
-        assert!(pruner.parse_segments("invalid/path").is_err());
+        let result = pruner.parse_segments("date=2023-02-01/category=A/count=10/extra");
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        let result = pruner.parse_segments("date=2023-02-01/category=A/10");
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        let result = pruner.parse_segments("date=2023-02-01/category=A/non_exist_field=10");
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
     }
 }

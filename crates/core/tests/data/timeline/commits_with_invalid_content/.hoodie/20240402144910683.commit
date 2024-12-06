@@ -1,3 +1,7 @@
-{
-    bad: json
-}
+[
+    "should",
+    "not",
+    "be",
+    "an",
+    "array"
+]

@@ -254,6 +254,9 @@ mod tests {
         let result = BaseFile::from_file_name("no_file_extension");
         assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
 
+        let result = BaseFile::from_file_name(".parquet");
+        assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
+
         let result = BaseFile::from_file_name("no-valid-delimiter.parquet");
         assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
     }

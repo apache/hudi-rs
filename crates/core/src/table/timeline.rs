@@ -152,7 +152,7 @@ impl Timeline {
         let commit_metadata = json
             .as_object()
             .ok_or(CoreError::Timeline(format!(
-                "{}: Unexpected JSON object",
+                "{}: not a JSON object",
                 err_msg
             )))?
             .clone();
@@ -303,27 +303,25 @@ mod tests {
             action: "commit".to_owned(),
             timestamp: "20240402123035233".to_owned(),
         };
+
+        // Test error when reading empty commit metadata file
         let result = timeline.get_commit_metadata(&instant).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
-        assert!(
-            err.to_string().contains("EOF while parsing a value"),
-            "Expect an error for reading empty commit metadata file."
-        );
+        assert!(err.to_string().contains("Failed to get commit metadata"));
 
         let instant = Instant {
             state: State::Completed,
             action: "commit".to_owned(),
             timestamp: "20240402144910683".to_owned(),
         };
+
+        // Test error when reading a commit metadata file with invalid JSON
         let result = timeline.get_commit_metadata(&instant).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
-        assert!(
-            err.to_string().contains("key must be a string"),
-            "Expect an error for reading a commit metadata file with invalid JSON."
-        );
+        assert!(err.to_string().contains("not a JSON object"));
     }
 }
