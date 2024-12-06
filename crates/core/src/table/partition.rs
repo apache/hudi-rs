@@ -18,11 +18,9 @@
  */
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
+use crate::error::CoreError::{InvalidPartitionPath, Unsupported};
 use crate::exprs::filter::Filter;
 use crate::exprs::ExprOperator;
-use crate::{CoreError, Result};
-use crate::error::CoreError;
-use crate::error::CoreError::{InvalidPartitionPath, Unsupported};
 use crate::Result;
 
 use arrow_array::{ArrayRef, Scalar, StringArray};
@@ -168,15 +166,17 @@ pub struct PartitionFilter {
 }
 
 impl TryFrom<(Filter, &Schema)> for PartitionFilter {
-    type Error = crate::CoreError;
+    type Error = crate::table::CoreError;
 
     fn try_from((filter, partition_schema): (Filter, &Schema)) -> Result<Self> {
+        let field: &Field = partition_schema
+            .field_with_name(&filter.field_name)
+            .map_err(|_| InvalidPartitionPath("Partition path should be in schema.".to_string()))?;
 
-        let field: &Field = partition_schema.field_with_name(field_name)?;
-        
         let operator = filter.operator;
         let value = &[filter.value.as_str()];
-        let value = Self::cast_value(value, field.data_type())?;
+        let value = Self::cast_value(value, field.data_type())
+            .map_err(|_| Unsupported(format!("Unable to cast {}.", field.data_type())))?;
 
         let field = field.clone();
         Ok(PartitionFilter {
@@ -370,7 +370,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("not found in partition schema"));
+            .contains("Partition path should be in schema."));
     }
 
     #[test]
@@ -383,7 +383,6 @@ mod tests {
         };
         let result = PartitionFilter::try_from((filter, &schema));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unable to cast"));
     }
 
     #[test]

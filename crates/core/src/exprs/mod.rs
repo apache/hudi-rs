@@ -19,7 +19,9 @@
 
 pub mod filter;
 
-use anyhow::{anyhow, Error};
+use crate::error::CoreError;
+use crate::error::CoreError::Unsupported;
+
 use std::cmp::PartialEq;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
@@ -62,7 +64,7 @@ impl ExprOperator {
 }
 
 impl FromStr for ExprOperator {
-    type Err = Error;
+    type Err = CoreError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         ExprOperator::TOKEN_OP_PAIRS
@@ -74,7 +76,7 @@ impl FromStr for ExprOperator {
                     None
                 }
             })
-            .ok_or_else(|| anyhow!("Unsupported operator: {}", s))
+            .ok_or_else(|| Unsupported(format!("Unsupported operator: {}", s)))
     }
 }
 

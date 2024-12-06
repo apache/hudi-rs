@@ -17,8 +17,9 @@
  * under the License.
  */
 
+use crate::error::CoreError::Unsupported;
 use crate::exprs::ExprOperator;
-use anyhow::{Context, Result};
+use crate::Result;
 use arrow_array::StringArray;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_cast::{cast_with_options, CastOptions};
@@ -50,7 +51,7 @@ impl Filter {
 }
 
 impl TryFrom<(&str, &str, &str)> for Filter {
-    type Error = anyhow::Error;
+    type Error = crate::error::CoreError;
 
     fn try_from(filter: (&str, &str, &str)) -> Result<Self> {
         let (field_name, operator_str, value_str) = filter;
@@ -58,7 +59,7 @@ impl TryFrom<(&str, &str, &str)> for Filter {
         let field_name = field_name.to_string();
 
         let operator = ExprOperator::from_str(operator_str)
-            .with_context(|| format!("Unsupported operator: {}", operator_str))?;
+            .map_err(|_| Unsupported(format!("Unsupported operator: {}", operator_str)))?;
 
         let value = value_str.to_string();
 
