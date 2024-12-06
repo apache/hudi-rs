@@ -18,7 +18,9 @@
  */
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
-use crate::{CoreError, Result};
+use crate::error::CoreError;
+use crate::error::CoreError::{InvalidPartitionPath, Unsupported};
+use crate::Result;
 use arrow_array::{ArrayRef, Scalar, StringArray};
 use arrow_cast::{cast_with_options, CastOptions};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -119,7 +121,7 @@ impl PartitionPruner {
         let parts: Vec<&str> = partition_path.split('/').collect();
 
         if parts.len() != self.schema.fields().len() {
-            return Err(CoreError::Internal(format!(
+            return Err(InvalidPartitionPath(format!(
                 "Partition path should have {} part(s) but got {}",
                 self.schema.fields().len(),
                 parts.len()
@@ -132,14 +134,11 @@ impl PartitionPruner {
             .zip(parts)
             .map(|(field, part)| {
                 let value = if self.is_hive_style {
-                    let (name, value) = part.split_once('=').ok_or_else(|| {
-                        CoreError::Internal(format!(
-                            "Partition path should be hive-style but got {}",
-                            part
-                        ))
-                    })?;
+                    let (name, value) = part.split_once('=').ok_or(InvalidPartitionPath(
+                        format!("Partition path should be hive-style but got {}", part),
+                    ))?;
                     if name != field.name() {
-                        return Err(CoreError::Internal(format!(
+                        return Err(InvalidPartitionPath(format!(
                             "Partition path should contain {} but got {}",
                             field.name(),
                             name
@@ -179,13 +178,13 @@ impl Operator {
 }
 
 impl FromStr for Operator {
-    type Err = crate::CoreError;
+    type Err = CoreError;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         Operator::TOKEN_OP_PAIRS
             .iter()
             .find_map(|&(token, op)| if token == s { Some(op) } else { None })
-            .ok_or_else(|| CoreError::Internal(format!("Unsupported operator: {}", s)))
+            .ok_or(Unsupported(format!("Unsupported operator: {}", s)))
     }
 }
 
@@ -198,9 +197,11 @@ pub struct PartitionFilter {
 }
 
 impl TryFrom<((&str, &str, &str), &Schema)> for PartitionFilter {
-    type Error = crate::CoreError;
+    type Error = CoreError;
 
-    fn try_from((filter, partition_schema): ((&str, &str, &str), &Schema)) -> Result<Self> {
+    fn try_from(
+        (filter, partition_schema): ((&str, &str, &str), &Schema),
+    ) -> Result<Self, Self::Error> {
         let (field_name, operator_str, value_str) = filter;
 
         let field: &Field = partition_schema.field_with_name(field_name)?;
@@ -435,6 +436,13 @@ mod tests {
         let configs = create_hudi_configs(true, false);
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
-        assert!(pruner.parse_segments("invalid/path").is_err());
+        let result = pruner.parse_segments("date=2023-02-01/category=A/count=10/extra");
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        let result = pruner.parse_segments("date=2023-02-01/category=A/10");
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        let result = pruner.parse_segments("date=2023-02-01/category=A/non_exist_field=10");
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
     }
 }

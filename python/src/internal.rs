@@ -26,13 +26,14 @@ use arrow::pyarrow::ToPyArrow;
 use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
+use hudi::error::CoreError;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
+use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::util::convert_vec_to_slice;
 use hudi::util::vec_to_slice;
-use hudi::CoreError;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 
@@ -45,7 +46,7 @@ fn convert_to_py_err(err: CoreError) -> PyErr {
 
 #[derive(thiserror::Error, Debug)]
 pub enum PythonError {
-    #[error("Error in Hudi core")]
+    #[error("Error in Hudi core: {0}")]
     HudiCore(#[from] CoreError),
 }
 
@@ -110,17 +111,17 @@ pub struct HudiFileSlice {
 #[pymethods]
 impl HudiFileSlice {
     fn base_file_relative_path(&self) -> PyResult<String> {
-        Ok(PathBuf::from(&self.partition_path)
+        let path = PathBuf::from(&self.partition_path)
             .join(&self.base_file_name)
             .to_str()
             .map(String::from)
-            .ok_or_else(|| {
-                CoreError::Internal(format!(
-                    "Failed to get base file relative path for file slice: {:?}",
-                    self
-                ))
-            })
-            .map_err(PythonError::from)?)
+            .ok_or(StorageError::InvalidPath(format!(
+                "Failed to get base file relative path for file slice: {:?}",
+                self
+            )))
+            .map_err(CoreError::from)
+            .map_err(PythonError::from)?;
+        Ok(path)
     }
 }
 

@@ -19,12 +19,10 @@
 
 //! Utility functions for storage.
 use std::path::Path;
-use url::{ParseError, Url};
+use url::Url;
 
-use crate::{
-    CoreError::{InvalidPath, UrlParse},
-    Result,
-};
+use crate::storage::error::StorageError::{InvalidPath, UrlParseError};
+use crate::storage::Result;
 
 /// Splits a filename into a stem and an extension.
 pub fn split_filename(filename: &str) -> Result<(String, String)> {
@@ -33,10 +31,7 @@ pub fn split_filename(filename: &str) -> Result<(String, String)> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| InvalidPath {
-            name: filename.to_string(),
-            detail: "no file stem found".to_string(),
-        })?
+        .ok_or(InvalidPath(format!("No file stem found in {}", filename)))?
         .to_string();
 
     let extension = path
@@ -52,19 +47,12 @@ pub fn split_filename(filename: &str) -> Result<(String, String)> {
 pub fn parse_uri(uri: &str) -> Result<Url> {
     let mut url = match Url::parse(uri) {
         Ok(url) => url,
-        Err(source) => Url::from_directory_path(uri).map_err(|_| UrlParse {
-            url: uri.to_string(),
-            source,
-        })?,
+        Err(e) => Url::from_directory_path(uri).map_err(|_| UrlParseError(e))?,
     };
 
     if url.path().ends_with('/') {
-        url.path_segments_mut()
-            .map_err(|_| InvalidPath {
-                name: uri.to_string(),
-                detail: "parse uri failed".to_string(),
-            })?
-            .pop();
+        let err = InvalidPath(format!("Url {:?} cannot be a base", url));
+        url.path_segments_mut().map_err(|_| err)?.pop();
     }
 
     Ok(url)
@@ -85,12 +73,8 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
 
     for &seg in segments {
         let segs: Vec<_> = seg.split('/').filter(|&s| !s.is_empty()).collect();
-        url.path_segments_mut()
-            .map_err(|_| UrlParse {
-                url: base_url.to_string(),
-                source: ParseError::RelativeUrlWithoutBase,
-            })?
-            .extend(segs);
+        let err = InvalidPath(format!("Url {:?} cannot be a base", url));
+        url.path_segments_mut().map_err(|_| err)?.extend(segs);
     }
 
     Ok(url)
@@ -98,11 +82,8 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::str::FromStr;
-
-    use url::Url;
-
-    use crate::storage::utils::{join_url_segments, parse_uri};
 
     #[test]
     fn parse_valid_uri_in_various_forms() {

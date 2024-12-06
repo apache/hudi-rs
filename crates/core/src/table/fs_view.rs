@@ -25,8 +25,9 @@ use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
 
+use crate::error::CoreError;
 use crate::table::partition::PartitionPruner;
-use crate::{CoreError, Result};
+use crate::Result;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
