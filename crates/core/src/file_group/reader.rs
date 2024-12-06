@@ -17,12 +17,14 @@
  * under the License.
  */
 use crate::config::table::HudiTableConfig;
-use crate::config::utils::split_hudi_options_from_others;
+use crate::config::util::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
+use crate::error::CoreError::ReadFileSliceError;
 use crate::file_group::FileSlice;
 use crate::storage::Storage;
-use anyhow::Result;
+use crate::Result;
 use arrow_array::RecordBatch;
+use futures::TryFutureExt;
 use std::sync::Arc;
 
 /// File group reader handles all read operations against a file group.
@@ -58,7 +60,15 @@ impl FileGroupReader {
         &self,
         relative_path: &str,
     ) -> Result<RecordBatch> {
-        self.storage.get_parquet_file_data(relative_path).await
+        self.storage
+            .get_parquet_file_data(relative_path)
+            .map_err(|e| {
+                ReadFileSliceError(
+                    format!("Failed to read file slice at path '{}'", relative_path),
+                    e,
+                )
+            })
+            .await
     }
 
     pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
@@ -90,5 +100,17 @@ mod tests {
             .hudi_configs
             .contains(HudiTableConfig::BasePath));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_returns_error() {
+        let storage =
+            Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())
+                .unwrap();
+        let reader = FileGroupReader::new(storage);
+        let result = reader
+            .read_file_slice_by_base_file_path("non_existent_file")
+            .await;
+        assert!(matches!(result.unwrap_err(), ReadFileSliceError(_, _)));
     }
 }

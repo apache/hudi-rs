@@ -24,8 +24,10 @@ use crate::config::HudiConfigs;
 use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
+
+use crate::error::CoreError;
 use crate::table::partition::PartitionPruner;
-use anyhow::Result;
+use crate::Result;
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -134,7 +136,7 @@ impl FileSystemView {
             .map(|path| async move {
                 let file_groups =
                     Self::load_file_groups_for_partition(&self.storage, &path).await?;
-                Ok::<_, anyhow::Error>((path, file_groups))
+                Ok::<_, CoreError>((path, file_groups))
             })
             // TODO parameterize the parallelism for partition loading
             .buffer_unordered(10)

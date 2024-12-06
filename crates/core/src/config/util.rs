@@ -18,7 +18,8 @@
  */
 //! Config utilities.
 
-use anyhow::{Context, Result};
+use crate::config::error::ConfigError::ParseLine;
+use crate::config::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor};
@@ -57,7 +58,7 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
     let mut options = HashMap::new();
 
     for line in lines {
-        let line = line.context("Failed to read line")?;
+        let line = line.map_err(|e| ParseLine(format!("Failed to parse config data: {:?}", e)))?;
         let trimmed_line = line.trim();
         if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
             continue;
@@ -65,7 +66,10 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
         let mut parts = trimmed_line.splitn(2, |c| split_chars.contains(c));
         let key = parts
             .next()
-            .context("Missing key in config line")?
+            .ok_or(ParseLine(format!(
+                "Missing key in config line: {}",
+                trimmed_line
+            )))?
             .trim()
             .to_owned();
         let value = parts.next().unwrap_or("").trim().to_owned();

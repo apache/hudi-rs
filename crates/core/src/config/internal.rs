@@ -21,9 +21,10 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
 use strum_macros::EnumIter;
 
+use crate::config::error::ConfigError::{NotFound, ParseBool};
+use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
 
 /// Configurations for internal use.
@@ -64,11 +65,13 @@ impl ConfigParser for HudiInternalConfig {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+            .ok_or(NotFound(self.key()));
 
         match self {
             Self::SkipConfigValidation => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Boolean),
         }
     }

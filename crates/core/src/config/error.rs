@@ -16,38 +16,32 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Crate `hudi-core`.
-//!
-//! # The [config] module is responsible for managing configurations.
-//!
-//! **Example**
-//!
-//! ```rust
-//! use hudi_core::config::read::HudiReadConfig::{AsOfTimestamp, InputPartitions};
-//! use hudi_core::table::Table as HudiTable;
-//!
-//! let options = [(InputPartitions, "2"), (AsOfTimestamp, "20240101010100000")];
-//! HudiTable::new_with_options("/tmp/hudi_data", options);
-//! ```
-//!
-//! # The [table] module is responsible for managing Hudi tables.
-//!
-//! **Example**
-//!
-//! create hudi table
-//! ```rust
-//! use hudi_core::table::Table;
-//!
-//! pub async fn test() {
-//!     let hudi_table = Table::new("/tmp/hudi_data").await.unwrap();
-//! }
-//! ```
+use std::num::ParseIntError;
+use std::str::ParseBoolError;
+use thiserror::Error;
 
-pub mod config;
-pub mod error;
-pub mod file_group;
-pub mod storage;
-pub mod table;
-pub mod util;
+pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
-use error::Result;
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    /// ParseBool(key, value, source)
+    #[error("Failed to parse '{1}' for config '{0}': {2}")]
+    ParseBool(String, String, ParseBoolError),
+
+    /// ParseInt(key, value, source)
+    #[error("Failed to parse '{1}' for config '{0}': {2}")]
+    ParseInt(String, String, ParseIntError),
+
+    /// ParseLine(message)
+    #[error("Failed to parse line: {0}'")]
+    ParseLine(String),
+
+    #[error("Config value '{0}' is not valid")]
+    InvalidValue(String),
+
+    #[error("Config '{0}' not found")]
+    NotFound(String),
+
+    #[error("Config value '{0}' is not supported")]
+    UnsupportedValue(String),
+}

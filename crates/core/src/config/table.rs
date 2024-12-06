@@ -21,10 +21,13 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use anyhow::anyhow;
-use anyhow::Result;
 use strum_macros::{AsRefStr, EnumIter};
 
+use crate::config::error::ConfigError;
+use crate::config::error::ConfigError::{
+    InvalidValue, NotFound, ParseBool, ParseInt, UnsupportedValue,
+};
+use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
 
 /// Configurations for Hudi tables, most of them are persisted in `hoodie.properties`.
@@ -146,7 +149,7 @@ impl ConfigParser for HudiTableConfig {
         let get_result = configs
             .get(self.as_ref())
             .map(|v| v.as_str())
-            .ok_or(anyhow!("Config '{}' not found", self.as_ref()));
+            .ok_or(NotFound(self.key()));
 
         match self {
             Self::BaseFileFormat => get_result
@@ -154,24 +157,34 @@ impl ConfigParser for HudiTableConfig {
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::BasePath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::Checksum => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Integer),
             Self::DatabaseName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::DropsPartitionFields => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Boolean),
             Self::IsHiveStylePartitioning => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Boolean),
             Self::IsPartitionPathUrlencoded => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Boolean),
             Self::KeyGeneratorClass => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
             Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PopulatesMetaFields => get_result
-                .and_then(|v| bool::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Boolean),
             Self::RecordKeyFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
@@ -180,10 +193,14 @@ impl ConfigParser for HudiTableConfig {
                 .and_then(TableTypeValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::TableVersion => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Integer),
             Self::TimelineLayoutVersion => get_result
-                .and_then(|v| isize::from_str(v).map_err(|e| anyhow!(e)))
+                .and_then(|v| {
+                    isize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
                 .map(HudiConfigValue::Integer),
         }
     }
@@ -199,13 +216,13 @@ pub enum TableTypeValue {
 }
 
 impl FromStr for TableTypeValue {
-    type Err = anyhow::Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "copy_on_write" | "copy-on-write" | "cow" => Ok(Self::CopyOnWrite),
             "merge_on_read" | "merge-on-read" | "mor" => Ok(Self::MergeOnRead),
-            _ => Err(anyhow!("Unsupported table type: {}", s)),
+            v => Err(InvalidValue(v.to_string())),
         }
     }
 }
@@ -218,21 +235,20 @@ pub enum BaseFileFormatValue {
 }
 
 impl FromStr for BaseFileFormatValue {
-    type Err = anyhow::Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
-            _ => Err(anyhow!("Unsupported base file format: {}", s)),
+            "orc" => Err(UnsupportedValue(s.to_string())),
+            v => Err(InvalidValue(v.to_string())),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use crate::config::table::{BaseFileFormatValue, TableTypeValue};
+    use super::*;
 
     #[test]
     fn create_table_type() {
@@ -260,10 +276,22 @@ mod tests {
             TableTypeValue::from_str("Merge-on-read").unwrap(),
             TableTypeValue::MergeOnRead
         );
-        assert!(TableTypeValue::from_str("").is_err());
-        assert!(TableTypeValue::from_str("copyonwrite").is_err());
-        assert!(TableTypeValue::from_str("MERGEONREAD").is_err());
-        assert!(TableTypeValue::from_str("foo").is_err());
+        assert!(matches!(
+            TableTypeValue::from_str("").unwrap_err(),
+            InvalidValue(_)
+        ));
+        assert!(matches!(
+            TableTypeValue::from_str("copyonwrite").unwrap_err(),
+            InvalidValue(_)
+        ));
+        assert!(matches!(
+            TableTypeValue::from_str("MERGEONREAD").unwrap_err(),
+            InvalidValue(_)
+        ));
+        assert!(matches!(
+            TableTypeValue::from_str("foo").unwrap_err(),
+            InvalidValue(_)
+        ));
     }
 
     #[test]
@@ -276,10 +304,13 @@ mod tests {
             BaseFileFormatValue::from_str("PArquet").unwrap(),
             BaseFileFormatValue::Parquet
         );
-        assert!(TableTypeValue::from_str("").is_err());
-        assert!(
-            TableTypeValue::from_str("orc").is_err(),
-            "orc is not yet supported."
-        );
+        assert!(matches!(
+            BaseFileFormatValue::from_str("").unwrap_err(),
+            InvalidValue(_)
+        ));
+        assert!(matches!(
+            BaseFileFormatValue::from_str("orc").unwrap_err(),
+            UnsupportedValue(_)
+        ));
     }
 }
