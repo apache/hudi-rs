@@ -336,10 +336,7 @@ mod tests {
     }
 
     /// Test helper to get relative file paths from the table with filters.
-    async fn get_file_paths_with_filters(
-        table: &Table,
-        filters: &[Filter]],
-    ) -> Result<Vec<String>> {
+    async fn get_file_paths_with_filters(table: &Table, filters: &[Filter]) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         for f in table.get_file_slices(filters).await? {
             file_paths.push(f.base_file_path().to_string());
@@ -740,7 +737,7 @@ mod tests {
 
         let filter_lt_30 = Filter::try_from(("byteField", "<", "30")).unwrap();
 
-        let actual = get_file_paths_with_filters(hudi_table, &[filter_ge_10, filter_lt_30])
+        let actual = get_file_paths_with_filters(&hudi_table, &[filter_ge_10, filter_lt_30])
             .await
             .unwrap()
             .into_iter()
@@ -755,7 +752,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let filter_gt_30 = Filter::try_from(("byteField", ">", "30")).unwrap();
-        let actual = get_file_paths_with_filters(hudi_table, &[filter_gt_30])
+        let actual = get_file_paths_with_filters(&hudi_table, &[filter_gt_30])
             .await
             .unwrap()
             .into_iter()
@@ -790,11 +787,12 @@ mod tests {
         let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
         let filter_ne_100 = Filter::try_from(("shortField", "!=", "100")).unwrap();
 
-        let actual = get_file_paths_with_filters(hudi_table, &[filter_gte_10, filter_lt_20, filter_ne_100])
-            .await
-            .unwrap()
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let actual =
+            get_file_paths_with_filters(&hudi_table, &[filter_gte_10, filter_lt_20, filter_ne_100])
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>();
         let expected = [
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
         ]
@@ -805,7 +803,7 @@ mod tests {
         let filter_lt_20 = Filter::try_from(("byteField", ">", "20")).unwrap();
         let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
 
-        let actual = get_file_paths_with_filters(hudi_table, &[filter_lt_20, filter_eq_300])
+        let actual = get_file_paths_with_filters(&hudi_table, &[filter_lt_20, filter_eq_300])
             .await
             .unwrap()
             .into_iter()
