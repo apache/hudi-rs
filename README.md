@@ -23,7 +23,7 @@
   </a>
 </p>
 <p align="center">
-  A native Rust library for Apache Hudi, with bindings to Python
+  The native Rust implementation for Apache Hudi, with Python API bindings.
   <br>
   <br>
   <a href="https://github.com/apache/hudi-rs/actions/workflows/ci.yml">

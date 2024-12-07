@@ -248,8 +248,22 @@ impl TableProvider for HudiDataSource {
 /// // Initialize a new HudiTableFactory
 /// let factory = HudiTableFactory::new();
 ///     
-/// // The factory can now be used to create Hudi tables
+/// // The factory can be used to create Hudi tables
 /// let table = factory.create_table(...)?;
+///
+///
+/// // Using `CREATE EXTERNAL TABLE` to register Hudi table:
+/// let test_table =  factory.create_table(...)?; // Table with path + url
+/// let ctx = SessionContext::new();
+///
+/// // Register table in session using `CREATE EXTERNAL TABLE` command
+/// let create_table_sql = format!(
+///     "CREATE EXTERNAL TABLE {} STORED AS HUDI LOCATION '{}' {}",
+///     test_table.as_ref(),
+///     test_table.path(),
+///     concat_as_sql_options(options)
+/// );
+/// ctx.sql(create_table_sql.as_str()).await?; // Query against this table
 ///
 /// ```
 #[derive(Debug)]

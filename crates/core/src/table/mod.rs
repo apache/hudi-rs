@@ -244,6 +244,10 @@ impl Table {
             .await
     }
 
+    pub fn create_file_group_reader(&self) -> FileGroupReader {
+        FileGroupReader::new(self.file_system_view.storage.clone())
+    }
+
     /// Get all the latest records in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
@@ -272,17 +276,22 @@ impl Table {
         Ok(batches)
     }
 
-    #[cfg(test)]
-    async fn get_file_paths_with_filters(&self, filters: &[Filter]) -> Result<Vec<String>> {
-        let mut file_paths = Vec::new();
-        for f in self.get_file_slices(filters).await? {
-            file_paths.push(f.base_file_path().to_string());
-        }
-        Ok(file_paths)
+    /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
+    pub async fn read_incremental_records(
+        &self,
+        _start_timestamp: &str,
+        _end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        todo!("read_incremental_states")
     }
 
-    pub fn create_file_group_reader(&self) -> FileGroupReader {
-        FileGroupReader::new(self.file_system_view.storage.clone())
+    /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
+    pub async fn read_incremental_changes(
+        &self,
+        _start_timestamp: &str,
+        _end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        todo!("read_incremental_changes")
     }
 }
 
@@ -324,6 +333,18 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Test helper to get relative file paths from the table with filters.
+    async fn get_file_paths_with_filters(
+        table: &Table,
+        filters: &[Filter]],
+    ) -> Result<Vec<String>> {
+        let mut file_paths = Vec::new();
+        for f in table.get_file_slices(filters).await? {
+            file_paths.push(f.base_file_path().to_string());
+        }
+        Ok(file_paths)
     }
 
     #[tokio::test]
@@ -700,8 +721,7 @@ mod tests {
         assert_eq!(hudi_table.timeline.instants.len(), 2);
 
         let partition_filters = &[];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -720,8 +740,7 @@ mod tests {
 
         let filter_lt_30 = Filter::try_from(("byteField", "<", "30")).unwrap();
 
-        let actual = hudi_table
-            .get_file_paths_with_filters(&[filter_ge_10, filter_lt_30])
+        let actual = get_file_paths_with_filters(hudi_table, &[filter_ge_10, filter_lt_30])
             .await
             .unwrap()
             .into_iter()
@@ -736,8 +755,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let filter_gt_30 = Filter::try_from(("byteField", ">", "30")).unwrap();
-        let actual = hudi_table
-            .get_file_paths_with_filters(&[filter_gt_30])
+        let actual = get_file_paths_with_filters(hudi_table, &[filter_gt_30])
             .await
             .unwrap()
             .into_iter()
@@ -753,8 +771,7 @@ mod tests {
         assert_eq!(hudi_table.timeline.instants.len(), 2);
 
         let partition_filters = &[];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -773,8 +790,7 @@ mod tests {
         let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
         let filter_ne_100 = Filter::try_from(("shortField", "!=", "100")).unwrap();
 
-        let actual = hudi_table
-            .get_file_paths_with_filters(&[filter_gte_10, filter_lt_20, filter_ne_100])
+        let actual = get_file_paths_with_filters(hudi_table, &[filter_gte_10, filter_lt_20, filter_ne_100])
             .await
             .unwrap()
             .into_iter()
@@ -789,8 +805,7 @@ mod tests {
         let filter_lt_20 = Filter::try_from(("byteField", ">", "20")).unwrap();
         let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
 
-        let actual = hudi_table
-            .get_file_paths_with_filters(&[filter_lt_20, filter_eq_300])
+        let actual = get_file_paths_with_filters(hudi_table, &[filter_lt_20, filter_eq_300])
             .await
             .unwrap()
             .into_iter()

@@ -41,6 +41,22 @@ develop: setup ## Install Python binding of hudi-rs
 	$(info --- Develop with Python binding ---)
 	maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS)
 
+.PHONY: format
+format: format-rust format-python ## Format Rust and Python code
+
+.PHONY: format-rust
+format-rust: ## Format Rust code
+	$(info --- Format Rust code ---)
+	cargo fmt --all
+
+.PHONY: format-python
+format-python: ## Format Python code
+	$(info --- Format Python code ---)
+	ruff format .
+
+.PHONY: check
+check: check-rust check-python ## Run check on Rust and Python
+
 .PHONY: check-rust
 check-rust: ## Run check on Rust
 	$(info --- Check Rust clippy ---)
@@ -56,6 +72,9 @@ check-python: ## Run check on Python
 	ruff check .
 	$(info --- Check Python typing ---)
 	mypy .
+
+.PHONY: test
+test: test-rust test-python ## Run tests on Rust and Python
 
 .PHONY: test-rust
 test-rust: ## Run tests on Rust

@@ -21,7 +21,7 @@
 # https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
 
 github:
-  description: "A native Rust library for Apache Hudi, with bindings into Python"
+  description: "The native Rust implementation for Apache Hudi, with Python API bindings."
   homepage: https://hudi.apache.org/
   labels:
     - apache
