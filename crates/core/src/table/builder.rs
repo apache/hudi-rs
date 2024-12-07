@@ -28,7 +28,9 @@ use strum::IntoEnumIterator;
 
 use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig::{DropsPartitionFields, TableType, TableVersion};
+use crate::config::table::HudiTableConfig::{
+    DropsPartitionFields, TableType, TableVersion, TimelineLayoutVersion,
+};
 use crate::config::table::TableTypeValue::CopyOnWrite;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
@@ -262,6 +264,13 @@ impl TableBuilder {
         if !(5..=6).contains(&table_version) {
             return Err(CoreError::Unsupported(
                 "Only support table version 5 and 6.".to_string(),
+            ));
+        }
+
+        let timeline_layout_version = hudi_configs.get(TimelineLayoutVersion)?.to::<isize>();
+        if timeline_layout_version != 1 {
+            return Err(CoreError::Unsupported(
+                "Only support timeline layout version 1.".to_string(),
             ));
         }
 
