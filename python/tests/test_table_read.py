@@ -194,16 +194,22 @@ def test_read_table_as_of_timestamp(get_sample_table):
         },
     ]
 
+
 def test_convert_filters_valid(get_sample_table):
     table_path = get_sample_table
     table = HudiTable(table_path)
 
     filters = [
         ("city", "=", "san_francisco"),
-        ("fare", ">", "50"),
-        ("driver", "!=", "john_doe"),
+        ("city", ">", "san_francisco"),
+        ("city", "<", "san_francisco"),
+        ("city", "<=", "san_francisco"),
+        ("city", ">=", "san_francisco"),
     ]
 
-    file_slices = table.get_file_slices(filters=filters)
+    result = [3, 1, 1, 4, 4]
 
-    assert len(file_slices) > 0
+    for i in range(len(filters)):
+        filter_list = [filters[i]]
+        file_slices = table.get_file_slices(filters=filter_list)
+        assert len(file_slices) == result[i]
