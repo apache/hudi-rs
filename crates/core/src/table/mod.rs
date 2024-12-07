@@ -243,6 +243,10 @@ impl Table {
             .await
     }
 
+    pub fn create_file_group_reader(&self) -> FileGroupReader {
+        FileGroupReader::new(self.file_system_view.storage.clone())
+    }
+
     /// Get all the latest records in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
@@ -271,20 +275,22 @@ impl Table {
         Ok(batches)
     }
 
-    #[cfg(test)]
-    async fn get_file_paths_with_filters(
+    /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
+    pub async fn read_incremental_records(
         &self,
-        filters: &[(&str, &str, &str)],
-    ) -> Result<Vec<String>> {
-        let mut file_paths = Vec::new();
-        for f in self.get_file_slices(filters).await? {
-            file_paths.push(f.base_file_path().to_string());
-        }
-        Ok(file_paths)
+        _start_timestamp: &str,
+        _end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        todo!("read_incremental_states")
     }
 
-    pub fn create_file_group_reader(&self) -> FileGroupReader {
-        FileGroupReader::new(self.file_system_view.storage.clone())
+    /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
+    pub async fn read_incremental_changes(
+        &self,
+        _start_timestamp: &str,
+        _end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        todo!("read_incremental_changes")
     }
 }
 
@@ -324,6 +330,18 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Test helper to get relative file paths from the table with filters.
+    async fn get_file_paths_with_filters(
+        table: &Table,
+        filters: &[(&str, &str, &str)],
+    ) -> Result<Vec<String>> {
+        let mut file_paths = Vec::new();
+        for f in table.get_file_slices(filters).await? {
+            file_paths.push(f.base_file_path().to_string());
+        }
+        Ok(file_paths)
     }
 
     #[tokio::test]
@@ -700,8 +718,7 @@ mod tests {
         assert_eq!(hudi_table.timeline.instants.len(), 2);
 
         let partition_filters = &[];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -717,8 +734,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let partition_filters = &[("byteField", ">=", "10"), ("byteField", "<", "30")];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -733,8 +749,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let partition_filters = &[("byteField", ">", "30")];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -750,8 +765,7 @@ mod tests {
         assert_eq!(hudi_table.timeline.instants.len(), 2);
 
         let partition_filters = &[];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -771,8 +785,7 @@ mod tests {
             ("byteField", "<", "20"),
             ("shortField", "!=", "100"),
         ];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
@@ -786,8 +799,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         let partition_filters = &[("byteField", ">", "20"), ("shortField", "=", "300")];
-        let actual = hudi_table
-            .get_file_paths_with_filters(partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
             .await
             .unwrap()
             .into_iter()
