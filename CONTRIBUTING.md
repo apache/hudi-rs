@@ -132,6 +132,10 @@ coverage change for PRs, with a 10% lenacy.
 To help with contributing to the project, please explore [Hudi's documentation](https://hudi.apache.org/docs/overview)
 for further learning.
 
+## Current Issues 
+
+All issues being worked on for different releases can be found in the projects tab [here](https://github.com/apache/hudi-rs/projects). The roadmap contains issues and pull requests being worked on for the upcoming release and future releases to come.
+
 ## Code of Conduct
 
 We expect all community members to follow
