@@ -31,7 +31,7 @@ pub enum CoreError {
     Config(#[from] ConfigError),
 
     #[error("Data type error: {0}")]
-    DataType(String),
+    Schema(String),
 
     #[error("File group error: {0}")]
     FileGroup(String),
