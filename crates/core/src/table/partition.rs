@@ -19,17 +19,14 @@
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::InvalidPartitionPath;
-use crate::expr::filter::Filter;
+use crate::expr::filter::{Filter, SchemableFilter};
 use crate::expr::ExprOperator;
 use crate::Result;
 
-use arrow_array::{ArrayRef, Scalar, StringArray};
-use arrow_cast::{cast_with_options, CastOptions};
+use arrow_array::{ArrayRef, Scalar};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::Schema;
-use arrow_schema::{DataType, Field};
 
-use crate::table::CoreError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -39,7 +36,7 @@ pub struct PartitionPruner {
     schema: Arc<Schema>,
     is_hive_style: bool,
     is_url_encoded: bool,
-    and_filters: Vec<PartitionFilter>,
+    and_filters: Vec<SchemableFilter>,
 }
 
 impl PartitionPruner {
@@ -50,8 +47,8 @@ impl PartitionPruner {
     ) -> Result<Self> {
         let and_filters = and_filters
             .iter()
-            .map(|filter| PartitionFilter::try_from((filter.clone(), partition_schema)))
-            .collect::<Result<Vec<PartitionFilter>>>()?;
+            .map(|filter| SchemableFilter::try_from((filter.clone(), partition_schema)))
+            .collect::<Result<Vec<SchemableFilter>>>()?;
 
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs
@@ -151,56 +148,10 @@ impl PartitionPruner {
                 } else {
                     part
                 };
-                let scalar = PartitionFilter::cast_value(&[value], field.data_type())?;
+                let scalar = SchemableFilter::cast_value(&[value], field.data_type())?;
                 Ok((field.name().to_string(), scalar))
             })
             .collect()
-    }
-}
-
-/// A partition filter that represents a filter expression for partition pruning.
-#[derive(Debug, Clone)]
-pub struct PartitionFilter {
-    pub field: Field,
-    pub operator: ExprOperator,
-    pub value: Scalar<ArrayRef>,
-}
-
-impl TryFrom<(Filter, &Schema)> for PartitionFilter {
-    type Error = CoreError;
-
-    fn try_from((filter, partition_schema): (Filter, &Schema)) -> Result<Self, Self::Error> {
-        let field: &Field = partition_schema
-            .field_with_name(&filter.field_name)
-            .map_err(|_| InvalidPartitionPath("Partition path should be in schema.".to_string()))?;
-
-        let operator = filter.operator;
-        let value = &[filter.field_value.as_str()];
-        let value = Self::cast_value(value, field.data_type())?;
-
-        let field = field.clone();
-        Ok(PartitionFilter {
-            field,
-            operator,
-            value,
-        })
-    }
-}
-
-impl PartitionFilter {
-    pub fn cast_value(value: &[&str; 1], data_type: &DataType) -> Result<Scalar<ArrayRef>> {
-        let cast_options = CastOptions {
-            safe: false,
-            format_options: Default::default(),
-        };
-
-        let value = StringArray::from(Vec::from(value));
-
-        Ok(Scalar::new(
-            cast_with_options(&value, data_type, &cast_options).map_err(|e| {
-                CoreError::DataType(format!("Unable to cast {:?}: {:?}", data_type, e))
-            })?,
-        ))
     }
 }
 
@@ -345,7 +296,7 @@ mod tests {
             field_value: "2023-01-01".to_string(),
         };
 
-        let partition_filter = PartitionFilter::try_from((filter, &schema)).unwrap();
+        let partition_filter = SchemableFilter::try_from((filter, &schema)).unwrap();
         assert_eq!(partition_filter.field.name(), "date");
         assert_eq!(partition_filter.operator, ExprOperator::Eq);
 
@@ -365,12 +316,12 @@ mod tests {
             operator: ExprOperator::Eq,
             field_value: "2023-01-01".to_string(),
         };
-        let result = PartitionFilter::try_from((filter, &schema));
+        let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Partition path should be in schema."));
+            .contains("Field invalid_field not found in schema"));
     }
 
     #[test]
@@ -381,7 +332,7 @@ mod tests {
             operator: ExprOperator::Eq,
             field_value: "not_a_number".to_string(),
         };
-        let result = PartitionFilter::try_from((filter, &schema));
+        let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
     }
 
@@ -394,7 +345,7 @@ mod tests {
                 operator: ExprOperator::from_str(op).unwrap(),
                 field_value: "5".to_string(),
             };
-            let partition_filter = PartitionFilter::try_from((filter, &schema));
+            let partition_filter = SchemableFilter::try_from((filter, &schema));
             let filter = partition_filter.unwrap();
             assert_eq!(filter.field.name(), "count");
             assert_eq!(filter.operator, ExprOperator::from_str(op).unwrap());

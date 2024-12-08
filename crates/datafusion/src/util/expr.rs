@@ -19,8 +19,7 @@
 
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{BinaryExpr, Expr};
-use hudi_core::expr::filter::Filter as HudiFilter;
-use hudi_core::expr::ExprOperator;
+use hudi_core::expr::filter::{col, Filter as HudiFilter};
 
 /// Converts DataFusion expressions into Hudi filters.
 ///
@@ -36,25 +35,14 @@ use hudi_core::expr::ExprOperator;
 ///
 /// TODO: Handle other DataFusion [`Expr`]
 pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<HudiFilter> {
-    let mut filters: Vec<HudiFilter> = Vec::new();
-
-    for expr in exprs {
-        match expr {
-            Expr::BinaryExpr(binary_expr) => {
-                if let Some(filter) = binary_expr_to_filter(binary_expr) {
-                    filters.push(filter);
-                }
-            }
-            Expr::Not(not_expr) => {
-                if let Some(filter) = not_expr_to_filter(not_expr) {
-                    filters.push(filter);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    filters
+    exprs
+        .iter()
+        .filter_map(|expr| match expr {
+            Expr::BinaryExpr(binary_expr) => binary_expr_to_filter(binary_expr),
+            Expr::Not(not_expr) => not_expr_to_filter(not_expr),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Converts a binary expression [`Expr::BinaryExpr`] into a [`HudiFilter`].
@@ -66,34 +54,27 @@ fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
         _ => return None,
     };
 
-    let field_name = column.name().to_string();
+    let field = col(column.name());
+    let lit_str = literal.to_string();
 
-    let operator = match binary_expr.op {
-        Operator::Eq => ExprOperator::Eq,
-        Operator::NotEq => ExprOperator::Ne,
-        Operator::Lt => ExprOperator::Lt,
-        Operator::LtEq => ExprOperator::Lte,
-        Operator::Gt => ExprOperator::Gt,
-        Operator::GtEq => ExprOperator::Gte,
+    let filter = match binary_expr.op {
+        Operator::Eq => field.eq(lit_str),
+        Operator::NotEq => field.ne(lit_str),
+        Operator::Lt => field.lt(lit_str),
+        Operator::LtEq => field.lte(lit_str),
+        Operator::Gt => field.gt(lit_str),
+        Operator::GtEq => field.gte(lit_str),
         _ => return None,
     };
 
-    let value = literal.to_string();
-
-    Some(HudiFilter {
-        field_name,
-        operator,
-        field_value: value,
-    })
+    Some(filter)
 }
 
 /// Converts a NOT expression (`Expr::Not`) into a `PartitionFilter`.
 fn not_expr_to_filter(not_expr: &Expr) -> Option<HudiFilter> {
     match not_expr {
         Expr::BinaryExpr(ref binary_expr) => {
-            let mut filter = binary_expr_to_filter(binary_expr)?;
-            filter.operator = filter.operator.negate()?;
-            Some(filter)
+            binary_expr_to_filter(binary_expr).map(|filter| filter.negate())?
         }
         _ => None,
     }

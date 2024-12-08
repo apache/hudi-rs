@@ -127,13 +127,18 @@ impl HudiDataSource {
     fn is_supported_operator(&self, op: &Operator) -> bool {
         matches!(
             op,
-            Operator::Eq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Gt
+                | Operator::Lt
+                | Operator::GtEq
+                | Operator::LtEq
         )
     }
 
     fn is_supported_operand(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::Column(col) => self.schema().field_with_name(&col.name).is_ok(),
+            Expr::Column(col) => self.schema().column_with_name(&col.name).is_some(),
             Expr::Literal(_) => true,
             _ => false,
         }
@@ -546,19 +551,19 @@ mod tests {
                 .await
                 .unwrap();
 
-        let expr1 = Expr::BinaryExpr(BinaryExpr {
+        let expr0 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::Eq,
             right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())))),
         });
 
-        let expr2 = Expr::BinaryExpr(BinaryExpr {
+        let expr1 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
             op: Operator::Gt,
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
         });
 
-        let expr3 = Expr::BinaryExpr(BinaryExpr {
+        let expr2 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name(
                 "nonexistent_column".to_string(),
             ))),
@@ -566,28 +571,28 @@ mod tests {
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
         });
 
-        let expr4 = Expr::BinaryExpr(BinaryExpr {
+        let expr3 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::NotEq,
             right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())))),
         });
 
-        let expr5 = Expr::Literal(ScalarValue::Int32(Some(10)));
+        let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)));
 
-        let expr6 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
+        let expr5 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
             op: Operator::Gt,
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
         })));
 
-        let filters = vec![&expr1, &expr2, &expr3, &expr4, &expr5, &expr6];
+        let filters = vec![&expr0, &expr1, &expr2, &expr3, &expr4, &expr5];
         let result = table_provider.supports_filters_pushdown(&filters).unwrap();
 
         assert_eq!(result.len(), 6);
         assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
-        assert_eq!(result[3], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[3], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[5], TableProviderFilterPushDown::Inexact);
     }
