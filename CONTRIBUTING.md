@@ -125,7 +125,7 @@ When submitting a pull request, please follow these guidelines:
 ### Code coverage
 
 We use [codecov](https://app.codecov.io/github/apache/hudi-rs) to generate code coverage report and enforce net positive
-coverage change for PRs, with a 5% lenacy.
+coverage change for PRs, with a 10% lenacy.
 
 ## Learning
 
