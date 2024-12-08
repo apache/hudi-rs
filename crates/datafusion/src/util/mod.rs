@@ -16,39 +16,5 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Crate `hudi-core`.
-//!
-//! # The [config] module is responsible for managing configurations.
-//!
-//! **Example**
-//!
-//! ```rust
-//! use hudi_core::config::read::HudiReadConfig::{AsOfTimestamp, InputPartitions};
-//! use hudi_core::table::Table as HudiTable;
-//!
-//! let options = [(InputPartitions, "2"), (AsOfTimestamp, "20240101010100000")];
-//! HudiTable::new_with_options("/tmp/hudi_data", options);
-//! ```
-//!
-//! # The [table] module is responsible for managing Hudi tables.
-//!
-//! **Example**
-//!
-//! create hudi table
-//! ```rust
-//! use hudi_core::table::Table;
-//!
-//! pub async fn test() {
-//!     let hudi_table = Table::new("/tmp/hudi_data").await.unwrap();
-//! }
-//! ```
 
-pub mod config;
-pub mod error;
 pub mod expr;
-pub mod file_group;
-pub mod storage;
-pub mod table;
-pub mod util;
-
-use error::Result;

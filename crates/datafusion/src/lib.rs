@@ -17,6 +17,8 @@
  * under the License.
  */
 
+pub(crate) mod util;
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -31,14 +33,16 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::Result;
-use datafusion_expr::{CreateExternalTable, Expr, TableType};
+use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
+use crate::util::expr::exprs_to_filters;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, parse_uri};
@@ -54,7 +58,7 @@ use hudi_core::table::Table as HudiTable;
 ///
 /// use datafusion::error::Result;
 /// use datafusion::prelude::{DataFrame, SessionContext};
-/// use hudi::HudiDataSource;
+/// use hudi_datafusion::HudiDataSource;
 ///
 /// // Initialize a new DataFusion session context
 /// let ctx = SessionContext::new();
@@ -62,7 +66,7 @@ use hudi_core::table::Table as HudiTable;
 /// // Create a new HudiDataSource with specific read options
 /// let hudi = HudiDataSource::new_with_options(
 ///     "/tmp/trips_table",
-/// [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
+///     [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
 ///
 /// // Register the Hudi table with the session context
 /// ctx.register_table("trips_table", Arc::new(hudi))?;
@@ -98,6 +102,42 @@ impl HudiDataSource {
             .get_or_default(InputPartitions)
             .to::<usize>()
     }
+
+    /// Check if the given expression can be pushed down to the Hudi table.
+    ///
+    /// The expression can be pushed down if it is a binary expression with a supported operator and operands.
+    fn can_push_down(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary_expr) => {
+                let left = &binary_expr.left;
+                let op = &binary_expr.op;
+                let right = &binary_expr.right;
+                self.is_supported_operator(op)
+                    && self.is_supported_operand(left)
+                    && self.is_supported_operand(right)
+            }
+            Expr::Not(inner_expr) => {
+                // Recursively check if the inner expression can be pushed down
+                self.can_push_down(inner_expr)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_supported_operator(&self, op: &Operator) -> bool {
+        matches!(
+            op,
+            Operator::Eq | Operator::Gt | Operator::Lt | Operator::GtEq | Operator::LtEq
+        )
+    }
+
+    fn is_supported_operand(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(col) => self.schema().field_with_name(&col.name).is_ok(),
+            Expr::Literal(_) => true,
+            _ => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -129,10 +169,11 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
+        // Convert Datafusion `Expr` to `Filter`
+        let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
-            // TODO: implement supports_filters_pushdown() to pass filters to Hudi table API
-            .get_file_slices_splits(self.get_input_partitions(), &[])
+            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters.as_slice())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
@@ -176,6 +217,22 @@ impl TableProvider for HudiDataSource {
 
         Ok(exec_builder.build_arc())
     }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        filters
+            .iter()
+            .map(|expr| {
+                if self.can_push_down(expr) {
+                    Ok(TableProviderFilterPushDown::Inexact)
+                } else {
+                    Ok(TableProviderFilterPushDown::Unsupported)
+                }
+            })
+            .collect()
+    }
 }
 
 /// `HudiTableFactory` is responsible for creating and configuring Hudi tables.
@@ -188,7 +245,8 @@ impl TableProvider for HudiDataSource {
 /// Creating a new `HudiTableFactory` instance:
 ///
 /// ```rust
-/// use hudi::HudiTableFactory;
+/// use datafusion::prelude::SessionContext;
+/// use hudi_datafusion::HudiTableFactory;
 ///
 /// // Initialize a new HudiTableFactory
 /// let factory = HudiTableFactory::new();
@@ -265,12 +323,13 @@ mod tests {
     use super::*;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{DataFusionError, ScalarValue};
+    use datafusion_common::{Column, DataFusionError, ScalarValue};
     use std::fs::canonicalize;
     use std::path::Path;
     use std::sync::Arc;
     use url::Url;
 
+    use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_tests::TestTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
@@ -478,5 +537,58 @@ mod tests {
             verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
             verify_data_with_replacecommits(&ctx, &sql, test_table.as_ref()).await
         }
+    }
+
+    #[tokio::test]
+    async fn test_supports_filters_pushdown() {
+        let table_provider =
+            HudiDataSource::new_with_options(V6Nonpartitioned.path().as_str(), empty_options())
+                .await
+                .unwrap();
+
+        let expr1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())))),
+        });
+
+        let expr2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+        });
+
+        let expr3 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name(
+                "nonexistent_column".to_string(),
+            ))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+        });
+
+        let expr4 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::NotEq,
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())))),
+        });
+
+        let expr5 = Expr::Literal(ScalarValue::Int32(Some(10)));
+
+        let expr6 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+        })));
+
+        let filters = vec![&expr1, &expr2, &expr3, &expr4, &expr5, &expr6];
+        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
+
+        assert_eq!(result.len(), 6);
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
+        assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[3], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
+        assert_eq!(result[5], TableProviderFilterPushDown::Inexact);
     }
 }

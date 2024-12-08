@@ -84,18 +84,17 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
-use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Schema};
-use url::Url;
+pub mod builder;
+mod fs_view;
+pub mod partition;
+mod timeline;
 
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::expr::filter::Filter;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
 use crate::table::builder::TableBuilder;
@@ -104,10 +103,11 @@ use crate::table::partition::PartitionPruner;
 use crate::table::timeline::Timeline;
 use crate::Result;
 
-pub mod builder;
-mod fs_view;
-mod partition;
-mod timeline;
+use arrow::record_batch::RecordBatch;
+use arrow_schema::{Field, Schema};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use url::Url;
 
 /// Hudi Table in-memory
 #[derive(Clone, Debug)]
@@ -195,10 +195,11 @@ impl Table {
     /// The file slices are split into `n` chunks.
     ///
     /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
+    ///
     pub async fn get_file_slices_splits(
         &self,
         n: usize,
-        filters: &[(&str, &str, &str)],
+        filters: &[Filter],
     ) -> Result<Vec<Vec<FileSlice>>> {
         let file_slices = self.get_file_slices(filters).await?;
         if file_slices.is_empty() {
@@ -217,7 +218,7 @@ impl Table {
     /// Get all the [FileSlice]s in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
-    pub async fn get_file_slices(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<FileSlice>> {
+    pub async fn get_file_slices(&self, filters: &[Filter]) -> Result<Vec<FileSlice>> {
         if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
             self.get_file_slices_as_of(timestamp.to::<String>().as_str(), filters)
                 .await
@@ -232,7 +233,7 @@ impl Table {
     async fn get_file_slices_as_of(
         &self,
         timestamp: &str,
-        filters: &[(&str, &str, &str)],
+        filters: &[Filter],
     ) -> Result<Vec<FileSlice>> {
         let excludes = self.timeline.get_replaced_file_groups().await?;
         let partition_schema = self.get_partition_schema().await?;
@@ -250,7 +251,7 @@ impl Table {
     /// Get all the latest records in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
-    pub async fn read_snapshot(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<RecordBatch>> {
+    pub async fn read_snapshot(&self, filters: &[Filter]) -> Result<Vec<RecordBatch>> {
         if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
             self.read_snapshot_as_of(timestamp.to::<String>().as_str(), filters)
                 .await
@@ -265,7 +266,7 @@ impl Table {
     async fn read_snapshot_as_of(
         &self,
         timestamp: &str,
-        filters: &[(&str, &str, &str)],
+        filters: &[Filter],
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
@@ -298,12 +299,13 @@ impl Table {
 mod tests {
     use super::*;
     use arrow_array::StringArray;
+    use hudi_tests::{assert_not, TestTable};
+    use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
     use std::{env, panic};
 
-    use hudi_tests::{assert_not, TestTable};
-
+    use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
         IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
@@ -313,6 +315,7 @@ mod tests {
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
+    use crate::table::Filter;
 
     /// Test helper to create a new `Table` instance without validating the configuration.
     ///
@@ -333,10 +336,7 @@ mod tests {
     }
 
     /// Test helper to get relative file paths from the table with filters.
-    async fn get_file_paths_with_filters(
-        table: &Table,
-        filters: &[(&str, &str, &str)],
-    ) -> Result<Vec<String>> {
+    async fn get_file_paths_with_filters(table: &Table, filters: &[Filter]) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         for f in table.get_file_slices(filters).await? {
             file_paths.push(f.base_file_path().to_string());
@@ -733,8 +733,11 @@ mod tests {
         .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
-        let partition_filters = &[("byteField", ">=", "10"), ("byteField", "<", "30")];
-        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
+        let filter_ge_10 = Filter::try_from(("byteField", ">=", "10")).unwrap();
+
+        let filter_lt_30 = Filter::try_from(("byteField", "<", "30")).unwrap();
+
+        let actual = get_file_paths_with_filters(&hudi_table, &[filter_ge_10, filter_lt_30])
             .await
             .unwrap()
             .into_iter()
@@ -748,8 +751,8 @@ mod tests {
         .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
-        let partition_filters = &[("byteField", ">", "30")];
-        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
+        let filter_gt_30 = Filter::try_from(("byteField", ">", "30")).unwrap();
+        let actual = get_file_paths_with_filters(&hudi_table, &[filter_gt_30])
             .await
             .unwrap()
             .into_iter()
@@ -780,16 +783,16 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
-        let partition_filters = &[
-            ("byteField", ">=", "10"),
-            ("byteField", "<", "20"),
-            ("shortField", "!=", "100"),
-        ];
-        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
-            .await
-            .unwrap()
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let filter_gte_10 = Filter::try_from(("byteField", ">=", "10")).unwrap();
+        let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
+        let filter_ne_100 = Filter::try_from(("shortField", "!=", "100")).unwrap();
+
+        let actual =
+            get_file_paths_with_filters(&hudi_table, &[filter_gte_10, filter_lt_20, filter_ne_100])
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>();
         let expected = [
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
         ]
@@ -797,9 +800,10 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
+        let filter_lt_20 = Filter::try_from(("byteField", ">", "20")).unwrap();
+        let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
 
-        let partition_filters = &[("byteField", ">", "20"), ("shortField", "=", "300")];
-        let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
+        let actual = get_file_paths_with_filters(&hudi_table, &[filter_lt_20, filter_eq_300])
             .await
             .unwrap()
             .into_iter()
@@ -812,12 +816,15 @@ mod tests {
     async fn hudi_table_read_snapshot_for_complex_keygen_hive_style() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let partition_filters = &[
-            ("byteField", ">=", "10"),
-            ("byteField", "<", "20"),
-            ("shortField", "!=", "100"),
-        ];
-        let records = hudi_table.read_snapshot(partition_filters).await.unwrap();
+
+        let filter_gte_10 = Filter::try_from(("byteField", ">=", "10")).unwrap();
+        let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
+        let filter_ne_100 = Filter::try_from(("shortField", "!=", "100")).unwrap();
+
+        let records = hudi_table
+            .read_snapshot(&[filter_gte_10, filter_lt_20, filter_ne_100])
+            .await
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].num_rows(), 2);
         let actual_partition_paths: HashSet<&str> = HashSet::from_iter(

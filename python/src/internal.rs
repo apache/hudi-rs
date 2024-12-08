@@ -23,19 +23,17 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use arrow::pyarrow::ToPyArrow;
-use pyo3::{pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use tokio::runtime::Runtime;
 
 use hudi::error::CoreError;
+use hudi::expr::filter::Filter;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
-use hudi::util::convert_vec_to_slice;
-use hudi::util::vec_to_slice;
-use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 
 create_exception!(_internal, HudiCoreError, PyException);
 
@@ -197,12 +195,11 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        let filters = convert_filters(filters)?;
+
         py.allow_threads(|| {
             let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices_splits(n, vec_to_slice!(filters.unwrap_or_default())),
-                )
+                .block_on(self.inner.get_file_slices_splits(n, &filters))
                 .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
@@ -217,12 +214,11 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
+        let filters = convert_filters(filters)?;
+
         py.allow_threads(|| {
             let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices(vec_to_slice!(filters.unwrap_or_default())),
-                )
+                .block_on(self.inner.get_file_slices(&filters))
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
@@ -239,13 +235,27 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<PyObject> {
-        rt().block_on(
-            self.inner
-                .read_snapshot(vec_to_slice!(filters.unwrap_or_default())),
-        )
-        .map_err(PythonError::from)?
-        .to_pyarrow(py)
+        let filters = convert_filters(filters)?;
+
+        rt().block_on(self.inner.read_snapshot(&filters))
+            .map_err(PythonError::from)?
+            .to_pyarrow(py)
     }
+}
+
+fn convert_filters(filters: Option<Vec<(String, String, String)>>) -> PyResult<Vec<Filter>> {
+    filters
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(field, op, value)| {
+            Filter::try_from((field.as_str(), op.as_str(), value.as_str())).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "Invalid filter ({}, {}, {}): {}",
+                    field, op, value, e
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(not(tarpaulin))]

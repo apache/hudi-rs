@@ -180,10 +180,12 @@ impl FileSystemView {
 mod tests {
     use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
+    use crate::expr::filter::Filter;
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
     use crate::table::partition::PartitionPruner;
     use crate::table::Table;
+
     use hudi_tests::TestTable;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -298,12 +300,16 @@ mod tests {
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+
+        let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
+        let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
         let partition_pruner = PartitionPruner::new(
-            &[("byteField", "<", "20"), ("shortField", "=", "300")],
+            &[filter_lt_20, filter_eq_300],
             &partition_schema,
             hudi_table.hudi_configs.as_ref(),
         )
         .unwrap();
+
         let file_slices = fs_view
             .get_file_slices_as_of("20240418173235694", &partition_pruner, excludes)
             .await
