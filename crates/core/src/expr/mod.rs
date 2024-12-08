@@ -60,6 +60,18 @@ impl ExprOperator {
         (">", ExprOperator::Gt),
         (">=", ExprOperator::Gte),
     ];
+
+    /// Negates the operator.
+    pub fn negate(&self) -> Option<ExprOperator> {
+        match self {
+            ExprOperator::Eq => Some(ExprOperator::Ne),
+            ExprOperator::Ne => Some(ExprOperator::Eq),
+            ExprOperator::Lt => Some(ExprOperator::Gte),
+            ExprOperator::Lte => Some(ExprOperator::Gt),
+            ExprOperator::Gt => Some(ExprOperator::Lte),
+            ExprOperator::Gte => Some(ExprOperator::Lt),
+        }
+    }
 }
 
 impl FromStr for ExprOperator {

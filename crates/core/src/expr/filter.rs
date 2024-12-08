@@ -20,10 +20,6 @@
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::Result;
-use arrow_array::StringArray;
-use arrow_array::{ArrayRef, Scalar};
-use arrow_cast::{cast_with_options, CastOptions};
-use arrow_schema::DataType;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -33,22 +29,7 @@ pub struct Filter {
     pub field_value: String,
 }
 
-impl Filter {
-    pub fn cast_value(value: &[&str; 1], data_type: &DataType) -> Result<Scalar<ArrayRef>> {
-        let cast_options = CastOptions {
-            safe: false,
-            format_options: Default::default(),
-        };
-
-        let value = StringArray::from(Vec::from(value));
-
-        Ok(Scalar::new(cast_with_options(
-            &value,
-            data_type,
-            &cast_options,
-        )?))
-    }
-}
+impl Filter {}
 
 impl TryFrom<(&str, &str, &str)> for Filter {
     type Error = CoreError;

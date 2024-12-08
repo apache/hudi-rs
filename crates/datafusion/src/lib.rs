@@ -17,7 +17,7 @@
  * under the License.
  */
 
-pub mod utils;
+pub(crate) mod util;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ use datafusion_common::Result;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
-use crate::utils::exprs_to_filter::convert_exprs_to_filter;
+use crate::util::expr::exprs_to_filters;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, parse_uri};
@@ -58,7 +58,7 @@ use hudi_core::table::Table as HudiTable;
 ///
 /// use datafusion::error::Result;
 /// use datafusion::prelude::{DataFrame, SessionContext};
-/// use hudi::HudiDataSource;
+/// use hudi_datafusion::HudiDataSource;
 ///
 /// // Initialize a new DataFusion session context
 /// let ctx = SessionContext::new();
@@ -66,7 +66,7 @@ use hudi_core::table::Table as HudiTable;
 /// // Create a new HudiDataSource with specific read options
 /// let hudi = HudiDataSource::new_with_options(
 ///     "/tmp/trips_table",
-/// [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
+///     [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
 ///
 /// // Register the Hudi table with the session context
 /// ctx.register_table("trips_table", Arc::new(hudi))?;
@@ -96,7 +96,6 @@ impl HudiDataSource {
         }
     }
 
-    // Helper functions until all exprs are supported
     fn get_input_partitions(&self) -> usize {
         self.table
             .hudi_configs
@@ -104,6 +103,9 @@ impl HudiDataSource {
             .to::<usize>()
     }
 
+    /// Check if the given expression can be pushed down to the Hudi table.
+    ///
+    /// The expression can be pushed down if it is a binary expression with a supported operator and operands.
     fn can_push_down(&self, expr: &Expr) -> bool {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
@@ -168,7 +170,7 @@ impl TableProvider for HudiDataSource {
         self.table.register_storage(state.runtime_env().clone());
 
         // Convert Datafusion `Expr` to `Filter`
-        let pushdown_filters = convert_exprs_to_filter(filters);
+        let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
             .get_file_slices_splits(self.get_input_partitions(), pushdown_filters.as_slice())
@@ -243,7 +245,8 @@ impl TableProvider for HudiDataSource {
 /// Creating a new `HudiTableFactory` instance:
 ///
 /// ```rust
-/// use hudi::HudiTableFactory;
+/// use datafusion::prelude::SessionContext;
+/// use hudi_datafusion::HudiTableFactory;
 ///
 /// // Initialize a new HudiTableFactory
 /// let factory = HudiTableFactory::new();

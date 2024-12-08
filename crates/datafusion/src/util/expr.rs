@@ -19,41 +19,46 @@
 
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{BinaryExpr, Expr};
-use hudi_core::expr::filter::Filter;
+use hudi_core::expr::filter::Filter as HudiFilter;
 use hudi_core::expr::ExprOperator;
 
-// TODO: Handle other Datafusion `Expr`
-
-/// Converts a slice of DataFusion expressions (`Expr`) into a vector of `Filter`.
-/// Returns `Some(Vec<Filter>)` if at least one filter is successfully converted,
+/// Converts DataFusion expressions into Hudi filters.
+///
+/// Takes a slice of DataFusion [`Expr`] and attempts to convert each expression
+/// into a [`HudiFilter`]. Only binary expressions and NOT expressions are currently supported.
+///
+/// # Arguments
+/// * `exprs` - A slice of DataFusion expressions to convert
+///
+/// # Returns
+/// Returns `Some(Vec<HudiFilter>)` if at least one filter is successfully converted,
 /// otherwise returns `None`.
-pub fn convert_exprs_to_filter(exprs: &[Expr]) -> Vec<Filter> {
-    let mut filters: Vec<Filter> = Vec::new();
+///
+/// TODO: Handle other DataFusion [`Expr`]
+pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<HudiFilter> {
+    let mut filters: Vec<HudiFilter> = Vec::new();
 
     for expr in exprs {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
-                if let Some(filter) = convert_binary_expr(binary_expr) {
+                if let Some(filter) = binary_expr_to_filter(binary_expr) {
                     filters.push(filter);
                 }
             }
             Expr::Not(not_expr) => {
-                // Handle NOT expressions
-                if let Some(filter) = convert_not_expr(not_expr) {
+                if let Some(filter) = not_expr_to_filter(not_expr) {
                     filters.push(filter);
                 }
             }
-            _ => {
-                continue;
-            }
+            _ => {}
         }
     }
 
     filters
 }
 
-/// Converts a binary expression (`Expr::BinaryExpr`) into a `Filter`.
-fn convert_binary_expr(binary_expr: &BinaryExpr) -> Option<Filter> {
+/// Converts a binary expression [`Expr::BinaryExpr`] into a [`HudiFilter`].
+fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
     // extract the column and literal from the binary expression
     let (column, literal) = match (&*binary_expr.left, &*binary_expr.right) {
         (Expr::Column(col), Expr::Literal(lit)) => (col, lit),
@@ -75,7 +80,7 @@ fn convert_binary_expr(binary_expr: &BinaryExpr) -> Option<Filter> {
 
     let value = literal.to_string();
 
-    Some(Filter {
+    Some(HudiFilter {
         field_name,
         operator,
         field_value: value,
@@ -83,26 +88,14 @@ fn convert_binary_expr(binary_expr: &BinaryExpr) -> Option<Filter> {
 }
 
 /// Converts a NOT expression (`Expr::Not`) into a `PartitionFilter`.
-fn convert_not_expr(not_expr: &Expr) -> Option<Filter> {
+fn not_expr_to_filter(not_expr: &Expr) -> Option<HudiFilter> {
     match not_expr {
         Expr::BinaryExpr(ref binary_expr) => {
-            let mut filter = convert_binary_expr(binary_expr)?;
-            filter.operator = negate_operator(filter.operator)?;
+            let mut filter = binary_expr_to_filter(binary_expr)?;
+            filter.operator = filter.operator.negate()?;
             Some(filter)
         }
         _ => None,
-    }
-}
-
-/// Negates a given operator
-fn negate_operator(op: ExprOperator) -> Option<ExprOperator> {
-    match op {
-        ExprOperator::Eq => Some(ExprOperator::Ne),
-        ExprOperator::Ne => Some(ExprOperator::Eq),
-        ExprOperator::Lt => Some(ExprOperator::Gte),
-        ExprOperator::Lte => Some(ExprOperator::Gt),
-        ExprOperator::Gt => Some(ExprOperator::Lte),
-        ExprOperator::Gte => Some(ExprOperator::Lt),
     }
 }
 
@@ -128,11 +121,11 @@ mod tests {
 
         let filters = vec![expr];
 
-        let result = convert_exprs_to_filter(&filters);
+        let result = exprs_to_filters(&filters);
 
         assert_eq!(result.len(), 1);
 
-        let expected_filter = Filter {
+        let expected_filter = HudiFilter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Eq,
             field_value: "42".to_string(),
@@ -143,7 +136,6 @@ mod tests {
         assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
     }
 
-    // Tests the conversion of a NOT expression
     #[test]
     fn test_convert_not_expr() {
         let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
@@ -157,11 +149,11 @@ mod tests {
 
         let filters = vec![expr];
 
-        let result = convert_exprs_to_filter(&filters);
+        let result = exprs_to_filters(&filters);
 
         assert_eq!(result.len(), 1);
 
-        let expected_filter = Filter {
+        let expected_filter = HudiFilter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Ne,
             field_value: "42".to_string(),
@@ -178,7 +170,7 @@ mod tests {
         let test_cases = vec![
             (
                 col("int32_col").eq(lit(42i32)),
-                Some(Filter {
+                Some(HudiFilter {
                     field_name: String::from("int32_col"),
                     operator: ExprOperator::Eq,
                     field_value: String::from("42"),
@@ -186,7 +178,7 @@ mod tests {
             ),
             (
                 col("int64_col").gt_eq(lit(100i64)),
-                Some(Filter {
+                Some(HudiFilter {
                     field_name: String::from("int64_col"),
                     operator: ExprOperator::Gte,
                     field_value: String::from("100"),
@@ -194,7 +186,7 @@ mod tests {
             ),
             (
                 col("float64_col").lt(lit(32.666)),
-                Some(Filter {
+                Some(HudiFilter {
                     field_name: String::from("float64_col"),
                     operator: ExprOperator::Lt,
                     field_value: "32.666".to_string(),
@@ -202,7 +194,7 @@ mod tests {
             ),
             (
                 col("string_col").not_eq(lit("test")),
-                Some(Filter {
+                Some(HudiFilter {
                     field_name: String::from("string_col"),
                     operator: ExprOperator::Ne,
                     field_value: String::from("test"),
@@ -211,8 +203,8 @@ mod tests {
         ];
 
         let filters: Vec<Expr> = test_cases.iter().map(|(expr, _)| expr.clone()).collect();
-        let result = convert_exprs_to_filter(&filters);
-        let expected_filters: Vec<&Filter> = test_cases
+        let result = exprs_to_filters(&filters);
+        let expected_filters: Vec<&HudiFilter> = test_cases
             .iter()
             .filter_map(|(_, opt_filter)| opt_filter.as_ref())
             .collect();
@@ -247,11 +239,11 @@ mod tests {
 
             let filters = vec![expr];
 
-            let result = convert_exprs_to_filter(&filters);
+            let result = exprs_to_filters(&filters);
 
             assert_eq!(result.len(), 1);
 
-            let expected_filter = Filter {
+            let expected_filter = HudiFilter {
                 field_name: schema.field(0).name().to_string(),
                 operator: expected_op,
                 field_value: String::from("42"),
@@ -272,15 +264,16 @@ mod tests {
         ));
 
         let filters = vec![expr];
-        let result = convert_exprs_to_filter(&filters);
+        let result = exprs_to_filters(&filters);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_negate_operator_for_all_ops() {
         for (op, _) in ExprOperator::TOKEN_OP_PAIRS {
-            if let Some(negated_op) = negate_operator(ExprOperator::from_str(op).unwrap()) {
-                let double_negated_op = negate_operator(negated_op)
+            if let Some(negated_op) = ExprOperator::from_str(op).unwrap().negate() {
+                let double_negated_op = negated_op
+                    .negate()
                     .expect("Negation should be defined for all operators");
 
                 assert_eq!(double_negated_op, ExprOperator::from_str(op).unwrap());

@@ -18,7 +18,7 @@
  */
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
-use crate::error::CoreError::{InvalidPartitionPath, Unsupported};
+use crate::error::CoreError::InvalidPartitionPath;
 use crate::expr::filter::Filter;
 use crate::expr::ExprOperator;
 use crate::Result;
@@ -29,6 +29,7 @@ use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::Schema;
 use arrow_schema::{DataType, Field};
 
+use crate::table::CoreError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -166,17 +167,16 @@ pub struct PartitionFilter {
 }
 
 impl TryFrom<(Filter, &Schema)> for PartitionFilter {
-    type Error = crate::table::CoreError;
+    type Error = CoreError;
 
-    fn try_from((filter, partition_schema): (Filter, &Schema)) -> Result<Self> {
+    fn try_from((filter, partition_schema): (Filter, &Schema)) -> Result<Self, Self::Error> {
         let field: &Field = partition_schema
             .field_with_name(&filter.field_name)
             .map_err(|_| InvalidPartitionPath("Partition path should be in schema.".to_string()))?;
 
         let operator = filter.operator;
         let value = &[filter.field_value.as_str()];
-        let value = Self::cast_value(value, field.data_type())
-            .map_err(|_| Unsupported(format!("Unable to cast {}.", field.data_type())))?;
+        let value = Self::cast_value(value, field.data_type())?;
 
         let field = field.clone();
         Ok(PartitionFilter {
@@ -196,11 +196,11 @@ impl PartitionFilter {
 
         let value = StringArray::from(Vec::from(value));
 
-        Ok(Scalar::new(cast_with_options(
-            &value,
-            data_type,
-            &cast_options,
-        )?))
+        Ok(Scalar::new(
+            cast_with_options(&value, data_type, &cast_options).map_err(|e| {
+                CoreError::DataType(format!("Unable to cast {:?}: {:?}", data_type, e))
+            })?,
+        ))
     }
 }
 
