@@ -94,7 +94,7 @@ use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::exprs::filter::Filter;
+use crate::expr::filter::Filter;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
 use crate::table::builder::TableBuilder;

@@ -51,7 +51,6 @@ impl Display for ExprOperator {
     }
 }
 
-// TODO: Add more operators
 impl ExprOperator {
     pub const TOKEN_OP_PAIRS: [(&'static str, ExprOperator); 6] = [
         ("=", ExprOperator::Eq),

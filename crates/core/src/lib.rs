@@ -45,7 +45,7 @@
 
 pub mod config;
 pub mod error;
-pub mod exprs;
+pub mod expr;
 pub mod file_group;
 pub mod storage;
 pub mod table;

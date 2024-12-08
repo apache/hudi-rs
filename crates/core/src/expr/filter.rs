@@ -17,8 +17,8 @@
  * under the License.
  */
 
-use crate::error::CoreError::Unsupported;
-use crate::exprs::ExprOperator;
+use crate::error::CoreError;
+use crate::expr::ExprOperator;
 use crate::Result;
 use arrow_array::StringArray;
 use arrow_array::{ArrayRef, Scalar};
@@ -30,7 +30,7 @@ use std::str::FromStr;
 pub struct Filter {
     pub field_name: String,
     pub operator: ExprOperator,
-    pub value: String,
+    pub field_value: String,
 }
 
 impl Filter {
@@ -51,22 +51,21 @@ impl Filter {
 }
 
 impl TryFrom<(&str, &str, &str)> for Filter {
-    type Error = crate::error::CoreError;
+    type Error = CoreError;
 
-    fn try_from(filter: (&str, &str, &str)) -> Result<Self> {
-        let (field_name, operator_str, value_str) = filter;
+    fn try_from(binary_expr_tuple: (&str, &str, &str)) -> Result<Self, Self::Error> {
+        let (field_name, operator_str, field_value) = binary_expr_tuple;
 
         let field_name = field_name.to_string();
 
-        let operator = ExprOperator::from_str(operator_str)
-            .map_err(|_| Unsupported(format!("Unsupported operator: {}", operator_str)))?;
+        let operator = ExprOperator::from_str(operator_str)?;
 
-        let value = value_str.to_string();
+        let field_value = field_value.to_string();
 
         Ok(Filter {
             field_name,
             operator,
-            value,
+            field_value,
         })
     }
 }

@@ -19,8 +19,8 @@
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::{InvalidPartitionPath, Unsupported};
-use crate::exprs::filter::Filter;
-use crate::exprs::ExprOperator;
+use crate::expr::filter::Filter;
+use crate::expr::ExprOperator;
 use crate::Result;
 
 use arrow_array::{ArrayRef, Scalar, StringArray};
@@ -174,7 +174,7 @@ impl TryFrom<(Filter, &Schema)> for PartitionFilter {
             .map_err(|_| InvalidPartitionPath("Partition path should be in schema.".to_string()))?;
 
         let operator = filter.operator;
-        let value = &[filter.value.as_str()];
+        let value = &[filter.field_value.as_str()];
         let value = Self::cast_value(value, field.data_type())
             .map_err(|_| Unsupported(format!("Unable to cast {}.", field.data_type())))?;
 
@@ -342,7 +342,7 @@ mod tests {
         let filter = Filter {
             field_name: "date".to_string(),
             operator: ExprOperator::Eq,
-            value: "2023-01-01".to_string(),
+            field_value: "2023-01-01".to_string(),
         };
 
         let partition_filter = PartitionFilter::try_from((filter, &schema)).unwrap();
@@ -363,7 +363,7 @@ mod tests {
         let filter = Filter {
             field_name: "invalid_field".to_string(),
             operator: ExprOperator::Eq,
-            value: "2023-01-01".to_string(),
+            field_value: "2023-01-01".to_string(),
         };
         let result = PartitionFilter::try_from((filter, &schema));
         assert!(result.is_err());
@@ -379,7 +379,7 @@ mod tests {
         let filter = Filter {
             field_name: "count".to_string(),
             operator: ExprOperator::Eq,
-            value: "not_a_number".to_string(),
+            field_value: "not_a_number".to_string(),
         };
         let result = PartitionFilter::try_from((filter, &schema));
         assert!(result.is_err());
@@ -392,7 +392,7 @@ mod tests {
             let filter = Filter {
                 field_name: "count".to_string(),
                 operator: ExprOperator::from_str(op).unwrap(),
-                value: "5".to_string(),
+                field_value: "5".to_string(),
             };
             let partition_filter = PartitionFilter::try_from((filter, &schema));
             let filter = partition_filter.unwrap();

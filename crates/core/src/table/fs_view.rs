@@ -180,7 +180,7 @@ impl FileSystemView {
 mod tests {
     use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
-    use crate::exprs::filter::Filter;
+    use crate::expr::filter::Filter;
     use crate::storage::Storage;
     use crate::table::fs_view::FileSystemView;
     use crate::table::partition::PartitionPruner;

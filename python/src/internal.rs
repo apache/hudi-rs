@@ -26,7 +26,7 @@ use arrow::pyarrow::ToPyArrow;
 use tokio::runtime::Runtime;
 
 use hudi::error::CoreError;
-use hudi::exprs::filter::Filter;
+use hudi::expr::filter::Filter;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileSlice;
 use hudi::storage::error::StorageError;

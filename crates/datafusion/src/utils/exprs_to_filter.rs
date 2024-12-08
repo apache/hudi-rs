@@ -19,8 +19,8 @@
 
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{BinaryExpr, Expr};
-use hudi_core::exprs::filter::Filter;
-use hudi_core::exprs::ExprOperator;
+use hudi_core::expr::filter::Filter;
+use hudi_core::expr::ExprOperator;
 
 // TODO: Handle other Datafusion `Expr`
 
@@ -78,7 +78,7 @@ fn convert_binary_expr(binary_expr: &BinaryExpr) -> Option<Filter> {
     Some(Filter {
         field_name,
         operator,
-        value,
+        field_value: value,
     })
 }
 
@@ -112,7 +112,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
     use datafusion_expr::{BinaryExpr, Expr};
-    use hudi_core::exprs::ExprOperator;
+    use hudi_core::expr::ExprOperator;
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -135,12 +135,12 @@ mod tests {
         let expected_filter = Filter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Eq,
-            value: "42".to_string(),
+            field_value: "42".to_string(),
         };
 
         assert_eq!(result[0].field_name, expected_filter.field_name);
         assert_eq!(result[0].operator, expected_filter.operator);
-        assert_eq!(*result[0].value.clone(), expected_filter.value);
+        assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
     }
 
     // Tests the conversion of a NOT expression
@@ -164,12 +164,12 @@ mod tests {
         let expected_filter = Filter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Ne,
-            value: "42".to_string(),
+            field_value: "42".to_string(),
         };
 
         assert_eq!(result[0].field_name, expected_filter.field_name);
         assert_eq!(result[0].operator, expected_filter.operator);
-        assert_eq!(*result[0].value.clone(), expected_filter.value);
+        assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
     }
 
     #[test]
@@ -181,7 +181,7 @@ mod tests {
                 Some(Filter {
                     field_name: String::from("int32_col"),
                     operator: ExprOperator::Eq,
-                    value: String::from("42"),
+                    field_value: String::from("42"),
                 }),
             ),
             (
@@ -189,7 +189,7 @@ mod tests {
                 Some(Filter {
                     field_name: String::from("int64_col"),
                     operator: ExprOperator::Gte,
-                    value: String::from("100"),
+                    field_value: String::from("100"),
                 }),
             ),
             (
@@ -197,7 +197,7 @@ mod tests {
                 Some(Filter {
                     field_name: String::from("float64_col"),
                     operator: ExprOperator::Lt,
-                    value: "32.666".to_string(),
+                    field_value: "32.666".to_string(),
                 }),
             ),
             (
@@ -205,7 +205,7 @@ mod tests {
                 Some(Filter {
                     field_name: String::from("string_col"),
                     operator: ExprOperator::Ne,
-                    value: String::from("test"),
+                    field_value: String::from("test"),
                 }),
             ),
         ];
@@ -222,7 +222,7 @@ mod tests {
         for (result, expected_filter) in result.iter().zip(expected_filters.iter()) {
             assert_eq!(result.field_name, expected_filter.field_name);
             assert_eq!(result.operator, expected_filter.operator);
-            assert_eq!(*result.value.clone(), expected_filter.value);
+            assert_eq!(*result.field_value.clone(), expected_filter.field_value);
         }
     }
 
@@ -254,12 +254,12 @@ mod tests {
             let expected_filter = Filter {
                 field_name: schema.field(0).name().to_string(),
                 operator: expected_op,
-                value: String::from("42"),
+                field_value: String::from("42"),
             };
 
             assert_eq!(result[0].field_name, expected_filter.field_name);
             assert_eq!(result[0].operator, expected_filter.operator);
-            assert_eq!(*result[0].value.clone(), expected_filter.value);
+            assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
         }
     }
 
