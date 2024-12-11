@@ -15,23 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-**/Cargo.lock
-/target
-**/target
+[workspace]
+members = []
 
-/.idea
-.vscode
+[package]
+version = "0.1.0"
+name = "integration_test"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75.0"
+description = "Integration tests for hudi-rs"
 
-# python
-.env
-venv
-**/.python-version
-__pycache__
 
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
+[dependencies]
+hudi = { features=["datafusion"], path="../crates/hudi" }
+hudi-tests = { path="../crates/tests" }
+datafusion = { version = "= 39.0.0" }
+datafusion-expr = { version = "= 39.0.0" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
