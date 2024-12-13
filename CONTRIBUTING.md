@@ -22,10 +22,24 @@
 Welcome to the Apache Hudi community! We appreciate your interest in contributing to this open-source data lake
 platform. This guide will walk you through the process of making your first contribution.
 
+## Starter issues
+
+If you are new to the project, we recommend starting with issues listed
+in https://github.com/apache/hudi-rs/contribute.
+
 ## File an issue
 
 Testing and reporting bugs are also valueable contributions. Please follow
 the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_report.yml) to file bug reports.
+
+## Issue tracking
+
+All issues tagged for a release can be found in the corresponding milestone page,
+see https://github.com/apache/hudi-rs/milestones.
+
+Features, bugs, and `p0` issues that are targeting the next release can be found in
+this [project view](https://github.com/orgs/apache/projects/356/views/4). Pull requests won't be tracked in the project
+view, instead, they will be linked to the corresponding issues.
 
 ## Prepare for development
 
