@@ -25,7 +25,7 @@ platform. This guide will walk you through the process of making your first cont
 ## Starter issues
 
 If you are new to the project, we recommend starting with issues listed
-under https://github.com/apache/hudi-rs/contribute.
+in https://github.com/apache/hudi-rs/contribute.
 
 ## File an issue
 
@@ -37,9 +37,9 @@ the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_r
 All issues tagged for a release can be found in the corresponding milestone page,
 see https://github.com/apache/hudi-rs/milestones.
 
-Major features and critical bug fixes that are targeting the next release can be found in
+Features, bugs, and `p0` issues that are targeting the next release can be found in
 this [project view](https://github.com/orgs/apache/projects/356/views/4). Pull requests won't be tracked in the project
-view, instead, they will be linked to the corresponding issue.
+view, instead, they will be linked to the corresponding issues.
 
 ## Prepare for development
 
