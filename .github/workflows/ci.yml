@@ -112,11 +112,7 @@ jobs:
           if-no-files-found: 'error'
 
   integration-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-22.04 ]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Integration tests
