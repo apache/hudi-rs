@@ -34,8 +34,8 @@ if [ $attempt -eq $max_attempts ]; then
   exit 1
 fi
 
-# Run the python app
-docker exec -it runner /bin/bash -c "
+# install dependencies and run the app
+docker exec -T runner /bin/bash -c "
   cd /opt/hudi-rs/python && \
   make setup develop && \
   cd /opt/hudi-rs/demo/app && \
