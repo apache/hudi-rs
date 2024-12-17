@@ -15,21 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
+FROM alpine
 
-/.idea
-.vscode
+RUN apk update && apk add --no-cache \
+	wget ca-certificates bash unzip
 
-# python
-venv
-**/.python-version
-__pycache__
+RUN cd /usr/local/bin && \
+  wget -q --show-progress https://dl.min.io/client/mc/release/linux-amd64/mc && \
+  chmod +x mc
 
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
+WORKDIR /opt/data

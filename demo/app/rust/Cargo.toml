@@ -15,21 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
+[workspace]
+# keep this empty such that it won't be linked to the repo workspace
 
-/.idea
-.vscode
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
 
-# python
-venv
-**/.python-version
-__pycache__
-
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
+[dependencies]
+tokio = "^1"
+datafusion = "^43"
+hudi = { path = "../../../crates/hudi", features = ["datafusion"] }

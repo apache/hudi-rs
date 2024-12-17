@@ -111,6 +111,18 @@ jobs:
           path: ./cov-reports
           if-no-files-found: 'error'
 
+  integration-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Integration tests
+        run: |
+          cd demo
+          ./run_app.sh
 
   publish-coverage:
     name: Publish coverage reports to codecov.io
