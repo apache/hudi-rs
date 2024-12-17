@@ -35,7 +35,7 @@ if [ $attempt -eq $max_attempts ]; then
 fi
 
 # install dependencies and run the app
-docker exec -T runner /bin/bash -c "
+docker compose exec -T runner /bin/bash -c "
   cd /opt/hudi-rs/python && \
   make setup develop && \
   cd /opt/hudi-rs/demo/app && \
