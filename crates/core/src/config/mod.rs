@@ -172,7 +172,7 @@ pub struct HudiConfigs {
 }
 
 impl HudiConfigs {
-    /// Create [HudiConfigs] using opitons in the form of key-value pairs.
+    /// Create [HudiConfigs] using options in the form of key-value pairs.
     pub fn new<I, K, V>(options: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
