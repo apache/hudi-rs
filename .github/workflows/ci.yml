@@ -111,6 +111,14 @@ jobs:
           path: ./cov-reports
           if-no-files-found: 'error'
 
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Integration tests
+        run: |
+          cd demo
+          ./run_app.sh
 
   publish-coverage:
     name: Publish coverage reports to codecov.io

@@ -15,21 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
+FROM rust:1.79
 
-/.idea
-.vscode
+RUN apt-get update && apt-get install -y python3-dev python3-venv
 
-# python
-venv
-**/.python-version
-__pycache__
+RUN python3 -m venv /opt/venv
 
-# macOS
-**/.DS_Store
+ENV PATH="/opt/venv/bin:$PATH"
 
-# coverage files
-*.profraw
-cobertura.xml
+ENV VIRTUAL_ENV=/opt/venv
+
+RUN pip install --no-cache-dir --upgrade pip
+
+WORKDIR /opt
+
+CMD tail -f /dev/null

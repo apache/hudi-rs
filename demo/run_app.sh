@@ -1,3 +1,5 @@
+#!/bin/bash
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -14,22 +16,29 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
-/Cargo.lock
-/target
-**/target
+docker compose up --build -d
 
-/.idea
-.vscode
+max_attempts=30
+attempt=0
 
-# python
-venv
-**/.python-version
-__pycache__
+until [ "$(docker inspect -f '{{.State.Status}}' runner)" = "running" ] || [ $attempt -eq $max_attempts ]; do
+  attempt=$(( $attempt + 1 ))
+  echo "Waiting for container... (attempt $attempt of $max_attempts)"
+  sleep 1
+done
 
-# macOS
-**/.DS_Store
+if [ $attempt -eq $max_attempts ]; then
+  echo "Container failed to become ready in time"
+  exit 1
+fi
 
-# coverage files
-*.profraw
-cobertura.xml
+# install dependencies and run the app
+docker compose exec -T runner /bin/bash -c "
+  cd /opt/hudi-rs/python && \
+  make setup develop && \
+  cd /opt/hudi-rs/demo/app && \
+  cargo run --manifest-path=rust/Cargo.toml && \
+  python -m python.src.main
+  "

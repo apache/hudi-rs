@@ -1,3 +1,5 @@
+#!/bin/sh
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -14,22 +16,16 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
-/Cargo.lock
-/target
-**/target
+mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
 
-/.idea
-.vscode
+# create a bucket named `hudi-demo`
+mc mb local/hudi-demo
 
-# python
-venv
-**/.python-version
-__pycache__
+# unzip the data
+mkdir /tmp/tables
+for zip in /opt/data/tables/*.zip; do unzip -o "$zip" -d "/tmp/tables/"; done
 
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
+# copy the data to the bucket
+mc cp -r /tmp/tables/* local/hudi-demo/
