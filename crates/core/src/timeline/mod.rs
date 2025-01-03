@@ -16,84 +16,23 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+mod instant;
+mod selector;
 
-use std::cmp::{Ordering, PartialOrd};
-use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use arrow_schema::Schema;
-use parquet::arrow::parquet_to_arrow_schema;
-use serde_json::{Map, Value};
-
+use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
-use crate::storage::error::StorageError;
-use crate::storage::util::split_filename;
 use crate::storage::Storage;
+use crate::timeline::selector::TimelineSelector;
 use crate::Result;
-
-/// The [State] of an [Instant] represents the status of the action performed on the table.
-#[allow(dead_code)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum State {
-    Requested,
-    Inflight,
-    Completed,
-}
-
-/// An [Instant] represents a point in time when an action was performed on the table.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Instant {
-    state: State,
-    action: String,
-    timestamp: String,
-}
-
-impl PartialOrd for Instant {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.timestamp.cmp(&other.timestamp))
-    }
-}
-
-impl Ord for Instant {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.timestamp.cmp(&other.timestamp)
-    }
-}
-
-impl Instant {
-    pub fn state_suffix(&self) -> String {
-        match self.state {
-            State::Requested => ".requested".to_owned(),
-            State::Inflight => ".inflight".to_owned(),
-            State::Completed => "".to_owned(),
-        }
-    }
-
-    pub fn file_name(&self) -> String {
-        format!("{}.{}{}", self.timestamp, self.action, self.state_suffix())
-    }
-
-    pub fn relative_path(&self) -> Result<String> {
-        let mut commit_file_path = PathBuf::from(".hoodie");
-        commit_file_path.push(self.file_name());
-        commit_file_path
-            .to_str()
-            .ok_or(StorageError::InvalidPath(format!(
-                "Failed to get file path for {:?}",
-                self
-            )))
-            .map_err(CoreError::Storage)
-            .map(|s| s.to_string())
-    }
-
-    pub fn is_replacecommit(&self) -> bool {
-        self.action == "replacecommit"
-    }
-}
+use arrow_schema::Schema;
+use instant::Instant;
+use parquet::arrow::parquet_to_arrow_schema;
+use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
+use std::sync::Arc;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
 #[derive(Clone, Debug)]
@@ -110,7 +49,7 @@ impl Timeline {
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
-        let instants = Self::load_completed_commits(&storage).await?;
+        let instants = Self::load_active_completed_commits(&storage, hudi_configs.clone()).await?;
         Ok(Self {
             storage,
             hudi_configs,
@@ -118,16 +57,39 @@ impl Timeline {
         })
     }
 
-    async fn load_completed_commits(storage: &Storage) -> Result<Vec<Instant>> {
+    pub async fn from_instants(
+        hudi_configs: Arc<HudiConfigs>,
+        storage_options: Arc<HashMap<String, String>>,
+        instants: Vec<Instant>,
+    ) -> Result<Self> {
+        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
+        Ok(Self {
+            storage,
+            hudi_configs,
+            instants,
+        })
+    }
+
+    async fn load_active_completed_commits(
+        storage: &Storage,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Result<Vec<Instant>> {
         let mut completed_commits = Vec::new();
+        let selector = TimelineSelector::active_completed_commits();
+        let timezone = hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .to::<String>();
         for file_info in storage.list_files(Some(".hoodie")).await? {
-            let (file_stem, file_ext) = split_filename(file_info.name.as_str())?;
-            if matches!(file_ext.as_str(), "commit" | "replacecommit") {
-                completed_commits.push(Instant {
-                    state: State::Completed,
-                    timestamp: file_stem,
-                    action: file_ext.to_owned(),
-                })
+            match Instant::try_from((file_info.name.as_str(), timezone.as_str())) {
+                Ok(instant) => {
+                    if selector.should_select(&instant) {
+                        completed_commits.push(instant)
+                    }
+                }
+                Err(_) => {
+                    // Ignore files like `hoodie.properties` that are not valid timeline files
+                    continue;
+                }
             }
         }
         completed_commits.sort();
@@ -274,16 +236,8 @@ mod tests {
         assert_eq!(
             timeline.instants,
             vec![
-                Instant {
-                    state: State::Completed,
-                    action: "commit".to_owned(),
-                    timestamp: "20240402123035233".to_owned(),
-                },
-                Instant {
-                    state: State::Completed,
-                    action: "commit".to_owned(),
-                    timestamp: "20240402144910683".to_owned(),
-                },
+                Instant::try_from("20240402123035233.commit").unwrap(),
+                Instant::try_from("20240402144910683.commit").unwrap(),
             ]
         )
     }
@@ -298,11 +252,7 @@ mod tests {
         )
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
-        let instant = Instant {
-            state: State::Completed,
-            action: "commit".to_owned(),
-            timestamp: "20240402123035233".to_owned(),
-        };
+        let instant = Instant::try_from("20240402123035233.commit").unwrap();
 
         // Test error when reading empty commit metadata file
         let result = timeline.get_commit_metadata(&instant).await;
@@ -311,11 +261,7 @@ mod tests {
         assert!(matches!(err, CoreError::Timeline(_)));
         assert!(err.to_string().contains("Failed to get commit metadata"));
 
-        let instant = Instant {
-            state: State::Completed,
-            action: "commit".to_owned(),
-            timestamp: "20240402144910683".to_owned(),
-        };
+        let instant = Instant::try_from("20240402144910683.commit").unwrap();
 
         // Test error when reading a commit metadata file with invalid JSON
         let result = timeline.get_commit_metadata(&instant).await;

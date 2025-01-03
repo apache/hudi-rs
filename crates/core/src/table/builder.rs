@@ -38,8 +38,8 @@ use crate::config::{HudiConfigs, HUDI_CONF_DIR};
 use crate::error::CoreError;
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
-use crate::table::timeline::Timeline;
 use crate::table::Table;
+use crate::timeline::Timeline;
 use crate::Result;
 
 /// Builder for creating a [Table] instance.
