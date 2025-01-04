@@ -103,6 +103,9 @@ pub enum HudiTableConfig {
 
     /// Version of timeline used, by the table.
     TimelineLayoutVersion,
+
+    /// Timezone of the timeline timestamps. Default to UTC.
+    TimelineTimezone,
 }
 
 impl AsRef<str> for HudiTableConfig {
@@ -124,6 +127,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::TableType => "hoodie.table.type",
             Self::TableVersion => "hoodie.table.version",
             Self::TimelineLayoutVersion => "hoodie.timeline.layout.version",
+            Self::TimelineTimezone => "hoodie.table.timeline.timezone",
         }
     }
 }
@@ -137,6 +141,9 @@ impl ConfigParser for HudiTableConfig {
             Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
             Self::PartitionFields => Some(HudiConfigValue::List(vec![])),
             Self::PopulatesMetaFields => Some(HudiConfigValue::Boolean(true)),
+            Self::TimelineTimezone => Some(HudiConfigValue::String(
+                TimelineTimezoneValue::UTC.as_ref().to_string(),
+            )),
             _ => None,
         }
     }
@@ -202,6 +209,9 @@ impl ConfigParser for HudiTableConfig {
                     isize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Integer),
+            Self::TimelineTimezone => get_result
+                .and_then(TimelineTimezoneValue::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
         }
     }
 }
@@ -241,6 +251,27 @@ impl FromStr for BaseFileFormatValue {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
             "orc" => Err(UnsupportedValue(s.to_string())),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
+/// Config value for [HudiTableConfig::TimelineTimezone].
+#[derive(Clone, Debug, PartialEq, AsRefStr)]
+pub enum TimelineTimezoneValue {
+    #[strum(serialize = "utc")]
+    UTC,
+    #[strum(serialize = "local")]
+    Local,
+}
+
+impl FromStr for TimelineTimezoneValue {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "utc" => Ok(Self::UTC),
+            "local" => Ok(Self::Local),
             v => Err(InvalidValue(v.to_string())),
         }
     }
@@ -311,6 +342,34 @@ mod tests {
         assert!(matches!(
             BaseFileFormatValue::from_str("orc").unwrap_err(),
             UnsupportedValue(_)
+        ));
+    }
+
+    #[test]
+    fn create_timeline_timezone() {
+        assert_eq!(
+            TimelineTimezoneValue::from_str("utc").unwrap(),
+            TimelineTimezoneValue::UTC
+        );
+        assert_eq!(
+            TimelineTimezoneValue::from_str("uTc").unwrap(),
+            TimelineTimezoneValue::UTC
+        );
+        assert_eq!(
+            TimelineTimezoneValue::from_str("local").unwrap(),
+            TimelineTimezoneValue::Local
+        );
+        assert_eq!(
+            TimelineTimezoneValue::from_str("LOCAL").unwrap(),
+            TimelineTimezoneValue::Local
+        );
+        assert!(matches!(
+            TimelineTimezoneValue::from_str("").unwrap_err(),
+            InvalidValue(_)
+        ));
+        assert!(matches!(
+            TimelineTimezoneValue::from_str("foo").unwrap_err(),
+            InvalidValue(_)
         ));
     }
 }

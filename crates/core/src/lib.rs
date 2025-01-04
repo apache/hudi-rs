@@ -49,6 +49,7 @@ pub mod expr;
 pub mod file_group;
 pub mod storage;
 pub mod table;
+pub mod timeline;
 pub mod util;
 
 use error::Result;

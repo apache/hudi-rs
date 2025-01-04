@@ -87,7 +87,6 @@
 pub mod builder;
 mod fs_view;
 pub mod partition;
-mod timeline;
 
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
 use crate::config::table::HudiTableConfig;
@@ -100,7 +99,7 @@ use crate::file_group::FileSlice;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
-use crate::table::timeline::Timeline;
+use crate::timeline::Timeline;
 use crate::Result;
 
 use arrow::record_batch::RecordBatch;

@@ -18,30 +18,10 @@
  */
 
 //! Utility functions for storage.
-use std::path::Path;
 use url::Url;
 
 use crate::storage::error::StorageError::{InvalidPath, UrlParseError};
 use crate::storage::Result;
-
-/// Splits a filename into a stem and an extension.
-pub fn split_filename(filename: &str) -> Result<(String, String)> {
-    let path = Path::new(filename);
-
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or(InvalidPath(format!("No file stem found in {}", filename)))?
-        .to_string();
-
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_string();
-
-    Ok((stem, extension))
-}
 
 /// Parses a URI string into a URL.
 pub fn parse_uri(uri: &str) -> Result<Url> {
