@@ -120,17 +120,12 @@ impl TryFrom<&str> for Instant {
 
     /// Parse a timeline file name into an [Instant]. Timezone is assumed to be UTC.
     fn try_from(file_name: &str) -> Result<Self> {
-        Self::try_from((file_name, "UTC"))
+        Self::try_from_file_name_and_timezone(file_name, "UTC")
     }
 }
 
-impl TryFrom<(&str, &str)> for Instant {
-    type Error = CoreError;
-
-    /// Parse a timeline file name and a timezone value into an [Instant].
-    /// See [TimelineTimezoneValue] for valid timezone values.
-    fn try_from(file_name_and_timezone: (&str, &str)) -> Result<Self> {
-        let (file_name, timezone) = file_name_and_timezone;
+impl Instant {
+    pub fn try_from_file_name_and_timezone(file_name: &str, timezone: &str) -> Result<Self> {
         let (timestamp, action_suffix) = file_name
             .split_once('.')
             .ok_or_else(|| CoreError::Timeline(format!("Invalid file name: {}", file_name)))?;
@@ -145,9 +140,7 @@ impl TryFrom<(&str, &str)> for Instant {
             epoch_millis: dt.timestamp_millis(),
         })
     }
-}
 
-impl Instant {
     fn validate_timestamp(timestamp: &str) -> Result<()> {
         if !matches!(timestamp.len(), 14 | 17) {
             return Err(CoreError::Timeline(format!(
@@ -156,11 +149,6 @@ impl Instant {
             )));
         }
         Ok(())
-    }
-
-    /// Convert a timeline timestamp string in UTC to epoch milliseconds.
-    pub fn parse_utc_as_epoch_millis(timestamp: &str) -> Result<i64> {
-        Self::parse_datetime(timestamp, "UTC").map(|dt| dt.timestamp_millis())
     }
 
     pub fn parse_datetime(timestamp: &str, timezone: &str) -> Result<DateTime<Utc>> {
@@ -195,7 +183,7 @@ impl Instant {
         }
     }
 
-    fn parse_action_and_state(action_suffix: &str) -> Result<(Action, State)> {
+    pub fn parse_action_and_state(action_suffix: &str) -> Result<(Action, State)> {
         match action_suffix.split_once('.') {
             Some((action_str, state_str)) => {
                 Ok((Action::from_str(action_str)?, State::from_str(state_str)?))
@@ -368,8 +356,8 @@ mod tests {
     #[test]
     fn test_create_instant_using_local_timezone() {
         let file_name = "20240103153000.commit";
-        let instant_local = Instant::try_from((file_name, "local")).unwrap();
-        let instant_utc = Instant::try_from((file_name, "utc")).unwrap();
+        let instant_local = Instant::try_from_file_name_and_timezone(file_name, "local").unwrap();
+        let instant_utc = Instant::try_from_file_name_and_timezone(file_name, "utc").unwrap();
         let offset_seconds = (instant_local.epoch_millis - instant_utc.epoch_millis) / 1000;
         assert_eq!(
             offset_seconds,
