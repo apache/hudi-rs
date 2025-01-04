@@ -44,6 +44,7 @@ pub struct Timeline {
 }
 
 impl Timeline {
+    #[cfg(test)]
     pub async fn new_from_instants(
         hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,

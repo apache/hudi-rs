@@ -170,38 +170,26 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn create_test_instant(file_name: &str) -> Instant {
-        Instant::try_from(file_name).unwrap()
-    }
-
-    async fn create_test_timeline() -> Timeline {
-        let instants = vec![
-            create_test_instant("20240103153000.commit"),
-            create_test_instant("20240103153010999.commit"),
-            create_test_instant("20240103153020999.commit.requested"),
-            create_test_instant("20240103153020999.inflight"),
-            create_test_instant("20240103153020999.commit"),
-            create_test_instant("20240103153030999.commit"),
-        ];
-        Timeline::new_from_instants(
-            Arc::new(HudiConfigs::new([(
-                HudiTableConfig::BasePath,
-                "file:///tmp/base",
-            )])),
-            Arc::new(HashMap::new()),
-            instants,
-        )
-        .await
-        .unwrap()
-    }
-
     #[test]
     fn test_default() {
         assert_eq!(TimelineSelector::default(), TimelineSelector::empty());
     }
 
     #[test]
-    fn test_should_select() {
+    fn test_try_create_instant() {
+        let selector = TimelineSelector {
+            states: vec![State::Completed],
+            actions: vec![Action::Commit],
+            start_datetime: None,
+            end_datetime: None,
+            timezone: "UTC".to_string(),
+            include_archived: false,
+        };
+        assert!(
+            selector.try_create_instant("20240103153030999").is_err(),
+            "Should fail to create instant as file name is invalid"
+        );
+
         let instant_file_name = "20240103153030999.commit";
 
         let selector = TimelineSelector {
@@ -267,6 +255,27 @@ mod tests {
         );
     }
 
+    async fn create_test_timeline() -> Timeline {
+        let instants = vec![
+            Instant::try_from("20240103153000.commit").unwrap(),
+            Instant::try_from("20240103153010999.commit").unwrap(),
+            Instant::try_from("20240103153020999.commit.requested").unwrap(),
+            Instant::try_from("20240103153020999.inflight").unwrap(),
+            Instant::try_from("20240103153020999.commit").unwrap(),
+            Instant::try_from("20240103153030999.commit").unwrap(),
+        ];
+        Timeline::new_from_instants(
+            Arc::new(HudiConfigs::new([(
+                HudiTableConfig::BasePath,
+                "file:///tmp/base",
+            )])),
+            Arc::new(HashMap::new()),
+            instants,
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_select_no_instants() {
         let timeline = create_test_timeline().await;
@@ -313,6 +322,18 @@ mod tests {
     #[tokio::test]
     async fn test_timestamp_filtering() -> Result<()> {
         let timeline = create_test_timeline().await;
+
+        let selector = create_test_active_completed_selector(None, None);
+        let selected = selector.select(&timeline)?;
+        assert_eq!(
+            selected.iter().map(|i| &i.timestamp).collect::<Vec<_>>(),
+            &[
+                "20240103153000",
+                "20240103153010999",
+                "20240103153020999",
+                "20240103153030999",
+            ]
+        );
 
         // starting from the earliest timestamp (inclusive)
         let selector = create_test_active_completed_selector(Some("20240103153000000"), None);
