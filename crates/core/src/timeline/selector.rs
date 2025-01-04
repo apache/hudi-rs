@@ -86,7 +86,7 @@ impl TimelineSelector {
 
     /// Select loaded instants based on the given criteria.
     pub fn select(&self, timeline: &Timeline) -> Result<Vec<Instant>> {
-        if self.states.is_empty() && self.actions.is_empty() {
+        if self.states.is_empty() || self.actions.is_empty() {
             return Ok(vec![]);
         }
 
@@ -116,11 +116,7 @@ impl TimelineSelector {
         Ok(time_pruned_instants
             .iter()
             .filter(|instant| {
-                if !self.actions.is_empty() && !self.actions.contains(&instant.action) {
-                    return false;
-                }
-
-                self.states.contains(&instant.state)
+                self.actions.contains(&instant.action) && self.states.contains(&instant.state)
             })
             .cloned()
             .collect())
@@ -164,15 +160,6 @@ mod tests {
     #[test]
     fn test_default() {
         assert_eq!(TimelineSelector::default(), TimelineSelector::empty());
-    }
-
-    #[tokio::test]
-    async fn test_empty_selector() {
-        let timeline = create_test_timeline().await;
-        let selector = TimelineSelector::empty();
-
-        assert_not!(timeline.instants.is_empty());
-        assert!(selector.select(&timeline).unwrap().is_empty());
     }
 
     #[test]
@@ -235,6 +222,33 @@ mod tests {
             selector.should_select(&instant),
             "Should not select as timestamp is at the end timestamp (exclusive)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_select_no_instants() {
+        let timeline = create_test_timeline().await;
+        assert_not!(timeline.instants.is_empty());
+
+        let selector = TimelineSelector::empty();
+        assert!(selector.select(&timeline).unwrap().is_empty());
+
+        let selector = TimelineSelector {
+            states: vec![],
+            actions: vec![Action::Commit],
+            start_timestamp: None,
+            end_timestamp: None,
+            include_archived: false,
+        };
+        assert!(selector.select(&timeline).unwrap().is_empty());
+
+        let selector = TimelineSelector {
+            states: vec![State::Completed],
+            actions: vec![],
+            start_timestamp: None,
+            end_timestamp: None,
+            include_archived: false,
+        };
+        assert!(selector.select(&timeline).unwrap().is_empty());
     }
 
     fn create_test_active_completed_selector(
