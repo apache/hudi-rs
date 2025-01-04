@@ -115,7 +115,8 @@ impl TableBuilder {
         let hudi_configs = Arc::from(hudi_configs);
         let storage_options = Arc::from(self.storage_options.clone());
 
-        let timeline = Timeline::new(hudi_configs.clone(), storage_options.clone()).await?;
+        let timeline =
+            Timeline::new_from_storage(hudi_configs.clone(), storage_options.clone()).await?;
 
         let file_system_view =
             FileSystemView::new(hudi_configs.clone(), storage_options.clone()).await?;

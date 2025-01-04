@@ -19,7 +19,6 @@
 mod instant;
 mod selector;
 
-use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
@@ -28,6 +27,7 @@ use crate::timeline::selector::TimelineSelector;
 use crate::Result;
 use arrow_schema::Schema;
 use instant::Instant;
+use log::debug;
 use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -44,20 +44,8 @@ pub struct Timeline {
 }
 
 impl Timeline {
-    pub async fn new(
-        hudi_configs: Arc<HudiConfigs>,
-        storage_options: Arc<HashMap<String, String>>,
-    ) -> Result<Self> {
-        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
-        let instants = Self::load_active_completed_commits(&storage, hudi_configs.clone()).await?;
-        Ok(Self {
-            storage,
-            hudi_configs,
-            instants,
-        })
-    }
-
-    pub async fn from_instants(
+    #[cfg(test)]
+    pub async fn new_from_instants(
         hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,
         instants: Vec<Instant>,
@@ -70,30 +58,48 @@ impl Timeline {
         })
     }
 
-    async fn load_active_completed_commits(
-        storage: &Storage,
+    pub async fn new_from_storage(
         hudi_configs: Arc<HudiConfigs>,
-    ) -> Result<Vec<Instant>> {
-        let mut completed_commits = Vec::new();
-        let selector = TimelineSelector::active_completed_commits();
-        let timezone = hudi_configs
-            .get_or_default(HudiTableConfig::TimelineTimezone)
-            .to::<String>();
-        for file_info in storage.list_files(Some(".hoodie")).await? {
-            match Instant::try_from((file_info.name.as_str(), timezone.as_str())) {
-                Ok(instant) => {
-                    if selector.should_select(&instant) {
-                        completed_commits.push(instant)
-                    }
-                }
-                Err(_) => {
-                    // Ignore files like `hoodie.properties` that are not valid timeline files
-                    continue;
+        storage_options: Arc<HashMap<String, String>>,
+    ) -> Result<Self> {
+        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
+        let selector = TimelineSelector::active_completed_commits(hudi_configs.clone());
+        let instants = Self::load_instants(&selector, &storage).await?;
+        Ok(Self {
+            storage,
+            hudi_configs,
+            instants,
+        })
+    }
+
+    async fn load_instants(selector: &TimelineSelector, storage: &Storage) -> Result<Vec<Instant>> {
+        let files = storage.list_files(Some(".hoodie")).await?;
+
+        // For most cases, we load completed instants, so we can pre-allocate the vector with a
+        // capacity of 1/3 of the total number of listed files,
+        // ignoring requested and inflight instants.
+        let mut instants = Vec::with_capacity(files.len() / 3);
+
+        for file_info in files {
+            match selector.try_create_instant(file_info.name.as_str()) {
+                Ok(instant) => instants.push(instant),
+                Err(e) => {
+                    // Ignore files that are not valid or desired instants.
+                    debug!(
+                        "Instant not created from file {:?} due to: {:?}",
+                        file_info, e
+                    );
                 }
             }
         }
-        completed_commits.sort();
-        Ok(completed_commits)
+
+        instants.sort_unstable();
+
+        // As of current impl., we don't mutate instants once timeline is created,
+        // so we can save some memory by shrinking the capacity.
+        instants.shrink_to_fit();
+
+        Ok(instants)
     }
 
     pub fn get_latest_commit_timestamp(&self) -> Option<&str> {
@@ -198,7 +204,7 @@ mod tests {
     use crate::config::table::HudiTableConfig;
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
-        Timeline::new(
+        Timeline::new_from_storage(
             Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_url)])),
             Arc::new(HashMap::new()),
         )

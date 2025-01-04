@@ -104,7 +104,11 @@ pub enum HudiTableConfig {
     /// Version of timeline used, by the table.
     TimelineLayoutVersion,
 
-    /// Timezone of the timeline timestamps. Default to UTC.
+    /// Timezone of the timeline timestamps.
+    ///
+    /// # See also
+    ///
+    /// - [`TimelineTimezoneValue`] - Possible values for this configuration.
     TimelineTimezone,
 }
 
@@ -263,6 +267,12 @@ pub enum TimelineTimezoneValue {
     UTC,
     #[strum(serialize = "local")]
     Local,
+}
+
+impl Default for TimelineTimezoneValue {
+    fn default() -> Self {
+        Self::UTC
+    }
 }
 
 impl FromStr for TimelineTimezoneValue {

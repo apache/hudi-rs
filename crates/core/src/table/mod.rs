@@ -309,7 +309,7 @@ mod tests {
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
         IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
         PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
-        TimelineLayoutVersion,
+        TimelineLayoutVersion, TimelineTimezone,
     };
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::util::join_url_segments;
@@ -495,6 +495,10 @@ mod tests {
         );
         assert!(configs.validate(TableVersion).is_err());
         assert!(configs.validate(TimelineLayoutVersion).is_err());
+        assert!(
+            configs.validate(TimelineTimezone).is_ok(),
+            "non-required config is missing"
+        );
     }
 
     #[tokio::test]
@@ -516,6 +520,7 @@ mod tests {
         assert!(configs.get(TableType).is_ok(), "Valid table type value");
         assert!(configs.get(TableVersion).is_err());
         assert!(configs.get(TimelineLayoutVersion).is_err());
+        assert!(configs.get(TimelineTimezone).is_err());
     }
 
     #[tokio::test]
@@ -546,6 +551,10 @@ mod tests {
         );
         assert!(panic::catch_unwind(|| configs.get_or_default(TableVersion)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(TimelineLayoutVersion)).is_err());
+        assert_eq!(
+            configs.get_or_default(TimelineTimezone).to::<String>(),
+            "utc"
+        );
     }
 
     #[tokio::test]
@@ -582,6 +591,10 @@ mod tests {
         );
         assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
         assert_eq!(configs.get(TimelineLayoutVersion).unwrap().to::<isize>(), 1);
+        assert_eq!(
+            configs.get(TimelineTimezone).unwrap().to::<String>(),
+            "local"
+        );
     }
 
     #[tokio::test]
