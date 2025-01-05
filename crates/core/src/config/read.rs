@@ -42,23 +42,24 @@ use crate::config::{ConfigParser, HudiConfigValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiReadConfig {
-    /// Define input splits
-    /// - Hoodie Key : hoodie.read.input.partitions
+    /// The query instant for time travel. Without specified this option, we query the latest snapshot.
+    AsOfTimestamp,
+
+    /// Number of input partitions to read the data in parallel.
     ///
-    /// If has 100 files, [InputPartitions] is 5, will product 5 chunk,
-    /// every iter or task process 20 files
+    /// For processing 100 files, [InputPartitions] being 5 will produce 5 partitions, with each partition having 20 files.
     InputPartitions,
 
-    /// The query instant for time travel. Without specified this option, we query the latest snapshot.
-    /// - Hoodie Key : hoodie.read.as.of.timestamp
-    AsOfTimestamp,
+    /// Parallelism for listing files on storage.
+    ListingParallelism,
 }
 
 impl AsRef<str> for HudiReadConfig {
     fn as_ref(&self) -> &str {
         match self {
-            Self::InputPartitions => "hoodie.read.input.partitions",
             Self::AsOfTimestamp => "hoodie.read.as.of.timestamp",
+            Self::InputPartitions => "hoodie.read.input.partitions",
+            Self::ListingParallelism => "hoodie.read.listing.parallelism",
         }
     }
 }
@@ -69,6 +70,7 @@ impl ConfigParser for HudiReadConfig {
     fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
+            HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             _ => None,
         }
     }
@@ -80,12 +82,17 @@ impl ConfigParser for HudiReadConfig {
             .ok_or(NotFound(self.key()));
 
         match self {
+            Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::InputPartitions => get_result
                 .and_then(|v| {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
-            Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::ListingParallelism => get_result
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::UInteger),
         }
     }
 }
@@ -99,7 +106,7 @@ mod tests {
     fn parse_valid_config_value() {
         let options = HashMap::from([(InputPartitions.as_ref().to_string(), "100".to_string())]);
         let value = InputPartitions.parse_value(&options).unwrap().to::<usize>();
-        assert_eq!(value, 100usize);
+        assert_eq!(value, 100);
     }
 
     #[test]
