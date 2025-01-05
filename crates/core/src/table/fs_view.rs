@@ -25,6 +25,7 @@ use crate::file_group::{BaseFile, FileGroup, FileSlice};
 use crate::storage::file_info::FileInfo;
 use crate::storage::{get_leaf_dirs, Storage};
 
+use crate::config::read::HudiReadConfig::ListingParallelism;
 use crate::error::CoreError;
 use crate::table::partition::PartitionPruner;
 use crate::Result;
@@ -55,11 +56,11 @@ impl FileSystemView {
         })
     }
 
-    async fn load_all_partition_paths(storage: &Storage) -> Result<Vec<String>> {
-        Self::load_partition_paths(storage, &PartitionPruner::empty()).await
+    async fn list_all_partition_paths(storage: &Storage) -> Result<Vec<String>> {
+        Self::list_partition_paths(storage, &PartitionPruner::empty()).await
     }
 
-    async fn load_partition_paths(
+    async fn list_partition_paths(
         storage: &Storage,
         partition_pruner: &PartitionPruner,
     ) -> Result<Vec<String>> {
@@ -86,7 +87,7 @@ impl FileSystemView {
             .collect())
     }
 
-    async fn load_file_groups_for_partition(
+    async fn list_file_groups_for_partition(
         storage: &Storage,
         partition_path: &str,
     ) -> Result<Vec<FileGroup>> {
@@ -118,35 +119,30 @@ impl FileSystemView {
         Ok(file_groups)
     }
 
-    pub async fn get_file_slices_as_of(
-        &self,
-        timestamp: &str,
-        partition_pruner: &PartitionPruner,
-        excluding_file_groups: &HashSet<FileGroup>,
-    ) -> Result<Vec<FileSlice>> {
-        let all_partition_paths = Self::load_all_partition_paths(&self.storage).await?;
+    async fn load_file_groups(&self, partition_pruner: &PartitionPruner) -> Result<()> {
+        let all_partition_paths = Self::list_all_partition_paths(&self.storage).await?;
 
-        let partition_paths_to_load = all_partition_paths
+        let partition_paths_to_list = all_partition_paths
             .into_iter()
             .filter(|p| !self.partition_to_file_groups.contains_key(p))
             .filter(|p| partition_pruner.should_include(p))
             .collect::<HashSet<_>>();
 
-        stream::iter(partition_paths_to_load)
+        let parallelism = self
+            .hudi_configs
+            .get_or_default(ListingParallelism)
+            .to::<usize>();
+        stream::iter(partition_paths_to_list)
             .map(|path| async move {
                 let file_groups =
-                    Self::load_file_groups_for_partition(&self.storage, &path).await?;
+                    Self::list_file_groups_for_partition(&self.storage, &path).await?;
                 Ok::<_, CoreError>((path, file_groups))
             })
-            // TODO parameterize the parallelism for partition loading
-            .buffer_unordered(10)
+            .buffer_unordered(parallelism)
             .try_for_each(|(path, file_groups)| async move {
                 self.partition_to_file_groups.insert(path, file_groups);
                 Ok(())
             })
-            .await?;
-
-        self.collect_file_slices_as_of(timestamp, partition_pruner, excluding_file_groups)
             .await
     }
 
@@ -173,6 +169,17 @@ impl FileSystemView {
             }
         }
         Ok(file_slices)
+    }
+
+    pub async fn get_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        partition_pruner: &PartitionPruner,
+        excluding_file_groups: &HashSet<FileGroup>,
+    ) -> Result<Vec<FileSlice>> {
+        self.load_file_groups(partition_pruner).await?;
+        self.collect_file_slices_as_of(timestamp, partition_pruner, excluding_file_groups)
+            .await
     }
 }
 
@@ -205,7 +212,7 @@ mod tests {
         let base_url = TestTable::V6Nonpartitioned.url();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let partition_pruner = PartitionPruner::empty();
-        let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
+        let partition_paths = FileSystemView::list_partition_paths(&storage, &partition_pruner)
             .await
             .unwrap();
         let partition_path_set: HashSet<&str> =
@@ -218,7 +225,7 @@ mod tests {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let partition_pruner = PartitionPruner::empty();
-        let partition_paths = FileSystemView::load_partition_paths(&storage, &partition_pruner)
+        let partition_paths = FileSystemView::list_partition_paths(&storage, &partition_pruner)
             .await
             .unwrap();
         let partition_path_set: HashSet<&str> =
