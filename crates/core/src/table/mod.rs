@@ -278,14 +278,36 @@ impl Table {
     /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
     pub async fn read_incremental_records(
         &self,
-        _start_timestamp: &str,
-        _end_timestamp: Option<&str>,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
-        todo!("read_incremental_states")
+        let Some(as_of_timestamp) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
+        else {
+            return Ok(Vec::new());
+        };
+        let mut file_slices: Vec<FileSlice> = Vec::new();
+        let file_groups = self
+            .timeline
+            .get_file_groups_in_range(Some(start_timestamp), end_timestamp)
+            .await?;
+        for file_group in file_groups {
+            if let Some(file_slice) = file_group.get_file_slice_as_of(as_of_timestamp) {
+                file_slices.push(file_slice.clone());
+            }
+        }
+
+        // TODO: add commit time filters
+
+        let fg_reader = self.create_file_group_reader();
+        let batches =
+            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
+                .await?;
+        Ok(batches)
     }
 
     /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
-    pub async fn read_incremental_changes(
+    async fn read_incremental_changes(
         &self,
         _start_timestamp: &str,
         _end_timestamp: Option<&str>,
@@ -727,7 +749,7 @@ mod tests {
     async fn hudi_table_get_file_paths_for_simple_keygen_non_hive_style() {
         let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        assert_eq!(hudi_table.timeline.instants.len(), 2);
+        assert_eq!(hudi_table.timeline.completed_commits.len(), 2);
 
         let partition_filters = &[];
         let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
@@ -777,7 +799,7 @@ mod tests {
     async fn hudi_table_get_file_paths_for_complex_keygen_hive_style() {
         let base_url = TestTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        assert_eq!(hudi_table.timeline.instants.len(), 2);
+        assert_eq!(hudi_table.timeline.completed_commits.len(), 2);
 
         let partition_filters = &[];
         let actual = get_file_paths_with_filters(&hudi_table, partition_filters)

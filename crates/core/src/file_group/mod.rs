@@ -20,6 +20,7 @@
 //!
 //! A set of data/base files + set of log files, that make up a unit for all operations.
 
+pub mod builder;
 pub mod reader;
 
 use crate::error::CoreError;
@@ -187,8 +188,17 @@ impl FileGroup {
         }
     }
 
-    #[cfg(test)]
-    fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
+    pub fn new_with_base_file_name(
+        id: String,
+        partition_path: Option<String>,
+        file_name: &str,
+    ) -> Result<Self> {
+        let mut file_group = Self::new(id, partition_path);
+        file_group.add_base_file_from_name(file_name)?;
+        Ok(file_group)
+    }
+
+    pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let base_file = BaseFile::from_file_name(file_name)?;
         self.add_base_file(base_file)
     }

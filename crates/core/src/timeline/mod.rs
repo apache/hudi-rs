@@ -21,6 +21,7 @@ mod selector;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::file_group::builder::{build_file_groups, build_replaced_file_groups};
 use crate::file_group::FileGroup;
 use crate::storage::Storage;
 use crate::timeline::selector::TimelineSelector;
@@ -40,7 +41,7 @@ use std::sync::Arc;
 pub struct Timeline {
     hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
-    pub instants: Vec<Instant>,
+    pub completed_commits: Vec<Instant>,
 }
 
 impl Timeline {
@@ -54,7 +55,7 @@ impl Timeline {
         Ok(Self {
             storage,
             hudi_configs,
-            instants,
+            completed_commits: instants,
         })
     }
 
@@ -63,12 +64,12 @@ impl Timeline {
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
-        let selector = TimelineSelector::active_completed_commits(hudi_configs.clone());
+        let selector = TimelineSelector::completed_commits(hudi_configs.clone())?;
         let instants = Self::load_instants(&selector, &storage).await?;
         Ok(Self {
             storage,
             hudi_configs,
-            instants,
+            completed_commits: instants,
         })
     }
 
@@ -103,35 +104,29 @@ impl Timeline {
     }
 
     pub fn get_latest_commit_timestamp(&self) -> Option<&str> {
-        self.instants
+        self.completed_commits
             .iter()
             .next_back()
             .map(|instant| instant.timestamp.as_str())
     }
 
-    async fn get_commit_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
-        let bytes = self
-            .storage
-            .get_file_data(instant.relative_path()?.as_str())
-            .await?;
-        let err_msg = format!("Failed to get commit metadata for {:?}", instant);
-        let json: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| CoreError::Timeline(format!("{}: {:?}", err_msg, e)))?;
-        let commit_metadata = json
-            .as_object()
-            .ok_or(CoreError::Timeline(format!(
-                "{}: not a JSON object",
-                err_msg
-            )))?
-            .clone();
-        Ok(commit_metadata)
-    }
-
     async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
-        match self.instants.iter().next_back() {
+        match self.completed_commits.iter().next_back() {
             Some(instant) => self.get_commit_metadata(instant).await,
             None => Ok(Map::new()),
         }
+    }
+
+    async fn get_commit_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
+        let path = instant.relative_path()?;
+        let bytes = self.storage.get_file_data(path.as_str()).await?;
+
+        serde_json::from_slice(&bytes)
+            .and_then(|json: Value| {
+                json.as_object()
+                    .ok_or_else(|| serde::de::Error::custom("not a JSON object"))
+                    .map(Clone::clone)
+            }).map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
     pub async fn get_latest_schema(&self) -> Result<Schema> {
@@ -160,32 +155,43 @@ impl Timeline {
     }
 
     pub async fn get_replaced_file_groups(&self) -> Result<HashSet<FileGroup>> {
-        let mut fgs: HashSet<FileGroup> = HashSet::new();
-        for instant in self.instants.iter().filter(|i| i.is_replacecommit()) {
-            let commit_metadata = self.get_commit_metadata(instant).await?;
-            if let Some(ptn_to_replaced) = commit_metadata.get("partitionToReplaceFileIds") {
-                for (ptn, fg_ids) in ptn_to_replaced
-                    .as_object()
-                    .expect("partitionToReplaceFileIds should be a map")
-                {
-                    let fg_ids = fg_ids
-                        .as_array()
-                        .expect("file group ids should be an array")
-                        .iter()
-                        .map(|fg_id| fg_id.as_str().expect("file group id should be a string"));
-
-                    let ptn = Some(ptn.to_string()).filter(|s| !s.is_empty());
-
-                    for fg_id in fg_ids {
-                        fgs.insert(FileGroup::new(fg_id.to_string(), ptn.clone()));
-                    }
-                }
-            }
+        let mut file_groups: HashSet<FileGroup> = HashSet::new();
+        let selector = TimelineSelector::completed_replacecommits(self.hudi_configs.clone())?;
+        for instant in selector.select(self)? {
+            let commit_metadata = self.get_commit_metadata(&instant).await?;
+            file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
         }
 
         // TODO: return file group and instants, and handle multi-writer fg id conflicts
 
-        Ok(fgs)
+        Ok(file_groups)
+    }
+
+    /// Get file groups in the timeline ranging from start (exclusive) to end (inclusive).
+    /// File groups are as of the [end] timestamp or the latest if not given.
+    pub async fn get_file_groups_in_range(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<HashSet<FileGroup>> {
+        let mut file_groups: HashSet<FileGroup> = HashSet::new();
+        let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
+        let selector =
+            TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), start, end)?;
+        let commits = selector.select(self)?;
+        for instant in commits {
+            let commit_metadata = self.get_commit_metadata(&instant).await?;
+            file_groups.extend(build_file_groups(&commit_metadata)?);
+
+            if instant.is_replacecommit() {
+                replaced_file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
+            }
+        }
+
+        Ok(file_groups
+            .difference(&replaced_file_groups)
+            .cloned()
+            .collect())
     }
 }
 
@@ -240,7 +246,7 @@ mod tests {
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
         assert_eq!(
-            timeline.instants,
+            timeline.completed_commits,
             vec![
                 Instant::try_from("20240402123035233.commit").unwrap(),
                 Instant::try_from("20240402144910683.commit").unwrap(),
