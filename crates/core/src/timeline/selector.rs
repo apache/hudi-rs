@@ -368,7 +368,12 @@ mod tests {
         let selected = selector.select(&timeline)?;
         assert_eq!(
             selected.iter().map(|i| &i.timestamp).collect::<Vec<_>>(),
-            &["20240103153000", "20240103153010999", "20240103153020999", "20240103153030999"]
+            &[
+                "20240103153000",
+                "20240103153010999",
+                "20240103153020999",
+                "20240103153030999"
+            ]
         );
 
         // start and end in the middle

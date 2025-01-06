@@ -122,11 +122,7 @@ impl Timeline {
         let bytes = self.storage.get_file_data(path.as_str()).await?;
 
         serde_json::from_slice(&bytes)
-            .and_then(|json: Value| {
-                json.as_object()
-                    .ok_or_else(|| serde::de::Error::custom("not a JSON object"))
-                    .map(Clone::clone)
-            }).map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
     pub async fn get_latest_schema(&self) -> Result<Schema> {
@@ -280,6 +276,6 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
-        assert!(err.to_string().contains("not a JSON object"));
+        assert!(err.to_string().contains("Failed to get commit metadata"));
     }
 }

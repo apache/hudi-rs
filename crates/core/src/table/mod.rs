@@ -276,6 +276,7 @@ impl Table {
     }
 
     /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
+    #[allow(dead_code)]
     pub async fn read_incremental_records(
         &self,
         start_timestamp: &str,
