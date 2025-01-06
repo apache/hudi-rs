@@ -57,8 +57,8 @@ datafusion-physical-expr = { version = "= 43.0.0" }
 
 # serde
 percent-encoding = { version = "2.3.1" }
-serde = { version = "1", features = ["std", "derive"] }
-serde_json = { version = "1" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
 
 # "stdlib"
 thiserror = { version = "2.0.3" }
