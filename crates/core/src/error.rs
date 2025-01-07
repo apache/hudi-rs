@@ -36,8 +36,8 @@ pub enum CoreError {
     #[error("File group error: {0}")]
     FileGroup(String),
 
-    #[error("{0}: {1:?}")]
-    ReadFileSliceError(String, StorageError),
+    #[error("{0}")]
+    ReadFileSliceError(String),
 
     #[error("{0}")]
     InvalidPartitionPath(String),

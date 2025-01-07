@@ -20,8 +20,9 @@
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::Result;
-use arrow_array::{ArrayRef, Scalar, StringArray};
+use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar, StringArray};
 use arrow_cast::{cast_with_options, CastOptions};
+use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
 use std::str::FromStr;
 
@@ -170,5 +171,17 @@ impl SchemableFilter {
                 CoreError::Schema(format!("Unable to cast {:?}: {:?}", data_type, e))
             })?,
         ))
+    }
+
+    pub fn apply_comparsion(&self, value: &dyn Datum) -> Result<BooleanArray> {
+        match self.operator {
+            ExprOperator::Eq => eq(value, &self.value),
+            ExprOperator::Ne => neq(value, &self.value),
+            ExprOperator::Lt => lt(value, &self.value),
+            ExprOperator::Lte => lt_eq(value, &self.value),
+            ExprOperator::Gt => gt(value, &self.value),
+            ExprOperator::Gte => gt_eq(value, &self.value),
+        }
+        .map_err(|e| e.into())
     }
 }

@@ -20,22 +20,47 @@ use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::ReadFileSliceError;
+use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::FileSlice;
 use crate::storage::Storage;
 use crate::Result;
-use arrow_array::RecordBatch;
+use arrow::compute::and;
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::Schema;
 use futures::TryFutureExt;
 use std::sync::Arc;
+
+use arrow::compute::filter_record_batch;
 
 /// File group reader handles all read operations against a file group.
 #[derive(Clone, Debug)]
 pub struct FileGroupReader {
     storage: Arc<Storage>,
+    and_filters: Vec<SchemableFilter>,
 }
 
 impl FileGroupReader {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            and_filters: Vec::new(),
+        }
+    }
+
+    pub fn new_with_filters(
+        storage: Arc<Storage>,
+        and_filters: &[Filter],
+        schema: &Schema,
+    ) -> Result<Self> {
+        let and_filters = and_filters
+            .iter()
+            .map(|filter| SchemableFilter::try_from((filter.clone(), schema)))
+            .collect::<Result<Vec<SchemableFilter>>>()?;
+
+        Ok(Self {
+            storage,
+            and_filters,
+        })
     }
 
     pub fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
@@ -53,22 +78,39 @@ impl FileGroupReader {
         let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
 
         let storage = Storage::new(Arc::new(others), hudi_configs)?;
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            and_filters: Vec::new(),
+        })
     }
 
     pub async fn read_file_slice_by_base_file_path(
         &self,
         relative_path: &str,
     ) -> Result<RecordBatch> {
-        self.storage
+        let records: RecordBatch = self
+            .storage
             .get_parquet_file_data(relative_path)
-            .map_err(|e| {
-                ReadFileSliceError(
-                    format!("Failed to read file slice at path '{}'", relative_path),
-                    e,
-                )
-            })
-            .await
+            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
+            .await?;
+
+        if self.and_filters.is_empty() {
+            return Ok(records);
+        }
+
+        let mut mask = BooleanArray::from(vec![true; records.num_rows()]);
+        for filter in &self.and_filters {
+            let col_name = filter.field.name().as_str();
+            let col_values = records
+                .column_by_name(col_name)
+                .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} not found")))?;
+
+            let comparison = filter.apply_comparsion(col_values)?;
+            mask = and(&mask, &comparison)?;
+        }
+
+        filter_record_batch(&records, &mask)
+            .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
     }
 
     pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
@@ -111,6 +153,6 @@ mod tests {
         let result = reader
             .read_file_slice_by_base_file_path("non_existent_file")
             .await;
-        assert!(matches!(result.unwrap_err(), ReadFileSliceError(_, _)));
+        assert!(matches!(result.unwrap_err(), ReadFileSliceError(_)));
     }
 }

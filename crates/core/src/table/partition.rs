@@ -20,11 +20,9 @@ use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::InvalidPartitionPath;
 use crate::expr::filter::{Filter, SchemableFilter};
-use crate::expr::ExprOperator;
 use crate::Result;
 
 use arrow_array::{ArrayRef, Scalar};
-use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::Schema;
 
 use std::collections::HashMap;
@@ -90,16 +88,7 @@ impl PartitionPruner {
         self.and_filters.iter().all(|filter| {
             match segments.get(filter.field.name()) {
                 Some(segment_value) => {
-                    let comparison_result = match filter.operator {
-                        ExprOperator::Eq => eq(segment_value, &filter.value),
-                        ExprOperator::Ne => neq(segment_value, &filter.value),
-                        ExprOperator::Lt => lt(segment_value, &filter.value),
-                        ExprOperator::Lte => lt_eq(segment_value, &filter.value),
-                        ExprOperator::Gt => gt(segment_value, &filter.value),
-                        ExprOperator::Gte => gt_eq(segment_value, &filter.value),
-                    };
-
-                    match comparison_result {
+                    match filter.apply_comparsion(segment_value) {
                         Ok(scalar) => scalar.value(0),
                         Err(_) => true, // Include the partition when comparison error occurs
                     }
@@ -161,6 +150,7 @@ mod tests {
     use crate::config::table::HudiTableConfig::{
         IsHiveStylePartitioning, IsPartitionPathUrlencoded,
     };
+    use crate::expr::ExprOperator;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::Date32Array;
