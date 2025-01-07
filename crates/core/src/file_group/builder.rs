@@ -99,3 +99,334 @@ pub fn build_replaced_file_groups(
 
     Ok(file_groups)
 }
+
+#[cfg(test)]
+mod tests {
+
+    mod test_build_file_groups {
+        use super::super::*;
+        use crate::file_group::builder::build_file_groups;
+        use serde_json::{json, Map, Value};
+
+        #[test]
+        fn test_missing_partition_to_write_stats() {
+            let metadata: Map<String, Value> = json!({
+                "compacted": false,
+                "operationType": "UPSERT"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(result,
+                Err(CoreError::CommitMetadata(msg))
+                if msg == "Invalid or missing partitionToWriteStats object"));
+        }
+
+        #[test]
+        fn test_invalid_write_stats_array() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToWriteStats": {
+                    "byteField=20/shortField=100": "not_an_array"
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid write stats array"
+            ));
+        }
+
+        #[test]
+        fn test_missing_file_id() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToWriteStats": {
+                    "byteField=20/shortField=100": [{
+                        "path": "byteField=20/shortField=100/some-file.parquet"
+                    }]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid fileId in write stats"
+            ));
+        }
+
+        #[test]
+        fn test_missing_path() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToWriteStats": {
+                    "byteField=20/shortField=100": [{
+                        "fileId": "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0"
+                    }]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid path in write stats"
+            ));
+        }
+
+        #[test]
+        fn test_invalid_path_format() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToWriteStats": {
+                    "byteField=20/shortField=100": [{
+                        "fileId": "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0",
+                        "path": "" // empty path
+                    }]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file name in path"
+            ));
+        }
+
+        #[test]
+        fn test_non_string_file_id() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToWriteStats": {
+                    "byteField=20/shortField=100": [{
+                        "fileId": 123, // number instead of string
+                        "path": "byteField=20/shortField=100/some-file.parquet"
+                    }]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid fileId in write stats"
+            ));
+        }
+
+        #[test]
+        fn test_non_string_path() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToWriteStats": {
+                    "byteField=20/shortField=100": [{
+                        "fileId": "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0",
+                        "path": 123 // number instead of string
+                    }]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid path in write stats"
+            ));
+        }
+
+        #[test]
+        fn test_valid_sample_data() {
+            let sample_json = r#"{
+            "partitionToWriteStats": {
+                "byteField=20/shortField=100": [{
+                    "fileId": "bb7c3a45-387f-490d-aab2-981c3f1a8ada-0",
+                    "path": "byteField=20/shortField=100/bb7c3a45-387f-490d-aab2-981c3f1a8ada-0_0-140-198_20240418173213674.parquet"
+                }],
+                "byteField=10/shortField=300": [{
+                    "fileId": "a22e8257-e249-45e9-ba46-115bc85adcba-0",
+                    "path": "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_1-140-199_20240418173213674.parquet"
+                }]
+            }
+        }"#;
+
+            let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
+            let result = build_file_groups(&metadata);
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert_eq!(file_groups.len(), 2);
+        }
+    }
+
+    mod test_build_replaced_file_groups {
+        use super::super::*;
+        use serde_json::{json, Map, Value};
+
+        #[test]
+        fn test_missing_partition_to_replace() {
+            let metadata: Map<String, Value> = json!({
+                "compacted": false,
+                "operationType": "UPSERT"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid or missing partitionToReplaceFileIds object"
+            ));
+        }
+
+        #[test]
+        fn test_invalid_file_group_ids_array() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "20": "not_an_array"
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file group ids array"
+            ));
+        }
+
+        #[test]
+        fn test_invalid_file_group_id_type() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "20": [123] // number instead of string
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file group id string"
+            ));
+        }
+
+        #[test]
+        fn test_null_value_in_array() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "20": [null]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(matches!(
+                result,
+                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file group id string"
+            ));
+        }
+
+        #[test]
+        fn test_empty_partition() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "": ["d398fae1-c0e6-4098-8124-f55f7098bdba-0"]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert_eq!(file_groups.len(), 1);
+            let file_group = file_groups.iter().next().unwrap();
+            assert!(file_group.partition_path.is_none());
+        }
+
+        #[test]
+        fn test_multiple_file_groups_same_partition() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "20": [
+                        "88163884-fef0-4aab-865d-c72327a8a1d5-0",
+                        "88163884-fef0-4aab-865d-c72327a8a1d5-1"
+                    ]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            let actual_partition_paths = file_groups
+                .iter()
+                .map(|fg| fg.partition_path.as_ref().unwrap().as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_partition_paths, &["20", "20"]);
+        }
+
+        #[test]
+        fn test_empty_array() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "20": []
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert!(file_groups.is_empty());
+        }
+
+        #[test]
+        fn test_valid_sample_data() {
+            let metadata: Map<String, Value> = json!({
+                "partitionToReplaceFileIds": {
+                    "30": ["d398fae1-c0e6-4098-8124-f55f7098bdba-0"],
+                    "20": ["88163884-fef0-4aab-865d-c72327a8a1d5-0"],
+                    "10": ["4f2685a3-614f-49ca-9b2b-e1cb9fb61f27-0"]
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = build_replaced_file_groups(&metadata);
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert_eq!(file_groups.len(), 3);
+
+            let expected_partitions = HashSet::from_iter(vec!["10", "20", "30"]);
+            let actual_partitions: HashSet<&str> = file_groups
+                .iter()
+                .map(|fg| fg.partition_path.as_ref().unwrap().as_str())
+                .collect();
+            assert_eq!(actual_partitions, expected_partitions);
+        }
+    }
+}

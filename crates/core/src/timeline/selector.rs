@@ -70,31 +70,15 @@ impl TimelineSelector {
         })
     }
 
-    pub fn completed_replacecommits(hudi_configs: Arc<HudiConfigs>) -> Result<Self> {
-        Self::completed_replacecommits_in_range(hudi_configs, None, None)
-    }
-
-    pub fn completed_replacecommits_in_range(
-        hudi_configs: Arc<HudiConfigs>,
-        start: Option<&str>,
-        end: Option<&str>,
-    ) -> Result<Self> {
-        let timezone = Self::get_timezone_from_configs(hudi_configs);
-        let start_datetime = start
-            .map(|s| Instant::parse_datetime(s, &timezone))
-            .transpose()?;
-        let end_datetime = end
-            .map(|e| Instant::parse_datetime(e, &timezone))
-            .transpose()?;
-
-        Ok(Self {
-            timezone,
-            start_datetime,
-            end_datetime,
+    pub fn completed_replacecommits(hudi_configs: Arc<HudiConfigs>) -> Self {
+        Self {
+            timezone: Self::get_timezone_from_configs(hudi_configs),
+            start_datetime: None,
+            end_datetime: None,
             states: Some(vec![State::Completed]),
             actions: Some(vec![Action::ReplaceCommit]),
             include_archived: false,
-        })
+        }
     }
 
     pub fn try_create_instant(&self, file_name: &str) -> Result<Instant> {
