@@ -20,8 +20,9 @@
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::Result;
-use arrow_array::{ArrayRef, Scalar, StringArray};
+use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar, StringArray};
 use arrow_cast::{cast_with_options, CastOptions};
+use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
 use std::str::FromStr;
 
@@ -170,5 +171,154 @@ impl SchemableFilter {
                 CoreError::Schema(format!("Unable to cast {:?}: {:?}", data_type, e))
             })?,
         ))
+    }
+
+    pub fn apply_comparsion(&self, value: &dyn Datum) -> Result<BooleanArray> {
+        match self.operator {
+            ExprOperator::Eq => eq(value, &self.value),
+            ExprOperator::Ne => neq(value, &self.value),
+            ExprOperator::Lt => lt(value, &self.value),
+            ExprOperator::Lte => lt_eq(value, &self.value),
+            ExprOperator::Gt => gt(value, &self.value),
+            ExprOperator::Gte => gt_eq(value, &self.value),
+        }
+        .map_err(|e| e.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn create_test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("string_col", DataType::Utf8, false),
+            Field::new("int_col", DataType::Int64, false),
+        ])
+    }
+
+    #[test]
+    fn test_schemable_filter_try_from() -> Result<()> {
+        let schema = create_test_schema();
+
+        // Test string column filter creation
+        let string_filter = Filter {
+            field_name: "string_col".to_string(),
+            operator: ExprOperator::Eq,
+            field_value: "test_value".to_string(),
+        };
+
+        let schemable = SchemableFilter::try_from((string_filter, &schema))?;
+        assert_eq!(schemable.field.name(), "string_col");
+        assert_eq!(schemable.field.data_type(), &DataType::Utf8);
+        assert_eq!(schemable.operator, ExprOperator::Eq);
+
+        // Test integer column filter creation
+        let int_filter = Filter {
+            field_name: "int_col".to_string(),
+            operator: ExprOperator::Gt,
+            field_value: "42".to_string(),
+        };
+
+        let schemable = SchemableFilter::try_from((int_filter, &schema))?;
+        assert_eq!(schemable.field.name(), "int_col");
+        assert_eq!(schemable.field.data_type(), &DataType::Int64);
+        assert_eq!(schemable.operator, ExprOperator::Gt);
+
+        // Test error case - non-existent column
+        let invalid_filter = Filter {
+            field_name: "non_existent".to_string(),
+            operator: ExprOperator::Eq,
+            field_value: "value".to_string(),
+        };
+
+        assert!(SchemableFilter::try_from((invalid_filter, &schema)).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schemable_filter_cast_value() -> Result<()> {
+        // Test casting to string
+        let string_value = SchemableFilter::cast_value(&["test"], &DataType::Utf8)?;
+        assert_eq!(string_value.get().0.len(), 1);
+
+        // Test casting to integer
+        let int_value = SchemableFilter::cast_value(&["42"], &DataType::Int64)?;
+        assert_eq!(int_value.get().0.len(), 1);
+
+        // Test invalid integer cast
+        let result = SchemableFilter::cast_value(&["not_a_number"], &DataType::Int64);
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schemable_filter_apply_comparison() -> Result<()> {
+        let schema = create_test_schema();
+
+        // Test string equality comparison
+        let eq_filter = Filter {
+            field_name: "string_col".to_string(),
+            operator: ExprOperator::Eq,
+            field_value: "test".to_string(),
+        };
+        let schemable = SchemableFilter::try_from((eq_filter, &schema))?;
+
+        let test_array = StringArray::from(vec!["test", "other", "test"]);
+        let result = schemable.apply_comparsion(&test_array)?;
+        assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+
+        // Test integer greater than comparison
+        let gt_filter = Filter {
+            field_name: "int_col".to_string(),
+            operator: ExprOperator::Gt,
+            field_value: "50".to_string(),
+        };
+        let schemable = SchemableFilter::try_from((gt_filter, &schema))?;
+
+        let test_array = Int64Array::from(vec![40, 50, 60]);
+        let result = schemable.apply_comparsion(&test_array)?;
+        assert_eq!(result, BooleanArray::from(vec![false, false, true]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schemable_filter_all_operators() -> Result<()> {
+        let schema = create_test_schema();
+        let test_array = Int64Array::from(vec![40, 50, 60]);
+
+        let test_cases = vec![
+            (ExprOperator::Eq, "50", vec![false, true, false]),
+            (ExprOperator::Ne, "50", vec![true, false, true]),
+            (ExprOperator::Lt, "50", vec![true, false, false]),
+            (ExprOperator::Lte, "50", vec![true, true, false]),
+            (ExprOperator::Gt, "50", vec![false, false, true]),
+            (ExprOperator::Gte, "50", vec![false, true, true]),
+        ];
+
+        for (operator, value, expected) in test_cases {
+            let filter = Filter {
+                field_name: "int_col".to_string(),
+                operator,
+                field_value: value.to_string(),
+            };
+
+            let schemable = SchemableFilter::try_from((filter, &schema))?;
+            let result = schemable.apply_comparsion(&test_array)?;
+            assert_eq!(
+                result,
+                BooleanArray::from(expected),
+                "Failed for operator {:?} with value {}",
+                operator,
+                value
+            );
+        }
+
+        Ok(())
     }
 }
