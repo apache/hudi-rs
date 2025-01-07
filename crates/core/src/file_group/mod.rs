@@ -67,12 +67,19 @@ impl BaseFile {
     }
 
     /// Construct [BaseFile] with the base file name.
+    ///
+    /// TODO: refactor such that file info size is optional and no one expects it.
     pub fn from_file_name(file_name: &str) -> Result<Self> {
         let (file_group_id, commit_time) = Self::parse_file_name(file_name)?;
+        let info = FileInfo {
+            name: file_name.to_string(),
+            size: 0,
+            uri: "".to_string(),
+        };
         Ok(Self {
             file_group_id,
             commit_time,
-            info: FileInfo::default(),
+            info,
             stats: None,
         })
     }
@@ -100,6 +107,7 @@ pub struct FileSlice {
 }
 
 impl FileSlice {
+    #[cfg(test)]
     pub fn base_file_path(&self) -> &str {
         self.base_file.info.uri.as_str()
     }

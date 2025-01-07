@@ -189,6 +189,9 @@ class HudiTable:
             List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
         """
         ...
+    def read_incremental_records(
+        self, start_commit_time: str, end_commit_time: Optional[str]
+    ) -> List["pyarrow.RecordBatch"]: ...
 
 def build_hudi_table(
     base_uri: str,

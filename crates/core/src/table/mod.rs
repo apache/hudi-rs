@@ -93,7 +93,7 @@ use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::expr::filter::Filter;
+use crate::expr::filter::{Filter, FilterField};
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::FileSlice;
 use crate::table::builder::TableBuilder;
@@ -247,6 +247,14 @@ impl Table {
         FileGroupReader::new(self.file_system_view.storage.clone())
     }
 
+    pub async fn create_file_group_reader_with_filters(
+        &self,
+        filters: &[Filter],
+    ) -> Result<FileGroupReader> {
+        let schema = self.get_schema().await?;
+        FileGroupReader::new_with_filters(self.file_system_view.storage.clone(), filters, &schema)
+    }
+
     /// Get all the latest records in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
@@ -276,21 +284,23 @@ impl Table {
     }
 
     /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
-    #[allow(dead_code)]
     pub async fn read_incremental_records(
         &self,
         start_timestamp: &str,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
+        // If the end timestamp is not provided, use the latest commit timestamp.
         let Some(as_of_timestamp) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
         else {
             return Ok(Vec::new());
         };
+
+        // Use timestamp range to get the target file slices.
         let mut file_slices: Vec<FileSlice> = Vec::new();
         let file_groups = self
             .timeline
-            .get_file_groups_in_range(Some(start_timestamp), end_timestamp)
+            .get_incremental_file_groups(Some(start_timestamp), Some(as_of_timestamp))
             .await?;
         for file_group in file_groups {
             if let Some(file_slice) = file_group.get_file_slice_as_of(as_of_timestamp) {
@@ -298,9 +308,12 @@ impl Table {
             }
         }
 
-        // TODO: add commit time filters
-
-        let fg_reader = self.create_file_group_reader();
+        // Read incremental records from the file slices.
+        let filters = &[
+            FilterField::new("_hoodie_commit_time").gt(start_timestamp),
+            FilterField::new("_hoodie_commit_time").lte(as_of_timestamp),
+        ];
+        let fg_reader = self.create_file_group_reader_with_filters(filters).await?;
         let batches =
             futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
                 .await?;
@@ -308,6 +321,7 @@ impl Table {
     }
 
     /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
+    #[allow(dead_code)]
     async fn read_incremental_changes(
         &self,
         _start_timestamp: &str,
@@ -320,13 +334,6 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
-    use hudi_tests::{assert_not, TestTable};
-    use std::collections::HashSet;
-    use std::fs::canonicalize;
-    use std::path::PathBuf;
-    use std::{env, panic};
-
     use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
@@ -338,6 +345,12 @@ mod tests {
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
     use crate::table::Filter;
+    use arrow_array::{Array, StringArray};
+    use hudi_tests::{assert_not, TestTable};
+    use std::collections::HashSet;
+    use std::fs::canonicalize;
+    use std::path::PathBuf;
+    use std::{env, panic};
 
     /// Test helper to create a new `Table` instance without validating the configuration.
     ///
@@ -892,5 +905,88 @@ mod tests {
             "a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
         ]);
         assert_eq!(actual_file_names, expected_file_names);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_read_incremental_records_for_simplekeygen_nonhivestyle_overwritetable(
+    ) -> Result<()> {
+        let base_url = TestTable::V6SimplekeygenNonhivestyleOverwritetable.url();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // read records changed from the first commit (exclusive) to the second commit (inclusive)
+        let records = hudi_table
+            .read_incremental_records("20240707001301554", Some("20240707001302376"))
+            .await?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].num_rows(), 1);
+        assert_eq!(records[1].num_rows(), 1);
+
+        // verify the partition paths
+        let partition_paths = arrow::compute::concat(&[
+            records[0].column_by_name("_hoodie_partition_path").unwrap(),
+            records[1].column_by_name("_hoodie_partition_path").unwrap(),
+        ])?
+        .to_data();
+        let partition_paths = StringArray::from(partition_paths);
+        let actual_partition_paths: HashSet<&str> = HashSet::from_iter(
+            partition_paths
+                .iter()
+                .map(|s| s.unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let expected_partition_paths = HashSet::from_iter(vec!["10", "30"]);
+        assert_eq!(actual_partition_paths, expected_partition_paths);
+
+        // verify the file names
+        let file_names = arrow::compute::concat(&[
+            records[0].column_by_name("_hoodie_file_name").unwrap(),
+            records[1].column_by_name("_hoodie_file_name").unwrap(),
+        ])?
+        .to_data();
+        let file_names = StringArray::from(file_names);
+        let actual_file_names: HashSet<&str> =
+            HashSet::from_iter(file_names.iter().map(|s| s.unwrap()).collect::<Vec<_>>());
+        let expected_file_names = HashSet::from_iter(vec![
+            "d398fae1-c0e6-4098-8124-f55f7098bdba-0_1-95-136_20240707001302376.parquet",
+            "4f2685a3-614f-49ca-9b2b-e1cb9fb61f27-0_0-95-135_20240707001302376.parquet",
+        ]);
+        assert_eq!(actual_file_names, expected_file_names);
+
+        // read records changed from the first commit (exclusive) to
+        // the latest (an insert overwrite table's replacecommit)
+        let records = hudi_table
+            .read_incremental_records("20240707001301554", None)
+            .await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].num_rows(), 1);
+
+        // verify the partition paths
+        let partition_paths = arrow::compute::concat(&[records[0]
+            .column_by_name("_hoodie_partition_path")
+            .unwrap()])?
+        .to_data();
+        let partition_paths = StringArray::from(partition_paths);
+        let actual_partition_paths: HashSet<&str> = HashSet::from_iter(
+            partition_paths
+                .iter()
+                .map(|s| s.unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let expected_partition_paths = HashSet::from_iter(vec!["30"]);
+        assert_eq!(actual_partition_paths, expected_partition_paths);
+
+        // verify the file names
+        let file_names =
+            arrow::compute::concat(&[records[0].column_by_name("_hoodie_file_name").unwrap()])?
+                .to_data();
+        let file_names = StringArray::from(file_names);
+        let actual_file_names: HashSet<&str> =
+            HashSet::from_iter(file_names.iter().map(|s| s.unwrap()).collect::<Vec<_>>());
+        let expected_file_names = HashSet::from_iter(vec![
+            "ebcb261d-62d3-4895-90ec-5b3c9622dff4-0_0-111-154_20240707001303088.parquet",
+        ]);
+        assert_eq!(actual_file_names, expected_file_names);
+
+        Ok(())
     }
 }

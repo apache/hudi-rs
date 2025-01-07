@@ -165,15 +165,18 @@ impl Timeline {
 
     /// Get file groups in the timeline ranging from start (exclusive) to end (inclusive).
     /// File groups are as of the [end] timestamp or the latest if not given.
-    pub async fn get_file_groups_in_range(
+    pub async fn get_incremental_file_groups(
         &self,
-        start: Option<&str>,
-        end: Option<&str>,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
     ) -> Result<HashSet<FileGroup>> {
         let mut file_groups: HashSet<FileGroup> = HashSet::new();
         let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
-        let selector =
-            TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), start, end)?;
+        let selector = TimelineSelector::completed_commits_in_range(
+            self.hudi_configs.clone(),
+            start_timestamp,
+            end_timestamp,
+        )?;
         let commits = selector.select(self)?;
         for instant in commits {
             let commit_metadata = self.get_commit_metadata(&instant).await?;
