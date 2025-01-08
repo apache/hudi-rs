@@ -179,10 +179,7 @@ impl Storage {
         for dir in dir_paths {
             dirs.push(
                 dir.filename()
-                    .ok_or(InvalidPath(format!(
-                        "Failed to get file name from: {:?}",
-                        dir
-                    )))?
+                    .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", dir)))?
                     .to_string(),
             )
         }
@@ -211,10 +208,12 @@ impl Storage {
             let name = obj_meta
                 .location
                 .filename()
-                .ok_or(InvalidPath(format!(
-                    "Failed to get file name from {:?}",
-                    obj_meta.location
-                )))?
+                .ok_or_else(|| {
+                    InvalidPath(format!(
+                        "Failed to get file name from {:?}",
+                        obj_meta.location
+                    ))
+                })?
                 .to_string();
             let uri = join_url_segments(&prefix_url, &[&name])?.to_string();
             file_info.push(FileInfo {
@@ -249,10 +248,9 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
                 next_subdir.push(curr);
             }
             next_subdir.push(child_dir);
-            let next_subdir = next_subdir.to_str().ok_or(InvalidPath(format!(
-                "Failed to convert path: {:?}",
-                next_subdir
-            )))?;
+            let next_subdir = next_subdir
+                .to_str()
+                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {:?}", next_subdir)))?;
             let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }

@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::{HudiTableConfig, TimelineTimezoneValue};
+use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::timeline::instant::{Action, Instant, State};
@@ -36,62 +36,77 @@ pub struct TimelineSelector {
     include_archived: bool,
 }
 
-impl Default for TimelineSelector {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
 #[allow(dead_code)]
 impl TimelineSelector {
-    /// An empty [TimelineSelector] that selects no instants.
-    pub fn empty() -> Self {
-        Self {
-            timezone: TimelineTimezoneValue::default().as_ref().to_string(),
-            start_datetime: None,
-            end_datetime: None,
-            states: vec![],
-            actions: vec![],
-            include_archived: false,
-        }
+    fn get_timezone_from_configs(hudi_configs: Arc<HudiConfigs>) -> String {
+        hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .to::<String>()
     }
 
-    pub fn active_completed_commits(hudi_configs: Arc<HudiConfigs>) -> Self {
-        let timezone = hudi_configs
-            .get_or_default(HudiTableConfig::TimelineTimezone)
-            .to::<String>();
+    pub fn completed_commits(hudi_configs: Arc<HudiConfigs>) -> Result<Self> {
+        Self::completed_commits_in_range(hudi_configs, None, None)
+    }
 
-        Self {
+    pub fn completed_commits_in_range(
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
+        let timezone = Self::get_timezone_from_configs(hudi_configs);
+        let start_datetime = start
+            .map(|s| Instant::parse_datetime(s, &timezone))
+            .transpose()?;
+        let end_datetime = end
+            .map(|e| Instant::parse_datetime(e, &timezone))
+            .transpose()?;
+        Ok(Self {
             timezone,
-            start_datetime: None,
-            end_datetime: None,
+            start_datetime,
+            end_datetime,
             states: vec![State::Completed],
             actions: vec![Action::Commit, Action::ReplaceCommit],
             include_archived: false,
+        })
+    }
+
+    pub fn completed_replacecommits(hudi_configs: Arc<HudiConfigs>) -> Self {
+        Self {
+            timezone: Self::get_timezone_from_configs(hudi_configs),
+            start_datetime: None,
+            end_datetime: None,
+            states: vec![State::Completed],
+            actions: vec![Action::ReplaceCommit],
+            include_archived: false,
         }
+    }
+
+    pub fn should_include_action(&self, action: &Action) -> bool {
+        self.actions.is_empty() || self.actions.contains(action)
+    }
+
+    pub fn should_include_state(&self, state: &State) -> bool {
+        self.states.is_empty() || self.states.contains(state)
     }
 
     pub fn try_create_instant(&self, file_name: &str) -> Result<Instant> {
         let (timestamp, action_suffix) = file_name.split_once('.').ok_or_else(|| {
             CoreError::Timeline(format!(
-                "Instant not created due to invalid file name: {}",
-                file_name
+                "Instant not created due to invalid file name: {file_name}"
             ))
         })?;
 
         let (action, state) = Instant::parse_action_and_state(action_suffix)?;
 
-        if !self.actions.contains(&action) {
+        if !self.should_include_action(&action) {
             return Err(CoreError::Timeline(format!(
-                "Instant not created for due to unmatched action: {}",
-                file_name
+                "Instant not created for due to unmatched action: {file_name}"
             )));
         }
 
-        if !self.states.contains(&state) {
+        if !self.should_include_state(&state) {
             return Err(CoreError::Timeline(format!(
-                "Instant not created for due to unmatched state: {}",
-                file_name
+                "Instant not created for due to unmatched state: {file_name}"
             )));
         }
 
@@ -122,39 +137,44 @@ impl TimelineSelector {
         })
     }
 
-    /// Select loaded instants based on the given criteria.
+    /// Select loaded instants based on the selector's properties.
+    ///
+    /// Instants timestamps should be in the range from start (exclusive) to end (inclusive).
     pub fn select(&self, timeline: &Timeline) -> Result<Vec<Instant>> {
-        if self.states.is_empty() || self.actions.is_empty() {
-            return Ok(vec![]);
-        }
-
         let time_pruned_instants = if let Some(start) = self.start_datetime {
-            // Find first instant >= start using binary search
+            // Find first instant > start using binary search
             let start_pos = timeline
-                .instants
-                .partition_point(|instant| instant.epoch_millis < start.timestamp_millis());
+                .completed_commits
+                .partition_point(|instant| instant.epoch_millis <= start.timestamp_millis());
 
             if let Some(end) = self.end_datetime {
-                // Find first instant >= end using binary search
-                let end_pos = timeline.instants[start_pos..]
-                    .partition_point(|instant| instant.epoch_millis < end.timestamp_millis());
-                &timeline.instants[start_pos..start_pos + end_pos]
+                // Find first instant > end using binary search
+                let end_pos = timeline.completed_commits[start_pos..]
+                    .partition_point(|instant| instant.epoch_millis <= end.timestamp_millis());
+                &timeline.completed_commits[start_pos..start_pos + end_pos]
             } else {
-                &timeline.instants[start_pos..]
+                &timeline.completed_commits[start_pos..]
             }
         } else if let Some(end) = self.end_datetime {
+            // Find first instant > end using binary search
             let end_pos = timeline
-                .instants
-                .partition_point(|instant| instant.epoch_millis < end.timestamp_millis());
-            &timeline.instants[..end_pos]
+                .completed_commits
+                .partition_point(|instant| instant.epoch_millis <= end.timestamp_millis());
+            &timeline.completed_commits[..end_pos]
         } else {
-            &timeline.instants[..]
+            &timeline.completed_commits[..]
         };
 
         Ok(time_pruned_instants
             .iter()
             .filter(|instant| {
-                self.actions.contains(&instant.action) && self.states.contains(&instant.state)
+                if !self.should_include_action(&instant.action) {
+                    return false;
+                }
+                if !self.should_include_state(&instant.state) {
+                    return false;
+                }
+                true
             })
             .cloned()
             .collect())
@@ -170,21 +190,25 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    #[test]
-    fn test_default() {
-        assert_eq!(TimelineSelector::default(), TimelineSelector::empty());
+    fn create_test_selector(
+        actions: &[Action],
+        states: &[State],
+        start_datetime: Option<DateTime<Utc>>,
+        end_datetime: Option<DateTime<Utc>>,
+    ) -> TimelineSelector {
+        TimelineSelector {
+            timezone: "UTC".to_string(),
+            start_datetime,
+            end_datetime,
+            states: states.to_vec(),
+            actions: actions.to_vec(),
+            include_archived: false,
+        }
     }
 
     #[test]
     fn test_try_create_instant() {
-        let selector = TimelineSelector {
-            states: vec![State::Completed],
-            actions: vec![Action::Commit],
-            start_datetime: None,
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
+        let selector = create_test_selector(&[Action::Commit], &[State::Completed], None, None);
         assert!(
             selector.try_create_instant("20240103153030999").is_err(),
             "Should fail to create instant as file name is invalid"
@@ -192,63 +216,39 @@ mod tests {
 
         let instant_file_name = "20240103153030999.commit";
 
-        let selector = TimelineSelector {
-            states: vec![State::Completed],
-            actions: vec![Action::Commit],
-            start_datetime: None,
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
+        let selector = create_test_selector(&[Action::Commit], &[State::Completed], None, None);
         assert!(selector.try_create_instant(instant_file_name).is_ok());
 
-        let selector = TimelineSelector {
-            states: vec![State::Requested],
-            actions: vec![Action::Commit],
-            start_datetime: None,
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
+        let selector = create_test_selector(&[Action::Commit], &[State::Requested], None, None);
         assert!(
             selector.try_create_instant(instant_file_name).is_err(),
             "Should fail to create instant as state is different"
         );
 
-        let selector = TimelineSelector {
-            states: vec![State::Completed],
-            actions: vec![Action::ReplaceCommit],
-            start_datetime: None,
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
+        let selector =
+            create_test_selector(&[Action::ReplaceCommit], &[State::Completed], None, None);
         assert!(
             selector.try_create_instant(instant_file_name).is_err(),
             "Should fail to create instant as action is different"
         );
 
-        let selector = TimelineSelector {
-            states: vec![State::Completed],
-            actions: vec![Action::Commit],
-            start_datetime: Instant::parse_datetime("20240103153031", "UTC").ok(),
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
+        let selector = create_test_selector(
+            &[Action::Commit],
+            &[State::Completed],
+            Instant::parse_datetime("20240103153031", "UTC").ok(),
+            None,
+        );
         assert!(
             selector.try_create_instant(instant_file_name).is_err(),
             "Should fail to create instant as timestamp is before start"
         );
 
-        let selector = TimelineSelector {
-            states: vec![State::Completed],
-            actions: vec![Action::Commit],
-            start_datetime: None,
-            end_datetime: Instant::parse_datetime("20240103153030999", "UTC").ok(),
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
+        let selector = create_test_selector(
+            &[Action::Commit],
+            &[State::Completed],
+            None,
+            Instant::parse_datetime("20240103153030999", "UTC").ok(),
+        );
         assert!(
             selector.try_create_instant(instant_file_name).is_err(),
             "Should fail to create instant as timestamp is at the end timestamp (exclusive)"
@@ -264,7 +264,7 @@ mod tests {
             Instant::try_from("20240103153020999.commit").unwrap(),
             Instant::try_from("20240103153030999.commit").unwrap(),
         ];
-        Timeline::new_from_instants(
+        Timeline::new_from_completed_commits(
             Arc::new(HudiConfigs::new([(
                 HudiTableConfig::BasePath,
                 "file:///tmp/base",
@@ -279,24 +279,11 @@ mod tests {
     #[tokio::test]
     async fn test_select_no_instants() {
         let timeline = create_test_timeline().await;
-        assert_not!(timeline.instants.is_empty());
-
-        let selector = TimelineSelector::empty();
-        assert!(selector.select(&timeline).unwrap().is_empty());
+        assert_not!(timeline.completed_commits.is_empty());
 
         let selector = TimelineSelector {
-            states: vec![],
-            actions: vec![Action::Commit],
-            start_datetime: None,
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
-        assert!(selector.select(&timeline).unwrap().is_empty());
-
-        let selector = TimelineSelector {
-            states: vec![State::Completed],
-            actions: vec![],
+            actions: vec![Action::ReplaceCommit],
+            states: vec![State::Completed, State::Requested],
             start_datetime: None,
             end_datetime: None,
             timezone: "UTC".to_string(),
@@ -335,8 +322,20 @@ mod tests {
             ]
         );
 
-        // starting from the earliest timestamp (inclusive)
+        // starting from the earliest timestamp (exclusive)
         let selector = create_test_active_completed_selector(Some("20240103153000000"), None);
+        let selected = selector.select(&timeline)?;
+        assert_eq!(
+            selected.iter().map(|i| &i.timestamp).collect::<Vec<_>>(),
+            &[
+                "20240103153010999",
+                "20240103153020999",
+                "20240103153030999",
+            ]
+        );
+
+        // ending at the latest timestamp (inclusive)
+        let selector = create_test_active_completed_selector(None, Some("20240103153030999"));
         let selected = selector.select(&timeline)?;
         assert_eq!(
             selected.iter().map(|i| &i.timestamp).collect::<Vec<_>>(),
@@ -344,27 +343,19 @@ mod tests {
                 "20240103153000",
                 "20240103153010999",
                 "20240103153020999",
-                "20240103153030999",
+                "20240103153030999"
             ]
-        );
-
-        // ending until the latest timestamp (exclusive)
-        let selector = create_test_active_completed_selector(None, Some("20240103153030999"));
-        let selected = selector.select(&timeline)?;
-        assert_eq!(
-            selected.iter().map(|i| &i.timestamp).collect::<Vec<_>>(),
-            &["20240103153000", "20240103153010999", "20240103153020999",]
         );
 
         // start and end in the middle
         let selector = create_test_active_completed_selector(
-            Some("20240103153010000"),
-            Some("20240103153030000"),
+            Some("20240103153010999"),
+            Some("20240103153020999"),
         );
         let selected = selector.select(&timeline)?;
         assert_eq!(
             selected.iter().map(|i| &i.timestamp).collect::<Vec<_>>(),
-            &["20240103153010999", "20240103153020999",]
+            &["20240103153020999"]
         );
         Ok(())
     }

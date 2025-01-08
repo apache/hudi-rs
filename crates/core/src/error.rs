@@ -30,6 +30,9 @@ pub enum CoreError {
     #[error("Config error: {0}")]
     Config(#[from] ConfigError),
 
+    #[error("Commit metadata error: {0}")]
+    CommitMetadata(String),
+
     #[error("Data type error: {0}")]
     Schema(String),
 

@@ -241,6 +241,21 @@ impl HudiTable {
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }
+
+    #[pyo3(signature = (start_timestamp, end_timestamp=None))]
+    fn read_incremental_records(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<PyObject> {
+        rt().block_on(
+            self.inner
+                .read_incremental_records(start_timestamp, end_timestamp),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
+    }
 }
 
 fn convert_filters(filters: Option<Vec<(String, String, String)>>) -> PyResult<Vec<Filter>> {

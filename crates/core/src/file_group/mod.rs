@@ -20,6 +20,7 @@
 //!
 //! A set of data/base files + set of log files, that make up a unit for all operations.
 
+pub mod builder;
 pub mod reader;
 
 use crate::error::CoreError;
@@ -66,12 +67,19 @@ impl BaseFile {
     }
 
     /// Construct [BaseFile] with the base file name.
+    ///
+    /// TODO: refactor such that file info size is optional and no one expects it.
     pub fn from_file_name(file_name: &str) -> Result<Self> {
         let (file_group_id, commit_time) = Self::parse_file_name(file_name)?;
+        let info = FileInfo {
+            name: file_name.to_string(),
+            size: 0,
+            uri: "".to_string(),
+        };
         Ok(Self {
             file_group_id,
             commit_time,
-            info: FileInfo::default(),
+            info,
             stats: None,
         })
     }
@@ -99,6 +107,7 @@ pub struct FileSlice {
 }
 
 impl FileSlice {
+    #[cfg(test)]
     pub fn base_file_path(&self) -> &str {
         self.base_file.info.uri.as_str()
     }
@@ -187,8 +196,17 @@ impl FileGroup {
         }
     }
 
-    #[cfg(test)]
-    fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
+    pub fn new_with_base_file_name(
+        id: String,
+        partition_path: Option<String>,
+        file_name: &str,
+    ) -> Result<Self> {
+        let mut file_group = Self::new(id, partition_path);
+        file_group.add_base_file_from_name(file_name)?;
+        Ok(file_group)
+    }
+
+    pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let base_file = BaseFile::from_file_name(file_name)?;
         self.add_base_file(base_file)
     }
