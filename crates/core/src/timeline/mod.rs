@@ -46,16 +46,16 @@ pub struct Timeline {
 
 impl Timeline {
     #[cfg(test)]
-    pub async fn new_from_instants(
+    pub async fn new_from_completed_commits(
         hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,
-        instants: Vec<Instant>,
+        completed_commits: Vec<Instant>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         Ok(Self {
             storage,
             hudi_configs,
-            completed_commits: instants,
+            completed_commits,
         })
     }
 
@@ -65,11 +65,11 @@ impl Timeline {
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         let selector = TimelineSelector::completed_commits(hudi_configs.clone())?;
-        let instants = Self::load_instants(&selector, &storage).await?;
+        let completed_commits = Self::load_instants(&selector, &storage).await?;
         Ok(Self {
             storage,
             hudi_configs,
-            completed_commits: instants,
+            completed_commits,
         })
     }
 
@@ -178,11 +178,11 @@ impl Timeline {
             end_timestamp,
         )?;
         let commits = selector.select(self)?;
-        for instant in commits {
-            let commit_metadata = self.get_commit_metadata(&instant).await?;
+        for commit in commits {
+            let commit_metadata = self.get_commit_metadata(&commit).await?;
             file_groups.extend(build_file_groups(&commit_metadata)?);
 
-            if instant.is_replacecommit() {
+            if commit.is_replacecommit() {
                 replaced_file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
             }
         }

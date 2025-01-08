@@ -190,7 +190,7 @@ class HudiTable:
         """
         ...
     def read_incremental_records(
-        self, start_commit_time: str, end_commit_time: Optional[str]
+        self, start_timestamp: str, end_timestamp: Optional[str]
     ) -> List["pyarrow.RecordBatch"]: ...
 
 def build_hudi_table(

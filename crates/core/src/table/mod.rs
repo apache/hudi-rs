@@ -877,18 +877,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_complex_keygen_hive_style() {
+        async fn test_complex_keygen_hive_style() -> Result<()> {
             let base_url = TestTable::V6ComplexkeygenHivestyle.url();
-            let hudi_table = Table::new(base_url.path()).await.unwrap();
+            let hudi_table = Table::new(base_url.path()).await?;
 
-            let filter_gte_10 = Filter::try_from(("byteField", ">=", "10")).unwrap();
-            let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
-            let filter_ne_100 = Filter::try_from(("shortField", "!=", "100")).unwrap();
-
-            let records = hudi_table
-                .read_snapshot(&[filter_gte_10, filter_lt_20, filter_ne_100])
-                .await
-                .unwrap();
+            let filters = &[
+                Filter::try_from(("byteField", ">=", "10"))?,
+                Filter::try_from(("byteField", "<", "20"))?,
+                Filter::try_from(("shortField", "!=", "100"))?,
+            ];
+            let records = hudi_table.read_snapshot(filters).await?;
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].num_rows(), 2);
 
@@ -915,6 +913,8 @@ mod tests {
                 "a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
             ]);
             assert_eq!(actual_file_names, expected_file_names);
+
+            Ok(())
         }
     }
 

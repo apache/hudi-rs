@@ -105,7 +105,6 @@ mod tests {
 
     mod test_build_file_groups {
         use super::super::*;
-        use crate::file_group::builder::build_file_groups;
         use serde_json::{json, Map, Value};
 
         #[test]
@@ -265,6 +264,17 @@ mod tests {
             assert!(result.is_ok());
             let file_groups = result.unwrap();
             assert_eq!(file_groups.len(), 2);
+
+            let expected_partitions = HashSet::from_iter(vec![
+                "byteField=20/shortField=100",
+                "byteField=10/shortField=300",
+            ]);
+            let actual_partitions = HashSet::<&str>::from_iter(
+                file_groups
+                    .iter()
+                    .map(|fg| fg.partition_path.as_ref().unwrap().as_str()),
+            );
+            assert_eq!(actual_partitions, expected_partitions);
         }
     }
 
@@ -422,10 +432,11 @@ mod tests {
             assert_eq!(file_groups.len(), 3);
 
             let expected_partitions = HashSet::from_iter(vec!["10", "20", "30"]);
-            let actual_partitions: HashSet<&str> = file_groups
-                .iter()
-                .map(|fg| fg.partition_path.as_ref().unwrap().as_str())
-                .collect();
+            let actual_partitions = HashSet::<&str>::from_iter(
+                file_groups
+                    .iter()
+                    .map(|fg| fg.partition_path.as_ref().unwrap().as_str()),
+            );
             assert_eq!(actual_partitions, expected_partitions);
         }
     }

@@ -31,8 +31,8 @@ pub struct TimelineSelector {
     timezone: String,
     start_datetime: Option<DateTime<Utc>>,
     end_datetime: Option<DateTime<Utc>>,
-    states: Option<Vec<State>>,
-    actions: Option<Vec<Action>>,
+    states: Vec<State>,
+    actions: Vec<Action>,
     include_archived: bool,
 }
 
@@ -64,8 +64,8 @@ impl TimelineSelector {
             timezone,
             start_datetime,
             end_datetime,
-            states: Some(vec![State::Completed]),
-            actions: Some(vec![Action::Commit, Action::ReplaceCommit]),
+            states: vec![State::Completed],
+            actions: vec![Action::Commit, Action::ReplaceCommit],
             include_archived: false,
         })
     }
@@ -75,38 +75,39 @@ impl TimelineSelector {
             timezone: Self::get_timezone_from_configs(hudi_configs),
             start_datetime: None,
             end_datetime: None,
-            states: Some(vec![State::Completed]),
-            actions: Some(vec![Action::ReplaceCommit]),
+            states: vec![State::Completed],
+            actions: vec![Action::ReplaceCommit],
             include_archived: false,
         }
+    }
+
+    pub fn should_include_action(&self, action: &Action) -> bool {
+        self.actions.is_empty() || self.actions.contains(action)
+    }
+
+    pub fn should_include_state(&self, state: &State) -> bool {
+        self.states.is_empty() || self.states.contains(state)
     }
 
     pub fn try_create_instant(&self, file_name: &str) -> Result<Instant> {
         let (timestamp, action_suffix) = file_name.split_once('.').ok_or_else(|| {
             CoreError::Timeline(format!(
-                "Instant not created due to invalid file name: {}",
-                file_name
+                "Instant not created due to invalid file name: {file_name}"
             ))
         })?;
 
         let (action, state) = Instant::parse_action_and_state(action_suffix)?;
 
-        if let Some(actions) = &self.actions {
-            if !actions.contains(&action) {
-                return Err(CoreError::Timeline(format!(
-                    "Instant not created for due to unmatched action: {}",
-                    file_name
-                )));
-            }
+        if !self.should_include_action(&action) {
+            return Err(CoreError::Timeline(format!(
+                "Instant not created for due to unmatched action: {file_name}"
+            )));
         }
 
-        if let Some(states) = &self.states {
-            if !states.contains(&state) {
-                return Err(CoreError::Timeline(format!(
-                    "Instant not created for due to unmatched state: {}",
-                    file_name
-                )));
-            }
+        if !self.should_include_state(&state) {
+            return Err(CoreError::Timeline(format!(
+                "Instant not created for due to unmatched state: {file_name}"
+            )));
         }
 
         let dt = Instant::parse_datetime(timestamp, &self.timezone)?;
@@ -167,15 +168,11 @@ impl TimelineSelector {
         Ok(time_pruned_instants
             .iter()
             .filter(|instant| {
-                if let Some(actions) = &self.actions {
-                    if !actions.contains(&instant.action) {
-                        return false;
-                    }
+                if !self.should_include_action(&instant.action) {
+                    return false;
                 }
-                if let Some(states) = &self.states {
-                    if !states.contains(&instant.state) {
-                        return false;
-                    }
+                if !self.should_include_state(&instant.state) {
+                    return false;
                 }
                 true
             })
@@ -203,8 +200,8 @@ mod tests {
             timezone: "UTC".to_string(),
             start_datetime,
             end_datetime,
-            states: Some(states.to_vec()),
-            actions: Some(actions.to_vec()),
+            states: states.to_vec(),
+            actions: actions.to_vec(),
             include_archived: false,
         }
     }
@@ -267,7 +264,7 @@ mod tests {
             Instant::try_from("20240103153020999.commit").unwrap(),
             Instant::try_from("20240103153030999.commit").unwrap(),
         ];
-        Timeline::new_from_instants(
+        Timeline::new_from_completed_commits(
             Arc::new(HudiConfigs::new([(
                 HudiTableConfig::BasePath,
                 "file:///tmp/base",
@@ -285,18 +282,8 @@ mod tests {
         assert_not!(timeline.completed_commits.is_empty());
 
         let selector = TimelineSelector {
-            states: Some(vec![]),
-            actions: Some(vec![Action::Commit]),
-            start_datetime: None,
-            end_datetime: None,
-            timezone: "UTC".to_string(),
-            include_archived: false,
-        };
-        assert!(selector.select(&timeline).unwrap().is_empty());
-
-        let selector = TimelineSelector {
-            states: Some(vec![State::Completed]),
-            actions: Some(vec![]),
+            actions: vec![Action::ReplaceCommit],
+            states: vec![State::Completed, State::Requested],
             start_datetime: None,
             end_datetime: None,
             timezone: "UTC".to_string(),
@@ -310,8 +297,8 @@ mod tests {
         end: Option<&str>,
     ) -> TimelineSelector {
         TimelineSelector {
-            states: Some(vec![State::Completed]),
-            actions: Some(vec![Action::Commit, Action::ReplaceCommit]),
+            states: vec![State::Completed],
+            actions: vec![Action::Commit, Action::ReplaceCommit],
             start_datetime: start.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             end_datetime: end.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             timezone: "UTC".to_string(),
