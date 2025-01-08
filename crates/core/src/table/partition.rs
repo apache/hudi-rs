@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// A partition pruner that filters partitions based on the partition path and its filters.
 #[derive(Debug, Clone)]
 pub struct PartitionPruner {
-    schema: Arc<Schema>,
+    pub schema: Arc<Schema>,
     is_hive_style: bool,
     is_url_encoded: bool,
     and_filters: Vec<SchemableFilter>,
@@ -96,6 +96,80 @@ impl PartitionPruner {
                 None => true, // Include the partition when filtering field does not match any field in the partition
             }
         })
+    }
+
+    pub fn should_include_with_level(&self, partition_path: &str, level: usize) -> bool {
+        let (field, value) = match self.parse_segments_with_level(partition_path, level) {
+            Ok(s) => s,
+            Err(_) => return true,
+        };
+
+        self.and_filters.iter().all(|filter| {
+            if field.eq(filter.field.name()) {
+                match filter.apply_comparsion(&value) {
+                    Ok(scalar) => scalar.value(0),
+                    Err(_) => true,
+                }
+            } else {
+                true
+            }
+        })
+    }
+
+    fn parse_segments_with_level(
+        &self,
+        partition_path: &str,
+        level: usize,
+    ) -> Result<(String, Scalar<ArrayRef>)> {
+        let partition_path = if self.is_url_encoded {
+            percent_encoding::percent_decode(partition_path.as_bytes())
+                .decode_utf8()?
+                .into_owned()
+        } else {
+            partition_path.to_string()
+        };
+
+        if level >= self.schema.fields.len() {
+            return Err(InvalidPartitionPath(format!(
+                "Partition path should have {} part(s) but got {}",
+                self.schema.fields.len(),
+                level
+            )));
+        }
+
+        let parts: Vec<&str> = partition_path.split('/').collect();
+        if level >= parts.len() {
+            return Err(InvalidPartitionPath(format!(
+                "Partition path should have {} part(s) but got {}",
+                parts.len(),
+                level
+            )));
+        }
+
+        let need_part = parts[level];
+
+        let need_field = self.schema.fields.get(level).unwrap();
+
+        let value = if self.is_hive_style {
+            let (name, value) = need_part
+                .split_once('=')
+                .ok_or(InvalidPartitionPath(format!(
+                    "Partition path should be hive-style but got {}",
+                    need_part
+                )))?;
+            if name != need_field.name() {
+                return Err(InvalidPartitionPath(format!(
+                    "Partition path should contain {} but got {}",
+                    need_field.name(),
+                    name
+                )));
+            }
+            value
+        } else {
+            need_part
+        };
+        let scalar = SchemableFilter::cast_value(&[value], need_field.data_type())?;
+        Ok((need_field.name().to_string(), scalar))
     }
 
     fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
