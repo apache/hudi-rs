@@ -118,8 +118,8 @@ impl FileGroupReader {
     }
 
     pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        self.read_file_slice_by_base_file_path(&file_slice.base_file_relative_path())
-            .await
+        let relative_path = file_slice.base_file_relative_path()?;
+        self.read_file_slice_by_base_file_path(&relative_path).await
     }
 }
 

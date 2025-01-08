@@ -17,9 +17,32 @@
  * under the License.
  */
 
-/// File stats that can be retrieved by reading the file's metadata.
-#[derive(Clone, Debug, Default)]
-pub struct FileStats {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileMetadata {
+    /// File name
+    pub name: String,
+
+    /// Size in bytes on storage
+    pub size: usize,
+
+    /// Size in bytes in memory
+    pub byte_size: i64,
+
+    /// Number of records in the file
     pub num_records: i64,
-    pub size_bytes: i64,
+
+    /// Whether all the properties are populated or not
+    pub fully_populated: bool,
+}
+
+impl FileMetadata {
+    pub fn new(name: impl Into<String>, size: usize) -> Self {
+        Self {
+            name: name.into(),
+            size,
+            byte_size: 0,
+            num_records: 0,
+            fully_populated: false,
+        }
+    }
 }

@@ -45,7 +45,7 @@ use datafusion_physical_expr::create_physical_expr;
 use crate::util::expr::exprs_to_filters;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
-use hudi_core::storage::util::{get_scheme_authority, parse_uri};
+use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::Table as HudiTable;
 
 /// Create a `HudiDataSource`.
@@ -181,16 +181,26 @@ impl TableProvider for HudiDataSource {
             .get_file_slices_splits(self.get_input_partitions(), pushdown_filters.as_slice())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
+        let base_url = self.table.base_url().map_err(|e| {
+            Execution(format!(
+                "Failed to get base path config from Hudi table: {e:?}"
+            ))
+        })?;
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {
-            let parquet_file_group_vec = file_slice_vec
-                .iter()
-                .map(|f| {
-                    let url = parse_uri(&f.base_file.info.uri).unwrap();
-                    let size = f.base_file.info.size as u64;
-                    PartitionedFile::new(url.path(), size)
-                })
-                .collect();
+            let mut parquet_file_group_vec = Vec::new();
+            for f in file_slice_vec {
+                let relative_path = f.base_file_relative_path().map_err(|e| {
+                    Execution(format!(
+                        "Failed to get base file relative path for {f:?} due to {e:?}"
+                    ))
+                })?;
+                let url = join_url_segments(&base_url, &[relative_path.as_str()])
+                    .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
+                let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
+                let partitioned_file = PartitionedFile::new(url.path(), size as u64);
+                parquet_file_group_vec.push(partitioned_file);
+            }
             parquet_file_groups.push(parquet_file_group_vec)
         }
 
