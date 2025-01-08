@@ -61,6 +61,7 @@
 //! use url::Url;
 //! use hudi_core::table::Table;
 //! use hudi_core::storage::util::parse_uri;
+//! use hudi_core::storage::util::join_url_segments;
 //!
 //! pub async fn test() {
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
@@ -74,8 +75,8 @@
 //!             let file_group_vec = file_slice_vec
 //!                 .iter()
 //!                 .map(|f| {
-//!                     let url = parse_uri(&f.base_file.info.uri).unwrap();
-//!                     let size = f.base_file.info.size as u64;
+//!                     let relative_path = f.base_file_relative_path().unwrap();
+//!                     let url = join_url_segments(&base_uri, &[relative_path.as_str()]).unwrap();
 //!                     url.path().to_string()
 //!                 })
 //!                 .collect();
@@ -372,8 +373,11 @@ mod tests {
     /// Test helper to get relative file paths from the table with filters.
     async fn get_file_paths_with_filters(table: &Table, filters: &[Filter]) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
+        let base_url = table.base_url()?;
         for f in table.get_file_slices(filters).await? {
-            file_paths.push(f.base_file_path().to_string());
+            let relative_path = f.base_file_relative_path()?;
+            let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
+            file_paths.push(file_url.to_string());
         }
         Ok(file_paths)
     }
@@ -710,7 +714,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path())
+                .map(|f| f.base_file_relative_path().unwrap())
                 .collect::<Vec<_>>(),
             vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
         );
@@ -724,7 +728,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path())
+                .map(|f| f.base_file_relative_path().unwrap())
                 .collect::<Vec<_>>(),
             vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",]
         );
@@ -738,7 +742,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path())
+                .map(|f| f.base_file_relative_path().unwrap())
                 .collect::<Vec<_>>(),
             vec!["a079bdb3-731c-4894-b855-abfcd6921007-0_0-182-253_20240418173550988.parquet",]
         );
@@ -752,7 +756,7 @@ mod tests {
         assert_eq!(
             file_slices
                 .iter()
-                .map(|f| f.base_file_relative_path())
+                .map(|f| f.base_file_relative_path().unwrap())
                 .collect::<Vec<_>>(),
             Vec::<String>::new()
         );

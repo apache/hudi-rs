@@ -21,12 +21,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::HudiConfigs;
-use crate::file_group::{BaseFile, FileGroup, FileSlice};
-use crate::storage::file_info::FileInfo;
+use crate::file_group::base_file::BaseFile;
+use crate::file_group::{FileGroup, FileSlice};
 use crate::storage::{get_leaf_dirs, Storage};
 
 use crate::config::read::HudiReadConfig::ListingParallelism;
 use crate::error::CoreError;
+use crate::storage::file_metadata::FileMetadata;
 use crate::table::partition::PartitionPruner;
 use crate::Result;
 use dashmap::DashMap;
@@ -91,7 +92,7 @@ impl FileSystemView {
         storage: &Storage,
         partition_path: &str,
     ) -> Result<Vec<FileGroup>> {
-        let file_info: Vec<FileInfo> = storage
+        let file_metadata: Vec<FileMetadata> = storage
             .list_files(Some(partition_path))
             .await?
             .into_iter()
@@ -99,8 +100,8 @@ impl FileSystemView {
             .collect();
 
         let mut fg_id_to_base_files: HashMap<String, Vec<BaseFile>> = HashMap::new();
-        for f in file_info {
-            let base_file = BaseFile::from_file_info(f)?;
+        for metadata in file_metadata {
+            let base_file = BaseFile::try_from(metadata)?;
             let fg_id = &base_file.file_group_id;
             fg_id_to_base_files
                 .entry(fg_id.to_owned())
@@ -163,7 +164,7 @@ impl FileSystemView {
                     continue;
                 }
                 if let Some(fsl) = fg.get_file_slice_mut_as_of(timestamp) {
-                    fsl.load_stats(&self.storage).await?;
+                    fsl.load_metadata_if_needed(&self.storage).await?;
                     file_slices.push(fsl.clone());
                 }
             }
@@ -260,7 +261,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.stats.as_ref().unwrap().num_records, 4);
+            assert_eq!(fsl.base_file.file_metadata.as_ref().unwrap().num_records, 4);
         }
     }
 
@@ -289,7 +290,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.stats.as_ref().unwrap().num_records, 1);
+            assert_eq!(fsl.base_file.file_metadata.as_ref().unwrap().num_records, 1);
         }
     }
 
@@ -330,7 +331,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.stats.as_ref().unwrap().num_records, 2);
+            assert_eq!(fsl.base_file.file_metadata.as_ref().unwrap().num_records, 2);
         }
     }
 }

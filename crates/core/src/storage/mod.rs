@@ -38,12 +38,11 @@ use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::storage::error::Result;
 use crate::storage::error::StorageError::{Creation, InvalidPath};
-use crate::storage::file_info::FileInfo;
+use crate::storage::file_metadata::FileMetadata;
 use crate::storage::util::join_url_segments;
 
 pub mod error;
-pub mod file_info;
-pub mod file_stats;
+pub mod file_metadata;
 pub mod util;
 
 #[allow(dead_code)]
@@ -105,22 +104,41 @@ impl Storage {
     }
 
     #[cfg(test)]
-    async fn get_file_info(&self, relative_path: &str) -> Result<FileInfo> {
+    async fn get_file_metadata_not_populated(&self, relative_path: &str) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let meta = self.object_store.head(&obj_path).await?;
-        let uri = obj_url.to_string();
-        let name = obj_path
+        let name = meta.location.filename().ok_or_else(|| {
+            InvalidPath(format!("Failed to get file name from: {:?}", meta.location))
+        })?;
+        Ok(FileMetadata::new(name.to_string(), meta.size))
+    }
+
+    pub async fn get_file_metadata(&self, relative_path: &str) -> Result<FileMetadata> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        let location = obj_meta.location.clone();
+        let file_name = location
             .filename()
-            .ok_or(InvalidPath(format!(
-                "Failed to get file name from {:?}",
-                obj_path
-            )))?
-            .to_string();
-        Ok(FileInfo {
-            uri,
-            name,
-            size: meta.size,
+            .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", &obj_meta)))?;
+        let size = obj_meta.size;
+        let reader = ParquetObjectReader::new(obj_store, obj_meta);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        let parquet_meta = builder.metadata().clone();
+        let num_records = parquet_meta.file_metadata().num_rows();
+        let size_bytes = parquet_meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.total_byte_size())
+            .sum::<i64>();
+        Ok(FileMetadata {
+            name: file_name.to_string(),
+            size,
+            byte_size: size_bytes,
+            num_records,
+            fully_populated: true,
         })
     }
 
@@ -196,33 +214,22 @@ impl Storage {
         Ok(list_res.common_prefixes)
     }
 
-    pub async fn list_files(&self, subdir: Option<&str>) -> Result<Vec<FileInfo>> {
+    pub async fn list_files(&self, subdir: Option<&str>) -> Result<Vec<FileMetadata>> {
         let prefix_url = join_url_segments(&self.base_url, &[subdir.unwrap_or_default()])?;
         let prefix_path = ObjPath::from_url_path(prefix_url.path())?;
         let list_res = self
             .object_store
             .list_with_delimiter(Some(&prefix_path))
             .await?;
-        let mut file_info = Vec::new();
+        let mut file_metadata = Vec::new();
         for obj_meta in list_res.objects {
-            let name = obj_meta
-                .location
+            let location = obj_meta.location;
+            let name = location
                 .filename()
-                .ok_or_else(|| {
-                    InvalidPath(format!(
-                        "Failed to get file name from {:?}",
-                        obj_meta.location
-                    ))
-                })?
-                .to_string();
-            let uri = join_url_segments(&prefix_url, &[&name])?.to_string();
-            file_info.push(FileInfo {
-                uri,
-                name,
-                size: obj_meta.size,
-            });
+                .ok_or_else(|| InvalidPath(format!("Failed to get file name from {location:?}")))?;
+            file_metadata.push(FileMetadata::new(name.to_string(), obj_meta.size));
         }
-        Ok(file_info)
+        Ok(file_metadata)
     }
 }
 
@@ -349,54 +356,27 @@ mod tests {
         )
         .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let file_info_1: Vec<FileInfo> = storage
+        let file_info_1: Vec<FileMetadata> = storage
             .list_files(None)
             .await
             .unwrap()
             .into_iter()
             .collect();
-        assert_eq!(
-            file_info_1,
-            vec![FileInfo {
-                uri: join_url_segments(&storage.base_url, &["a.parquet"])
-                    .unwrap()
-                    .to_string(),
-                name: "a.parquet".to_string(),
-                size: 0,
-            }]
-        );
-        let file_info_2: Vec<FileInfo> = storage
+        assert_eq!(file_info_1, vec![FileMetadata::new("a.parquet", 0)]);
+        let file_info_2: Vec<FileMetadata> = storage
             .list_files(Some("part1"))
             .await
             .unwrap()
             .into_iter()
             .collect();
-        assert_eq!(
-            file_info_2,
-            vec![FileInfo {
-                uri: join_url_segments(&storage.base_url, &["part1/b.parquet"])
-                    .unwrap()
-                    .to_string(),
-                name: "b.parquet".to_string(),
-                size: 0,
-            }]
-        );
-        let file_info_3: Vec<FileInfo> = storage
+        assert_eq!(file_info_2, vec![FileMetadata::new("b.parquet", 0)],);
+        let file_info_3: Vec<FileMetadata> = storage
             .list_files(Some("part2/part22"))
             .await
             .unwrap()
             .into_iter()
             .collect();
-        assert_eq!(
-            file_info_3,
-            vec![FileInfo {
-                uri: join_url_segments(&storage.base_url, &["part2/part22/c.parquet"])
-                    .unwrap()
-                    .to_string(),
-                name: "c.parquet".to_string(),
-                size: 0,
-            }]
-        );
+        assert_eq!(file_info_3, vec![FileMetadata::new("c.parquet", 0)],);
     }
 
     #[tokio::test]
@@ -432,15 +412,12 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let file_info = storage.get_file_info("a.parquet").await.unwrap();
-        assert_eq!(file_info.name, "a.parquet");
-        assert_eq!(
-            file_info.uri,
-            join_url_segments(&storage.base_url, &["a.parquet"])
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(file_info.size, 866);
+        let file_metadata = storage
+            .get_file_metadata_not_populated("a.parquet")
+            .await
+            .unwrap();
+        assert_eq!(file_metadata.name, "a.parquet");
+        assert_eq!(file_metadata.size, 866);
     }
 
     #[tokio::test]
