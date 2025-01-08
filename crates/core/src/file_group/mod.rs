@@ -83,7 +83,8 @@ impl FileSlice {
         &self.base_file.instant_time
     }
 
-    /// Load [FileMetadata] from storage layer for the [BaseFile] if needed.
+    /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
+    /// or if `file_metadata` is not fully populated.
     pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
         if let Some(metadata) = &self.base_file.file_metadata {
             if metadata.fully_populated {

@@ -60,22 +60,22 @@ class HudiFileSlice:
     the partition it belongs to, and associated metadata.
 
     Attributes:
-        file_group_id (str): The ID of the file group this slice belongs to.
+        file_group_id (str): The id of the file group this file slice belongs to.
         partition_path (str): The path of the partition containing this file slice.
-        commit_time (str): The commit time of this file slice.
+        creation_instant_time (str): The creation instant time of this file slice.
         base_file_name (str): The name of the base file.
-        base_file_size (int): The size of the base file.
-        num_records (int): The number of records in the base file.
-        size_bytes (int): The size of the file slice in bytes.
+        base_file_size (int): The on-disk size of the base file in bytes.
+        base_file_byte_size (int): The in-memory size of the base file in bytes.
+        num_records (int): The number of records in the file slice.
     """
 
     file_group_id: str
     partition_path: str
-    commit_time: str
+    creation_instant_time: str
     base_file_name: str
     base_file_size: int
+    base_file_byte_size: int
     num_records: int
-    size_bytes: int
 
     def base_file_relative_path(self) -> str:
         """
