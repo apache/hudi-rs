@@ -60,6 +60,7 @@ impl FileSystemView {
         })
     }
 
+    #[allow(dead_code)]
     async fn list_all_partition_paths(storage: &Storage) -> Result<Vec<String>> {
         Self::list_partition_paths(storage, &PartitionPruner::empty()).await
     }
