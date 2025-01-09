@@ -46,7 +46,7 @@ arrow-ord = { version = "= 53.3.0" }
 arrow-row = { version = "= 53.3.0" }
 arrow-schema = { version = "= 53.3.0", features = ["serde"] }
 arrow-select = { version = "= 53.3.0" }
-object_store = { version = "= 0.11.1", features = ["aws", "azure", "gcp"] }
+object_store = { version = "= 0.11.2", features = ["aws", "azure", "gcp"] }
 parquet = { version = "= 53.3.0", features = ["async", "object_store"] }
 
 # datafusion
@@ -61,19 +61,18 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 
 # "stdlib"
-thiserror = { version = "2.0.3" }
+thiserror = { version = "2.0.10" }
 bytes = { version = "1" }
 chrono = { version = "0.4" }
 log = { version = "0.4" }
 paste = { version = "1.0.15" }
-once_cell = { version = "1.19.0" }
-strum = { version = "0.26.3", features = ["derive"] }
-strum_macros = "0.26.4"
-url = { version = "2" }
+strum = { version = "0.26", features = ["derive"] }
+strum_macros = "0.26"
+url = { version = "2.5" }
 
 # runtime / async
 async-recursion = { version = "1.1.1" }
 async-trait = { version = "0.1" }
-dashmap = { version = "6.0.1" }
+dashmap = { version = "6.1" }
 futures = { version = "0.3" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
