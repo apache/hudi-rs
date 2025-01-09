@@ -27,7 +27,7 @@ pub struct BaseFile {
     pub file_name: String,
 
     /// The id of the enclosing file group.
-    pub file_group_id: String,
+    pub file_id: String,
 
     /// The associated instant time of the base file.
     pub instant_time: String,
@@ -37,14 +37,14 @@ pub struct BaseFile {
 }
 
 impl BaseFile {
-    /// Parse file name and extract `file_group_id` and `instant_time`.
+    /// Parse file name and extract `file_id` and `instant_time`.
     fn parse_file_name(file_name: &str) -> Result<(String, String)> {
         let err_msg = format!("Failed to parse file name '{file_name}' for base file.");
         let (name, _) = file_name
             .rsplit_once('.')
             .ok_or_else(|| CoreError::FileGroup(err_msg.clone()))?;
         let parts: Vec<&str> = name.split('_').collect();
-        let file_group_id = parts
+        let file_id = parts
             .first()
             .ok_or_else(|| CoreError::FileGroup(err_msg.clone()))?
             .to_string();
@@ -52,7 +52,7 @@ impl BaseFile {
             .get(2)
             .ok_or_else(|| CoreError::FileGroup(err_msg.clone()))?
             .to_string();
-        Ok((file_group_id, instant_time))
+        Ok((file_id, instant_time))
     }
 }
 
@@ -60,10 +60,10 @@ impl TryFrom<&str> for BaseFile {
     type Error = CoreError;
 
     fn try_from(file_name: &str) -> Result<Self> {
-        let (file_group_id, instant_time) = Self::parse_file_name(file_name)?;
+        let (file_id, instant_time) = Self::parse_file_name(file_name)?;
         Ok(Self {
             file_name: file_name.to_string(),
-            file_group_id,
+            file_id,
             instant_time,
             file_metadata: None,
         })
@@ -75,10 +75,10 @@ impl TryFrom<FileMetadata> for BaseFile {
 
     fn try_from(metadata: FileMetadata) -> Result<Self> {
         let file_name = metadata.name.clone();
-        let (file_group_id, instant_time) = Self::parse_file_name(&file_name)?;
+        let (file_id, instant_time) = Self::parse_file_name(&file_name)?;
         Ok(Self {
             file_name,
-            file_group_id,
+            file_id,
             instant_time,
             file_metadata: Some(metadata),
         })
@@ -94,10 +94,7 @@ mod tests {
     fn test_create_base_file_from_file_name() {
         let file_name = "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet";
         let base_file = BaseFile::try_from(file_name).unwrap();
-        assert_eq!(
-            base_file.file_group_id,
-            "5a226868-2934-4f84-a16f-55124630c68d-0"
-        );
+        assert_eq!(base_file.file_id, "5a226868-2934-4f84-a16f-55124630c68d-0");
         assert_eq!(base_file.instant_time, "20240402144910683");
         assert!(base_file.file_metadata.is_none());
     }
@@ -109,10 +106,7 @@ mod tests {
             1024,
         );
         let base_file = BaseFile::try_from(metadata).unwrap();
-        assert_eq!(
-            base_file.file_group_id,
-            "5a226868-2934-4f84-a16f-55124630c68d-0"
-        );
+        assert_eq!(base_file.file_id, "5a226868-2934-4f84-a16f-55124630c68d-0");
         assert_eq!(base_file.instant_time, "20240402144910683");
         let file_metadata = base_file.file_metadata.unwrap();
         assert_eq!(file_metadata.size, 1024);

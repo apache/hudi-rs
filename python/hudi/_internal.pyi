@@ -60,7 +60,7 @@ class HudiFileSlice:
     the partition it belongs to, and associated metadata.
 
     Attributes:
-        file_group_id (str): The id of the file group this file slice belongs to.
+        file_id (str): The id of the file group this file slice belongs to.
         partition_path (str): The path of the partition containing this file slice.
         creation_instant_time (str): The creation instant time of this file slice.
         base_file_name (str): The name of the base file.
@@ -69,7 +69,7 @@ class HudiFileSlice:
         num_records (int): The number of records in the file slice.
     """
 
-    file_group_id: str
+    file_id: str
     partition_path: str
     creation_instant_time: str
     base_file_name: str

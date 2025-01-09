@@ -102,7 +102,7 @@ impl FileSystemView {
         let mut fg_id_to_base_files: HashMap<String, Vec<BaseFile>> = HashMap::new();
         for metadata in file_metadata {
             let base_file = BaseFile::try_from(metadata)?;
-            let fg_id = &base_file.file_group_id;
+            let fg_id = &base_file.file_id;
             fg_id_to_base_files
                 .entry(fg_id.to_owned())
                 .or_default()
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(file_slices.len(), 1);
         let fg_ids = file_slices
             .iter()
-            .map(|fsl| fsl.file_group_id())
+            .map(|fsl| fsl.file_id())
             .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"]);
         for fsl in file_slices.iter() {
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(file_slices.len(), 1);
         let fg_ids = file_slices
             .iter()
-            .map(|fsl| fsl.file_group_id())
+            .map(|fsl| fsl.file_id())
             .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
         for fsl in file_slices.iter() {
@@ -327,7 +327,7 @@ mod tests {
 
         let fg_ids = file_slices
             .iter()
-            .map(|fsl| fsl.file_group_id())
+            .map(|fsl| fsl.file_id())
             .collect::<Vec<_>>();
         assert_eq!(fg_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {

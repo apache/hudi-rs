@@ -38,6 +38,9 @@ pub enum StorageError {
     ObjectStorePathError(#[from] object_store::path::Error),
 
     #[error(transparent)]
+    ReaderError(#[from] std::io::Error),
+
+    #[error(transparent)]
     ParquetError(#[from] parquet::errors::ParquetError),
 
     #[error(transparent)]

@@ -22,6 +22,7 @@
 
 pub mod base_file;
 pub mod builder;
+pub mod log_file;
 pub mod reader;
 
 use crate::error::CoreError;
@@ -65,8 +66,8 @@ impl FileSlice {
 
     /// Returns the enclosing [FileGroup]'s id.
     #[inline]
-    pub fn file_group_id(&self) -> &str {
-        &self.base_file.file_group_id
+    pub fn file_id(&self) -> &str {
+        &self.base_file.file_id
     }
 
     /// Returns the partition path of the [FileSlice].
@@ -101,14 +102,14 @@ impl FileSlice {
 /// Hudi File Group.
 #[derive(Clone, Debug)]
 pub struct FileGroup {
-    pub id: String,
+    pub file_id: String,
     pub partition_path: Option<String>,
     pub file_slices: BTreeMap<String, FileSlice>,
 }
 
 impl PartialEq for FileGroup {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.partition_path == other.partition_path
+        self.file_id == other.file_id && self.partition_path == other.partition_path
     }
 }
 
@@ -116,7 +117,7 @@ impl Eq for FileGroup {}
 
 impl Hash for FileGroup {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.file_id.hash(state);
         self.partition_path.hash(state);
     }
 }
@@ -126,7 +127,7 @@ impl fmt::Display for FileGroup {
         f.write_str(
             format!(
                 "File Group: partition {:?} id {}",
-                &self.partition_path, &self.id
+                &self.partition_path, &self.file_id
             )
             .as_str(),
         )
@@ -134,9 +135,9 @@ impl fmt::Display for FileGroup {
 }
 
 impl FileGroup {
-    pub fn new(id: String, partition_path: Option<String>) -> Self {
+    pub fn new(file_id: String, partition_path: Option<String>) -> Self {
         Self {
-            id,
+            file_id,
             partition_path,
             file_slices: BTreeMap::new(),
         }
@@ -162,7 +163,7 @@ impl FileGroup {
         if self.file_slices.contains_key(instant_time) {
             Err(CoreError::FileGroup(format!(
                 "Instant time {instant_time} is already present in File Group {}",
-                self.id
+                self.file_id
             )))
         } else {
             self.file_slices.insert(
@@ -236,7 +237,7 @@ mod tests {
     #[test]
     fn test_file_group_display() {
         let file_group = FileGroup {
-            id: "group123".to_string(),
+            file_id: "group123".to_string(),
             partition_path: Some("part/2023-01-01".to_string()),
             file_slices: BTreeMap::new(),
         };
@@ -249,7 +250,7 @@ mod tests {
         );
 
         let file_group_no_partition = FileGroup {
-            id: "group456".to_string(),
+            file_id: "group456".to_string(),
             partition_path: None,
             file_slices: BTreeMap::new(),
         };
