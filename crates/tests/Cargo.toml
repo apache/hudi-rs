@@ -30,16 +30,7 @@ repository.workspace = true
 [dependencies]
 # arrow
 arrow = { workspace = true }
-arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-ipc = { workspace = true }
-arrow-json = { workspace = true }
-arrow-ord = { workspace = true }
-arrow-row = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
 
 # "stdlib"
 strum = { workspace = true }
@@ -47,5 +38,5 @@ strum_macros = { workspace = true }
 url = { workspace = true }
 
 # testing
-tempfile = "3.10.1"
-zip-extract = "0.2.1"
+tempfile = "3"
+zip-extract = "0.2"
