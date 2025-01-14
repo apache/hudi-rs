@@ -32,7 +32,6 @@ impl StorageReader {
         let get_result = object_store.get(&object_meta.location).await?;
         // TODO change to use stream
         let bytes = get_result.bytes().await?;
-        println!("Bytes length: {}", bytes.len());
         let reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
         Ok(Self { reader })
     }
