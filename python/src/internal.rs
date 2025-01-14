@@ -90,7 +90,7 @@ impl HudiFileGroupReader {
 #[pyclass]
 pub struct HudiFileSlice {
     #[pyo3(get)]
-    file_group_id: String,
+    file_id: String,
     #[pyo3(get)]
     partition_path: String,
     #[pyo3(get)]
@@ -125,7 +125,7 @@ impl HudiFileSlice {
 
 #[cfg(not(tarpaulin))]
 fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
-    let file_group_id = f.file_group_id().to_string();
+    let file_id = f.file_id().to_string();
     let partition_path = f.partition_path().to_string();
     let creation_instant_time = f.creation_instant_time().to_string();
     let base_file_name = f.base_file.file_name.clone();
@@ -134,7 +134,7 @@ fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
     let base_file_byte_size = file_metadata.byte_size;
     let num_records = file_metadata.num_records;
     HudiFileSlice {
-        file_group_id,
+        file_id,
         partition_path,
         creation_instant_time,
         base_file_name,

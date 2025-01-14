@@ -41,7 +41,7 @@ pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet
         let partition = (!partition.is_empty()).then(|| partition.to_string());
 
         for stat in write_stats {
-            let file_group_id = stat
+            let file_id = stat
                 .get("fileId")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| CoreError::CommitMetadata("Invalid fileId in write stats".into()))?;
@@ -57,7 +57,7 @@ pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet
                 .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?;
 
             let file_group = FileGroup::new_with_base_file_name(
-                file_group_id.to_string(),
+                file_id.to_string(),
                 partition.clone(),
                 file_name,
             )?;
@@ -80,15 +80,15 @@ pub fn build_replaced_file_groups(
 
     let mut file_groups = HashSet::new();
 
-    for (partition, file_group_ids_value) in partition_to_replaced {
-        let file_group_ids = file_group_ids_value
+    for (partition, file_ids_value) in partition_to_replaced {
+        let file_ids = file_ids_value
             .as_array()
             .ok_or_else(|| CoreError::CommitMetadata("Invalid file group ids array".into()))?;
 
         let partition = (!partition.is_empty()).then(|| partition.to_string());
 
-        for file_group_id in file_group_ids {
-            let id = file_group_id
+        for file_id in file_ids {
+            let id = file_id
                 .as_str()
                 .ok_or_else(|| CoreError::CommitMetadata("Invalid file group id string".into()))?;
 
@@ -300,7 +300,7 @@ mod tests {
         }
 
         #[test]
-        fn test_invalid_file_group_ids_array() {
+        fn test_invalid_file_ids_array() {
             let metadata: Map<String, Value> = json!({
                 "partitionToReplaceFileIds": {
                     "20": "not_an_array"
@@ -318,7 +318,7 @@ mod tests {
         }
 
         #[test]
-        fn test_invalid_file_group_id_type() {
+        fn test_invalid_file_id_type() {
             let metadata: Map<String, Value> = json!({
                 "partitionToReplaceFileIds": {
                     "20": [123] // number instead of string

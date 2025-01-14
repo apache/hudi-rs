@@ -43,10 +43,19 @@ pub enum CoreError {
     ReadFileSliceError(String),
 
     #[error("{0}")]
+    LogFormatError(String),
+
+    #[error("{0}")]
+    LogBlockError(String),
+
+    #[error("{0}")]
     InvalidPartitionPath(String),
 
     #[error(transparent)]
     ParquetError(#[from] parquet::errors::ParquetError),
+
+    #[error("{0}")]
+    ReadLogFileError(#[from] std::io::Error),
 
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),

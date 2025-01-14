@@ -36,13 +36,15 @@ use url::Url;
 
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
-use crate::storage::error::Result;
 use crate::storage::error::StorageError::{Creation, InvalidPath};
+use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
+use crate::storage::reader::StorageReader;
 use crate::storage::util::join_url_segments;
 
 pub mod error;
 pub mod file_metadata;
+pub mod reader;
 pub mod util;
 
 #[allow(dead_code)]
@@ -189,6 +191,16 @@ impl Storage {
         }
 
         Ok(concat_batches(&schema, &batches)?)
+    }
+
+    pub async fn get_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        StorageReader::new(obj_store, obj_meta)
+            .await
+            .map_err(StorageError::ReaderError)
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
