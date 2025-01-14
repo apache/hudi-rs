@@ -81,3 +81,100 @@ impl LogFormatVersion {
         matches!(self, LogFormatVersion::V1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_format_version_from_bytes() {
+        // Test valid versions
+        assert_eq!(
+            LogFormatVersion::try_from([0, 0, 0, 0]).unwrap(),
+            LogFormatVersion::V0
+        );
+        assert_eq!(
+            LogFormatVersion::try_from([0, 0, 0, 1]).unwrap(),
+            LogFormatVersion::V1
+        );
+        assert_eq!(
+            LogFormatVersion::try_from([0, 0, 0, 2]).unwrap(),
+            LogFormatVersion::V2
+        );
+        assert_eq!(
+            LogFormatVersion::try_from([0, 0, 0, 3]).unwrap(),
+            LogFormatVersion::V3
+        );
+
+        // Test invalid version
+        let err = LogFormatVersion::try_from([0, 0, 0, 4]).unwrap_err();
+        assert!(matches!(err, CoreError::LogFormatError(_)));
+        assert!(err.to_string().contains("Invalid log format version: 4"));
+    }
+
+    #[test]
+    fn test_log_format_version_from_u32() {
+        // Test valid versions
+        assert_eq!(
+            LogFormatVersion::try_from(0u32).unwrap(),
+            LogFormatVersion::V0
+        );
+        assert_eq!(
+            LogFormatVersion::try_from(1u32).unwrap(),
+            LogFormatVersion::V1
+        );
+        assert_eq!(
+            LogFormatVersion::try_from(2u32).unwrap(),
+            LogFormatVersion::V2
+        );
+        assert_eq!(
+            LogFormatVersion::try_from(3u32).unwrap(),
+            LogFormatVersion::V3
+        );
+
+        // Test invalid version
+        let err = LogFormatVersion::try_from(4u32).unwrap_err();
+        assert!(matches!(err, CoreError::LogFormatError(_)));
+        assert!(err.to_string().contains("Invalid log format version: 4"));
+    }
+
+    #[test]
+    fn test_version_feature_flags_v0() {
+        let version = LogFormatVersion::V0;
+        assert!(!version.has_block_type());
+        assert!(!version.has_header());
+        assert!(!version.has_content_length());
+        assert!(!version.has_footer());
+        assert!(!version.has_total_log_block_length());
+    }
+
+    #[test]
+    fn test_version_feature_flags_v1() {
+        let version = LogFormatVersion::V1;
+        assert!(version.has_block_type());
+        assert!(version.has_header());
+        assert!(version.has_content_length());
+        assert!(version.has_footer());
+        assert!(version.has_total_log_block_length());
+    }
+
+    #[test]
+    fn test_version_feature_flags_v2() {
+        let version = LogFormatVersion::V2;
+        assert!(version.has_block_type());
+        assert!(version.has_header());
+        assert!(version.has_content_length());
+        assert!(!version.has_footer());
+        assert!(!version.has_total_log_block_length());
+    }
+
+    #[test]
+    fn test_version_feature_flags_v3() {
+        let version = LogFormatVersion::V3;
+        assert!(version.has_block_type());
+        assert!(version.has_header());
+        assert!(version.has_content_length());
+        assert!(!version.has_footer());
+        assert!(!version.has_total_log_block_length());
+    }
+}

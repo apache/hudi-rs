@@ -236,18 +236,6 @@ impl<R: Read + Seek> LogFileReader<R> {
     }
 }
 
-impl<R: Read + Seek> Iterator for LogFileReader<R> {
-    type Item = Result<LogBlock>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.read_next_block() {
-            Ok(Some(block)) => Some(Ok(block)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
