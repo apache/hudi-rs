@@ -56,7 +56,7 @@ impl FileSlice {
 
     /// Returns the relative path of the base file.
     pub fn base_file_relative_path(&self) -> Result<String> {
-        let file_name = &self.base_file.file_name;
+        let file_name = &self.base_file.file_name();
         let path = PathBuf::from(self.partition_path()).join(file_name);
         path.to_str().map(|s| s.to_string()).ok_or_else(|| {
             CoreError::FileGroup(format!(
@@ -83,7 +83,7 @@ impl FileSlice {
     /// This is also an instant time stored in the [Timeline].
     #[inline]
     pub fn creation_instant_time(&self) -> &str {
-        &self.base_file.instant_time
+        &self.base_file.commit_timestamp
     }
 
     /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
@@ -161,15 +161,15 @@ impl FileGroup {
     }
 
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
-        let instant_time = base_file.instant_time.as_str();
-        if self.file_slices.contains_key(instant_time) {
+        let commit_timestamp = base_file.commit_timestamp.as_str();
+        if self.file_slices.contains_key(commit_timestamp) {
             Err(CoreError::FileGroup(format!(
-                "Instant time {instant_time} is already present in File Group {}",
+                "Instant time {commit_timestamp} is already present in File Group {}",
                 self.file_id
             )))
         } else {
             self.file_slices.insert(
-                instant_time.to_owned(),
+                commit_timestamp.to_owned(),
                 FileSlice::new(base_file, self.partition_path.clone()),
             );
             Ok(self)
@@ -195,13 +195,13 @@ impl FileGroup {
     ///
     /// TODO: support adding log files to file group without base files.
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
-        let instant_time = log_file.base_commit_timestamp.as_str();
-        if let Some(file_slice) = self.file_slices.get_mut(instant_time) {
+        let commit_timestamp = log_file.base_commit_timestamp.as_str();
+        if let Some(file_slice) = self.file_slices.get_mut(commit_timestamp) {
             file_slice.log_files.insert(log_file);
             Ok(self)
         } else {
             Err(CoreError::FileGroup(format!(
-                "Instant time {instant_time} not found in File Group {}",
+                "Instant time {commit_timestamp} not found in File Group {}",
                 self.file_id
             )))
         }
@@ -257,7 +257,7 @@ mod tests {
             fg.get_file_slice_as_of("20240402123035233")
                 .unwrap()
                 .base_file
-                .instant_time,
+                .commit_timestamp,
             "20240402123035233"
         );
         assert!(fg.get_file_slice_as_of("-1").is_none());

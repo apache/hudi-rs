@@ -39,7 +39,7 @@ pub struct LogFile {
 const LOG_FILE_PREFIX: char = '.';
 
 impl LogFile {
-    /// Parse a log file name into parts.
+    /// Parse a log file's name into parts.
     ///
     /// File name format:
     ///
