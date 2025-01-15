@@ -111,6 +111,8 @@ impl FileSystemView {
 
             let base_file_extension = format!(".{}", base_file_format);
             if file_metadata.name.ends_with(&base_file_extension) {
+                // After excluding the unintended files,
+                // we expect a file that has the base file extension to be a valid base file.
                 let base_file = BaseFile::try_from(file_metadata)?;
                 let file_id = &base_file.file_id;
                 file_id_to_base_files
@@ -127,6 +129,10 @@ impl FileSystemView {
                             .push(log_file);
                     }
                     Err(e) => {
+                        // We don't support cdc log files yet, hence skipping error when parsing
+                        // fails. However, once we support all data files, we should return error
+                        // here because we expect all files to be either base files or log files,
+                        // after excluding the unintended files.
                         log::warn!("Failed to create a log file: {}", e);
                         continue;
                     }
