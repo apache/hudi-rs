@@ -21,7 +21,7 @@ use crate::config::util::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
-use crate::file_group::FileSlice;
+use crate::file_group::file_slice::FileSlice;
 use crate::storage::Storage;
 use crate::Result;
 use arrow::compute::and;

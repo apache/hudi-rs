@@ -27,8 +27,8 @@ use tokio::runtime::Runtime;
 
 use hudi::error::CoreError;
 use hudi::expr::filter::Filter;
+use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
-use hudi::file_group::FileSlice;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;

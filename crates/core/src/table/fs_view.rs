@@ -22,12 +22,13 @@ use std::sync::Arc;
 
 use crate::config::HudiConfigs;
 use crate::file_group::base_file::BaseFile;
-use crate::file_group::{FileGroup, FileSlice};
+use crate::file_group::FileGroup;
 use crate::storage::{get_leaf_dirs, Storage};
 
 use crate::config::read::HudiReadConfig::ListingParallelism;
 use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::error::CoreError;
+use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::LogFile;
 use crate::table::partition::{PartitionPruner, PARTITION_METAFIELD_PREFIX};
 use crate::Result;

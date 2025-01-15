@@ -22,84 +22,20 @@
 
 pub mod base_file;
 pub mod builder;
+pub mod file_slice;
 pub mod log_file;
 pub mod reader;
 
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::storage::Storage;
 use crate::Result;
-use std::collections::{BTreeMap, BTreeSet};
+use file_slice::FileSlice;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::str::FromStr;
-
-/// Within a [FileGroup], a [FileSlice] is a logical group of [BaseFile] and [LogFile]s.
-#[derive(Clone, Debug)]
-pub struct FileSlice {
-    pub base_file: BaseFile,
-    pub log_files: BTreeSet<LogFile>,
-    pub partition_path: Option<String>,
-}
-
-impl FileSlice {
-    pub fn new(base_file: BaseFile, partition_path: Option<String>) -> Self {
-        Self {
-            base_file,
-            log_files: BTreeSet::new(),
-            partition_path,
-        }
-    }
-
-    /// Returns the relative path of the base file.
-    pub fn base_file_relative_path(&self) -> Result<String> {
-        let file_name = &self.base_file.file_name();
-        let path = PathBuf::from(self.partition_path()).join(file_name);
-        path.to_str().map(|s| s.to_string()).ok_or_else(|| {
-            CoreError::FileGroup(format!(
-                "Failed to get base file relative path for file slice: {:?}",
-                self
-            ))
-        })
-    }
-
-    /// Returns the enclosing [FileGroup]'s id.
-    #[inline]
-    pub fn file_id(&self) -> &str {
-        &self.base_file.file_id
-    }
-
-    /// Returns the partition path of the [FileSlice].
-    #[inline]
-    pub fn partition_path(&self) -> &str {
-        self.partition_path.as_deref().unwrap_or_default()
-    }
-
-    /// Returns the instant time that marks the [FileSlice] creation.
-    ///
-    /// This is also an instant time stored in the [Timeline].
-    #[inline]
-    pub fn creation_instant_time(&self) -> &str {
-        &self.base_file.commit_timestamp
-    }
-
-    /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
-    /// or if `file_metadata` is not fully populated.
-    pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
-        if let Some(metadata) = &self.base_file.file_metadata {
-            if metadata.fully_populated {
-                return Ok(());
-            }
-        }
-        let relative_path = self.base_file_relative_path()?;
-        let fetched_metadata = storage.get_file_metadata(&relative_path).await?;
-        self.base_file.file_metadata = Some(fetched_metadata);
-        Ok(())
-    }
-}
 
 /// Hudi File Group.
 #[derive(Clone, Debug)]
