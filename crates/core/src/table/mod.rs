@@ -90,8 +90,8 @@ mod fs_view;
 pub mod partition;
 
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
-use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
+use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::expr::filter::{Filter, FilterField};
@@ -106,6 +106,7 @@ use crate::Result;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
@@ -163,6 +164,16 @@ impl Table {
         self.file_system_view
             .storage
             .register_object_store(runtime_env.clone());
+    }
+
+    pub fn get_table_type(&self) -> TableTypeValue {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
+        let table_type = self
+            .hudi_configs
+            .get(HudiTableConfig::TableType)
+            .expect(&err_msg)
+            .to::<String>();
+        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
     }
 
     /// Get the latest [Schema] of the table.
@@ -278,10 +289,11 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
+        let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, false)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
         )
         .await?;
         Ok(batches)
