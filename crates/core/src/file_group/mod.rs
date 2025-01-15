@@ -176,7 +176,10 @@ impl FileGroup {
         }
     }
 
-    pub fn add_base_files(&mut self, base_files: Vec<BaseFile>) -> Result<&Self> {
+    pub fn add_base_files<I>(&mut self, base_files: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = BaseFile>,
+    {
         for base_file in base_files {
             self.add_base_file(base_file)?;
         }
@@ -204,7 +207,10 @@ impl FileGroup {
         }
     }
 
-    pub fn add_log_files(&mut self, log_files: Vec<LogFile>) -> Result<&Self> {
+    pub fn add_log_files<I>(&mut self, log_files: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = LogFile>,
+    {
         for log_file in log_files {
             self.add_log_file(log_file)?;
         }
