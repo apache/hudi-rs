@@ -27,20 +27,21 @@ pub mod reader;
 
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
+use crate::file_group::log_file::LogFile;
 use crate::storage::Storage;
 use crate::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::str::FromStr;
 
-/// Within a [FileGroup], a [FileSlice] is a logical group of [BaseFile] and log files.
-///
-/// [note] The log files are not yet supported.
+/// Within a [FileGroup], a [FileSlice] is a logical group of [BaseFile] and [LogFile]s.
 #[derive(Clone, Debug)]
 pub struct FileSlice {
     pub base_file: BaseFile,
+    pub log_files: BTreeSet<LogFile>,
     pub partition_path: Option<String>,
 }
 
@@ -48,6 +49,7 @@ impl FileSlice {
     pub fn new(base_file: BaseFile, partition_path: Option<String>) -> Self {
         Self {
             base_file,
+            log_files: BTreeSet::new(),
             partition_path,
         }
     }
@@ -154,7 +156,7 @@ impl FileGroup {
     }
 
     pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
-        let base_file = BaseFile::try_from(file_name)?;
+        let base_file = BaseFile::from_str(file_name)?;
         self.add_base_file(base_file)
     }
 
@@ -172,6 +174,41 @@ impl FileGroup {
             );
             Ok(self)
         }
+    }
+
+    pub fn add_base_files(&mut self, base_files: Vec<BaseFile>) -> Result<&Self> {
+        for base_file in base_files {
+            self.add_base_file(base_file)?;
+        }
+        Ok(self)
+    }
+
+    pub fn add_log_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
+        let log_file = LogFile::from_str(file_name)?;
+        self.add_log_file(log_file)
+    }
+
+    /// Add a [LogFile] to the [FileGroup].
+    ///
+    /// TODO: support adding log files to file group without base files.
+    pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
+        let instant_time = log_file.base_commit_timestamp.as_str();
+        if let Some(file_slice) = self.file_slices.get_mut(instant_time) {
+            file_slice.log_files.insert(log_file);
+            Ok(self)
+        } else {
+            Err(CoreError::FileGroup(format!(
+                "Instant time {instant_time} not found in File Group {}",
+                self.file_id
+            )))
+        }
+    }
+
+    pub fn add_log_files(&mut self, log_files: Vec<LogFile>) -> Result<&Self> {
+        for log_file in log_files {
+            self.add_log_file(log_file)?;
+        }
+        Ok(self)
     }
 
     pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {

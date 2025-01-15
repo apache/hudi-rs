@@ -146,6 +146,9 @@ impl ConfigParser for HudiTableConfig {
 
     fn default_value(&self) -> Option<Self::Output> {
         match self {
+            Self::BaseFileFormat => Some(HudiConfigValue::String(
+                BaseFileFormatValue::Parquet.as_ref().to_string(),
+            )),
             Self::DatabaseName => Some(HudiConfigValue::String("default".to_string())),
             Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
             Self::PartitionFields => Some(HudiConfigValue::List(vec![])),

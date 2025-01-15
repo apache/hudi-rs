@@ -566,7 +566,10 @@ mod tests {
     async fn get_default_for_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid").await;
         let configs = table.hudi_configs;
-        assert!(panic::catch_unwind(|| configs.get_or_default(BaseFileFormat)).is_err());
+        assert_eq!(
+            configs.get_or_default(BaseFileFormat).to::<String>(),
+            "parquet"
+        );
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
         assert_eq!(
             configs.get_or_default(DatabaseName).to::<String>(),

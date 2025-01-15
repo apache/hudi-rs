@@ -188,6 +188,7 @@ mod tests {
     use crate::config::HudiConfigs;
     use hudi_tests::assert_not;
     use std::collections::HashMap;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     fn create_test_selector(
@@ -257,12 +258,12 @@ mod tests {
 
     async fn create_test_timeline() -> Timeline {
         let instants = vec![
-            Instant::try_from("20240103153000.commit").unwrap(),
-            Instant::try_from("20240103153010999.commit").unwrap(),
-            Instant::try_from("20240103153020999.commit.requested").unwrap(),
-            Instant::try_from("20240103153020999.inflight").unwrap(),
-            Instant::try_from("20240103153020999.commit").unwrap(),
-            Instant::try_from("20240103153030999.commit").unwrap(),
+            Instant::from_str("20240103153000.commit").unwrap(),
+            Instant::from_str("20240103153010999.commit").unwrap(),
+            Instant::from_str("20240103153020999.commit.requested").unwrap(),
+            Instant::from_str("20240103153020999.inflight").unwrap(),
+            Instant::from_str("20240103153020999.commit").unwrap(),
+            Instant::from_str("20240103153030999.commit").unwrap(),
         ];
         Timeline::new_from_completed_commits(
             Arc::new(HudiConfigs::new([(

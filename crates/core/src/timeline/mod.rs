@@ -200,6 +200,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::canonicalize;
     use std::path::Path;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     use url::Url;
@@ -247,8 +248,8 @@ mod tests {
         assert_eq!(
             timeline.completed_commits,
             vec![
-                Instant::try_from("20240402123035233.commit").unwrap(),
-                Instant::try_from("20240402144910683.commit").unwrap(),
+                Instant::from_str("20240402123035233.commit").unwrap(),
+                Instant::from_str("20240402144910683.commit").unwrap(),
             ]
         )
     }
@@ -263,7 +264,7 @@ mod tests {
         )
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
-        let instant = Instant::try_from("20240402123035233.commit").unwrap();
+        let instant = Instant::from_str("20240402123035233.commit").unwrap();
 
         // Test error when reading empty commit metadata file
         let result = timeline.get_commit_metadata(&instant).await;
@@ -272,7 +273,7 @@ mod tests {
         assert!(matches!(err, CoreError::Timeline(_)));
         assert!(err.to_string().contains("Failed to get commit metadata"));
 
-        let instant = Instant::try_from("20240402144910683.commit").unwrap();
+        let instant = Instant::from_str("20240402144910683.commit").unwrap();
 
         // Test error when reading a commit metadata file with invalid JSON
         let result = timeline.get_commit_metadata(&instant).await;

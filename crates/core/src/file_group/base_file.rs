@@ -19,6 +19,7 @@
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::Result;
+use std::str::FromStr;
 
 /// Hudi Base file, part of a [FileSlice].
 #[derive(Clone, Debug)]
@@ -56,10 +57,10 @@ impl BaseFile {
     }
 }
 
-impl TryFrom<&str> for BaseFile {
-    type Error = CoreError;
+impl FromStr for BaseFile {
+    type Err = CoreError;
 
-    fn try_from(file_name: &str) -> Result<Self> {
+    fn from_str(file_name: &str) -> Result<Self, Self::Err> {
         let (file_id, instant_time) = Self::parse_file_name(file_name)?;
         Ok(Self {
             file_name: file_name.to_string(),
@@ -74,10 +75,10 @@ impl TryFrom<FileMetadata> for BaseFile {
     type Error = CoreError;
 
     fn try_from(metadata: FileMetadata) -> Result<Self> {
-        let file_name = metadata.name.clone();
-        let (file_id, instant_time) = Self::parse_file_name(&file_name)?;
+        let file_name = metadata.name.as_str();
+        let (file_id, instant_time) = Self::parse_file_name(file_name)?;
         Ok(Self {
-            file_name,
+            file_name: file_name.to_string(),
             file_id,
             instant_time,
             file_metadata: Some(metadata),
@@ -93,7 +94,7 @@ mod tests {
     #[test]
     fn test_create_base_file_from_file_name() {
         let file_name = "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet";
-        let base_file = BaseFile::try_from(file_name).unwrap();
+        let base_file = BaseFile::from_str(file_name).unwrap();
         assert_eq!(base_file.file_id, "5a226868-2934-4f84-a16f-55124630c68d-0");
         assert_eq!(base_file.instant_time, "20240402144910683");
         assert!(base_file.file_metadata.is_none());
@@ -115,10 +116,10 @@ mod tests {
 
     #[test]
     fn create_a_base_file_returns_error() {
-        let result = BaseFile::try_from("no_file_extension");
+        let result = BaseFile::from_str("no_file_extension");
         assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
 
-        let result = BaseFile::try_from(".parquet");
+        let result = BaseFile::from_str(".parquet");
         assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
 
         let metadata = FileMetadata::new("no-valid-delimiter.parquet", 1024);
