@@ -39,6 +39,15 @@ pub struct LogFile {
 const LOG_FILE_PREFIX: char = '.';
 
 impl LogFile {
+
+    /// Parse a log file name into parts.
+    ///
+    /// File name format:
+    ///
+    /// ```text
+    /// .[File Id]_[Base Commit Timestamp].[Log File Extension].[Log File Version]_[File Write Token]
+    /// ```
+    /// TODO support `.cdc` suffix
     fn parse_file_name(file_name: &str) -> Result<(String, String, String, String, String)> {
         let err_msg = format!("Failed to parse file name '{file_name}' for log file.");
 
@@ -83,15 +92,6 @@ impl LogFile {
         ))
     }
 
-    /// Returns the file name of the log file.
-    ///
-    /// File name format:
-    ///
-    /// ```text
-    /// .[File Id]_[Base Commit Timestamp].[Log File Extension].[Log File Version]_[File Write Token]
-    /// ```
-    ///
-    /// TODO support `.cdc` suffix
     #[inline]
     pub fn file_name(&self) -> String {
         format!(
