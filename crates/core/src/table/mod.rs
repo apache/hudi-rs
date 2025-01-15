@@ -330,10 +330,11 @@ impl Table {
             FilterField::new("_hoodie_commit_time").lte(as_of_timestamp),
         ];
         let fg_reader = self.create_file_group_reader_with_filters(filters).await?;
+        let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, false)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
         )
         .await?;
         Ok(batches)
