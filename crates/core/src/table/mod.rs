@@ -278,9 +278,12 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
-        let batches =
-            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
-                .await?;
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, false)),
+        )
+        .await?;
         Ok(batches)
     }
 
@@ -315,9 +318,12 @@ impl Table {
             FilterField::new("_hoodie_commit_time").lte(as_of_timestamp),
         ];
         let fg_reader = self.create_file_group_reader_with_filters(filters).await?;
-        let batches =
-            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
-                .await?;
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, false)),
+        )
+        .await?;
         Ok(batches)
     }
 

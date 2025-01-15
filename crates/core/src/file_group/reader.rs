@@ -30,7 +30,9 @@ use arrow_schema::Schema;
 use futures::TryFutureExt;
 use std::sync::Arc;
 
+use crate::file_group::log_file::reader::LogFileReader;
 use arrow::compute::filter_record_batch;
+use arrow_select::concat::concat_batches;
 
 /// File group reader handles all read operations against a file group.
 #[derive(Clone, Debug)]
@@ -117,9 +119,33 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
     }
 
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+    pub async fn read_file_slice(
+        &self,
+        file_slice: &FileSlice,
+        base_file_only: bool,
+    ) -> Result<RecordBatch> {
         let relative_path = file_slice.base_file_relative_path()?;
-        self.read_file_slice_by_base_file_path(&relative_path).await
+        if base_file_only {
+            // TODO caller to support read optimized queries
+            self.read_file_slice_by_base_file_path(&relative_path).await
+        } else {
+            let mut log_file_records_unmerged: Vec<RecordBatch> = Vec::new();
+            for log_file in &file_slice.log_files {
+                let relative_path = file_slice.log_file_relative_path(log_file)?;
+                let storage = self.storage.clone();
+                let mut log_file_reader = LogFileReader::new(storage, &relative_path).await?;
+                let batches = log_file_reader.read_all_records_unmerged()?;
+                log_file_records_unmerged.extend_from_slice(&batches);
+            }
+            let base_file_records = self
+                .read_file_slice_by_base_file_path(&relative_path)
+                .await?;
+            let schema = base_file_records.schema();
+            let mut all_records = vec![base_file_records];
+            all_records.extend_from_slice(&log_file_records_unmerged);
+            // TODO perform merge
+            Ok(concat_batches(&schema, &all_records)?)
+        }
     }
 }
 

@@ -129,6 +129,7 @@ impl TryFrom<[u8; 4]> for BlockMetadataKey {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LogBlock {
     pub format_version: LogFormatVersion,

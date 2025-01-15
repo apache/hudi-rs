@@ -16,11 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::error;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
 use crate::storage::Storage;
+use crate::Result;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -42,16 +42,23 @@ impl FileSlice {
         }
     }
 
-    /// Returns the relative path of the base file.
-    pub fn base_file_relative_path(&self) -> error::Result<String> {
-        let file_name = &self.base_file.file_name();
+    fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
         let path = PathBuf::from(self.partition_path()).join(file_name);
         path.to_str().map(|s| s.to_string()).ok_or_else(|| {
-            CoreError::FileGroup(format!(
-                "Failed to get base file relative path for file slice: {:?}",
-                self
-            ))
+            CoreError::FileGroup(format!("Failed to get relative path for file: {file_name}",))
         })
+    }
+
+    /// Returns the relative path of the [BaseFile] in the [FileSlice].
+    pub fn base_file_relative_path(&self) -> Result<String> {
+        let file_name = &self.base_file.file_name();
+        self.relative_path_for_file(file_name)
+    }
+
+    /// Returns the relative path of the given [LogFile] in the [FileSlice].
+    pub fn log_file_relative_path(&self, log_file: &LogFile) -> Result<String> {
+        let file_name = &log_file.file_name();
+        self.relative_path_for_file(file_name)
     }
 
     /// Returns the enclosing [FileGroup]'s id.
@@ -76,7 +83,7 @@ impl FileSlice {
 
     /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
     /// or if `file_metadata` is not fully populated.
-    pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> error::Result<()> {
+    pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
         if let Some(metadata) = &self.base_file.file_metadata {
             if metadata.fully_populated {
                 return Ok(());

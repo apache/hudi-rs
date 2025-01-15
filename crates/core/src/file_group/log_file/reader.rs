@@ -25,6 +25,7 @@ use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
 use crate::storage::reader::StorageReader;
 use crate::storage::Storage;
 use crate::Result;
+use arrow_array::RecordBatch;
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek};
@@ -50,12 +51,21 @@ impl LogFileReader<StorageReader> {
         })
     }
 
-    pub fn read_all_blocks(mut self) -> Result<Vec<LogBlock>> {
+    fn read_all_blocks(&mut self) -> Result<Vec<LogBlock>> {
         let mut blocks = Vec::new();
         while let Some(block) = self.read_next_block()? {
             blocks.push(block);
         }
         Ok(blocks)
+    }
+
+    pub fn read_all_records_unmerged(&mut self) -> Result<Vec<RecordBatch>> {
+        let all_blocks = self.read_all_blocks()?;
+        let mut batches = Vec::new();
+        for block in all_blocks {
+            batches.extend_from_slice(&block.record_batches);
+        }
+        Ok(batches)
     }
 }
 
@@ -256,7 +266,7 @@ mod tests {
         let (dir, file_name) = get_sample_log_file();
         let dir_url = Url::from_directory_path(dir).unwrap();
         let storage = Storage::new_with_base_url(dir_url).unwrap();
-        let reader = LogFileReader::new(storage, &file_name).await.unwrap();
+        let mut reader = LogFileReader::new(storage, &file_name).await.unwrap();
         let blocks = reader.read_all_blocks().unwrap();
         assert_eq!(blocks.len(), 1);
 
