@@ -33,6 +33,9 @@ pub enum CoreError {
     #[error("Commit metadata error: {0}")]
     CommitMetadata(String),
 
+    #[error("{0}")]
+    MergeRecordError(String),
+
     #[error("Data type error: {0}")]
     Schema(String),
 

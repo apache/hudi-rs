@@ -29,6 +29,7 @@ use crate::config::error::ConfigError::{
 };
 use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
+use crate::merge::RecordMergeStrategyValue;
 
 /// Configurations for Hudi tables, most of them are persisted in `hoodie.properties`.
 ///
@@ -91,6 +92,9 @@ pub enum HudiTableConfig {
     /// Concatenated values of these fields are used as the record key component of HoodieKey.
     RecordKeyFields,
 
+    /// Strategy to merge incoming records with existing records in the table.
+    RecordMergeStrategy,
+
     /// Table name that will be used for registering with Hive. Needs to be same across runs.
     TableName,
 
@@ -127,6 +131,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::PrecombineField => "hoodie.table.precombine.field",
             Self::PopulatesMetaFields => "hoodie.populate.meta.fields",
             Self::RecordKeyFields => "hoodie.table.recordkey.fields",
+            Self::RecordMergeStrategy => "hoodie.table.record.merge.strategy",
             Self::TableName => "hoodie.table.name",
             Self::TableType => "hoodie.table.type",
             Self::TableVersion => "hoodie.table.version",
@@ -145,6 +150,9 @@ impl ConfigParser for HudiTableConfig {
             Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
             Self::PartitionFields => Some(HudiConfigValue::List(vec![])),
             Self::PopulatesMetaFields => Some(HudiConfigValue::Boolean(true)),
+            Self::RecordMergeStrategy => Some(HudiConfigValue::String(
+                RecordMergeStrategyValue::default().as_ref().to_string(),
+            )),
             Self::TimelineTimezone => Some(HudiConfigValue::String(
                 TimelineTimezoneValue::UTC.as_ref().to_string(),
             )),
@@ -199,6 +207,9 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Boolean),
             Self::RecordKeyFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
+            Self::RecordMergeStrategy => get_result
+                .and_then(RecordMergeStrategyValue::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::TableName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::TableType => get_result
                 .and_then(TableTypeValue::from_str)
