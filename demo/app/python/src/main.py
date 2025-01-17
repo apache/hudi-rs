@@ -19,7 +19,7 @@ from hudi import HudiTableBuilder
 import pyarrow as pa
 
 hudi_table = HudiTableBuilder.from_base_uri(
-    "s3://hudi-demo/v6_complexkeygen_hivestyle"
+    "s3://hudi-demo/cow/v6_complexkeygen_hivestyle"
 ).build()
 records = hudi_table.read_snapshot()
 

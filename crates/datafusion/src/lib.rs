@@ -346,12 +346,12 @@ mod tests {
 
     use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
-    use hudi_tests::SampleCowTable::{
+    use hudi_tests::SampleTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
         V6TimebasedkeygenNonhivestyle,
     };
-    use hudi_tests::{utils, SampleCowTable};
+    use hudi_tests::{utils, SampleTable};
     use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
@@ -369,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_empty_schema_from_empty_table() {
         let table_provider =
-            HudiDataSource::new_with_options(V6Empty.path().as_str(), empty_options())
+            HudiDataSource::new_with_options(V6Empty.path_to_cow().as_str(), empty_options())
                 .await
                 .unwrap();
         let schema = table_provider.schema();
@@ -377,7 +377,7 @@ mod tests {
     }
 
     async fn register_test_table_with_session<I, K, V>(
-        test_table: &SampleCowTable,
+        test_table: &SampleTable,
         options: I,
         use_sql: bool,
     ) -> Result<SessionContext, DataFusionError>
@@ -391,12 +391,12 @@ mod tests {
             let create_table_sql = format!(
                 "CREATE EXTERNAL TABLE {} STORED AS HUDI LOCATION '{}' {}",
                 test_table.as_ref(),
-                test_table.path(),
+                test_table.path_to_cow(),
                 concat_as_sql_options(options)
             );
             ctx.sql(create_table_sql.as_str()).await?;
         } else {
-            let base_url = test_table.url();
+            let base_url = test_table.url_to_cow();
             let hudi = HudiDataSource::new_with_options(base_url.as_str(), options).await?;
             ctx.register_table(test_table.as_ref(), Arc::new(hudi))?;
         }
@@ -445,7 +445,7 @@ mod tests {
             "CREATE EXTERNAL TABLE {} STORED AS {} LOCATION '{}'",
             test_table.as_ref(),
             invalid_format,
-            test_table.path()
+            test_table.path_to_cow()
         );
 
         let ctx = create_test_session().await;
@@ -556,10 +556,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_supports_filters_pushdown() {
-        let table_provider =
-            HudiDataSource::new_with_options(V6Nonpartitioned.path().as_str(), empty_options())
-                .await
-                .unwrap();
+        let table_provider = HudiDataSource::new_with_options(
+            V6Nonpartitioned.path_to_cow().as_str(),
+            empty_options(),
+        )
+        .await
+        .unwrap();
 
         let expr0 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),

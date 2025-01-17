@@ -238,7 +238,7 @@ mod tests {
     use crate::table::partition::PartitionPruner;
     use crate::table::Table;
 
-    use hudi_tests::SampleCowTable;
+    use hudi_tests::SampleTable;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use url::Url;
@@ -254,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_partition_paths_for_nonpartitioned_table() {
-        let base_url = SampleCowTable::V6Nonpartitioned.url();
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::list_partition_paths(&storage, &partition_pruner)
@@ -267,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_partition_paths_for_complexkeygen_table() {
-        let base_url = SampleCowTable::V6ComplexkeygenHivestyle.url();
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let partition_pruner = PartitionPruner::empty();
         let partition_paths = FileSystemView::list_partition_paths(&storage, &partition_pruner)
@@ -287,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn fs_view_get_latest_file_slices() {
-        let base_url = SampleCowTable::V6Nonpartitioned.url();
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let fs_view = create_test_fs_view(base_url).await;
 
         assert!(fs_view.partition_to_file_groups.is_empty());
@@ -311,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn fs_view_get_latest_file_slices_with_replace_commit() {
-        let base_url = SampleCowTable::V6SimplekeygenNonhivestyleOverwritetable.url();
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fs_view = create_test_fs_view(base_url).await;
 
@@ -340,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn fs_view_get_latest_file_slices_with_partition_filters() {
-        let base_url = SampleCowTable::V6ComplexkeygenHivestyle.url();
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fs_view = create_test_fs_view(base_url).await;
 
