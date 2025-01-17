@@ -256,7 +256,10 @@ impl Table {
     }
 
     pub fn create_file_group_reader(&self) -> FileGroupReader {
-        FileGroupReader::new(self.file_system_view.storage.clone())
+        FileGroupReader::new(
+            self.file_system_view.storage.clone(),
+            self.hudi_configs.clone(),
+        )
     }
 
     pub async fn create_file_group_reader_with_filters(
@@ -264,7 +267,12 @@ impl Table {
         filters: &[Filter],
     ) -> Result<FileGroupReader> {
         let schema = self.get_schema().await?;
-        FileGroupReader::new_with_filters(self.file_system_view.storage.clone(), filters, &schema)
+        FileGroupReader::new_with_filters(
+            self.file_system_view.storage.clone(),
+            self.hudi_configs.clone(),
+            filters,
+            &schema,
+        )
     }
 
     /// Get all the latest records in the table.
