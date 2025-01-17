@@ -36,7 +36,7 @@ pub fn extract_test_table(zip_path: &Path) -> PathBuf {
 
 #[derive(Debug, EnumString, AsRefStr, EnumIter)]
 #[strum(serialize_all = "snake_case")]
-pub enum TestTable {
+pub enum SampleCowTable {
     V6ComplexkeygenHivestyle,
     V6Empty,
     V6Nonpartitioned,
@@ -46,11 +46,11 @@ pub enum TestTable {
     V6TimebasedkeygenNonhivestyle,
 }
 
-impl TestTable {
+impl SampleCowTable {
     pub fn zip_path(&self) -> Box<Path> {
         let dir = env!("CARGO_MANIFEST_DIR");
         let data_path = Path::new(dir)
-            .join("data/tables")
+            .join("data/tables/cow")
             .join(format!("{}.zip", self.as_ref()));
         data_path.into_boxed_path()
     }
@@ -71,11 +71,11 @@ impl TestTable {
 mod tests {
     use strum::IntoEnumIterator;
 
-    use crate::TestTable;
+    use crate::SampleCowTable;
 
     #[test]
-    fn test_table_zip_file_should_exist() {
-        for t in TestTable::iter() {
+    fn sample_table_zip_file_should_exist() {
+        for t in SampleCowTable::iter() {
             let path = t.zip_path();
             assert!(path.exists());
             assert!(path.is_file());

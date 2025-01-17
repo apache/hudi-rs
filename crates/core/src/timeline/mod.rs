@@ -205,7 +205,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_tests::TestTable;
+    use hudi_tests::SampleCowTable;
 
     use crate::config::table::HudiTableConfig;
 
@@ -220,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeline_read_latest_schema() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleCowTable::V6Nonpartitioned.url();
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 21)
@@ -228,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeline_read_latest_schema_from_empty_table() {
-        let base_url = TestTable::V6Empty.url();
+        let base_url = SampleCowTable::V6Empty.url();
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await;
         assert!(table_schema.is_err());

@@ -373,7 +373,7 @@ mod tests {
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
     use crate::table::Filter;
-    use hudi_tests::{assert_not, TestTable};
+    use hudi_tests::{assert_not, SampleCowTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -411,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hudi_table_get_hudi_options() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleCowTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let hudi_options = hudi_table.hudi_options();
         for (k, v) in hudi_options.iter() {
@@ -422,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hudi_table_get_storage_options() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleCowTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
 
         let cloud_prefixes: HashSet<_> = Storage::CLOUD_STORAGE_PREFIXES
@@ -449,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_schema() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleCowTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fields: Vec<String> = hudi_table
             .get_schema()
@@ -502,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_partition_schema() {
-        let base_url = TestTable::V6TimebasedkeygenNonhivestyle.url();
+        let base_url = SampleCowTable::V6TimebasedkeygenNonhivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let fields: Vec<String> = hudi_table
             .get_partition_schema()
@@ -702,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_read_file_slice() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleCowTable::V6Nonpartitioned.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
             .create_file_group_reader()
@@ -717,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_hudi_table_get_file_slices_splits() {
-        let base_url = TestTable::V6Empty.url();
+        let base_url = SampleCowTable::V6Empty.url();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let file_slices_splits = hudi_table.get_file_slices_splits(2, &[]).await.unwrap();
@@ -726,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_file_slices_splits() {
-        let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
+        let base_url = SampleCowTable::V6SimplekeygenNonhivestyle.url();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let file_slices_splits = hudi_table.get_file_slices_splits(2, &[]).await.unwrap();
@@ -737,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_file_slices_as_of_timestamps() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleCowTable::V6Nonpartitioned.url();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
@@ -794,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_file_paths_for_simple_keygen_non_hive_style() {
-        let base_url = TestTable::V6SimplekeygenNonhivestyle.url();
+        let base_url = SampleCowTable::V6SimplekeygenNonhivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         assert_eq!(hudi_table.timeline.completed_commits.len(), 2);
 
@@ -844,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_file_paths_for_complex_keygen_hive_style() {
-        let base_url = TestTable::V6ComplexkeygenHivestyle.url();
+        let base_url = SampleCowTable::V6ComplexkeygenHivestyle.url();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         assert_eq!(hudi_table.timeline.completed_commits.len(), 2);
 
@@ -896,12 +896,12 @@ mod tests {
     mod test_snapshot_queries {
         use super::super::*;
         use arrow_array::{Array, StringArray};
-        use hudi_tests::TestTable;
+        use hudi_tests::SampleCowTable;
         use std::collections::HashSet;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
-            let base_url = TestTable::V6Empty.url();
+            let base_url = SampleCowTable::V6Empty.url();
             let hudi_table = Table::new(base_url.path()).await?;
 
             let records = hudi_table.read_snapshot(&[]).await?;
@@ -912,7 +912,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_complex_keygen_hive_style() -> Result<()> {
-            let base_url = TestTable::V6ComplexkeygenHivestyle.url();
+            let base_url = SampleCowTable::V6ComplexkeygenHivestyle.url();
             let hudi_table = Table::new(base_url.path()).await?;
 
             let filters = &[
@@ -955,12 +955,12 @@ mod tests {
     mod test_incremental_queries {
         use super::super::*;
         use arrow_array::{Array, StringArray};
-        use hudi_tests::TestTable;
+        use hudi_tests::SampleCowTable;
         use std::collections::HashSet;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
-            let base_url = TestTable::V6Empty.url();
+            let base_url = SampleCowTable::V6Empty.url();
             let hudi_table = Table::new(base_url.path()).await?;
 
             let records = hudi_table.read_incremental_records("0", None).await?;
@@ -971,7 +971,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
-            let base_url = TestTable::V6SimplekeygenNonhivestyleOverwritetable.url();
+            let base_url = SampleCowTable::V6SimplekeygenNonhivestyleOverwritetable.url();
             let hudi_table = Table::new(base_url.path()).await?;
 
             // read records changed from the first commit (exclusive) to the second commit (inclusive)

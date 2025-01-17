@@ -346,12 +346,12 @@ mod tests {
 
     use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
-    use hudi_tests::TestTable::{
+    use hudi_tests::SampleCowTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
         V6TimebasedkeygenNonhivestyle,
     };
-    use hudi_tests::{utils, TestTable};
+    use hudi_tests::{utils, SampleCowTable};
     use utils::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
@@ -377,7 +377,7 @@ mod tests {
     }
 
     async fn register_test_table_with_session<I, K, V>(
-        test_table: &TestTable,
+        test_table: &SampleCowTable,
         options: I,
         use_sql: bool,
     ) -> Result<SessionContext, DataFusionError>
