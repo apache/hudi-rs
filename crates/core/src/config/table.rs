@@ -393,4 +393,24 @@ mod tests {
             InvalidValue(_)
         ));
     }
+
+    #[test]
+    fn create_record_merge_strategy() {
+        assert_eq!(
+            RecordMergeStrategyValue::from_str("Append_Only").unwrap(),
+            RecordMergeStrategyValue::AppendOnly
+        );
+        assert_eq!(
+            RecordMergeStrategyValue::from_str("OVERWRITE_with_LATEST").unwrap(),
+            RecordMergeStrategyValue::OverwriteWithLatest
+        );
+        assert!(matches!(
+            RecordMergeStrategyValue::from_str("").unwrap_err(),
+            InvalidValue(_)
+        ));
+        assert!(matches!(
+            RecordMergeStrategyValue::from_str("foo").unwrap_err(),
+            InvalidValue(_)
+        ));
+    }
 }
