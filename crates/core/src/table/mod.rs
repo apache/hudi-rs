@@ -895,9 +895,9 @@ mod tests {
 
     mod test_snapshot_queries {
         use super::super::*;
+        use crate::metadata::meta_field::MetaField;
         use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
         use hudi_tests::SampleTable;
-        use std::collections::HashSet;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
@@ -923,7 +923,6 @@ mod tests {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table.read_snapshot(&[]).await?;
                 let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
-                assert_eq!(all_records.num_rows(), 4);
 
                 let ids = all_records
                     .column_by_name("id")
@@ -944,22 +943,20 @@ mod tests {
                     .downcast_ref::<BooleanArray>()
                     .unwrap();
 
-                let mut data: Vec<(i32, String, bool)> = ids
+                let mut data: Vec<(i32, &str, bool)> = ids
                     .iter()
                     .zip(names.iter())
                     .zip(is_actives.iter())
-                    .map(|((id, name), is_active)| {
-                        (id.unwrap(), name.unwrap().to_string(), is_active.unwrap())
-                    })
+                    .map(|((id, name), is_active)| (id.unwrap(), name.unwrap(), is_active.unwrap()))
                     .collect();
                 data.sort_unstable_by_key(|(id, _, _)| *id);
                 assert_eq!(
                     data,
                     vec![
-                        (1, "Alice".to_string(), false),
-                        (2, "Bob".to_string(), false),
-                        (3, "Carol".to_string(), true),
-                        (4, "Diana".to_string(), true),
+                        (1, "Alice", false),
+                        (2, "Bob", false),
+                        (3, "Carol", true),
+                        (4, "Diana", true),
                     ]
                 )
             }
@@ -967,8 +964,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_complex_keygen_hive_style() -> Result<()> {
-            let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
+            let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_mor();
             let hudi_table = Table::new(base_url.path()).await?;
 
             let filters = &[
@@ -977,32 +974,50 @@ mod tests {
                 Filter::try_from(("shortField", "!=", "100"))?,
             ];
             let records = hudi_table.read_snapshot(filters).await?;
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].num_rows(), 2);
+            let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
 
-            let partition_paths = StringArray::from(
-                records[0]
-                    .column_by_name("_hoodie_partition_path")
-                    .unwrap()
-                    .to_data(),
-            );
-            let actual_partition_paths =
-                HashSet::<&str>::from_iter(partition_paths.iter().map(|s| s.unwrap()));
-            let expected_partition_paths = HashSet::from_iter(vec!["byteField=10/shortField=300"]);
-            assert_eq!(actual_partition_paths, expected_partition_paths);
+            let partition_paths = all_records
+                .column_by_name(MetaField::PartitionPath.as_ref())
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ids = all_records
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = all_records
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let is_actives = all_records
+                .column_by_name("isActive")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
 
-            let file_names = StringArray::from(
-                records[0]
-                    .column_by_name("_hoodie_file_name")
-                    .unwrap()
-                    .to_data(),
+            let mut data: Vec<(&str, i32, &str, bool)> = partition_paths
+                .iter()
+                .zip(ids.iter())
+                .zip(names.iter())
+                .zip(is_actives.iter())
+                .map(|(((pt, id), name), is_active)| {
+                    (pt.unwrap(), id.unwrap(), name.unwrap(), is_active.unwrap())
+                })
+                .collect();
+            data.sort_unstable_by_key(|(_, id, _, _)| *id);
+            assert_eq!(
+                data,
+                vec![
+                    ("byteField=10/shortField=300", 1, "Alice", false),
+                    ("byteField=10/shortField=300", 3, "Carol", true),
+                ]
             );
-            let actual_file_names =
-                HashSet::<&str>::from_iter(file_names.iter().map(|s| s.unwrap()));
-            let expected_file_names: HashSet<&str> = HashSet::from_iter(vec![
-                "a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
-            ]);
-            assert_eq!(actual_file_names, expected_file_names);
 
             Ok(())
         }
