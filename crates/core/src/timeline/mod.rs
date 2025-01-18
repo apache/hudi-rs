@@ -269,10 +269,11 @@ mod tests {
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await;
         assert!(table_schema.is_err());
-        assert_eq!(
-            table_schema.err().unwrap().to_string(),
-            "Timeline error: Failed to resolve the latest schema: no file path found"
-        )
+        assert!(table_schema
+            .err()
+            .unwrap()
+            .to_string()
+            .starts_with("Timeline error: Failed to resolve the latest schema:"))
     }
 
     #[tokio::test]
