@@ -65,7 +65,7 @@ impl TimelineSelector {
             start_datetime,
             end_datetime,
             states: vec![State::Completed],
-            actions: vec![Action::Commit, Action::ReplaceCommit],
+            actions: vec![Action::Commit, Action::DeltaCommit, Action::ReplaceCommit],
             include_archived: false,
         })
     }

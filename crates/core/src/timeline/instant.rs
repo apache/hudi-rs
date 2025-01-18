@@ -28,6 +28,7 @@ use std::str::FromStr;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Commit,
+    DeltaCommit,
     ReplaceCommit,
 }
 
@@ -37,6 +38,7 @@ impl FromStr for Action {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "commit" => Ok(Action::Commit),
+            "deltacommit" => Ok(Action::DeltaCommit),
             "replacecommit" => Ok(Action::ReplaceCommit),
             _ => Err(CoreError::Timeline(format!("Invalid action: {}", s))),
         }
@@ -47,6 +49,7 @@ impl Action {
     pub fn as_str(&self) -> &str {
         match self {
             Action::Commit => "commit",
+            Action::DeltaCommit => "deltacommit",
             Action::ReplaceCommit => "replacecommit",
         }
     }

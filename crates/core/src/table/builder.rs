@@ -22,17 +22,15 @@ use std::collections::HashMap;
 use std::env;
 use std::hash::Hash;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 
 use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
 use crate::config::read::HudiReadConfig;
+use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::{
-    DropsPartitionFields, TableType, TableVersion, TimelineLayoutVersion,
+    DropsPartitionFields, TableVersion, TimelineLayoutVersion,
 };
-use crate::config::table::TableTypeValue::CopyOnWrite;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
 use crate::error::CoreError;
@@ -254,13 +252,6 @@ impl TableBuilder {
         }
 
         // additional validation
-        let table_type = hudi_configs.get(TableType)?.to::<String>();
-        if TableTypeValue::from_str(&table_type)? != CopyOnWrite {
-            return Err(CoreError::Unsupported(
-                "Only support copy-on-write table.".to_string(),
-            ));
-        }
-
         let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
         if !(5..=6).contains(&table_version) {
             return Err(CoreError::Unsupported(

@@ -47,7 +47,11 @@ TBLPROPERTIES (
     type = 'mor',
     primaryKey = 'id',
     preCombineField = 'longField',
-    'hoodie.metadata.enable' = 'false'
+    'hoodie.metadata.enable' = 'false',
+    'hoodie.table.log.file.format' = 'PARQUET',
+    'hoodie.logfile.data.block.format' = 'parquet',
+    'hoodie.datasource.write.record.merger.impls' = 'org.apache.hudi.HoodieSparkRecordMerger',
+    'hoodie.parquet.small.file.limit' = '0'
 );
 
 INSERT INTO v6_nonpartitioned VALUES

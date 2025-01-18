@@ -33,6 +33,8 @@ use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
@@ -128,25 +130,60 @@ impl Timeline {
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
-        let parquet_path = commit_metadata
+        let first_partition = commit_metadata
             .get("partitionToWriteStats")
-            .and_then(|v| v.as_object())
+            .and_then(|v| v.as_object());
+
+        let partition_path = first_partition
+            .and_then(|obj| obj.keys().next())
+            .ok_or_else(|| {
+                CoreError::Timeline(
+                    "Failed to resolve the latest schema: no partition path found".to_string(),
+                )
+            })?;
+
+        let first_value = first_partition
             .and_then(|obj| obj.values().next())
             .and_then(|value| value.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first_value| first_value["path"].as_str());
+            .and_then(|arr| arr.first());
 
-        if let Some(path) = parquet_path {
-            let parquet_meta = self.storage.get_parquet_file_metadata(path).await?;
-
-            Ok(parquet_to_arrow_schema(
-                parquet_meta.file_metadata().schema_descr(),
-                None,
-            )?)
-        } else {
-            Err(CoreError::Timeline(
+        let parquet_path = first_value.and_then(|v| v["path"].as_str());
+        match parquet_path {
+            Some(path) if path.ends_with(".parquet") => {
+                let parquet_meta = self.storage.get_parquet_file_metadata(path).await?;
+                Ok(parquet_to_arrow_schema(
+                    parquet_meta.file_metadata().schema_descr(),
+                    None,
+                )?)
+            }
+            Some(_) => {
+                // TODO: properly handle deltacommit
+                let base_file = first_value
+                    .and_then(|v| v["baseFile"].as_str())
+                    .ok_or_else(|| {
+                        CoreError::Timeline(
+                            "Failed to resolve the latest schema: no file path found".to_string(),
+                        )
+                    })?;
+                let parquet_file_path_buf = PathBuf::from_str(partition_path)
+                    .map_err(|e| {
+                        CoreError::Timeline(format!("Failed to resolve the latest schema: {}", e))
+                    })?
+                    .join(base_file);
+                let path = parquet_file_path_buf.to_str().ok_or_else(|| {
+                    CoreError::Timeline(
+                        "Failed to resolve the latest schema: invalid file path".to_string(),
+                    )
+                })?;
+                let parquet_meta = self.storage.get_parquet_file_metadata(path).await?;
+                Ok(parquet_to_arrow_schema(
+                    parquet_meta.file_metadata().schema_descr(),
+                    None,
+                )?)
+            }
+            None => Err(CoreError::Timeline(
                 "Failed to resolve the latest schema: no file path found".to_string(),
-            ))
+            )),
         }
     }
 

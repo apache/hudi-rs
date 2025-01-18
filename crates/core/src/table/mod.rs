@@ -895,18 +895,74 @@ mod tests {
 
     mod test_snapshot_queries {
         use super::super::*;
-        use arrow_array::{Array, StringArray};
+        use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
         use hudi_tests::SampleTable;
         use std::collections::HashSet;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
-            let base_url = SampleTable::V6Empty.url_to_cow();
-            let hudi_table = Table::new(base_url.path()).await?;
+            let base_urls = [
+                SampleTable::V6Empty.url_to_cow(),
+                SampleTable::V6Empty.url_to_mor(),
+            ];
+            for base_url in base_urls.iter() {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let records = hudi_table.read_snapshot(&[]).await?;
+                assert!(records.is_empty());
+            }
+            Ok(())
+        }
 
-            let records = hudi_table.read_snapshot(&[]).await?;
-            assert!(records.is_empty());
+        #[tokio::test]
+        async fn test_non_partitioned() -> Result<()> {
+            let base_urls = [
+                SampleTable::V6Nonpartitioned.url_to_cow(),
+                SampleTable::V6Nonpartitioned.url_to_mor(),
+            ];
+            for base_url in base_urls.iter() {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let records = hudi_table.read_snapshot(&[]).await?;
+                let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
+                assert_eq!(all_records.num_rows(), 4);
 
+                let ids = all_records
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let names = all_records
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let is_actives = all_records
+                    .column_by_name("isActive")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap();
+
+                let mut data: Vec<(i32, String, bool)> = ids
+                    .iter()
+                    .zip(names.iter())
+                    .zip(is_actives.iter())
+                    .map(|((id, name), is_active)| {
+                        (id.unwrap(), name.unwrap().to_string(), is_active.unwrap())
+                    })
+                    .collect();
+                data.sort_unstable_by_key(|(id, _, _)| *id);
+                assert_eq!(
+                    data,
+                    vec![
+                        (1, "Alice".to_string(), false),
+                        (2, "Bob".to_string(), false),
+                        (3, "Carol".to_string(), true),
+                        (4, "Diana".to_string(), true),
+                    ]
+                )
+            }
             Ok(())
         }
 
