@@ -22,82 +22,20 @@
 
 pub mod base_file;
 pub mod builder;
+pub mod file_slice;
 pub mod log_file;
 pub mod reader;
 
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
-use crate::storage::Storage;
+use crate::file_group::log_file::LogFile;
 use crate::Result;
+use file_slice::FileSlice;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-
-/// Within a [FileGroup], a [FileSlice] is a logical group of [BaseFile] and log files.
-///
-/// [note] The log files are not yet supported.
-#[derive(Clone, Debug)]
-pub struct FileSlice {
-    pub base_file: BaseFile,
-    pub partition_path: Option<String>,
-}
-
-impl FileSlice {
-    pub fn new(base_file: BaseFile, partition_path: Option<String>) -> Self {
-        Self {
-            base_file,
-            partition_path,
-        }
-    }
-
-    /// Returns the relative path of the base file.
-    pub fn base_file_relative_path(&self) -> Result<String> {
-        let file_name = &self.base_file.file_name;
-        let path = PathBuf::from(self.partition_path()).join(file_name);
-        path.to_str().map(|s| s.to_string()).ok_or_else(|| {
-            CoreError::FileGroup(format!(
-                "Failed to get base file relative path for file slice: {:?}",
-                self
-            ))
-        })
-    }
-
-    /// Returns the enclosing [FileGroup]'s id.
-    #[inline]
-    pub fn file_id(&self) -> &str {
-        &self.base_file.file_id
-    }
-
-    /// Returns the partition path of the [FileSlice].
-    #[inline]
-    pub fn partition_path(&self) -> &str {
-        self.partition_path.as_deref().unwrap_or_default()
-    }
-
-    /// Returns the instant time that marks the [FileSlice] creation.
-    ///
-    /// This is also an instant time stored in the [Timeline].
-    #[inline]
-    pub fn creation_instant_time(&self) -> &str {
-        &self.base_file.instant_time
-    }
-
-    /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
-    /// or if `file_metadata` is not fully populated.
-    pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
-        if let Some(metadata) = &self.base_file.file_metadata {
-            if metadata.fully_populated {
-                return Ok(());
-            }
-        }
-        let relative_path = self.base_file_relative_path()?;
-        let fetched_metadata = storage.get_file_metadata(&relative_path).await?;
-        self.base_file.file_metadata = Some(fetched_metadata);
-        Ok(())
-    }
-}
+use std::str::FromStr;
 
 /// Hudi File Group.
 #[derive(Clone, Debug)]
@@ -154,24 +92,65 @@ impl FileGroup {
     }
 
     pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
-        let base_file = BaseFile::try_from(file_name)?;
+        let base_file = BaseFile::from_str(file_name)?;
         self.add_base_file(base_file)
     }
 
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
-        let instant_time = base_file.instant_time.as_str();
-        if self.file_slices.contains_key(instant_time) {
+        let commit_timestamp = base_file.commit_timestamp.as_str();
+        if self.file_slices.contains_key(commit_timestamp) {
             Err(CoreError::FileGroup(format!(
-                "Instant time {instant_time} is already present in File Group {}",
+                "Instant time {commit_timestamp} is already present in File Group {}",
                 self.file_id
             )))
         } else {
             self.file_slices.insert(
-                instant_time.to_owned(),
+                commit_timestamp.to_owned(),
                 FileSlice::new(base_file, self.partition_path.clone()),
             );
             Ok(self)
         }
+    }
+
+    pub fn add_base_files<I>(&mut self, base_files: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = BaseFile>,
+    {
+        for base_file in base_files {
+            self.add_base_file(base_file)?;
+        }
+        Ok(self)
+    }
+
+    pub fn add_log_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
+        let log_file = LogFile::from_str(file_name)?;
+        self.add_log_file(log_file)
+    }
+
+    /// Add a [LogFile] to the [FileGroup].
+    ///
+    /// TODO: support adding log files to file group without base files.
+    pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
+        let commit_timestamp = log_file.base_commit_timestamp.as_str();
+        if let Some(file_slice) = self.file_slices.get_mut(commit_timestamp) {
+            file_slice.log_files.insert(log_file);
+            Ok(self)
+        } else {
+            Err(CoreError::FileGroup(format!(
+                "Instant time {commit_timestamp} not found in File Group {}",
+                self.file_id
+            )))
+        }
+    }
+
+    pub fn add_log_files<I>(&mut self, log_files: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = LogFile>,
+    {
+        for log_file in log_files {
+            self.add_log_file(log_file)?;
+        }
+        Ok(self)
     }
 
     pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {
@@ -214,7 +193,7 @@ mod tests {
             fg.get_file_slice_as_of("20240402123035233")
                 .unwrap()
                 .base_file
-                .instant_time,
+                .commit_timestamp,
             "20240402123035233"
         );
         assert!(fg.get_file_slice_as_of("-1").is_none());

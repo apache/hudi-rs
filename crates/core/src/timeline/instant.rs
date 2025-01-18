@@ -28,6 +28,7 @@ use std::str::FromStr;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Commit,
+    DeltaCommit,
     ReplaceCommit,
 }
 
@@ -37,6 +38,7 @@ impl FromStr for Action {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "commit" => Ok(Action::Commit),
+            "deltacommit" => Ok(Action::DeltaCommit),
             "replacecommit" => Ok(Action::ReplaceCommit),
             _ => Err(CoreError::Timeline(format!("Invalid action: {}", s))),
         }
@@ -47,6 +49,7 @@ impl Action {
     pub fn as_str(&self) -> &str {
         match self {
             Action::Commit => "commit",
+            Action::DeltaCommit => "deltacommit",
             Action::ReplaceCommit => "replacecommit",
         }
     }
@@ -115,11 +118,11 @@ impl Ord for Instant {
     }
 }
 
-impl TryFrom<&str> for Instant {
-    type Error = CoreError;
+impl FromStr for Instant {
+    type Err = CoreError;
 
     /// Parse a timeline file name into an [Instant]. Timezone is assumed to be UTC.
-    fn try_from(file_name: &str) -> Result<Self> {
+    fn from_str(file_name: &str) -> Result<Self, Self::Err> {
         Self::try_from_file_name_and_timezone(file_name, "UTC")
     }
 }
@@ -280,13 +283,13 @@ mod tests {
     #[test]
     fn test_instant_from_file_name() -> Result<()> {
         // Test completed commit
-        let instant = Instant::try_from("20240103153000.commit")?;
+        let instant = Instant::from_str("20240103153000.commit")?;
         assert_eq!(instant.timestamp, "20240103153000");
         assert_eq!(instant.action, Action::Commit);
         assert_eq!(instant.state, State::Completed);
 
         // Test inflight replacecommit with milliseconds
-        let instant = Instant::try_from("20240103153000123.replacecommit.inflight")?;
+        let instant = Instant::from_str("20240103153000123.replacecommit.inflight")?;
         assert_eq!(instant.timestamp, "20240103153000123");
         assert_eq!(instant.action, Action::ReplaceCommit);
         assert_eq!(instant.state, State::Inflight);
@@ -297,16 +300,16 @@ mod tests {
     #[test]
     fn test_invalid_file_names() {
         // Invalid timestamp format
-        assert!(Instant::try_from("2024010315.commit").is_err());
+        assert!(Instant::from_str("2024010315.commit").is_err());
 
         // Invalid action
-        assert!(Instant::try_from("20240103153000.invalid").is_err());
+        assert!(Instant::from_str("20240103153000.invalid").is_err());
 
         // Invalid state
-        assert!(Instant::try_from("20240103153000.commit.invalid").is_err());
+        assert!(Instant::from_str("20240103153000.commit.invalid").is_err());
 
         // No dot separator
-        assert!(Instant::try_from("20240103153000commit").is_err());
+        assert!(Instant::from_str("20240103153000commit").is_err());
     }
 
     #[test]
@@ -319,7 +322,7 @@ mod tests {
         ];
 
         for original_name in test_cases {
-            let instant = Instant::try_from(original_name)?;
+            let instant = Instant::from_str(original_name)?;
             assert_eq!(instant.file_name(), original_name);
         }
 
@@ -328,12 +331,12 @@ mod tests {
 
     #[test]
     fn test_instant_ordering() -> Result<()> {
-        let instant1 = Instant::try_from("20240103153000.commit")?;
-        let instant2 = Instant::try_from("20240103153000001.commit")?;
-        let instant3 = Instant::try_from("20240103153000999.commit.requested")?;
-        let instant4 = Instant::try_from("20240103153000999.inflight")?;
-        let instant5 = Instant::try_from("20240103153000999.commit")?;
-        let instant6 = Instant::try_from("20240103153001.commit")?;
+        let instant1 = Instant::from_str("20240103153000.commit")?;
+        let instant2 = Instant::from_str("20240103153000001.commit")?;
+        let instant3 = Instant::from_str("20240103153000999.commit.requested")?;
+        let instant4 = Instant::from_str("20240103153000999.inflight")?;
+        let instant5 = Instant::from_str("20240103153000999.commit")?;
+        let instant6 = Instant::from_str("20240103153001.commit")?;
 
         assert!(instant1 < instant2);
         assert!(instant2 < instant3);
@@ -346,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_relative_path() {
-        let instant = Instant::try_from("20240103153000.commit").unwrap();
+        let instant = Instant::from_str("20240103153000.commit").unwrap();
         assert_eq!(
             instant.relative_path().unwrap(),
             ".hoodie/20240103153000.commit"

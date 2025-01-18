@@ -27,8 +27,8 @@ use tokio::runtime::Runtime;
 
 use hudi::error::CoreError;
 use hudi::expr::filter::Filter;
+use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
-use hudi::file_group::FileSlice;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
@@ -128,7 +128,7 @@ fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
     let file_id = f.file_id().to_string();
     let partition_path = f.partition_path().to_string();
     let creation_instant_time = f.creation_instant_time().to_string();
-    let base_file_name = f.base_file.file_name.clone();
+    let base_file_name = f.base_file.file_name();
     let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
     let base_file_size = file_metadata.size;
     let base_file_byte_size = file_metadata.byte_size;

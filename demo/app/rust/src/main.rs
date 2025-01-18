@@ -26,9 +26,9 @@ use hudi::HudiDataSource;
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = SessionContext::new();
-    let hudi = HudiDataSource::new("s3://hudi-demo/v6_complexkeygen_hivestyle").await?;
-    ctx.register_table("v6_table", Arc::new(hudi))?;
-    let df: DataFrame = ctx.sql("SELECT * from v6_table").await?;
+    let hudi = HudiDataSource::new("s3://hudi-demo/cow/v6_complexkeygen_hivestyle").await?;
+    ctx.register_table("cow_v6_table", Arc::new(hudi))?;
+    let df: DataFrame = ctx.sql("SELECT * from cow_v6_table").await?;
     assert!(
         df.schema()
             .columns()

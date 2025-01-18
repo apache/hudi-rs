@@ -36,7 +36,7 @@ pub fn extract_test_table(zip_path: &Path) -> PathBuf {
 
 #[derive(Debug, EnumString, AsRefStr, EnumIter)]
 #[strum(serialize_all = "snake_case")]
-pub enum TestTable {
+pub enum SampleTable {
     V6ComplexkeygenHivestyle,
     V6Empty,
     V6Nonpartitioned,
@@ -46,23 +46,35 @@ pub enum TestTable {
     V6TimebasedkeygenNonhivestyle,
 }
 
-impl TestTable {
-    pub fn zip_path(&self) -> Box<Path> {
+impl SampleTable {
+    fn zip_path(&self, table_type: &str) -> Box<Path> {
         let dir = env!("CARGO_MANIFEST_DIR");
         let data_path = Path::new(dir)
             .join("data/tables")
+            .join(table_type.to_lowercase())
             .join(format!("{}.zip", self.as_ref()));
         data_path.into_boxed_path()
     }
 
-    pub fn path(&self) -> String {
-        let zip_path = self.zip_path();
+    pub fn path_to_cow(&self) -> String {
+        let zip_path = self.zip_path("cow");
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
     }
 
-    pub fn url(&self) -> Url {
-        let path = self.path();
+    pub fn path_to_mor(&self) -> String {
+        let zip_path = self.zip_path("mor");
+        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+        path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn url_to_cow(&self) -> Url {
+        let path = self.path_to_cow();
+        Url::from_file_path(path).unwrap()
+    }
+
+    pub fn url_to_mor(&self) -> Url {
+        let path = self.path_to_mor();
         Url::from_file_path(path).unwrap()
     }
 }
@@ -71,12 +83,12 @@ impl TestTable {
 mod tests {
     use strum::IntoEnumIterator;
 
-    use crate::TestTable;
+    use crate::SampleTable;
 
     #[test]
-    fn test_table_zip_file_should_exist() {
-        for t in TestTable::iter() {
-            let path = t.zip_path();
+    fn sample_table_zip_file_should_exist() {
+        for t in SampleTable::iter() {
+            let path = t.zip_path("cow");
             assert!(path.exists());
             assert!(path.is_file());
         }

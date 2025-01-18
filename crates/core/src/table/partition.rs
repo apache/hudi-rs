@@ -28,6 +28,8 @@ use arrow_schema::Schema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
+
 /// A partition pruner that filters partitions based on the partition path and its filters.
 #[derive(Debug, Clone)]
 pub struct PartitionPruner {

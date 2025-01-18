@@ -30,7 +30,7 @@ use futures::StreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{parse_url_opts, ObjectStore};
 use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::{parquet_to_arrow_schema, ParquetRecordBatchStreamBuilder};
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
@@ -152,6 +152,17 @@ impl Storage {
         let reader = ParquetObjectReader::new(obj_store, meta);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         Ok(builder.metadata().as_ref().clone())
+    }
+
+    pub async fn get_parquet_file_schema(
+        &self,
+        relative_path: &str,
+    ) -> Result<arrow::datatypes::Schema> {
+        let parquet_meta = self.get_parquet_file_metadata(relative_path).await?;
+        Ok(parquet_to_arrow_schema(
+            parquet_meta.file_metadata().schema_descr(),
+            None,
+        )?)
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {

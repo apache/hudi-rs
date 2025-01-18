@@ -21,7 +21,7 @@ use crate::config::util::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
-use crate::file_group::FileSlice;
+use crate::file_group::file_slice::FileSlice;
 use crate::storage::Storage;
 use crate::Result;
 use arrow::compute::and;
@@ -30,25 +30,30 @@ use arrow_schema::Schema;
 use futures::TryFutureExt;
 use std::sync::Arc;
 
+use crate::file_group::log_file::reader::LogFileReader;
+use crate::merge::record_merger::RecordMerger;
 use arrow::compute::filter_record_batch;
 
 /// File group reader handles all read operations against a file group.
 #[derive(Clone, Debug)]
 pub struct FileGroupReader {
     storage: Arc<Storage>,
+    hudi_configs: Arc<HudiConfigs>,
     and_filters: Vec<SchemableFilter>,
 }
 
 impl FileGroupReader {
-    pub fn new(storage: Arc<Storage>) -> Self {
+    pub fn new(storage: Arc<Storage>, hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             storage,
+            hudi_configs,
             and_filters: Vec::new(),
         }
     }
 
     pub fn new_with_filters(
         storage: Arc<Storage>,
+        hudi_configs: Arc<HudiConfigs>,
         and_filters: &[Filter],
         schema: &Schema,
     ) -> Result<Self> {
@@ -59,6 +64,7 @@ impl FileGroupReader {
 
         Ok(Self {
             storage,
+            hudi_configs,
             and_filters,
         })
     }
@@ -77,11 +83,8 @@ impl FileGroupReader {
 
         let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
 
-        let storage = Storage::new(Arc::new(others), hudi_configs)?;
-        Ok(Self {
-            storage,
-            and_filters: Vec::new(),
-        })
+        let storage = Storage::new(Arc::new(others), hudi_configs.clone())?;
+        Ok(Self::new(storage, hudi_configs))
     }
 
     fn create_boolean_array_mask(&self, records: &RecordBatch) -> Result<BooleanArray> {
@@ -117,9 +120,33 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
     }
 
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+    pub async fn read_file_slice(
+        &self,
+        file_slice: &FileSlice,
+        base_file_only: bool,
+    ) -> Result<RecordBatch> {
         let relative_path = file_slice.base_file_relative_path()?;
-        self.read_file_slice_by_base_file_path(&relative_path).await
+        if base_file_only {
+            // TODO caller to support read optimized queries
+            self.read_file_slice_by_base_file_path(&relative_path).await
+        } else {
+            let base_file_records = self
+                .read_file_slice_by_base_file_path(&relative_path)
+                .await?;
+            let schema = base_file_records.schema();
+            let mut all_records = vec![base_file_records];
+
+            for log_file in &file_slice.log_files {
+                let relative_path = file_slice.log_file_relative_path(log_file)?;
+                let storage = self.storage.clone();
+                let mut log_file_reader = LogFileReader::new(storage, &relative_path).await?;
+                let log_file_records = log_file_reader.read_all_records_unmerged()?;
+                all_records.extend_from_slice(&log_file_records);
+            }
+
+            let merger = RecordMerger::new(self.hudi_configs.clone());
+            merger.merge_record_batches(&schema, &all_records)
+        }
     }
 }
 
@@ -138,7 +165,7 @@ mod tests {
     fn test_new() {
         let base_url = Url::parse("file:///tmp/hudi_data").unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let fg_reader = FileGroupReader::new(storage.clone());
+        let fg_reader = FileGroupReader::new(storage.clone(), Arc::from(HudiConfigs::empty()));
         assert!(Arc::ptr_eq(&fg_reader.storage, &storage));
     }
 
@@ -155,9 +182,15 @@ mod tests {
         let base_url = Url::parse("file:///tmp/hudi_data").unwrap();
         let storage = Storage::new_with_base_url(base_url)?;
         let schema = create_test_schema();
+        let empty_configs = Arc::new(HudiConfigs::empty());
 
         // Test case 1: Empty filters
-        let reader = FileGroupReader::new_with_filters(storage.clone(), &[], &schema)?;
+        let reader = FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &[],
+            &schema,
+        )?;
         assert!(reader.and_filters.is_empty());
 
         // Test case 2: Multiple filters
@@ -165,14 +198,23 @@ mod tests {
             FilterField::new("_hoodie_commit_time").gt("0"),
             FilterField::new("age").gte("18"),
         ];
-        let reader = FileGroupReader::new_with_filters(storage.clone(), &filters, &schema)?;
+        let reader = FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &filters,
+            &schema,
+        )?;
         assert_eq!(reader.and_filters.len(), 2);
 
         // Test case 3: Invalid field name should error
         let invalid_filters = vec![FilterField::new("non_existent_field").eq("value")];
-        assert!(
-            FileGroupReader::new_with_filters(storage.clone(), &invalid_filters, &schema).is_err()
-        );
+        assert!(FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &invalid_filters,
+            &schema
+        )
+        .is_err());
 
         Ok(())
     }
@@ -194,7 +236,8 @@ mod tests {
         let storage =
             Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())
                 .unwrap();
-        let reader = FileGroupReader::new(storage);
+        let empty_configs = Arc::new(HudiConfigs::empty());
+        let reader = FileGroupReader::new(storage, empty_configs.clone());
         let result = reader
             .read_file_slice_by_base_file_path("non_existent_file")
             .await;
@@ -217,17 +260,28 @@ mod tests {
     fn test_create_boolean_array_mask() -> Result<()> {
         let storage =
             Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())?;
+        let empty_configs = Arc::new(HudiConfigs::empty());
         let schema = create_test_schema();
         let records = create_test_record_batch()?;
 
         // Test case 1: No filters
-        let reader = FileGroupReader::new_with_filters(storage.clone(), &[], &schema)?;
+        let reader = FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &[],
+            &schema,
+        )?;
         let mask = reader.create_boolean_array_mask(&records)?;
         assert_eq!(mask, BooleanArray::from(vec![true; 5]));
 
         // Test case 2: Single filter on commit time
         let filters = vec![FilterField::new("_hoodie_commit_time").gt("2")];
-        let reader = FileGroupReader::new_with_filters(storage.clone(), &filters, &schema)?;
+        let reader = FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &filters,
+            &schema,
+        )?;
         let mask = reader.create_boolean_array_mask(&records)?;
         assert_eq!(
             mask,
@@ -240,7 +294,12 @@ mod tests {
             FilterField::new("_hoodie_commit_time").gt("2"),
             FilterField::new("age").lt("40"),
         ];
-        let reader = FileGroupReader::new_with_filters(storage.clone(), &filters, &schema)?;
+        let reader = FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &filters,
+            &schema,
+        )?;
         let mask = reader.create_boolean_array_mask(&records)?;
         assert_eq!(
             mask,
@@ -250,7 +309,12 @@ mod tests {
 
         // Test case 4: Filter resulting in all false
         let filters = vec![FilterField::new("age").gt("100")];
-        let reader = FileGroupReader::new_with_filters(storage.clone(), &filters, &schema)?;
+        let reader = FileGroupReader::new_with_filters(
+            storage.clone(),
+            empty_configs.clone(),
+            &filters,
+            &schema,
+        )?;
         let mask = reader.create_boolean_array_mask(&records)?;
         assert_eq!(mask, BooleanArray::from(vec![false; 5]));
 

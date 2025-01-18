@@ -29,10 +29,11 @@ use crate::Result;
 use arrow_schema::Schema;
 use instant::Instant;
 use log::debug;
-use parquet::arrow::parquet_to_arrow_schema;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
@@ -128,25 +129,55 @@ impl Timeline {
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
-        let parquet_path = commit_metadata
+        let first_partition = commit_metadata
             .get("partitionToWriteStats")
-            .and_then(|v| v.as_object())
+            .and_then(|v| v.as_object());
+
+        let partition_path = first_partition
+            .and_then(|obj| obj.keys().next())
+            .ok_or_else(|| {
+                CoreError::CommitMetadata(
+                    "Failed to resolve the latest schema: no partition path found".to_string(),
+                )
+            })?;
+
+        let first_value = first_partition
             .and_then(|obj| obj.values().next())
             .and_then(|value| value.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first_value| first_value["path"].as_str());
+            .and_then(|arr| arr.first());
 
-        if let Some(path) = parquet_path {
-            let parquet_meta = self.storage.get_parquet_file_metadata(path).await?;
-
-            Ok(parquet_to_arrow_schema(
-                parquet_meta.file_metadata().schema_descr(),
-                None,
-            )?)
-        } else {
-            Err(CoreError::Timeline(
+        let parquet_path = first_value.and_then(|v| v["path"].as_str());
+        match parquet_path {
+            Some(path) if path.ends_with(".parquet") => {
+                Ok(self.storage.get_parquet_file_schema(path).await?)
+            }
+            Some(_) => {
+                // TODO: properly handle deltacommit
+                let base_file = first_value
+                    .and_then(|v| v["baseFile"].as_str())
+                    .ok_or_else(|| {
+                        CoreError::CommitMetadata(
+                            "Failed to resolve the latest schema: no file path found".to_string(),
+                        )
+                    })?;
+                let parquet_file_path_buf = PathBuf::from_str(partition_path)
+                    .map_err(|e| {
+                        CoreError::CommitMetadata(format!(
+                            "Failed to resolve the latest schema: {}",
+                            e
+                        ))
+                    })?
+                    .join(base_file);
+                let path = parquet_file_path_buf.to_str().ok_or_else(|| {
+                    CoreError::CommitMetadata(
+                        "Failed to resolve the latest schema: invalid file path".to_string(),
+                    )
+                })?;
+                Ok(self.storage.get_parquet_file_schema(path).await?)
+            }
+            None => Err(CoreError::CommitMetadata(
                 "Failed to resolve the latest schema: no file path found".to_string(),
-            ))
+            )),
         }
     }
 
@@ -200,11 +231,12 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::canonicalize;
     use std::path::Path;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     use url::Url;
 
-    use hudi_tests::TestTable;
+    use hudi_tests::SampleTable;
 
     use crate::config::table::HudiTableConfig;
 
@@ -219,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeline_read_latest_schema() {
-        let base_url = TestTable::V6Nonpartitioned.url();
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await.unwrap();
         assert_eq!(table_schema.fields.len(), 21)
@@ -227,14 +259,15 @@ mod tests {
 
     #[tokio::test]
     async fn timeline_read_latest_schema_from_empty_table() {
-        let base_url = TestTable::V6Empty.url();
+        let base_url = SampleTable::V6Empty.url_to_cow();
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await;
         assert!(table_schema.is_err());
-        assert_eq!(
-            table_schema.err().unwrap().to_string(),
-            "Timeline error: Failed to resolve the latest schema: no file path found"
-        )
+        assert!(table_schema
+            .err()
+            .unwrap()
+            .to_string()
+            .starts_with("Commit metadata error: Failed to resolve the latest schema:"))
     }
 
     #[tokio::test]
@@ -247,8 +280,8 @@ mod tests {
         assert_eq!(
             timeline.completed_commits,
             vec![
-                Instant::try_from("20240402123035233.commit").unwrap(),
-                Instant::try_from("20240402144910683.commit").unwrap(),
+                Instant::from_str("20240402123035233.commit").unwrap(),
+                Instant::from_str("20240402144910683.commit").unwrap(),
             ]
         )
     }
@@ -263,7 +296,7 @@ mod tests {
         )
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
-        let instant = Instant::try_from("20240402123035233.commit").unwrap();
+        let instant = Instant::from_str("20240402123035233.commit").unwrap();
 
         // Test error when reading empty commit metadata file
         let result = timeline.get_commit_metadata(&instant).await;
@@ -272,7 +305,7 @@ mod tests {
         assert!(matches!(err, CoreError::Timeline(_)));
         assert!(err.to_string().contains("Failed to get commit metadata"));
 
-        let instant = Instant::try_from("20240402144910683.commit").unwrap();
+        let instant = Instant::from_str("20240402144910683.commit").unwrap();
 
         // Test error when reading a commit metadata file with invalid JSON
         let result = timeline.get_commit_metadata(&instant).await;

@@ -24,8 +24,11 @@ mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
 mc mb local/hudi-demo
 
 # unzip the data
-mkdir /tmp/tables
-for zip in /opt/data/tables/*.zip; do unzip -o "$zip" -d "/tmp/tables/"; done
+mkdir -p /tmp/tables/cow/
+for zip in /opt/data/tables/cow/*.zip; do unzip -o "$zip" -d "/tmp/tables/cow/"; done
+mkdir -p /tmp/tables/mor/
+for zip in /opt/data/tables/mor/*.zip; do unzip -o "$zip" -d "/tmp/tables/mor/"; done
 
 # copy the data to the bucket
-mc cp -r /tmp/tables/* local/hudi-demo/
+mc cp -r /tmp/tables/cow/* local/hudi-demo/cow/
+mc cp -r /tmp/tables/mor/* local/hudi-demo/mor/
