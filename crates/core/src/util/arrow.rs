@@ -67,3 +67,84 @@ pub fn lexsort_to_indices(arrays: &[ArrayRef], desc: bool) -> UInt32Array {
     }
     UInt32Array::from_iter_values(sort.iter().map(|(i, _)| *i as u32))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow_array::Float64Array;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_basic_int_sort() {
+        let arr = Int32Array::from(vec![3, 1, 4, 1, 5]);
+        let arrays = vec![Arc::new(arr) as ArrayRef];
+
+        // Test ascending
+        let result = lexsort_to_indices(&arrays, false);
+        assert_eq!(
+            result.values(),
+            &[1, 3, 0, 2, 4] // Indices that would sort to [1,1,3,4,5]
+        );
+
+        // Test descending
+        let result = lexsort_to_indices(&arrays, true);
+        assert_eq!(
+            result.values(),
+            &[4, 2, 0, 1, 3] // Indices that would sort to [5,4,3,1,1]
+        );
+    }
+
+    #[test]
+    fn test_multiple_columns() {
+        let arr1 = Int32Array::from(vec![1, 1, 2, 2]);
+        let arr2 = StringArray::from(vec!["b", "a", "b", "a"]);
+        let arrays = vec![Arc::new(arr1) as ArrayRef, Arc::new(arr2) as ArrayRef];
+
+        let result = lexsort_to_indices(&arrays, false);
+        assert_eq!(
+            result.values(),
+            &[1, 0, 3, 2] // Should sort by first column then second
+        );
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // Empty array
+        assert_eq!(lexsort_to_indices(&[], false).len(), 0);
+
+        // Array of empty array
+        let arr = Int32Array::from(vec![] as Vec<i32>);
+        let arrays = vec![Arc::new(arr) as ArrayRef];
+        let result = lexsort_to_indices(&arrays, false);
+        assert_eq!(result.len(), 0);
+
+        // Single element
+        let arr = Int32Array::from(vec![1]);
+        let arrays = vec![Arc::new(arr) as ArrayRef];
+        let result = lexsort_to_indices(&arrays, false);
+        assert_eq!(result.values(), &[0]);
+
+        // All equal values
+        let arr = Int32Array::from(vec![5, 5, 5, 5]);
+        let arrays = vec![Arc::new(arr) as ArrayRef];
+        let result = lexsort_to_indices(&arrays, false);
+        assert_eq!(result.values(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_different_types() {
+        let int_arr = Int32Array::from(vec![1, 2, 1]);
+        let str_arr = StringArray::from(vec!["a", "b", "c"]);
+        let float_arr = Float64Array::from(vec![1.0, 2.0, 3.0]);
+
+        let arrays = vec![
+            Arc::new(int_arr) as ArrayRef,
+            Arc::new(str_arr) as ArrayRef,
+            Arc::new(float_arr) as ArrayRef,
+        ];
+
+        let result = lexsort_to_indices(&arrays, false);
+        assert_eq!(result.values(), &[0, 2, 1]);
+    }
+}

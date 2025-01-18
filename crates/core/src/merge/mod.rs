@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod record_merger;
+
 use crate::config::error;
 use crate::config::error::ConfigError;
 use crate::config::error::ConfigError::InvalidValue;
