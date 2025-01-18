@@ -48,6 +48,7 @@ pub mod error;
 pub mod expr;
 pub mod file_group;
 pub mod merge;
+pub mod metadata;
 pub mod storage;
 pub mod table;
 pub mod timeline;

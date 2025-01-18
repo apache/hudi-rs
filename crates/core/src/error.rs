@@ -54,6 +54,9 @@ pub enum CoreError {
     #[error("{0}")]
     InvalidPartitionPath(String),
 
+    #[error("{0}")]
+    InvalidValue(String),
+
     #[error(transparent)]
     ParquetError(#[from] parquet::errors::ParquetError),
 

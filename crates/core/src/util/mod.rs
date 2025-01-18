@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod arrow;
 
 pub fn convert_vec_to_slice(vec: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
     vec.iter()
