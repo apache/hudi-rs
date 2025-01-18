@@ -182,11 +182,12 @@ mod tests {
         let base_url = Url::parse("file:///tmp/hudi_data").unwrap();
         let storage = Storage::new_with_base_url(base_url)?;
         let schema = create_test_schema();
+        let empty_configs = Arc::new(HudiConfigs::empty());
 
         // Test case 1: Empty filters
         let reader = FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &[],
             &schema,
         )?;
@@ -199,7 +200,7 @@ mod tests {
         ];
         let reader = FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &filters,
             &schema,
         )?;
@@ -209,7 +210,7 @@ mod tests {
         let invalid_filters = vec![FilterField::new("non_existent_field").eq("value")];
         assert!(FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &invalid_filters,
             &schema
         )
@@ -235,7 +236,8 @@ mod tests {
         let storage =
             Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())
                 .unwrap();
-        let reader = FileGroupReader::new(storage, Arc::from(HudiConfigs::empty()));
+        let empty_configs = Arc::new(HudiConfigs::empty());
+        let reader = FileGroupReader::new(storage, empty_configs.clone());
         let result = reader
             .read_file_slice_by_base_file_path("non_existent_file")
             .await;
@@ -258,13 +260,14 @@ mod tests {
     fn test_create_boolean_array_mask() -> Result<()> {
         let storage =
             Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())?;
+        let empty_configs = Arc::new(HudiConfigs::empty());
         let schema = create_test_schema();
         let records = create_test_record_batch()?;
 
         // Test case 1: No filters
         let reader = FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &[],
             &schema,
         )?;
@@ -275,7 +278,7 @@ mod tests {
         let filters = vec![FilterField::new("_hoodie_commit_time").gt("2")];
         let reader = FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &filters,
             &schema,
         )?;
@@ -293,7 +296,7 @@ mod tests {
         ];
         let reader = FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &filters,
             &schema,
         )?;
@@ -308,7 +311,7 @@ mod tests {
         let filters = vec![FilterField::new("age").gt("100")];
         let reader = FileGroupReader::new_with_filters(
             storage.clone(),
-            Arc::from(HudiConfigs::empty()),
+            empty_configs.clone(),
             &filters,
             &schema,
         )?;
