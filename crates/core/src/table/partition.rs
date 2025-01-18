@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// A partition pruner that filters partitions based on the partition path and its filters.
 #[derive(Debug, Clone)]
 pub struct PartitionPruner {
-    schema: Arc<Schema>,
+    pub schema: Arc<Schema>,
     is_hive_style: bool,
     is_url_encoded: bool,
     and_filters: Vec<SchemableFilter>,
@@ -96,6 +96,80 @@ impl PartitionPruner {
                 None => true, // Include the partition when filtering field does not match any field in the partition
             }
         })
+    }
+
+    pub fn should_include_with_level(&self, partition_path: &str, level: usize) -> bool {
+        let (field, value) = match self.parse_segment_with_level(partition_path, level) {
+            Ok(s) => s,
+            Err(_) => return true,
+        };
+
+        self.and_filters.iter().all(|filter| {
+            if field.eq(filter.field.name()) {
+                match filter.apply_comparsion(&value) {
+                    Ok(scalar) => scalar.value(0),
+                    Err(_) => true,
+                }
+            } else {
+                true
+            }
+        })
+    }
+
+    fn parse_segment_with_level(
+        &self,
+        partition_path: &str,
+        level: usize,
+    ) -> Result<(String, Scalar<ArrayRef>)> {
+        let partition_path = if self.is_url_encoded {
+            percent_encoding::percent_decode(partition_path.as_bytes())
+                .decode_utf8()?
+                .into_owned()
+        } else {
+            partition_path.to_string()
+        };
+
+        if level >= self.schema.fields.len() {
+            return Err(InvalidPartitionPath(format!(
+                "Partition path should have {} part(s) but got {}",
+                self.schema.fields.len(),
+                level
+            )));
+        }
+
+        let parts: Vec<&str> = partition_path.split('/').collect();
+        if level >= parts.len() {
+            return Err(InvalidPartitionPath(format!(
+                "Partition path should have {} part(s) but got {}",
+                parts.len(),
+                level
+            )));
+        }
+
+        let need_part = parts[level];
+
+        let need_field = self.schema.fields.get(level).unwrap();
+
+        let value = if self.is_hive_style {
+            let (name, value) = need_part
+                .split_once('=')
+                .ok_or(InvalidPartitionPath(format!(
+                    "Partition path should be hive-style but got {}",
+                    need_part
+                )))?;
+            if name != need_field.name() {
+                return Err(InvalidPartitionPath(format!(
+                    "Partition path should contain {} but got {}",
+                    need_field.name(),
+                    name
+                )));
+            }
+            value
+        } else {
+            need_part
+        };
+        let scalar = SchemableFilter::cast_value(&[value], need_field.data_type())?;
+        Ok((need_field.name().to_string(), scalar))
     }
 
     fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
@@ -244,6 +318,77 @@ mod tests {
         assert!(segments.contains_key("date"));
         assert!(segments.contains_key("category"));
         assert!(segments.contains_key("count"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_with_level() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+
+        let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let filter_lte_100 = Filter::try_from(("count", "<=", "100")).unwrap();
+
+        let pruner = PartitionPruner::new(
+            &[filter_gt_date, filter_eq_a, filter_lte_100],
+            &schema,
+            &configs,
+        )
+        .unwrap();
+
+        assert!(pruner.should_include_with_level("date=2023-02-01", 0));
+        assert_not!(pruner.should_include_with_level("date=2022-12-31", 0));
+        assert!(pruner.should_include_with_level("date=2023-02-01/category=A", 1));
+        assert_not!(pruner.should_include_with_level("date=2023-02-01/category=B", 1));
+        assert!(pruner.should_include_with_level("date=2022-12-32/category=A", 1));
+        assert!(pruner.should_include_with_level("date=2023-02-01/category=A/count=10", 2));
+        assert_not!(pruner.should_include_with_level("date=2023-02-01/category=A/count=200", 2));
+        assert!(pruner.should_include_with_level("date=2022-12-32/category=B/count=100", 2));
+    }
+
+    #[test]
+    fn test_partition_pruner_parse_segments_with_level() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        // 1. test with valid level
+        let (mut field, _) = pruner
+            .parse_segment_with_level("date=2023-02-01/category=A/count=10", 0)
+            .unwrap();
+        assert_eq!(field, "date");
+        (field, _) = pruner
+            .parse_segment_with_level("date=2023-02-01/category=A/count=10", 1)
+            .unwrap();
+        assert_eq!(field, "category");
+        (field, _) = pruner
+            .parse_segment_with_level("date=2023-02-01/category=A/count=10", 2)
+            .unwrap();
+        assert_eq!(field, "count");
+        (field, _) = pruner
+            .parse_segment_with_level("date=2023-02-01/category=A", 1)
+            .unwrap();
+        assert_eq!(field, "category");
+        (field, _) = pruner
+            .parse_segment_with_level("date=2023-02-01/category=A", 0)
+            .unwrap();
+        assert_eq!(field, "date");
+
+        // 2. test with invalid level
+        let result = pruner.parse_segment_with_level("date=2023-02-01/category=A/count=10", 3);
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        // 3. test with mismatch level
+        let result = pruner.parse_segment_with_level("date=2023-02-01/category=A", 2);
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        // 4. test with mismatch partition field name
+        let result = pruner.parse_segment_with_level("date=2023-02-01/count=10/category=A", 2);
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
+
+        // 5. test with not-exist partition field
+        let result = pruner.parse_segment_with_level("dt=2023-02-01/category=A/count=10", 0);
+        assert!(matches!(result.unwrap_err(), InvalidPartitionPath(_)));
     }
 
     #[test]
