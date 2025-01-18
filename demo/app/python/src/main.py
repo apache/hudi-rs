@@ -18,35 +18,37 @@
 from hudi import HudiTableBuilder
 import pyarrow as pa
 
-hudi_table = HudiTableBuilder.from_base_uri(
-    "s3://hudi-demo/cow/v6_complexkeygen_hivestyle"
-).build()
-records = hudi_table.read_snapshot()
+for url in [
+    "s3://hudi-demo/cow/v6_complexkeygen_hivestyle",
+    "s3://hudi-demo/mor/v6_complexkeygen_hivestyle",
+]:
+    hudi_table = HudiTableBuilder.from_base_uri(url).build()
+    records = hudi_table.read_snapshot()
 
-arrow_table = pa.Table.from_batches(records)
-assert arrow_table.schema.names == [
-    "_hoodie_commit_time",
-    "_hoodie_commit_seqno",
-    "_hoodie_record_key",
-    "_hoodie_partition_path",
-    "_hoodie_file_name",
-    "id",
-    "name",
-    "isActive",
-    "intField",
-    "longField",
-    "floatField",
-    "doubleField",
-    "decimalField",
-    "dateField",
-    "timestampField",
-    "binaryField",
-    "arrayField",
-    "mapField",
-    "structField",
-    "byteField",
-    "shortField",
-]
-assert arrow_table.num_rows == 4
+    arrow_table = pa.Table.from_batches(records)
+    assert arrow_table.schema.names == [
+        "_hoodie_commit_time",
+        "_hoodie_commit_seqno",
+        "_hoodie_record_key",
+        "_hoodie_partition_path",
+        "_hoodie_file_name",
+        "id",
+        "name",
+        "isActive",
+        "intField",
+        "longField",
+        "floatField",
+        "doubleField",
+        "decimalField",
+        "dateField",
+        "timestampField",
+        "binaryField",
+        "arrayField",
+        "mapField",
+        "structField",
+        "byteField",
+        "shortField",
+    ]
+    assert arrow_table.num_rows == 4
 
 print("Python API: read snapshot successfully!")

@@ -26,6 +26,9 @@ mc mb local/hudi-demo
 # unzip the data
 mkdir -p /tmp/tables/cow/
 for zip in /opt/data/tables/cow/*.zip; do unzip -o "$zip" -d "/tmp/tables/cow/"; done
+mkdir -p /tmp/tables/mor/
+for zip in /opt/data/tables/mor/*.zip; do unzip -o "$zip" -d "/tmp/tables/mor/"; done
 
 # copy the data to the bucket
 mc cp -r /tmp/tables/cow/* local/hudi-demo/cow/
+mc cp -r /tmp/tables/mor/* local/hudi-demo/mor/
