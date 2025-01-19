@@ -25,10 +25,28 @@ use crate::Result;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
 
+use crate::config::table::HudiTableConfig::{KeyGeneratorClass, PartitionFields};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
+pub const EMPTY_PARTITION_PATH: &str = "";
+
+pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
+    let has_partition_fields = !hudi_configs
+        .get_or_default(PartitionFields)
+        .to::<Vec<String>>()
+        .is_empty();
+
+    let uses_non_partitioned_key_gen = hudi_configs
+        .try_get(KeyGeneratorClass)
+        .map(|key_gen| {
+            key_gen.to::<String>() == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
+        })
+        .unwrap_or(false);
+
+    has_partition_fields && !uses_non_partitioned_key_gen
+}
 
 /// A partition pruner that filters partitions based on the partition path and its filters.
 #[derive(Debug, Clone)]

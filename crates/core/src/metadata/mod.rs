@@ -17,3 +17,13 @@
  * under the License.
  */
 pub mod meta_field;
+
+pub const HUDI_METADATA_DIR: &str = ".hoodie";
+pub const DELTALAKE_METADATA_DIR: &str = "_delta_log";
+pub const ICEBERG_METADATA_DIR: &str = "metadata";
+
+pub const LAKE_FORMAT_METADATA_DIRS: &[&str; 3] = &[
+    HUDI_METADATA_DIR,
+    DELTALAKE_METADATA_DIR,
+    ICEBERG_METADATA_DIR,
+];

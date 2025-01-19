@@ -41,7 +41,7 @@ use std::str::FromStr;
 #[derive(Clone, Debug)]
 pub struct FileGroup {
     pub file_id: String,
-    pub partition_path: Option<String>,
+    pub partition_path: String,
     pub file_slices: BTreeMap<String, FileSlice>,
 }
 
@@ -64,7 +64,7 @@ impl fmt::Display for FileGroup {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(
             format!(
-                "File Group: partition {:?} id {}",
+                "File Group: partition={}, id={}",
                 &self.partition_path, &self.file_id
             )
             .as_str(),
@@ -73,7 +73,7 @@ impl fmt::Display for FileGroup {
 }
 
 impl FileGroup {
-    pub fn new(file_id: String, partition_path: Option<String>) -> Self {
+    pub fn new(file_id: String, partition_path: String) -> Self {
         Self {
             file_id,
             partition_path,
@@ -83,7 +83,7 @@ impl FileGroup {
 
     pub fn new_with_base_file_name(
         id: String,
-        partition_path: Option<String>,
+        partition_path: String,
         file_name: &str,
     ) -> Result<Self> {
         let mut file_group = Self::new(id, partition_path);
@@ -175,10 +175,14 @@ impl FileGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::partition::EMPTY_PARTITION_PATH;
 
     #[test]
     fn load_a_valid_file_group() {
-        let mut fg = FileGroup::new("5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(), None);
+        let mut fg = FileGroup::new(
+            "5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(),
+            EMPTY_PARTITION_PATH.to_string(),
+        );
         let _ = fg.add_base_file_from_name(
             "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
         );
@@ -186,7 +190,7 @@ mod tests {
             "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402123035233.parquet",
         );
         assert_eq!(fg.file_slices.len(), 2);
-        assert!(fg.partition_path.is_none());
+        assert_eq!(fg.partition_path, EMPTY_PARTITION_PATH);
         let commit_times: Vec<&str> = fg.file_slices.keys().map(|k| k.as_str()).collect();
         assert_eq!(commit_times, vec!["20240402123035233", "20240402144910683"]);
         assert_eq!(
@@ -201,7 +205,10 @@ mod tests {
 
     #[test]
     fn add_base_file_with_same_commit_time_should_fail() {
-        let mut fg = FileGroup::new("5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(), None);
+        let mut fg = FileGroup::new(
+            "5a226868-2934-4f84-a16f-55124630c68d-0".to_owned(),
+            EMPTY_PARTITION_PATH.to_string(),
+        );
         let res1 = fg.add_base_file_from_name(
             "5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
         );
@@ -217,7 +224,7 @@ mod tests {
     fn test_file_group_display() {
         let file_group = FileGroup {
             file_id: "group123".to_string(),
-            partition_path: Some("part/2023-01-01".to_string()),
+            partition_path: "part/2023-01-01".to_string(),
             file_slices: BTreeMap::new(),
         };
 
@@ -225,12 +232,12 @@ mod tests {
 
         assert_eq!(
             display_string,
-            "File Group: partition Some(\"part/2023-01-01\") id group123"
+            "File Group: partition=part/2023-01-01, id=group123"
         );
 
         let file_group_no_partition = FileGroup {
             file_id: "group456".to_string(),
-            partition_path: None,
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
             file_slices: BTreeMap::new(),
         };
 
@@ -238,7 +245,7 @@ mod tests {
 
         assert_eq!(
             display_string_no_partition,
-            "File Group: partition None id group456"
+            "File Group: partition=, id=group456"
         );
     }
 }

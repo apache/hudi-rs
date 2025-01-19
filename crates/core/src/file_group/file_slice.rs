@@ -30,11 +30,11 @@ use std::path::PathBuf;
 pub struct FileSlice {
     pub base_file: BaseFile,
     pub log_files: BTreeSet<LogFile>,
-    pub partition_path: Option<String>,
+    pub partition_path: String,
 }
 
 impl FileSlice {
-    pub fn new(base_file: BaseFile, partition_path: Option<String>) -> Self {
+    pub fn new(base_file: BaseFile, partition_path: String) -> Self {
         Self {
             base_file,
             log_files: BTreeSet::new(),
@@ -43,7 +43,7 @@ impl FileSlice {
     }
 
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
-        let path = PathBuf::from(self.partition_path()).join(file_name);
+        let path = PathBuf::from(self.partition_path.as_str()).join(file_name);
         path.to_str().map(|s| s.to_string()).ok_or_else(|| {
             CoreError::FileGroup(format!("Failed to get relative path for file: {file_name}",))
         })
@@ -65,12 +65,6 @@ impl FileSlice {
     #[inline]
     pub fn file_id(&self) -> &str {
         &self.base_file.file_id
-    }
-
-    /// Returns the partition path of the [FileSlice].
-    #[inline]
-    pub fn partition_path(&self) -> &str {
-        self.partition_path.as_deref().unwrap_or_default()
     }
 
     /// Returns the instant time that marks the [FileSlice] creation.
