@@ -38,8 +38,6 @@ pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet
             .as_array()
             .ok_or_else(|| CoreError::CommitMetadata("Invalid write stats array".into()))?;
 
-        let partition = (!partition.is_empty()).then(|| partition.to_string());
-
         for stat in write_stats {
             let file_id = stat
                 .get("fileId")
@@ -84,8 +82,6 @@ pub fn build_replaced_file_groups(
         let file_ids = file_ids_value
             .as_array()
             .ok_or_else(|| CoreError::CommitMetadata("Invalid file group ids array".into()))?;
-
-        let partition = (!partition.is_empty()).then(|| partition.to_string());
 
         for file_id in file_ids {
             let id = file_id
@@ -269,17 +265,15 @@ mod tests {
                 "byteField=20/shortField=100",
                 "byteField=10/shortField=300",
             ]);
-            let actual_partitions = HashSet::<&str>::from_iter(
-                file_groups
-                    .iter()
-                    .map(|fg| fg.partition_path.as_ref().unwrap().as_str()),
-            );
+            let actual_partitions =
+                HashSet::<&str>::from_iter(file_groups.iter().map(|fg| fg.partition_path.as_str()));
             assert_eq!(actual_partitions, expected_partitions);
         }
     }
 
     mod test_build_replaced_file_groups {
         use super::super::*;
+        use crate::table::partition::EMPTY_PARTITION_PATH;
         use serde_json::{json, Map, Value};
 
         #[test]
@@ -369,7 +363,7 @@ mod tests {
             let file_groups = result.unwrap();
             assert_eq!(file_groups.len(), 1);
             let file_group = file_groups.iter().next().unwrap();
-            assert!(file_group.partition_path.is_none());
+            assert_eq!(file_group.partition_path, EMPTY_PARTITION_PATH);
         }
 
         #[test]
@@ -391,7 +385,7 @@ mod tests {
             let file_groups = result.unwrap();
             let actual_partition_paths = file_groups
                 .iter()
-                .map(|fg| fg.partition_path.as_ref().unwrap().as_str())
+                .map(|fg| fg.partition_path.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(actual_partition_paths, &["20", "20"]);
         }
@@ -432,11 +426,8 @@ mod tests {
             assert_eq!(file_groups.len(), 3);
 
             let expected_partitions = HashSet::from_iter(vec!["10", "20", "30"]);
-            let actual_partitions = HashSet::<&str>::from_iter(
-                file_groups
-                    .iter()
-                    .map(|fg| fg.partition_path.as_ref().unwrap().as_str()),
-            );
+            let actual_partitions =
+                HashSet::<&str>::from_iter(file_groups.iter().map(|fg| fg.partition_path.as_str()));
             assert_eq!(actual_partitions, expected_partitions);
         }
     }

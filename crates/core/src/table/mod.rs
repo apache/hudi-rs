@@ -87,6 +87,7 @@
 
 pub mod builder;
 mod fs_view;
+mod listing;
 pub mod partition;
 
 use crate::config::read::HudiReadConfig::AsOfTimestamp;
