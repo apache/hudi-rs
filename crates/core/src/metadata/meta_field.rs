@@ -200,4 +200,34 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn test_get_schema() {
+        assert_eq!(MetaField::schema().fields.len(), 5);
+        assert_eq!(
+            MetaField::schema().fields[0].name(),
+            MetaField::CommitTime.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[1].name(),
+            MetaField::CommitSeqno.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[2].name(),
+            MetaField::RecordKey.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[3].name(),
+            MetaField::PartitionPath.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[4].name(),
+            MetaField::FileName.as_ref()
+        );
+        assert_eq!(MetaField::schema_with_operation().fields.len(), 6);
+        assert_eq!(
+            MetaField::schema_with_operation().fields[5].name(),
+            MetaField::Operation.as_ref()
+        );
+    }
 }
