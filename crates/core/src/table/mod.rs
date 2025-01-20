@@ -339,9 +339,8 @@ impl Table {
             FilterField::new(MetaField::CommitTime.as_ref()).gt(start_timestamp),
             FilterField::new(MetaField::CommitTime.as_ref()).lte(as_of_timestamp),
         ];
-        let fg_reader = self
-            .create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())
-            .await?;
+        let fg_reader =
+            self.create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())?;
         let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
         let batches = futures::future::try_join_all(
             file_slices
