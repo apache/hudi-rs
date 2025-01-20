@@ -64,6 +64,7 @@ serde_json = { version = "1.0" }
 thiserror = { version = "2.0.10" }
 bytes = { version = "1" }
 chrono = { version = "0.4" }
+lazy_static = { version = "1.5.0" }
 log = { version = "0.4" }
 paste = { version = "1.0.15" }
 strum = { version = "0.26", features = ["derive"] }

@@ -104,6 +104,7 @@ use crate::table::partition::PartitionPruner;
 use crate::timeline::Timeline;
 use crate::Result;
 
+use crate::metadata::meta_field::MetaField;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -263,16 +264,16 @@ impl Table {
         )
     }
 
-    pub async fn create_file_group_reader_with_filters(
+    pub fn create_file_group_reader_with_filters(
         &self,
         filters: &[Filter],
+        schema: &Schema,
     ) -> Result<FileGroupReader> {
-        let schema = self.get_schema().await?;
         FileGroupReader::new_with_filters(
             self.file_system_view.storage.clone(),
             self.hudi_configs.clone(),
             filters,
-            &schema,
+            schema,
         )
     }
 
@@ -335,10 +336,12 @@ impl Table {
 
         // Read incremental records from the file slices.
         let filters = &[
-            FilterField::new("_hoodie_commit_time").gt(start_timestamp),
-            FilterField::new("_hoodie_commit_time").lte(as_of_timestamp),
+            FilterField::new(MetaField::CommitTime.as_ref()).gt(start_timestamp),
+            FilterField::new(MetaField::CommitTime.as_ref()).lte(as_of_timestamp),
         ];
-        let fg_reader = self.create_file_group_reader_with_filters(filters).await?;
+        let fg_reader = self
+            .create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())
+            .await?;
         let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
         let batches = futures::future::try_join_all(
             file_slices
