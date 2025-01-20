@@ -18,8 +18,11 @@
  */
 use crate::error::CoreError;
 use crate::Result;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use lazy_static::lazy_static;
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaField {
@@ -66,10 +69,36 @@ impl FromStr for MetaField {
     }
 }
 
+lazy_static! {
+    static ref SCHEMA: Arc<Schema> = Arc::new(Schema::new(vec![
+        Field::new(MetaField::CommitTime.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::CommitSeqno.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::RecordKey.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::PartitionPath.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::FileName.as_ref(), DataType::Utf8, false),
+    ]));
+    static ref SCHEMA_WITH_OPERATION: Arc<Schema> = Arc::new(Schema::new(vec![
+        Field::new(MetaField::CommitTime.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::CommitSeqno.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::RecordKey.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::PartitionPath.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::FileName.as_ref(), DataType::Utf8, false),
+        Field::new(MetaField::Operation.as_ref(), DataType::Utf8, false),
+    ]));
+}
+
 impl MetaField {
     #[inline]
     pub fn field_index(&self) -> usize {
         self.clone() as usize
+    }
+
+    pub fn schema() -> SchemaRef {
+        SCHEMA.clone()
+    }
+
+    pub fn schema_with_operation() -> SchemaRef {
+        SCHEMA_WITH_OPERATION.clone()
     }
 }
 
@@ -170,5 +199,35 @@ mod tests {
             assert_eq!(field, parsed);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_get_schema() {
+        assert_eq!(MetaField::schema().fields.len(), 5);
+        assert_eq!(
+            MetaField::schema().fields[0].name(),
+            MetaField::CommitTime.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[1].name(),
+            MetaField::CommitSeqno.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[2].name(),
+            MetaField::RecordKey.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[3].name(),
+            MetaField::PartitionPath.as_ref()
+        );
+        assert_eq!(
+            MetaField::schema().fields[4].name(),
+            MetaField::FileName.as_ref()
+        );
+        assert_eq!(MetaField::schema_with_operation().fields.len(), 6);
+        assert_eq!(
+            MetaField::schema_with_operation().fields[5].name(),
+            MetaField::Operation.as_ref()
+        );
     }
 }
