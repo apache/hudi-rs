@@ -137,6 +137,7 @@ pub struct LogBlock {
     pub header: HashMap<BlockMetadataKey, String>,
     pub record_batches: Vec<RecordBatch>,
     pub footer: HashMap<BlockMetadataKey, String>,
+    pub skipped: bool,
 }
 
 impl LogBlock {

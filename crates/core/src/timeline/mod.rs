@@ -17,7 +17,7 @@
  * under the License.
  */
 mod instant;
-mod selector;
+pub(crate) mod selector;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -54,8 +54,8 @@ impl Timeline {
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         Ok(Self {
-            storage,
             hudi_configs,
+            storage,
             completed_commits,
         })
     }
@@ -68,8 +68,8 @@ impl Timeline {
         let selector = TimelineSelector::completed_commits(hudi_configs.clone())?;
         let completed_commits = Self::load_instants(&selector, &storage).await?;
         Ok(Self {
-            storage,
             hudi_configs,
+            storage,
             completed_commits,
         })
     }

@@ -17,6 +17,8 @@
  * under the License.
  */
 
+use crate::config::table::HudiTableConfig;
+use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock,
@@ -24,6 +26,7 @@ use crate::file_group::log_file::log_block::{
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
 use crate::storage::reader::StorageReader;
 use crate::storage::Storage;
+use crate::timeline::selector::InstantRange;
 use crate::Result;
 use arrow_array::RecordBatch;
 use bytes::BytesMut;
@@ -36,31 +39,48 @@ pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct LogFileReader<R> {
+    hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     reader: R,
     buffer: BytesMut,
+    timezone: String,
 }
 
 impl LogFileReader<StorageReader> {
-    pub async fn new(storage: Arc<Storage>, relative_path: &str) -> Result<Self> {
+    pub async fn new(
+        hudi_configs: Arc<HudiConfigs>,
+        storage: Arc<Storage>,
+        relative_path: &str,
+    ) -> Result<Self> {
         let reader = storage.get_storage_reader(relative_path).await?;
+        let timezone = hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .to::<String>();
         Ok(Self {
+            hudi_configs,
             storage,
             reader,
             buffer: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
+            timezone,
         })
     }
 
-    fn read_all_blocks(&mut self) -> Result<Vec<LogBlock>> {
+    fn read_all_blocks(&mut self, instant_range: &InstantRange) -> Result<Vec<LogBlock>> {
         let mut blocks = Vec::new();
-        while let Some(block) = self.read_next_block()? {
+        while let Some(block) = self.read_next_block(instant_range)? {
+            if block.skipped {
+                continue;
+            }
             blocks.push(block);
         }
         Ok(blocks)
     }
 
-    pub fn read_all_records_unmerged(&mut self) -> Result<Vec<RecordBatch>> {
-        let all_blocks = self.read_all_blocks()?;
+    pub fn read_all_records_unmerged(
+        &mut self,
+        instant_range: &InstantRange,
+    ) -> Result<Vec<RecordBatch>> {
+        let all_blocks = self.read_all_blocks(instant_range)?;
         let mut batches = Vec::new();
         for block in all_blocks {
             batches.extend_from_slice(&block.record_batches);
@@ -217,7 +237,21 @@ impl<R: Read + Seek> LogFileReader<R> {
         Ok(Some(u64::from_be_bytes(size_buf)))
     }
 
-    fn read_next_block(&mut self) -> Result<Option<LogBlock>> {
+    fn should_skip_block(
+        &self,
+        header: &HashMap<BlockMetadataKey, String>,
+        instant_range: &InstantRange,
+    ) -> Result<bool> {
+        let instant_time =
+            header
+                .get(&BlockMetadataKey::InstantTime)
+                .ok_or(CoreError::LogFormatError(
+                    "Instant time not found".to_string(),
+                ))?;
+        instant_range.not_in_range(instant_time, &self.timezone)
+    }
+
+    fn read_next_block(&mut self, instant_range: &InstantRange) -> Result<Option<LogBlock>> {
         if !self.read_magic()? {
             return Ok(None);
         }
@@ -231,6 +265,11 @@ impl<R: Read + Seek> LogFileReader<R> {
         let format_version = self.read_format_version()?;
         let block_type = self.read_block_type(&format_version)?;
         let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+        let mut skipped = false;
+        if self.should_skip_block(&header, instant_range)? {
+            skipped = true;
+            // TODO skip reading block
+        }
         let content = self.read_content(&format_version, block_length)?;
         let record_batches = LogBlock::decode_content(&block_type, content)?;
         let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
@@ -242,6 +281,7 @@ impl<R: Read + Seek> LogFileReader<R> {
             header,
             record_batches,
             footer,
+            skipped,
         }))
     }
 }
@@ -265,9 +305,13 @@ mod tests {
     async fn test_read_sample_log_file() {
         let (dir, file_name) = get_sample_log_file();
         let dir_url = Url::from_directory_path(dir).unwrap();
+        let hudi_configs = Arc::new(HudiConfigs::empty());
         let storage = Storage::new_with_base_url(dir_url).unwrap();
-        let mut reader = LogFileReader::new(storage, &file_name).await.unwrap();
-        let blocks = reader.read_all_blocks().unwrap();
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name)
+            .await
+            .unwrap();
+        let instant_range = InstantRange::up_to("20250113230424191", "utc");
+        let blocks = reader.read_all_blocks(&instant_range).unwrap();
         assert_eq!(blocks.len(), 1);
 
         let block = &blocks[0];
