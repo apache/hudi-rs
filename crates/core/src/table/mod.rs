@@ -352,10 +352,12 @@ impl Table {
         let fg_reader =
             self.create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())?;
         let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+        let timezone = self.timezone();
+        let instant_range = InstantRange::up_to(as_of_timestamp, &timezone);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
         )
         .await?;
         Ok(batches)
