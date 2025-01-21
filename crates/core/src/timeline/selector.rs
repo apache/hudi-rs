@@ -25,6 +25,7 @@ use crate::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InstantRange {
     timezone: String,
@@ -56,6 +57,28 @@ impl InstantRange {
         Self::new(
             timezone.to_string(),
             None,
+            Some(end_timestamp.to_string()),
+            false,
+            true,
+        )
+    }
+
+    /// Create a new [InstantRange] with an open timestamp range.
+    pub fn within(start_timestamp: &str, end_timestamp: &str, timezone: &str) -> Self {
+        Self::new(
+            timezone.to_string(),
+            Some(start_timestamp.to_string()),
+            Some(end_timestamp.to_string()),
+            false,
+            false,
+        )
+    }
+
+    /// Create a new [InstantRange] with an open start and closed end timestamp range.
+    pub fn within_open_closed(start_timestamp: &str, end_timestamp: &str, timezone: &str) -> Self {
+        Self::new(
+            timezone.to_string(),
+            Some(start_timestamp.to_string()),
             Some(end_timestamp.to_string()),
             false,
             true,
