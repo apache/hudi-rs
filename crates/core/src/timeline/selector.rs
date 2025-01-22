@@ -52,7 +52,7 @@ impl InstantRange {
         }
     }
 
-    /// Create a new [InstantRange] with an end timestamp inclusive.
+    /// Create a new [InstantRange] with a closed end timestamp range.
     pub fn up_to(end_timestamp: &str, timezone: &str) -> Self {
         Self::new(
             timezone.to_string(),
@@ -322,6 +322,36 @@ mod tests {
 
         assert_eq!(range.timezone(), "UTC");
         assert!(range.start_timestamp.is_none());
+        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(!range.start_inclusive);
+        assert!(range.end_inclusive);
+    }
+
+    #[test]
+    fn test_within() {
+        let range = InstantRange::within(
+            "20240101000000000",
+            "20241231235959999",
+            "UTC"
+        );
+
+        assert_eq!(range.timezone(), "UTC");
+        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
+        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(!range.start_inclusive);
+        assert!(!range.end_inclusive);
+    }
+
+    #[test]
+    fn test_within_open_closed() {
+        let range = InstantRange::within_open_closed(
+            "20240101000000000",
+            "20241231235959999",
+            "UTC"
+        );
+
+        assert_eq!(range.timezone(), "UTC");
+        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
         assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
         assert!(!range.start_inclusive);
         assert!(range.end_inclusive);
