@@ -19,6 +19,7 @@
 //! Hudi read configurations.
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::str::FromStr;
 
 use strum_macros::EnumIter;
@@ -66,6 +67,12 @@ impl AsRef<str> for HudiReadConfig {
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
         }
+    }
+}
+
+impl Display for HudiReadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
     }
 }
 
