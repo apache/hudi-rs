@@ -90,11 +90,10 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
-use crate::config::read::HudiReadConfig::AsOfTimestamp;
+use crate::config::read::HudiReadConfig::{AsOfTimestamp, UseReadOptimizedMode};
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
-use crate::error::CoreError;
 use crate::expr::filter::{Filter, FilterField};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -141,11 +140,25 @@ impl Table {
             .await
     }
 
-    pub fn base_url(&self) -> Result<Url> {
+    #[inline]
+    pub fn base_url(&self) -> Url {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::BasePath);
         self.hudi_configs
-            .get(HudiTableConfig::BasePath)?
+            .get(HudiTableConfig::BasePath)
+            .expect(&err_msg)
             .to_url()
-            .map_err(CoreError::from)
+            .expect(&err_msg)
+    }
+
+    #[inline]
+    pub fn table_type(&self) -> TableTypeValue {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
+        let table_type = self
+            .hudi_configs
+            .get(HudiTableConfig::TableType)
+            .expect(&err_msg)
+            .to::<String>();
+        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
     }
 
     #[inline]
@@ -174,16 +187,6 @@ impl Table {
         self.file_system_view
             .storage
             .register_object_store(runtime_env.clone());
-    }
-
-    pub fn get_table_type(&self) -> TableTypeValue {
-        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
-        let table_type = self
-            .hudi_configs
-            .get(HudiTableConfig::TableType)
-            .expect(&err_msg)
-            .to::<String>();
-        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
     }
 
     /// Get the latest [Schema] of the table.
@@ -289,11 +292,21 @@ impl Table {
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
     pub async fn read_snapshot(&self, filters: &[Filter]) -> Result<Vec<RecordBatch>> {
+        let read_optimized_mode = self
+            .hudi_configs
+            .get_or_default(UseReadOptimizedMode)
+            .to::<bool>();
+
         if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.read_snapshot_as_of(timestamp.to::<String>().as_str(), filters)
-                .await
+            self.read_snapshot_as_of(
+                timestamp.to::<String>().as_str(),
+                filters,
+                read_optimized_mode,
+            )
+            .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.read_snapshot_as_of(timestamp, filters).await
+            self.read_snapshot_as_of(timestamp, filters, read_optimized_mode)
+                .await
         } else {
             Ok(Vec::new())
         }
@@ -304,10 +317,12 @@ impl Table {
         &self,
         timestamp: &str,
         filters: &[Filter],
+        read_optimized_mode: bool,
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
-        let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+        let base_file_only =
+            read_optimized_mode || self.table_type() == TableTypeValue::CopyOnWrite;
         let timezone = self.timezone();
         let instant_range = InstantRange::up_to(timestamp, &timezone);
         let batches = futures::future::try_join_all(
@@ -351,7 +366,9 @@ impl Table {
         ];
         let fg_reader =
             self.create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())?;
-        let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+
+        // Read-optimized mode does not apply to incremental query semantics.
+        let base_file_only = self.table_type() == TableTypeValue::CopyOnWrite;
         let timezone = self.timezone();
         let instant_range =
             InstantRange::within_open_closed(start_timestamp, end_timestamp, &timezone);
@@ -416,7 +433,7 @@ mod tests {
     /// Test helper to get relative file paths from the table with filters.
     async fn get_file_paths_with_filters(table: &Table, filters: &[Filter]) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
-        let base_url = table.base_url()?;
+        let base_url = table.base_url();
         for f in table.get_file_slices(filters).await? {
             let relative_path = f.base_file_relative_path()?;
             let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
@@ -947,6 +964,36 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_non_partitioned_read_optimized() -> Result<()> {
+            let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let commit_timestamps = hudi_table
+                .timeline
+                .completed_commits
+                .iter()
+                .map(|i| i.timestamp.as_str())
+                .collect::<Vec<_>>();
+            let latest_commit = commit_timestamps.last().unwrap();
+            let records = hudi_table
+                .read_snapshot_as_of(latest_commit, &[], true)
+                .await?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(
+                sample_data,
+                vec![
+                    (1, "Alice", true), // this was updated to false in a log file and not to be read out
+                    (2, "Bob", false),
+                    (3, "Carol", true),
+                    (4, "Diana", true), // this was inserted in a base file and should be read out
+                ]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
             for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
@@ -977,7 +1024,9 @@ mod tests {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
+                let records = hudi_table
+                    .read_snapshot_as_of(first_commit, &[], false)
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 

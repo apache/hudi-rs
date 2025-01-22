@@ -181,11 +181,7 @@ impl TableProvider for HudiDataSource {
             .get_file_slices_splits(self.get_input_partitions(), pushdown_filters.as_slice())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
-        let base_url = self.table.base_url().map_err(|e| {
-            Execution(format!(
-                "Failed to get base path config from Hudi table: {e:?}"
-            ))
-        })?;
+        let base_url = self.table.base_url();
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {
             let mut parquet_file_group_vec = Vec::new();
@@ -204,12 +200,7 @@ impl TableProvider for HudiDataSource {
             parquet_file_groups.push(parquet_file_group_vec)
         }
 
-        let base_url = self.table.base_url().map_err(|e| {
-            Execution(format!(
-                "Failed to get base path config from Hudi table: {}",
-                e
-            ))
-        })?;
+        let base_url = self.table.base_url();
         let url = ObjectStoreUrl::parse(get_scheme_authority(&base_url))?;
         let fsc = FileScanConfig::new(url, self.schema())
             .with_file_groups(parquet_file_groups)
