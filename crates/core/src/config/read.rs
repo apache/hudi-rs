@@ -23,7 +23,7 @@ use std::str::FromStr;
 
 use strum_macros::EnumIter;
 
-use crate::config::error::ConfigError::{NotFound, ParseInt};
+use crate::config::error::ConfigError::{NotFound, ParseBool, ParseInt};
 use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
 
@@ -52,6 +52,10 @@ pub enum HudiReadConfig {
 
     /// Parallelism for listing files on storage.
     ListingParallelism,
+
+    /// When set to true, only [BaseFile]s will be read for optimized reads.
+    /// This is only applicable to Merge-On-Read (MOR) tables.
+    UseReadOptimizedMode,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -60,6 +64,7 @@ impl AsRef<str> for HudiReadConfig {
             Self::AsOfTimestamp => "hoodie.read.as.of.timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
+            Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
         }
     }
 }
@@ -71,6 +76,7 @@ impl ConfigParser for HudiReadConfig {
         match self {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
+            HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             _ => None,
         }
     }
@@ -93,6 +99,11 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::UseReadOptimizedMode => get_result
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::Boolean),
         }
     }
 }
@@ -100,25 +111,70 @@ impl ConfigParser for HudiReadConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::read::HudiReadConfig::InputPartitions;
+    use crate::config::read::HudiReadConfig::{
+        InputPartitions, ListingParallelism, UseReadOptimizedMode,
+    };
 
     #[test]
     fn parse_valid_config_value() {
-        let options = HashMap::from([(InputPartitions.as_ref().to_string(), "100".to_string())]);
-        let value = InputPartitions.parse_value(&options).unwrap().to::<usize>();
-        assert_eq!(value, 100);
+        let options = HashMap::from([
+            (InputPartitions.as_ref().to_string(), "100".to_string()),
+            (ListingParallelism.as_ref().to_string(), "100".to_string()),
+            (
+                UseReadOptimizedMode.as_ref().to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            InputPartitions.parse_value(&options).unwrap().to::<usize>(),
+            100
+        );
+        assert_eq!(
+            ListingParallelism
+                .parse_value(&options)
+                .unwrap()
+                .to::<usize>(),
+            100
+        );
+        assert!(UseReadOptimizedMode
+            .parse_value(&options)
+            .unwrap()
+            .to::<bool>());
     }
 
     #[test]
     fn parse_invalid_config_value() {
-        let options = HashMap::from([(InputPartitions.as_ref().to_string(), "foo".to_string())]);
-        let value = InputPartitions.parse_value(&options);
-        assert!(matches!(value.unwrap_err(), ParseInt(_, _, _)));
+        let options = HashMap::from([
+            (InputPartitions.as_ref().to_string(), "foo".to_string()),
+            (ListingParallelism.as_ref().to_string(), "_100".to_string()),
+            (UseReadOptimizedMode.as_ref().to_string(), "1".to_string()),
+        ]);
+        assert!(matches!(
+            InputPartitions.parse_value(&options).unwrap_err(),
+            ParseInt(_, _, _)
+        ));
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)
                 .to::<usize>(),
             0
         );
+        assert!(matches!(
+            ListingParallelism.parse_value(&options).unwrap_err(),
+            ParseInt(_, _, _)
+        ));
+        assert_eq!(
+            ListingParallelism
+                .parse_value_or_default(&options)
+                .to::<usize>(),
+            10
+        );
+        assert!(matches!(
+            UseReadOptimizedMode.parse_value(&options).unwrap_err(),
+            ParseBool(_, _, _)
+        ));
+        assert!(!UseReadOptimizedMode
+            .parse_value_or_default(&options)
+            .to::<bool>(),)
     }
 }

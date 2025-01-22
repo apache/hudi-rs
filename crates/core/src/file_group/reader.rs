@@ -32,18 +32,19 @@ use std::sync::Arc;
 
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::merge::record_merger::RecordMerger;
+use crate::timeline::selector::InstantRange;
 use arrow::compute::filter_record_batch;
 
 /// File group reader handles all read operations against a file group.
 #[derive(Clone, Debug)]
 pub struct FileGroupReader {
-    storage: Arc<Storage>,
     hudi_configs: Arc<HudiConfigs>,
+    storage: Arc<Storage>,
     and_filters: Vec<SchemableFilter>,
 }
 
 impl FileGroupReader {
-    pub fn new(storage: Arc<Storage>, hudi_configs: Arc<HudiConfigs>) -> Self {
+    pub fn new(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
         Self {
             storage,
             hudi_configs,
@@ -84,7 +85,7 @@ impl FileGroupReader {
         let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
 
         let storage = Storage::new(Arc::new(others), hudi_configs.clone())?;
-        Ok(Self::new(storage, hudi_configs))
+        Ok(Self::new(hudi_configs, storage))
     }
 
     fn create_boolean_array_mask(&self, records: &RecordBatch) -> Result<BooleanArray> {
@@ -124,6 +125,7 @@ impl FileGroupReader {
         &self,
         file_slice: &FileSlice,
         base_file_only: bool,
+        instant_range: InstantRange,
     ) -> Result<RecordBatch> {
         let relative_path = file_slice.base_file_relative_path()?;
         if base_file_only {
@@ -138,9 +140,11 @@ impl FileGroupReader {
 
             for log_file in &file_slice.log_files {
                 let relative_path = file_slice.log_file_relative_path(log_file)?;
+                let hudi_configs = self.hudi_configs.clone();
                 let storage = self.storage.clone();
-                let mut log_file_reader = LogFileReader::new(storage, &relative_path).await?;
-                let log_file_records = log_file_reader.read_all_records_unmerged()?;
+                let mut log_file_reader =
+                    LogFileReader::new(hudi_configs, storage, &relative_path).await?;
+                let log_file_records = log_file_reader.read_all_records_unmerged(&instant_range)?;
                 all_records.extend_from_slice(&log_file_records);
             }
 
@@ -165,7 +169,7 @@ mod tests {
     fn test_new() {
         let base_url = Url::parse("file:///tmp/hudi_data").unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let fg_reader = FileGroupReader::new(storage.clone(), Arc::from(HudiConfigs::empty()));
+        let fg_reader = FileGroupReader::new(Arc::from(HudiConfigs::empty()), storage.clone());
         assert!(Arc::ptr_eq(&fg_reader.storage, &storage));
     }
 
@@ -237,7 +241,7 @@ mod tests {
             Storage::new_with_base_url(Url::parse("file:///non-existent-path/table").unwrap())
                 .unwrap();
         let empty_configs = Arc::new(HudiConfigs::empty());
-        let reader = FileGroupReader::new(storage, empty_configs.clone());
+        let reader = FileGroupReader::new(empty_configs.clone(), storage);
         let result = reader
             .read_file_slice_by_base_file_path("non_existent_file")
             .await;

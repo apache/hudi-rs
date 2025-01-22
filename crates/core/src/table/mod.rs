@@ -90,11 +90,10 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
-use crate::config::read::HudiReadConfig::AsOfTimestamp;
+use crate::config::read::HudiReadConfig::{AsOfTimestamp, UseReadOptimizedMode};
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
-use crate::error::CoreError;
 use crate::expr::filter::{Filter, FilterField};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -105,6 +104,7 @@ use crate::timeline::Timeline;
 use crate::Result;
 
 use crate::metadata::meta_field::MetaField;
+use crate::timeline::selector::InstantRange;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -140,11 +140,32 @@ impl Table {
             .await
     }
 
-    pub fn base_url(&self) -> Result<Url> {
+    #[inline]
+    pub fn base_url(&self) -> Url {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::BasePath);
         self.hudi_configs
-            .get(HudiTableConfig::BasePath)?
+            .get(HudiTableConfig::BasePath)
+            .expect(&err_msg)
             .to_url()
-            .map_err(CoreError::from)
+            .expect(&err_msg)
+    }
+
+    #[inline]
+    pub fn table_type(&self) -> TableTypeValue {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
+        let table_type = self
+            .hudi_configs
+            .get(HudiTableConfig::TableType)
+            .expect(&err_msg)
+            .to::<String>();
+        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
+    }
+
+    #[inline]
+    pub fn timezone(&self) -> String {
+        self.hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .to::<String>()
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -166,16 +187,6 @@ impl Table {
         self.file_system_view
             .storage
             .register_object_store(runtime_env.clone());
-    }
-
-    pub fn get_table_type(&self) -> TableTypeValue {
-        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
-        let table_type = self
-            .hudi_configs
-            .get(HudiTableConfig::TableType)
-            .expect(&err_msg)
-            .to::<String>();
-        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
     }
 
     /// Get the latest [Schema] of the table.
@@ -259,8 +270,8 @@ impl Table {
 
     pub fn create_file_group_reader(&self) -> FileGroupReader {
         FileGroupReader::new(
-            self.file_system_view.storage.clone(),
             self.hudi_configs.clone(),
+            self.file_system_view.storage.clone(),
         )
     }
 
@@ -281,11 +292,21 @@ impl Table {
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
     pub async fn read_snapshot(&self, filters: &[Filter]) -> Result<Vec<RecordBatch>> {
+        let read_optimized_mode = self
+            .hudi_configs
+            .get_or_default(UseReadOptimizedMode)
+            .to::<bool>();
+
         if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.read_snapshot_as_of(timestamp.to::<String>().as_str(), filters)
-                .await
+            self.read_snapshot_as_of(
+                timestamp.to::<String>().as_str(),
+                filters,
+                read_optimized_mode,
+            )
+            .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.read_snapshot_as_of(timestamp, filters).await
+            self.read_snapshot_as_of(timestamp, filters, read_optimized_mode)
+                .await
         } else {
             Ok(Vec::new())
         }
@@ -296,14 +317,18 @@ impl Table {
         &self,
         timestamp: &str,
         filters: &[Filter],
+        read_optimized_mode: bool,
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
-        let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+        let base_file_only =
+            read_optimized_mode || self.table_type() == TableTypeValue::CopyOnWrite;
+        let timezone = self.timezone();
+        let instant_range = InstantRange::up_to(timestamp, &timezone);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
         )
         .await?;
         Ok(batches)
@@ -316,7 +341,7 @@ impl Table {
         end_timestamp: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
         // If the end timestamp is not provided, use the latest commit timestamp.
-        let Some(as_of_timestamp) =
+        let Some(end_timestamp) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
         else {
             return Ok(Vec::new());
@@ -326,10 +351,10 @@ impl Table {
         let mut file_slices: Vec<FileSlice> = Vec::new();
         let file_groups = self
             .timeline
-            .get_incremental_file_groups(Some(start_timestamp), Some(as_of_timestamp))
+            .get_incremental_file_groups(Some(start_timestamp), Some(end_timestamp))
             .await?;
         for file_group in file_groups {
-            if let Some(file_slice) = file_group.get_file_slice_as_of(as_of_timestamp) {
+            if let Some(file_slice) = file_group.get_file_slice_as_of(end_timestamp) {
                 file_slices.push(file_slice.clone());
             }
         }
@@ -337,15 +362,20 @@ impl Table {
         // Read incremental records from the file slices.
         let filters = &[
             FilterField::new(MetaField::CommitTime.as_ref()).gt(start_timestamp),
-            FilterField::new(MetaField::CommitTime.as_ref()).lte(as_of_timestamp),
+            FilterField::new(MetaField::CommitTime.as_ref()).lte(end_timestamp),
         ];
         let fg_reader =
             self.create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())?;
-        let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+
+        // Read-optimized mode does not apply to incremental query semantics.
+        let base_file_only = self.table_type() == TableTypeValue::CopyOnWrite;
+        let timezone = self.timezone();
+        let instant_range =
+            InstantRange::within_open_closed(start_timestamp, end_timestamp, &timezone);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
         )
         .await?;
         Ok(batches)
@@ -403,7 +433,7 @@ mod tests {
     /// Test helper to get relative file paths from the table with filters.
     async fn get_file_paths_with_filters(table: &Table, filters: &[Filter]) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
-        let base_url = table.base_url()?;
+        let base_url = table.base_url();
         for f in table.get_file_slices(filters).await? {
             let relative_path = f.base_file_relative_path()?;
             let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
@@ -896,19 +926,14 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    mod test_snapshot_queries {
+    mod test_snapshot_and_time_travel_queries {
         use super::super::*;
-        use crate::metadata::meta_field::MetaField;
-        use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
+        use arrow::compute::concat_batches;
         use hudi_tests::SampleTable;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
-            let base_urls = [
-                SampleTable::V6Empty.url_to_cow(),
-                SampleTable::V6Empty.url_to_mor(),
-            ];
-            for base_url in base_urls.iter() {
+            for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table.read_snapshot(&[]).await?;
                 assert!(records.is_empty());
@@ -918,203 +943,194 @@ mod tests {
 
         #[tokio::test]
         async fn test_non_partitioned() -> Result<()> {
-            let base_urls = [
-                SampleTable::V6Nonpartitioned.url_to_cow(),
-                SampleTable::V6Nonpartitioned.url_to_mor(),
-            ];
-            for base_url in base_urls.iter() {
+            for base_url in SampleTable::V6Nonpartitioned.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table.read_snapshot(&[]).await?;
-                let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
 
-                let ids = all_records
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
-                let names = all_records
-                    .column_by_name("name")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let is_actives = all_records
-                    .column_by_name("isActive")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .unwrap();
-
-                let mut data: Vec<(i32, &str, bool)> = ids
-                    .iter()
-                    .zip(names.iter())
-                    .zip(is_actives.iter())
-                    .map(|((id, name), is_active)| (id.unwrap(), name.unwrap(), is_active.unwrap()))
-                    .collect();
-                data.sort_unstable_by_key(|(id, _, _)| *id);
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
                 assert_eq!(
-                    data,
+                    sample_data,
                     vec![
                         (1, "Alice", false),
                         (2, "Bob", false),
                         (3, "Carol", true),
                         (4, "Diana", true),
                     ]
-                )
+                );
             }
             Ok(())
         }
 
         #[tokio::test]
-        async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
-            let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_mor();
+        async fn test_non_partitioned_read_optimized() -> Result<()> {
+            let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
             let hudi_table = Table::new(base_url.path()).await?;
-
-            let filters = &[
-                Filter::try_from(("byteField", ">=", "10"))?,
-                Filter::try_from(("byteField", "<", "20"))?,
-                Filter::try_from(("shortField", "!=", "100"))?,
-            ];
-            let records = hudi_table.read_snapshot(filters).await?;
-            let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
-
-            let partition_paths = all_records
-                .column_by_name(MetaField::PartitionPath.as_ref())
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let ids = all_records
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
-            let names = all_records
-                .column_by_name("name")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let is_actives = all_records
-                .column_by_name("isActive")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap();
-
-            let mut data: Vec<(&str, i32, &str, bool)> = partition_paths
+            let commit_timestamps = hudi_table
+                .timeline
+                .completed_commits
                 .iter()
-                .zip(ids.iter())
-                .zip(names.iter())
-                .zip(is_actives.iter())
-                .map(|(((pt, id), name), is_active)| {
-                    (pt.unwrap(), id.unwrap(), name.unwrap(), is_active.unwrap())
-                })
-                .collect();
-            data.sort_unstable_by_key(|(_, id, _, _)| *id);
+                .map(|i| i.timestamp.as_str())
+                .collect::<Vec<_>>();
+            let latest_commit = commit_timestamps.last().unwrap();
+            let records = hudi_table
+                .read_snapshot_as_of(latest_commit, &[], true)
+                .await?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
             assert_eq!(
-                data,
+                sample_data,
                 vec![
-                    ("byteField=10/shortField=300", 1, "Alice", false),
-                    ("byteField=10/shortField=300", 3, "Carol", true),
+                    (1, "Alice", true), // this was updated to false in a log file and not to be read out
+                    (2, "Bob", false),
+                    (3, "Carol", true),
+                    (4, "Diana", true), // this was inserted in a base file and should be read out
                 ]
             );
+            Ok(())
+        }
 
+        #[tokio::test]
+        async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
+            for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
+                let hudi_table = Table::new(base_url.path()).await?;
+
+                let filters = &[
+                    Filter::try_from(("byteField", ">=", "10"))?,
+                    Filter::try_from(("byteField", "<", "20"))?,
+                    Filter::try_from(("shortField", "!=", "100"))?,
+                ];
+                let records = hudi_table.read_snapshot(filters).await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true),]);
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
+            for base_url in &[SampleTable::V6SimplekeygenNonhivestyle.url_to_mor()] {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let commit_timestamps = hudi_table
+                    .timeline
+                    .completed_commits
+                    .iter()
+                    .map(|i| i.timestamp.as_str())
+                    .collect::<Vec<_>>();
+                let first_commit = commit_timestamps[0];
+                let records = hudi_table
+                    .read_snapshot_as_of(first_commit, &[], false)
+                    .await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![(1, "Alice", true), (2, "Bob", false), (3, "Carol", true),]
+                );
+            }
             Ok(())
         }
     }
 
     mod test_incremental_queries {
         use super::super::*;
-        use arrow_array::{Array, StringArray};
+        use arrow_select::concat::concat_batches;
         use hudi_tests::SampleTable;
-        use std::collections::HashSet;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
-            let base_url = SampleTable::V6Empty.url_to_cow();
-            let hudi_table = Table::new(base_url.path()).await?;
-
-            let records = hudi_table.read_incremental_records("0", None).await?;
-            assert!(records.is_empty());
-
+            for base_url in SampleTable::V6Empty.urls() {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let records = hudi_table.read_incremental_records("0", None).await?;
+                assert!(records.is_empty())
+            }
             Ok(())
         }
 
         #[tokio::test]
         async fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
-            let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_cow();
-            let hudi_table = Table::new(base_url.path()).await?;
+            for base_url in SampleTable::V6SimplekeygenNonhivestyleOverwritetable.urls() {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let commit_timestamps = hudi_table
+                    .timeline
+                    .completed_commits
+                    .iter()
+                    .map(|i| i.timestamp.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(commit_timestamps.len(), 3);
+                let first_commit = commit_timestamps[0];
+                let second_commit = commit_timestamps[1];
+                let third_commit = commit_timestamps[2];
 
-            // read records changed from the first commit (exclusive) to the second commit (inclusive)
-            let records = hudi_table
-                .read_incremental_records("20240707001301554", Some("20240707001302376"))
-                .await?;
-            assert_eq!(records.len(), 2);
-            assert_eq!(records[0].num_rows(), 1);
-            assert_eq!(records[1].num_rows(), 1);
+                // read records changed from the beginning to the 1st commit
+                let records = hudi_table
+                    .read_incremental_records("19700101000000", Some(first_commit))
+                    .await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![(1, "Alice", true), (2, "Bob", false), (3, "Carol", true),],
+                    "Should return 3 records inserted in the 1st commit"
+                );
 
-            // verify the partition paths
-            let partition_paths = StringArray::from(
-                arrow::compute::concat(&[
-                    records[0].column_by_name("_hoodie_partition_path").unwrap(),
-                    records[1].column_by_name("_hoodie_partition_path").unwrap(),
-                ])?
-                .to_data(),
-            );
-            let actual_partition_paths =
-                HashSet::<&str>::from_iter(partition_paths.iter().map(|s| s.unwrap()));
-            let expected_partition_paths = HashSet::from_iter(vec!["10", "30"]);
-            assert_eq!(actual_partition_paths, expected_partition_paths);
+                // read records changed from the 1st to the 2nd commit
+                let records = hudi_table
+                    .read_incremental_records(first_commit, Some(second_commit))
+                    .await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![(1, "Alice", false), (4, "Diana", true),],
+                    "Should return 2 records inserted or updated in the 2nd commit"
+                );
 
-            // verify the file names
-            let file_names = StringArray::from(
-                arrow::compute::concat(&[
-                    records[0].column_by_name("_hoodie_file_name").unwrap(),
-                    records[1].column_by_name("_hoodie_file_name").unwrap(),
-                ])?
-                .to_data(),
-            );
-            let actual_file_names =
-                HashSet::<&str>::from_iter(file_names.iter().map(|s| s.unwrap()));
-            let expected_file_names = HashSet::from_iter(vec![
-                "d398fae1-c0e6-4098-8124-f55f7098bdba-0_1-95-136_20240707001302376.parquet",
-                "4f2685a3-614f-49ca-9b2b-e1cb9fb61f27-0_0-95-135_20240707001302376.parquet",
-            ]);
-            assert_eq!(actual_file_names, expected_file_names);
+                // read records changed from the 2nd to the 3rd commit
+                let records = hudi_table
+                    .read_incremental_records(second_commit, Some(third_commit))
+                    .await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![(4, "Diana", false),],
+                    "Should return 1 record insert-overwritten in the 3rd commit"
+                );
 
-            // read records changed from the first commit (exclusive) to
-            // the latest (an insert overwrite table's replacecommit)
-            let records = hudi_table
-                .read_incremental_records("20240707001301554", None)
-                .await?;
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].num_rows(), 1);
+                // read records changed from the 1st commit
+                let records = hudi_table
+                    .read_incremental_records(first_commit, None)
+                    .await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![(4, "Diana", false),],
+                    "Should return 1 record insert-overwritten in the 3rd commit"
+                );
 
-            // verify the partition paths
-            let actual_partition_paths = StringArray::from(
-                records[0]
-                    .column_by_name("_hoodie_partition_path")
-                    .unwrap()
-                    .to_data(),
-            );
-            let expected_partition_paths = StringArray::from(vec!["30"]);
-            assert_eq!(actual_partition_paths, expected_partition_paths);
-
-            // verify the file names
-            let actual_file_names = StringArray::from(
-                records[0]
-                    .column_by_name("_hoodie_file_name")
-                    .unwrap()
-                    .to_data(),
-            );
-            let expected_file_names = StringArray::from(vec![
-                "ebcb261d-62d3-4895-90ec-5b3c9622dff4-0_0-111-154_20240707001303088.parquet",
-            ]);
-            assert_eq!(actual_file_names, expected_file_names);
-
+                // read records changed from the 3rd commit
+                let records = hudi_table
+                    .read_incremental_records(third_commit, None)
+                    .await?;
+                assert!(
+                    records.is_empty(),
+                    "Should return 0 record as it's the latest commit"
+                );
+            }
             Ok(())
         }
     }
