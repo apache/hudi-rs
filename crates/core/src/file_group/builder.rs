@@ -44,21 +44,42 @@ pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| CoreError::CommitMetadata("Invalid fileId in write stats".into()))?;
 
-            let path = stat
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| CoreError::CommitMetadata("Invalid path in write stats".into()))?;
+            let mut file_group = FileGroup::new(file_id.to_string(), partition.clone());
 
-            let file_name = Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?;
+            if let Some(base_file_name) = stat.get("baseFile") {
+                let base_file_name = base_file_name
+                    .as_str()
+                    .ok_or_else(|| CoreError::CommitMetadata("Invalid base file name".into()))?;
+                file_group.add_base_file_from_name(base_file_name)?;
 
-            let file_group = FileGroup::new_with_base_file_name(
-                file_id.to_string(),
-                partition.clone(),
-                file_name,
-            )?;
+                if let Some(log_file_names) = stat.get("logFiles") {
+                    let log_file_names = log_file_names.as_array().ok_or_else(|| {
+                        CoreError::CommitMetadata("Invalid log files array".into())
+                    })?;
+                    for log_file_name in log_file_names {
+                        let log_file_name = log_file_name.as_str().ok_or_else(|| {
+                            CoreError::CommitMetadata("Invalid log file name".into())
+                        })?;
+                        file_group.add_log_file_from_name(log_file_name)?;
+                    }
+                } else {
+                    return Err(CoreError::CommitMetadata(
+                        "Missing log files in write stats".into(),
+                    ));
+                }
+            } else {
+                let path = stat.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                    CoreError::CommitMetadata("Invalid path in write stats".into())
+                })?;
+
+                let file_name = Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?;
+
+                file_group.add_base_file_from_name(file_name)?;
+            }
+
             file_groups.insert(file_group);
         }
     }
