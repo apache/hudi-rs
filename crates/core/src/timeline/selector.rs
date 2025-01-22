@@ -25,6 +25,91 @@ use crate::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+pub struct InstantRange {
+    timezone: String,
+    start_timestamp: Option<String>,
+    end_timestamp: Option<String>,
+    start_inclusive: bool,
+    end_inclusive: bool,
+}
+
+impl InstantRange {
+    pub fn new(
+        timezone: String,
+        start_timestamp: Option<String>,
+        end_timestamp: Option<String>,
+        start_inclusive: bool,
+        end_inclusive: bool,
+    ) -> Self {
+        Self {
+            timezone,
+            start_timestamp,
+            end_timestamp,
+            start_inclusive,
+            end_inclusive,
+        }
+    }
+
+    /// Create a new [InstantRange] with an end timestamp inclusive.
+    pub fn up_to(end_timestamp: &str, timezone: &str) -> Self {
+        Self::new(
+            timezone.to_string(),
+            None,
+            Some(end_timestamp.to_string()),
+            false,
+            true,
+        )
+    }
+
+    pub fn timezone(&self) -> &str {
+        &self.timezone
+    }
+
+    pub fn start_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        self.start_timestamp
+            .as_deref()
+            .map(|timestamp| Instant::parse_datetime(timestamp, &self.timezone))
+            .transpose()
+    }
+
+    pub fn end_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        self.end_timestamp
+            .as_deref()
+            .map(|timestamp| Instant::parse_datetime(timestamp, &self.timezone))
+            .transpose()
+    }
+
+    pub fn is_in_range(&self, timestamp: &str, timezone: &str) -> Result<bool> {
+        let t = Instant::parse_datetime(timestamp, timezone)?;
+        if let Some(start) = self.start_timestamp()? {
+            if self.start_inclusive {
+                if t < start {
+                    return Ok(false);
+                }
+            } else if t <= start {
+                return Ok(false);
+            }
+        }
+
+        if let Some(end) = self.end_timestamp()? {
+            if self.end_inclusive {
+                if t > end {
+                    return Ok(false);
+                }
+            } else if t >= end {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub fn not_in_range(&self, timestamp: &str, timezone: &str) -> Result<bool> {
+        Ok(!self.is_in_range(timestamp, timezone)?)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineSelector {
@@ -38,7 +123,7 @@ pub struct TimelineSelector {
 
 #[allow(dead_code)]
 impl TimelineSelector {
-    fn get_timezone_from_configs(hudi_configs: Arc<HudiConfigs>) -> String {
+    fn get_timezone_from_configs(hudi_configs: &HudiConfigs) -> String {
         hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .to::<String>()
@@ -53,7 +138,7 @@ impl TimelineSelector {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<Self> {
-        let timezone = Self::get_timezone_from_configs(hudi_configs);
+        let timezone = Self::get_timezone_from_configs(&hudi_configs);
         let start_datetime = start
             .map(|s| Instant::parse_datetime(s, &timezone))
             .transpose()?;
@@ -72,7 +157,7 @@ impl TimelineSelector {
 
     pub fn completed_replacecommits(hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
-            timezone: Self::get_timezone_from_configs(hudi_configs),
+            timezone: Self::get_timezone_from_configs(&hudi_configs),
             start_datetime: None,
             end_datetime: None,
             states: vec![State::Completed],
@@ -190,6 +275,130 @@ mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    #[test]
+    fn test_new_instant_range() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            false,
+        );
+
+        assert_eq!(range.timezone(), "UTC");
+        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
+        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(range.start_inclusive);
+        assert!(!range.end_inclusive);
+    }
+
+    #[test]
+    fn test_up_to() {
+        let range = InstantRange::up_to("20241231235959999", "UTC");
+
+        assert_eq!(range.timezone(), "UTC");
+        assert!(range.start_timestamp.is_none());
+        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(!range.start_inclusive);
+        assert!(range.end_inclusive);
+    }
+
+    #[test]
+    fn test_is_in_range_inclusive_bounds() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        // Test exact bounds
+        assert!(range.is_in_range("20240101000000000", "UTC").unwrap());
+        assert!(range.is_in_range("20241231235959999", "UTC").unwrap());
+
+        // Test inside range
+        assert!(range.is_in_range("20240615120000000", "UTC").unwrap());
+
+        // Test outside range
+        assert!(!range.is_in_range("20231231235959999", "UTC").unwrap());
+        assert!(!range.is_in_range("20250101000000000", "UTC").unwrap());
+    }
+
+    #[test]
+    fn test_is_in_range_exclusive_bounds() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            false,
+            false,
+        );
+
+        // Test exact bounds
+        assert!(!range.is_in_range("20240101000000000", "UTC").unwrap());
+        assert!(!range.is_in_range("20241231235959999", "UTC").unwrap());
+
+        // Test inside range
+        assert!(range.is_in_range("20240615120000000", "UTC").unwrap());
+    }
+
+    #[test]
+    fn test_not_in_range() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(!range.not_in_range("20240615120000000", "UTC").unwrap());
+        assert!(range.not_in_range("20231231235959999", "UTC").unwrap());
+    }
+
+    #[test]
+    fn test_invalid_timestamp_format() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(range.is_in_range("invalid_timestamp", "UTC").is_err());
+    }
+
+    #[test]
+    fn test_invalid_timezone() {
+        let range = InstantRange::new(
+            "Invalid/Timezone".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(range.is_in_range("20240615120000000", "UTC").is_err());
+    }
+
+    #[test]
+    fn test_millisecond_precision() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20240101000000999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(range.is_in_range("20240101000000000", "UTC").unwrap());
+        assert!(range.is_in_range("20240101000000500", "UTC").unwrap());
+        assert!(range.is_in_range("20240101000000999", "UTC").unwrap());
+        assert!(!range.is_in_range("20240101000001000", "UTC").unwrap());
+    }
 
     fn create_test_selector(
         actions: &[Action],

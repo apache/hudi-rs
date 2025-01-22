@@ -105,6 +105,7 @@ use crate::timeline::Timeline;
 use crate::Result;
 
 use crate::metadata::meta_field::MetaField;
+use crate::timeline::selector::InstantRange;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -145,6 +146,13 @@ impl Table {
             .get(HudiTableConfig::BasePath)?
             .to_url()
             .map_err(CoreError::from)
+    }
+
+    #[inline]
+    pub fn timezone(&self) -> String {
+        self.hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .to::<String>()
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -259,8 +267,8 @@ impl Table {
 
     pub fn create_file_group_reader(&self) -> FileGroupReader {
         FileGroupReader::new(
-            self.file_system_view.storage.clone(),
             self.hudi_configs.clone(),
+            self.file_system_view.storage.clone(),
         )
     }
 
@@ -300,10 +308,12 @@ impl Table {
         let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
         let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+        let timezone = self.timezone();
+        let instant_range = InstantRange::up_to(timestamp, &timezone);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
         )
         .await?;
         Ok(batches)
@@ -342,10 +352,12 @@ impl Table {
         let fg_reader =
             self.create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())?;
         let base_file_only = self.get_table_type() == TableTypeValue::CopyOnWrite;
+        let timezone = self.timezone();
+        let instant_range = InstantRange::up_to(as_of_timestamp, &timezone);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only)),
+                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
         )
         .await?;
         Ok(batches)
@@ -896,19 +908,14 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    mod test_snapshot_queries {
+    mod test_snapshot_and_time_travel_queries {
         use super::super::*;
-        use crate::metadata::meta_field::MetaField;
-        use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
+        use arrow::compute::concat_batches;
         use hudi_tests::SampleTable;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
-            let base_urls = [
-                SampleTable::V6Empty.url_to_cow(),
-                SampleTable::V6Empty.url_to_mor(),
-            ];
-            for base_url in base_urls.iter() {
+            for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table.read_snapshot(&[]).await?;
                 assert!(records.is_empty());
@@ -918,110 +925,67 @@ mod tests {
 
         #[tokio::test]
         async fn test_non_partitioned() -> Result<()> {
-            let base_urls = [
-                SampleTable::V6Nonpartitioned.url_to_cow(),
-                SampleTable::V6Nonpartitioned.url_to_mor(),
-            ];
-            for base_url in base_urls.iter() {
+            for base_url in SampleTable::V6Nonpartitioned.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table.read_snapshot(&[]).await?;
-                let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
 
-                let ids = all_records
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap();
-                let names = all_records
-                    .column_by_name("name")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let is_actives = all_records
-                    .column_by_name("isActive")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .unwrap();
-
-                let mut data: Vec<(i32, &str, bool)> = ids
-                    .iter()
-                    .zip(names.iter())
-                    .zip(is_actives.iter())
-                    .map(|((id, name), is_active)| (id.unwrap(), name.unwrap(), is_active.unwrap()))
-                    .collect();
-                data.sort_unstable_by_key(|(id, _, _)| *id);
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
                 assert_eq!(
-                    data,
+                    sample_data,
                     vec![
                         (1, "Alice", false),
                         (2, "Bob", false),
                         (3, "Carol", true),
                         (4, "Diana", true),
                     ]
-                )
+                );
             }
             Ok(())
         }
 
         #[tokio::test]
         async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
-            let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_mor();
-            let hudi_table = Table::new(base_url.path()).await?;
+            for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
+                let hudi_table = Table::new(base_url.path()).await?;
 
-            let filters = &[
-                Filter::try_from(("byteField", ">=", "10"))?,
-                Filter::try_from(("byteField", "<", "20"))?,
-                Filter::try_from(("shortField", "!=", "100"))?,
-            ];
-            let records = hudi_table.read_snapshot(filters).await?;
-            let all_records = arrow::compute::concat_batches(&records[0].schema(), &records)?;
+                let filters = &[
+                    Filter::try_from(("byteField", ">=", "10"))?,
+                    Filter::try_from(("byteField", "<", "20"))?,
+                    Filter::try_from(("shortField", "!=", "100"))?,
+                ];
+                let records = hudi_table.read_snapshot(filters).await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
 
-            let partition_paths = all_records
-                .column_by_name(MetaField::PartitionPath.as_ref())
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let ids = all_records
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
-            let names = all_records
-                .column_by_name("name")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let is_actives = all_records
-                .column_by_name("isActive")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap();
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true),]);
+            }
+            Ok(())
+        }
 
-            let mut data: Vec<(&str, i32, &str, bool)> = partition_paths
-                .iter()
-                .zip(ids.iter())
-                .zip(names.iter())
-                .zip(is_actives.iter())
-                .map(|(((pt, id), name), is_active)| {
-                    (pt.unwrap(), id.unwrap(), name.unwrap(), is_active.unwrap())
-                })
-                .collect();
-            data.sort_unstable_by_key(|(_, id, _, _)| *id);
-            assert_eq!(
-                data,
-                vec![
-                    ("byteField=10/shortField=300", 1, "Alice", false),
-                    ("byteField=10/shortField=300", 3, "Carol", true),
-                ]
-            );
+        #[tokio::test]
+        async fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
+            for base_url in &[SampleTable::V6SimplekeygenNonhivestyle.url_to_mor()] {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let commit_timestamps = hudi_table
+                    .timeline
+                    .completed_commits
+                    .iter()
+                    .map(|i| i.timestamp.as_str())
+                    .collect::<Vec<_>>();
+                let first_commit = commit_timestamps[0];
+                let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
 
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![(1, "Alice", true), (2, "Bob", false), (3, "Carol", true),]
+                );
+            }
             Ok(())
         }
     }
