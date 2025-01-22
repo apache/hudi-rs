@@ -964,6 +964,36 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_non_partitioned_read_optimized() -> Result<()> {
+            let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let commit_timestamps = hudi_table
+                .timeline
+                .completed_commits
+                .iter()
+                .map(|i| i.timestamp.as_str())
+                .collect::<Vec<_>>();
+            let latest_commit = commit_timestamps.last().unwrap();
+            let records = hudi_table
+                .read_snapshot_as_of(latest_commit, &[], true)
+                .await?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(
+                sample_data,
+                vec![
+                    (1, "Alice", true), // this was updated to false in a log file and not to be read out
+                    (2, "Bob", false),
+                    (3, "Carol", true),
+                    (4, "Diana", true), // this was inserted in a base file and should be read out
+                ]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
             for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
