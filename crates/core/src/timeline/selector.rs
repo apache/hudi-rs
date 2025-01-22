@@ -329,11 +329,7 @@ mod tests {
 
     #[test]
     fn test_within() {
-        let range = InstantRange::within(
-            "20240101000000000",
-            "20241231235959999",
-            "UTC"
-        );
+        let range = InstantRange::within("20240101000000000", "20241231235959999", "UTC");
 
         assert_eq!(range.timezone(), "UTC");
         assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
@@ -344,11 +340,8 @@ mod tests {
 
     #[test]
     fn test_within_open_closed() {
-        let range = InstantRange::within_open_closed(
-            "20240101000000000",
-            "20241231235959999",
-            "UTC"
-        );
+        let range =
+            InstantRange::within_open_closed("20240101000000000", "20241231235959999", "UTC");
 
         assert_eq!(range.timezone(), "UTC");
         assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
