@@ -111,12 +111,15 @@ impl ConfigParser for HudiReadConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
+    use crate::config::read::HudiReadConfig::{
+        InputPartitions, ListingParallelism, UseReadOptimizedMode,
+    };
 
     #[test]
     fn parse_valid_config_value() {
         let options = HashMap::from([
             (InputPartitions.as_ref().to_string(), "100".to_string()),
+            (ListingParallelism.as_ref().to_string(), "100".to_string()),
             (
                 UseReadOptimizedMode.as_ref().to_string(),
                 "true".to_string(),
@@ -124,6 +127,13 @@ mod tests {
         ]);
         assert_eq!(
             InputPartitions.parse_value(&options).unwrap().to::<usize>(),
+            100
+        );
+        assert_eq!(
+            ListingParallelism
+                .parse_value(&options)
+                .unwrap()
+                .to::<usize>(),
             100
         );
         assert!(UseReadOptimizedMode
@@ -136,6 +146,7 @@ mod tests {
     fn parse_invalid_config_value() {
         let options = HashMap::from([
             (InputPartitions.as_ref().to_string(), "foo".to_string()),
+            (ListingParallelism.as_ref().to_string(), "_100".to_string()),
             (UseReadOptimizedMode.as_ref().to_string(), "1".to_string()),
         ]);
         assert!(matches!(
@@ -147,6 +158,16 @@ mod tests {
                 .parse_value_or_default(&options)
                 .to::<usize>(),
             0
+        );
+        assert!(matches!(
+            ListingParallelism.parse_value(&options).unwrap_err(),
+            ParseInt(_, _, _)
+        ));
+        assert_eq!(
+            ListingParallelism
+                .parse_value_or_default(&options)
+                .to::<usize>(),
+            10
         );
         assert!(matches!(
             UseReadOptimizedMode.parse_value(&options).unwrap_err(),
