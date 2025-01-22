@@ -276,6 +276,130 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    #[test]
+    fn test_new_instant_range() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            false,
+        );
+
+        assert_eq!(range.timezone(), "UTC");
+        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
+        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(range.start_inclusive);
+        assert!(!range.end_inclusive);
+    }
+
+    #[test]
+    fn test_up_to() {
+        let range = InstantRange::up_to("20241231235959999", "UTC");
+
+        assert_eq!(range.timezone(), "UTC");
+        assert!(range.start_timestamp.is_none());
+        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(!range.start_inclusive);
+        assert!(range.end_inclusive);
+    }
+
+    #[test]
+    fn test_is_in_range_inclusive_bounds() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        // Test exact bounds
+        assert!(range.is_in_range("20240101000000000", "UTC").unwrap());
+        assert!(range.is_in_range("20241231235959999", "UTC").unwrap());
+
+        // Test inside range
+        assert!(range.is_in_range("20240615120000000", "UTC").unwrap());
+
+        // Test outside range
+        assert!(!range.is_in_range("20231231235959999", "UTC").unwrap());
+        assert!(!range.is_in_range("20250101000000000", "UTC").unwrap());
+    }
+
+    #[test]
+    fn test_is_in_range_exclusive_bounds() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            false,
+            false,
+        );
+
+        // Test exact bounds
+        assert!(!range.is_in_range("20240101000000000", "UTC").unwrap());
+        assert!(!range.is_in_range("20241231235959999", "UTC").unwrap());
+
+        // Test inside range
+        assert!(range.is_in_range("20240615120000000", "UTC").unwrap());
+    }
+
+    #[test]
+    fn test_not_in_range() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(!range.not_in_range("20240615120000000", "UTC").unwrap());
+        assert!(range.not_in_range("20231231235959999", "UTC").unwrap());
+    }
+
+    #[test]
+    fn test_invalid_timestamp_format() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(range.is_in_range("invalid_timestamp", "UTC").is_err());
+    }
+
+    #[test]
+    fn test_invalid_timezone() {
+        let range = InstantRange::new(
+            "Invalid/Timezone".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20241231235959999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(range.is_in_range("20240615120000000", "UTC").is_err());
+    }
+
+    #[test]
+    fn test_millisecond_precision() {
+        let range = InstantRange::new(
+            "UTC".to_string(),
+            Some("20240101000000000".to_string()),
+            Some("20240101000000999".to_string()),
+            true,
+            true,
+        );
+
+        assert!(range.is_in_range("20240101000000000", "UTC").unwrap());
+        assert!(range.is_in_range("20240101000000500", "UTC").unwrap());
+        assert!(range.is_in_range("20240101000000999", "UTC").unwrap());
+        assert!(!range.is_in_range("20240101000001000", "UTC").unwrap());
+    }
+
     fn create_test_selector(
         actions: &[Action],
         states: &[State],
