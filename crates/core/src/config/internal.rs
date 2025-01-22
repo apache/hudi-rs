@@ -19,6 +19,7 @@
 //! Hudi internal configurations.
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::str::FromStr;
 
 use strum_macros::EnumIter;
@@ -49,6 +50,12 @@ impl AsRef<str> for HudiInternalConfig {
         match self {
             Self::SkipConfigValidation => "hoodie.internal.skip.config.validation",
         }
+    }
+}
+
+impl Display for HudiInternalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
     }
 }
 

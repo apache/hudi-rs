@@ -19,8 +19,8 @@
 //! Hudi table configurations.
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::str::FromStr;
-
 use strum_macros::{AsRefStr, EnumIter};
 
 use crate::config::error::ConfigError;
@@ -138,6 +138,12 @@ impl AsRef<str> for HudiTableConfig {
             Self::TimelineLayoutVersion => "hoodie.timeline.layout.version",
             Self::TimelineTimezone => "hoodie.table.timeline.timezone",
         }
+    }
+}
+
+impl Display for HudiTableConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
     }
 }
 
@@ -415,5 +421,21 @@ mod tests {
             RecordMergeStrategyValue::from_str("foo").unwrap_err(),
             InvalidValue(_)
         ));
+    }
+
+    #[test]
+    fn test_display_trait_implementation() {
+        assert_eq!(
+            format!("{}", HudiTableConfig::KeyGeneratorClass),
+            "hoodie.table.keygenerator.class"
+        );
+        assert_eq!(
+            format!("{}", HudiTableConfig::BaseFileFormat),
+            "hoodie.table.base.file.format"
+        );
+        assert_eq!(
+            format!("{}", HudiTableConfig::TableName),
+            "hoodie.table.name"
+        );
     }
 }
