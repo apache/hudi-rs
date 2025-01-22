@@ -111,25 +111,49 @@ impl ConfigParser for HudiReadConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::read::HudiReadConfig::InputPartitions;
+    use crate::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 
     #[test]
     fn parse_valid_config_value() {
-        let options = HashMap::from([(InputPartitions.as_ref().to_string(), "100".to_string())]);
-        let value = InputPartitions.parse_value(&options).unwrap().to::<usize>();
-        assert_eq!(value, 100);
+        let options = HashMap::from([
+            (InputPartitions.as_ref().to_string(), "100".to_string()),
+            (
+                UseReadOptimizedMode.as_ref().to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            InputPartitions.parse_value(&options).unwrap().to::<usize>(),
+            100
+        );
+        assert!(UseReadOptimizedMode
+            .parse_value(&options)
+            .unwrap()
+            .to::<bool>());
     }
 
     #[test]
     fn parse_invalid_config_value() {
-        let options = HashMap::from([(InputPartitions.as_ref().to_string(), "foo".to_string())]);
-        let value = InputPartitions.parse_value(&options);
-        assert!(matches!(value.unwrap_err(), ParseInt(_, _, _)));
+        let options = HashMap::from([
+            (InputPartitions.as_ref().to_string(), "foo".to_string()),
+            (UseReadOptimizedMode.as_ref().to_string(), "1".to_string()),
+        ]);
+        assert!(matches!(
+            InputPartitions.parse_value(&options).unwrap_err(),
+            ParseInt(_, _, _)
+        ));
         assert_eq!(
             InputPartitions
                 .parse_value_or_default(&options)
                 .to::<usize>(),
             0
         );
+        assert!(matches!(
+            UseReadOptimizedMode.parse_value(&options).unwrap_err(),
+            ParseBool(_, _, _)
+        ));
+        assert!(!UseReadOptimizedMode
+            .parse_value_or_default(&options)
+            .to::<bool>(),)
     }
 }
