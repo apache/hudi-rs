@@ -23,7 +23,7 @@ use std::str::FromStr;
 
 use strum_macros::EnumIter;
 
-use crate::config::error::ConfigError::{NotFound, ParseInt};
+use crate::config::error::ConfigError::{NotFound, ParseBool, ParseInt};
 use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
 
@@ -52,6 +52,10 @@ pub enum HudiReadConfig {
 
     /// Parallelism for listing files on storage.
     ListingParallelism,
+
+    /// When set to true, only [BaseFile]s will be read for optimized reads.
+    /// This is only applicable to Merge-On-Read (MOR) tables.
+    UseReadOptimizedMode,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -60,6 +64,7 @@ impl AsRef<str> for HudiReadConfig {
             Self::AsOfTimestamp => "hoodie.read.as.of.timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
+            Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
         }
     }
 }
@@ -71,6 +76,7 @@ impl ConfigParser for HudiReadConfig {
         match self {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
+            HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             _ => None,
         }
     }
@@ -93,6 +99,11 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::UseReadOptimizedMode => get_result
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::Boolean),
         }
     }
 }
