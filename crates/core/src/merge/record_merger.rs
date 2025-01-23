@@ -42,15 +42,6 @@ pub struct RecordMerger {
 
 impl RecordMerger {
     /// Validates the given [HudiConfigs] against the [RecordMergeStrategy].
-    ///
-    /// # Notes
-    /// This should be ideally called during table creation. However, an empty
-    /// table could have no precombine field being set, and we also want to keep
-    /// the default merge strategy as [OverwriteWithLatest] to fulfill the
-    /// snapshot read semantics out-of-the-box. This would conflict with
-    /// having no precombine field.
-    ///
-    /// TODO: We should derive merge strategy dynamically if not set by user.
     pub fn validate_configs(hudi_configs: &HudiConfigs) -> ConfigResult<()> {
         let merge_strategy = hudi_configs
             .get_or_default(RecordMergeStrategy)
@@ -93,8 +84,6 @@ impl RecordMerger {
         schema: &SchemaRef,
         batches: &[RecordBatch],
     ) -> Result<RecordBatch> {
-        Self::validate_configs(&self.hudi_configs)?;
-
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }

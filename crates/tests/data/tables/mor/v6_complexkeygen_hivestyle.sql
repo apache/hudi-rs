@@ -43,7 +43,6 @@ CREATE TABLE v6_complexkeygen_hivestyle (
                                             shortField SHORT
 )
     USING HUDI
-    LOCATION '/opt/data/external_tables/v6_complexkeygen_hivestyle'
 TBLPROPERTIES (
     type = 'mor',
     primaryKey = 'id,name',

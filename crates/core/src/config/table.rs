@@ -159,9 +159,6 @@ impl ConfigParser for HudiTableConfig {
             Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
             Self::PartitionFields => Some(HudiConfigValue::List(vec![])),
             Self::PopulatesMetaFields => Some(HudiConfigValue::Boolean(true)),
-            Self::RecordMergeStrategy => Some(HudiConfigValue::String(
-                RecordMergeStrategyValue::default().as_ref().to_string(),
-            )),
             Self::TimelineTimezone => Some(HudiConfigValue::String(
                 TimelineTimezoneValue::UTC.as_ref().to_string(),
             )),
@@ -238,6 +235,41 @@ impl ConfigParser for HudiTableConfig {
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
         }
     }
+
+    fn parse_value_or_default(&self, configs: &HashMap<String, String>) -> Self::Output {
+        self.parse_value(configs).unwrap_or_else(|_| {
+            match self {
+                Self::RecordMergeStrategy => {
+                    let populates_meta_fields = HudiTableConfig::PopulatesMetaFields
+                        .parse_value_or_default(configs)
+                        .to::<bool>();
+                    if !populates_meta_fields {
+                        // When populatesMetaFields is false, meta fields such as record key and
+                        // partition path are null, the table is supposed to be append-only.
+                        return HudiConfigValue::String(
+                            RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
+                        );
+                    }
+
+                    if !configs.contains_key(HudiTableConfig::PrecombineField.as_ref()) {
+                        // When precombine field is not available, we treat the table as append-only
+                        return HudiConfigValue::String(
+                            RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
+                        );
+                    }
+
+                    return HudiConfigValue::String(
+                        RecordMergeStrategyValue::OverwriteWithLatest
+                            .as_ref()
+                            .to_string(),
+                    );
+                }
+                _ => self
+                    .default_value()
+                    .unwrap_or_else(|| panic!("No default value for config '{}'", self.as_ref())),
+            }
+        })
+    }
 }
 
 /// Config value for [HudiTableConfig::TableType].
@@ -310,6 +342,7 @@ impl FromStr for TimelineTimezoneValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HudiConfigs;
 
     #[test]
     fn create_table_type() {
@@ -436,6 +469,41 @@ mod tests {
         assert_eq!(
             format!("{}", HudiTableConfig::TableName),
             "hoodie.table.name"
+        );
+    }
+
+    #[test]
+    fn test_derive_record_merger_strategy() {
+        let hudi_configs = HudiConfigs::new(vec![
+            (HudiTableConfig::PopulatesMetaFields, "false"),
+            (HudiTableConfig::PrecombineField, "ts"),
+        ]);
+        assert_eq!(
+            hudi_configs
+                .get_or_default(HudiTableConfig::RecordMergeStrategy)
+                .to::<String>(),
+            RecordMergeStrategyValue::AppendOnly.as_ref(),
+            "Should derive as append-only due to populatesMetaFields=false"
+        );
+
+        let hudi_configs = HudiConfigs::new(vec![(HudiTableConfig::PopulatesMetaFields, "true")]);
+        assert_eq!(
+            hudi_configs
+                .get_or_default(HudiTableConfig::RecordMergeStrategy)
+                .to::<String>(),
+            RecordMergeStrategyValue::AppendOnly.as_ref(),
+            "Should derive as append-only due to missing precombine field"
+        );
+
+        let hudi_configs = HudiConfigs::new(vec![
+            (HudiTableConfig::PopulatesMetaFields, "true"),
+            (HudiTableConfig::PrecombineField, "ts"),
+        ]);
+        assert_eq!(
+            hudi_configs
+                .get_or_default(HudiTableConfig::RecordMergeStrategy)
+                .to::<String>(),
+            RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
         );
     }
 }

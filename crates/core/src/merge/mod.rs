@@ -33,12 +33,6 @@ pub enum RecordMergeStrategyValue {
     OverwriteWithLatest,
 }
 
-impl Default for RecordMergeStrategyValue {
-    fn default() -> Self {
-        Self::OverwriteWithLatest
-    }
-}
-
 impl FromStr for RecordMergeStrategyValue {
     type Err = ConfigError;
 
