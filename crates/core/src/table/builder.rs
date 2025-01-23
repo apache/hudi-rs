@@ -34,6 +34,7 @@ use crate::config::table::HudiTableConfig::{
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
 use crate::error::CoreError;
+use crate::merge::record_merger::RecordMerger;
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::Table;
@@ -275,6 +276,8 @@ impl TableBuilder {
                 DropsPartitionFields.as_ref()
             )));
         }
+
+        RecordMerger::validate_configs(hudi_configs)?;
 
         Ok(())
     }

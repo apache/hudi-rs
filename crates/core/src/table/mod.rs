@@ -1015,7 +1015,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
-            for base_url in &[SampleTable::V6SimplekeygenNonhivestyle.url_to_mor()] {
+            for base_url in SampleTable::V6SimplekeygenNonhivestyle.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let commit_timestamps = hudi_table
                     .timeline
@@ -1035,6 +1035,28 @@ mod tests {
                     sample_data,
                     vec![(1, "Alice", true), (2, "Bob", false), (3, "Carol", true),]
                 );
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
+            for base_url in SampleTable::V6SimplekeygenHivestyleNoMetafields.urls() {
+                let hudi_table = Table::new(base_url.path()).await?;
+                let records = hudi_table.read_snapshot(&[]).await?;
+                let schema = &records[0].schema();
+                let records = concat_batches(schema, &records)?;
+
+                let sample_data = SampleTable::sample_data_order_by_id(&records);
+                assert_eq!(
+                    sample_data,
+                    vec![
+                        (1, "Alice", false),
+                        (2, "Bob", false),
+                        (3, "Carol", true),
+                        (4, "Diana", true),
+                    ]
+                )
             }
             Ok(())
         }

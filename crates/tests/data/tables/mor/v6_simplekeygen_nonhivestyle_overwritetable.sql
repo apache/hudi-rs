@@ -43,7 +43,6 @@ CREATE TABLE v6_simplekeygen_nonhivestyle_overwritetable (
                                               byteField BYTE
 )
     USING HUDI
-    LOCATION '/opt/data/external_tables/v6_simplekeygen_nonhivestyle_overwritetable'
 TBLPROPERTIES (
     type = 'mor',
     primaryKey = 'id',
