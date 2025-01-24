@@ -43,7 +43,7 @@ services:
       minio:
         condition: service_healthy
     volumes:
-      - ../crates/tests/data:/opt/data:ro
+      - ../crates/test/data:/opt/data:ro
       - ./infra/mc/prepare_data.sh:/opt/prepare_data.sh
     command:
       - /bin/sh

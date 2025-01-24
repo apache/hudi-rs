@@ -182,6 +182,6 @@ mod tests {
         ));
         assert!(!UseReadOptimizedMode
             .parse_value_or_default(&options)
-            .to::<bool>(),)
+            .to::<bool>())
     }
 }

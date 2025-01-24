@@ -72,7 +72,7 @@ datafusion-physical-expr = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 
 [dev-dependencies]
-hudi-tests = { path = "../tests" }
+hudi-test = { path = "../test" }
 
 [features]
 datafusion = [

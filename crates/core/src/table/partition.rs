@@ -174,7 +174,6 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::Date32Array;
-    use hudi_tests::assert_not;
     use std::str::FromStr;
 
     fn create_test_schema() -> Schema {
@@ -205,15 +204,15 @@ mod tests {
         let pruner = pruner.unwrap();
         assert_eq!(pruner.and_filters.len(), 2);
         assert!(pruner.is_hive_style);
-        assert_not!(pruner.is_url_encoded);
+        assert!(!pruner.is_url_encoded);
     }
 
     #[test]
     fn test_partition_pruner_empty() {
         let pruner = PartitionPruner::empty();
         assert!(pruner.is_empty());
-        assert_not!(pruner.is_hive_style);
-        assert_not!(pruner.is_url_encoded);
+        assert!(!pruner.is_hive_style);
+        assert!(!pruner.is_url_encoded);
     }
 
     #[test]
@@ -226,7 +225,7 @@ mod tests {
 
         let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
         let pruner_non_empty = PartitionPruner::new(&[filter_gt_date], &schema, &configs).unwrap();
-        assert_not!(pruner_non_empty.is_empty());
+        assert!(!pruner_non_empty.is_empty());
     }
 
     #[test]
@@ -247,8 +246,8 @@ mod tests {
 
         assert!(pruner.should_include("date=2023-02-01/category=A/count=10"));
         assert!(pruner.should_include("date=2023-02-01/category=A/count=100"));
-        assert_not!(pruner.should_include("date=2022-12-31/category=A/count=10"));
-        assert_not!(pruner.should_include("date=2023-02-01/category=B/count=10"));
+        assert!(!pruner.should_include("date=2022-12-31/category=A/count=10"));
+        assert!(!pruner.should_include("date=2023-02-01/category=B/count=10"));
     }
 
     #[test]

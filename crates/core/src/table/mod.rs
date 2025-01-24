@@ -406,7 +406,7 @@ mod tests {
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
     use crate::table::Filter;
-    use hudi_tests::{assert_not, SampleTable};
+    use hudi_test::SampleTable;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -635,7 +635,7 @@ mod tests {
             configs.get_or_default(DatabaseName).to::<String>(),
             "default"
         );
-        assert_not!(configs.get_or_default(DropsPartitionFields).to::<bool>());
+        assert!(!configs.get_or_default(DropsPartitionFields).to::<bool>());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
@@ -929,7 +929,7 @@ mod tests {
     mod test_snapshot_and_time_travel_queries {
         use super::super::*;
         use arrow::compute::concat_batches;
-        use hudi_tests::SampleTable;
+        use hudi_test::SampleTable;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
@@ -1065,7 +1065,7 @@ mod tests {
     mod test_incremental_queries {
         use super::super::*;
         use arrow_select::concat::concat_batches;
-        use hudi_tests::SampleTable;
+        use hudi_test::SampleTable;
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {

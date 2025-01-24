@@ -20,36 +20,6 @@
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
 
-#[macro_export]
-macro_rules! assert_not {
-    ($cond:expr) => {
-        if $cond {
-            panic!("assertion failed: condition is true");
-        }
-    };
-    ($cond:expr, $($arg:tt)+) => {
-        if $cond {
-            panic!("assertion failed: condition is true: {}", format_args!($($arg)+));
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! assert_approx_eq {
-    ($a:expr, $b:expr, $delta:expr) => {{
-        let a = $a;
-        let b = $b;
-        let delta = $delta;
-        let diff = if a > b { a - b } else { b - a };
-
-        assert!(
-            diff <= delta,
-            "assertion failed: `(left ≈ right)`\n  left: `{:?}`,\n right: `{:?}`,\n delta: `{:?}`",
-            a, b, delta
-        );
-    }};
-}
-
 pub fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
     record_batch
         .column_by_name(name)

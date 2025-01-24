@@ -54,4 +54,4 @@ tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-hudi-tests = { path = "../tests" }
+hudi-test = { path = "../test" }

@@ -122,7 +122,6 @@ impl TryFrom<FileMetadata> for BaseFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hudi_tests::assert_not;
 
     #[test]
     fn test_create_base_file_from_file_name() {
@@ -144,7 +143,7 @@ mod tests {
         assert_eq!(base_file.commit_timestamp, "20240402144910683");
         let file_metadata = base_file.file_metadata.unwrap();
         assert_eq!(file_metadata.size, 1024);
-        assert_not!(file_metadata.fully_populated);
+        assert!(!file_metadata.fully_populated);
     }
 
     #[test]
