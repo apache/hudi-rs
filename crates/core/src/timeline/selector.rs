@@ -294,7 +294,6 @@ mod tests {
     use super::*;
     use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
-    use hudi_tests::assert_not;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -535,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn test_select_no_instants() {
         let timeline = create_test_timeline().await;
-        assert_not!(timeline.completed_commits.is_empty());
+        assert!(!timeline.completed_commits.is_empty());
 
         let selector = TimelineSelector {
             actions: vec![Action::ReplaceCommit],

@@ -25,7 +25,7 @@ use strum_macros::{AsRefStr, EnumIter, EnumString};
 use tempfile::tempdir;
 use url::Url;
 
-pub mod utils;
+pub mod util;
 
 pub fn extract_test_table(zip_path: &Path) -> PathBuf {
     let target_dir = tempdir().unwrap().path().to_path_buf();

@@ -236,7 +236,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_tests::SampleTable;
+    use hudi_test::SampleTable;
 
     use crate::config::table::HudiTableConfig;
 

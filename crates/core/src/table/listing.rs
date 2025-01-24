@@ -191,7 +191,7 @@ impl FileLister {
 mod test {
     use super::*;
     use crate::table::Table;
-    use hudi_tests::SampleTable;
+    use hudi_test::SampleTable;
     use std::collections::HashSet;
 
     #[tokio::test]
