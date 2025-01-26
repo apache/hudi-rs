@@ -17,12 +17,11 @@
  * under the License.
  */
 
+use arrow::pyarrow::ToPyArrow;
 use std::collections::HashMap;
 use std::convert::From;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-
-use arrow::pyarrow::ToPyArrow;
 use tokio::runtime::Runtime;
 
 use hudi::error::CoreError;
@@ -208,6 +207,30 @@ impl HudiTable {
         })
     }
 
+    #[pyo3(signature = (n, timestamp, filters=None))]
+    fn get_file_slices_splits_as_of(
+        &self,
+        n: usize,
+        timestamp: &str,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        let filters = filters.unwrap_or_default();
+
+        py.allow_threads(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_splits_as_of(n, timestamp, &filters.as_strs()),
+                )
+                .map_err(PythonError::from)?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
+                .collect())
+        })
+    }
+
     #[pyo3(signature = (filters=None))]
     fn get_file_slices(
         &self,
@@ -219,6 +242,26 @@ impl HudiTable {
         py.allow_threads(|| {
             let file_slices = rt()
                 .block_on(self.inner.get_file_slices(&filters.as_strs()))
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(convert_file_slice).collect())
+        })
+    }
+
+    #[pyo3(signature = (timestamp, filters=None))]
+    fn get_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        let filters = filters.unwrap_or_default();
+
+        py.allow_threads(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_as_of(timestamp, &filters.as_strs()),
+                )
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(convert_file_slice).collect())
         })
@@ -240,6 +283,23 @@ impl HudiTable {
         rt().block_on(self.inner.read_snapshot(&filters.as_strs()))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+    }
+
+    #[pyo3(signature = (timestamp, filters=None))]
+    fn read_snapshot_as_of(
+        &self,
+        timestamp: &str,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<PyObject> {
+        let filters = filters.unwrap_or_default();
+
+        rt().block_on(
+            self.inner
+                .read_snapshot_as_of(timestamp, &filters.as_strs()),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
     }
 
     #[pyo3(signature = (start_timestamp, end_timestamp=None))]

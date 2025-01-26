@@ -109,22 +109,6 @@ class HudiTable:
             options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
-    def get_schema(self) -> "pyarrow.Schema":
-        """
-        Returns the schema of the Hudi table.
-
-        Returns:
-            pyarrow.Schema: The schema of the table.
-        """
-        ...
-    def get_partition_schema(self) -> "pyarrow.Schema":
-        """
-        Returns the partition schema of the Hudi table.
-
-        Returns:
-            pyarrow.Schema: The schema used for partitioning the table.
-        """
-        ...
     def hudi_options(self) -> Dict[str, str]:
         """
         Get hudi options for table.
@@ -139,6 +123,22 @@ class HudiTable:
 
         Returns:
             Dict[str, str]: A dictionary of storage options.
+        """
+        ...
+    def get_schema(self) -> "pyarrow.Schema":
+        """
+        Returns the schema of the Hudi table.
+
+        Returns:
+            pyarrow.Schema: The schema of the table.
+        """
+        ...
+    def get_partition_schema(self) -> "pyarrow.Schema":
+        """
+        Returns the partition schema of the Hudi table.
+
+        Returns:
+            pyarrow.Schema: The schema used for partitioning the table.
         """
         ...
     def get_file_slices_splits(
@@ -168,6 +168,13 @@ class HudiTable:
             List[HudiFileSlice]: A list of file slices matching the filters.
         """
         ...
+    def get_file_slices_as_of(
+        self, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List[HudiFileSlice]:
+        """
+        Retrieves all file slices in the Hudi table as of a timestamp, optionally filtered by the provided filters.
+        """
+        ...
     def create_file_group_reader(self) -> HudiFileGroupReader:
         """
         Creates a HudiFileGroupReader for reading records from file groups in the Hudi table.
@@ -187,6 +194,13 @@ class HudiTable:
 
         Returns:
             List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
+        """
+        ...
+    def read_snapshot_as_of(
+        self, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List["pyarrow.RecordBatch"]:
+        """
+        Reads the snapshot of the Hudi table as of a timestamp, optionally filtered by the provided filters.
         """
         ...
     def read_incremental_records(

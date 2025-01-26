@@ -121,7 +121,7 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
     }
 
-    pub async fn read_file_slice(
+    pub(crate) async fn read_file_slice(
         &self,
         file_slice: &FileSlice,
         base_file_only: bool,
