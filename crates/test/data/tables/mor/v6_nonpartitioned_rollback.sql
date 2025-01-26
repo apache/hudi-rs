@@ -85,3 +85,10 @@ INSERT INTO v6_nonpartitioned_rollback VALUES
                                   );
 
 call rollback_to_instant(table => 'v6_nonpartitioned_rollback', instant_time => '20250126035006837');
+
+INSERT INTO v6_nonpartitioned_rollback VALUES
+                                           (2, 'Bob', true, 0, 100, 25000, 9876543210, 2.0, 2.71828, 67890.12345, CAST('2023-04-02' AS DATE), CAST('2023-04-02 13:02:00' AS TIMESTAMP), CAST('more binary data' AS BINARY),
+                                            ARRAY(STRUCT('yellow', 400), STRUCT('purple', 500)),
+                                            MAP('key3', STRUCT(234.567, true), 'key4', STRUCT(567.890, false)),
+                                            STRUCT('Bob', 40, STRUCT(789.012, false))
+                                           );

@@ -1004,7 +1004,11 @@ mod tests {
             let sample_data = SampleTable::sample_data_order_by_id(&records);
             assert_eq!(
                 sample_data,
-                vec![(1, "Alice", true), (2, "Bob", false), (3, "Carol", true),]
+                vec![
+                    (1, "Alice", true), // this was updated to false then rolled back to true
+                    (2, "Bob", true),   // this was updated to true after rollback
+                    (3, "Carol", true),
+                ]
             );
             Ok(())
         }
