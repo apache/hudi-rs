@@ -44,7 +44,7 @@ pub struct FileGroupReader {
 }
 
 impl FileGroupReader {
-    pub fn new(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+    pub(crate) fn new(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
         Self {
             storage,
             hudi_configs,
@@ -52,7 +52,7 @@ impl FileGroupReader {
         }
     }
 
-    pub fn new_with_filters(
+    pub(crate) fn new_with_filters(
         storage: Arc<Storage>,
         hudi_configs: Arc<HudiConfigs>,
         and_filters: &[Filter],

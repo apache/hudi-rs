@@ -42,6 +42,16 @@ impl Filter {
     }
 }
 
+impl From<Filter> for (String, String, String) {
+    fn from(filter: Filter) -> Self {
+        (
+            filter.field_name,
+            filter.operator.to_string(),
+            filter.field_value,
+        )
+    }
+}
+
 impl TryFrom<(&str, &str, &str)> for Filter {
     type Error = CoreError;
 
@@ -60,6 +70,10 @@ impl TryFrom<(&str, &str, &str)> for Filter {
             field_value,
         })
     }
+}
+
+pub fn from_str_tuples(tuples: &[(&str, &str, &str)]) -> Result<Vec<Filter>> {
+    tuples.iter().map(|t| Filter::try_from(*t)).collect()
 }
 
 pub struct FilterField {
