@@ -25,6 +25,7 @@ use std::str::FromStr;
 mod log_block;
 mod log_format;
 pub mod reader;
+pub mod scanner;
 
 #[derive(Clone, Debug)]
 pub struct LogFile {

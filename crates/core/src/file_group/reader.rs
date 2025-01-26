@@ -30,7 +30,7 @@ use arrow_schema::Schema;
 use futures::TryFutureExt;
 use std::sync::Arc;
 
-use crate::file_group::log_file::reader::LogFileReader;
+use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::merge::record_merger::RecordMerger;
 use crate::timeline::selector::InstantRange;
 use arrow::compute::filter_record_batch;
@@ -129,27 +129,29 @@ impl FileGroupReader {
     ) -> Result<RecordBatch> {
         let relative_path = file_slice.base_file_relative_path()?;
         if base_file_only {
-            // TODO caller to support read optimized queries
             self.read_file_slice_by_base_file_path(&relative_path).await
         } else {
-            let base_file_records = self
+            let base_record_batch = self
                 .read_file_slice_by_base_file_path(&relative_path)
                 .await?;
-            let schema = base_file_records.schema();
-            let mut all_records = vec![base_file_records];
+            let schema = base_record_batch.schema();
+            let mut all_record_batches = vec![base_record_batch];
 
-            for log_file in &file_slice.log_files {
-                let relative_path = file_slice.log_file_relative_path(log_file)?;
-                let hudi_configs = self.hudi_configs.clone();
-                let storage = self.storage.clone();
-                let mut log_file_reader =
-                    LogFileReader::new(hudi_configs, storage, &relative_path).await?;
-                let log_file_records = log_file_reader.read_all_records_unmerged(&instant_range)?;
-                all_records.extend_from_slice(&log_file_records);
+            let log_file_paths = file_slice
+                .log_files
+                .iter()
+                .map(|log_file| file_slice.log_file_relative_path(log_file))
+                .collect::<Result<Vec<String>>>()?;
+            let log_record_batches =
+                LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                    .scan(log_file_paths, &instant_range)
+                    .await?;
+            for log_record_batch in log_record_batches {
+                all_record_batches.extend(log_record_batch);
             }
 
             let merger = RecordMerger::new(self.hudi_configs.clone());
-            merger.merge_record_batches(&schema, &all_records)
+            merger.merge_record_batches(&schema, &all_record_batches)
         }
     }
 }

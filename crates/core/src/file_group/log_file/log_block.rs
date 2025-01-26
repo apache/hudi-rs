@@ -129,6 +129,28 @@ impl TryFrom<[u8; 4]> for BlockMetadataKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CommandBlockType {
+    Rollback = 0,
+}
+
+impl FromStr for CommandBlockType {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<u32>() {
+            Ok(0) => Ok(CommandBlockType::Rollback),
+            Ok(val) => Err(CoreError::LogFormatError(format!(
+                "Invalid command block type value: {val}"
+            ))),
+            Err(e) => Err(CoreError::LogFormatError(format!(
+                "Failed to parse command block type: {e}"
+            ))),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LogBlock {
@@ -153,9 +175,47 @@ impl LogBlock {
                 }
                 Ok(batches)
             }
+            BlockType::Command => Ok(Vec::new()),
             _ => Err(CoreError::LogBlockError(format!(
                 "Unsupported block type: {block_type:?}"
             ))),
+        }
+    }
+
+    pub fn instant_time(&self) -> Result<&str> {
+        let v = self
+            .header
+            .get(&BlockMetadataKey::InstantTime)
+            .ok_or_else(|| CoreError::LogBlockError("Instant time not found".to_string()))?;
+        Ok(v)
+    }
+
+    pub fn target_instant_time(&self) -> Result<&str> {
+        if self.block_type != BlockType::Command {
+            return Err(CoreError::LogBlockError(
+                "Target instant time is only available for command blocks".to_string(),
+            ));
+        }
+        let v = self
+            .header
+            .get(&BlockMetadataKey::TargetInstantTime)
+            .ok_or_else(|| CoreError::LogBlockError("Target instant time not found".to_string()))?;
+        Ok(v)
+    }
+
+    pub fn is_rollback_block(&self) -> Result<bool> {
+        if self.block_type != BlockType::Command {
+            return Ok(false);
+        }
+
+        match self.header.get(&BlockMetadataKey::CommandBlockType) {
+            Some(v) => {
+                let cmd_type = v.parse::<CommandBlockType>()?;
+                Ok(cmd_type == CommandBlockType::Rollback)
+            }
+            None => Err(CoreError::LogBlockError(
+                "Command block type not found in header".to_string(),
+            )),
         }
     }
 }
