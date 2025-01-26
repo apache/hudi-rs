@@ -357,7 +357,9 @@ impl Table {
         Ok(batches)
     }
 
-    /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
+    /// Get records that were inserted or updated between the given timestamps.
+    /// Records that were updated multiple times should have their latest states within
+    /// the time span being returned.
     pub async fn read_incremental_records(
         &self,
         start_timestamp: &str,
@@ -404,7 +406,9 @@ impl Table {
         Ok(batches)
     }
 
-    /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
+    /// Get the change-data-capture (CDC) records between the given timestamps.
+    /// The CDC records should reflect the records that were inserted, updated, and deleted
+    /// between the timestamps.
     #[allow(dead_code)]
     async fn read_incremental_changes(
         &self,
@@ -808,11 +812,11 @@ mod tests {
         );
 
         // as of the latest timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "20240418173551906")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_as_of("20240418173551906", &[])
             .await
             .unwrap();
-        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -986,7 +990,9 @@ mod tests {
         #[tokio::test]
         async fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
-            let hudi_table = Table::new(base_url.path()).await?;
+            let hudi_table =
+                Table::new_with_options(base_url.path(), [(UseReadOptimizedMode.as_ref(), "true")])
+                    .await?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -994,9 +1000,7 @@ mod tests {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
-            let records = hudi_table
-                .read_snapshot_internal(latest_commit, &[], true)
-                .await?;
+            let records = hudi_table.read_snapshot_as_of(latest_commit, &[]).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -1064,9 +1068,7 @@ mod tests {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records = hudi_table
-                    .read_snapshot_internal(first_commit, &[], false)
-                    .await?;
+                let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
