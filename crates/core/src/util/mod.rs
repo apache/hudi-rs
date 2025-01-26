@@ -18,19 +18,17 @@
  */
 pub mod arrow;
 
-pub fn convert_vec_to_slice(vec: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
-    vec.iter()
-        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
-        .collect()
+pub trait StrTupleRef {
+    fn as_strs(&self) -> Vec<(&str, &str, &str)>;
 }
 
-#[macro_export]
-macro_rules! vec_to_slice {
-    ($vec:expr) => {
-        &convert_vec_to_slice(&$vec)[..]
-    };
+impl StrTupleRef for Vec<(String, String, String)> {
+    fn as_strs(&self) -> Vec<(&str, &str, &str)> {
+        self.iter()
+            .map(|(s1, s2, s3)| (s1.as_str(), s2.as_str(), s3.as_str()))
+            .collect()
+    }
 }
-pub use vec_to_slice;
 
 #[cfg(test)]
 mod tests {
@@ -50,11 +48,11 @@ mod tests {
                 String::from("baz"),
             ),
         ];
-
-        let expected_slice = vec![("date", "=", "2022-01-02"), ("foo", "bar", "baz")];
-
-        let result = vec_to_slice!(&vec_of_strings);
-
-        assert_eq!(result, expected_slice);
+        let binding = vec_of_strings.as_strs();
+        let str_slice = &binding[..];
+        assert_eq!(
+            str_slice,
+            [("date", "=", "2022-01-02"), ("foo", "bar", "baz")]
+        );
     }
 }

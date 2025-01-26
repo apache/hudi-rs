@@ -94,7 +94,7 @@ use crate::config::read::HudiReadConfig::{AsOfTimestamp, UseReadOptimizedMode};
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
-use crate::expr::filter::{Filter, FilterField};
+use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::table::builder::TableBuilder;
@@ -140,7 +140,6 @@ impl Table {
             .await
     }
 
-    #[inline]
     pub fn base_url(&self) -> Url {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::BasePath);
         self.hudi_configs
@@ -150,7 +149,6 @@ impl Table {
             .expect(&err_msg)
     }
 
-    #[inline]
     pub fn table_type(&self) -> TableTypeValue {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
         let table_type = self
@@ -161,7 +159,6 @@ impl Table {
         TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
     }
 
-    #[inline]
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -223,7 +220,7 @@ impl Table {
     pub async fn get_file_slices_splits(
         &self,
         n: usize,
-        filters: &[Filter],
+        filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
         let file_slices = self.get_file_slices(filters).await?;
         if file_slices.is_empty() {
@@ -242,19 +239,29 @@ impl Table {
     /// Get all the [FileSlice]s in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
-    pub async fn get_file_slices(&self, filters: &[Filter]) -> Result<Vec<FileSlice>> {
+    pub async fn get_file_slices(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<FileSlice>> {
+        let filters = from_str_tuples(filters)?;
         if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.get_file_slices_as_of(timestamp.to::<String>().as_str(), filters)
+            self.get_file_slices_internal(timestamp.to::<String>().as_str(), &filters)
                 .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.get_file_slices_as_of(timestamp, filters).await
+            self.get_file_slices_internal(timestamp, &filters).await
         } else {
             Ok(Vec::new())
         }
     }
 
     /// Get all the [FileSlice]s at a given timestamp, as a time travel query.
-    async fn get_file_slices_as_of(
+    pub async fn get_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        filters: &[(&str, &str, &str)],
+    ) -> Result<Vec<FileSlice>> {
+        let filters = from_str_tuples(filters)?;
+        self.get_file_slices_internal(timestamp, &filters).await
+    }
+
+    async fn get_file_slices_internal(
         &self,
         timestamp: &str,
         filters: &[Filter],
@@ -277,13 +284,14 @@ impl Table {
 
     pub fn create_file_group_reader_with_filters(
         &self,
-        filters: &[Filter],
+        filters: &[(&str, &str, &str)],
         schema: &Schema,
     ) -> Result<FileGroupReader> {
+        let filters = from_str_tuples(filters)?;
         FileGroupReader::new_with_filters(
             self.file_system_view.storage.clone(),
             self.hudi_configs.clone(),
-            filters,
+            &filters,
             schema,
         )
     }
@@ -291,21 +299,22 @@ impl Table {
     /// Get all the latest records in the table.
     ///
     /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
-    pub async fn read_snapshot(&self, filters: &[Filter]) -> Result<Vec<RecordBatch>> {
+    pub async fn read_snapshot(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<RecordBatch>> {
+        let filters = from_str_tuples(filters)?;
         let read_optimized_mode = self
             .hudi_configs
             .get_or_default(UseReadOptimizedMode)
             .to::<bool>();
 
         if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.read_snapshot_as_of(
+            self.read_snapshot_internal(
                 timestamp.to::<String>().as_str(),
-                filters,
+                &filters,
                 read_optimized_mode,
             )
             .await
         } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.read_snapshot_as_of(timestamp, filters, read_optimized_mode)
+            self.read_snapshot_internal(timestamp, &filters, read_optimized_mode)
                 .await
         } else {
             Ok(Vec::new())
@@ -313,13 +322,27 @@ impl Table {
     }
 
     /// Get all the records in the table at a given timestamp, as a time travel query.
-    async fn read_snapshot_as_of(
+    pub async fn read_snapshot_as_of(
+        &self,
+        timestamp: &str,
+        filters: &[(&str, &str, &str)],
+    ) -> Result<Vec<RecordBatch>> {
+        let filters = from_str_tuples(filters)?;
+        let read_optimized_mode = self
+            .hudi_configs
+            .get_or_default(UseReadOptimizedMode)
+            .to::<bool>();
+        self.read_snapshot_internal(timestamp, &filters, read_optimized_mode)
+            .await
+    }
+
+    async fn read_snapshot_internal(
         &self,
         timestamp: &str,
         filters: &[Filter],
         read_optimized_mode: bool,
     ) -> Result<Vec<RecordBatch>> {
-        let file_slices = self.get_file_slices_as_of(timestamp, filters).await?;
+        let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
         let fg_reader = self.create_file_group_reader();
         let base_file_only =
             read_optimized_mode || self.table_type() == TableTypeValue::CopyOnWrite;
@@ -334,7 +357,9 @@ impl Table {
         Ok(batches)
     }
 
-    /// Get records that were inserted or updated between the given timestamps. Records that were updated multiple times should have their latest states within the time span being returned.
+    /// Get records that were inserted or updated between the given timestamps.
+    /// Records that were updated multiple times should have their latest states within
+    /// the time span being returned.
     pub async fn read_incremental_records(
         &self,
         start_timestamp: &str,
@@ -361,11 +386,11 @@ impl Table {
 
         // Read incremental records from the file slices.
         let filters = &[
-            FilterField::new(MetaField::CommitTime.as_ref()).gt(start_timestamp),
-            FilterField::new(MetaField::CommitTime.as_ref()).lte(end_timestamp),
+            (MetaField::CommitTime.as_ref(), ">", start_timestamp),
+            (MetaField::CommitTime.as_ref(), "<=", end_timestamp),
         ];
-        let fg_reader =
-            self.create_file_group_reader_with_filters(filters, MetaField::schema().as_ref())?;
+        let schema = MetaField::schema();
+        let fg_reader = self.create_file_group_reader_with_filters(filters, &schema)?;
 
         // Read-optimized mode does not apply to incremental query semantics.
         let base_file_only = self.table_type() == TableTypeValue::CopyOnWrite;
@@ -381,7 +406,9 @@ impl Table {
         Ok(batches)
     }
 
-    /// Get the change-data-capture (CDC) records between the given timestamps. The CDC records should reflect the records that were inserted, updated, and deleted between the timestamps.
+    /// Get the change-data-capture (CDC) records between the given timestamps.
+    /// The CDC records should reflect the records that were inserted, updated, and deleted
+    /// between the timestamps.
     #[allow(dead_code)]
     async fn read_incremental_changes(
         &self,
@@ -405,7 +432,6 @@ mod tests {
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
-    use crate::table::Filter;
     use hudi_test::SampleTable;
     use std::collections::HashSet;
     use std::fs::canonicalize;
@@ -431,7 +457,10 @@ mod tests {
     }
 
     /// Test helper to get relative file paths from the table with filters.
-    async fn get_file_paths_with_filters(table: &Table, filters: &[Filter]) -> Result<Vec<String>> {
+    async fn get_file_paths_with_filters(
+        table: &Table,
+        filters: &[(&str, &str, &str)],
+    ) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         let base_url = table.base_url();
         for f in table.get_file_slices(filters).await? {
@@ -783,11 +812,11 @@ mod tests {
         );
 
         // as of the latest timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "20240418173551906")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_as_of("20240418173551906", &[])
             .await
             .unwrap();
-        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -847,11 +876,8 @@ mod tests {
         .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
-        let filter_ge_10 = Filter::try_from(("byteField", ">=", "10")).unwrap();
-
-        let filter_lt_30 = Filter::try_from(("byteField", "<", "30")).unwrap();
-
-        let actual = get_file_paths_with_filters(&hudi_table, &[filter_ge_10, filter_lt_30])
+        let filters = [("byteField", ">=", "10"), ("byteField", "<", "30")];
+        let actual = get_file_paths_with_filters(&hudi_table, &filters)
             .await
             .unwrap()
             .into_iter()
@@ -865,8 +891,7 @@ mod tests {
         .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
-        let filter_gt_30 = Filter::try_from(("byteField", ">", "30")).unwrap();
-        let actual = get_file_paths_with_filters(&hudi_table, &[filter_gt_30])
+        let actual = get_file_paths_with_filters(&hudi_table, &[("byteField", ">", "30")])
             .await
             .unwrap()
             .into_iter()
@@ -897,16 +922,16 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
 
-        let filter_gte_10 = Filter::try_from(("byteField", ">=", "10")).unwrap();
-        let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
-        let filter_ne_100 = Filter::try_from(("shortField", "!=", "100")).unwrap();
-
-        let actual =
-            get_file_paths_with_filters(&hudi_table, &[filter_gte_10, filter_lt_20, filter_ne_100])
-                .await
-                .unwrap()
-                .into_iter()
-                .collect::<HashSet<_>>();
+        let filters = [
+            ("byteField", ">=", "10"),
+            ("byteField", "<", "20"),
+            ("shortField", "!=", "100"),
+        ];
+        let actual = get_file_paths_with_filters(&hudi_table, &filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
         let expected = [
             "byteField=10/shortField=300/a22e8257-e249-45e9-ba46-115bc85adcba-0_0-161-223_20240418173235694.parquet",
         ]
@@ -914,10 +939,9 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
-        let filter_lt_20 = Filter::try_from(("byteField", ">", "20")).unwrap();
-        let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
 
-        let actual = get_file_paths_with_filters(&hudi_table, &[filter_lt_20, filter_eq_300])
+        let filters = [("byteField", ">=", "20"), ("shortField", "=", "300")];
+        let actual = get_file_paths_with_filters(&hudi_table, &filters)
             .await
             .unwrap()
             .into_iter()
@@ -966,7 +990,9 @@ mod tests {
         #[tokio::test]
         async fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
-            let hudi_table = Table::new(base_url.path()).await?;
+            let hudi_table =
+                Table::new_with_options(base_url.path(), [(UseReadOptimizedMode.as_ref(), "true")])
+                    .await?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -974,9 +1000,7 @@ mod tests {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
-            let records = hudi_table
-                .read_snapshot_as_of(latest_commit, &[], true)
-                .await?;
+            let records = hudi_table.read_snapshot_as_of(latest_commit, &[]).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -1019,9 +1043,9 @@ mod tests {
                 let hudi_table = Table::new(base_url.path()).await?;
 
                 let filters = &[
-                    Filter::try_from(("byteField", ">=", "10"))?,
-                    Filter::try_from(("byteField", "<", "20"))?,
-                    Filter::try_from(("shortField", "!=", "100"))?,
+                    ("byteField", ">=", "10"),
+                    ("byteField", "<", "20"),
+                    ("shortField", "!=", "100"),
                 ];
                 let records = hudi_table.read_snapshot(filters).await?;
                 let schema = &records[0].schema();
@@ -1044,9 +1068,7 @@ mod tests {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records = hudi_table
-                    .read_snapshot_as_of(first_commit, &[], false)
-                    .await?;
+                let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 

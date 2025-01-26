@@ -34,7 +34,7 @@ use hudi_core::expr::filter::{col, Filter as HudiFilter};
 /// otherwise returns `None`.
 ///
 /// TODO: Handle other DataFusion [`Expr`]
-pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<HudiFilter> {
+pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<(String, String, String)> {
     exprs
         .iter()
         .filter_map(|expr| match expr {
@@ -42,6 +42,7 @@ pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<HudiFilter> {
             Expr::Not(not_expr) => not_expr_to_filter(not_expr),
             _ => None,
         })
+        .map(|filter| filter.into())
         .collect()
 }
 
@@ -111,10 +112,14 @@ mod tests {
             operator: ExprOperator::Eq,
             field_value: "42".to_string(),
         };
-
-        assert_eq!(result[0].field_name, expected_filter.field_name);
-        assert_eq!(result[0].operator, expected_filter.operator);
-        assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
+        assert_eq!(
+            result[0],
+            (
+                expected_filter.field_name,
+                expected_filter.operator.to_string(),
+                expected_filter.field_value
+            )
+        );
     }
 
     #[test]
@@ -139,10 +144,14 @@ mod tests {
             operator: ExprOperator::Ne,
             field_value: "42".to_string(),
         };
-
-        assert_eq!(result[0].field_name, expected_filter.field_name);
-        assert_eq!(result[0].operator, expected_filter.operator);
-        assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
+        assert_eq!(
+            result[0],
+            (
+                expected_filter.field_name,
+                expected_filter.operator.to_string(),
+                expected_filter.field_value
+            )
+        );
     }
 
     #[test]
@@ -193,9 +202,14 @@ mod tests {
         assert_eq!(result.len(), expected_filters.len());
 
         for (result, expected_filter) in result.iter().zip(expected_filters.iter()) {
-            assert_eq!(result.field_name, expected_filter.field_name);
-            assert_eq!(result.operator, expected_filter.operator);
-            assert_eq!(*result.field_value.clone(), expected_filter.field_value);
+            assert_eq!(
+                result,
+                &(
+                    expected_filter.field_name.clone(),
+                    expected_filter.operator.to_string(),
+                    expected_filter.field_value.clone()
+                )
+            );
         }
     }
 
@@ -229,10 +243,14 @@ mod tests {
                 operator: expected_op,
                 field_value: String::from("42"),
             };
-
-            assert_eq!(result[0].field_name, expected_filter.field_name);
-            assert_eq!(result[0].operator, expected_filter.operator);
-            assert_eq!(*result[0].field_value.clone(), expected_filter.field_value);
+            assert_eq!(
+                result[0],
+                (
+                    expected_filter.field_name,
+                    expected_filter.operator.to_string(),
+                    expected_filter.field_value
+                )
+            );
         }
     }
 
