@@ -41,6 +41,7 @@ pub enum SampleTable {
     V6ComplexkeygenHivestyle,
     V6Empty,
     V6Nonpartitioned,
+    V6NonpartitionedRollback,
     V6SimplekeygenHivestyleNoMetafields,
     V6SimplekeygenNonhivestyle,
     V6SimplekeygenNonhivestyleOverwritetable,
@@ -100,10 +101,6 @@ impl SampleTable {
         path_buf.to_str().unwrap().to_string()
     }
 
-    pub fn paths(&self) -> Vec<String> {
-        vec![self.path_to_cow(), self.path_to_mor()]
-    }
-
     pub fn url_to_cow(&self) -> Url {
         let path = self.path_to_cow();
         Url::from_file_path(path).unwrap()
@@ -128,9 +125,22 @@ mod tests {
     #[test]
     fn sample_table_zip_file_should_exist() {
         for t in SampleTable::iter() {
-            let path = t.zip_path("cow");
-            assert!(path.exists());
-            assert!(path.is_file());
+            match t {
+                SampleTable::V6TimebasedkeygenNonhivestyle => {
+                    let path = t.zip_path("cow");
+                    assert!(path.exists());
+                }
+                SampleTable::V6NonpartitionedRollback => {
+                    let path = t.zip_path("mor");
+                    assert!(path.exists());
+                }
+                _ => {
+                    let path = t.zip_path("cow");
+                    assert!(path.exists());
+                    let path = t.zip_path("mor");
+                    assert!(path.exists());
+                }
+            }
         }
     }
 }

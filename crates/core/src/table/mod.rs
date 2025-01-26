@@ -994,6 +994,26 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_non_partitioned_rollback() -> Result<()> {
+            let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let records = hudi_table.read_snapshot(&[]).await?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(
+                sample_data,
+                vec![
+                    (1, "Alice", true), // this was updated to false then rolled back to true
+                    (2, "Bob", true),   // this was updated to true after rollback
+                    (3, "Carol", true),
+                ]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
             for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;

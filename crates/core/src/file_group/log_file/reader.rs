@@ -28,7 +28,6 @@ use crate::storage::reader::StorageReader;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
 use crate::Result;
-use arrow_array::RecordBatch;
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek};
@@ -65,7 +64,7 @@ impl LogFileReader<StorageReader> {
         })
     }
 
-    fn read_all_blocks(&mut self, instant_range: &InstantRange) -> Result<Vec<LogBlock>> {
+    pub fn read_all_blocks(&mut self, instant_range: &InstantRange) -> Result<Vec<LogBlock>> {
         let mut blocks = Vec::new();
         while let Some(block) = self.read_next_block(instant_range)? {
             if block.skipped {
@@ -74,18 +73,6 @@ impl LogFileReader<StorageReader> {
             blocks.push(block);
         }
         Ok(blocks)
-    }
-
-    pub fn read_all_records_unmerged(
-        &mut self,
-        instant_range: &InstantRange,
-    ) -> Result<Vec<RecordBatch>> {
-        let all_blocks = self.read_all_blocks(instant_range)?;
-        let mut batches = Vec::new();
-        for block in all_blocks {
-            batches.extend_from_slice(&block.record_batches);
-        }
-        Ok(batches)
     }
 }
 
@@ -289,44 +276,82 @@ impl<R: Read + Seek> LogFileReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_group::log_file::log_block::CommandBlock;
+    use crate::storage::util::parse_uri;
     use std::fs::canonicalize;
     use std::path::PathBuf;
-    use url::Url;
 
-    fn get_sample_log_file() -> (PathBuf, String) {
+    fn get_valid_log_parquet() -> (String, String) {
         let dir = PathBuf::from("tests/data/log_files/valid_log_parquet");
         (
-            canonicalize(dir).unwrap(),
+            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
             ".ee2ace10-7667-40f5-9848-0a144b5ea064-0_20250113230302428.log.1_0-188-387".to_string(),
         )
     }
 
-    #[tokio::test]
-    async fn test_read_sample_log_file() {
-        let (dir, file_name) = get_sample_log_file();
-        let dir_url = Url::from_directory_path(dir).unwrap();
+    fn get_valid_log_rollback() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_rollback");
+        (
+            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            ".0712b9f9-d2d5-4cae-bcf4-8fd7146af503-0_20250126040823628.log.2_1-0-1".to_string(),
+        )
+    }
+
+    async fn create_log_file_reader(
+        dir: &str,
+        file_name: &str,
+    ) -> Result<LogFileReader<StorageReader>> {
+        let dir_url = parse_uri(dir)?;
         let hudi_configs = Arc::new(HudiConfigs::empty());
-        let storage = Storage::new_with_base_url(dir_url).unwrap();
-        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name)
-            .await
-            .unwrap();
+        let storage = Storage::new_with_base_url(dir_url)?;
+        LogFileReader::new(hudi_configs, storage, file_name).await
+    }
+
+    #[tokio::test]
+    async fn test_read_log_file_with_parquet_data_block() -> Result<()> {
+        let (dir, file_name) = get_valid_log_parquet();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250113230424191", "utc");
-        let blocks = reader.read_all_blocks(&instant_range).unwrap();
+        let blocks = reader.read_all_blocks(&instant_range)?;
         assert_eq!(blocks.len(), 1);
 
         let block = &blocks[0];
         assert_eq!(block.format_version, LogFormatVersion::V1);
         assert_eq!(block.block_type, BlockType::ParquetData);
         assert_eq!(block.header.len(), 2);
-        assert_eq!(
-            block.header.get(&BlockMetadataKey::InstantTime).unwrap(),
-            "20250113230424191"
-        );
-        assert!(block.header.contains_key(&BlockMetadataKey::Schema));
-        assert_eq!(block.footer.len(), 0);
+        assert_eq!(block.instant_time()?, "20250113230424191");
+        assert!(block.target_instant_time().is_err());
+        assert!(block.schema().is_ok());
+        assert!(block.command_block_type().is_err());
 
         let batches = block.record_batches.as_slice();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+
+        assert!(block.footer.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_log_file_with_rollback_block() -> Result<()> {
+        let (dir, file_name) = get_valid_log_rollback();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
+        let instant_range = InstantRange::up_to("20250126040936578", "utc");
+        let blocks = reader.read_all_blocks(&instant_range)?;
+        assert_eq!(blocks.len(), 1);
+
+        let block = &blocks[0];
+        assert_eq!(block.format_version, LogFormatVersion::V1);
+        assert_eq!(block.block_type, BlockType::Command);
+        assert_eq!(block.header.len(), 3);
+        assert_eq!(block.instant_time()?, "20250126040936578");
+        assert_eq!(block.target_instant_time()?, "20250126040826878");
+        assert!(block.schema().is_err());
+        assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
+        assert!(block.record_batches.is_empty());
+        assert!(block.footer.is_empty());
+
+        Ok(())
     }
 }
