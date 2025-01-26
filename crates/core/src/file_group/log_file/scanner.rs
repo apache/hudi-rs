@@ -55,7 +55,7 @@ impl LogFileScanner {
             let blocks = reader.read_all_blocks(instant_range)?;
 
             for block in &blocks {
-                if block.is_rollback_block()? {
+                if block.is_rollback_block() {
                     rollback_targets.insert(block.target_instant_time()?.to_string());
                 }
             }
