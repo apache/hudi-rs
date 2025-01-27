@@ -181,9 +181,16 @@ impl Timeline {
         }
     }
 
-    pub async fn get_replaced_file_groups(&self) -> Result<HashSet<FileGroup>> {
+    pub async fn get_replaced_file_groups_as_of(
+        &self,
+        timestamp: &str,
+    ) -> Result<HashSet<FileGroup>> {
         let mut file_groups: HashSet<FileGroup> = HashSet::new();
-        let selector = TimelineSelector::completed_replacecommits(self.hudi_configs.clone());
+        let selector = TimelineSelector::completed_replacecommits_in_range(
+            self.hudi_configs.clone(),
+            None,
+            Some(timestamp),
+        )?;
         for instant in selector.select(self)? {
             let commit_metadata = self.get_commit_metadata(&instant).await?;
             file_groups.extend(build_replaced_file_groups(&commit_metadata)?);

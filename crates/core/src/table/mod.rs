@@ -295,7 +295,10 @@ impl Table {
         timestamp: &str,
         filters: &[Filter],
     ) -> Result<Vec<FileSlice>> {
-        let excludes = self.timeline.get_replaced_file_groups().await?;
+        let excludes = self
+            .timeline
+            .get_replaced_file_groups_as_of(timestamp)
+            .await?;
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
@@ -829,10 +832,46 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_get_file_slices_splits_as_of() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
-
         let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        // before replacecommit (insert overwrite table)
+        let second_latest_timestamp = "20250121000656060";
         let file_slices_splits = hudi_table
-            .get_file_slices_splits_as_of(2, "20250121000702475", &[])
+            .get_file_slices_splits_as_of(2, second_latest_timestamp, &[])
+            .await
+            .unwrap();
+        assert_eq!(file_slices_splits.len(), 2);
+        assert_eq!(file_slices_splits[0].len(), 2);
+        assert_eq!(file_slices_splits[1].len(), 1);
+        let file_slices = file_slices_splits
+            .iter()
+            .flatten()
+            .filter(|f| f.partition_path == "10")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            file_slices.len(),
+            1,
+            "Partition 10 should have 1 file slice"
+        );
+        let file_slice = file_slices[0];
+        assert_eq!(
+            file_slice.base_file.file_name(),
+            "92e64357-e4d1-4639-a9d3-c3535829d0aa-0_1-53-79_20250121000647668.parquet"
+        );
+        assert_eq!(
+            file_slice.log_files.len(),
+            1,
+            "File slice should have 1 log file"
+        );
+        assert_eq!(
+            file_slice.log_files.iter().next().unwrap().file_name(),
+            ".92e64357-e4d1-4639-a9d3-c3535829d0aa-0_20250121000647668.log.1_0-73-101"
+        );
+
+        // as of replacecommit (insert overwrite table)
+        let latest_timestamp = "20250121000702475";
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_as_of(2, latest_timestamp, &[])
             .await
             .unwrap();
         assert_eq!(file_slices_splits.len(), 1);
@@ -882,7 +921,7 @@ mod tests {
         );
 
         // as of non-exist old timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "0")];
+        let opts = [(AsOfTimestamp.as_ref(), "19700101000000")];
         let hudi_table = Table::new_with_options(base_url.path(), opts)
             .await
             .unwrap();
