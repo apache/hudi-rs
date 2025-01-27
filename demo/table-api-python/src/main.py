@@ -15,17 +15,18 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from hudi import HudiTableBuilder
 import pyarrow as pa
+
+from hudi import HudiTableBuilder
 
 for url in [
     "s3://hudi-demo/cow/v6_complexkeygen_hivestyle",
     "s3://hudi-demo/mor/v6_complexkeygen_hivestyle",
 ]:
     hudi_table = HudiTableBuilder.from_base_uri(url).build()
-    records = hudi_table.read_snapshot()
+    batches = hudi_table.read_snapshot()
 
-    arrow_table = pa.Table.from_batches(records)
+    arrow_table = pa.Table.from_batches(batches)
     assert arrow_table.schema.names == [
         "_hoodie_commit_time",
         "_hoodie_commit_seqno",
@@ -51,4 +52,4 @@ for url in [
     ]
     assert arrow_table.num_rows == 4
 
-print("Python API: read snapshot successfully!")
+print("Table API (Python): read snapshot successfully!")

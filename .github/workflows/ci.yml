@@ -120,7 +120,7 @@ jobs:
       - name: Integration tests
         run: |
           cd demo
-          ./run_app.sh
+          ./run_demo.sh
 
   publish-coverage:
     name: Publish coverage reports to codecov.io

@@ -140,6 +140,27 @@ impl Table {
             .await
     }
 
+    pub fn hudi_options(&self) -> HashMap<String, String> {
+        self.hudi_configs.as_options()
+    }
+
+    pub fn storage_options(&self) -> HashMap<String, String> {
+        self.storage_options.as_ref().clone()
+    }
+
+    #[cfg(feature = "datafusion")]
+    pub fn register_storage(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) {
+        self.timeline
+            .storage
+            .register_object_store(runtime_env.clone());
+        self.file_system_view
+            .storage
+            .register_object_store(runtime_env.clone());
+    }
+
     pub fn base_url(&self) -> Url {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::BasePath);
         self.hudi_configs
@@ -163,27 +184,6 @@ impl Table {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .to::<String>()
-    }
-
-    pub fn hudi_options(&self) -> HashMap<String, String> {
-        self.hudi_configs.as_options()
-    }
-
-    pub fn storage_options(&self) -> HashMap<String, String> {
-        self.storage_options.as_ref().clone()
-    }
-
-    #[cfg(feature = "datafusion")]
-    pub fn register_storage(
-        &self,
-        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    ) {
-        self.timeline
-            .storage
-            .register_object_store(runtime_env.clone());
-        self.file_system_view
-            .storage
-            .register_object_store(runtime_env.clone());
     }
 
     /// Get the latest [Schema] of the table.
@@ -222,7 +222,36 @@ impl Table {
         n: usize,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
-        let file_slices = self.get_file_slices(filters).await?;
+        let filters = from_str_tuples(filters)?;
+        if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
+            self.get_file_slices_splits_internal(n, timestamp.to::<String>().as_str(), &filters)
+                .await
+        } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            self.get_file_slices_splits_internal(n, timestamp, &filters)
+                .await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn get_file_slices_splits_as_of(
+        &self,
+        n: usize,
+        timestamp: &str,
+        filters: &[(&str, &str, &str)],
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        let filters = from_str_tuples(filters)?;
+        self.get_file_slices_splits_internal(n, timestamp, &filters)
+            .await
+    }
+
+    async fn get_file_slices_splits_internal(
+        &self,
+        n: usize,
+        timestamp: &str,
+        filters: &[Filter],
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
         if file_slices.is_empty() {
             return Ok(Vec::new());
         }
@@ -282,7 +311,7 @@ impl Table {
         )
     }
 
-    pub fn create_file_group_reader_with_filters(
+    fn create_file_group_reader_with_filters(
         &self,
         filters: &[(&str, &str, &str)],
         schema: &Schema,
@@ -795,6 +824,19 @@ mod tests {
         assert_eq!(file_slices_splits.len(), 2);
         assert_eq!(file_slices_splits[0].len(), 2);
         assert_eq!(file_slices_splits[1].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_splits_as_of() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_as_of(2, "20250121000702475", &[])
+            .await
+            .unwrap();
+        assert_eq!(file_slices_splits.len(), 1);
+        assert_eq!(file_slices_splits[0].len(), 1);
     }
 
     #[tokio::test]

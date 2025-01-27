@@ -19,11 +19,12 @@
 # keep this empty such that it won't be linked to the repo workspace
 
 [package]
-name = "app"
+name = "demo-table-api-rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 tokio = "^1"
-datafusion = "^43"
-hudi = { path = "../../../crates/hudi", features = ["datafusion"] }
+arrow = { version = "= 53.3.0", features = ["pyarrow"] }
+
+hudi = { path = "../../crates/hudi" }

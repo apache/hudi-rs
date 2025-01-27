@@ -109,22 +109,6 @@ class HudiTable:
             options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
-    def get_schema(self) -> "pyarrow.Schema":
-        """
-        Returns the schema of the Hudi table.
-
-        Returns:
-            pyarrow.Schema: The schema of the table.
-        """
-        ...
-    def get_partition_schema(self) -> "pyarrow.Schema":
-        """
-        Returns the partition schema of the Hudi table.
-
-        Returns:
-            pyarrow.Schema: The schema used for partitioning the table.
-        """
-        ...
     def hudi_options(self) -> Dict[str, str]:
         """
         Get hudi options for table.
@@ -141,6 +125,22 @@ class HudiTable:
             Dict[str, str]: A dictionary of storage options.
         """
         ...
+    def get_schema(self) -> "pyarrow.Schema":
+        """
+        Returns the schema of the Hudi table.
+
+        Returns:
+            pyarrow.Schema: The schema of the table.
+        """
+        ...
+    def get_partition_schema(self) -> "pyarrow.Schema":
+        """
+        Returns the partition schema of the Hudi table.
+
+        Returns:
+            pyarrow.Schema: The schema used for partitioning the table.
+        """
+        ...
     def get_file_slices_splits(
         self, n: int, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[List[HudiFileSlice]]:
@@ -155,6 +155,13 @@ class HudiTable:
             List[List[HudiFileSlice]]: A list of file slice groups, each group being a list of HudiFileSlice objects.
         """
         ...
+    def get_file_slices_splits_as_of(
+        self, n: int, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List[List[HudiFileSlice]]:
+        """
+        Retrieves all file slices in the Hudi table as of a timestamp in 'n' splits, optionally filtered by given filters.
+        """
+        ...
     def get_file_slices(
         self, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[HudiFileSlice]:
@@ -166,6 +173,13 @@ class HudiTable:
 
         Returns:
             List[HudiFileSlice]: A list of file slices matching the filters.
+        """
+        ...
+    def get_file_slices_as_of(
+        self, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List[HudiFileSlice]:
+        """
+        Retrieves all file slices in the Hudi table as of a timestamp, optionally filtered by the provided filters.
         """
         ...
     def create_file_group_reader(self) -> HudiFileGroupReader:
@@ -189,9 +203,27 @@ class HudiTable:
             List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
         """
         ...
+    def read_snapshot_as_of(
+        self, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List["pyarrow.RecordBatch"]:
+        """
+        Reads the snapshot of the Hudi table as of a timestamp, optionally filtered by the provided filters.
+        """
+        ...
     def read_incremental_records(
         self, start_timestamp: str, end_timestamp: Optional[str]
-    ) -> List["pyarrow.RecordBatch"]: ...
+    ) -> List["pyarrow.RecordBatch"]:
+        """
+        Reads incremental records from the Hudi table between the given timestamps.
+
+        Parameters:
+            start_timestamp (str): The start timestamp (exclusive).
+            end_timestamp (Optional[str]): The end timestamp (inclusive).
+
+        Returns:
+            List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
+        """
+        ...
 
 def build_hudi_table(
     base_uri: str,

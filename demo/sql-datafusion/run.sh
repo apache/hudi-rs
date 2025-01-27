@@ -18,27 +18,4 @@
 # under the License.
 #
 
-docker compose up --build -d
-
-max_attempts=30
-attempt=0
-
-until [ "$(docker inspect -f '{{.State.Status}}' runner)" = "running" ] || [ $attempt -eq $max_attempts ]; do
-  attempt=$(( $attempt + 1 ))
-  echo "Waiting for container... (attempt $attempt of $max_attempts)"
-  sleep 1
-done
-
-if [ $attempt -eq $max_attempts ]; then
-  echo "Container failed to become ready in time"
-  exit 1
-fi
-
-# install dependencies and run the app
-docker compose exec -T runner /bin/bash -c "
-  cd /opt/hudi-rs/python && \
-  make setup develop && \
-  cd /opt/hudi-rs/demo/app && \
-  cargo run --manifest-path=rust/Cargo.toml && \
-  python -m python.src.main
-  "
+cargo run
