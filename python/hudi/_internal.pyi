@@ -155,6 +155,13 @@ class HudiTable:
             List[List[HudiFileSlice]]: A list of file slice groups, each group being a list of HudiFileSlice objects.
         """
         ...
+    def get_file_slices_splits_as_of(
+        self, n: int, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+    ) -> List[List[HudiFileSlice]]:
+        """
+        Retrieves all file slices in the Hudi table as of a timestamp in 'n' splits, optionally filtered by given filters.
+        """
+        ...
     def get_file_slices(
         self, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[HudiFileSlice]:

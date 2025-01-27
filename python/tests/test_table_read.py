@@ -15,6 +15,8 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
+from itertools import chain
+
 import pyarrow as pa
 
 from hudi import HudiTable
@@ -153,13 +155,24 @@ def test_read_table_for_partition(get_sample_table):
     ]
 
 
-def test_read_table_as_of_timestamp(get_sample_table):
+def test_table_apis_as_of_timestamp(get_sample_table):
     table_path = get_sample_table
-    table = HudiTable(
-        table_path, options={"hoodie.read.as.of.timestamp": "20240402123035233"}
-    )
+    table = HudiTable(table_path)
+    timestamp = "20240402123035233"
 
-    batches = table.read_snapshot()
+    file_slices_gen = table.get_file_slices_splits_as_of(2, timestamp)
+    file_slices_base_paths = set(
+        f.base_file_relative_path() for f in chain.from_iterable(file_slices_gen)
+    )
+    assert file_slices_base_paths == {
+        "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet",
+        "san_francisco/d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0_1-9-0_20240402123035233.parquet",
+        "san_francisco/5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402123035233.parquet",
+        "sao_paulo/ee915c68-d7f8-44f6-9759-e691add290d8-0_3-11-0_20240402123035233.parquet",
+        "chennai/68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0_4-12-0_20240402123035233.parquet",
+    }
+
+    batches = table.read_snapshot_as_of(timestamp)
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {
