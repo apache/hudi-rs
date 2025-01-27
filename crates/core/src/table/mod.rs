@@ -827,6 +827,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hudi_table_get_file_slices_splits_as_of() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_as_of(2, "20250121000702475", &[])
+            .await
+            .unwrap();
+        assert_eq!(file_slices_splits.len(), 1);
+        assert_eq!(file_slices_splits[0].len(), 1);
+    }
+
+    #[tokio::test]
     async fn hudi_table_get_file_slices_as_of_timestamps() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
 

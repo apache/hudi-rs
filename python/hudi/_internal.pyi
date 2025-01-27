@@ -212,7 +212,18 @@ class HudiTable:
         ...
     def read_incremental_records(
         self, start_timestamp: str, end_timestamp: Optional[str]
-    ) -> List["pyarrow.RecordBatch"]: ...
+    ) -> List["pyarrow.RecordBatch"]:
+        """
+        Reads incremental records from the Hudi table between the given timestamps.
+
+        Parameters:
+            start_timestamp (str): The start timestamp (exclusive).
+            end_timestamp (Optional[str]): The end timestamp (inclusive).
+
+        Returns:
+            List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
+        """
+        ...
 
 def build_hudi_table(
     base_uri: str,
