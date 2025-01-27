@@ -118,13 +118,20 @@ mod tests {
     async fn fs_view_get_latest_file_slices() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table
+            .timeline
+            .completed_commits
+            .iter()
+            .next_back()
+            .map(|i| i.timestamp.clone())
+            .unwrap();
         let fs_view = &hudi_table.file_system_view;
 
         assert!(fs_view.partition_to_file_groups.is_empty());
         let partition_pruner = PartitionPruner::empty();
         let excludes = HashSet::new();
         let file_slices = fs_view
-            .get_file_slices_as_of("20240418173551906", &partition_pruner, &excludes)
+            .get_file_slices_as_of(&latest_timestamp, &partition_pruner, &excludes)
             .await
             .unwrap();
         assert_eq!(fs_view.partition_to_file_groups.len(), 1);
@@ -143,17 +150,24 @@ mod tests {
     async fn fs_view_get_latest_file_slices_with_replace_commit() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table
+            .timeline
+            .completed_commits
+            .iter()
+            .next_back()
+            .map(|i| i.timestamp.clone())
+            .unwrap();
         let fs_view = &hudi_table.file_system_view;
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
         let partition_pruner = PartitionPruner::empty();
         let excludes = &hudi_table
             .timeline
-            .get_replaced_file_groups()
+            .get_replaced_file_groups_as_of(&latest_timestamp)
             .await
             .unwrap();
         let file_slices = fs_view
-            .get_file_slices_as_of("20240707001303088", &partition_pruner, excludes)
+            .get_file_slices_as_of(&latest_timestamp, &partition_pruner, excludes)
             .await
             .unwrap();
         assert_eq!(fs_view.partition_to_file_groups.len(), 3);
@@ -172,13 +186,20 @@ mod tests {
     async fn fs_view_get_latest_file_slices_with_partition_filters() {
         let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table
+            .timeline
+            .completed_commits
+            .iter()
+            .next_back()
+            .map(|i| i.timestamp.clone())
+            .unwrap();
         let fs_view = &hudi_table.file_system_view;
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
 
         let excludes = &hudi_table
             .timeline
-            .get_replaced_file_groups()
+            .get_replaced_file_groups_as_of(&latest_timestamp)
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
@@ -193,7 +214,7 @@ mod tests {
         .unwrap();
 
         let file_slices = fs_view
-            .get_file_slices_as_of("20240418173235694", &partition_pruner, excludes)
+            .get_file_slices_as_of(&latest_timestamp, &partition_pruner, excludes)
             .await
             .unwrap();
         assert_eq!(fs_view.partition_to_file_groups.len(), 1);

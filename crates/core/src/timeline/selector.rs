@@ -152,6 +152,12 @@ impl TimelineSelector {
             .to::<String>()
     }
 
+    fn parse_datetime(timezone: &str, timestamp: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+        timestamp
+            .map(|e| Instant::parse_datetime(e, timezone))
+            .transpose()
+    }
+
     pub fn completed_commits(hudi_configs: Arc<HudiConfigs>) -> Result<Self> {
         Self::completed_commits_in_range(hudi_configs, None, None)
     }
@@ -162,12 +168,8 @@ impl TimelineSelector {
         end: Option<&str>,
     ) -> Result<Self> {
         let timezone = Self::get_timezone_from_configs(&hudi_configs);
-        let start_datetime = start
-            .map(|s| Instant::parse_datetime(s, &timezone))
-            .transpose()?;
-        let end_datetime = end
-            .map(|e| Instant::parse_datetime(e, &timezone))
-            .transpose()?;
+        let start_datetime = Self::parse_datetime(&timezone, start)?;
+        let end_datetime = Self::parse_datetime(&timezone, end)?;
         Ok(Self {
             timezone,
             start_datetime,
@@ -178,15 +180,22 @@ impl TimelineSelector {
         })
     }
 
-    pub fn completed_replacecommits(hudi_configs: Arc<HudiConfigs>) -> Self {
-        Self {
-            timezone: Self::get_timezone_from_configs(&hudi_configs),
-            start_datetime: None,
-            end_datetime: None,
+    pub fn completed_replacecommits_in_range(
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
+        let timezone = Self::get_timezone_from_configs(&hudi_configs);
+        let start_datetime = Self::parse_datetime(&timezone, start)?;
+        let end_datetime = Self::parse_datetime(&timezone, end)?;
+        Ok(Self {
+            timezone,
+            start_datetime,
+            end_datetime,
             states: vec![State::Completed],
             actions: vec![Action::ReplaceCommit],
             include_archived: false,
-        }
+        })
     }
 
     pub fn should_include_action(&self, action: &Action) -> bool {
