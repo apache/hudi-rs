@@ -29,37 +29,38 @@ async fn main() -> Result<()> {
     let hudi = HudiDataSource::new("s3://hudi-demo/cow/v6_complexkeygen_hivestyle").await?;
     ctx.register_table("cow_v6_table", Arc::new(hudi))?;
     let df: DataFrame = ctx.sql("SELECT * from cow_v6_table").await?;
-    assert!(
+    assert_eq!(
         df.schema()
             .columns()
             .iter()
             .map(|c| c.name())
-            .collect::<Vec<_>>()
-            == vec![
-                "_hoodie_commit_time",
-                "_hoodie_commit_seqno",
-                "_hoodie_record_key",
-                "_hoodie_partition_path",
-                "_hoodie_file_name",
-                "id",
-                "name",
-                "isActive",
-                "intField",
-                "longField",
-                "floatField",
-                "doubleField",
-                "decimalField",
-                "dateField",
-                "timestampField",
-                "binaryField",
-                "arrayField",
-                "mapField",
-                "structField",
-                "byteField",
-                "shortField",
-            ]
+            .collect::<Vec<_>>(),
+        vec![
+            "_hoodie_commit_time",
+            "_hoodie_commit_seqno",
+            "_hoodie_record_key",
+            "_hoodie_partition_path",
+            "_hoodie_file_name",
+            "id",
+            "name",
+            "isActive",
+            "intField",
+            "longField",
+            "floatField",
+            "doubleField",
+            "decimalField",
+            "dateField",
+            "timestampField",
+            "binaryField",
+            "arrayField",
+            "mapField",
+            "structField",
+            "byteField",
+            "shortField",
+        ]
     );
-    assert!(df.count().await.unwrap() == 4);
-    println!("Rust API: read snapshot successfully!");
+    assert_eq!(df.count().await?, 4);
+
+    println!("SQL (DataFusion): read snapshot successfully!");
     Ok(())
 }

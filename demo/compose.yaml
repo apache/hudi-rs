@@ -64,5 +64,5 @@ services:
       AWS_REGION: us-east-1 # minio default
 
 networks:
-  app_network:
+  demo_network:
     driver: bridge
