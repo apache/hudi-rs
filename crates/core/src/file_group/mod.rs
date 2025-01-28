@@ -37,7 +37,11 @@ use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
-/// Hudi File Group.
+/// A [FileGroup] contains multiple [FileSlice]s within a partition,
+/// and it can be uniquely identified by `file_id` across the table.
+///
+/// The [FileSlice]s are ordered by the commit timestamps that indicate the creation of the
+/// [FileSlice].
 #[derive(Clone, Debug)]
 pub struct FileGroup {
     pub file_id: String,
@@ -73,6 +77,7 @@ impl fmt::Display for FileGroup {
 }
 
 impl FileGroup {
+    /// Create a new [FileGroup] with the given `file_id` and `partition_path` with no [FileSlice]s.
     pub fn new(file_id: String, partition_path: String) -> Self {
         Self {
             file_id,
@@ -81,6 +86,7 @@ impl FileGroup {
         }
     }
 
+    /// Create a new [FileGroup] with a [BaseFile]'s file name.
     pub fn new_with_base_file_name(
         id: String,
         partition_path: String,
@@ -91,11 +97,13 @@ impl FileGroup {
         Ok(file_group)
     }
 
+    /// Add a [BaseFile] based on the file name to the corresponding [FileSlice] in the [FileGroup].
     pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let base_file = BaseFile::from_str(file_name)?;
         self.add_base_file(base_file)
     }
 
+    /// Add a [BaseFile] to the corresponding [FileSlice] in the [FileGroup].
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
         let commit_timestamp = base_file.commit_timestamp.as_str();
         if self.file_slices.contains_key(commit_timestamp) {
@@ -112,6 +120,7 @@ impl FileGroup {
         }
     }
 
+    /// Add multiple [BaseFile]s to the corresponding [FileSlice]s in the [FileGroup].
     pub fn add_base_files<I>(&mut self, base_files: I) -> Result<&Self>
     where
         I: IntoIterator<Item = BaseFile>,
@@ -122,12 +131,13 @@ impl FileGroup {
         Ok(self)
     }
 
+    /// Add a [LogFile] based on the file name to the corresponding [FileSlice] in the [FileGroup].
     pub fn add_log_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let log_file = LogFile::from_str(file_name)?;
         self.add_log_file(log_file)
     }
 
-    /// Add a [LogFile] to the [FileGroup].
+    /// Add a [LogFile] to the corresponding [FileSlice] in the [FileGroup].
     ///
     /// TODO: support adding log files to file group without base files.
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
@@ -143,6 +153,7 @@ impl FileGroup {
         }
     }
 
+    /// Add multiple [LogFile]s to the corresponding [FileSlice]s in the [FileGroup].
     pub fn add_log_files<I>(&mut self, log_files: I) -> Result<&Self>
     where
         I: IntoIterator<Item = LogFile>,
@@ -153,6 +164,8 @@ impl FileGroup {
         Ok(self)
     }
 
+    /// Retrieves a reference to the closest [FileSlice] that was created on or before the given
+    /// `timestamp`.
     pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {
         let as_of = timestamp.to_string();
         if let Some((_, file_slice)) = self.file_slices.range(..=as_of).next_back() {
@@ -162,6 +175,8 @@ impl FileGroup {
         }
     }
 
+    /// Retrieves a mutable reference to the closest [FileSlice] that was created on or before the
+    /// given `timestamp`.
     pub fn get_file_slice_mut_as_of(&mut self, timestamp: &str) -> Option<&mut FileSlice> {
         let as_of = timestamp.to_string();
         if let Some((_, file_slice)) = self.file_slices.range_mut(..=as_of).next_back() {
