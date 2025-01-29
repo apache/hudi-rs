@@ -23,6 +23,29 @@ use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::path::Path;
 
+pub trait FileGroupMerger {
+    fn merge<I>(&mut self, file_groups: I) -> Result<()>
+    where
+        I: IntoIterator<Item = FileGroup>;
+}
+
+impl FileGroupMerger for HashSet<FileGroup> {
+    fn merge<I>(&mut self, file_groups: I) -> Result<()>
+    where
+        I: IntoIterator<Item = FileGroup>,
+    {
+        for file_group in file_groups {
+            if let Some(mut existing) = self.take(&file_group) {
+                existing.merge(&file_group)?;
+                self.insert(existing);
+            } else {
+                self.insert(file_group);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet<FileGroup>> {
     let partition_stats = commit_metadata
         .get("partitionToWriteStats")

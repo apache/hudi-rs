@@ -33,6 +33,14 @@ pub struct FileSlice {
     pub partition_path: String,
 }
 
+impl PartialEq for FileSlice {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_file == other.base_file && self.partition_path == other.partition_path
+    }
+}
+
+impl Eq for FileSlice {}
+
 impl FileSlice {
     pub fn new(base_file: BaseFile, partition_path: String) -> Self {
         Self {
@@ -45,6 +53,17 @@ impl FileSlice {
     #[inline]
     pub fn has_log_file(&self) -> bool {
         !self.log_files.is_empty()
+    }
+
+    pub fn merge(&mut self, other: &FileSlice) -> Result<()> {
+        if self != other {
+            return Err(CoreError::FileGroup(
+                "Cannot merge different file slices.".to_string(),
+            ));
+        }
+        self.log_files.extend(other.log_files.iter().cloned());
+
+        Ok(())
     }
 
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {

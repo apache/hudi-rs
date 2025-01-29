@@ -21,7 +21,7 @@ pub(crate) mod selector;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::builder::{build_file_groups, build_replaced_file_groups};
+use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
 use crate::storage::Storage;
 use crate::timeline::selector::TimelineSelector;
@@ -220,7 +220,7 @@ impl Timeline {
         let commits = selector.select(self)?;
         for commit in commits {
             let commit_metadata = self.get_commit_metadata(&commit).await?;
-            file_groups.extend(build_file_groups(&commit_metadata)?);
+            file_groups.merge(build_file_groups(&commit_metadata)?)?;
 
             if commit.is_replacecommit() {
                 replaced_file_groups.extend(build_replaced_file_groups(&commit_metadata)?);

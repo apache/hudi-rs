@@ -97,6 +97,26 @@ impl FileGroup {
         Ok(file_group)
     }
 
+    pub fn merge(&mut self, other: &FileGroup) -> Result<()> {
+        if self != other {
+            return Err(CoreError::FileGroup(format!(
+                "Cannot merge FileGroup with different file groups. Existing: {}, New: {}",
+                self, other
+            )));
+        }
+
+        for (commit_timestamp, other_file_slice) in other.file_slices.iter() {
+            if let Some(existing_file_slice) = self.file_slices.get_mut(commit_timestamp) {
+                existing_file_slice.merge(other_file_slice)?;
+            } else {
+                self.file_slices
+                    .insert(commit_timestamp.clone(), other_file_slice.clone());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Add a [BaseFile] based on the file name to the corresponding [FileSlice] in the [FileGroup].
     pub fn add_base_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let base_file = BaseFile::from_str(file_name)?;

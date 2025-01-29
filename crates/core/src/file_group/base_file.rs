@@ -88,6 +88,14 @@ impl BaseFile {
     }
 }
 
+impl PartialEq for BaseFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_name() == other.file_name()
+    }
+}
+
+impl Eq for BaseFile {}
+
 impl FromStr for BaseFile {
     type Err = CoreError;
 
