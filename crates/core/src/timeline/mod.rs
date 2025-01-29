@@ -45,7 +45,7 @@ pub struct Timeline {
     pub completed_commits: Vec<Instant>,
 }
 
-pub const DEFAULT_START_TIMESTAMP: &str = "19700101000000000";
+pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
 
 impl Timeline {
     #[cfg(test)]

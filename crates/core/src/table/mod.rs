@@ -99,7 +99,7 @@ use crate::file_group::reader::FileGroupReader;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
-use crate::timeline::{Timeline, DEFAULT_START_TIMESTAMP};
+use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
 use crate::Result;
 
 use crate::config::read::HudiReadConfig;
@@ -335,7 +335,7 @@ impl Table {
             return Ok(Vec::new());
         };
 
-        let start = start_timestamp.unwrap_or(DEFAULT_START_TIMESTAMP);
+        let start = start_timestamp.unwrap_or(EARLIEST_START_TIMESTAMP);
 
         self.get_file_slices_between_internal(start, end).await
     }
