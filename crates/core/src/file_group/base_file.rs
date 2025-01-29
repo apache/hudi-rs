@@ -19,6 +19,7 @@
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::Result;
+use std::fmt::Display;
 use std::str::FromStr;
 
 /// Hudi Base file, part of a [FileSlice].
@@ -85,6 +86,12 @@ impl BaseFile {
             commit_timestamp = self.commit_timestamp,
             extension = self.extension,
         )
+    }
+}
+
+impl Display for BaseFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BaseFile: {}", self.file_name())
     }
 }
 

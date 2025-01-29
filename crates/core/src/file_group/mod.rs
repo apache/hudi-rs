@@ -100,8 +100,7 @@ impl FileGroup {
     pub fn merge(&mut self, other: &FileGroup) -> Result<()> {
         if self != other {
             return Err(CoreError::FileGroup(format!(
-                "Cannot merge FileGroup with different file groups. Existing: {}, New: {}",
-                self, other
+                "Cannot merge different file groups: {self} and {other}",
             )));
         }
 

@@ -22,6 +22,7 @@ use crate::file_group::log_file::LogFile;
 use crate::storage::Storage;
 use crate::Result;
 use std::collections::BTreeSet;
+use std::fmt::Display;
 use std::path::PathBuf;
 
 /// Within a [crate::file_group::FileGroup],
@@ -31,6 +32,16 @@ pub struct FileSlice {
     pub base_file: BaseFile,
     pub log_files: BTreeSet<LogFile>,
     pub partition_path: String,
+}
+
+impl Display for FileSlice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FileSlice {{ base_file: {}, partition_path: {} }}",
+            self.base_file, self.partition_path
+        )
+    }
 }
 
 impl PartialEq for FileSlice {
@@ -57,9 +68,9 @@ impl FileSlice {
 
     pub fn merge(&mut self, other: &FileSlice) -> Result<()> {
         if self != other {
-            return Err(CoreError::FileGroup(
-                "Cannot merge different file slices.".to_string(),
-            ));
+            return Err(CoreError::FileGroup(format!(
+                "Cannot merge different file slices: {self} and {other}"
+            )));
         }
         self.log_files.extend(other.log_files.iter().cloned());
 
@@ -110,6 +121,118 @@ impl FileSlice {
         let relative_path = self.base_file_relative_path()?;
         let fetched_metadata = storage.get_file_metadata(&relative_path).await?;
         self.base_file.file_metadata = Some(fetched_metadata);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::table::partition::EMPTY_PARTITION_PATH;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_file_slices_merge() -> Result<()> {
+        let base = BaseFile::from_str(
+            "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
+        )?;
+        let mut log_set1 = BTreeSet::new();
+        log_set1.insert(LogFile::from_str(
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.4_0-51-115",
+        )?);
+        log_set1.insert(LogFile::from_str(
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.2_0-51-115",
+        )?);
+
+        let mut log_set2 = BTreeSet::new();
+        log_set2.insert(LogFile::from_str(
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.3_0-51-115",
+        )?);
+        log_set2.insert(LogFile::from_str(
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115",
+        )?);
+        log_set1.insert(LogFile::from_str(
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.2_0-51-115",
+        )?);
+
+        let mut slice1 = FileSlice {
+            base_file: base.clone(),
+            log_files: log_set1,
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+        };
+
+        let slice2 = FileSlice {
+            base_file: base,
+            log_files: log_set2,
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+        };
+
+        slice1.merge(&slice2)?;
+
+        // Verify merged result
+        assert_eq!(slice1.log_files.len(), 4);
+        let log_file_names = slice1
+            .log_files
+            .iter()
+            .map(|log| log.file_name())
+            .collect::<Vec<String>>();
+        assert_eq!(
+            log_file_names.as_slice(),
+            &[
+                ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115",
+                ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.2_0-51-115",
+                ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.3_0-51-115",
+                ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.4_0-51-115",
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_different_base_files() -> Result<()> {
+        let mut slice1 = FileSlice {
+            base_file: BaseFile::from_str(
+                "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
+            )?,
+            log_files: BTreeSet::new(),
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+        };
+
+        let slice2 = FileSlice {
+            base_file: BaseFile::from_str(
+                "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
+            )?,
+            log_files: BTreeSet::new(),
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+        };
+
+        // Should return error for different base files
+        assert!(slice1.merge(&slice2).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_different_partition_paths() -> Result<()> {
+        let base = BaseFile::from_str(
+            "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
+        )?;
+        let mut slice1 = FileSlice {
+            base_file: base.clone(),
+            log_files: BTreeSet::new(),
+            partition_path: "path/to/partition1".to_string(),
+        };
+
+        let slice2 = FileSlice {
+            base_file: base,
+            log_files: BTreeSet::new(),
+            partition_path: "path/to/partition2".to_string(),
+        };
+
+        // Should return error for different partition paths
+        assert!(slice1.merge(&slice2).is_err());
+
         Ok(())
     }
 }
