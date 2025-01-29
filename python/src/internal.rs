@@ -27,6 +27,7 @@ use tokio::runtime::Runtime;
 use hudi::error::CoreError;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
+use hudi::file_group::FileGroup;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
@@ -82,6 +83,34 @@ impl HudiFileGroupReader {
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }
+    fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<PyObject> {
+        let mut file_group = FileGroup::new(
+            file_slice.file_id.clone(),
+            file_slice.partition_path.clone(),
+        );
+        file_group
+            .add_base_file_from_name(&file_slice.base_file_name)
+            .map_err(PythonError::from)?;
+        for name in file_slice.log_file_names.iter() {
+            file_group
+                .add_log_file_from_name(name)
+                .map_err(PythonError::from)?;
+        }
+        let (_, inner_file_slice) = file_group
+            .file_slices
+            .iter()
+            .next()
+            .ok_or_else(|| {
+                CoreError::FileGroup(format!(
+                    "Failed to get file slice from file group: {:?}",
+                    file_group
+                ))
+            })
+            .map_err(PythonError::from)?;
+        rt().block_on(self.inner.read_file_slice(inner_file_slice))
+            .map_err(PythonError::from)?
+            .to_pyarrow(py)
+    }
 }
 
 #[cfg(not(tarpaulin))]
@@ -101,6 +130,8 @@ pub struct HudiFileSlice {
     #[pyo3(get)]
     base_file_byte_size: i64,
     #[pyo3(get)]
+    log_file_names: Vec<String>,
+    #[pyo3(get)]
     num_records: i64,
 }
 
@@ -112,34 +143,59 @@ impl HudiFileSlice {
             .join(&self.base_file_name)
             .to_str()
             .map(String::from)
-            .ok_or(StorageError::InvalidPath(format!(
-                "Failed to get base file relative path for file slice: {:?}",
-                self
-            )))
+            .ok_or_else(|| {
+                StorageError::InvalidPath(format!(
+                    "Failed to get base file relative path for file slice: {:?}",
+                    self
+                ))
+            })
             .map_err(CoreError::from)
             .map_err(PythonError::from)?;
         Ok(path)
     }
+    fn log_files_relative_paths(&self) -> PyResult<Vec<String>> {
+        let mut paths = Vec::<String>::new();
+        for name in self.log_file_names.iter() {
+            let p = PathBuf::from(&self.partition_path)
+                .join(name)
+                .to_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    StorageError::InvalidPath(format!(
+                        "Failed to get log file relative path for file slice: {:?}",
+                        self
+                    ))
+                })
+                .map_err(CoreError::from)
+                .map_err(PythonError::from)?;
+            paths.push(p)
+        }
+        Ok(paths)
+    }
 }
 
 #[cfg(not(tarpaulin))]
-fn convert_file_slice(f: &FileSlice) -> HudiFileSlice {
-    let file_id = f.file_id().to_string();
-    let partition_path = f.partition_path.to_string();
-    let creation_instant_time = f.creation_instant_time().to_string();
-    let base_file_name = f.base_file.file_name();
-    let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
-    let base_file_size = file_metadata.size;
-    let base_file_byte_size = file_metadata.byte_size;
-    let num_records = file_metadata.num_records;
-    HudiFileSlice {
-        file_id,
-        partition_path,
-        creation_instant_time,
-        base_file_name,
-        base_file_size,
-        base_file_byte_size,
-        num_records,
+impl From<&FileSlice> for HudiFileSlice {
+    fn from(f: &FileSlice) -> Self {
+        let file_id = f.file_id().to_string();
+        let partition_path = f.partition_path.to_string();
+        let creation_instant_time = f.creation_instant_time().to_string();
+        let base_file_name = f.base_file.file_name();
+        let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
+        let base_file_size = file_metadata.size;
+        let base_file_byte_size = file_metadata.byte_size;
+        let log_file_names = f.log_files.iter().map(|l| l.file_name()).collect();
+        let num_records = file_metadata.num_records;
+        HudiFileSlice {
+            file_id,
+            partition_path,
+            creation_instant_time,
+            base_file_name,
+            base_file_size,
+            base_file_byte_size,
+            log_file_names,
+            num_records,
+        }
     }
 }
 
@@ -202,7 +258,7 @@ impl HudiTable {
                 .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
-                .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
+                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
                 .collect())
         })
     }
@@ -226,7 +282,7 @@ impl HudiTable {
                 .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
-                .map(|inner_vec| inner_vec.iter().map(convert_file_slice).collect())
+                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
                 .collect())
         })
     }
@@ -243,7 +299,7 @@ impl HudiTable {
             let file_slices = rt()
                 .block_on(self.inner.get_file_slices(&filters.as_strs()))
                 .map_err(PythonError::from)?;
-            Ok(file_slices.iter().map(convert_file_slice).collect())
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
         })
     }
 
@@ -263,12 +319,37 @@ impl HudiTable {
                         .get_file_slices_as_of(timestamp, &filters.as_strs()),
                 )
                 .map_err(PythonError::from)?;
-            Ok(file_slices.iter().map(convert_file_slice).collect())
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
         })
     }
 
-    fn create_file_group_reader(&self) -> PyResult<HudiFileGroupReader> {
-        let fg_reader = self.inner.create_file_group_reader();
+    #[pyo3(signature = (start_timestamp=None, end_timestamp=None))]
+    fn get_file_slices_between(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        py.allow_threads(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_between(start_timestamp, end_timestamp),
+                )
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (options=None))]
+    fn create_file_group_reader_with_options(
+        &self,
+        options: Option<HashMap<String, String>>,
+    ) -> PyResult<HudiFileGroupReader> {
+        let fg_reader = self
+            .inner
+            .create_file_group_reader_with_options(options.unwrap_or_default())
+            .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner: fg_reader })
     }
 

@@ -67,7 +67,7 @@ use hudi_core::util::StrTupleRef;
 /// // Create a new HudiDataSource with specific read options
 /// let hudi = HudiDataSource::new_with_options(
 ///     "/tmp/trips_table",
-///     [("hoodie.read.as.of.timestamp", "20241122010827898")]).await?;
+///     [("hoodie.read.input.partitions", 5)]).await?;
 ///
 /// // Register the Hudi table with the session context
 /// ctx.register_table("trips_table", Arc::new(hudi))?;

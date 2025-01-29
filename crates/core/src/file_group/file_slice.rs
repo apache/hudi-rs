@@ -42,6 +42,11 @@ impl FileSlice {
         }
     }
 
+    #[inline]
+    pub fn has_log_file(&self) -> bool {
+        !self.log_files.is_empty()
+    }
+
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
         let path = PathBuf::from(self.partition_path.as_str()).join(file_name);
         path.to_str().map(|s| s.to_string()).ok_or_else(|| {

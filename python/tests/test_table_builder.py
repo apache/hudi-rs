@@ -113,11 +113,19 @@ def test_read_table_returns_correct_data(get_sample_table):
 @pytest.mark.parametrize(
     "hudi_options,storage_options,options",
     [
-        ({"hoodie.read.as.of.timestamp": "20240402123035233"}, {}, {}),
-        ({}, {}, {"hoodie.read.as.of.timestamp": "20240402123035233"}),
+        (
+            {"hoodie.read.file_group.start_timestamp": "resolved value"},
+            {"hoodie.read.file_group.start_timestamp": "not taking"},
+            {"hoodie.read.file_group.start_timestamp": "lower precedence"},
+        ),
+        (
+            {},
+            {"hoodie.read.file_group.start_timestamp": "not taking"},
+            {"hoodie.read.file_group.start_timestamp": "resolved value"},
+        ),
     ],
 )
-def test_read_table_as_of_timestamp(
+def test_setting_table_options(
     get_sample_table, hudi_options, storage_options, options
 ):
     table_path = get_sample_table
@@ -129,37 +137,7 @@ def test_read_table_as_of_timestamp(
         .build()
     )
 
-    batches = table.read_snapshot()
-    t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
-    assert t.to_pylist() == [
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695046462179,
-            "uuid": "9909a8b1-2d15-4d3d-8ec9-efc48c536a00",
-            "fare": 33.9,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695091554788,
-            "uuid": "e96c4396-3fad-413a-a942-4cb36106d721",
-            "fare": 27.7,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695115999911,
-            "uuid": "c8abbe79-8d89-47ea-b4ce-4d224bae5bfa",
-            "fare": 17.85,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695159649087,
-            "uuid": "334e26e9-8355-45cc-97c6-c31daf0df330",
-            "fare": 19.1,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695516137016,
-            "uuid": "e3cf430c-889d-4015-bc98-59bdce1e530c",
-            "fare": 34.15,
-        },
-    ]
+    assert (
+        table.hudi_options().get("hoodie.read.file_group.start_timestamp")
+        == "resolved value"
+    )
