@@ -369,7 +369,17 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        FileGroupReader::new_with_configs_and_options(self.hudi_configs.clone(), options)
+        let mut overwriting_options = HashMap::with_capacity(self.storage_options.len());
+        for (k, v) in self.storage_options.iter() {
+            overwriting_options.insert(k.clone(), v.clone());
+        }
+        for (k, v) in options {
+            overwriting_options.insert(k.as_ref().to_string(), v.into());
+        }
+        FileGroupReader::new_with_configs_and_options(
+            self.hudi_configs.clone(),
+            overwriting_options,
+        )
     }
 
     /// Get all the latest records in the table.
