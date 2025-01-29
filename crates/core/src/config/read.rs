@@ -33,18 +33,21 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// **Example**
 ///
 /// ```rust
-/// use hudi_core::config::read::HudiReadConfig::{AsOfTimestamp, InputPartitions};
+/// use hudi_core::config::read::HudiReadConfig::InputPartitions;
 /// use hudi_core::table::Table as HudiTable;
 ///
-/// let options = [(InputPartitions, "2"), (AsOfTimestamp, "20240101010100000")];
+/// let options = [(InputPartitions, "2")];
 /// HudiTable::new_with_options("/tmp/hudi_data", options)
 /// ```
 ///
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiReadConfig {
-    /// The query instant for time travel. Without specified this option, we query the latest snapshot.
-    AsOfTimestamp,
+    /// Start timestamp (exclusive) for [FileGroup] to filter records.
+    FileGroupStartTimestamp,
+
+    /// End timestamp (inclusive) for [FileGroup] to filter records.
+    FileGroupEndTimestamp,
 
     /// Number of input partitions to read the data in parallel.
     ///
@@ -62,7 +65,8 @@ pub enum HudiReadConfig {
 impl AsRef<str> for HudiReadConfig {
     fn as_ref(&self) -> &str {
         match self {
-            Self::AsOfTimestamp => "hoodie.read.as.of.timestamp",
+            Self::FileGroupStartTimestamp => "hoodie.read.file_group.start_timestamp",
+            Self::FileGroupEndTimestamp => "hoodie.read.file_group.end_timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
@@ -95,7 +99,12 @@ impl ConfigParser for HudiReadConfig {
             .ok_or(NotFound(self.key()));
 
         match self {
-            Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::FileGroupStartTimestamp => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
+            Self::FileGroupEndTimestamp => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
             Self::InputPartitions => get_result
                 .and_then(|v| {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))

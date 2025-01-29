@@ -24,11 +24,11 @@ __version__: str
 @dataclass(init=False)
 class HudiFileGroupReader:
     """
-    A reader for a group of Hudi file slices. Allows reading of records from the base file in a Hudi table.
+    The reader that handles all read operations against a file group.
 
     Attributes:
-        base_uri (str): The base URI of the Hudi table.
-        options (Optional[Dict[str, str]]): Additional options for reading the file group.
+        base_uri (str): The base URI of the file group's residing table.
+        options (Optional[Dict[str, str]]): Additional options for the reader.
     """
     def __init__(self, base_uri: str, options: Optional[Dict[str, str]] = None):
         """
@@ -43,13 +43,24 @@ class HudiFileGroupReader:
         self, relative_path: str
     ) -> "pyarrow.RecordBatch":
         """
-        Reads the data from the base file given a relative path.
+        Reads the data from the base file at the given relative path.
 
         Parameters:
             relative_path (str): The relative path to the base file.
 
         Returns:
-            pyarrow.RecordBatch: A batch of records read from the base file.
+            pyarrow.RecordBatch: A record batch read from the base file.
+        """
+        ...
+    def read_file_slice(self, file_slice: HudiFileSlice) -> "pyarrow.RecordBatch":
+        """
+        Reads the data from the given file slice.
+
+        Parameters:
+            file_slice (HudiFileSlice): The file slice to read from.
+
+        Returns:
+            pyarrow.RecordBatch: A record batch read from the file slice.
         """
         ...
 
@@ -66,6 +77,7 @@ class HudiFileSlice:
         base_file_name (str): The name of the base file.
         base_file_size (int): The on-disk size of the base file in bytes.
         base_file_byte_size (int): The in-memory size of the base file in bytes.
+        log_file_names (List[str]): The names of the ordered log files.
         num_records (int): The number of records in the file slice.
     """
 
@@ -75,6 +87,7 @@ class HudiFileSlice:
     base_file_name: str
     base_file_size: int
     base_file_byte_size: int
+    log_file_names: List[str]
     num_records: int
 
     def base_file_relative_path(self) -> str:
@@ -83,6 +96,14 @@ class HudiFileSlice:
 
         Returns:
             str: The relative path of the base file.
+        """
+        ...
+    def log_files_relative_paths(self) -> List[str]:
+        """
+        Returns the relative paths of the log files for this file slice.
+
+        Returns:
+            List[str]: A list of relative paths of the log files.
         """
         ...
 
@@ -182,7 +203,18 @@ class HudiTable:
         Retrieves all file slices in the Hudi table as of a timestamp, optionally filtered by the provided filters.
         """
         ...
-    def create_file_group_reader(self) -> HudiFileGroupReader:
+    def get_file_slices_between(
+        self,
+        start_timestamp: Optional[str],
+        end_timestamp: Optional[str],
+    ) -> List[HudiFileSlice]:
+        """
+        Retrieves all changed file slices in the Hudi table between the given timestamps.
+        """
+        ...
+    def create_file_group_reader_with_options(
+        self, options: Optional[Dict[str, str]] = None
+    ) -> HudiFileGroupReader:
         """
         Creates a HudiFileGroupReader for reading records from file groups in the Hudi table.
 

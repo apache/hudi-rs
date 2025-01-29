@@ -45,9 +45,11 @@ pub struct Timeline {
     pub completed_commits: Vec<Instant>,
 }
 
+pub const DEFAULT_START_TIMESTAMP: &str = "19700101000000000";
+
 impl Timeline {
     #[cfg(test)]
-    pub async fn new_from_completed_commits(
+    pub(crate) async fn new_from_completed_commits(
         hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,
         completed_commits: Vec<Instant>,
@@ -60,7 +62,7 @@ impl Timeline {
         })
     }
 
-    pub async fn new_from_storage(
+    pub(crate) async fn new_from_storage(
         hudi_configs: Arc<HudiConfigs>,
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
@@ -104,7 +106,7 @@ impl Timeline {
         Ok(instants)
     }
 
-    pub fn get_latest_commit_timestamp(&self) -> Option<&str> {
+    pub(crate) fn get_latest_commit_timestamp(&self) -> Option<&str> {
         self.completed_commits
             .iter()
             .next_back()
@@ -126,7 +128,7 @@ impl Timeline {
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
-    pub async fn get_latest_schema(&self) -> Result<Schema> {
+    pub(crate) async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
         let first_partition = commit_metadata
@@ -181,7 +183,7 @@ impl Timeline {
         }
     }
 
-    pub async fn get_replaced_file_groups_as_of(
+    pub(crate) async fn get_replaced_file_groups_as_of(
         &self,
         timestamp: &str,
     ) -> Result<HashSet<FileGroup>> {
@@ -203,7 +205,7 @@ impl Timeline {
 
     /// Get file groups in the timeline ranging from start (exclusive) to end (inclusive).
     /// File groups are as of the [end] timestamp or the latest if not given.
-    pub async fn get_incremental_file_groups(
+    pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,

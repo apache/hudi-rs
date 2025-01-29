@@ -90,7 +90,6 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
-use crate::config::read::HudiReadConfig::{AsOfTimestamp, UseReadOptimizedMode};
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
@@ -100,11 +99,10 @@ use crate::file_group::reader::FileGroupReader;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
-use crate::timeline::Timeline;
+use crate::timeline::{Timeline, DEFAULT_START_TIMESTAMP};
 use crate::Result;
 
-use crate::metadata::meta_field::MetaField;
-use crate::timeline::selector::InstantRange;
+use crate::config::read::HudiReadConfig;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -211,22 +209,18 @@ impl Table {
         Ok(Schema::new(partition_fields))
     }
 
-    /// Get all the [FileSlice]s in the table.
+    /// Get all the [FileSlice]s in splits from the table.
     ///
-    /// The file slices are split into `n` chunks.
-    ///
-    /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
-    ///
+    /// # Arguments
+    ///     * `n` - The number of chunks to split the file slices into.
+    ///     * `filters` - Partition filters to apply.
     pub async fn get_file_slices_splits(
         &self,
         n: usize,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
-        let filters = from_str_tuples(filters)?;
-        if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.get_file_slices_splits_internal(n, timestamp.to::<String>().as_str(), &filters)
-                .await
-        } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            let filters = from_str_tuples(filters)?;
             self.get_file_slices_splits_internal(n, timestamp, &filters)
                 .await
         } else {
@@ -234,6 +228,12 @@ impl Table {
         }
     }
 
+    /// Get all the [FileSlice]s in splits from the table at a given timestamp.
+    ///
+    /// # Arguments
+    ///     * `n` - The number of chunks to split the file slices into.
+    ///     * `timestamp` - The timestamp which file slices associated with.
+    ///     * `filters` - Partition filters to apply.
     pub async fn get_file_slices_splits_as_of(
         &self,
         n: usize,
@@ -267,20 +267,28 @@ impl Table {
 
     /// Get all the [FileSlice]s in the table.
     ///
-    /// If the [AsOfTimestamp] configuration is set, the file slices at the specified timestamp will be returned.
+    /// # Arguments
+    ///     * `filters` - Partition filters to apply.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing snapshot query.
     pub async fn get_file_slices(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<FileSlice>> {
-        let filters = from_str_tuples(filters)?;
-        if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.get_file_slices_internal(timestamp.to::<String>().as_str(), &filters)
-                .await
-        } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            let filters = from_str_tuples(filters)?;
             self.get_file_slices_internal(timestamp, &filters).await
         } else {
             Ok(Vec::new())
         }
     }
 
-    /// Get all the [FileSlice]s at a given timestamp, as a time travel query.
+    /// Get all the [FileSlice]s in the table at a given timestamp.
+    ///
+    /// # Arguments
+    ///     * `timestamp` - The timestamp which file slices associated with.
+    ///     * `filters` - Partition filters to apply.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing time travel query.
     pub async fn get_file_slices_as_of(
         &self,
         timestamp: &str,
@@ -307,91 +315,114 @@ impl Table {
             .await
     }
 
-    pub fn create_file_group_reader(&self) -> FileGroupReader {
-        FileGroupReader::new(
-            self.hudi_configs.clone(),
-            self.file_system_view.storage.clone(),
-        )
+    /// Get all the changed [FileSlice]s in the table between the given timestamps.
+    ///
+    /// # Arguments
+    ///     * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
+    ///     * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing incremental query.
+    pub async fn get_file_slices_between(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<FileSlice>> {
+        // If the end timestamp is not provided, use the latest commit timestamp.
+        let Some(end) = end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
+        else {
+            // No latest commit timestamp means the table is empty.
+            return Ok(Vec::new());
+        };
+
+        let start = start_timestamp.unwrap_or(DEFAULT_START_TIMESTAMP);
+
+        self.get_file_slices_between_internal(start, end).await
     }
 
-    fn create_file_group_reader_with_filters(
+    async fn get_file_slices_between_internal(
         &self,
-        filters: &[(&str, &str, &str)],
-        schema: &Schema,
-    ) -> Result<FileGroupReader> {
-        let filters = from_str_tuples(filters)?;
-        FileGroupReader::new_with_filters(
-            self.file_system_view.storage.clone(),
-            self.hudi_configs.clone(),
-            &filters,
-            schema,
-        )
+        start_timestamp: &str,
+        end_timestamp: &str,
+    ) -> Result<Vec<FileSlice>> {
+        let mut file_slices: Vec<FileSlice> = Vec::new();
+        let file_groups = self
+            .timeline
+            .get_file_groups_between(Some(start_timestamp), Some(end_timestamp))
+            .await?;
+        for file_group in file_groups {
+            if let Some(file_slice) = file_group.get_file_slice_as_of(end_timestamp) {
+                file_slices.push(file_slice.clone());
+            }
+        }
+
+        Ok(file_slices)
+    }
+
+    /// Create a [FileGroupReader] using the [Table]'s Hudi configs, and overwriting options.
+    pub fn create_file_group_reader_with_options<I, K, V>(
+        &self,
+        options: I,
+    ) -> Result<FileGroupReader>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        FileGroupReader::new_with_configs_and_options(self.hudi_configs.clone(), options)
     }
 
     /// Get all the latest records in the table.
     ///
-    /// If the [AsOfTimestamp] configuration is set, the records at the specified timestamp will be returned.
+    /// # Arguments
+    ///     * `filters` - Partition filters to apply.
     pub async fn read_snapshot(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<RecordBatch>> {
-        let filters = from_str_tuples(filters)?;
-        let read_optimized_mode = self
-            .hudi_configs
-            .get_or_default(UseReadOptimizedMode)
-            .to::<bool>();
-
-        if let Some(timestamp) = self.hudi_configs.try_get(AsOfTimestamp) {
-            self.read_snapshot_internal(
-                timestamp.to::<String>().as_str(),
-                &filters,
-                read_optimized_mode,
-            )
-            .await
-        } else if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
-            self.read_snapshot_internal(timestamp, &filters, read_optimized_mode)
-                .await
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+            let filters = from_str_tuples(filters)?;
+            self.read_snapshot_internal(timestamp, &filters).await
         } else {
             Ok(Vec::new())
         }
     }
 
-    /// Get all the records in the table at a given timestamp, as a time travel query.
+    /// Get all the records in the table at a given timestamp.
+    ///
+    /// # Arguments
+    ///     * `timestamp` - The timestamp which records associated with.
+    ///     * `filters` - Partition filters to apply.
     pub async fn read_snapshot_as_of(
         &self,
         timestamp: &str,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<RecordBatch>> {
         let filters = from_str_tuples(filters)?;
-        let read_optimized_mode = self
-            .hudi_configs
-            .get_or_default(UseReadOptimizedMode)
-            .to::<bool>();
-        self.read_snapshot_internal(timestamp, &filters, read_optimized_mode)
-            .await
+        self.read_snapshot_internal(timestamp, &filters).await
     }
 
     async fn read_snapshot_internal(
         &self,
         timestamp: &str,
         filters: &[Filter],
-        read_optimized_mode: bool,
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
-        let fg_reader = self.create_file_group_reader();
-        let base_file_only =
-            read_optimized_mode || self.table_type() == TableTypeValue::CopyOnWrite;
-        let timezone = self.timezone();
-        let instant_range = InstantRange::up_to(timestamp, &timezone);
-        let batches = futures::future::try_join_all(
-            file_slices
-                .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
-        )
-        .await?;
+        let fg_reader = self.create_file_group_reader_with_options([(
+            HudiReadConfig::FileGroupEndTimestamp,
+            timestamp,
+        )])?;
+        let batches =
+            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
+                .await?;
         Ok(batches)
     }
 
     /// Get records that were inserted or updated between the given timestamps.
+    ///
     /// Records that were updated multiple times should have their latest states within
     /// the time span being returned.
+    ///
+    /// # Arguments
+    ///     * `start_timestamp` - Only records that were inserted or updated after this timestamp will be returned.
+    ///     * `end_timestamp` - If provided, only records that were inserted or updated before or at this timestamp will be returned.
     pub async fn read_incremental_records(
         &self,
         start_timestamp: &str,
@@ -404,41 +435,23 @@ impl Table {
             return Ok(Vec::new());
         };
 
-        // Use timestamp range to get the target file slices.
-        let mut file_slices: Vec<FileSlice> = Vec::new();
-        let file_groups = self
-            .timeline
-            .get_incremental_file_groups(Some(start_timestamp), Some(end_timestamp))
+        let file_slices = self
+            .get_file_slices_between_internal(start_timestamp, end_timestamp)
             .await?;
-        for file_group in file_groups {
-            if let Some(file_slice) = file_group.get_file_slice_as_of(end_timestamp) {
-                file_slices.push(file_slice.clone());
-            }
-        }
 
-        // Read incremental records from the file slices.
-        let filters = &[
-            (MetaField::CommitTime.as_ref(), ">", start_timestamp),
-            (MetaField::CommitTime.as_ref(), "<=", end_timestamp),
-        ];
-        let schema = MetaField::schema();
-        let fg_reader = self.create_file_group_reader_with_filters(filters, &schema)?;
+        let fg_reader = self.create_file_group_reader_with_options([
+            (HudiReadConfig::FileGroupStartTimestamp, start_timestamp),
+            (HudiReadConfig::FileGroupEndTimestamp, end_timestamp),
+        ])?;
 
-        // Read-optimized mode does not apply to incremental query semantics.
-        let base_file_only = self.table_type() == TableTypeValue::CopyOnWrite;
-        let timezone = self.timezone();
-        let instant_range =
-            InstantRange::within_open_closed(start_timestamp, end_timestamp, &timezone);
-        let batches = futures::future::try_join_all(
-            file_slices
-                .iter()
-                .map(|f| fg_reader.read_file_slice(f, base_file_only, instant_range.clone())),
-        )
-        .await?;
+        let batches =
+            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
+                .await?;
         Ok(batches)
     }
 
     /// Get the change-data-capture (CDC) records between the given timestamps.
+    ///
     /// The CDC records should reflect the records that were inserted, updated, and deleted
     /// between the timestamps.
     #[allow(dead_code)]
@@ -454,13 +467,13 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::read::HudiReadConfig::AsOfTimestamp;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
         IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
         PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion, TimelineTimezone,
     };
+    use crate::config::util::empty_options;
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
@@ -799,7 +812,8 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
-            .create_file_group_reader()
+            .create_file_group_reader_with_options(empty_options())
+            .unwrap()
             .read_file_slice_by_base_file_path(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
             )
@@ -907,11 +921,13 @@ mod tests {
         );
 
         // as of just smaller than the latest timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "20240418173551905")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
+        let hudi_table = Table::new_with_options(base_url.path(), empty_options())
             .await
             .unwrap();
-        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_as_of("20240418173551905", &[])
+            .await
+            .unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -921,11 +937,13 @@ mod tests {
         );
 
         // as of non-exist old timestamp
-        let opts = [(AsOfTimestamp.as_ref(), "19700101000000")];
-        let hudi_table = Table::new_with_options(base_url.path(), opts)
+        let hudi_table = Table::new_with_options(base_url.path(), empty_options())
             .await
             .unwrap();
-        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_as_of("19700101000000", &[])
+            .await
+            .unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -1071,9 +1089,11 @@ mod tests {
         #[tokio::test]
         async fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
-            let hudi_table =
-                Table::new_with_options(base_url.path(), [(UseReadOptimizedMode.as_ref(), "true")])
-                    .await?;
+            let hudi_table = Table::new_with_options(
+                base_url.path(),
+                [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
+            )
+            .await?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
