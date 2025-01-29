@@ -844,7 +844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_file_slices_splits_as_of() {
+    async fn hudi_table_get_file_slices_splits_as_of_timestamps() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
 
@@ -951,6 +951,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             Vec::<String>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn empty_hudi_table_get_file_slices_between_timestamps() {
+        let base_url = SampleTable::V6Empty.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_between(Some(EARLIEST_START_TIMESTAMP), None)
+            .await
+            .unwrap();
+        assert!(file_slices.is_empty())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_between_timestamps() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_between(None, Some("20250121000656060"))
+            .await
+            .unwrap();
+        assert_eq!(file_slices.len(), 3);
+        // TODO: Add more assertions
     }
 
     #[tokio::test]
