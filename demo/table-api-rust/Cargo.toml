@@ -25,6 +25,6 @@ edition = "2021"
 
 [dependencies]
 tokio = "^1"
-arrow = { version = "= 53.3.0", features = ["pyarrow"] }
+arrow = { version = "= 53.4.0", features = ["pyarrow"] }
 
 hudi = { path = "../../crates/hudi" }

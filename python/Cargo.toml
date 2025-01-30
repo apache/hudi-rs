@@ -47,3 +47,6 @@ tokio = { workspace = true }
 [dependencies.pyo3]
 version = "0.22.6"
 features = ["extension-module", "abi3", "abi3-py39"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

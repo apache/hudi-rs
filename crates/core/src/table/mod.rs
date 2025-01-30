@@ -56,7 +56,7 @@
 //! }
 //! ```
 //! 4. get file slice
-//! Users can obtain metadata to customize reading methods, read in batches, perform parallel reads, and more.
+//!    Users can obtain metadata to customize reading methods, read in batches, perform parallel reads, and more.
 //! ```rust
 //! use url::Url;
 //! use hudi_core::table::Table;
