@@ -110,7 +110,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
-/// Hudi Table in-memory
+/// The main struct that provides table APIs for interacting with a Hudi table.
 #[derive(Clone, Debug)]
 pub struct Table {
     pub hudi_configs: Arc<HudiConfigs>,
