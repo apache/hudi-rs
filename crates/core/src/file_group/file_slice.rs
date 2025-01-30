@@ -38,8 +38,8 @@ impl Display for FileSlice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FileSlice {{ base_file: {}, partition_path: {} }}",
-            self.base_file, self.partition_path
+            "FileSlice {{ base_file: {}, log_files: {:?}, partition_path: {} }}",
+            self.base_file, self.log_files, self.partition_path
         )
     }
 }

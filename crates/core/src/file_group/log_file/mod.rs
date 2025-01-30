@@ -20,6 +20,7 @@ use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::Result;
 use std::cmp::Ordering;
+use std::fmt::Display;
 use std::str::FromStr;
 
 mod log_block;
@@ -139,6 +140,12 @@ impl TryFrom<FileMetadata> for LogFile {
             write_token,
             file_metadata: Some(metadata),
         })
+    }
+}
+
+impl Display for LogFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LogFile: {}", self.file_name())
     }
 }
 
