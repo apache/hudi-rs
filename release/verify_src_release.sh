@@ -105,6 +105,7 @@ echo "<<< OK"
 echo ">>> Verifying no binary files..."
 find_binary_files() {
   find . -type f \
+    -not -path "*/test/data/*" \
     -not -path "*/tests/data/*" \
     -not -path "*/tests/table/*" \
     -not -name "*.json" -not -name "*.xml" \
