@@ -19,6 +19,7 @@
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::Result;
+use std::fmt::Display;
 use std::str::FromStr;
 
 /// Hudi Base file, part of a [FileSlice].
@@ -87,6 +88,20 @@ impl BaseFile {
         )
     }
 }
+
+impl Display for BaseFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BaseFile: {}", self.file_name())
+    }
+}
+
+impl PartialEq for BaseFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_name() == other.file_name()
+    }
+}
+
+impl Eq for BaseFile {}
 
 impl FromStr for BaseFile {
     type Err = CoreError;

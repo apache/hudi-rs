@@ -978,12 +978,37 @@ mod tests {
     async fn hudi_table_get_file_slices_between_timestamps() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices = hudi_table
+        let mut file_slices = hudi_table
             .get_file_slices_between(None, Some("20250121000656060"))
             .await
             .unwrap();
         assert_eq!(file_slices.len(), 3);
-        // TODO: Add more assertions
+
+        file_slices.sort_unstable_by_key(|f| f.partition_path.clone());
+
+        let file_slice_0 = &file_slices[0];
+        assert_eq!(file_slice_0.partition_path, "10");
+        assert_eq!(
+            file_slice_0.file_id(),
+            "92e64357-e4d1-4639-a9d3-c3535829d0aa-0"
+        );
+        assert_eq!(file_slice_0.log_files.len(), 1);
+
+        let file_slice_1 = &file_slices[1];
+        assert_eq!(file_slice_1.partition_path, "20");
+        assert_eq!(
+            file_slice_1.file_id(),
+            "d49ae379-4f20-4549-8e23-a5f9604412c0-0"
+        );
+        assert!(file_slice_1.log_files.is_empty());
+
+        let file_slice_2 = &file_slices[2];
+        assert_eq!(file_slice_2.partition_path, "30");
+        assert_eq!(
+            file_slice_2.file_id(),
+            "de3550df-e12c-4591-9335-92ff992258a2-0"
+        );
+        assert!(file_slice_2.log_files.is_empty());
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::Result;
 use std::cmp::Ordering;
+use std::fmt::Display;
 use std::str::FromStr;
 
 mod log_block;
@@ -142,6 +143,12 @@ impl TryFrom<FileMetadata> for LogFile {
     }
 }
 
+impl Display for LogFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LogFile: {}", self.file_name())
+    }
+}
+
 impl PartialEq for LogFile {
     fn eq(&self, other: &Self) -> bool {
         self.file_name() == other.file_name()
@@ -170,6 +177,13 @@ impl Ord for LogFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_log_file_name_in_formatted_str() {
+        let filename = ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115";
+        let log_file = LogFile::from_str(filename).unwrap();
+        assert!(format!("{}", log_file).contains(filename));
+    }
 
     #[test]
     fn test_valid_filename_parsing() {
