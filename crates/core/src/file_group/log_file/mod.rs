@@ -179,6 +179,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_log_file_name_in_formatted_str() {
+        let filename = ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115";
+        let log_file = LogFile::from_str(filename).unwrap();
+        assert!(format!("{}", log_file).contains(filename));
+    }
+
+    #[test]
     fn test_valid_filename_parsing() {
         let filename = ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115";
         let log_file = LogFile::from_str(filename).unwrap();
