@@ -57,7 +57,7 @@ jobs:
         os: [ ubuntu-22.04 ]
     runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.30.0
+      image: xd009642/tarpaulin:0.31.5
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4

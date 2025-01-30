@@ -26,7 +26,7 @@ resolver = "2"
 version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.79"
+rust-version = "1.81"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 readme = "README.md"
 description = "A native Rust library for Apache Hudi"
@@ -35,19 +35,19 @@ repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "= 53.3.0", features = ["pyarrow"] }
-arrow-arith = { version = "= 53.3.0" }
-arrow-array = { version = "= 53.3.0" }
-arrow-buffer = { version = "= 53.3.0" }
-arrow-cast = { version = "= 53.3.0" }
-arrow-ipc = { version = "= 53.3.0" }
-arrow-json = { version = "= 53.3.0" }
-arrow-ord = { version = "= 53.3.0" }
-arrow-row = { version = "= 53.3.0" }
-arrow-schema = { version = "= 53.3.0", features = ["serde"] }
-arrow-select = { version = "= 53.3.0" }
+arrow = { version = "= 53.4.0", features = ["pyarrow"] }
+arrow-arith = { version = "= 53.4.0" }
+arrow-array = { version = "= 53.4.0" }
+arrow-buffer = { version = "= 53.4.0" }
+arrow-cast = { version = "= 53.4.0" }
+arrow-ipc = { version = "= 53.4.0" }
+arrow-json = { version = "= 53.4.0" }
+arrow-ord = { version = "= 53.4.0" }
+arrow-row = { version = "= 53.4.0" }
+arrow-schema = { version = "= 53.4.0", features = ["serde"] }
+arrow-select = { version = "= 53.4.0" }
 object_store = { version = "= 0.11.2", features = ["aws", "azure", "gcp"] }
-parquet = { version = "= 53.3.0", features = ["async", "object_store"] }
+parquet = { version = "= 53.4.0", features = ["async", "object_store"] }
 
 # datafusion
 datafusion = { version = "= 43.0.0" }
@@ -61,7 +61,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 
 # "stdlib"
-thiserror = { version = "2.0.10" }
+thiserror = { version = "2.0.11" }
 bytes = { version = "1" }
 chrono = { version = "0.4" }
 lazy_static = { version = "1.5.0" }

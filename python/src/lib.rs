@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 
 mod internal;
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[pymodule]
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

@@ -56,14 +56,14 @@ impl From<PythonError> for PyErr {
     }
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
 #[pyclass]
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiFileGroupReader {
     #[new]
@@ -113,7 +113,7 @@ impl HudiFileGroupReader {
     }
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
 #[pyclass]
 pub struct HudiFileSlice {
@@ -135,7 +135,7 @@ pub struct HudiFileSlice {
     num_records: i64,
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiFileSlice {
     fn base_file_relative_path(&self) -> PyResult<String> {
@@ -174,7 +174,7 @@ impl HudiFileSlice {
     }
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 impl From<&FileSlice> for HudiFileSlice {
     fn from(f: &FileSlice) -> Self {
         let file_id = f.file_id().to_string();
@@ -199,13 +199,13 @@ impl From<&FileSlice> for HudiFileSlice {
     }
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[pyclass]
 pub struct HudiTable {
     inner: Table,
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiTable {
     #[new]
@@ -399,7 +399,7 @@ impl HudiTable {
     }
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 #[pyfunction]
 #[pyo3(signature = (base_uri, hudi_options=None, storage_options=None, options=None))]
 pub fn build_hudi_table(
@@ -420,7 +420,7 @@ pub fn build_hudi_table(
     Ok(HudiTable { inner })
 }
 
-#[cfg(not(tarpaulin))]
+#[cfg(not(tarpaulin_include))]
 fn rt() -> &'static Runtime {
     static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
     TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
