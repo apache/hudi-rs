@@ -113,7 +113,8 @@ hudi_table = (
 #### Rust
 
 ```rust
-let hudi_table = HudiTableBuilder::from_base_uri("/tmp/trips_table")
+let hudi_table = 
+    HudiTableBuilder::from_base_uri("/tmp/trips_table")
     .with_option("hoodie.read.use.read_optimized.mode", "true")
     .build().await?;
 ```
@@ -205,7 +206,7 @@ extension to query Hudi tables.
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@42
+cargo add tokio@1 datafusion@43
 cargo add hudi --features datafusion
 ```
 
