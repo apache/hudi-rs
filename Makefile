@@ -18,13 +18,14 @@
 .DEFAULT_GOAL := help
 
 VENV := venv
-MATURIN_VERSION := $(shell grep 'requires =' pyproject.toml | cut -d= -f2- | tr -d '[ "]')
+PYTHON_DIR = python
+MATURIN_VERSION := $(shell grep 'requires =' $(PYTHON_DIR)/pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
 
 .PHONY: setup-venv
 setup-venv: ## Setup the virtualenv
 	$(info --- Setup virtualenv ---)
-	python -m venv $(VENV)
+	python3 -m venv $(VENV)
 
 .PHONY: setup
 setup: ## Setup the requirements
@@ -34,12 +35,12 @@ setup: ## Setup the requirements
 .PHONY: build
 build: setup ## Build Python binding of hudi-rs
 	$(info --- Build Python binding ---)
-	maturin build $(MATURIN_EXTRA_ARGS)
+	maturin build $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
 
 .PHONY: develop
 develop: setup ## Install Python binding of hudi-rs
 	$(info --- Develop with Python binding ---)
-	maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS)
+	maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
 
 .PHONY: format
 format: format-rust format-python ## Format Rust and Python code
@@ -52,7 +53,7 @@ format-rust: ## Format Rust code
 .PHONY: format-python
 format-python: ## Format Python code
 	$(info --- Format Python code ---)
-	ruff format .
+	ruff format $(PYTHON_DIR)
 
 .PHONY: check
 check: check-rust check-python ## Run check on Rust and Python
@@ -67,11 +68,11 @@ check-rust: ## Run check on Rust
 .PHONY: check-python
 check-python: ## Run check on Python
 	$(info --- Check Python format ---)
-	ruff format --check --diff .
+	ruff format --check --diff $(PYTHON_DIR)
 	$(info --- Check Python linting ---)
-	ruff check .
+	ruff check $(PYTHON_DIR)
 	$(info --- Check Python typing ---)
-	mypy .
+	pushd $(PYTHON_DIR); mypy .; popd
 
 .PHONY: test
 test: test-rust test-python ## Run tests on Rust and Python
@@ -84,4 +85,4 @@ test-rust: ## Run tests on Rust
 .PHONY: test-python
 test-python: ## Run tests on Python
 	$(info --- Run Python tests ---)
-	pytest -s
+	pytest -s $(PYTHON_DIR)

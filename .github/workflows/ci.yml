@@ -64,7 +64,6 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
-        # https://github.com/xd009642/tarpaulin/issues/1092#issuecomment-1407739176
         run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -91,21 +90,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: python/pyproject.toml
       - name: Setup Python venv
-        working-directory: ./python
         run: |
           make setup-venv
           source venv/bin/activate
           make develop
       - name: Python unit tests with coverage report
         run: |
-          pushd python
           source venv/bin/activate
-          coverage run --include 'hudi/*' -m pytest -v
-          # move to parent so the reported file paths will match the actual repo paths
-          popd
-          coverage xml --data-file=python/.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
+          coverage run --include 'python/hudi/*' -m pytest -v
+          coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
