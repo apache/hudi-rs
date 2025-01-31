@@ -29,7 +29,7 @@ corresponding milestone for the release, and edit the issue description as below
 
 ### Issues
 
-- [ ] All remaining issues in the [milestone](https://github.com/apache/hudi-rs/milestone/1) should be closed.
+- [ ] All other issues in the [release milestone](https://github.com/apache/hudi-rs/milestone/1) should be closed.
 
 > [!IMPORTANT]
 > Highlight blocker issues if any
@@ -37,27 +37,55 @@ corresponding milestone for the release, and edit the issue description as below
 - [ ] https://github.com/apache/hudi-rs/issues/xxx
 - [ ] https://github.com/apache/hudi-rs/issues/xxx
 
-### GitHub
+### Prepare release candidate(s)
 
-- [ ] Bump version
-- [ ] Push release tag
-
-### ASF
-
-- [ ] Create an ASF release
-- [ ] Upload artifacts to the SVN dist repo
-- [ ] Start VOTE in dev email list
+- [ ] Create a release branch 
+- [ ] Bump the version in the release branch for the target RC
+- [ ] Bump the version in `main` branch
+- [ ] Upload the target RC artifacts to the ASF dev repo (SVN)
+- [ ] Verify the target RC artifacts
+- [ ] Push a desired RC release git tag to the release branch
+- [ ] Start VOTE in `dev@hudi.apache.org`
 
 > [!IMPORTANT]
 > Proceed from here only after VOTE passes.
 
 ### Official release
 
-- [ ] Push the release git tag
-- [ ] Publish artifacts to SVN RELEASE branch
-- [ ] Merge the PR to update the changelog
+- [ ] Bump the version in the release branch for the official release
+- [ ] Push the official release git tag to the release branch
+- [ ] Upload the release artifacts to the ASF release repo (SVN)
+- [ ] Merge a PR to update the changelog in `main` branch
+- [ ] Publish release notes in https://github.com/apache/hudi-rs/releases
+- [ ] Register ASF release in https://reporter.apache.org/addrelease.html?hudi
 - [ ] Send `ANNOUNCE` email to dev and user email lists
+- [ ] Close this tracking issue and the release milestone
 ```
+
+## ASF work
+
+### Upload source release to SVN dev
+
+> [!NOTE]
+> Make sure you're using a computer that has your code-signing gpg key installed.
+
+Run the below script to create and upload the source release artifacts.
+
+```shell
+RELEASE_VER=0.1.0-rc.1
+
+./release/upload_src_release_to_dev.sh $RELEASE_VER ${YOUR CODE-SIGNING KEY ID}
+```
+
+Run the below script to verify the source release.
+
+```shell
+RELEASE_VER=0.1.0-rc.1
+
+./release/verify_src_release.sh $RELEASE_VER dev
+```
+
+Fix any issues if found before proceeding to the next step.
 
 ## GitHub work
 
@@ -73,6 +101,9 @@ Execute the below script that creates a branch with the new version changes comm
 ```
 
 ### Bump version in release branch
+
+> [!NOTE]
+> When working on a release branch, use a local clone of `apache/hudi-rs` instead of your own fork.
 
 For a major or minor release, create a release branch in the format of `release/[0-9]+.[0-9]+.x` matching the target
 release version. For example, if it's `0.2.0`, cut a branch named `release/0.2.x`, if it's `1.0.0`, cut a branch
@@ -91,9 +122,17 @@ On the release branch, bump the version to indicate pre-release by pushing a com
 - If it is ready for voting, go with `rc.1`, `rc.2`, etc
 
 ```shell
-cargo set-version 0.2.0-rc.1 --manifest-path crates/hudi/Cargo.toml
-git commit -am "build(release): bump version to 0.2.0-rc.1"
+RELEASE_VER=0.2.0-rc.1
+
+cargo set-version $RELEASE_VER --manifest-path crates/hudi/Cargo.toml
+git commit -am "build(release): bump version to $RELEASE_VER"
 ```
+
+### Testing
+
+Once the "bump version" commit is pushed, CI will be triggered and all tests need to pass before proceed to the next.
+
+Perform any release related tests, such as integration tests, before proceeding to the next step.
 
 ### Generate changelog
 
@@ -117,12 +156,6 @@ git cliff release-{previous_release_version}..HEAD | xclip
 
 Paste the changelog output as a comment on the tracking issue.
 
-### Testing
-
-Once the "bump version" commit is pushed, CI will be triggered and all tests need to pass before proceed to the next.
-
-Perform any release related tests, such as integration tests, before proceeding to the next step.
-
 ### Push tag
 
 > [!IMPORTANT]
@@ -138,29 +171,13 @@ Push a tag to the commit that matches to the version in the form of `release-*`.
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
 
 ```shell
-git tag release-0.1.0-rc.1
-git push origin release-0.1.0-rc.1
+RELEASE_VER=0.1.0-rc.1
+
+git tag release-$RELEASE_VER
+git push origin release-$RELEASE_VER
 ```
 
 Once the CI completes, check crates.io and pypi.org for the new release artifacts.
-
-## ASF work
-
-### Upload source release to SVN dev
-
-Run the below script to create and upload the source release artifacts.
-
-```shell
-./release/upload_src_release_to_dev.sh
-```
-
-Run the below script to verify the source release.
-
-```shell
-./release/verify_src_release.sh 0.1.0-rc.1 dev
-```
-
-Fix any issues if found before proceeding to the next step.
 
 ### Start a `[VOTE]` thread
 
@@ -208,8 +225,10 @@ Release Manager
 Remove the pre-release suffix from the version in the release branch.
 
 ```shell
-cargo set-version 0.2.0 --manifest-path crates/hudi/Cargo.toml
-git commit -am "build(release): bump version to 0.2.0"
+RELEASE_VER=0.2.0
+
+cargo set-version $RELEASE_VER --manifest-path crates/hudi/Cargo.toml
+git commit -am "build(release): bump version to $RELEASE_VER"
 ```
 
 Wait for the CI to pass before proceeding to the next step.
@@ -219,13 +238,17 @@ Wait for the CI to pass before proceeding to the next step.
 Run the below script to create and upload the source release artifacts.
 
 ```shell
-./release/publish_src_release.sh
+RELEASE_VER=0.2.0
+
+./release/publish_src_release.sh $RELEASE_VER ${YOUR CODE-SIGNING KEY ID}
 ```
 
 Run the below script to verify the source release.
 
 ```shell
-./release/verify_src_release.sh 0.2.0 release
+RELEASE_VER=0.2.0
+
+./release/verify_src_release.sh $RELEASE_VER release
 ```
 
 There shouldn't be any issue in verifying the source release at this step. But if any error came out from it, 
@@ -238,8 +261,10 @@ revert the last version bump commit, fix the reported error, and start a new rel
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
 
 ```shell
-git tag release-0.2.0
-git push origin release-0.2.0
+RELEASE_VER=0.2.0
+
+git tag release-$RELEASE_VER
+git push origin release-$RELEASE_VER
 ```
 
 Once the CI completes, check crates.io and pypi.org for the new release artifacts.
@@ -253,23 +278,23 @@ Close the tracking issue.
 ### Send `ANNOUNCE` email
 
 ```text
-subject: [ANNOUNCE] hudi-rs 0.1.0 released
+subject: [ANNOUNCE] hudi-rs ${RELEASE_VER} released
 
 Hi all,
 
-The Apache Hudi community is pleased to announce the release 0.1.0 of
-hudi-rs <https://github.com/apache/hudi-rs>, a native Rust library for
-Apache Hudi, with bindings into Python.
+The Apache Hudi community is pleased to announce the release ${RELEASE_VER} of
+hudi-rs <https://github.com/apache/hudi-rs>, the native Rust implementation for
+Apache Hudi, with Python API bindings.
 
 Highlights for this release:
 
 <insert highlights here based on the changelog>
 
 The release notes can be found here
-https://github.com/apache/hudi-rs/releases/tag/release-0.1.0
+https://github.com/apache/hudi-rs/releases/tag/release-${RELEASE_VER}
 
 The source releases are available here
-https://dist.apache.org/repos/dist/release/hudi/hudi-rs-0.1.0/
+https://dist.apache.org/repos/dist/release/hudi/hudi-rs-${RELEASE_VER}/
 
 Please refer to the readme for installation and usage examples
 https://github.com/apache/hudi-rs/blob/main/README.md

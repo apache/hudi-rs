@@ -29,7 +29,7 @@ license = "Apache-2.0"
 rust-version = "1.81"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 readme = "README.md"
-description = "A native Rust library for Apache Hudi"
+description = "The native Rust implementation for Apache Hudi"
 homepage = "https://github.com/apache/hudi-rs"
 repository = "https://github.com/apache/hudi-rs"
 
