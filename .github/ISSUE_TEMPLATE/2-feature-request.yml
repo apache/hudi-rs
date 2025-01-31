@@ -17,30 +17,22 @@
 
 name: Feature request 🚀
 description: Suggest an idea to help us improve
-labels: ['feat']
+labels: ['feature']
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to fill out this feature request!
   - type: textarea
-    id: feat-description
+    id: feature-description
     attributes:
-      label: Description of the improvement
-      description: Tell us what improvement would you like to suggest
-    validations:
-      required: true
-  - type: textarea
-    id: expected-behavior
-    attributes:
-      label: Expected behavior
-      description: What should be the expected behavior.
-      placeholder: A clear and concise description of what you expected to happen.
+      label: Feature Description
+      description: Tell us how the feature would work
     validations:
       required: true
   - type: textarea
     id: additional-context
     attributes:
       label: Additional context
-      description: Do you want to share any additional context about this improvement?
-      placeholder: Add any other context about the improvement here.
+      description: Any additional context about this feature?
+      placeholder: Tell us any related context like production use cases.
