@@ -17,8 +17,9 @@
 
 .DEFAULT_GOAL := help
 
-VENV := venv
-MATURIN_VERSION := $(shell grep 'requires =' pyproject.toml | cut -d= -f2- | tr -d '[ "]')
+PYTHON_DIR := python
+VENV := $(PYTHON_DIR)/venv
+MATURIN_VERSION := $(shell grep 'requires =' $(PYTHON_DIR)/pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
 
 .PHONY: setup-venv
@@ -34,12 +35,12 @@ setup: ## Setup the requirements
 .PHONY: build
 build: setup ## Build Python binding of hudi-rs
 	$(info --- Build Python binding ---)
-	maturin build $(MATURIN_EXTRA_ARGS)
+	cd $(PYTHON_DIR) && maturin build $(MATURIN_EXTRA_ARGS)
 
 .PHONY: develop
 develop: setup ## Install Python binding of hudi-rs
 	$(info --- Develop with Python binding ---)
-	maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS)
+	cd $(PYTHON_DIR) && maturin develop --extras=devel,pandas $(MATURIN_EXTRA_ARGS)
 
 .PHONY: format
 format: format-rust format-python ## Format Rust and Python code
@@ -52,7 +53,7 @@ format-rust: ## Format Rust code
 .PHONY: format-python
 format-python: ## Format Python code
 	$(info --- Format Python code ---)
-	ruff format .
+	cd $(PYTHON_DIR) && ruff format .
 
 .PHONY: check
 check: check-rust check-python ## Run check on Rust and Python
@@ -67,11 +68,11 @@ check-rust: ## Run check on Rust
 .PHONY: check-python
 check-python: ## Run check on Python
 	$(info --- Check Python format ---)
-	ruff format --check --diff .
+	cd $(PYTHON_DIR) && ruff format --check --diff .
 	$(info --- Check Python linting ---)
-	ruff check .
+	cd $(PYTHON_DIR) && ruff check .
 	$(info --- Check Python typing ---)
-	mypy .
+	cd $(PYTHON_DIR) && mypy .
 
 .PHONY: test
 test: test-rust test-python ## Run tests on Rust and Python
@@ -84,4 +85,4 @@ test-rust: ## Run tests on Rust
 .PHONY: test-python
 test-python: ## Run tests on Python
 	$(info --- Run Python tests ---)
-	pytest -s
+	cd $(PYTHON_DIR) && pytest -s
