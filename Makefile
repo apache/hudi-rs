@@ -63,7 +63,7 @@ check: check-rust check-python ## Run check on Rust and Python
 .PHONY: check-rust
 check-rust: ## Run check on Rust
 	$(info --- Check Rust clippy ---)
-	cargo clippy --all-targets --all-features --workspace -- -D warnings
+	cargo clippy --all-targets --all-features --workspace --no-deps -- -D warnings
 	$(info --- Check Rust format ---)
 	cargo fmt --all -- --check
 
