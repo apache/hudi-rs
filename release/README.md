@@ -21,11 +21,13 @@
 
 ## Start a tracking issue
 
-Create a tracking issue for the release with title `Tracking issue for release <release version>`. Add the issue to the
+Create a tracking issue for the release with title `Tracking issue for release x.y.z`. Add the issue to the
 corresponding milestone for the release, and edit the issue description as below.
 
 ```markdown
 ## Tasks
+
+This issue tracks the release process as instructed in the [release guide](https://github.com/apache/hudi-rs/tree/main/release/README.md).
 
 ### Issues
 
@@ -62,32 +64,7 @@ corresponding milestone for the release, and edit the issue description as below
 - [ ] Close this tracking issue and the release milestone
 ```
 
-## ASF work
-
-### Upload source release to SVN dev
-
-> [!NOTE]
-> Make sure you're using a computer that has your code-signing gpg key installed.
-
-Run the below script to create and upload the source release artifacts.
-
-```shell
-RELEASE_VER=0.1.0-rc.1
-
-./release/upload_src_release_to_dev.sh $RELEASE_VER ${YOUR CODE-SIGNING KEY ID}
-```
-
-Run the below script to verify the source release.
-
-```shell
-RELEASE_VER=0.1.0-rc.1
-
-./release/verify_src_release.sh $RELEASE_VER dev
-```
-
-Fix any issues if found before proceeding to the next step.
-
-## GitHub work
+## Prepare release candidate(s)
 
 > [!NOTE]
 > We adhere to [Semantic Versioning](https://semver.org/), and create a release branch for each major or minor release.
@@ -102,7 +79,7 @@ Execute the below script that creates a branch with the new version changes comm
 
 ### Bump version in release branch
 
-> [!NOTE]
+> [!IMPORTANT]
 > When working on a release branch, use a local clone of `apache/hudi-rs` instead of your own fork.
 
 For a major or minor release, create a release branch in the format of `release/[0-9]+.[0-9]+.x` matching the target
@@ -122,7 +99,7 @@ On the release branch, bump the version to indicate pre-release by pushing a com
 - If it is ready for voting, go with `rc.1`, `rc.2`, etc
 
 ```shell
-RELEASE_VER=0.2.0-rc.1
+RELEASE_VER=x.y.z-rc.1
 
 cargo set-version $RELEASE_VER --manifest-path crates/hudi/Cargo.toml
 git commit -am "build(release): bump version to $RELEASE_VER"
@@ -130,9 +107,60 @@ git commit -am "build(release): bump version to $RELEASE_VER"
 
 ### Testing
 
-Once the "bump version" commit is pushed, CI will be triggered and all tests need to pass before proceed to the next.
+Once the "bump version" commit is pushed, the CI tests will be triggered and running.
 
-Perform any release related tests, such as integration tests, before proceeding to the next step.
+> [!IMPORTANT]
+> Perform any release related tests in addition to the CI if applicable before proceeding to the next step.
+
+### Upload source release to SVN dev
+
+Pick the code-signing gpg key by running
+
+```shell
+gpg --list-secret-keys --keyid-format=long
+```
+
+> [!NOTE]
+> Make sure you're using a computer that has your code-signing gpg key installed.
+
+Run the below script to create and upload the source release artifacts.
+
+```shell
+RELEASE_VER=x.y.z-rc.1
+
+./release/upload_src_release_to_dev.sh $RELEASE_VER ${YOUR CODE-SIGNING KEY ID}
+```
+
+Run the below script to verify the source release.
+
+```shell
+RELEASE_VER=x.y.z-rc.1
+
+./release/verify_src_release.sh $RELEASE_VER dev
+```
+
+> [!IMPORTANT]
+> Fix any issues if found before proceeding to the next step.
+
+### Push tag
+
+Push a tag to the commit that matches to the version in the form of `release-*`. For example,
+
+- If the release is `0.1.0-rc.1`, the tag should `release-0.1.0-rc.1`
+- If the release is `2.0.0-beta.2`, the tag should `release-2.0.0-beta.2`
+
+> [!CAUTION]
+> Pushing a matching tag to the upstream (apache) branch will trigger CI to publish the artifacts to crates.io and
+> pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
+
+```shell
+RELEASE_VER=x.y.z-rc.1
+
+git tag release-$RELEASE_VER
+git push origin release-$RELEASE_VER
+```
+
+Once the CI completes, check crates.io and pypi.org for the new release artifacts.
 
 ### Generate changelog
 
@@ -155,29 +183,6 @@ git cliff release-{previous_release_version}..HEAD | xclip
 ```
 
 Paste the changelog output as a comment on the tracking issue.
-
-### Push tag
-
-> [!IMPORTANT]
-> The version in the code should be the target release version.
-
-Push a tag to the commit that matches to the version in the form of `release-*`. For example,
-
-- If the release is `0.1.0-rc.1`, the tag should `release-0.1.0-rc.1`
-- If the release is `2.0.0-beta.2`, the tag should `release-2.0.0-beta.2`
-
-> [!CAUTION]
-> Pushing a matching tag to the upstream (apache) branch will trigger CI to publish the artifacts to crates.io and
-> pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
-
-```shell
-RELEASE_VER=0.1.0-rc.1
-
-git tag release-$RELEASE_VER
-git push origin release-$RELEASE_VER
-```
-
-Once the CI completes, check crates.io and pypi.org for the new release artifacts.
 
 ### Start a `[VOTE]` thread
 
@@ -225,28 +230,34 @@ Release Manager
 Remove the pre-release suffix from the version in the release branch.
 
 ```shell
-RELEASE_VER=0.2.0
+RELEASE_VER=x.y.z
 
 cargo set-version $RELEASE_VER --manifest-path crates/hudi/Cargo.toml
 git commit -am "build(release): bump version to $RELEASE_VER"
 ```
 
-Wait for the CI to pass before proceeding to the next step.
+> [!IMPORTANT]
+> Wait for the CI to pass before proceeding to the next step.
 
 ### Upload source release to SVN release
 
 Run the below script to create and upload the source release artifacts.
 
 ```shell
-RELEASE_VER=0.2.0
+RELEASE_VER=x.y.z
+CODE_SIGNING_KEY=<your code-signing key id>
 
-./release/publish_src_release.sh $RELEASE_VER ${YOUR CODE-SIGNING KEY ID}
+./release/upload_src_release_to_dev.sh $RELEASE_VER $CODE_SIGNING_KEY
+
+./release/publish_src_release.sh $RELEASE_VER $CODE_SIGNING_KEY
 ```
+
+// TODO support verify local copy
 
 Run the below script to verify the source release.
 
 ```shell
-RELEASE_VER=0.2.0
+RELEASE_VER=x.y.z
 
 ./release/verify_src_release.sh $RELEASE_VER release
 ```
@@ -261,7 +272,7 @@ revert the last version bump commit, fix the reported error, and start a new rel
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
 
 ```shell
-RELEASE_VER=0.2.0
+RELEASE_VER=x.y.z
 
 git tag release-$RELEASE_VER
 git push origin release-$RELEASE_VER
@@ -273,7 +284,11 @@ Once the CI completes, check crates.io and pypi.org for the new release artifact
 
 Use `git cliff` to prepend the current release's change to `changelog.md` in the main branch.
 
-Close the tracking issue.
+### Publish Release Notes
+
+
+
+Close the tracking issue and the milestone.
 
 ### Send `ANNOUNCE` email
 
