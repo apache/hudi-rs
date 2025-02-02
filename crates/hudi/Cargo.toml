@@ -28,8 +28,8 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-hudi-core = { version = "0.3.0-rc.1", path = "../core" }
-hudi-datafusion = { version = "0.3.0-rc.1", path = "../datafusion", optional = true }
+hudi-core = { version = "0.3.0", path = "../core" }
+hudi-datafusion = { version = "0.3.0", path = "../datafusion", optional = true }
 
 [features]
 datafusion = [
