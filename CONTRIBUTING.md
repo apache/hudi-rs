@@ -49,8 +49,7 @@ view, instead, they will be linked to the corresponding issues.
 
 ## Commonly used dev commands
 
-For most of the time, use dev commands specified in [`python/Makefile`](./python/Makefile), it applies to both Python
-and Rust modules. You don't need to `cd` to the root directory and run `cargo` commands.
+For most of the time, use dev commands specified in the [`Makefile`](Makefile).
 
 To setup python virtual env, run
 
@@ -59,13 +58,10 @@ make setup-venv
 ```
 
 > [!NOTE]
-> This will run `python` command to setup the virtual environment. You can either change that to `python3.X`,
-> or simply alias `python` to your local `python3.X` installation, for example:
-> ```shell
-> echo "alias python=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" >> ~/.zshrc`
-> ```
+> This will run `python3` command to set up the virtual environment in `venv/`.
+> Activate the virtual environment by running `source venv/bin/activate` for example.
 
-Once activate virtual env, build the project for development by
+Once a virtual environment is activated, build the project for development by
 
 ```shell
 make develop
@@ -96,24 +92,18 @@ For Python,
 # For all tests
 make test-python
 # or
-pytest -s
+pytest -s python/tests
 
 # For a specific test case
-pytest tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
+pytest python/tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
 ```
 
 ## Before creating a pull request
 
-Run test commands to make sure the code is working as expected:
+Run the below command and fix issues if any:
 
 ```shell
-make test
-```
-
-Run check commands and follow the suggestions to fix the code:
-
-```shell
-make check
+make format check test
 ```
 
 ## Create a pull request

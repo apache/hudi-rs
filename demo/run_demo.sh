@@ -36,7 +36,7 @@ fi
 
 # install dependencies and run the demo apps
 docker compose exec -T runner /bin/bash -c "
-  cd /opt/hudi-rs/python && \
+  cd /opt/hudi-rs && \
   make setup develop && \
   cd /opt/hudi-rs/demo/sql-datafusion && ./run.sh &&\
   cd /opt/hudi-rs/demo/table-api-python && ./run.sh && \
