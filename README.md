@@ -46,10 +46,15 @@
 The `hudi-rs` project aims to broaden the use of [Apache Hudi](https://github.com/apache/hudi) for a diverse range of
 users and projects.
 
-| Source        | Installation Command |
-|---------------|----------------------|
-| **PyPi**      | `pip install hudi`   |
-| **Crates.io** | `cargo add hudi`     |
+| Source                  | Downloads                   | Installation Command |
+|-------------------------|-----------------------------|----------------------|
+| [**PyPi.org**][pypi]    | [![][pypi-badge]][pypi]     | `pip install hudi`   |
+| [**Crates.io**][crates] | [![][crates-badge]][crates] | `cargo add hudi`     |
+
+[pypi]: https://pypi.org/project/hudi/
+[pypi-badge]: https://img.shields.io/pypi/dm/hudi?style=flat-square&color=51AEF3
+[crates]: https://crates.io/crates/hudi
+[crates-badge]: https://img.shields.io/crates/d/hudi?style=flat-square&color=163669
 
 ## Usage Examples
 
@@ -238,7 +243,7 @@ async fn main() -> Result<()> {
 
 Hudi is also integrated with
 
-- [Daft](https://www.getdaft.io/projects/docs/en/stable/user_guide/integrations/hudi.html)
+- [Daft](https://www.getdaft.io/projects/docs/en/stable/integrations/hudi/)
 - [Ray](https://docs.ray.io/en/latest/data/api/doc/ray.data.read_hudi.html#ray.data.read_hudi)
 
 ### Work with cloud storage
