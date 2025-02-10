@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.81
+FROM rust:1.84
 
 RUN apt-get update && apt-get install -y python3-dev python3-venv
 

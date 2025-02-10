@@ -33,12 +33,12 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::TableProvider;
+use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
-use datafusion_common::Result;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
