@@ -258,11 +258,11 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    return HudiConfigValue::String(
+                    HudiConfigValue::String(
                         RecordMergeStrategyValue::OverwriteWithLatest
                             .as_ref()
                             .to_string(),
-                    );
+                    )
                 }
                 _ => self
                     .default_value()

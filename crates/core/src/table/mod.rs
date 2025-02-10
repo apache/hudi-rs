@@ -257,7 +257,7 @@ impl Table {
         }
 
         let n = std::cmp::max(1, n);
-        let chunk_size = (file_slices.len() + n - 1) / n;
+        let chunk_size = file_slices.len().div_ceil(n);
 
         Ok(file_slices
             .chunks(chunk_size)
