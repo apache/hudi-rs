@@ -241,8 +241,9 @@ impl Table {
         timestamp: &str,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
+        let timestamp = format_timestamp(timestamp);
         let filters = from_str_tuples(filters)?;
-        self.get_file_slices_splits_internal(n, timestamp, &filters)
+        self.get_file_slices_splits_internal(n, &timestamp, &filters)
             .await
     }
 
@@ -295,8 +296,9 @@ impl Table {
         timestamp: &str,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<FileSlice>> {
+        let timestamp = format_timestamp(timestamp);
         let filters = from_str_tuples(filters)?;
-        self.get_file_slices_internal(timestamp, &filters).await
+        self.get_file_slices_internal(&timestamp, &filters).await
     }
 
     async fn get_file_slices_internal(
@@ -406,8 +408,9 @@ impl Table {
         timestamp: &str,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<RecordBatch>> {
+        let timestamp = format_timestamp(timestamp);
         let filters = from_str_tuples(filters)?;
-        self.read_snapshot_internal(timestamp, &filters).await
+        self.read_snapshot_internal(&timestamp, &filters).await
     }
 
     async fn read_snapshot_internal(
@@ -489,7 +492,6 @@ impl Table {
 ///
 /// # Returns
 /// A string formatted as `yyyyMMddHHmmSSSSS`. If the input cannot be parsed, the original string is returned.
-///
 fn format_timestamp(timestamp: &str) -> String {
     if let Ok(datetime) = DateTime::parse_from_rfc3339(timestamp) {
         return datetime.format("%Y%m%d%H%M%S%3f").to_string();
