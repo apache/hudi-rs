@@ -496,7 +496,7 @@ fn format_timestamp(timestamp: &str) -> String {
     if let Ok(datetime) = DateTime::parse_from_rfc3339(timestamp) {
         return datetime.format("%Y%m%d%H%M%S%3f").to_string();
     }
-    
+
     let formats = ["yyyyMMddHHmmSSSSS", "yyyyMMddHHmmSS"];
     for format in formats.iter() {
         if let Ok(datetime) = DateTime::parse_from_str(timestamp, format) {
@@ -507,7 +507,7 @@ fn format_timestamp(timestamp: &str) -> String {
     if timestamp.len() == 10 && timestamp.chars().all(|c| c.is_digit(10) || c == '-') {
         return format!("{}000000000", timestamp.replace("-", ""));
     }
-    
+
     timestamp.to_string()
 }
 
