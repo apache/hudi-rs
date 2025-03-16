@@ -20,6 +20,7 @@
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock,
 };
@@ -37,7 +38,7 @@ pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct LogFileReader<R> {
+pub struct LogFileReader<R: Read + Seek> {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     reader: R,
@@ -132,7 +133,7 @@ impl<R: Read + Seek> LogFileReader<R> {
     }
 
     /// Read 4 bytes for [`LogFormatVersion`].
-    fn read_format_version(&mut self) -> Result<LogFormatVersion> {
+    fn read_log_format_version(&mut self) -> Result<LogFormatVersion> {
         let mut version_buf = [0u8; 4];
         self.reader.read_exact(&mut version_buf)?;
         LogFormatVersion::try_from(version_buf)
@@ -193,24 +194,6 @@ impl<R: Read + Seek> LogFileReader<R> {
         Ok(metadata)
     }
 
-    /// Read the content of the log block.
-    fn read_content(
-        &mut self,
-        format_version: &LogFormatVersion,
-        fallback_length: u64,
-    ) -> Result<Vec<u8>> {
-        let content_length = if format_version.has_content_length() {
-            let mut content_length_buf = [0u8; 8];
-            self.reader.read_exact(&mut content_length_buf)?;
-            u64::from_be_bytes(content_length_buf)
-        } else {
-            fallback_length
-        };
-        let mut content_buf = vec![0u8; content_length as usize];
-        self.reader.read_exact(&mut content_buf)?;
-        Ok(content_buf)
-    }
-
     /// Read 8 bytes for the total length of the log block.
     fn read_total_block_length(
         &mut self,
@@ -249,7 +232,7 @@ impl<R: Read + Seek> LogFileReader<R> {
             .map_err(CoreError::ReadLogFileError)?;
 
         let (block_length, _) = self.read_block_length_or_corrupted_block(curr_pos)?;
-        let format_version = self.read_format_version()?;
+        let format_version = self.read_log_format_version()?;
         let block_type = self.read_block_type(&format_version)?;
         let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
         let mut skipped = false;
@@ -257,8 +240,15 @@ impl<R: Read + Seek> LogFileReader<R> {
             skipped = true;
             // TODO skip reading block
         }
-        let content = self.read_content(&format_version, block_length)?;
-        let record_batches = LogBlock::decode_content(&block_type, content)?;
+
+        let decoder = Decoder::new(self.hudi_configs.clone());
+        let record_batches = decoder.decode_content(
+            self.reader.by_ref(),
+            &format_version,
+            block_length,
+            &block_type,
+            &header,
+        )?;
         let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
         let _ = self.read_total_block_length(&format_version)?;
 
