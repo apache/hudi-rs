@@ -27,6 +27,9 @@ pub enum CoreError {
     #[error(transparent)]
     ArrowError(#[from] arrow::error::ArrowError),
 
+    #[error(transparent)]
+    AvroError(#[from] apache_avro::Error),
+
     #[error("Config error: {0}")]
     Config(#[from] ConfigError),
 

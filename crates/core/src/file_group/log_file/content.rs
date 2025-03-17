@@ -16,16 +16,19 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::file_group::log_file::avro::AvroDataBlockContentReader;
 use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::Result;
+use apache_avro::Schema as AvroSchema;
 use arrow_array::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -43,11 +46,11 @@ impl Decoder {
     }
     pub fn decode_content(
         &self,
-        reader: &mut impl Read,
+        reader: &mut (impl Read + Seek),
         log_format_version: &LogFormatVersion,
         fallback_length: u64,
         block_type: &BlockType,
-        _header: &HashMap<BlockMetadataKey, String>,
+        header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<Vec<RecordBatch>> {
         let content_length = if log_format_version.has_content_length() {
             let mut content_length_buf = [0u8; 8];
@@ -59,6 +62,13 @@ impl Decoder {
 
         let mut reader = reader.by_ref().take(content_length);
         match block_type {
+            BlockType::AvroData => {
+                let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+                    CoreError::LogBlockError("Schema not found in block header".to_string())
+                })?;
+                let writer_schema = AvroSchema::parse_str(writer_schema)?;
+                self.decode_avro_record_content(reader, &writer_schema)
+            }
             BlockType::ParquetData => self.decode_parquet_record_content(&mut reader),
             BlockType::Command => Ok(Vec::new()),
             _ => Err(CoreError::LogBlockError(format!(
@@ -67,7 +77,37 @@ impl Decoder {
         }
     }
 
-    fn decode_parquet_record_content(&self, reader: &mut impl Read) -> Result<Vec<RecordBatch>> {
+    fn decode_avro_record_content(
+        &self,
+        mut reader: impl Read,
+        writer_schema: &AvroSchema,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut format_version = [0u8; 4];
+        reader.read_exact(&mut format_version)?;
+        let format_version = u32::from_be_bytes(format_version);
+        if format_version != 3 {
+            return Err(CoreError::LogBlockError(format!(
+                "Unsupported delete record format version: {format_version}"
+            )));
+        }
+
+        let mut record_count = [0u8; 4];
+        reader.read_exact(&mut record_count)?;
+        let record_count = u32::from_be_bytes(record_count);
+
+        let record_content_reader =
+            AvroDataBlockContentReader::new(reader, writer_schema, record_count);
+        let mut avro_arrow_array_reader =
+            AvroArrowArrayReader::try_new(record_content_reader, writer_schema, None)?;
+        let mut batches = Vec::new();
+        while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
+            let batch = batch.map_err(CoreError::ArrowError)?;
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
+
+    fn decode_parquet_record_content(&self, mut reader: impl Read) -> Result<Vec<RecordBatch>> {
         let mut content_bytes = Vec::new();
         reader.read_to_end(&mut content_bytes)?;
         let content_bytes = Bytes::from(content_bytes);

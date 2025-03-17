@@ -49,6 +49,9 @@ arrow-select = { version = "~54.1.0" }
 object_store = { version = "~0.11.2", features = ["aws", "azure", "gcp"] }
 parquet = { version = "~54.1.0", features = ["async", "object_store"] }
 
+# avro
+apache-avro = { version = "0.17.0" }
+
 # datafusion
 datafusion = { version = "~45.0.0" }
 datafusion-expr = { version = "~45.0.0" }
@@ -66,6 +69,7 @@ bytes = { version = "1" }
 chrono = { version = "=0.4.39" }
 lazy_static = { version = "1.5.0" }
 log = { version = "0.4" }
+num-traits = { version = "0.2" }
 paste = { version = "1.0.15" }
 strum = { version = "0.27.0", features = ["derive"] }
 strum_macros = "0.27.0"
