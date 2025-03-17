@@ -271,6 +271,14 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::PathBuf;
 
+    fn get_valid_log_avro() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_avro");
+        (
+            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string(),
+        )
+    }
+
     fn get_valid_log_parquet() -> (String, String) {
         let dir = PathBuf::from("tests/data/log_files/valid_log_parquet");
         (
@@ -295,6 +303,32 @@ mod tests {
         let hudi_configs = Arc::new(HudiConfigs::empty());
         let storage = Storage::new_with_base_url(dir_url)?;
         LogFileReader::new(hudi_configs, storage, file_name).await
+    }
+
+    #[tokio::test]
+    async fn test_read_log_file_with_avro_data_block() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
+        let instant_range = InstantRange::up_to("20250316025828811", "utc");
+        let blocks = reader.read_all_blocks(&instant_range)?;
+        assert_eq!(blocks.len(), 1);
+
+        let block = &blocks[0];
+        assert_eq!(block.format_version, LogFormatVersion::V1);
+        assert_eq!(block.block_type, BlockType::AvroData);
+        assert_eq!(block.header.len(), 2);
+        assert_eq!(block.instant_time()?, "20250316025828811");
+        assert!(block.target_instant_time().is_err());
+        assert!(block.schema().is_ok());
+        assert!(block.command_block_type().is_err());
+
+        let batches = block.record_batches.as_slice();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        assert!(block.footer.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
