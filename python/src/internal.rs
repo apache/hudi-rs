@@ -231,6 +231,18 @@ impl HudiTable {
         self.inner.storage_options()
     }
 
+    fn table_name(&self) -> String {
+        self.inner.table_name()
+    }
+
+    fn table_type(&self) -> String {
+        self.inner.table_type()
+    }
+
+    fn timezone(&self) -> String {
+        self.inner.timezone()
+    }
+
     fn get_avro_schema(&self) -> PyResult<String> {
         let avro_schema = rt()
             .block_on(self.inner.get_avro_schema())

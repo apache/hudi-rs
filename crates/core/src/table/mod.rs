@@ -168,14 +168,20 @@ impl Table {
             .expect(&err_msg)
     }
 
-    pub fn table_type(&self) -> TableTypeValue {
+    pub fn table_name(&self) -> String {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableName);
+        self.hudi_configs
+            .get(HudiTableConfig::TableName)
+            .expect(&err_msg)
+            .to::<String>()
+    }
+
+    pub fn table_type(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
-        let table_type = self
-            .hudi_configs
+        self.hudi_configs
             .get(HudiTableConfig::TableType)
             .expect(&err_msg)
-            .to::<String>();
-        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
+            .to::<String>()
     }
 
     pub fn timezone(&self) -> String {

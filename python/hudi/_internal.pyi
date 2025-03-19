@@ -146,6 +146,33 @@ class HudiTable:
             Dict[str, str]: A dictionary of storage options.
         """
         ...
+    @property
+    def table_name(self) -> str:
+        """
+        Get table name.
+
+        Returns:
+            str: The name of the table.
+        """
+        ...
+    @property
+    def table_type(self) -> str:
+        """
+        Get table type.
+
+        Returns:
+            str: The type of the table.
+        """
+        ...
+    @property
+    def timezone(self) -> str:
+        """
+        Get timezone.
+
+        Returns:
+            str: The timezone of the table.
+        """
+        ...
     def get_avro_schema(self) -> str:
         """
         Returns the Avro schema of the Hudi table.
