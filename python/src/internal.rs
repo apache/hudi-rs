@@ -211,6 +211,7 @@ pub struct HudiInstant {
 #[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiInstant {
+    #[getter]
     pub fn timestamp(&self) -> String {
         self.inner.timestamp.to_owned()
     }
