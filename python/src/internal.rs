@@ -258,14 +258,17 @@ impl HudiTable {
         self.inner.storage_options()
     }
 
+    #[getter]
     fn table_name(&self) -> String {
         self.inner.table_name()
     }
 
+    #[getter]
     fn table_type(&self) -> String {
         self.inner.table_type()
     }
 
+    #[getter]
     fn timezone(&self) -> String {
         self.inner.timezone()
     }
