@@ -61,31 +61,6 @@ impl From<PythonError> for PyErr {
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
 #[pyclass]
-pub struct HudiInstant {
-    inner: Instant,
-}
-
-#[cfg(not(tarpaulin_include))]
-#[pymethods]
-impl HudiInstant {
-    pub fn timestamp(&self) -> String {
-        self.inner.timestamp.to_owned()
-    }
-
-    // TODO impl other properties
-}
-
-impl From<&Instant> for HudiInstant {
-    fn from(i: &Instant) -> Self {
-        HudiInstant {
-            inner: i.to_owned(),
-        }
-    }
-}
-
-#[cfg(not(tarpaulin_include))]
-#[derive(Clone, Debug)]
-#[pyclass]
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
 }
@@ -227,6 +202,31 @@ impl From<&FileSlice> for HudiFileSlice {
 }
 
 #[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug)]
+#[pyclass]
+pub struct HudiInstant {
+    inner: Instant,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiInstant {
+    pub fn timestamp(&self) -> String {
+        self.inner.timestamp.to_owned()
+    }
+
+    // TODO impl other properties
+}
+
+impl From<&Instant> for HudiInstant {
+    fn from(i: &Instant) -> Self {
+        HudiInstant {
+            inner: i.to_owned(),
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
 #[pyclass]
 pub struct HudiTable {
     inner: Table,
@@ -270,11 +270,13 @@ impl HudiTable {
         self.inner.timezone()
     }
 
-    fn get_avro_schema(&self) -> PyResult<String> {
-        let avro_schema = rt()
-            .block_on(self.inner.get_avro_schema())
-            .map_err(PythonError::from)?;
-        Ok(avro_schema)
+    fn get_avro_schema(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let avro_schema = rt()
+                .block_on(self.inner.get_avro_schema())
+                .map_err(PythonError::from)?;
+            Ok(avro_schema)
+        })
     }
 
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
@@ -461,6 +463,19 @@ impl HudiTimeline {
                 .block_on(self.inner.get_completed_commits(desc))
                 .map_err(PythonError::from)?;
             Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    pub fn get_commit_metadata_in_json(
+        &self,
+        instant: &HudiInstant,
+        py: Python,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            let commit_metadata = rt()
+                .block_on(self.inner.get_commit_metadata_in_json(&instant.inner))
+                .map_err(PythonError::from)?;
+            Ok(commit_metadata)
         })
     }
 }
