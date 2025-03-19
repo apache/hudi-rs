@@ -128,6 +128,23 @@ impl Timeline {
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
+    pub(crate) async fn get_latest_avro_schema(&self) -> Result<String> {
+        let commit_metadata = self.get_latest_commit_metadata().await?;
+        commit_metadata
+            .get("extraMetadata")
+            .and_then(|v| v.as_object())
+            .and_then(|obj| {
+                obj.get("schema")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .ok_or_else(|| {
+                CoreError::CommitMetadata(
+                    "Failed to resolve the latest schema: no schema found".to_string(),
+                )
+            })
+    }
+
     pub(crate) async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
