@@ -33,7 +33,7 @@ use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::util::StrTupleRef;
 use pyo3::exceptions::PyException;
-use pyo3::{create_exception, pyclass, pyfunction, pymethods, IntoPy, PyErr, PyObject, PyResult, Python};
+use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 
 create_exception!(_internal, HudiCoreError, PyException);
 
@@ -231,8 +231,11 @@ impl HudiTable {
         self.inner.storage_options()
     }
 
-    fn get_avro_schema(&self, py: Python) -> PyResult<String> {
-        rt().block_on(self.inner.get_avro_schema()).map_err(PythonError::from)?.into_py(py)
+    fn get_avro_schema(&self) -> PyResult<String> {
+        let avro_schema = rt()
+            .block_on(self.inner.get_avro_schema())
+            .map_err(PythonError::from)?;
+        Ok(avro_schema)
     }
 
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
