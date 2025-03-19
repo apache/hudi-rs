@@ -31,6 +31,8 @@ use hudi::file_group::FileGroup;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
+use hudi::timeline::instant::Instant;
+use hudi::timeline::Timeline;
 use hudi::util::StrTupleRef;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
@@ -200,6 +202,32 @@ impl From<&FileSlice> for HudiFileSlice {
 }
 
 #[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug)]
+#[pyclass]
+pub struct HudiInstant {
+    inner: Instant,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiInstant {
+    #[getter]
+    pub fn timestamp(&self) -> String {
+        self.inner.timestamp.to_owned()
+    }
+
+    // TODO impl other properties
+}
+
+impl From<&Instant> for HudiInstant {
+    fn from(i: &Instant) -> Self {
+        HudiInstant {
+            inner: i.to_owned(),
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
 #[pyclass]
 pub struct HudiTable {
     inner: Table,
@@ -231,6 +259,30 @@ impl HudiTable {
         self.inner.storage_options()
     }
 
+    #[getter]
+    fn table_name(&self) -> String {
+        self.inner.table_name()
+    }
+
+    #[getter]
+    fn table_type(&self) -> String {
+        self.inner.table_type()
+    }
+
+    #[getter]
+    fn timezone(&self) -> String {
+        self.inner.timezone()
+    }
+
+    fn get_avro_schema(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let avro_schema = rt()
+                .block_on(self.inner.get_avro_schema())
+                .map_err(PythonError::from)?;
+            Ok(avro_schema)
+        })
+    }
+
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_schema())
             .map_err(PythonError::from)?
@@ -241,6 +293,13 @@ impl HudiTable {
         rt().block_on(self.inner.get_partition_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+    }
+
+    fn get_timeline(&self, py: Python) -> HudiTimeline {
+        py.allow_threads(|| {
+            let timeline = self.inner.get_timeline();
+            HudiTimeline::from(timeline)
+        })
     }
 
     #[pyo3(signature = (n, filters=None))]
@@ -396,6 +455,47 @@ impl HudiTable {
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pyclass]
+pub struct HudiTimeline {
+    inner: Timeline,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiTimeline {
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_commits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_commits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    pub fn get_commit_metadata_in_json(
+        &self,
+        instant: &HudiInstant,
+        py: Python,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            let commit_metadata = rt()
+                .block_on(self.inner.get_commit_metadata_in_json(&instant.inner))
+                .map_err(PythonError::from)?;
+            Ok(commit_metadata)
+        })
+    }
+}
+
+impl From<&Timeline> for HudiTimeline {
+    fn from(t: &Timeline) -> Self {
+        HudiTimeline {
+            inner: t.to_owned(),
+        }
     }
 }
 

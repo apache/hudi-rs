@@ -90,8 +90,8 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
+use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
@@ -106,7 +106,6 @@ use crate::config::read::HudiReadConfig;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
@@ -168,20 +167,31 @@ impl Table {
             .expect(&err_msg)
     }
 
-    pub fn table_type(&self) -> TableTypeValue {
+    pub fn table_name(&self) -> String {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableName);
+        self.hudi_configs
+            .get(HudiTableConfig::TableName)
+            .expect(&err_msg)
+            .to::<String>()
+    }
+
+    pub fn table_type(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
-        let table_type = self
-            .hudi_configs
+        self.hudi_configs
             .get(HudiTableConfig::TableType)
             .expect(&err_msg)
-            .to::<String>();
-        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
+            .to::<String>()
     }
 
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .to::<String>()
+    }
+
+    /// Get the latest Avro schema string of the table.
+    pub async fn get_avro_schema(&self) -> Result<String> {
+        self.timeline.get_latest_avro_schema().await
     }
 
     /// Get the latest [Schema] of the table.
@@ -207,6 +217,11 @@ impl Table {
             .collect();
 
         Ok(Schema::new(partition_fields))
+    }
+
+    /// Get the [Timeline] of the table.
+    pub fn get_timeline(&self) -> &Timeline {
+        &self.timeline
     }
 
     /// Get all the [FileSlice]s in splits from the table.

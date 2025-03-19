@@ -108,6 +108,11 @@ class HudiFileSlice:
         ...
 
 @dataclass(init=False)
+class HudiInstant:
+    @property
+    def timestamp(self) -> str: ...
+
+@dataclass(init=False)
 class HudiTable:
     """
     Represents a Hudi table and provides methods to interact with it.
@@ -146,6 +151,41 @@ class HudiTable:
             Dict[str, str]: A dictionary of storage options.
         """
         ...
+    @property
+    def table_name(self) -> str:
+        """
+        Get table name.
+
+        Returns:
+            str: The name of the table.
+        """
+        ...
+    @property
+    def table_type(self) -> str:
+        """
+        Get table type.
+
+        Returns:
+            str: The type of the table.
+        """
+        ...
+    @property
+    def timezone(self) -> str:
+        """
+        Get timezone.
+
+        Returns:
+            str: The timezone of the table.
+        """
+        ...
+    def get_avro_schema(self) -> str:
+        """
+        Returns the Avro schema of the Hudi table.
+
+        Returns:
+            str: The Avro schema of the table.
+        """
+        ...
     def get_schema(self) -> "pyarrow.Schema":
         """
         Returns the schema of the Hudi table.
@@ -160,6 +200,11 @@ class HudiTable:
 
         Returns:
             pyarrow.Schema: The schema used for partitioning the table.
+        """
+        ...
+    def get_timeline(self) -> HudiTimeline:
+        """
+        Returns the timeline of the Hudi table.
         """
         ...
     def get_file_slices_splits(
@@ -256,6 +301,11 @@ class HudiTable:
             List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
         """
         ...
+
+@dataclass(init=False)
+class HudiTimeline:
+    def get_completed_commits(self, desc: bool = False) -> List[HudiInstant]: ...
+    def get_commit_metadata_in_json(self, instant: HudiInstant) -> str: ...
 
 def build_hudi_table(
     base_uri: str,
