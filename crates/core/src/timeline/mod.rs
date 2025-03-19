@@ -119,6 +119,21 @@ impl Timeline {
         Self::load_instants(&selector, &self.storage, desc).await
     }
 
+    pub async fn get_commit_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
+        let path = instant.relative_path()?;
+        let bytes = self.storage.get_file_data(path.as_str()).await?;
+
+        serde_json::from_slice(&bytes)
+            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+    }
+
+    pub async fn get_commit_metadata_in_json(&self, instant: &Instant) -> Result<String> {
+        let path = instant.relative_path()?;
+        let bytes = self.storage.get_file_data(path.as_str()).await?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+    }
+
     pub(crate) fn get_latest_commit_timestamp(&self) -> Option<&str> {
         self.completed_commits
             .iter()
@@ -131,14 +146,6 @@ impl Timeline {
             Some(instant) => self.get_commit_metadata(instant).await,
             None => Ok(Map::new()),
         }
-    }
-
-    async fn get_commit_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
-        let path = instant.relative_path()?;
-        let bytes = self.storage.get_file_data(path.as_str()).await?;
-
-        serde_json::from_slice(&bytes)
-            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
     pub(crate) async fn get_latest_avro_schema(&self) -> Result<String> {

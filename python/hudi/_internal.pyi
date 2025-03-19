@@ -22,11 +22,6 @@ import pyarrow  # type: ignore
 __version__: str
 
 @dataclass(init=False)
-class HudiInstant:
-    @property
-    def timestamp(self) -> str: ...
-
-@dataclass(init=False)
 class HudiFileGroupReader:
     """
     The reader that handles all read operations against a file group.
@@ -111,6 +106,11 @@ class HudiFileSlice:
             List[str]: A list of relative paths of the log files.
         """
         ...
+
+@dataclass(init=False)
+class HudiInstant:
+    @property
+    def timestamp(self) -> str: ...
 
 @dataclass(init=False)
 class HudiTable:
@@ -305,6 +305,7 @@ class HudiTable:
 @dataclass(init=False)
 class HudiTimeline:
     def get_completed_commits(self, desc: bool = False) -> List[HudiInstant]: ...
+    def get_commit_metadata_in_json(self, instant: HudiInstant) -> str: ...
 
 def build_hudi_table(
     base_uri: str,
