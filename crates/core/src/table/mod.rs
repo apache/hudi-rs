@@ -220,7 +220,7 @@ impl Table {
     }
 
     /// Get the [Timeline] of the table.
-    pub async fn get_timeline(&self) -> &Timeline {
+    pub fn get_timeline(&self) -> &Timeline {
         &self.timeline
     }
 

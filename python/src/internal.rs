@@ -291,6 +291,13 @@ impl HudiTable {
             .to_pyarrow(py)
     }
 
+    fn get_timeline(&self, py: Python) -> HudiTimeline {
+        py.allow_threads(|| {
+            let timeline = self.inner.get_timeline();
+            HudiTimeline::from(timeline)
+        })
+    }
+
     #[pyo3(signature = (n, filters=None))]
     fn get_file_slices_splits(
         &self,
@@ -477,6 +484,14 @@ impl HudiTimeline {
                 .map_err(PythonError::from)?;
             Ok(commit_metadata)
         })
+    }
+}
+
+impl From<&Timeline> for HudiTimeline {
+    fn from(t: &Timeline) -> Self {
+        HudiTimeline {
+            inner: t.to_owned(),
+        }
     }
 }
 
