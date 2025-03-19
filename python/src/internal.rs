@@ -31,6 +31,8 @@ use hudi::file_group::FileGroup;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
+use hudi::timeline::instant::Instant;
+use hudi::timeline::Timeline;
 use hudi::util::StrTupleRef;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
@@ -52,6 +54,31 @@ impl From<PythonError> for PyErr {
     fn from(err: PythonError) -> PyErr {
         match err {
             PythonError::HudiCore(err) => convert_to_py_err(err),
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug)]
+#[pyclass]
+pub struct HudiInstant {
+    inner: Instant,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiInstant {
+    pub fn timestamp(&self) -> String {
+        self.inner.timestamp.to_owned()
+    }
+
+    // TODO impl other properties
+}
+
+impl From<&Instant> for HudiInstant {
+    fn from(i: &Instant) -> Self {
+        HudiInstant {
+            inner: i.to_owned(),
         }
     }
 }
@@ -415,6 +442,26 @@ impl HudiTable {
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pyclass]
+pub struct HudiTimeline {
+    inner: Timeline,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiTimeline {
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_commits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_commits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
     }
 }
 
