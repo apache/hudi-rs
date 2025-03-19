@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-mod instant;
+pub mod instant;
 pub(crate) mod selector;
 
 use crate::config::HudiConfigs;
@@ -68,7 +68,7 @@ impl Timeline {
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         let selector = TimelineSelector::completed_commits(hudi_configs.clone())?;
-        let completed_commits = Self::load_instants(&selector, &storage).await?;
+        let completed_commits = Self::load_instants(&selector, &storage, false).await?;
         Ok(Self {
             hudi_configs,
             storage,
@@ -76,7 +76,11 @@ impl Timeline {
         })
     }
 
-    async fn load_instants(selector: &TimelineSelector, storage: &Storage) -> Result<Vec<Instant>> {
+    async fn load_instants(
+        selector: &TimelineSelector,
+        storage: &Storage,
+        desc: bool,
+    ) -> Result<Vec<Instant>> {
         let files = storage.list_files(Some(".hoodie")).await?;
 
         // For most cases, we load completed instants, so we can pre-allocate the vector with a
@@ -103,7 +107,16 @@ impl Timeline {
         // so we can save some memory by shrinking the capacity.
         instants.shrink_to_fit();
 
-        Ok(instants)
+        if desc {
+            Ok(instants.into_iter().rev().collect())
+        } else {
+            Ok(instants)
+        }
+    }
+
+    pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::completed_commits(self.hudi_configs.clone())?;
+        Self::load_instants(&selector, &self.storage, desc).await
     }
 
     pub(crate) fn get_latest_commit_timestamp(&self) -> Option<&str> {

@@ -90,8 +90,8 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
+use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
@@ -106,7 +106,6 @@ use crate::config::read::HudiReadConfig;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
@@ -218,6 +217,11 @@ impl Table {
             .collect();
 
         Ok(Schema::new(partition_fields))
+    }
+
+    /// Get the [Timeline] of the table.
+    pub async fn get_timeline(&self) -> &Timeline {
+        &self.timeline
     }
 
     /// Get all the [FileSlice]s in splits from the table.

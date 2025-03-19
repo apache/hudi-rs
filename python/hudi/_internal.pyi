@@ -22,6 +22,11 @@ import pyarrow  # type: ignore
 __version__: str
 
 @dataclass(init=False)
+class HudiInstant:
+    @property
+    def timestamp(self) -> str: ...
+
+@dataclass(init=False)
 class HudiFileGroupReader:
     """
     The reader that handles all read operations against a file group.
@@ -197,6 +202,11 @@ class HudiTable:
             pyarrow.Schema: The schema used for partitioning the table.
         """
         ...
+    def get_timeline(self) -> HudiTimeline:
+        """
+        Returns the timeline of the Hudi table.
+        """
+        ...
     def get_file_slices_splits(
         self, n: int, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[List[HudiFileSlice]]:
@@ -291,6 +301,10 @@ class HudiTable:
             List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
         """
         ...
+
+@dataclass(init=False)
+class HudiTimeline:
+    def get_completed_commits(self, desc: bool = False) -> List[HudiInstant]: ...
 
 def build_hudi_table(
     base_uri: str,
