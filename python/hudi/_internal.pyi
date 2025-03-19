@@ -146,6 +146,14 @@ class HudiTable:
             Dict[str, str]: A dictionary of storage options.
         """
         ...
+    def get_avro_schema(self) -> str:
+        """
+        Returns the Avro schema of the Hudi table.
+
+        Returns:
+            str: The Avro schema of the table.
+        """
+        ...
     def get_schema(self) -> "pyarrow.Schema":
         """
         Returns the schema of the Hudi table.
