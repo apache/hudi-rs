@@ -184,6 +184,11 @@ impl Table {
             .to::<String>()
     }
 
+    /// Get the latest Avro schema string of the table.
+    pub async fn get_avro_schema(&self) -> Result<String> {
+        self.timeline.get_latest_avro_schema().await
+    }
+
     /// Get the latest [Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
