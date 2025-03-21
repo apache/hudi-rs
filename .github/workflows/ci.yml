@@ -67,7 +67,7 @@ jobs:
         run: |
           cargo tarpaulin \
             --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
-            -e crates/core/src/avro_to_arrow/* \
+            --exclude-files crates/core/src/avro_to_arrow/* \
             -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
