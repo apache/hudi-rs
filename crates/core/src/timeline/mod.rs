@@ -201,7 +201,7 @@ impl Timeline {
         }
     }
 
-    pub(crate) async fn get_latest_avro_schema(&self) -> Result<String> {
+    pub async fn get_latest_avro_schema(&self) -> Result<String> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
         commit_metadata
             .get("extraMetadata")
@@ -218,7 +218,7 @@ impl Timeline {
             })
     }
 
-    pub(crate) async fn get_latest_schema(&self) -> Result<Schema> {
+    pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
         let first_partition = commit_metadata
