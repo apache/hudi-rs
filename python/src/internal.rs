@@ -533,6 +533,16 @@ impl HudiTimeline {
         })
     }
 
+    pub fn get_latest_commit_timestamp(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let commit_timestamp = self
+                .inner
+                .get_latest_commit_timestamp()
+                .map_err(PythonError::from)?;
+            Ok(commit_timestamp)
+        })
+    }
+
     pub fn get_latest_avro_schema(&self, py: Python) -> PyResult<String> {
         py.allow_threads(|| {
             let schema = rt()
