@@ -95,6 +95,7 @@ jobs:
         run: |
           make setup-venv
           source venv/bin/activate
+          make build
           make develop
       - name: Python unit tests with coverage report
         run: |
