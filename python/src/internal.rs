@@ -532,6 +532,21 @@ impl HudiTimeline {
             Ok(commit_metadata)
         })
     }
+
+    pub fn get_latest_avro_schema(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let schema = rt()
+                .block_on(self.inner.get_latest_avro_schema())
+                .map_err(PythonError::from)?;
+            Ok(schema)
+        })
+    }
+
+    pub fn get_latest_schema(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self.inner.get_latest_schema())
+            .map_err(PythonError::from)?
+            .to_pyarrow(py)
+    }
 }
 
 impl From<&Timeline> for HudiTimeline {
