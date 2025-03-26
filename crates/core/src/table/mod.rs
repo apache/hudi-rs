@@ -238,7 +238,7 @@ impl Table {
         n: usize,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.get_file_slices_splits_internal(n, timestamp, &filters)
                 .await
@@ -292,7 +292,7 @@ impl Table {
     /// # Notes
     ///     * This API is useful for implementing snapshot query.
     pub async fn get_file_slices(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<FileSlice>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.get_file_slices_internal(timestamp, &filters).await
         } else {
@@ -348,7 +348,8 @@ impl Table {
         end_timestamp: Option<&str>,
     ) -> Result<Vec<FileSlice>> {
         // If the end timestamp is not provided, use the latest commit timestamp.
-        let Some(end) = end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
+        let Some(end) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             // No latest commit timestamp means the table is empty.
             return Ok(Vec::new());
@@ -406,7 +407,7 @@ impl Table {
     /// # Arguments
     ///     * `filters` - Partition filters to apply.
     pub async fn read_snapshot(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<RecordBatch>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.read_snapshot_internal(timestamp, &filters).await
         } else {
@@ -459,7 +460,7 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         // If the end timestamp is not provided, use the latest commit timestamp.
         let Some(end_timestamp) =
-            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             return Ok(Vec::new());
         };

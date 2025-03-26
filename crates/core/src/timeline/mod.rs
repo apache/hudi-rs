@@ -187,7 +187,14 @@ impl Timeline {
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
-    pub(crate) fn get_latest_commit_timestamp(&self) -> Option<&str> {
+    pub fn get_latest_commit_timestamp(&self) -> Result<String> {
+        self.completed_commits.iter().next_back().map_or_else(
+            || Err(CoreError::Timeline("No commits found".to_string())),
+            |i| Ok(i.timestamp.clone()),
+        )
+    }
+
+    pub(crate) fn get_latest_commit_timestamp_as_option(&self) -> Option<&str> {
         self.completed_commits
             .iter()
             .next_back()
