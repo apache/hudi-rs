@@ -21,8 +21,6 @@ use crate::error::CoreError;
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::Result;
 use arrow_array::RecordBatch;
-use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -163,25 +161,6 @@ pub struct LogBlock {
 }
 
 impl LogBlock {
-    pub fn decode_content(block_type: &BlockType, content: Vec<u8>) -> Result<Vec<RecordBatch>> {
-        match block_type {
-            BlockType::ParquetData => {
-                let record_bytes = Bytes::from(content);
-                let parquet_reader = ParquetRecordBatchReader::try_new(record_bytes, 1024)?;
-                let mut batches = Vec::new();
-                for item in parquet_reader {
-                    let batch = item.map_err(CoreError::ArrowError)?;
-                    batches.push(batch);
-                }
-                Ok(batches)
-            }
-            BlockType::Command => Ok(Vec::new()),
-            _ => Err(CoreError::LogBlockError(format!(
-                "Unsupported block type: {block_type:?}"
-            ))),
-        }
-    }
-
     pub fn instant_time(&self) -> Result<&str> {
         let v = self
             .header
@@ -236,10 +215,6 @@ impl LogBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int64Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-    use std::sync::Arc;
 
     #[test]
     fn test_block_type_as_ref() {
@@ -343,40 +318,6 @@ mod tests {
 
         // Test invalid metadata key
         assert!(BlockMetadataKey::try_from([0, 0, 0, 7]).is_err());
-    }
-
-    #[test]
-    fn test_decode_parquet_content() -> Result<()> {
-        // Create sample parquet bytes
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-
-        let ids = Int64Array::from(vec![1, 2, 3]);
-        let names = StringArray::from(vec!["a", "b", "c"]);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef],
-        )?;
-
-        let mut buf = Vec::new();
-        {
-            let mut writer = ArrowWriter::try_new(&mut buf, schema, None)?;
-            writer.write(&batch)?;
-            writer.close()?;
-        }
-
-        // Test decoding the parquet content
-        let batches = LogBlock::decode_content(&BlockType::ParquetData, buf)?;
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 3);
-
-        // Test decoding with unsupported block type
-        assert!(LogBlock::decode_content(&BlockType::AvroData, vec![]).is_err());
-
-        Ok(())
     }
 
     #[test]

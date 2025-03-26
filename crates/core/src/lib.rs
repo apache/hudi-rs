@@ -43,6 +43,7 @@
 //! }
 //! ```
 
+mod avro_to_arrow;
 pub mod config;
 pub mod error;
 pub mod expr;

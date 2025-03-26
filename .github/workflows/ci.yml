@@ -57,14 +57,18 @@ jobs:
         os: [ ubuntu-22.04 ]
     runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.31.5
+      image: xd009642/tarpaulin:latest-slim
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
-        run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace -o xml --output-dir ./cov-reports --skip-clean
+        run: |
+          cargo tarpaulin \
+            --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
+            --exclude-files crates/core/src/avro_to_arrow/* \
+            -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:

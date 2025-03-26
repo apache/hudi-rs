@@ -43,6 +43,9 @@ arrow-select = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 
+# avro
+apache-avro = { workspace = true }
+
 # serde
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -53,6 +56,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 lazy_static = { workspace = true }
 log = { workspace = true }
+num-traits = { workspace = true }
 paste = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
