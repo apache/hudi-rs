@@ -170,6 +170,15 @@ class HudiTable:
         """
         ...
     @property
+    def is_mor(self) -> str:
+        """
+        Get whether the table is an MOR table.
+
+        Returns:
+            str: True if the table is a MOR table, False otherwise.
+        """
+        ...
+    @property
     def timezone(self) -> str:
         """
         Get timezone.

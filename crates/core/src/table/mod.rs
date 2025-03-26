@@ -90,8 +90,8 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
-use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
+use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
@@ -181,6 +181,10 @@ impl Table {
             .get(HudiTableConfig::TableType)
             .expect(&err_msg)
             .to::<String>()
+    }
+
+    pub fn is_mor(&self) -> bool {
+        self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
 
     pub fn timezone(&self) -> String {
