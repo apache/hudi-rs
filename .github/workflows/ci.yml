@@ -107,6 +107,12 @@ jobs:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
           if-no-files-found: 'error'
+      - name: Upload wheel files
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-artifact-${{ join(matrix.*, '-') }}
+          path: ./target/wheels/*.whl
+          if-no-files-found: 'error'
 
   integration-tests:
     runs-on: ubuntu-latest
@@ -120,6 +126,7 @@ jobs:
   publish-coverage:
     name: Publish coverage reports to codecov.io
     runs-on: ubuntu-latest
+    if: false
     needs: [ rust-tests, python-tests ]
     steps:
       - uses: actions/download-artifact@v4
