@@ -270,6 +270,11 @@ impl HudiTable {
     }
 
     #[getter]
+    fn is_mor(&self) -> bool {
+        self.inner.is_mor()
+    }
+
+    #[getter]
     fn timezone(&self) -> String {
         self.inner.timezone()
     }
