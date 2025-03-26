@@ -477,14 +477,52 @@ impl HudiTimeline {
         })
     }
 
-    pub fn get_commit_metadata_in_json(
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_deltacommits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_deltacommits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_replacecommits(
+        &self,
+        desc: bool,
+        py: Python,
+    ) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_replacecommits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_clustering_commits(
+        &self,
+        desc: bool,
+        py: Python,
+    ) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_clustering_commits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    pub fn get_instant_metadata_in_json(
         &self,
         instant: &HudiInstant,
         py: Python,
     ) -> PyResult<String> {
         py.allow_threads(|| {
             let commit_metadata = rt()
-                .block_on(self.inner.get_commit_metadata_in_json(&instant.inner))
+                .block_on(self.inner.get_instant_metadata_in_json(&instant.inner))
                 .map_err(PythonError::from)?;
             Ok(commit_metadata)
         })
