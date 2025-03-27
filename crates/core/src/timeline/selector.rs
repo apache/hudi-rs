@@ -158,8 +158,23 @@ impl TimelineSelector {
             .transpose()
     }
 
-    pub fn completed_commits(hudi_configs: Arc<HudiConfigs>) -> Result<Self> {
-        Self::completed_commits_in_range(hudi_configs, None, None)
+    pub fn completed_actions_in_range(
+        actions: &[Action],
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
+        let timezone = Self::get_timezone_from_configs(&hudi_configs);
+        let start_datetime = Self::parse_datetime(&timezone, start)?;
+        let end_datetime = Self::parse_datetime(&timezone, end)?;
+        Ok(Self {
+            timezone,
+            start_datetime,
+            end_datetime,
+            states: vec![State::Completed],
+            actions: actions.to_vec(),
+            include_archived: false,
+        })
     }
 
     pub fn completed_commits_in_range(
@@ -167,17 +182,15 @@ impl TimelineSelector {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<Self> {
-        let timezone = Self::get_timezone_from_configs(&hudi_configs);
-        let start_datetime = Self::parse_datetime(&timezone, start)?;
-        let end_datetime = Self::parse_datetime(&timezone, end)?;
-        Ok(Self {
-            timezone,
-            start_datetime,
-            end_datetime,
-            states: vec![State::Completed],
-            actions: vec![Action::Commit, Action::DeltaCommit, Action::ReplaceCommit],
-            include_archived: false,
-        })
+        Self::completed_actions_in_range(&[Action::Commit], hudi_configs, start, end)
+    }
+
+    pub fn completed_deltacommits_in_range(
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
+        Self::completed_actions_in_range(&[Action::DeltaCommit], hudi_configs, start, end)
     }
 
     pub fn completed_replacecommits_in_range(
@@ -185,17 +198,7 @@ impl TimelineSelector {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<Self> {
-        let timezone = Self::get_timezone_from_configs(&hudi_configs);
-        let start_datetime = Self::parse_datetime(&timezone, start)?;
-        let end_datetime = Self::parse_datetime(&timezone, end)?;
-        Ok(Self {
-            timezone,
-            start_datetime,
-            end_datetime,
-            states: vec![State::Completed],
-            actions: vec![Action::ReplaceCommit],
-            include_archived: false,
-        })
+        Self::completed_actions_in_range(&[Action::ReplaceCommit], hudi_configs, start, end)
     }
 
     pub fn should_include_action(&self, action: &Action) -> bool {
