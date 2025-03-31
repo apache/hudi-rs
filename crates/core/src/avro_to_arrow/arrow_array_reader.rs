@@ -872,7 +872,7 @@ fn resolve_u8(v: &Value) -> AvroResult<u8> {
         other => Err(AvroError::GetU8(other.into())),
     }?;
     if let Value::Int(n) = int {
-        if n >= 0 && n <= From::from(u8::MAX) {
+        if n >= 0 && n <= u8::MAX as i32 {
             return Ok(n as u8);
         }
     }
