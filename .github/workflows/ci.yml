@@ -57,7 +57,7 @@ jobs:
         os: [ ubuntu-22.04 ]
     runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.31.5
+      image: xd009642/tarpaulin:0.32.3-slim
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
@@ -103,6 +103,7 @@ jobs:
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
+        if: ${{ (matrix.os == 'ubuntu-22.04') && (matrix.python-version == '3.9') }}
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
