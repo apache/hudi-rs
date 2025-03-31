@@ -1110,7 +1110,7 @@ mod tests {
     mod test_snapshot_and_time_travel_queries {
         use super::super::*;
         use arrow::compute::concat_batches;
-        use hudi_test::SampleTable;
+        use hudi_test::{QuickstartTripsTable, SampleTable};
 
         #[tokio::test]
         async fn test_empty() -> Result<()> {
@@ -1119,6 +1119,53 @@ mod tests {
                 let records = hudi_table.read_snapshot(&[]).await?;
                 assert!(records.is_empty());
             }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_quickstart_trips_table() -> Result<()> {
+            let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            let updated_rider = "rider-D";
+
+            // verify updated record as of the latest commit
+            let records = hudi_table.read_snapshot(&[]).await?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
+                .into_iter()
+                .filter(|(_, rider, _)| rider == updated_rider)
+                .collect::<Vec<_>>();
+            assert_eq!(uuid_rider_and_fare.len(), 1);
+            assert_eq!(
+                uuid_rider_and_fare[0].0,
+                "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
+            );
+            assert_eq!(uuid_rider_and_fare[0].2, 25.0);
+
+            // verify updated record as of the first commit
+            let commit_timestamps = hudi_table
+                .timeline
+                .completed_commits
+                .iter()
+                .map(|i| i.timestamp.as_str())
+                .collect::<Vec<_>>();
+            let first_commit = commit_timestamps[0];
+            let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
+                .into_iter()
+                .filter(|(_, rider, _)| rider == updated_rider)
+                .collect::<Vec<_>>();
+            assert_eq!(uuid_rider_and_fare.len(), 1);
+            assert_eq!(
+                uuid_rider_and_fare[0].0,
+                "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
+            );
+            assert_eq!(uuid_rider_and_fare[0].2, 33.9);
+
             Ok(())
         }
 
