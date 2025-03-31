@@ -95,8 +95,14 @@ impl SampleTable {
         path_buf.to_str().unwrap().to_string()
     }
 
-    pub fn path_to_mor(&self) -> String {
-        let zip_path = self.zip_path("mor");
+    pub fn path_to_mor_avro(&self) -> String {
+        let zip_path = self.zip_path("mor/avro");
+        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+        path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn path_to_mor_parquet(&self) -> String {
+        let zip_path = self.zip_path("mor/parquet");
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
     }
@@ -106,13 +112,18 @@ impl SampleTable {
         Url::from_file_path(path).unwrap()
     }
 
-    pub fn url_to_mor(&self) -> Url {
-        let path = self.path_to_mor();
+    pub fn url_to_mor_avro(&self) -> Url {
+        let path = self.path_to_mor_avro();
+        Url::from_file_path(path).unwrap()
+    }
+
+    pub fn url_to_mor_parquet(&self) -> Url {
+        let path = self.path_to_mor_parquet();
         Url::from_file_path(path).unwrap()
     }
 
     pub fn urls(&self) -> Vec<Url> {
-        vec![self.url_to_cow(), self.url_to_mor()]
+        vec![self.url_to_cow(), self.url_to_mor_parquet()]
     }
 }
 
@@ -131,13 +142,13 @@ mod tests {
                     assert!(path.exists());
                 }
                 SampleTable::V6NonpartitionedRollback => {
-                    let path = t.zip_path("mor");
+                    let path = t.zip_path("mor/parquet");
                     assert!(path.exists());
                 }
                 _ => {
                     let path = t.zip_path("cow");
                     assert!(path.exists());
-                    let path = t.zip_path("mor");
+                    let path = t.zip_path("mor/parquet");
                     assert!(path.exists());
                 }
             }

@@ -855,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_file_slices_splits_as_of_timestamps() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
 
         // before replacecommit (insert overwrite table)
@@ -976,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn hudi_table_get_file_slices_between_timestamps() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor();
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let mut file_slices = hudi_table
             .get_file_slices_between(None, Some("20250121000656060"))
@@ -1146,7 +1146,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_non_partitioned_read_optimized() -> Result<()> {
-            let base_url = SampleTable::V6Nonpartitioned.url_to_mor();
+            let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
             let hudi_table = Table::new_with_options(
                 base_url.path(),
                 [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
@@ -1178,7 +1178,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_non_partitioned_rollback() -> Result<()> {
-            let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor();
+            let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor_parquet();
             let hudi_table = Table::new(base_url.path()).await?;
             let records = hudi_table.read_snapshot(&[]).await?;
             let schema = &records[0].schema();
