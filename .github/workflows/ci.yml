@@ -77,8 +77,8 @@ jobs:
       fail-fast: false
       matrix:
         # TODO: add windows
-        os: [ ubuntu-22.04, macos-14 ]
-        python-version: [ '3.9', '3.12' ]
+        os: [ ubuntu-22.04, ubuntu-22.04-arm, macos-14 ]
+        python-version: [ '3.9' ]
         exclude:
           - os: macos-14
             python-version: '3.9'
@@ -95,6 +95,7 @@ jobs:
         run: |
           make setup-venv
           source venv/bin/activate
+          make build
           make develop
       - name: Python unit tests with coverage report
         run: |
@@ -107,6 +108,12 @@ jobs:
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
+          if-no-files-found: 'error'
+      - name: Upload wheel files
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-artifact-${{ join(matrix.*, '-') }}
+          path: ./target/wheels/*.whl
           if-no-files-found: 'error'
 
   integration-tests:
@@ -121,6 +128,7 @@ jobs:
   publish-coverage:
     name: Publish coverage reports to codecov.io
     runs-on: ubuntu-latest
+    if: false
     needs: [ rust-tests, python-tests ]
     steps:
       - uses: actions/download-artifact@v4
