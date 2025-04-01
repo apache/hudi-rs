@@ -124,11 +124,95 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use apache_avro::to_avro_datum;
+    use apache_avro::types::Record as AvroRecord;
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::io::{BufReader, Cursor};
     use std::sync::Arc;
+
+    #[test]
+    fn test_decode_avro_content() -> Result<()> {
+        // Create Avro schema
+        let schema_str = r#"{
+            "type": "record",
+            "name": "TestRecord",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "name", "type": ["null", "string"]}
+            ]
+        }"#;
+        let writer_schema = AvroSchema::parse_str(schema_str)?;
+
+        // Create in-memory buffer and write the data
+        let mut buf = Vec::new();
+
+        // Write format version (3)
+        buf.extend_from_slice(&3u32.to_be_bytes());
+
+        // Write record count (2)
+        buf.extend_from_slice(&2u32.to_be_bytes());
+
+        // Create records
+        let mut record1 = AvroRecord::new(&writer_schema).unwrap();
+        record1.put("id", 42i64);
+        record1.put("name", Some("Alice"));
+
+        let mut record2 = AvroRecord::new(&writer_schema).unwrap();
+        record2.put("id", 43i64);
+        record2.put("name", None::<String>);
+
+        // Function to write a record with its size
+        let write_record = |buf: &mut Vec<u8>, record: AvroRecord| -> Result<()> {
+            // Convert record to Avro format
+            let record_bytes = to_avro_datum(&writer_schema, record)?;
+
+            // Write record size to buffer
+            buf.extend_from_slice(&(record_bytes.len() as u32).to_be_bytes());
+
+            // Write record bytes to buffer
+            buf.extend_from_slice(&record_bytes);
+
+            Ok(())
+        };
+
+        // Write both records
+        write_record(&mut buf, record1)?;
+        write_record(&mut buf, record2)?;
+
+        // Create decoder and test
+        let hudi_configs = HudiConfigs::empty();
+        let decoder = Decoder::new(Arc::new(hudi_configs));
+        let reader = Cursor::new(buf);
+
+        let batches = decoder.decode_avro_record_content(reader, &writer_schema)?;
+
+        // Verify results
+        assert!(!batches.is_empty(), "Should have at least one batch");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2, "Batch should have 2 rows");
+
+        // Verify first row values
+        let id_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_array.value(0), 42);
+        assert_eq!(id_array.value(1), 43);
+
+        // Verify second row values
+        let name_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+        assert!(name_array.is_null(1), "Second name value should be null");
+
+        Ok(())
+    }
 
     #[test]
     fn test_decode_parquet_content() -> Result<()> {
