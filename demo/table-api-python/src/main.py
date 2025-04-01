@@ -21,7 +21,7 @@ from hudi import HudiTableBuilder
 
 for url in [
     "s3://hudi-demo/cow/v6_complexkeygen_hivestyle",
-    "s3://hudi-demo/mor/v6_complexkeygen_hivestyle",
+    "s3://hudi-demo/mor/parquet/v6_complexkeygen_hivestyle",
 ]:
     hudi_table = HudiTableBuilder.from_base_uri(url).build()
     batches = hudi_table.read_snapshot()
