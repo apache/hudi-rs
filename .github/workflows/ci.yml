@@ -81,10 +81,14 @@ jobs:
       fail-fast: false
       matrix:
         # TODO: add windows
-        os: [ ubuntu-22.04, macos-14 ]
+        os: [ ubuntu-24.04, ubuntu-22.04-arm, macos-15 ]
         python-version: [ '3.9', '3.12' ]
         exclude:
-          - os: macos-14
+          - os: ubuntu-24.04
+            python-version: '3.9'
+          - os: ubuntu-22.04-arm
+            python-version: '3.12'
+          - os: macos-15
             python-version: '3.9'
     runs-on: ${{ matrix.os }}
     steps:
@@ -99,6 +103,7 @@ jobs:
         run: |
           make setup-venv
           source venv/bin/activate
+          make build
           make develop
       - name: Python unit tests with coverage report
         run: |
@@ -107,10 +112,16 @@ jobs:
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
-        if: ${{ (matrix.os == 'ubuntu-22.04') && (matrix.python-version == '3.9') }}
+        if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.12') }}
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
+          if-no-files-found: 'error'
+      - name: Upload wheel files
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-artifact-${{ join(matrix.*, '-') }}
+          path: ./target/wheels/*.whl
           if-no-files-found: 'error'
 
   integration-tests:
