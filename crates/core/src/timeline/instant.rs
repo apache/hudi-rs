@@ -24,6 +24,7 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::str::FromStr;
+use crate::metadata::HUDI_METADATA_DIR;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -214,7 +215,7 @@ impl Instant {
     }
 
     pub fn relative_path(&self) -> Result<String> {
-        let mut commit_file_path = PathBuf::from(".hoodie");
+        let mut commit_file_path = PathBuf::from(HUDI_METADATA_DIR);
         commit_file_path.push(self.file_name());
         commit_file_path
             .to_str()

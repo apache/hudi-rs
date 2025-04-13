@@ -198,12 +198,12 @@ impl Table {
         self.timeline.get_latest_avro_schema().await
     }
 
-    /// Get the latest [Schema] of the table.
+    /// Get the latest [arrow_schema::Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
 
-    /// Get the latest partition [Schema] of the table
+    /// Get the latest partition [arrow_schema::Schema] of the table.
     pub async fn get_partition_schema(&self) -> Result<Schema> {
         let partition_fields: HashSet<String> = self
             .hudi_configs

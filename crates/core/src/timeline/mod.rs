@@ -36,6 +36,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use crate::metadata::HUDI_METADATA_DIR;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
 #[derive(Clone, Debug)]
@@ -89,7 +90,7 @@ impl Timeline {
         storage: &Storage,
         desc: bool,
     ) -> Result<Vec<Instant>> {
-        let files = storage.list_files(Some(".hoodie")).await?;
+        let files = storage.list_files(Some(HUDI_METADATA_DIR)).await?;
 
         // For most cases, we load completed instants, so we can pre-allocate the vector with a
         // capacity of 1/3 of the total number of listed files,
@@ -122,12 +123,27 @@ impl Timeline {
         }
     }
 
+    /// Get the completed commit [Instant]s in the timeline.
+    ///
+    /// * For Copy-on-write tables, this includes commit instants.
+    /// * For Merge-on-read tables, this includes compaction commit instants.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
     pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector =
             TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), None, None)?;
         Self::load_instants(&selector, &self.storage, desc).await
     }
 
+    /// Get the completed deltacommit [Instant]s in the timeline.
+    ///
+    /// Only applicable for Merge-on-read tables. Empty vector will be returned for Copy-on-write tables.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
     pub async fn get_completed_deltacommits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector = TimelineSelector::completed_deltacommits_in_range(
             self.hudi_configs.clone(),
@@ -137,6 +153,11 @@ impl Timeline {
         Self::load_instants(&selector, &self.storage, desc).await
     }
 
+    /// Get the completed replacecommit [Instant]s in the timeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
     pub async fn get_completed_replacecommits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector = TimelineSelector::completed_replacecommits_in_range(
             self.hudi_configs.clone(),
@@ -146,6 +167,11 @@ impl Timeline {
         Self::load_instants(&selector, &self.storage, desc).await
     }
 
+    /// Get the completed clustering commit [Instant]s in the timeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
     pub async fn get_completed_clustering_commits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector = TimelineSelector::completed_replacecommits_in_range(
             self.hudi_configs.clone(),
@@ -169,7 +195,7 @@ impl Timeline {
         Ok(clustering_instants)
     }
 
-    pub(crate) async fn get_instant_metadata(
+    async fn get_instant_metadata(
         &self,
         instant: &Instant,
     ) -> Result<Map<String, Value>> {
@@ -180,25 +206,12 @@ impl Timeline {
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
+    /// Get the instant metadata in JSON format.
     pub async fn get_instant_metadata_in_json(&self, instant: &Instant) -> Result<String> {
         let path = instant.relative_path()?;
         let bytes = self.storage.get_file_data(path.as_str()).await?;
         String::from_utf8(bytes.to_vec())
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
-    }
-
-    pub fn get_latest_commit_timestamp(&self) -> Result<String> {
-        self.completed_commits.iter().next_back().map_or_else(
-            || Err(CoreError::Timeline("No commits found".to_string())),
-            |i| Ok(i.timestamp.clone()),
-        )
-    }
-
-    pub(crate) fn get_latest_commit_timestamp_as_option(&self) -> Option<&str> {
-        self.completed_commits
-            .iter()
-            .next_back()
-            .map(|instant| instant.timestamp.as_str())
     }
 
     async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
@@ -208,6 +221,24 @@ impl Timeline {
         }
     }
 
+    pub(crate) fn get_latest_commit_timestamp_as_option(&self) -> Option<&str> {
+        self.completed_commits
+            .iter()
+            .next_back()
+            .map(|instant| instant.timestamp.as_str())
+    }
+
+    /// Get the latest commit timestamp from the [Timeline].
+    ///
+    /// Only completed commits are considered.
+    pub fn get_latest_commit_timestamp(&self) -> Result<String> {
+        self.get_latest_commit_timestamp_as_option().map_or_else(
+            || Err(CoreError::Timeline("No commits found".to_string())),
+            |t| Ok(t.to_string()),
+        )
+    }
+
+    /// Get the latest Avro schema string from the [Timeline].
     pub async fn get_latest_avro_schema(&self) -> Result<String> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
         commit_metadata
@@ -225,6 +256,7 @@ impl Timeline {
             })
     }
 
+    /// Get the latest [arrow_schema::Schema] from the [Timeline].
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 

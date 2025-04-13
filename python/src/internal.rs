@@ -213,10 +213,23 @@ pub struct HudiInstant {
 impl HudiInstant {
     #[getter]
     pub fn timestamp(&self) -> String {
-        self.inner.timestamp.to_owned()
+        self.inner.timestamp.to_string()
     }
 
-    // TODO impl other properties
+    #[getter]
+    pub fn action(&self) -> String {
+        self.inner.action.to_string()
+    }
+
+    #[getter]
+    pub fn state(&self) -> String {
+        self.inner.state.to_string()
+    }
+
+    #[getter]
+    pub fn epoch_mills(&self) -> i64 {
+        self.inner.epoch_millis
+    }
 }
 
 impl From<&Instant> for HudiInstant {
