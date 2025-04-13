@@ -31,6 +31,8 @@ use hudi::file_group::FileGroup;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
+use hudi::timeline::instant::Instant;
+use hudi::timeline::Timeline;
 use hudi::util::StrTupleRef;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
@@ -200,6 +202,45 @@ impl From<&FileSlice> for HudiFileSlice {
 }
 
 #[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug)]
+#[pyclass]
+pub struct HudiInstant {
+    inner: Instant,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiInstant {
+    #[getter]
+    pub fn timestamp(&self) -> String {
+        self.inner.timestamp.to_string()
+    }
+
+    #[getter]
+    pub fn action(&self) -> String {
+        self.inner.action.as_ref().to_string()
+    }
+
+    #[getter]
+    pub fn state(&self) -> String {
+        self.inner.state.as_ref().to_string()
+    }
+
+    #[getter]
+    pub fn epoch_mills(&self) -> i64 {
+        self.inner.epoch_millis
+    }
+}
+
+impl From<&Instant> for HudiInstant {
+    fn from(i: &Instant) -> Self {
+        HudiInstant {
+            inner: i.to_owned(),
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
 #[pyclass]
 pub struct HudiTable {
     inner: Table,
@@ -231,6 +272,35 @@ impl HudiTable {
         self.inner.storage_options()
     }
 
+    #[getter]
+    fn table_name(&self) -> String {
+        self.inner.table_name()
+    }
+
+    #[getter]
+    fn table_type(&self) -> String {
+        self.inner.table_type()
+    }
+
+    #[getter]
+    fn is_mor(&self) -> bool {
+        self.inner.is_mor()
+    }
+
+    #[getter]
+    fn timezone(&self) -> String {
+        self.inner.timezone()
+    }
+
+    fn get_avro_schema(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let avro_schema = rt()
+                .block_on(self.inner.get_avro_schema())
+                .map_err(PythonError::from)?;
+            Ok(avro_schema)
+        })
+    }
+
     fn get_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_schema())
             .map_err(PythonError::from)?
@@ -241,6 +311,13 @@ impl HudiTable {
         rt().block_on(self.inner.get_partition_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+    }
+
+    fn get_timeline(&self, py: Python) -> HudiTimeline {
+        py.allow_threads(|| {
+            let timeline = self.inner.get_timeline();
+            HudiTimeline::from(timeline)
+        })
     }
 
     #[pyo3(signature = (n, filters=None))]
@@ -396,6 +473,110 @@ impl HudiTable {
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pyclass]
+pub struct HudiTimeline {
+    inner: Timeline,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiTimeline {
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_commits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_commits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_deltacommits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_deltacommits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_replacecommits(
+        &self,
+        desc: bool,
+        py: Python,
+    ) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_replacecommits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (desc=false))]
+    pub fn get_completed_clustering_commits(
+        &self,
+        desc: bool,
+        py: Python,
+    ) -> PyResult<Vec<HudiInstant>> {
+        py.allow_threads(|| {
+            let instants = rt()
+                .block_on(self.inner.get_completed_clustering_commits(desc))
+                .map_err(PythonError::from)?;
+            Ok(instants.iter().map(HudiInstant::from).collect())
+        })
+    }
+
+    pub fn get_instant_metadata_in_json(
+        &self,
+        instant: &HudiInstant,
+        py: Python,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            let commit_metadata = rt()
+                .block_on(self.inner.get_instant_metadata_in_json(&instant.inner))
+                .map_err(PythonError::from)?;
+            Ok(commit_metadata)
+        })
+    }
+
+    pub fn get_latest_commit_timestamp(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let commit_timestamp = self
+                .inner
+                .get_latest_commit_timestamp()
+                .map_err(PythonError::from)?;
+            Ok(commit_timestamp)
+        })
+    }
+
+    pub fn get_latest_avro_schema(&self, py: Python) -> PyResult<String> {
+        py.allow_threads(|| {
+            let schema = rt()
+                .block_on(self.inner.get_latest_avro_schema())
+                .map_err(PythonError::from)?;
+            Ok(schema)
+        })
+    }
+
+    pub fn get_latest_schema(&self, py: Python) -> PyResult<PyObject> {
+        rt().block_on(self.inner.get_latest_schema())
+            .map_err(PythonError::from)?
+            .to_pyarrow(py)
+    }
+}
+
+impl From<&Timeline> for HudiTimeline {
+    fn from(t: &Timeline) -> Self {
+        HudiTimeline {
+            inner: t.to_owned(),
+        }
     }
 }
 

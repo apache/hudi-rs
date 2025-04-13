@@ -16,14 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-mod instant;
+pub mod instant;
 pub(crate) mod selector;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
+use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
+use crate::timeline::instant::Action;
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
 use arrow_schema::Schema;
@@ -46,6 +48,8 @@ pub struct Timeline {
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
+pub const DEFAULT_LOADING_ACTIONS: &[Action] =
+    &[Action::Commit, Action::DeltaCommit, Action::ReplaceCommit];
 
 impl Timeline {
     #[cfg(test)]
@@ -67,8 +71,13 @@ impl Timeline {
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
-        let selector = TimelineSelector::completed_commits(hudi_configs.clone())?;
-        let completed_commits = Self::load_instants(&selector, &storage).await?;
+        let selector = TimelineSelector::completed_actions_in_range(
+            DEFAULT_LOADING_ACTIONS,
+            hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        let completed_commits = Self::load_instants(&selector, &storage, false).await?;
         Ok(Self {
             hudi_configs,
             storage,
@@ -76,8 +85,12 @@ impl Timeline {
         })
     }
 
-    async fn load_instants(selector: &TimelineSelector, storage: &Storage) -> Result<Vec<Instant>> {
-        let files = storage.list_files(Some(".hoodie")).await?;
+    async fn load_instants(
+        selector: &TimelineSelector,
+        storage: &Storage,
+        desc: bool,
+    ) -> Result<Vec<Instant>> {
+        let files = storage.list_files(Some(HUDI_METADATA_DIR)).await?;
 
         // For most cases, we load completed instants, so we can pre-allocate the vector with a
         // capacity of 1/3 of the total number of listed files,
@@ -103,24 +116,86 @@ impl Timeline {
         // so we can save some memory by shrinking the capacity.
         instants.shrink_to_fit();
 
-        Ok(instants)
-    }
-
-    pub(crate) fn get_latest_commit_timestamp(&self) -> Option<&str> {
-        self.completed_commits
-            .iter()
-            .next_back()
-            .map(|instant| instant.timestamp.as_str())
-    }
-
-    async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
-        match self.completed_commits.iter().next_back() {
-            Some(instant) => self.get_commit_metadata(instant).await,
-            None => Ok(Map::new()),
+        if desc {
+            Ok(instants.into_iter().rev().collect())
+        } else {
+            Ok(instants)
         }
     }
 
-    async fn get_commit_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
+    /// Get the completed commit [Instant]s in the timeline.
+    ///
+    /// * For Copy-on-write tables, this includes commit instants.
+    /// * For Merge-on-read tables, this includes compaction commit instants.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
+    pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
+        let selector =
+            TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), None, None)?;
+        Self::load_instants(&selector, &self.storage, desc).await
+    }
+
+    /// Get the completed deltacommit [Instant]s in the timeline.
+    ///
+    /// Only applicable for Merge-on-read tables. Empty vector will be returned for Copy-on-write tables.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
+    pub async fn get_completed_deltacommits(&self, desc: bool) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::completed_deltacommits_in_range(
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        Self::load_instants(&selector, &self.storage, desc).await
+    }
+
+    /// Get the completed replacecommit [Instant]s in the timeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
+    pub async fn get_completed_replacecommits(&self, desc: bool) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::completed_replacecommits_in_range(
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        Self::load_instants(&selector, &self.storage, desc).await
+    }
+
+    /// Get the completed clustering commit [Instant]s in the timeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `desc` - If true, the [Instant]s are sorted in descending order.
+    pub async fn get_completed_clustering_commits(&self, desc: bool) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::completed_replacecommits_in_range(
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        let instants = Self::load_instants(&selector, &self.storage, desc).await?;
+        let mut clustering_instants = Vec::new();
+        for instant in instants {
+            let metadata = self.get_instant_metadata(&instant).await?;
+            let op_type = metadata
+                .get("operationType")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    CoreError::CommitMetadata("Failed to get operation type".to_string())
+                })?;
+            if op_type == "cluster" {
+                clustering_instants.push(instant);
+            }
+        }
+        Ok(clustering_instants)
+    }
+
+    async fn get_instant_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
         let path = instant.relative_path()?;
         let bytes = self.storage.get_file_data(path.as_str()).await?;
 
@@ -128,7 +203,58 @@ impl Timeline {
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
-    pub(crate) async fn get_latest_schema(&self) -> Result<Schema> {
+    /// Get the instant metadata in JSON format.
+    pub async fn get_instant_metadata_in_json(&self, instant: &Instant) -> Result<String> {
+        let path = instant.relative_path()?;
+        let bytes = self.storage.get_file_data(path.as_str()).await?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+    }
+
+    async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
+        match self.completed_commits.iter().next_back() {
+            Some(instant) => self.get_instant_metadata(instant).await,
+            None => Ok(Map::new()),
+        }
+    }
+
+    pub(crate) fn get_latest_commit_timestamp_as_option(&self) -> Option<&str> {
+        self.completed_commits
+            .iter()
+            .next_back()
+            .map(|instant| instant.timestamp.as_str())
+    }
+
+    /// Get the latest commit timestamp from the [Timeline].
+    ///
+    /// Only completed commits are considered.
+    pub fn get_latest_commit_timestamp(&self) -> Result<String> {
+        self.get_latest_commit_timestamp_as_option().map_or_else(
+            || Err(CoreError::Timeline("No commits found".to_string())),
+            |t| Ok(t.to_string()),
+        )
+    }
+
+    /// Get the latest Avro schema string from the [Timeline].
+    pub async fn get_latest_avro_schema(&self) -> Result<String> {
+        let commit_metadata = self.get_latest_commit_metadata().await?;
+        commit_metadata
+            .get("extraMetadata")
+            .and_then(|v| v.as_object())
+            .and_then(|obj| {
+                obj.get("schema")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .ok_or_else(|| {
+                CoreError::CommitMetadata(
+                    "Failed to resolve the latest schema: no schema found".to_string(),
+                )
+            })
+    }
+
+    /// Get the latest [arrow_schema::Schema] from the [Timeline].
+    pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
 
         let first_partition = commit_metadata
@@ -194,7 +320,7 @@ impl Timeline {
             Some(timestamp),
         )?;
         for instant in selector.select(self)? {
-            let commit_metadata = self.get_commit_metadata(&instant).await?;
+            let commit_metadata = self.get_instant_metadata(&instant).await?;
             file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
         }
 
@@ -212,14 +338,15 @@ impl Timeline {
     ) -> Result<HashSet<FileGroup>> {
         let mut file_groups: HashSet<FileGroup> = HashSet::new();
         let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
-        let selector = TimelineSelector::completed_commits_in_range(
+        let selector = TimelineSelector::completed_actions_in_range(
+            DEFAULT_LOADING_ACTIONS,
             self.hudi_configs.clone(),
             start_timestamp,
             end_timestamp,
         )?;
         let commits = selector.select(self)?;
         for commit in commits {
-            let commit_metadata = self.get_commit_metadata(&commit).await?;
+            let commit_metadata = self.get_instant_metadata(&commit).await?;
             file_groups.merge(build_file_groups(&commit_metadata)?)?;
 
             if commit.is_replacecommit() {
@@ -308,7 +435,7 @@ mod tests {
         let instant = Instant::from_str("20240402123035233.commit").unwrap();
 
         // Test error when reading empty commit metadata file
-        let result = timeline.get_commit_metadata(&instant).await;
+        let result = timeline.get_instant_metadata(&instant).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
@@ -317,7 +444,7 @@ mod tests {
         let instant = Instant::from_str("20240402144910683.commit").unwrap();
 
         // Test error when reading a commit metadata file with invalid JSON
-        let result = timeline.get_commit_metadata(&instant).await;
+        let result = timeline.get_instant_metadata(&instant).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));

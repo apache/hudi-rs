@@ -106,7 +106,6 @@ use crate::config::read::HudiReadConfig;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
 
@@ -168,14 +167,24 @@ impl Table {
             .expect(&err_msg)
     }
 
-    pub fn table_type(&self) -> TableTypeValue {
+    pub fn table_name(&self) -> String {
+        let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableName);
+        self.hudi_configs
+            .get(HudiTableConfig::TableName)
+            .expect(&err_msg)
+            .to::<String>()
+    }
+
+    pub fn table_type(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
-        let table_type = self
-            .hudi_configs
+        self.hudi_configs
             .get(HudiTableConfig::TableType)
             .expect(&err_msg)
-            .to::<String>();
-        TableTypeValue::from_str(table_type.as_str()).expect(&err_msg)
+            .to::<String>()
+    }
+
+    pub fn is_mor(&self) -> bool {
+        self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
 
     pub fn timezone(&self) -> String {
@@ -184,12 +193,17 @@ impl Table {
             .to::<String>()
     }
 
-    /// Get the latest [Schema] of the table.
+    /// Get the latest Avro schema string of the table.
+    pub async fn get_avro_schema(&self) -> Result<String> {
+        self.timeline.get_latest_avro_schema().await
+    }
+
+    /// Get the latest [arrow_schema::Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
     }
 
-    /// Get the latest partition [Schema] of the table
+    /// Get the latest partition [arrow_schema::Schema] of the table.
     pub async fn get_partition_schema(&self) -> Result<Schema> {
         let partition_fields: HashSet<String> = self
             .hudi_configs
@@ -209,6 +223,11 @@ impl Table {
         Ok(Schema::new(partition_fields))
     }
 
+    /// Get the [Timeline] of the table.
+    pub fn get_timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
     /// Get all the [FileSlice]s in splits from the table.
     ///
     /// # Arguments
@@ -219,7 +238,7 @@ impl Table {
         n: usize,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<Vec<FileSlice>>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.get_file_slices_splits_internal(n, timestamp, &filters)
                 .await
@@ -273,7 +292,7 @@ impl Table {
     /// # Notes
     ///     * This API is useful for implementing snapshot query.
     pub async fn get_file_slices(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<FileSlice>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.get_file_slices_internal(timestamp, &filters).await
         } else {
@@ -329,7 +348,8 @@ impl Table {
         end_timestamp: Option<&str>,
     ) -> Result<Vec<FileSlice>> {
         // If the end timestamp is not provided, use the latest commit timestamp.
-        let Some(end) = end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
+        let Some(end) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             // No latest commit timestamp means the table is empty.
             return Ok(Vec::new());
@@ -387,7 +407,7 @@ impl Table {
     /// # Arguments
     ///     * `filters` - Partition filters to apply.
     pub async fn read_snapshot(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<RecordBatch>> {
-        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp() {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.read_snapshot_internal(timestamp, &filters).await
         } else {
@@ -440,7 +460,7 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         // If the end timestamp is not provided, use the latest commit timestamp.
         let Some(end_timestamp) =
-            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp())
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             return Ok(Vec::new());
         };
