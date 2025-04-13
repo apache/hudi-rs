@@ -57,14 +57,18 @@ jobs:
         os: [ ubuntu-22.04 ]
     runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.31.5
+      image: xd009642/tarpaulin:0.32.3-slim
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
-        run: cargo tarpaulin --engine llvm --no-dead-code --no-fail-fast --all-features --workspace -o xml --output-dir ./cov-reports --skip-clean
+        run: |
+          cargo tarpaulin \
+            --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
+            --exclude-files crates/core/src/avro_to_arrow/* \
+            -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
@@ -77,10 +81,14 @@ jobs:
       fail-fast: false
       matrix:
         # TODO: add windows
-        os: [ ubuntu-22.04, macos-14 ]
+        os: [ ubuntu-24.04, ubuntu-22.04-arm, macos-15 ]
         python-version: [ '3.9', '3.12' ]
         exclude:
-          - os: macos-14
+          - os: ubuntu-24.04
+            python-version: '3.9'
+          - os: ubuntu-22.04-arm
+            python-version: '3.12'
+          - os: macos-15
             python-version: '3.9'
     runs-on: ${{ matrix.os }}
     steps:
@@ -95,6 +103,7 @@ jobs:
         run: |
           make setup-venv
           source venv/bin/activate
+          make build
           make develop
       - name: Python unit tests with coverage report
         run: |
@@ -103,9 +112,16 @@ jobs:
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
+        if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.12') }}
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
+          if-no-files-found: 'error'
+      - name: Upload wheel files
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-artifact-${{ join(matrix.*, '-') }}
+          path: ./target/wheels/*.whl
           if-no-files-found: 'error'
 
   integration-tests:
@@ -122,6 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ rust-tests, python-tests ]
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: cov-report-*
@@ -132,4 +149,4 @@ jobs:
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./cov-reports/*
+          directory: ./cov-reports

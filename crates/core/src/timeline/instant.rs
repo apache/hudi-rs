@@ -180,7 +180,7 @@ impl Instant {
             TimelineTimezoneValue::UTC => Ok(DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
             TimelineTimezoneValue::Local => Ok(Local
                 .from_local_datetime(&naive_dt)
-                .earliest()
+                .single()
                 .ok_or_else(|| CoreError::Timeline("Invalid local datetime".to_string()))?
                 .to_utc()),
         }
@@ -358,13 +358,22 @@ mod tests {
 
     #[test]
     fn test_create_instant_using_local_timezone() {
+        // Set a fixed timezone for consistent testing
+        let original_tz = std::env::var("TZ").ok();
+        std::env::set_var("TZ", "Etc/GMT+5"); // UTC-5 fixed timezone with no DST
+
         let file_name = "20240103153000.commit";
         let instant_local = Instant::try_from_file_name_and_timezone(file_name, "local").unwrap();
         let instant_utc = Instant::try_from_file_name_and_timezone(file_name, "utc").unwrap();
         let offset_seconds = (instant_local.epoch_millis - instant_utc.epoch_millis) / 1000;
-        assert_eq!(
-            offset_seconds,
-            Local::now().offset().utc_minus_local() as i64
-        );
+
+        // Expected: In UTC+5, the offset should be exactly 5 hours
+        assert_eq!(offset_seconds, 5 * 3600);
+
+        // Restore original TZ
+        match original_tz {
+            Some(tz) => std::env::set_var("TZ", tz),
+            None => std::env::remove_var("TZ"),
+        }
     }
 }

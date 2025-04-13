@@ -23,6 +23,8 @@ use std::cmp::Ordering;
 use std::fmt::Display;
 use std::str::FromStr;
 
+mod avro;
+mod content;
 mod log_block;
 mod log_format;
 pub mod reader;

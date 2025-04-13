@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,69 @@ pub fn extract_test_table(zip_path: &Path) -> PathBuf {
     let archive = fs::read(zip_path).unwrap();
     zip_extract::extract(Cursor::new(archive), &target_dir, false).unwrap();
     target_dir
+}
+
+#[allow(dead_code)]
+#[derive(Debug, EnumString, AsRefStr, EnumIter)]
+pub enum QuickstartTripsTable {
+    #[strum(serialize = "v6_trips_8i1u")]
+    V6Trips8I1U,
+}
+
+impl QuickstartTripsTable {
+    pub fn uuid_rider_and_fare(record_batch: &RecordBatch) -> Vec<(String, String, f64)> {
+        let uuids = record_batch
+            .column_by_name("uuid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let riders = record_batch
+            .column_by_name("rider")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let fares = record_batch
+            .column_by_name("fare")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        uuids
+            .iter()
+            .zip(riders.iter())
+            .zip(fares.iter())
+            .map(|((uuid, rider), fare)| {
+                (
+                    uuid.unwrap().to_string(),
+                    rider.unwrap().to_string(),
+                    fare.unwrap(),
+                )
+            })
+            .collect()
+    }
+    fn zip_path(&self, table_type: &str, log_format: Option<&str>) -> Box<Path> {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let data_path = Path::new(dir)
+            .join("data/quickstart_trips_table")
+            .join(table_type.to_lowercase())
+            .join(log_format.unwrap_or_default())
+            .join(format!("{}.zip", self.as_ref()));
+        data_path.into_boxed_path()
+    }
+
+    pub fn path_to_mor_avro(&self) -> String {
+        let zip_path = self.zip_path("mor", Some("avro"));
+        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+        path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn url_to_mor_avro(&self) -> Url {
+        let path = self.path_to_mor_avro();
+        Url::from_file_path(path).unwrap()
+    }
 }
 
 #[allow(dead_code)]
@@ -80,23 +143,24 @@ impl SampleTable {
         data
     }
 
-    fn zip_path(&self, table_type: &str) -> Box<Path> {
+    fn zip_path(&self, table_type: &str, log_format: Option<&str>) -> Box<Path> {
         let dir = env!("CARGO_MANIFEST_DIR");
         let data_path = Path::new(dir)
-            .join("data/tables")
+            .join("data/sample_table")
             .join(table_type.to_lowercase())
+            .join(log_format.unwrap_or_default())
             .join(format!("{}.zip", self.as_ref()));
         data_path.into_boxed_path()
     }
 
     pub fn path_to_cow(&self) -> String {
-        let zip_path = self.zip_path("cow");
+        let zip_path = self.zip_path("cow", None);
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
     }
 
-    pub fn path_to_mor(&self) -> String {
-        let zip_path = self.zip_path("mor");
+    pub fn path_to_mor_parquet(&self) -> String {
+        let zip_path = self.zip_path("mor", Some("parquet"));
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
     }
@@ -106,13 +170,13 @@ impl SampleTable {
         Url::from_file_path(path).unwrap()
     }
 
-    pub fn url_to_mor(&self) -> Url {
-        let path = self.path_to_mor();
+    pub fn url_to_mor_parquet(&self) -> Url {
+        let path = self.path_to_mor_parquet();
         Url::from_file_path(path).unwrap()
     }
 
     pub fn urls(&self) -> Vec<Url> {
-        vec![self.url_to_cow(), self.url_to_mor()]
+        vec![self.url_to_cow(), self.url_to_mor_parquet()]
     }
 }
 
@@ -120,24 +184,35 @@ impl SampleTable {
 mod tests {
     use strum::IntoEnumIterator;
 
-    use crate::SampleTable;
+    use crate::{QuickstartTripsTable, SampleTable};
 
+    #[test]
+    fn quickstart_trips_table_zip_file_should_exist() {
+        for t in QuickstartTripsTable::iter() {
+            match t {
+                QuickstartTripsTable::V6Trips8I1U => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
+            }
+        }
+    }
     #[test]
     fn sample_table_zip_file_should_exist() {
         for t in SampleTable::iter() {
             match t {
                 SampleTable::V6TimebasedkeygenNonhivestyle => {
-                    let path = t.zip_path("cow");
+                    let path = t.zip_path("cow", None);
                     assert!(path.exists());
                 }
                 SampleTable::V6NonpartitionedRollback => {
-                    let path = t.zip_path("mor");
+                    let path = t.zip_path("mor", Some("parquet"));
                     assert!(path.exists());
                 }
                 _ => {
-                    let path = t.zip_path("cow");
+                    let path = t.zip_path("cow", None);
                     assert!(path.exists());
-                    let path = t.zip_path("mor");
+                    let path = t.zip_path("mor", Some("parquet"));
                     assert!(path.exists());
                 }
             }
