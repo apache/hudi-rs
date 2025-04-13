@@ -112,7 +112,7 @@ jobs:
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
-        if: ${{ (matrix.os == 'ubuntu-22.04') && (matrix.python-version == '3.9') }}
+        if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.12') }}
         with:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
