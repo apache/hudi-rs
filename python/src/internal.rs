@@ -218,12 +218,12 @@ impl HudiInstant {
 
     #[getter]
     pub fn action(&self) -> String {
-        self.inner.action.to_string()
+        self.inner.action.as_ref().to_string()
     }
 
     #[getter]
     pub fn state(&self) -> String {
-        self.inner.state.to_string()
+        self.inner.state.as_ref().to_string()
     }
 
     #[getter]

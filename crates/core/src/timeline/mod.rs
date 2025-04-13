@@ -23,6 +23,7 @@ use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
+use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::timeline::instant::Action;
 use crate::timeline::selector::TimelineSelector;
@@ -36,7 +37,6 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use crate::metadata::HUDI_METADATA_DIR;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
 #[derive(Clone, Debug)]
@@ -195,10 +195,7 @@ impl Timeline {
         Ok(clustering_instants)
     }
 
-    async fn get_instant_metadata(
-        &self,
-        instant: &Instant,
-    ) -> Result<Map<String, Value>> {
+    async fn get_instant_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
         let path = instant.relative_path()?;
         let bytes = self.storage.get_file_data(path.as_str()).await?;
 
