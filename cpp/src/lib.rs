@@ -19,16 +19,11 @@
 mod util;
 
 use crate::util::create_raw_pointer_for_record_batches;
-use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::RecordBatchIterator;
-use hudi::config::util::empty_filters;
-use hudi::error::Result as HudiResult;
+use cxx::{CxxString, CxxVector};
+use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
-use hudi::table::Table;
-use hudi_test::QuickstartTripsTable;
-use cxx::{CxxVector, CxxString};
+use hudi::file_group::FileGroup;
 
-#[allow(clippy::result_large_err)]
 #[cxx::bridge]
 mod ffi {
     unsafe extern "C++" {
@@ -38,35 +33,29 @@ mod ffi {
     }
 
     extern "Rust" {
-        fn read_file_slice() -> *mut ArrowArrayStream;
         type HudiFileGroupReader;
-
         fn new_file_group_reader_with_options(
-            base_uri: &str,
+            base_uri: &CxxString,
             options: &CxxVector<CxxString>,
-        ) -> Result<Box<HudiFileGroupReader>>;
+        ) -> Box<HudiFileGroupReader>;
+
+        type HudiFileSlice;
+        fn new_file_slice_from_file_names(
+            partition_path: &CxxString,
+            base_file_name: &CxxString,
+            log_file_names: &CxxVector<CxxString>,
+        ) -> Box<HudiFileSlice>;
 
         fn read_file_slice_by_base_file_path(
             self: &HudiFileGroupReader,
-            relative_path: &str,
-        ) -> Result<*mut ArrowArrayStream>;
+            relative_path: &CxxString,
+        ) -> *mut ArrowArrayStream;
+
+        fn read_file_slice(
+            self: &HudiFileGroupReader,
+            file_slice: &HudiFileSlice,
+        ) -> *mut ArrowArrayStream;
     }
-}
-
-pub fn read_file_slice() -> *mut ffi::ArrowArrayStream {
-    let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
-    let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-
-    let batches = hudi_table.read_snapshot_blocking(empty_filters()).unwrap();
-    let schema = batches[0].schema();
-
-    let batch_iterator = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-
-    // Convert to FFI_ArrowArrayStream and get raw pointer
-    let ffi_array_stream = FFI_ArrowArrayStream::new(Box::new(batch_iterator));
-    let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
-
-    raw_ptr as *mut ffi::ArrowArrayStream
 }
 
 pub struct HudiFileGroupReader {
@@ -74,35 +63,98 @@ pub struct HudiFileGroupReader {
 }
 
 pub fn new_file_group_reader_with_options(
-    base_uri: &str,
-    options: &cxx::Vector<cxx::CxxString>,
-) -> HudiResult<Box<HudiFileGroupReader>> {
+    base_uri: &CxxString,
+    options: &CxxVector<CxxString>,
+) -> Box<HudiFileGroupReader> {
+    let base_uri = base_uri
+        .to_str()
+        .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+
     let mut opt_vec = Vec::new();
     for opt in options.iter() {
-        let opt_str = opt.to_str()?;
+        let opt_str = opt
+            .to_str()
+            .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
         if let Some((key, value)) = opt_str.split_once('=') {
             opt_vec.push((key, value))
         }
     }
 
-    let reader = FileGroupReader::new_with_options(base_uri, opt_vec)?;
+    let reader = FileGroupReader::new_with_options(base_uri, opt_vec)
+        .expect("Failed to create FileGroupReader with options");
     let reader_wrapper = HudiFileGroupReader { inner: reader };
-    Ok(Box::new(reader_wrapper))
+    Box::new(reader_wrapper)
 }
 
 impl HudiFileGroupReader {
     pub fn read_file_slice_by_base_file_path(
         &self,
-        relative_path: &str,
-    ) -> HudiResult<*mut ffi::ArrowArrayStream> {
+        relative_path: &CxxString,
+    ) -> *mut ffi::ArrowArrayStream {
+        let relative_path = relative_path
+            .to_str()
+            .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+
         let record_batch = self
             .inner
-            .read_file_slice_by_base_file_path_blocking(relative_path)?;
+            .read_file_slice_by_base_file_path_blocking(relative_path)
+            .expect("Failed to read file batch");
         let schema = record_batch.schema();
 
-        Ok(create_raw_pointer_for_record_batches(
-            vec![record_batch],
-            schema,
-        ))
+        create_raw_pointer_for_record_batches(vec![record_batch], schema)
     }
+
+    pub fn read_file_slice(&self, file_slice: &HudiFileSlice) -> *mut ffi::ArrowArrayStream {
+        let record_batch = self
+            .inner
+            .read_file_slice_blocking(&file_slice.inner)
+            .expect("Failed to read file slice");
+        let schema = record_batch.schema();
+
+        create_raw_pointer_for_record_batches(vec![record_batch], schema)
+    }
+}
+
+pub struct HudiFileSlice {
+    inner: FileSlice,
+}
+
+pub fn new_file_slice_from_file_names(
+    partition_path: &CxxString,
+    base_file_name: &CxxString,
+    log_file_names: &CxxVector<CxxString>,
+) -> Box<HudiFileSlice> {
+    let partition_path = partition_path
+        .to_str()
+        .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+    let base_file_name = base_file_name
+        .to_str()
+        .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+
+    let log_file_names = log_file_names
+        .iter()
+        .map(|name| {
+            name.to_str()
+                .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence")
+        })
+        .collect::<Vec<_>>();
+
+    let mut file_group = FileGroup::new_with_base_file_name(base_file_name, partition_path)
+        .expect("Failed to create FileGroup");
+    file_group
+        .add_log_files_from_names(&log_file_names)
+        .expect("Failed to add files to FileGroup");
+
+    let (_, file_slice) = file_group
+        .file_slices
+        .iter()
+        .next()
+        .expect("Failed to get file slice from FileGroup");
+
+    // todo: add api to create file slice from names to avoid cloning
+    let file_slice_wrapper = HudiFileSlice {
+        inner: file_slice.clone(),
+    };
+
+    Box::new(file_slice_wrapper)
 }

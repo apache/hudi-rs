@@ -22,7 +22,6 @@ fn main() {
     CFG.include_prefix = "hudi";
 
     cxx_build::bridge("src/lib.rs")
-        .file("src/file_group_reader.cpp")
         .include("include")
         .include("include/arrow/c")
         .flag_if_supported("-std=c++17")
@@ -30,9 +29,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/util.rs");
-    println!("cargo:rerun-if-changed=src/file_group_reader.cpp");
     println!("cargo:rerun-if-changed=include/arrow/c/abi.h");
-    println!("cargo:rerun-if-changed=include/file_group_reader.h");
 
     println!(
         "cargo:root={}",

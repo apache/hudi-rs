@@ -1,10 +1,28 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 #include <iostream>
 #include <string>
 #include <cstring>
-#include <iomanip>  // For std::setw
+#include <iomanip>
 #include "cxx.h"
-#include "src/lib.rs.h"  // Generated header from cxx
-#include "arrow/c/abi.h"  // Arrow C API header
+#include "src/lib.rs.h"
+#include "arrow/c/abi.h"
 
 
 // Function to print schema format info
@@ -118,7 +136,12 @@ int main() {
         std::cout << "Getting Hudi table schema and record batch information..." << std::endl;
 
         // Call Rust to get the ArrowArrayStream
-        ArrowArrayStream* stream_ptr = read_file_slice();
+        auto base_uri = "/base/path";
+        std::vector<std::string> opts{"foo=bar", "baz=qux"};
+        auto file_group_reader = new_file_group_reader_with_options(base_uri, opts);
+
+        auto base_file_path = "relative/path";
+        ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_by_base_file_path(base_file_path);
 
         if (!stream_ptr) {
             std::cerr << "Error: Received null stream pointer" << std::endl;
