@@ -16,25 +16,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::ffi;
+use arrow::datatypes::SchemaRef;
+use arrow_array::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::{RecordBatch, RecordBatchIterator};
 
-use cxx_build::CFG;
-fn main() {
-    CFG.include_prefix = "hudi";
-
-    cxx_build::bridge("src/lib.rs")
-        .include("include")
-        .include("include/arrow/c")
-        .flag_if_supported("-std=c++17")
-        .compile("hudi");
-
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/util.rs");
-    println!("cargo:rerun-if-changed=src/file_group_reader.cpp");
-    println!("cargo:rerun-if-changed=include/arrow/c/abi.h");
-    println!("cargo:rerun-if-changed=include/file_group_reader.h");
-
-    println!(
-        "cargo:root={}",
-        std::env::var("CARGO_MANIFEST_DIR").unwrap()
-    );
+pub fn create_raw_pointer_for_record_batches(
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+) -> *mut ffi::ArrowArrayStream {
+    let batches = batches.into_iter().map(Ok);
+    let batch_iterator = RecordBatchIterator::new(batches, schema);
+    let ffi_array_stream = FFI_ArrowArrayStream::new(Box::new(batch_iterator));
+    let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
+    raw_ptr as *mut ffi::ArrowArrayStream
 }
