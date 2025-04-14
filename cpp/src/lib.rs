@@ -16,13 +16,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+mod util;
 
+use crate::util::create_raw_pointer_for_record_batches;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::RecordBatchIterator;
 use hudi::config::util::empty_filters;
+use hudi::error::Result as HudiResult;
+use hudi::file_group::reader::FileGroupReader;
 use hudi::table::Table;
 use hudi_test::QuickstartTripsTable;
 
+#[allow(clippy::result_large_err)]
 #[cxx::bridge]
 mod ffi {
     unsafe extern "C++" {
@@ -33,6 +38,16 @@ mod ffi {
 
     extern "Rust" {
         fn read_file_slice() -> *mut ArrowArrayStream;
+        type HudiFileGroupReader;
+
+        fn new_file_group_reader_with_options(
+            base_uri: &str,
+            options: &CxxVector<CxxString>,
+        ) -> Result<Box<HudiFileGroupReader>>;
+        fn read_file_slice_by_base_file_path(
+            self: &HudiFileGroupReader,
+            relative_path: &str,
+        ) -> Result<*mut ArrowArrayStream>;
     }
 }
 
@@ -50,4 +65,42 @@ pub fn read_file_slice() -> *mut ffi::ArrowArrayStream {
     let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
 
     raw_ptr as *mut ffi::ArrowArrayStream
+}
+
+pub struct HudiFileGroupReader {
+    inner: FileGroupReader,
+}
+
+pub fn new_file_group_reader_with_options(
+    base_uri: &str,
+    options: &cxx::Vector<cxx::CxxString>,
+) -> HudiResult<Box<HudiFileGroupReader>> {
+    let mut opt_vec = Vec::new();
+    for opt in options.iter() {
+        let opt_str = opt.to_str()?;
+        if let Some((key, value)) = opt_str.split_once('=') {
+            opt_vec.push((key, value))
+        }
+    }
+
+    let reader = FileGroupReader::new_with_options(base_uri, opt_vec)?;
+    let reader_wrapper = HudiFileGroupReader { inner: reader };
+    Ok(Box::new(reader_wrapper))
+}
+
+impl HudiFileGroupReader {
+    pub fn read_file_slice_by_base_file_path(
+        &self,
+        relative_path: &str,
+    ) -> HudiResult<*mut ffi::ArrowArrayStream> {
+        let record_batch = self
+            .inner
+            .read_file_slice_by_base_file_path_blocking(relative_path)?;
+        let schema = record_batch.schema();
+
+        Ok(create_raw_pointer_for_record_batches(
+            vec![record_batch],
+            schema,
+        ))
+    }
 }

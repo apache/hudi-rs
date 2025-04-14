@@ -17,24 +17,29 @@
  * under the License.
  */
 
-use cxx_build::CFG;
-fn main() {
-    CFG.include_prefix = "hudi";
+#pragma once
 
-    cxx_build::bridge("src/lib.rs")
-        .include("include")
-        .include("include/arrow/c")
-        .flag_if_supported("-std=c++17")
-        .compile("hudi");
+#include <memory>
+#include <string>
+#include <vector>
+#include "arrow/c/abi.h"
 
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/util.rs");
-    println!("cargo:rerun-if-changed=src/file_group_reader.cpp");
-    println!("cargo:rerun-if-changed=include/arrow/c/abi.h");
-    println!("cargo:rerun-if-changed=include/file_group_reader.h");
+// Forward declaration - actual definition will come from cxx bridge
+class HudiFileGroupReader;
 
-    println!(
-        "cargo:root={}",
-        std::env::var("CARGO_MANIFEST_DIR").unwrap()
-    );
-}
+namespace hudi {
+
+// C++ interface for HudiFileGroupReader
+class FileGroupReader {
+public:
+    FileGroupReader(const std::string& base_uri,
+                    const std::vector<std::string>& options = {});
+    ~FileGroupReader();
+
+    struct ArrowArrayStream* readFileSliceByBaseFilePath(const std::string& relative_path);
+
+private:
+    std::unique_ptr<HudiFileGroupReader> reader_;
+};
+
+} // namespace hudi
