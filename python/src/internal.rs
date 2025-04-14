@@ -85,19 +85,16 @@ impl HudiFileGroupReader {
             .to_pyarrow(py)
     }
     fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<PyObject> {
-        let mut file_group = FileGroup::new(
-            file_slice.file_id.clone(),
-            file_slice.partition_path.clone(),
-        );
+        let mut file_group = FileGroup::new_with_base_file_name(
+            &file_slice.base_file_name,
+            &file_slice.partition_path,
+        )
+        .map_err(PythonError::from)?;
+        let log_file_names = &file_slice.log_file_names;
         file_group
-            .add_base_file_from_name(&file_slice.base_file_name)
+            .add_log_files_from_names(log_file_names)
             .map_err(PythonError::from)?;
-        for name in file_slice.log_file_names.iter() {
-            file_group
-                .add_log_file_from_name(name)
-                .map_err(PythonError::from)?;
-        }
-        let (_, inner_file_slice) = file_group
+        let (_, file_slice) = file_group
             .file_slices
             .iter()
             .next()
@@ -108,7 +105,7 @@ impl HudiFileGroupReader {
                 ))
             })
             .map_err(PythonError::from)?;
-        rt().block_on(self.inner.read_file_slice(inner_file_slice))
+        rt().block_on(self.inner.read_file_slice(file_slice))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }

@@ -181,6 +181,17 @@ impl FileGroup {
         Ok(self)
     }
 
+    pub fn add_log_files_from_names<I, S>(&mut self, log_file_names: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for file_name in log_file_names {
+            self.add_log_file_from_name(file_name.as_ref())?;
+        }
+        Ok(self)
+    }
+
     /// Retrieves a reference to the closest [FileSlice] that was created on or before the given
     /// `timestamp`.
     pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {
