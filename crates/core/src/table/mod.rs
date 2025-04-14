@@ -1445,7 +1445,7 @@ mod tests {
             for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
 
-                let filters = &[
+                let filters = vec![
                     ("byteField", ">=", "10"),
                     ("byteField", "<", "20"),
                     ("shortField", "!=", "100"),

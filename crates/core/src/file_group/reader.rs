@@ -168,6 +168,16 @@ impl FileGroupReader {
         }
     }
 
+    pub fn read_file_slice_by_base_file_path_blocking(
+        &self,
+        relative_path: &str,
+    ) -> Result<RecordBatch> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice_by_base_file_path(relative_path))
+    }
+
     fn create_instant_range_for_log_file_scan(&self) -> InstantRange {
         let timezone = self
             .hudi_configs
@@ -224,6 +234,13 @@ impl FileGroupReader {
             let merger = RecordMerger::new(self.hudi_configs.clone());
             merger.merge_record_batches(&schema, &all_record_batches)
         }
+    }
+
+    pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice(file_slice))
     }
 }
 
