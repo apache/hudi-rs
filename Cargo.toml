@@ -50,7 +50,7 @@ object_store = { version = "~0.11.2", features = ["aws", "azure", "gcp"] }
 parquet = { version = "~54.1.0", features = ["async", "object_store"] }
 
 # avro
-apache-avro = { version = "0.17.0" }
+apache-avro = { version = "0.18.0" }
 
 # datafusion
 datafusion = { version = "~45.0.0" }
