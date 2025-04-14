@@ -72,8 +72,15 @@ impl TryFrom<(&str, &str, &str)> for Filter {
     }
 }
 
-pub fn from_str_tuples(tuples: &[(&str, &str, &str)]) -> Result<Vec<Filter>> {
-    tuples.iter().map(|t| Filter::try_from(*t)).collect()
+pub fn from_str_tuples<I, S>(tuples: I) -> Result<Vec<Filter>>
+where
+    I: IntoIterator<Item = (S, S, S)>,
+    S: AsRef<str>,
+{
+    tuples
+        .into_iter()
+        .map(|t| Filter::try_from((t.0.as_ref(), t.1.as_ref(), t.2.as_ref())))
+        .collect()
 }
 
 pub struct FilterField {

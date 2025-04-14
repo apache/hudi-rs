@@ -47,18 +47,20 @@
 //! 3. read hudi table
 //! ```rust
 //! use url::Url;
+//! use hudi_core::config::util::empty_filters;
 //! use hudi_core::table::Table;
 //!
 //! pub async fn test() {
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let record_read = hudi_table.read_snapshot(&[]).await.unwrap();
+//!     let record_read = hudi_table.read_snapshot(empty_filters()).await.unwrap();
 //! }
 //! ```
 //! 4. get file slice
 //!    Users can obtain metadata to customize reading methods, read in batches, perform parallel reads, and more.
 //! ```rust
 //! use url::Url;
+//! use hudi_core::config::util::empty_filters;
 //! use hudi_core::table::Table;
 //! use hudi_core::storage::util::parse_uri;
 //! use hudi_core::storage::util::join_url_segments;
@@ -67,7 +69,7 @@
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
 //!     let file_slices = hudi_table
-//!             .get_file_slices_splits(2, &[])
+//!             .get_file_slices_splits(2, empty_filters())
 //!             .await.unwrap();
 //!     // define every parquet task reader how many slice
 //!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
@@ -124,6 +126,13 @@ impl Table {
         TableBuilder::from_base_uri(base_uri).build().await
     }
 
+    pub fn new_blocking(base_uri: &str) -> Result<Self> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { Table::new(base_uri).await })
+    }
+
     /// Create hudi table with options
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
@@ -135,6 +144,18 @@ impl Table {
             .with_options(options)
             .build()
             .await
+    }
+
+    pub fn new_with_options_blocking<I, K, V>(base_uri: &str, options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { Table::new_with_options(base_uri, options).await })
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -198,9 +219,23 @@ impl Table {
         self.timeline.get_latest_avro_schema().await
     }
 
+    pub fn get_avro_schema_blocking(&self) -> Result<String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_avro_schema().await })
+    }
+
     /// Get the latest [arrow_schema::Schema] of the table.
     pub async fn get_schema(&self) -> Result<Schema> {
         self.timeline.get_latest_schema().await
+    }
+
+    pub fn get_schema_blocking(&self) -> Result<Schema> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_schema().await })
     }
 
     /// Get the latest partition [arrow_schema::Schema] of the table.
@@ -223,6 +258,13 @@ impl Table {
         Ok(Schema::new(partition_fields))
     }
 
+    pub fn get_partition_schema_blocking(&self) -> Result<Schema> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_partition_schema().await })
+    }
+
     /// Get the [Timeline] of the table.
     pub fn get_timeline(&self) -> &Timeline {
         &self.timeline
@@ -233,11 +275,15 @@ impl Table {
     /// # Arguments
     ///     * `n` - The number of chunks to split the file slices into.
     ///     * `filters` - Partition filters to apply.
-    pub async fn get_file_slices_splits(
+    pub async fn get_file_slices_splits<I, S>(
         &self,
         n: usize,
-        filters: &[(&str, &str, &str)],
-    ) -> Result<Vec<Vec<FileSlice>>> {
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
         if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.get_file_slices_splits_internal(n, timestamp, &filters)
@@ -247,21 +293,59 @@ impl Table {
         }
     }
 
+    pub fn get_file_slices_splits_blocking<I, S>(
+        &self,
+        n: usize,
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_file_slices_splits(n, filters).await })
+    }
+
     /// Get all the [FileSlice]s in splits from the table at a given timestamp.
     ///
     /// # Arguments
     ///     * `n` - The number of chunks to split the file slices into.
     ///     * `timestamp` - The timestamp which file slices associated with.
     ///     * `filters` - Partition filters to apply.
-    pub async fn get_file_slices_splits_as_of(
+    pub async fn get_file_slices_splits_as_of<I, S>(
         &self,
         n: usize,
         timestamp: &str,
-        filters: &[(&str, &str, &str)],
-    ) -> Result<Vec<Vec<FileSlice>>> {
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
         let filters = from_str_tuples(filters)?;
         self.get_file_slices_splits_internal(n, timestamp, &filters)
             .await
+    }
+
+    pub fn get_file_slices_splits_as_of_blocking<I, S>(
+        &self,
+        n: usize,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.get_file_slices_splits_as_of(n, timestamp, filters)
+                    .await
+            })
     }
 
     async fn get_file_slices_splits_internal(
@@ -291,13 +375,28 @@ impl Table {
     ///
     /// # Notes
     ///     * This API is useful for implementing snapshot query.
-    pub async fn get_file_slices(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<FileSlice>> {
+    pub async fn get_file_slices<I, S>(&self, filters: I) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
         if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.get_file_slices_internal(timestamp, &filters).await
         } else {
             Ok(Vec::new())
         }
+    }
+
+    pub fn get_file_slices_blocking<I, S>(&self, filters: I) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_file_slices(filters).await })
     }
 
     /// Get all the [FileSlice]s in the table at a given timestamp.
@@ -308,13 +407,32 @@ impl Table {
     ///
     /// # Notes
     ///     * This API is useful for implementing time travel query.
-    pub async fn get_file_slices_as_of(
+    pub async fn get_file_slices_as_of<I, S>(
         &self,
         timestamp: &str,
-        filters: &[(&str, &str, &str)],
-    ) -> Result<Vec<FileSlice>> {
+        filters: I,
+    ) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
         let filters = from_str_tuples(filters)?;
         self.get_file_slices_internal(timestamp, &filters).await
+    }
+
+    pub fn get_file_slices_as_of_blocking<I, S>(
+        &self,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_file_slices_as_of(timestamp, filters).await })
     }
 
     async fn get_file_slices_internal(
@@ -358,6 +476,20 @@ impl Table {
         let start = start_timestamp.unwrap_or(EARLIEST_START_TIMESTAMP);
 
         self.get_file_slices_between_internal(start, end).await
+    }
+
+    pub fn get_file_slices_between_blocking(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<FileSlice>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.get_file_slices_between(start_timestamp, end_timestamp)
+                    .await
+            })
     }
 
     async fn get_file_slices_between_internal(
@@ -406,7 +538,11 @@ impl Table {
     ///
     /// # Arguments
     ///     * `filters` - Partition filters to apply.
-    pub async fn read_snapshot(&self, filters: &[(&str, &str, &str)]) -> Result<Vec<RecordBatch>> {
+    pub async fn read_snapshot<I, S>(&self, filters: I) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
         if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
             self.read_snapshot_internal(timestamp, &filters).await
@@ -415,18 +551,48 @@ impl Table {
         }
     }
 
+    pub fn read_snapshot_blocking<I, S>(&self, filters: I) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.read_snapshot(filters).await })
+    }
+
     /// Get all the records in the table at a given timestamp.
     ///
     /// # Arguments
     ///     * `timestamp` - The timestamp which records associated with.
     ///     * `filters` - Partition filters to apply.
-    pub async fn read_snapshot_as_of(
+    pub async fn read_snapshot_as_of<I, S>(
         &self,
         timestamp: &str,
-        filters: &[(&str, &str, &str)],
-    ) -> Result<Vec<RecordBatch>> {
+        filters: I,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
         let filters = from_str_tuples(filters)?;
         self.read_snapshot_internal(timestamp, &filters).await
+    }
+
+    pub fn read_snapshot_as_of_blocking<I, S>(
+        &self,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.read_snapshot_as_of(timestamp, filters).await })
     }
 
     async fn read_snapshot_internal(
@@ -503,7 +669,7 @@ mod tests {
         PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion, TimelineTimezone,
     };
-    use crate::config::util::empty_options;
+    use crate::config::util::{empty_filters, empty_options};
     use crate::config::HUDI_CONF_DIR;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
@@ -538,7 +704,7 @@ mod tests {
     ) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         let base_url = table.base_url();
-        for f in table.get_file_slices(filters).await? {
+        for f in table.get_file_slices(filters.to_vec()).await? {
             let relative_path = f.base_file_relative_path()?;
             let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
             file_paths.push(file_url.to_string());
@@ -858,7 +1024,10 @@ mod tests {
         let base_url = SampleTable::V6Empty.url_to_cow();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table.get_file_slices_splits(2, &[]).await.unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits(2, empty_filters())
+            .await
+            .unwrap();
         assert!(file_slices_splits.is_empty());
     }
 
@@ -867,7 +1036,10 @@ mod tests {
         let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table.get_file_slices_splits(2, &[]).await.unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits(2, empty_filters())
+            .await
+            .unwrap();
         assert_eq!(file_slices_splits.len(), 2);
         assert_eq!(file_slices_splits[0].len(), 2);
         assert_eq!(file_slices_splits[1].len(), 1);
@@ -881,7 +1053,7 @@ mod tests {
         // before replacecommit (insert overwrite table)
         let second_latest_timestamp = "20250121000656060";
         let file_slices_splits = hudi_table
-            .get_file_slices_splits_as_of(2, second_latest_timestamp, &[])
+            .get_file_slices_splits_as_of(2, second_latest_timestamp, empty_filters())
             .await
             .unwrap();
         assert_eq!(file_slices_splits.len(), 2);
@@ -915,7 +1087,7 @@ mod tests {
         // as of replacecommit (insert overwrite table)
         let latest_timestamp = "20250121000702475";
         let file_slices_splits = hudi_table
-            .get_file_slices_splits_as_of(2, latest_timestamp, &[])
+            .get_file_slices_splits_as_of(2, latest_timestamp, empty_filters())
             .await
             .unwrap();
         assert_eq!(file_slices_splits.len(), 1);
@@ -927,7 +1099,7 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices = hudi_table.get_file_slices(&[]).await.unwrap();
+        let file_slices = hudi_table.get_file_slices(empty_filters()).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -939,7 +1111,7 @@ mod tests {
         // as of the latest timestamp
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let file_slices = hudi_table
-            .get_file_slices_as_of("20240418173551906", &[])
+            .get_file_slices_as_of("20240418173551906", empty_filters())
             .await
             .unwrap();
         assert_eq!(
@@ -955,7 +1127,7 @@ mod tests {
             .await
             .unwrap();
         let file_slices = hudi_table
-            .get_file_slices_as_of("20240418173551905", &[])
+            .get_file_slices_as_of("20240418173551905", empty_filters())
             .await
             .unwrap();
         assert_eq!(
@@ -971,7 +1143,7 @@ mod tests {
             .await
             .unwrap();
         let file_slices = hudi_table
-            .get_file_slices_as_of("19700101000000", &[])
+            .get_file_slices_as_of("19700101000000", empty_filters())
             .await
             .unwrap();
         assert_eq!(
@@ -1129,6 +1301,7 @@ mod tests {
 
     mod test_snapshot_and_time_travel_queries {
         use super::super::*;
+        use crate::config::util::empty_filters;
         use arrow::compute::concat_batches;
         use hudi_test::{QuickstartTripsTable, SampleTable};
 
@@ -1136,7 +1309,7 @@ mod tests {
         async fn test_empty() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(&[]).await?;
+                let records = hudi_table.read_snapshot(empty_filters()).await?;
                 assert!(records.is_empty());
             }
             Ok(())
@@ -1150,7 +1323,7 @@ mod tests {
             let updated_rider = "rider-D";
 
             // verify updated record as of the latest commit
-            let records = hudi_table.read_snapshot(&[]).await?;
+            let records = hudi_table.read_snapshot(empty_filters()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -1172,7 +1345,9 @@ mod tests {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
+            let records = hudi_table
+                .read_snapshot_as_of(first_commit, empty_filters())
+                .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -1193,7 +1368,7 @@ mod tests {
         async fn test_non_partitioned() -> Result<()> {
             for base_url in SampleTable::V6Nonpartitioned.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(&[]).await?;
+                let records = hudi_table.read_snapshot(empty_filters()).await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -1226,7 +1401,9 @@ mod tests {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
-            let records = hudi_table.read_snapshot_as_of(latest_commit, &[]).await?;
+            let records = hudi_table
+                .read_snapshot_as_of(latest_commit, empty_filters())
+                .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -1247,7 +1424,7 @@ mod tests {
         async fn test_non_partitioned_rollback() -> Result<()> {
             let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor_parquet();
             let hudi_table = Table::new(base_url.path()).await?;
-            let records = hudi_table.read_snapshot(&[]).await?;
+            let records = hudi_table.read_snapshot(empty_filters()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -1294,7 +1471,9 @@ mod tests {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records = hudi_table.read_snapshot_as_of(first_commit, &[]).await?;
+                let records = hudi_table
+                    .read_snapshot_as_of(first_commit, empty_filters())
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -1311,7 +1490,7 @@ mod tests {
         async fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenHivestyleNoMetafields.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(&[]).await?;
+                let records = hudi_table.read_snapshot(empty_filters()).await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 

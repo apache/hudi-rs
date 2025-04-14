@@ -33,7 +33,6 @@ use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::timeline::instant::Instant;
 use hudi::timeline::Timeline;
-use hudi::util::StrTupleRef;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 
@@ -327,11 +326,12 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        let filters = filters.unwrap_or_default();
-
         py.allow_threads(|| {
             let file_slices = rt()
-                .block_on(self.inner.get_file_slices_splits(n, &filters.as_strs()))
+                .block_on(
+                    self.inner
+                        .get_file_slices_splits(n, filters.unwrap_or_default()),
+                )
                 .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
@@ -348,14 +348,13 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        let filters = filters.unwrap_or_default();
-
         py.allow_threads(|| {
             let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices_splits_as_of(n, timestamp, &filters.as_strs()),
-                )
+                .block_on(self.inner.get_file_slices_splits_as_of(
+                    n,
+                    timestamp,
+                    filters.unwrap_or_default(),
+                ))
                 .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
@@ -370,11 +369,9 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
-        let filters = filters.unwrap_or_default();
-
         py.allow_threads(|| {
             let file_slices = rt()
-                .block_on(self.inner.get_file_slices(&filters.as_strs()))
+                .block_on(self.inner.get_file_slices(filters.unwrap_or_default()))
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(HudiFileSlice::from).collect())
         })
@@ -387,13 +384,11 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
-        let filters = filters.unwrap_or_default();
-
         py.allow_threads(|| {
             let file_slices = rt()
                 .block_on(
                     self.inner
-                        .get_file_slices_as_of(timestamp, &filters.as_strs()),
+                        .get_file_slices_as_of(timestamp, filters.unwrap_or_default()),
                 )
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(HudiFileSlice::from).collect())
@@ -436,9 +431,7 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<PyObject> {
-        let filters = filters.unwrap_or_default();
-
-        rt().block_on(self.inner.read_snapshot(&filters.as_strs()))
+        rt().block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }
@@ -450,11 +443,9 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<PyObject> {
-        let filters = filters.unwrap_or_default();
-
         rt().block_on(
             self.inner
-                .read_snapshot_as_of(timestamp, &filters.as_strs()),
+                .read_snapshot_as_of(timestamp, filters.unwrap_or_default()),
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
