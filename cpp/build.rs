@@ -16,4 +16,23 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-pub mod arrow;
+
+use cxx_build::CFG;
+fn main() {
+    CFG.include_prefix = "hudi";
+
+    cxx_build::bridge("src/lib.rs")
+        .include("include")
+        .include("include/arrow/c")
+        .flag_if_supported("-std=c++17")
+        .compile("hudi");
+
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/util.rs");
+    println!("cargo:rerun-if-changed=include/arrow/c/abi.h");
+
+    println!(
+        "cargo:root={}",
+        std::env::var("CARGO_MANIFEST_DIR").unwrap()
+    );
+}

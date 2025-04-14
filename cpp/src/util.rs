@@ -16,4 +16,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-pub mod arrow;
+use crate::ffi;
+use arrow::datatypes::SchemaRef;
+use arrow_array::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::{RecordBatch, RecordBatchIterator};
+
+pub fn create_raw_pointer_for_record_batches(
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+) -> *mut ffi::ArrowArrayStream {
+    let batches = batches.into_iter().map(Ok);
+    let batch_iterator = RecordBatchIterator::new(batches, schema);
+    let ffi_array_stream = FFI_ArrowArrayStream::new(Box::new(batch_iterator));
+    let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
+    raw_ptr as *mut ffi::ArrowArrayStream
+}
