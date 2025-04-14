@@ -26,6 +26,7 @@ use hudi::error::Result as HudiResult;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::table::Table;
 use hudi_test::QuickstartTripsTable;
+use cxx::{CxxVector, CxxString};
 
 #[allow(clippy::result_large_err)]
 #[cxx::bridge]
@@ -44,6 +45,7 @@ mod ffi {
             base_uri: &str,
             options: &CxxVector<CxxString>,
         ) -> Result<Box<HudiFileGroupReader>>;
+
         fn read_file_slice_by_base_file_path(
             self: &HudiFileGroupReader,
             relative_path: &str,

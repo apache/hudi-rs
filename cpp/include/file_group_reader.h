@@ -23,19 +23,20 @@
 #include <string>
 #include <vector>
 #include "arrow/c/abi.h"
-
-// Forward declaration - actual definition will come from cxx bridge
-class HudiFileGroupReader;
+#include "hudi/src/lib.rs.h" // Generated from cxxbridge
+#include "rust/cxx.h" // For Rust C++ bridge
 
 namespace hudi {
 
-// C++ interface for HudiFileGroupReader
+// C++ wrapper class for Rust's FileGroupReader
 class FileGroupReader {
 public:
     FileGroupReader(const std::string& base_uri,
                     const std::vector<std::string>& options = {});
     ~FileGroupReader();
 
+    // Reads a file slice by its base file path
+    // Returns an ArrowArrayStream which must be released by the caller
     struct ArrowArrayStream* readFileSliceByBaseFilePath(const std::string& relative_path);
 
 private:
