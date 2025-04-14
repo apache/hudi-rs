@@ -22,6 +22,7 @@ fn main() {
     CFG.include_prefix = "hudi";
 
     cxx_build::bridge("src/lib.rs")
+        .file("src/file_group_reader.cpp")
         .include("include")
         .include("include/arrow/c")
         .flag_if_supported("-std=c++17")
