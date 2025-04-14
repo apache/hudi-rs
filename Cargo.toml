@@ -18,6 +18,7 @@
 [workspace]
 members = [
     "crates/*",
+    "cpp",
     "python",
 ]
 resolver = "2"
