@@ -16,13 +16,21 @@
 #  under the License.
 
 
-from hudi._internal import HudiFileGroupReader, HudiFileSlice, HudiTable
+from hudi._internal import (
+    HudiFileGroupReader,
+    HudiFileSlice,
+    HudiInstant,
+    HudiTable,
+    HudiTimeline,
+)
 from hudi._internal import __version__ as __version__
 from hudi.table.builder import HudiTableBuilder
 
 __all__ = [
     "HudiFileGroupReader",
     "HudiFileSlice",
+    "HudiInstant",
     "HudiTable",
     "HudiTableBuilder",
+    "HudiTimeline",
 ]

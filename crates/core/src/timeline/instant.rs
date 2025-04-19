@@ -18,6 +18,7 @@
  */
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
+use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::error::StorageError;
 use crate::Result;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
@@ -45,15 +46,17 @@ impl FromStr for Action {
     }
 }
 
-impl Action {
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for Action {
+    fn as_ref(&self) -> &str {
         match self {
             Action::Commit => "commit",
             Action::DeltaCommit => "deltacommit",
             Action::ReplaceCommit => "replacecommit",
         }
     }
+}
 
+impl Action {
     pub fn is_replacecommit(&self) -> bool {
         self == &Action::ReplaceCommit
     }
@@ -84,8 +87,8 @@ impl FromStr for State {
     }
 }
 
-impl State {
-    pub fn as_str(&self) -> &str {
+impl AsRef<str> for State {
+    fn as_ref(&self) -> &str {
         match self {
             State::Requested => "requested",
             State::Inflight => "inflight",
@@ -200,21 +203,21 @@ impl Instant {
 
     pub fn file_name(&self) -> String {
         match (&self.action, &self.state) {
-            (_, State::Completed) => format!("{}.{}", self.timestamp, self.action.as_str()),
+            (_, State::Completed) => format!("{}.{}", self.timestamp, self.action.as_ref()),
             (Action::Commit, State::Inflight) => {
-                format!("{}.{}", self.timestamp, self.state.as_str())
+                format!("{}.{}", self.timestamp, self.state.as_ref())
             }
             _ => format!(
                 "{}.{}.{}",
                 self.timestamp,
-                self.action.as_str(),
-                self.state.as_str()
+                self.action.as_ref(),
+                self.state.as_ref()
             ),
         }
     }
 
     pub fn relative_path(&self) -> Result<String> {
-        let mut commit_file_path = PathBuf::from(".hoodie");
+        let mut commit_file_path = PathBuf::from(HUDI_METADATA_DIR);
         commit_file_path.push(self.file_name());
         commit_file_path
             .to_str()
@@ -237,8 +240,8 @@ mod tests {
 
     #[test]
     fn test_action_methods() {
-        assert_eq!(Action::Commit.as_str(), "commit");
-        assert_eq!(Action::ReplaceCommit.as_str(), "replacecommit");
+        assert_eq!(Action::Commit.as_ref(), "commit");
+        assert_eq!(Action::ReplaceCommit.as_ref(), "replacecommit");
 
         assert!(!Action::Commit.is_replacecommit());
         assert!(Action::ReplaceCommit.is_replacecommit());
@@ -256,9 +259,9 @@ mod tests {
 
     #[test]
     fn test_state_methods() {
-        assert_eq!(State::Requested.as_str(), "requested");
-        assert_eq!(State::Inflight.as_str(), "inflight");
-        assert_eq!(State::Completed.as_str(), "");
+        assert_eq!(State::Requested.as_ref(), "requested");
+        assert_eq!(State::Inflight.as_ref(), "inflight");
+        assert_eq!(State::Completed.as_ref(), "");
     }
 
     #[test]
