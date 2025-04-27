@@ -18,6 +18,7 @@
  */
 
 use arrow::compute::concat_batches;
+use hudi::config::util::empty_filters;
 use hudi::error::Result;
 use hudi::table::builder::TableBuilder as HudiTableBuilder;
 
@@ -28,7 +29,7 @@ async fn main() -> Result<()> {
         "s3://hudi-demo/mor/parquet/v6_complexkeygen_hivestyle",
     ] {
         let hudi_table = HudiTableBuilder::from_base_uri(url).build().await?;
-        let batches = hudi_table.read_snapshot(&[]).await?;
+        let batches = hudi_table.read_snapshot(empty_filters()).await?;
 
         let batch = concat_batches(&batches[0].schema(), &batches)?;
         assert_eq!(

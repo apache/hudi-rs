@@ -168,6 +168,17 @@ impl FileGroupReader {
         }
     }
 
+    /// Same as [FileGroupReader::read_file_slice_by_base_file_path], but blocking.
+    pub fn read_file_slice_by_base_file_path_blocking(
+        &self,
+        relative_path: &str,
+    ) -> Result<RecordBatch> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice_by_base_file_path(relative_path))
+    }
+
     fn create_instant_range_for_log_file_scan(&self) -> InstantRange {
         let timezone = self
             .hudi_configs
@@ -225,6 +236,14 @@ impl FileGroupReader {
             merger.merge_record_batches(&schema, &all_record_batches)
         }
     }
+
+    /// Same as [FileGroupReader::read_file_slice], but blocking.
+    pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice(file_slice))
+    }
 }
 
 #[cfg(test)]
@@ -249,14 +268,12 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_read_file_slice_returns_error() {
+    #[test]
+    fn test_read_file_slice_returns_error() {
         let reader =
             FileGroupReader::new_with_options("file:///non-existent-path/table", empty_options())
                 .unwrap();
-        let result = reader
-            .read_file_slice_by_base_file_path("non_existent_file")
-            .await;
+        let result = reader.read_file_slice_by_base_file_path_blocking("non_existent_file");
         assert!(matches!(result.unwrap_err(), ReadFileSliceError(_)));
     }
 

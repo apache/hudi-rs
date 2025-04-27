@@ -87,13 +87,11 @@ impl FileGroup {
     }
 
     /// Create a new [FileGroup] with a [BaseFile]'s file name.
-    pub fn new_with_base_file_name(
-        id: String,
-        partition_path: String,
-        file_name: &str,
-    ) -> Result<Self> {
-        let mut file_group = Self::new(id, partition_path);
-        file_group.add_base_file_from_name(file_name)?;
+    pub fn new_with_base_file_name(file_name: &str, partition_path: &str) -> Result<Self> {
+        let base_file = BaseFile::from_str(file_name)?;
+        let file_id = base_file.file_id.clone();
+        let mut file_group = Self::new(file_id, partition_path.to_string());
+        file_group.add_base_file(base_file)?;
         Ok(file_group)
     }
 
@@ -154,6 +152,19 @@ impl FileGroup {
     pub fn add_log_file_from_name(&mut self, file_name: &str) -> Result<&Self> {
         let log_file = LogFile::from_str(file_name)?;
         self.add_log_file(log_file)
+    }
+
+    /// Add multiple [LogFile]s based on the file names to the corresponding [FileSlice]s in the
+    /// [FileGroup].
+    pub fn add_log_files_from_names<I, S>(&mut self, log_file_names: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for file_name in log_file_names {
+            self.add_log_file_from_name(file_name.as_ref())?;
+        }
+        Ok(self)
     }
 
     /// Add a [LogFile] to the corresponding [FileSlice] in the [FileGroup].

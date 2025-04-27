@@ -47,7 +47,6 @@ use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::Table as HudiTable;
-use hudi_core::util::StrTupleRef;
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -179,7 +178,7 @@ impl TableProvider for HudiDataSource {
         let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
-            .get_file_slices_splits(self.get_input_partitions(), &pushdown_filters.as_strs())
+            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
         let base_url = self.table.base_url();
