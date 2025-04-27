@@ -154,6 +154,19 @@ impl FileGroup {
         self.add_log_file(log_file)
     }
 
+    /// Add multiple [LogFile]s based on the file names to the corresponding [FileSlice]s in the
+    /// [FileGroup].
+    pub fn add_log_files_from_names<I, S>(&mut self, log_file_names: I) -> Result<&Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for file_name in log_file_names {
+            self.add_log_file_from_name(file_name.as_ref())?;
+        }
+        Ok(self)
+    }
+
     /// Add a [LogFile] to the corresponding [FileSlice] in the [FileGroup].
     ///
     /// TODO: support adding log files to file group without base files.
@@ -177,17 +190,6 @@ impl FileGroup {
     {
         for log_file in log_files {
             self.add_log_file(log_file)?;
-        }
-        Ok(self)
-    }
-
-    pub fn add_log_files_from_names<I, S>(&mut self, log_file_names: I) -> Result<&Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        for file_name in log_file_names {
-            self.add_log_file_from_name(file_name.as_ref())?;
         }
         Ok(self)
     }
