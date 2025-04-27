@@ -126,6 +126,7 @@ impl Table {
         TableBuilder::from_base_uri(base_uri).build().await
     }
 
+    /// Same as [Table::new], but blocking.
     pub fn new_blocking(base_uri: &str) -> Result<Self> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -146,6 +147,7 @@ impl Table {
             .await
     }
 
+    /// Same as [Table::new_with_options], but blocking.
     pub fn new_with_options_blocking<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -219,6 +221,7 @@ impl Table {
         self.timeline.get_latest_avro_schema().await
     }
 
+    /// Same as [Table::get_avro_schema], but blocking.
     pub fn get_avro_schema_blocking(&self) -> Result<String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -231,6 +234,7 @@ impl Table {
         self.timeline.get_latest_schema().await
     }
 
+    /// Same as [Table::get_schema], but blocking.
     pub fn get_schema_blocking(&self) -> Result<Schema> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -258,6 +262,7 @@ impl Table {
         Ok(Schema::new(partition_fields))
     }
 
+    /// Same as [Table::get_partition_schema], but blocking.
     pub fn get_partition_schema_blocking(&self) -> Result<Schema> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -293,6 +298,7 @@ impl Table {
         }
     }
 
+    /// Same as [Table::get_file_slices_splits], but blocking.
     pub fn get_file_slices_splits_blocking<I, S>(
         &self,
         n: usize,
@@ -329,6 +335,7 @@ impl Table {
             .await
     }
 
+    /// Same as [Table::get_file_slices_splits_as_of], but blocking.
     pub fn get_file_slices_splits_as_of_blocking<I, S>(
         &self,
         n: usize,
@@ -388,6 +395,7 @@ impl Table {
         }
     }
 
+    /// Same as [Table::get_file_slices], but blocking.
     pub fn get_file_slices_blocking<I, S>(&self, filters: I) -> Result<Vec<FileSlice>>
     where
         I: IntoIterator<Item = (S, S, S)>,
@@ -420,6 +428,7 @@ impl Table {
         self.get_file_slices_internal(timestamp, &filters).await
     }
 
+    /// Same as [Table::get_file_slices_as_of], but blocking.
     pub fn get_file_slices_as_of_blocking<I, S>(
         &self,
         timestamp: &str,
@@ -478,6 +487,7 @@ impl Table {
         self.get_file_slices_between_internal(start, end).await
     }
 
+    /// Same as [Table::get_file_slices_between], but blocking.
     pub fn get_file_slices_between_blocking(
         &self,
         start_timestamp: Option<&str>,
@@ -551,6 +561,7 @@ impl Table {
         }
     }
 
+    /// Same as [Table::read_snapshot], but blocking.
     pub fn read_snapshot_blocking<I, S>(&self, filters: I) -> Result<Vec<RecordBatch>>
     where
         I: IntoIterator<Item = (S, S, S)>,
@@ -580,6 +591,7 @@ impl Table {
         self.read_snapshot_internal(timestamp, &filters).await
     }
 
+    /// Same as [Table::read_snapshot_as_of], but blocking.
     pub fn read_snapshot_as_of_blocking<I, S>(
         &self,
         timestamp: &str,
@@ -646,6 +658,21 @@ impl Table {
         Ok(batches)
     }
 
+    /// Same as [Table::read_incremental_records], but blocking.
+    pub fn read_incremental_records_blocking(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.read_incremental_records(start_timestamp, end_timestamp)
+                    .await
+            })
+    }
+
     /// Get the change-data-capture (CDC) records between the given timestamps.
     ///
     /// The CDC records should reflect the records that were inserted, updated, and deleted
@@ -684,27 +711,26 @@ mod tests {
     /// # Arguments
     ///
     /// * `table_dir_name` - Name of the table root directory; all under `crates/core/tests/data/`.
-    async fn get_test_table_without_validation(table_dir_name: &str) -> Table {
+    fn get_test_table_without_validation(table_dir_name: &str) -> Table {
         let base_url = Url::from_file_path(
             canonicalize(PathBuf::from("tests").join("data").join(table_dir_name)).unwrap(),
         )
         .unwrap();
-        Table::new_with_options(
+        Table::new_with_options_blocking(
             base_url.as_str(),
             [("hoodie.internal.skip.config.validation", "true")],
         )
-        .await
         .unwrap()
     }
 
     /// Test helper to get relative file paths from the table with filters.
-    async fn get_file_paths_with_filters(
+    fn get_file_paths_with_filters(
         table: &Table,
         filters: &[(&str, &str, &str)],
     ) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         let base_url = table.base_url();
-        for f in table.get_file_slices(filters.to_vec()).await? {
+        for f in table.get_file_slices_blocking(filters.to_vec())? {
             let relative_path = f.base_file_relative_path()?;
             let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
             file_paths.push(file_url.to_string());
@@ -712,10 +738,10 @@ mod tests {
         Ok(file_paths)
     }
 
-    #[tokio::test]
-    async fn test_hudi_table_get_hudi_options() {
+    #[test]
+    fn test_hudi_table_get_hudi_options() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let hudi_options = hudi_table.hudi_options();
         for (k, v) in hudi_options.iter() {
             assert!(k.starts_with("hoodie."));
@@ -723,10 +749,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_hudi_table_get_storage_options() {
+    #[test]
+    fn test_hudi_table_get_storage_options() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
 
         let cloud_prefixes: HashSet<_> = Storage::CLOUD_STORAGE_PREFIXES
             .iter()
@@ -750,13 +776,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_schema() {
+    #[test]
+    fn hudi_table_get_schema() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let fields: Vec<String> = hudi_table
-            .get_schema()
-            .await
+            .get_schema_blocking()
             .unwrap()
             .flattened_fields()
             .into_iter()
@@ -803,13 +828,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_partition_schema() {
+    #[test]
+    fn hudi_table_get_partition_schema() {
         let base_url = SampleTable::V6TimebasedkeygenNonhivestyle.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let fields: Vec<String> = hudi_table
-            .get_partition_schema()
-            .await
+            .get_partition_schema_blocking()
             .unwrap()
             .flattened_fields()
             .into_iter()
@@ -818,9 +842,9 @@ mod tests {
         assert_eq!(fields, vec!["ts_str"]);
     }
 
-    #[tokio::test]
-    async fn validate_invalid_table_props() {
-        let table = get_test_table_without_validation("table_props_invalid").await;
+    #[test]
+    fn validate_invalid_table_props() {
+        let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
         assert!(
             configs.validate(BaseFileFormat).is_err(),
@@ -870,9 +894,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn get_invalid_table_props() {
-        let table = get_test_table_without_validation("table_props_invalid").await;
+    #[test]
+    fn get_invalid_table_props() {
+        let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
         assert!(configs.get(BaseFileFormat).is_err());
         assert!(configs.get(Checksum).is_err());
@@ -892,9 +916,9 @@ mod tests {
         assert!(configs.get(TimelineTimezone).is_err());
     }
 
-    #[tokio::test]
-    async fn get_default_for_invalid_table_props() {
-        let table = get_test_table_without_validation("table_props_invalid").await;
+    #[test]
+    fn get_default_for_invalid_table_props() {
+        let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
         assert_eq!(
             configs.get_or_default(BaseFileFormat).to::<String>(),
@@ -929,9 +953,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn get_valid_table_props() {
-        let table = get_test_table_without_validation("table_props_valid").await;
+    #[test]
+    fn get_valid_table_props() {
+        let table = get_test_table_without_validation("table_props_valid");
         let configs = table.hudi_configs;
         assert_eq!(
             configs.get(BaseFileFormat).unwrap().to::<String>(),
@@ -969,10 +993,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn get_global_table_props() {
+    #[test]
+    fn get_global_table_props() {
         // Without the environment variable HUDI_CONF_DIR
-        let table = get_test_table_without_validation("table_props_partial").await;
+        let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
@@ -982,7 +1006,7 @@ mod tests {
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("random/wrong/dir");
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
-        let table = get_test_table_without_validation("table_props_partial").await;
+        let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
@@ -992,7 +1016,7 @@ mod tests {
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
-        let table = get_test_table_without_validation("table_props_partial").await;
+        let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "tmpdb");
         assert_eq!(
@@ -1003,58 +1027,54 @@ mod tests {
         env::remove_var(HUDI_CONF_DIR)
     }
 
-    #[tokio::test]
-    async fn hudi_table_read_file_slice() {
+    #[test]
+    fn hudi_table_read_file_slice() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let batches = hudi_table
             .create_file_group_reader_with_options(empty_options())
             .unwrap()
-            .read_file_slice_by_base_file_path(
+            .read_file_slice_by_base_file_path_blocking(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
             )
-            .await
             .unwrap();
         assert_eq!(batches.num_rows(), 4);
         assert_eq!(batches.num_columns(), 21);
     }
 
-    #[tokio::test]
-    async fn empty_hudi_table_get_file_slices_splits() {
+    #[test]
+    fn empty_hudi_table_get_file_slices_splits() {
         let base_url = SampleTable::V6Empty.url_to_cow();
 
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let file_slices_splits = hudi_table
-            .get_file_slices_splits(2, empty_filters())
-            .await
+            .get_file_slices_splits_blocking(2, empty_filters())
             .unwrap();
         assert!(file_slices_splits.is_empty());
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits() {
+    #[test]
+    fn hudi_table_get_file_slices_splits() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
 
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let file_slices_splits = hudi_table
-            .get_file_slices_splits(2, empty_filters())
-            .await
+            .get_file_slices_splits_blocking(2, empty_filters())
             .unwrap();
         assert_eq!(file_slices_splits.len(), 2);
         assert_eq!(file_slices_splits[0].len(), 2);
         assert_eq!(file_slices_splits[1].len(), 1);
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits_as_of_timestamps() {
+    #[test]
+    fn hudi_table_get_file_slices_splits_as_of_timestamps() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
 
         // before replacecommit (insert overwrite table)
         let second_latest_timestamp = "20250121000656060";
         let file_slices_splits = hudi_table
-            .get_file_slices_splits_as_of(2, second_latest_timestamp, empty_filters())
-            .await
+            .get_file_slices_splits_as_of_blocking(2, second_latest_timestamp, empty_filters())
             .unwrap();
         assert_eq!(file_slices_splits.len(), 2);
         assert_eq!(file_slices_splits[0].len(), 2);
@@ -1087,19 +1107,20 @@ mod tests {
         // as of replacecommit (insert overwrite table)
         let latest_timestamp = "20250121000702475";
         let file_slices_splits = hudi_table
-            .get_file_slices_splits_as_of(2, latest_timestamp, empty_filters())
-            .await
+            .get_file_slices_splits_as_of_blocking(2, latest_timestamp, empty_filters())
             .unwrap();
         assert_eq!(file_slices_splits.len(), 1);
         assert_eq!(file_slices_splits[0].len(), 1);
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_as_of_timestamps() {
+    #[test]
+    fn hudi_table_get_file_slices_as_of_timestamps() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
 
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices = hudi_table.get_file_slices(empty_filters()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let file_slices = hudi_table
+            .get_file_slices_blocking(empty_filters())
+            .unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -1109,10 +1130,9 @@ mod tests {
         );
 
         // as of the latest timestamp
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let file_slices = hudi_table
-            .get_file_slices_as_of("20240418173551906", empty_filters())
-            .await
+            .get_file_slices_as_of_blocking("20240418173551906", empty_filters())
             .unwrap();
         assert_eq!(
             file_slices
@@ -1123,12 +1143,10 @@ mod tests {
         );
 
         // as of just smaller than the latest timestamp
-        let hudi_table = Table::new_with_options(base_url.path(), empty_options())
-            .await
-            .unwrap();
+        let hudi_table =
+            Table::new_with_options_blocking(base_url.path(), empty_options()).unwrap();
         let file_slices = hudi_table
-            .get_file_slices_as_of("20240418173551905", empty_filters())
-            .await
+            .get_file_slices_as_of_blocking("20240418173551905", empty_filters())
             .unwrap();
         assert_eq!(
             file_slices
@@ -1139,12 +1157,10 @@ mod tests {
         );
 
         // as of non-exist old timestamp
-        let hudi_table = Table::new_with_options(base_url.path(), empty_options())
-            .await
-            .unwrap();
+        let hudi_table =
+            Table::new_with_options_blocking(base_url.path(), empty_options()).unwrap();
         let file_slices = hudi_table
-            .get_file_slices_as_of("19700101000000", empty_filters())
-            .await
+            .get_file_slices_as_of_blocking("19700101000000", empty_filters())
             .unwrap();
         assert_eq!(
             file_slices
@@ -1155,24 +1171,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn empty_hudi_table_get_file_slices_between_timestamps() {
+    #[test]
+    fn empty_hudi_table_get_file_slices_between_timestamps() {
         let base_url = SampleTable::V6Empty.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let file_slices = hudi_table
-            .get_file_slices_between(Some(EARLIEST_START_TIMESTAMP), None)
-            .await
+            .get_file_slices_between_blocking(Some(EARLIEST_START_TIMESTAMP), None)
             .unwrap();
         assert!(file_slices.is_empty())
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_between_timestamps() {
+    #[test]
+    fn hudi_table_get_file_slices_between_timestamps() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         let mut file_slices = hudi_table
-            .get_file_slices_between(None, Some("20250121000656060"))
-            .await
+            .get_file_slices_between_blocking(None, Some("20250121000656060"))
             .unwrap();
         assert_eq!(file_slices.len(), 3);
 
@@ -1203,15 +1217,14 @@ mod tests {
         assert!(file_slice_2.log_files.is_empty());
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_file_paths_for_simple_keygen_non_hive_style() {
+    #[test]
+    fn hudi_table_get_file_paths_for_simple_keygen_non_hive_style() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         assert_eq!(hudi_table.timeline.completed_commits.len(), 2);
 
         let partition_filters = &[];
         let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
-            .await
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1227,7 +1240,6 @@ mod tests {
 
         let filters = [("byteField", ">=", "10"), ("byteField", "<", "30")];
         let actual = get_file_paths_with_filters(&hudi_table, &filters)
-            .await
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1241,7 +1253,6 @@ mod tests {
         assert_eq!(actual, expected);
 
         let actual = get_file_paths_with_filters(&hudi_table, &[("byteField", ">", "30")])
-            .await
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1249,15 +1260,14 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[tokio::test]
-    async fn hudi_table_get_file_paths_for_complex_keygen_hive_style() {
+    #[test]
+    fn hudi_table_get_file_paths_for_complex_keygen_hive_style() {
         let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
         assert_eq!(hudi_table.timeline.completed_commits.len(), 2);
 
         let partition_filters = &[];
         let actual = get_file_paths_with_filters(&hudi_table, partition_filters)
-            .await
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1277,7 +1287,6 @@ mod tests {
             ("shortField", "!=", "100"),
         ];
         let actual = get_file_paths_with_filters(&hudi_table, &filters)
-            .await
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1291,7 +1300,6 @@ mod tests {
 
         let filters = [("byteField", ">=", "20"), ("shortField", "=", "300")];
         let actual = get_file_paths_with_filters(&hudi_table, &filters)
-            .await
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>();
@@ -1305,25 +1313,25 @@ mod tests {
         use arrow::compute::concat_batches;
         use hudi_test::{QuickstartTripsTable, SampleTable};
 
-        #[tokio::test]
-        async fn test_empty() -> Result<()> {
+        #[test]
+        fn test_empty() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(empty_filters()).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
+                let records = hudi_table.read_snapshot_blocking(empty_filters())?;
                 assert!(records.is_empty());
             }
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_quickstart_trips_table() -> Result<()> {
+        #[test]
+        fn test_quickstart_trips_table() -> Result<()> {
             let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
-            let hudi_table = Table::new(base_url.path()).await?;
+            let hudi_table = Table::new_blocking(base_url.path())?;
 
             let updated_rider = "rider-D";
 
             // verify updated record as of the latest commit
-            let records = hudi_table.read_snapshot(empty_filters()).await?;
+            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -1345,9 +1353,7 @@ mod tests {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table
-                .read_snapshot_as_of(first_commit, empty_filters())
-                .await?;
+            let records = hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -1364,11 +1370,11 @@ mod tests {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_non_partitioned() -> Result<()> {
+        #[test]
+        fn test_non_partitioned() -> Result<()> {
             for base_url in SampleTable::V6Nonpartitioned.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(empty_filters()).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
+                let records = hudi_table.read_snapshot_blocking(empty_filters())?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -1386,14 +1392,13 @@ mod tests {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_non_partitioned_read_optimized() -> Result<()> {
+        #[test]
+        fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
-            let hudi_table = Table::new_with_options(
+            let hudi_table = Table::new_with_options_blocking(
                 base_url.path(),
                 [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-            )
-            .await?;
+            )?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -1401,9 +1406,8 @@ mod tests {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
-            let records = hudi_table
-                .read_snapshot_as_of(latest_commit, empty_filters())
-                .await?;
+            let records =
+                hudi_table.read_snapshot_as_of_blocking(latest_commit, empty_filters())?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -1420,11 +1424,11 @@ mod tests {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_non_partitioned_rollback() -> Result<()> {
+        #[test]
+        fn test_non_partitioned_rollback() -> Result<()> {
             let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor_parquet();
-            let hudi_table = Table::new(base_url.path()).await?;
-            let records = hudi_table.read_snapshot(empty_filters()).await?;
+            let hudi_table = Table::new_blocking(base_url.path())?;
+            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -1440,17 +1444,17 @@ mod tests {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
+        #[test]
+        fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
             for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
 
                 let filters = vec![
                     ("byteField", ">=", "10"),
                     ("byteField", "<", "20"),
                     ("shortField", "!=", "100"),
                 ];
-                let records = hudi_table.read_snapshot(filters).await?;
+                let records = hudi_table.read_snapshot_blocking(filters)?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -1460,10 +1464,10 @@ mod tests {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
+        #[test]
+        fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenNonhivestyle.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
                 let commit_timestamps = hudi_table
                     .timeline
                     .completed_commits
@@ -1471,9 +1475,8 @@ mod tests {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records = hudi_table
-                    .read_snapshot_as_of(first_commit, empty_filters())
-                    .await?;
+                let records =
+                    hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -1486,11 +1489,11 @@ mod tests {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
+        #[test]
+        fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenHivestyleNoMetafields.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(empty_filters()).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
+                let records = hudi_table.read_snapshot_blocking(empty_filters())?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -1514,20 +1517,20 @@ mod tests {
         use arrow_select::concat::concat_batches;
         use hudi_test::SampleTable;
 
-        #[tokio::test]
-        async fn test_empty() -> Result<()> {
+        #[test]
+        fn test_empty() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_incremental_records("0", None).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
+                let records = hudi_table.read_incremental_records_blocking("0", None)?;
                 assert!(records.is_empty())
             }
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
+        #[test]
+        fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenNonhivestyleOverwritetable.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
+                let hudi_table = Table::new_blocking(base_url.path())?;
                 let commit_timestamps = hudi_table
                     .timeline
                     .completed_commits
@@ -1541,8 +1544,7 @@ mod tests {
 
                 // read records changed from the beginning to the 1st commit
                 let records = hudi_table
-                    .read_incremental_records("19700101000000", Some(first_commit))
-                    .await?;
+                    .read_incremental_records_blocking("19700101000000", Some(first_commit))?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -1554,8 +1556,7 @@ mod tests {
 
                 // read records changed from the 1st to the 2nd commit
                 let records = hudi_table
-                    .read_incremental_records(first_commit, Some(second_commit))
-                    .await?;
+                    .read_incremental_records_blocking(first_commit, Some(second_commit))?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -1567,8 +1568,7 @@ mod tests {
 
                 // read records changed from the 2nd to the 3rd commit
                 let records = hudi_table
-                    .read_incremental_records(second_commit, Some(third_commit))
-                    .await?;
+                    .read_incremental_records_blocking(second_commit, Some(third_commit))?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -1579,9 +1579,7 @@ mod tests {
                 );
 
                 // read records changed from the 1st commit
-                let records = hudi_table
-                    .read_incremental_records(first_commit, None)
-                    .await?;
+                let records = hudi_table.read_incremental_records_blocking(first_commit, None)?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -1592,9 +1590,7 @@ mod tests {
                 );
 
                 // read records changed from the 3rd commit
-                let records = hudi_table
-                    .read_incremental_records(third_commit, None)
-                    .await?;
+                let records = hudi_table.read_incremental_records_blocking(third_commit, None)?;
                 assert!(
                     records.is_empty(),
                     "Should return 0 record as it's the latest commit"
