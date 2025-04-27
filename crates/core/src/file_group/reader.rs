@@ -168,6 +168,7 @@ impl FileGroupReader {
         }
     }
 
+    /// Same as `read_file_slice_by_base_file_path`, but blocking.
     pub fn read_file_slice_by_base_file_path_blocking(
         &self,
         relative_path: &str,
@@ -236,6 +237,7 @@ impl FileGroupReader {
         }
     }
 
+    /// Same as `read_file_slice`, but blocking.
     pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -266,14 +268,13 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_read_file_slice_returns_error() {
+    #[test]
+    fn test_read_file_slice_returns_error() {
         let reader =
             FileGroupReader::new_with_options("file:///non-existent-path/table", empty_options())
                 .unwrap();
         let result = reader
-            .read_file_slice_by_base_file_path("non_existent_file")
-            .await;
+            .read_file_slice_by_base_file_path_blocking("non_existent_file");
         assert!(matches!(result.unwrap_err(), ReadFileSliceError(_)));
     }
 
