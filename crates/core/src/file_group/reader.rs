@@ -273,8 +273,7 @@ mod tests {
         let reader =
             FileGroupReader::new_with_options("file:///non-existent-path/table", empty_options())
                 .unwrap();
-        let result = reader
-            .read_file_slice_by_base_file_path_blocking("non_existent_file");
+        let result = reader.read_file_slice_by_base_file_path_blocking("non_existent_file");
         assert!(matches!(result.unwrap_err(), ReadFileSliceError(_)));
     }
 
