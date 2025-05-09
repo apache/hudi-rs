@@ -15,7 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-venv/
-Cargo.lock
-**/target/
-**/build/
+[package]
+name = "hudi-cpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+readme.workspace = true
+description = "Native C++ binding for Apache Hudi, based on Hudi-rs."
+homepage.workspace = true
+repository = "https://github.com/apache/hudi-rs/tree/main/cpp/"
+
+[lib]
+name = "hudi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hudi = { path = "../crates/hudi", version = "0.4.0" }
+hudi-test = { path = "../crates/test", version = "0.4.0" }
+cxx = { version = "1.0" }
+arrow = { workspace = true , features = ["ffi"]}
+arrow-array = { workspace = true , features = ["ffi"]}
+
+[build-dependencies]
+cxx-build = { version = "1.0" }
