@@ -29,6 +29,11 @@ pub fn empty_options<'a>() -> std::iter::Empty<(&'a str, &'a str)> {
     std::iter::empty::<(&str, &str)>()
 }
 
+/// Returns an empty iterator to represent an empty set of filters.
+pub fn empty_filters<'a>() -> std::iter::Empty<(&'a str, &'a str, &'a str)> {
+    std::iter::empty::<(&str, &str, &str)>()
+}
+
 /// Splits the given options into two maps: one for Hudi options, and the other for others, which could be storage options for example.
 pub fn split_hudi_options_from_others<I, K, V>(
     all_options: I,
