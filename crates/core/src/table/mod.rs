@@ -92,6 +92,7 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
+use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
@@ -101,10 +102,9 @@ use crate::file_group::reader::FileGroupReader;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
+use crate::timeline::util::format_timestamp;
 use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
 use crate::Result;
-
-use crate::config::read::HudiReadConfig;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -330,8 +330,9 @@ impl Table {
         I: IntoIterator<Item = (S, S, S)>,
         S: AsRef<str>,
     {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
-        self.get_file_slices_splits_internal(n, timestamp, &filters)
+        self.get_file_slices_splits_internal(n, &timestamp, &filters)
             .await
     }
 
@@ -424,8 +425,9 @@ impl Table {
         I: IntoIterator<Item = (S, S, S)>,
         S: AsRef<str>,
     {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
-        self.get_file_slices_internal(timestamp, &filters).await
+        self.get_file_slices_internal(&timestamp, &filters).await
     }
 
     /// Same as [Table::get_file_slices_as_of], but blocking.
@@ -587,8 +589,9 @@ impl Table {
         I: IntoIterator<Item = (S, S, S)>,
         S: AsRef<str>,
     {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
-        self.read_snapshot_internal(timestamp, &filters).await
+        self.read_snapshot_internal(&timestamp, &filters).await
     }
 
     /// Same as [Table::read_snapshot_as_of], but blocking.
@@ -643,8 +646,12 @@ impl Table {
             return Ok(Vec::new());
         };
 
+        let timezone = self.timezone();
+        let start_timestamp = format_timestamp(start_timestamp, &timezone)?;
+        let end_timestamp = format_timestamp(end_timestamp, &timezone)?;
+
         let file_slices = self
-            .get_file_slices_between_internal(start_timestamp, end_timestamp)
+            .get_file_slices_between_internal(&start_timestamp, &end_timestamp)
             .await?;
 
         let fg_reader = self.create_file_group_reader_with_options([

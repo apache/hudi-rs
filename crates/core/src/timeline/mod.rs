@@ -18,6 +18,7 @@
  */
 pub mod instant;
 pub(crate) mod selector;
+pub(crate) mod util;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
