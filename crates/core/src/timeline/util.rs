@@ -36,7 +36,7 @@ use std::str::FromStr;
 pub fn format_timestamp(ts_str: &str, timezone: &str) -> Result<String> {
     let ts_str = ts_str.trim();
 
-    if let Ok(formatted_ts) = parse_hudi_timeline_format(ts_str) {
+    if let Ok(formatted_ts) = parse_timeline_format(ts_str) {
         return Ok(formatted_ts);
     }
 
@@ -60,11 +60,9 @@ pub fn format_timestamp(ts_str: &str, timezone: &str) -> Result<String> {
     )))
 }
 
-/// Parse existing Hudi timeline format and ensure it's properly formatted
-fn parse_hudi_timeline_format(ts_str: &str) -> Result<String> {
-    if ts_str.len() == 14 && ts_str.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(format!("{}000", ts_str));
-    } else if ts_str.len() == 17 && ts_str.chars().all(|c| c.is_ascii_digit()) {
+/// Parse the timestamp for timeline format
+fn parse_timeline_format(ts_str: &str) -> Result<String> {
+    if matches!(ts_str.len(), 14 | 17) && ts_str.chars().all(|c| c.is_ascii_digit()) {
         return Ok(ts_str.to_string());
     }
 
