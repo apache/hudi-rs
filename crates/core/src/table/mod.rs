@@ -92,23 +92,21 @@ mod fs_view;
 mod listing;
 pub mod partition;
 
+use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
-use crate::error::CoreError;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
+use crate::timeline::util::format_timestamp;
 use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
 use crate::Result;
-
-use crate::config::read::HudiReadConfig;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
-use chrono::{DateTime, Local, TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use url::Url;
@@ -216,10 +214,6 @@ impl Table {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .to::<String>()
-    }
-
-    pub fn is_utc_timezone(&self) -> bool {
-        self.timezone() == "UTC"
     }
 
     /// Get the latest Avro schema string of the table.
@@ -336,7 +330,7 @@ impl Table {
         I: IntoIterator<Item = (S, S, S)>,
         S: AsRef<str>,
     {
-        let timestamp = format_timestamp(timestamp, self.is_utc_timezone())?;
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
         self.get_file_slices_splits_internal(n, &timestamp, &filters)
             .await
@@ -431,7 +425,7 @@ impl Table {
         I: IntoIterator<Item = (S, S, S)>,
         S: AsRef<str>,
     {
-        let timestamp = format_timestamp(timestamp, self.is_utc_timezone())?;
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
         self.get_file_slices_internal(&timestamp, &filters).await
     }
@@ -595,7 +589,7 @@ impl Table {
         I: IntoIterator<Item = (S, S, S)>,
         S: AsRef<str>,
     {
-        let timestamp = format_timestamp(timestamp, self.is_utc_timezone())?;
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
         self.read_snapshot_internal(&timestamp, &filters).await
     }
@@ -652,8 +646,9 @@ impl Table {
             return Ok(Vec::new());
         };
 
-        let start_timestamp = format_timestamp(start_timestamp, self.is_utc_timezone())?;
-        let end_timestamp = format_timestamp(end_timestamp, self.is_utc_timezone())?;
+        let timezone = self.timezone();
+        let start_timestamp = format_timestamp(start_timestamp, &timezone)?;
+        let end_timestamp = format_timestamp(end_timestamp, &timezone)?;
 
         let file_slices = self
             .get_file_slices_between_internal(&start_timestamp, &end_timestamp)
@@ -697,58 +692,6 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         todo!("read_incremental_changes")
     }
-}
-
-/// Formats a timestamp string to `yyyyMMddHHmmSSSSS` format.
-///
-/// The function attempts to parse the input timestamp string (`timestamp`) into a `DateTime` object.
-/// It first tries parsing the ISO 8601 format, and if that fails, it tries two other formats: `yyyyMMddHHmmSSSSS`
-/// and `yyyyMMddHHmmSS`. If none of the formats match, it returns the original input string.
-///
-/// # Arguments
-/// - `timestamp`: The input timestamp string to be formatted.
-///
-/// # Returns
-/// A string formatted as `yyyyMMddHHmmSSSSS`.
-fn format_timestamp(timestamp: &str, is_utc: bool) -> Result<String> {
-    fn to_output<Tz: TimeZone>(dt: DateTime<Tz>, is_utc: bool) -> String {
-        match is_utc {
-            true => dt.with_timezone(&Utc).format("%Y%m%d%H%M%S%3f").to_string(),
-            false => dt
-                .with_timezone(&Local)
-                .format("%Y%m%d%H%M%S%3f")
-                .to_string(),
-        }
-    }
-
-    if let Ok(datetime) = DateTime::parse_from_rfc3339(timestamp) {
-        return Ok(to_output(datetime, is_utc));
-    }
-
-    let formats = ["%Y%m%d%H%M%S%3f", "%Y%m%d%H%M%S"];
-    for format in formats.iter() {
-        if let Ok(datetime) = DateTime::parse_from_str(timestamp, format) {
-            return Ok(to_output(datetime, is_utc));
-        }
-    }
-
-    // for a format like 2019-01-23.
-    if timestamp.len() == 10 && timestamp.chars().all(|c| c.is_ascii_digit() || c == '-') {
-        return Ok(format!("{}000000000", timestamp.replace("-", "")));
-    }
-
-    // for a format like 20190123000000 or 20190123000000000
-    if timestamp.chars().all(|c| c.is_ascii_digit()) {
-        match timestamp.len() {
-            14 | 17 => return Ok(timestamp.to_string()),
-            _ => {}
-        }
-    }
-
-    Err(CoreError::Timeline(format!(
-        "Failed to parse timestamp: {}",
-        timestamp
-    )))
 }
 
 #[cfg(test)]
@@ -1661,29 +1604,6 @@ mod tests {
                 );
             }
             Ok(())
-        }
-    }
-
-    #[test]
-    fn test_format_timestamp() {
-        let timestamps = vec![
-            ("2019-01-23T12:34:56.123456789+00:00", "20190123123456123"),
-            ("2019-01-23T12:34:56.123456+00:00", "20190123123456123"),
-            ("2019-01-23T12:34:56.123+00:00", "20190123123456123"),
-            ("2019-01-23T12:34:56+00:00", "20190123123456000"),
-            ("2019-01-23T12:34:56Z", "20190123123456000"),
-            ("2019-01-23", "20190123000000000"),
-            ("20190123123456", "20190123123456"),
-            ("20190123000000000", "20190123000000000"),
-            ("20190123123456000", "20190123123456000"),
-            ("20190123123456123", "20190123123456123"),
-        ];
-
-        for (timestamp, result) in timestamps {
-            assert_eq!(
-                crate::table::format_timestamp(timestamp, true).unwrap(),
-                result
-            )
         }
     }
 }

@@ -73,6 +73,9 @@ pub enum CoreError {
     Timeline(String),
 
     #[error("{0}")]
+    TimestampParsingError(String),
+
+    #[error("{0}")]
     Unsupported(String),
 
     #[error(transparent)]
