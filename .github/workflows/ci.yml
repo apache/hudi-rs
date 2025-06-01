@@ -54,15 +54,15 @@ jobs:
       fail-fast: false
       matrix:
         # TODO: add windows which does not support container
-        os: [ ubuntu-22.04 ]
+        os: [ ubuntu-24.04 ]
     runs-on: ${{ matrix.os }}
     container:
       image: xd009642/tarpaulin:0.32.7
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+      # - name: Cache dependencies
+      #   uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
