@@ -21,10 +21,6 @@ project(hudi-cpp VERSION 0.4.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Include GNUInstallDirs for standard installation directories
-include(GNUInstallDirs)
-include(CMakePackageConfigHelpers)
-
 # Find the cargo metadata to locate the project paths
 execute_process(
     COMMAND cargo metadata --format-version=1
@@ -39,12 +35,21 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
+# Determine library extension based on platform
+if(WIN32)
+    set(LIB_EXTENSION ".dll")
+elseif(APPLE)
+    set(LIB_EXTENSION ".dylib")
+else()
+    set(LIB_EXTENSION ".so")
+endif()
+
 # Determine library path based on build type
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
-    set(RUST_LIB_PATH "${TARGET_DIRECTORY}/debug/libhudi.dylib")
+    set(RUST_LIB_PATH "${TARGET_DIRECTORY}/debug/libhudi${LIB_EXTENSION}")
     set(CARGO_BUILD_COMMAND "cargo" "build")
 else()
-    set(RUST_LIB_PATH "${TARGET_DIRECTORY}/release/libhudi.dylib")
+    set(RUST_LIB_PATH "${TARGET_DIRECTORY}/release/libhudi${LIB_EXTENSION}")
     set(CARGO_BUILD_COMMAND "cargo" "build" "--release")
 endif()
 
@@ -54,9 +59,6 @@ set(INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CXX_GENERATED_DIR}"
 )
-
-# Create the cmake directory for config files
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/cmake)
 
 # Custom command to build the rust library
 add_custom_command(
@@ -70,101 +72,27 @@ add_custom_command(
 # Create a custom target that depends on the Rust library
 add_custom_target(rust_build ALL DEPENDS ${RUST_LIB_PATH})
 
-# Create a wrapper target for the rust library
+# Create the main library target
 add_library(hudi INTERFACE)
 target_include_directories(hudi INTERFACE
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "$<BUILD_INTERFACE:${CXX_GENERATED_DIR}>"
-    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/hudi>"
-    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CXX_GENERATED_DIR}/rust
+    ${CXX_GENERATED_DIR}/hudi
 )
-# Store the library path for later use in install rules
+
+# Store the library path as a property for consumers
 set_target_properties(hudi PROPERTIES
     INTERFACE_HUDI_LIBRARY_PATH ${RUST_LIB_PATH}
 )
+
+# Make sure the Rust library is built before anyone uses this target
 add_dependencies(hudi rust_build)
 
-# Add an alias target to match the exported name
+# Add an alias target to match exported name convention
 add_library(Hudi::Hudi ALIAS hudi)
-
-# Install the library
-install(FILES ${RUST_LIB_PATH}
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RENAME "libhudi${CMAKE_SHARED_LIBRARY_SUFFIX}"
-)
-
-# Install the header files
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hudi
-    FILES_MATCHING PATTERN "*.h"
-)
-
-# Install the generated headers
-add_custom_target(copy_generated_headers ALL
-    DEPENDS rust_build
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/include_copy
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CXX_GENERATED_DIR} ${CMAKE_CURRENT_BINARY_DIR}/include_copy
-    COMMENT "Copying generated headers to staging directory"
-)
-
-install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include_copy/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING
-        PATTERN "*.h"
-        PATTERN "*.cc"
-)
-
-# Install the FindHudi.cmake module
-install(FILES
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindHudi.cmake"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hudi
-)
-
-# Configure and install HudiConfig.cmake
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/HudiConfig.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/cmake/HudiConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hudi
-)
-
-# Write the version file
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/cmake/HudiConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
-
-# Install the config files
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/cmake/HudiConfig.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/cmake/HudiConfigVersion.cmake"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hudi
-)
-
-# Create the target export
-install(TARGETS hudi
-    EXPORT HudiTargets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
-
-# Install the target export file
-install(EXPORT HudiTargets
-    FILE HudiTargets.cmake
-    NAMESPACE Hudi::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hudi
-)
-
-# Export the targets for use in the build tree
-export(EXPORT HudiTargets
-    NAMESPACE Hudi::
-    FILE "${CMAKE_CURRENT_BINARY_DIR}/cmake/HudiTargets.cmake"
-)
 
 # Output configuration summary
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Rust library path: ${RUST_LIB_PATH}")
 message(STATUS "Generated C++ path: ${CXX_GENERATED_DIR}")
-message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "Hudi target created for add_subdirectory usage")

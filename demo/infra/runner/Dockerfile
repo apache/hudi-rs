@@ -17,7 +17,7 @@
 
 FROM rust:1.84
 
-RUN apt-get update && apt-get install -y python3-dev python3-venv
+RUN apt-get update && apt-get install -y cmake python3-dev python3-venv
 
 RUN python3 -m venv /opt/venv
 

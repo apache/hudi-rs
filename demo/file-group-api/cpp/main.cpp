@@ -20,6 +20,7 @@
 #include <string>
 #include <cstring>
 #include <iomanip>
+#include <cstdlib>
 #include "cxx.h"
 #include "src/lib.rs.h"
 #include "arrow/c/abi.h"
@@ -135,12 +136,21 @@ int main() {
     try {
         std::cout << "Getting Hudi table schema and record batch information..." << std::endl;
 
-        // Call Rust to get the ArrowArrayStream
-        auto base_uri = "/base/path";
-        std::vector<std::string> opts{"foo=bar", "baz=qux"};
+        auto base_uri = "s3://hudi-demo/cow/v6_nonpartitioned";
+
+        const char* aws_access_key_id = std::getenv("AWS_ACCESS_KEY_ID");
+        const char* aws_secret_access_key = std::getenv("AWS_SECRET_ACCESS_KEY");
+        
+        std::vector<std::string> opts{
+            "aws_access_key_id=" + std::string(aws_access_key_id),
+            "aws_secret_access_key=" + std::string(aws_secret_access_key),
+            "aws_endpoint_url=http://minio:9000",
+            "aws_allow_http=true",
+            "aws_region=us-east-1"
+        };
         auto file_group_reader = new_file_group_reader_with_options(base_uri, opts);
 
-        auto base_file_path = "relative/path";
+        auto base_file_path = "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
         ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_by_base_file_path(base_file_path);
 
         if (!stream_ptr) {
@@ -148,7 +158,6 @@ int main() {
             return 1;
         }
 
-        // Get the schema
         ArrowSchema c_schema;
         if (stream_ptr->get_schema(stream_ptr, &c_schema) != 0) {
             std::string error = "Error getting schema: ";
@@ -157,20 +166,16 @@ int main() {
             throw std::runtime_error(error);
         }
 
-        // Print detailed schema info
         std::cout << "\n===== Schema Details =====\n" << std::endl;
         PrintArrowSchema(&c_schema);
 
-        // Print schema as a table
         PrintSchemaTable(&c_schema);
 
-        // Now read and print info about each record batch
         std::cout << "\n===== Record Batch Information =====\n" << std::endl;
         int batch_count = 0;
         int64_t total_rows = 0;
 
         while (true) {
-            // Get the next batch
             ArrowArray c_array;
             if (stream_ptr->get_next(stream_ptr, &c_array) != 0) {
                 std::string error = "Error getting next batch: ";
@@ -185,7 +190,6 @@ int main() {
                 break;
             }
 
-            // Print batch information
             batch_count++;
             std::cout << "Record Batch #" << batch_count << ":" << std::endl;
             std::cout << "  Rows: " << c_array.length << std::endl;
@@ -194,10 +198,8 @@ int main() {
             std::cout << "  Number of buffers: " << c_array.n_buffers << std::endl;
             std::cout << "  Number of children: " << c_array.n_children << std::endl;
 
-            // Keep track of total rows
             total_rows += c_array.length;
 
-            // Release the array
             c_array.release(&c_array);
         }
 
@@ -205,15 +207,28 @@ int main() {
         std::cout << "  Total record batches: " << batch_count << std::endl;
         std::cout << "  Total rows: " << total_rows << std::endl;
 
-        // Release the schema
+        bool validation_passed = true;
+        if (batch_count != 1) {
+            std::cerr << "Validation failed: Expected exactly 1 record batch, got " << batch_count << std::endl;
+            validation_passed = false;
+        }
+        if (total_rows != 4) {
+            std::cerr << "Validation failed: Expected exactly 4 rows, got " << total_rows << std::endl;
+            validation_passed = false;
+        }
+
         if (c_schema.release) {
             c_schema.release(&c_schema);
         }
 
-        // Release the stream when done
         stream_ptr->release(stream_ptr);
 
-        std::cout << "\nSuccessfully retrieved and processed Hudi table data" << std::endl;
+        if (!validation_passed) {
+            std::cerr << "Data validation failed - resources cleaned up properly" << std::endl;
+            return 1;
+        }
+
+        std::cout << "\nData validation successful - all resources cleaned up" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

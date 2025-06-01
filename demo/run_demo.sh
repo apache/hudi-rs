@@ -34,11 +34,20 @@ if [ $attempt -eq $max_attempts ]; then
   exit 1
 fi
 
-# install dependencies and run the demo apps
+# install dependencies and run the demo Rust and Python apps
 docker compose exec -T runner /bin/bash -c "
   cd /opt/hudi-rs && \
   make setup develop && \
   cd /opt/hudi-rs/demo/sql-datafusion && ./run.sh &&\
   cd /opt/hudi-rs/demo/table-api-python && ./run.sh && \
   cd /opt/hudi-rs/demo/table-api-rust && ./run.sh
+  "
+
+# run the C++ demo app
+docker compose exec -T runner /bin/bash -c "
+  cd /opt/hudi-rs/demo/file-group-api/cpp && \
+  mkdir build && cd build && \
+  cmake .. && \
+  make && \
+  ./file_group_api_cpp
   "
