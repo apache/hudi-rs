@@ -61,8 +61,8 @@ jobs:
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+#      - name: Cache dependencies
+#        uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
