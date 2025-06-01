@@ -67,7 +67,7 @@ jobs:
         run: |
           cargo tarpaulin \
             --engine llvm --no-dead-code --no-fail-fast --all-features \
-            --packages crates/* \
+            --packages hudi-core,hudi-datafusion,hudi-test \
             --exclude-files crates/core/src/avro_to_arrow/* \
             -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
