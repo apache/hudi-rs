@@ -45,6 +45,8 @@ docker compose exec -T runner /bin/bash -c "
 
 # run the C++ demo app
 docker compose exec -T runner /bin/bash -c "
+  cd /opt/hudi-rs/cpp && \
+  cargo build --release && \
   cd /opt/hudi-rs/demo/file-group-api/cpp && \
   mkdir build && cd build && \
   cmake .. && \
