@@ -57,7 +57,7 @@ jobs:
         os: [ ubuntu-22.04 ]
     runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.32.3-slim
+      image: xd009642/tarpaulin:0.32.7-slim
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
@@ -66,8 +66,8 @@ jobs:
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
-            --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
-            -e hudi-cpp -e hudi-python \
+            --engine llvm --no-dead-code --no-fail-fast --all-features \
+            -p hudi-core -p hudi-datafusion -p hudi-test \
             --exclude-files crates/core/src/avro_to_arrow/* \
             -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
