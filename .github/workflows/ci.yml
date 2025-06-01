@@ -66,8 +66,8 @@ jobs:
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
-            --engine llvm --no-dead-code --no-fail-fast --all-features \
-            -p hudi-core -p hudi-datafusion -p hudi-test \
+            --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
+            -e hudi-cpp -e hudi-python \
             --exclude-files crates/core/src/avro_to_arrow/* \
             -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
