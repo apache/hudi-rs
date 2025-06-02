@@ -34,7 +34,19 @@ if [ $attempt -eq $max_attempts ]; then
   exit 1
 fi
 
-# install dependencies and run the demo apps
+# Run the C++ demo app
+docker compose exec -T runner /bin/bash -c "
+  cd /opt/hudi-rs/cpp && \
+  cargo build --release && \
+  cd /opt/hudi-rs/demo/file-group-api/cpp && \
+  mkdir build && cd build && \
+  cmake .. && \
+  make && \
+  ./file_group_api_cpp
+  "
+
+# Run the Rust and Python demo apps
+# Note: no need to activate venv since this is already in a container
 docker compose exec -T runner /bin/bash -c "
   cd /opt/hudi-rs && \
   make setup develop && \

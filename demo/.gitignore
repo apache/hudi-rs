@@ -18,3 +18,4 @@
 venv/
 Cargo.lock
 **/target/
+**/build/
