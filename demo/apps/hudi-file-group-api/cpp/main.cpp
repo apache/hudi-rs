@@ -138,16 +138,7 @@ int main() {
 
         auto base_uri = "s3://hudi-demo/cow/v6_nonpartitioned";
 
-        const char* aws_access_key_id = std::getenv("AWS_ACCESS_KEY_ID");
-        const char* aws_secret_access_key = std::getenv("AWS_SECRET_ACCESS_KEY");
-        
-        std::vector<std::string> opts{
-            "aws_access_key_id=" + std::string(aws_access_key_id),
-            "aws_secret_access_key=" + std::string(aws_secret_access_key),
-            "aws_endpoint_url=http://minio:9000",
-            "aws_allow_http=true",
-            "aws_region=us-east-1"
-        };
+        std::vector<std::string> opts{};
         auto file_group_reader = new_file_group_reader_with_options(base_uri, opts);
 
         auto base_file_path = "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";

@@ -27,6 +27,7 @@ use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::storage::Storage;
+use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
 use crate::Result;
 use arrow::compute::and;
@@ -44,16 +45,21 @@ pub struct FileGroupReader {
 }
 
 impl FileGroupReader {
-    pub(crate) fn new_with_configs_and_options<I, K, V>(
+    
+    /// Creates a new reader with the given Hudi configurations and overwriting options.
+    /// 
+    /// # Notes
+    /// This API does **not** use [`OptionResolver`] that loads table properties from storage to resolve options.
+    pub(crate) fn new_with_configs_and_overwriting_options<I, K, V>(
         hudi_configs: Arc<HudiConfigs>,
-        options: I,
+        overwriting_options: I,
     ) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
-        let (hudi_opts, others) = split_hudi_options_from_others(options);
+        let (hudi_opts, others) = split_hudi_options_from_others(overwriting_options);
 
         let mut final_opts = hudi_configs.as_options();
         final_opts.extend(hudi_opts);
@@ -67,22 +73,33 @@ impl FileGroupReader {
     }
 
     /// Creates a new reader with the given base URI and options.
-    ///
+    /// 
     /// # Arguments
     ///     * `base_uri` - The base URI of the file group's residing table.
     ///     * `options` - Additional options for the reader.
+    /// 
+    /// # Notes
+    /// This API uses [`OptionResolver`] that loads table properties from storage to resolve options.
     pub fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
-        let hudi_configs = Arc::new(HudiConfigs::new([(
-            HudiTableConfig::BasePath.as_ref().to_string(),
-            base_uri.to_string(),
-        )]));
-
-        Self::new_with_configs_and_options(hudi_configs, options)
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let mut resolver = OptionResolver::new_with_options(base_uri, options);
+                resolver.resolve_options().await?;
+                let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
+                let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+                
+                Ok(Self {
+                    hudi_configs,
+                    storage,
+                })
+            })
     }
 
     fn create_filtering_mask_for_base_file_records(

@@ -69,7 +69,7 @@ pub struct HudiFileGroupReader {
 impl HudiFileGroupReader {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
-    fn new(base_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
+    fn new_with_options(base_uri: &str, options: Option<HashMap<String, String>>) -> PyResult<Self> {
         let inner = FileGroupReader::new_with_options(base_uri, options.unwrap_or_default())
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner })

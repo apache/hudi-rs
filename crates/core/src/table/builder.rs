@@ -43,10 +43,10 @@ pub struct TableBuilder {
 /// Resolver for options including Hudi options, storage options, and generic options.
 #[derive(Debug, Clone)]
 pub struct OptionResolver {
-    base_uri: String,
-    hudi_options: HashMap<String, String>,
-    storage_options: HashMap<String, String>,
-    options: HashMap<String, String>,
+    pub base_uri: String,
+    pub hudi_options: HashMap<String, String>,
+    pub storage_options: HashMap<String, String>,
+    pub options: HashMap<String, String>,
 }
 
 macro_rules! impl_with_options {
@@ -139,6 +139,28 @@ impl OptionResolver {
             options: HashMap::new(),
         }
     }
+    
+    /// Create a new [OptionResolver] with the given base URI and options.
+    pub fn new_with_options<I, K, V>(
+        base_uri: &str,
+        options: I,
+    ) -> Self 
+    where 
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let options = options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+            .collect();
+        Self {
+            base_uri: base_uri.to_string(),
+            hudi_options: HashMap::new(),
+            storage_options: HashMap::new(),
+            options,
+        }
+    }
 
     /// Resolve all options by combining the ones from hoodie.properties, user-provided options,
     /// env vars, and global Hudi configs. The precedence order is as follows:
@@ -150,7 +172,7 @@ impl OptionResolver {
     /// 5. Global Hudi configs
     ///
     /// [note] Error may occur when 1 and 2 have conflicts.
-    async fn resolve_options(&mut self) -> Result<()> {
+    pub async fn resolve_options(&mut self) -> Result<()> {
         self.resolve_user_provided_options();
 
         // if any user-provided options are intended for cloud storage and in uppercase,
