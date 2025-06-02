@@ -126,13 +126,17 @@ jobs:
           if-no-files-found: 'error'
 
   integration-tests:
+    strategy:
+        fail-fast: false
+        matrix:
+          app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Integration tests
+      - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
-          ./run_demo.sh
+          ./ci_run.sh ${{ matrix.app-path }}
 
   publish-coverage:
     name: Publish coverage reports to codecov.io
