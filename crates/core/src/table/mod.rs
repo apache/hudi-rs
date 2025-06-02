@@ -541,7 +541,7 @@ impl Table {
         for (k, v) in options {
             overwriting_options.insert(k.as_ref().to_string(), v.into());
         }
-        FileGroupReader::new_with_configs_and_options(
+        FileGroupReader::new_with_configs_and_overwriting_options(
             self.hudi_configs.clone(),
             overwriting_options,
         )

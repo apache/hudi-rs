@@ -43,10 +43,10 @@ pub struct TableBuilder {
 /// Resolver for options including Hudi options, storage options, and generic options.
 #[derive(Debug, Clone)]
 pub struct OptionResolver {
-    base_uri: String,
-    hudi_options: HashMap<String, String>,
-    storage_options: HashMap<String, String>,
-    options: HashMap<String, String>,
+    pub base_uri: String,
+    pub hudi_options: HashMap<String, String>,
+    pub storage_options: HashMap<String, String>,
+    pub options: HashMap<String, String>,
 }
 
 macro_rules! impl_with_options {
@@ -106,11 +106,7 @@ impl TableBuilder {
 
         option_resolver.resolve_options().await?;
 
-        let hudi_configs = HudiConfigs::new(self.option_resolver.hudi_options.iter());
-
-        validate_configs(&hudi_configs).expect("Hudi configs are not valid.");
-
-        let hudi_configs = Arc::from(hudi_configs);
+        let hudi_configs = Arc::from(HudiConfigs::new(option_resolver.hudi_options.iter()));
 
         let storage_options = Arc::from(self.option_resolver.storage_options.clone());
 
@@ -140,6 +136,25 @@ impl OptionResolver {
         }
     }
 
+    /// Create a new [OptionResolver] with the given base URI and options.
+    pub fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let options = options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+            .collect();
+        Self {
+            base_uri: base_uri.to_string(),
+            hudi_options: HashMap::new(),
+            storage_options: HashMap::new(),
+            options,
+        }
+    }
+
     /// Resolve all options by combining the ones from hoodie.properties, user-provided options,
     /// env vars, and global Hudi configs. The precedence order is as follows:
     ///
@@ -150,16 +165,20 @@ impl OptionResolver {
     /// 5. Global Hudi configs
     ///
     /// [note] Error may occur when 1 and 2 have conflicts.
-    async fn resolve_options(&mut self) -> Result<()> {
+    pub async fn resolve_options(&mut self) -> Result<()> {
         self.resolve_user_provided_options();
 
-        // if any user-provided options are intended for cloud storage and in uppercase,
+        // If any user-provided options are intended for cloud storage and in uppercase,
         // convert them to lowercase. This is to allow `object_store` to pick them up.
         self.resolve_cloud_env_vars();
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
         // We can now resolve the hudi options
-        self.resolve_hudi_options().await
+        self.resolve_hudi_options().await?;
+
+        // Validate the resolved Hudi options
+        let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
+        validate_configs(&hudi_configs)
     }
 
     fn resolve_user_provided_options(&mut self) {
