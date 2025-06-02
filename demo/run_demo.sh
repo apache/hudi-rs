@@ -34,7 +34,7 @@ if [ $attempt -eq $max_attempts ]; then
   exit 1
 fi
 
-# run the C++ demo app
+# Run the C++ demo app
 docker compose exec -T runner /bin/bash -c "
   cd /opt/hudi-rs/cpp && \
   cargo build --release && \
@@ -45,14 +45,12 @@ docker compose exec -T runner /bin/bash -c "
   ./file_group_api_cpp
   "
 
-# run the Rust and Python demo apps
+# Run the Rust and Python demo apps
+# Note: no need to activate venv since this is already in a container
 docker compose exec -T runner /bin/bash -c "
   cd /opt/hudi-rs && \
-  make setup && \
-  source venv/bin/activate \
-  make develop && \
+  make setup develop && \
   cd /opt/hudi-rs/demo/sql-datafusion && ./run.sh &&\
   cd /opt/hudi-rs/demo/table-api-python && ./run.sh && \
-  cd /opt/hudi-rs/demo/table-api-rust && ./run.sh && \
-  deactivate
+  cd /opt/hudi-rs/demo/table-api-rust && ./run.sh
   "
