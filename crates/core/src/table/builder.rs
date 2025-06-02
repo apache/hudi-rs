@@ -106,11 +106,7 @@ impl TableBuilder {
 
         option_resolver.resolve_options().await?;
 
-        let hudi_configs = HudiConfigs::new(self.option_resolver.hudi_options.iter());
-
-        validate_configs(&hudi_configs).expect("Hudi configs are not valid.");
-
-        let hudi_configs = Arc::from(hudi_configs);
+        let hudi_configs = Arc::from(HudiConfigs::new(option_resolver.hudi_options.iter()));
 
         let storage_options = Arc::from(self.option_resolver.storage_options.clone());
 
@@ -139,13 +135,10 @@ impl OptionResolver {
             options: HashMap::new(),
         }
     }
-    
+
     /// Create a new [OptionResolver] with the given base URI and options.
-    pub fn new_with_options<I, K, V>(
-        base_uri: &str,
-        options: I,
-    ) -> Self 
-    where 
+    pub fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Self
+    where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
@@ -175,13 +168,17 @@ impl OptionResolver {
     pub async fn resolve_options(&mut self) -> Result<()> {
         self.resolve_user_provided_options();
 
-        // if any user-provided options are intended for cloud storage and in uppercase,
+        // If any user-provided options are intended for cloud storage and in uppercase,
         // convert them to lowercase. This is to allow `object_store` to pick them up.
         self.resolve_cloud_env_vars();
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
         // We can now resolve the hudi options
-        self.resolve_hudi_options().await
+        self.resolve_hudi_options().await?;
+
+        // Validate the resolved Hudi options
+        let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
+        validate_configs(&hudi_configs)
     }
 
     fn resolve_user_provided_options(&mut self) {

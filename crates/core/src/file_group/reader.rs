@@ -45,9 +45,8 @@ pub struct FileGroupReader {
 }
 
 impl FileGroupReader {
-    
     /// Creates a new reader with the given Hudi configurations and overwriting options.
-    /// 
+    ///
     /// # Notes
     /// This API does **not** use [`OptionResolver`] that loads table properties from storage to resolve options.
     pub(crate) fn new_with_configs_and_overwriting_options<I, K, V>(
@@ -73,11 +72,11 @@ impl FileGroupReader {
     }
 
     /// Creates a new reader with the given base URI and options.
-    /// 
+    ///
     /// # Arguments
     ///     * `base_uri` - The base URI of the file group's residing table.
     ///     * `options` - Additional options for the reader.
-    /// 
+    ///
     /// # Notes
     /// This API uses [`OptionResolver`] that loads table properties from storage to resolve options.
     pub fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
@@ -93,8 +92,9 @@ impl FileGroupReader {
                 let mut resolver = OptionResolver::new_with_options(base_uri, options);
                 resolver.resolve_options().await?;
                 let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
-                let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
-                
+                let storage =
+                    Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+
                 Ok(Self {
                     hudi_configs,
                     storage,
@@ -268,30 +268,79 @@ mod tests {
     use super::*;
     use crate::config::util::empty_options;
     use crate::error::CoreError;
+    use crate::Result;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use std::fs::canonicalize;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use url::Url;
+
+    fn get_non_existent_base_uri() -> String {
+        "file:///non-existent-path/table".to_string()
+    }
+
+    fn get_base_uri_with_valid_props() -> String {
+        let url = Url::from_file_path(
+            canonicalize(
+                PathBuf::from("tests")
+                    .join("data")
+                    .join("table_props_valid"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        url.as_ref().to_string()
+    }
+
+    fn get_base_uri_with_valid_props_minimum() -> String {
+        let url = Url::from_file_path(
+            canonicalize(
+                PathBuf::from("tests")
+                    .join("data")
+                    .join("table_props_valid_minimum"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        url.as_ref().to_string()
+    }
+
+    fn get_base_uri_with_invalid_props() -> String {
+        let url = Url::from_file_path(
+            canonicalize(
+                PathBuf::from("tests")
+                    .join("data")
+                    .join("table_props_invalid"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        url.as_ref().to_string()
+    }
 
     #[test]
-    fn test_new_with_options() -> Result<()> {
+    fn test_new_with_options() {
         let options = vec![("key1", "value1"), ("key2", "value2")];
-        let reader = FileGroupReader::new_with_options("/tmp/hudi_data", options)?;
+        let base_uri = get_base_uri_with_valid_props();
+        let reader = FileGroupReader::new_with_options(&base_uri, options).unwrap();
         assert!(!reader.storage.options.is_empty());
         assert!(reader
             .storage
             .hudi_configs
             .contains(HudiTableConfig::BasePath));
-        Ok(())
     }
 
     #[test]
-    fn test_read_file_slice_returns_error() {
-        let reader =
-            FileGroupReader::new_with_options("file:///non-existent-path/table", empty_options())
-                .unwrap();
-        let result = reader.read_file_slice_by_base_file_path_blocking("non_existent_file");
-        assert!(matches!(result.unwrap_err(), ReadFileSliceError(_)));
+    fn test_new_with_options_invalid_base_uri_or_invalid_props() {
+        let base_uri = get_non_existent_base_uri();
+        let result = FileGroupReader::new_with_options(&base_uri, empty_options());
+        assert!(result.is_err());
+
+        let base_uri = get_base_uri_with_invalid_props();
+        let result = FileGroupReader::new_with_options(&base_uri, empty_options());
+        assert!(result.is_err())
     }
 
     fn create_test_record_batch() -> Result<RecordBatch> {
@@ -313,11 +362,12 @@ mod tests {
 
     #[test]
     fn test_create_filtering_mask_for_base_file_records() -> Result<()> {
-        let base_uri = "file:///non-existent-path/table";
+        let base_uri = get_base_uri_with_valid_props_minimum();
         let records = create_test_record_batch()?;
-        // Test case 1: No meta fields populated
+
+        // Test case 1: Disable populating the meta fields
         let reader = FileGroupReader::new_with_options(
-            base_uri,
+            &base_uri,
             [
                 (HudiTableConfig::PopulatesMetaFields.as_ref(), "false"),
                 (HudiReadConfig::FileGroupStartTimestamp.as_ref(), "2"),
@@ -327,13 +377,13 @@ mod tests {
         assert_eq!(mask, None, "Commit time filtering should not be needed");
 
         // Test case 2: No commit time filtering options
-        let reader = FileGroupReader::new_with_options(base_uri, empty_options())?;
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
         let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
         assert_eq!(mask, None);
 
         // Test case 3: Filtering commit time > '2'
         let reader = FileGroupReader::new_with_options(
-            base_uri,
+            &base_uri,
             [(HudiReadConfig::FileGroupStartTimestamp, "2")],
         )?;
         let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
@@ -345,7 +395,7 @@ mod tests {
 
         // Test case 4: Filtering commit time <= '4'
         let reader = FileGroupReader::new_with_options(
-            base_uri,
+            &base_uri,
             [(HudiReadConfig::FileGroupEndTimestamp, "4")],
         )?;
         let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
@@ -353,7 +403,7 @@ mod tests {
 
         // Test case 5: Filtering commit time > '2' and <= '4'
         let reader = FileGroupReader::new_with_options(
-            base_uri,
+            &base_uri,
             [
                 (HudiReadConfig::FileGroupStartTimestamp, "2"),
                 (HudiReadConfig::FileGroupEndTimestamp, "4"),
