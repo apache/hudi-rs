@@ -18,4 +18,4 @@
 # under the License.
 #
 
-cargo run
+cargo run -- --no-build --no-tests

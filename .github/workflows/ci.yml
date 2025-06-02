@@ -61,13 +61,13 @@ jobs:
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      # - name: Cache dependencies
-      #   uses: Swatinem/rust-cache@v2
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
             --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
-            --exclude-files cpp/* \
+            --exclude-files cpp/src/* \
             --exclude-files crates/core/src/avro_to_arrow/* \
             -o xml --output-dir ./cov-reports --skip-clean
       - name: Upload coverage report
