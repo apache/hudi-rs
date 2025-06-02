@@ -40,7 +40,7 @@ if [ -z "$app_path" ]; then
   exit 1
 fi
 
-app_path_in_container="/opt/hudi-rs/demo/$app_path"
+app_path_in_container="/opt/hudi-rs/demo/apps/$app_path"
 if [ "$app_path" = "datafusion" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/venv/bin/activate && \
