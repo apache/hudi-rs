@@ -60,7 +60,7 @@ elif [ "$app_path" = "hudi-table-api/python" ]; then
     source /opt/venv/bin/activate && \
     cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
-    cargo run -- --no-build --no-tests
+    python -m src.main
     "
 elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "

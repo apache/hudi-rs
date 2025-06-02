@@ -16,6 +16,7 @@
 # under the License.
 ---
 services:
+  # storage layer containing test data
   minio:
     image: quay.io/minio/minio:latest
     container_name: minio
@@ -32,6 +33,7 @@ services:
       timeout: 5s
       retries: 3
 
+  # minio client to prepare test data
   mc:
     build:
       context: ./infra/mc
@@ -50,6 +52,7 @@ services:
       - -c
       - /opt/prepare_data.sh
 
+  # execution environment for running tests
   runner:
     build:
       context: ./infra/runner
