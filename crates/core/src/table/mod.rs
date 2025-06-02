@@ -91,6 +91,7 @@ pub mod builder;
 mod fs_view;
 mod listing;
 pub mod partition;
+mod validation;
 
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;

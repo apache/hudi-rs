@@ -16,5 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-pub mod arrow;
-pub mod collection;
+use std::collections::HashMap;
+use std::hash::Hash;
+
+pub fn extend_if_absent<K, V>(target: &mut HashMap<K, V>, source: &HashMap<K, V>)
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    for (key, value) in source {
+        target.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
