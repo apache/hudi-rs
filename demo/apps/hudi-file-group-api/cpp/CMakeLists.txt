@@ -21,10 +21,8 @@ project(hudi_cpp_example)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Add the hudi-cpp subdirectory (adjust path as needed)
-add_subdirectory(../../../cpp hudi-cpp)
+add_subdirectory(../../../../cpp hudi-cpp)
 
-# Add the example executable
 add_executable(file_group_api_cpp
   main.cpp
 )
