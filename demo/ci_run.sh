@@ -44,28 +44,27 @@ app_path_in_container="/opt/hudi-rs/demo/apps/$app_path"
 if [ "$app_path" = "datafusion" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/venv/bin/activate && \
+    cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
-    make setup develop && \
     cargo run -- --no-build --no-tests
     "
 elif [ "$app_path" = "hudi-table-api/rust" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/venv/bin/activate && \
+    cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
-    make setup develop && \
     cargo run -- --no-build --no-tests
     "
 elif [ "$app_path" = "hudi-table-api/python" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/venv/bin/activate && \
+    cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
-    make setup develop && \
     cargo run -- --no-build --no-tests
     "
 elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "
-    cd /opt/hudi-rs/cpp && \
-    cargo build --release && \
+    cd /opt/hudi-rs/cpp && cargo build --release && \
     cd $app_path_in_container && \
     mkdir build && cd build && \
     cmake .. && \
