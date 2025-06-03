@@ -204,7 +204,7 @@ reader = HudiFileGroupReader(
 record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet")
 ```
 
-##### Rust
+#### Rust
 
 ```rust
 use hudi::file_group::reader::FileGroupReader;
