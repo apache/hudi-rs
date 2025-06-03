@@ -201,7 +201,7 @@ reader = HudiFileGroupReader(
     "/table/base/path", {"hoodie.read.file_group.start_timestamp": "0"})
 
 # Returns a PyArrow RecordBatch
-record_batch = reader.read_file_slice_by_base_file_path("relative/base/file/path.parquet")
+record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet")
 ```
 
 ##### Rust
@@ -213,7 +213,7 @@ let reader = FileGroupReader::new_with_options(
     "/table/base/path", [("hoodie.read.file_group.start_timestamp", "0")])?;
 
 // Returns an Arrow RecordBatch
-let record_batch = reader.read_file_slice_by_base_file_path("relative/base/file/path.parquet").await?;
+let record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet").await?;
 ```
 
 #### C++
@@ -223,11 +223,11 @@ let record_batch = reader.read_file_slice_by_base_file_path("relative/base/file/
 #include "src/lib.rs.h"
 #include "arrow/c/abi.h"
 
-auto file_group_reader = new_file_group_reader_with_options(
+auto reader = new_file_group_reader_with_options(
     "/table/base/path", {"hoodie.read.file_group.start_timestamp=0"});
 
 // Returns an ArrowArrayStream pointer
-ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_by_base_file_path(base_file_path);
+ArrowArrayStream* stream_ptr = reader->read_file_slice_by_base_file_path("relative/path.parquet");
 ```
 
 ## Query Engine Integration
