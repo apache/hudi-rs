@@ -21,10 +21,11 @@
 # https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
 
 github:
-  description: "The native Rust implementation for Apache Hudi, with Python API bindings."
+  description: "The native Rust implementation for Apache Hudi, with C++ & Python API bindings."
   homepage: https://hudi.apache.org/
   labels:
     - apache
+    - c-plus-plus
     - hudi
     - rust
     - python
