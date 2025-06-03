@@ -43,8 +43,8 @@
   </a>
 </p>
 
-The `hudi-rs` project aims to broaden the use of [Apache Hudi](https://github.com/apache/hudi) for a diverse range of
-users and projects.
+The Hudi-rs project aims to standardize the core [Apache Hudi](https://github.com/apache/hudi) APIs, and broaden the
+Hudi integration in the data ecosystems for a diverse range of users and projects.
 
 | Source                  | Downloads                   | Installation Command |
 |-------------------------|-----------------------------|----------------------|
