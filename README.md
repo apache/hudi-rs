@@ -23,7 +23,7 @@
   </a>
 </p>
 <p align="center">
-  The native Rust implementation for Apache Hudi, with Python API bindings.
+  The native Rust implementation for Apache Hudi, with C++ & Python API bindings.
   <br>
   <br>
   <a href="https://github.com/apache/hudi-rs/actions/workflows/ci.yml">
@@ -43,8 +43,8 @@
   </a>
 </p>
 
-The `hudi-rs` project aims to broaden the use of [Apache Hudi](https://github.com/apache/hudi) for a diverse range of
-users and projects.
+The Hudi-rs project aims to standardize the core [Apache Hudi](https://github.com/apache/hudi) APIs, and broaden the
+Hudi integration in the data ecosystems for a diverse range of users and projects.
 
 | Source                  | Downloads                   | Installation Command |
 |-------------------------|-----------------------------|----------------------|
@@ -124,9 +124,6 @@ let hudi_table =
     .build().await?;
 ```
 
-> [!NOTE]
-> Currently reading MOR tables is limited to tables with Parquet data blocks.
-
 ### Time-Travel Query
 
 Time-travel query reads the data at a specific timestamp from the table. The table API also accepts partition filters.
@@ -147,6 +144,22 @@ let batches =
     hudi_table
     .read_snapshot_as_of("20241231123456789", &[("city", "=", "san_francisco")]).await?;
 ```
+
+<details>
+<summary>Supported timestamp formats</summary>
+
+The supported formats for the timestamp argument are:
+- Hudi Timeline format (highest matching precedence): `yyyyMMddHHmmssSSS` or `yyyyMMddHHmmss`.
+- Unix epoch time in seconds, milliseconds, microseconds, or nanoseconds.
+- ISO 8601 format including but not limited to:
+  - `yyyy-MM-dd'T'HH:mm:ss.SSS+00:00`
+  - `yyyy-MM-dd'T'HH:mm:ss.SSSZ`
+  - `yyyy-MM-dd'T'HH:mm:ss.SSS`
+  - `yyyy-MM-dd'T'HH:mm:ss+00:00`
+  - `yyyy-MM-dd'T'HH:mm:ssZ`
+  - `yyyy-MM-dd'T'HH:mm:ss`
+  - `yyyy-MM-dd`
+</details>
 
 ### Incremental Query
 
@@ -172,8 +185,50 @@ let batches = hudi_table.read_incremental_records(t1, Some(t2)).await?;
 let batches = hudi_table.read_incremental_records(t1, None).await?;
 ```
 
-> [!NOTE]
-> Currently the only supported format for the timestamp arguments is Hudi Timeline format: `yyyyMMddHHmmssSSS` or `yyyyMMddHHmmss`.
+*Incremental queries support the same timestamp formats as time-travel queries.*
+
+### File Group Reading (Experimental)
+
+File group reading allows you to read data from a specific file slice. This is useful when integrating with query
+engines, where the plan provides file paths.
+
+#### Python
+
+```python
+from hudi import HudiFileGroupReader
+
+reader = HudiFileGroupReader(
+    "/table/base/path", {"hoodie.read.file_group.start_timestamp": "0"})
+
+# Returns a PyArrow RecordBatch
+record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet")
+```
+
+#### Rust
+
+```rust
+use hudi::file_group::reader::FileGroupReader;
+
+let reader = FileGroupReader::new_with_options(
+    "/table/base/path", [("hoodie.read.file_group.start_timestamp", "0")])?;
+
+// Returns an Arrow RecordBatch
+let record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet").await?;
+```
+
+#### C++
+
+```cpp
+#include "cxx.h"
+#include "src/lib.rs.h"
+#include "arrow/c/abi.h"
+
+auto reader = new_file_group_reader_with_options(
+    "/table/base/path", {"hoodie.read.file_group.start_timestamp=0"});
+
+// Returns an ArrowArrayStream pointer
+ArrowArrayStream* stream_ptr = reader->read_file_slice_by_base_file_path("relative/path.parquet");
+```
 
 ## Query Engine Integration
 
@@ -199,6 +254,7 @@ Create a Hudi file group reader instance using its constructor or the Hudi table
 | Stage           | API                                   | Description                                                                                                                                                                        |
 |-----------------|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Query execution | `read_file_slice()`                   | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
+|                 | `read_file_slice_by_base_file_path()` | Read records from a given base file path; log files will be ignored                                                                                                                |
 
 
 ### Apache DataFusion
@@ -211,7 +267,7 @@ extension to query Hudi tables.
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@43
+cargo add tokio@1 datafusion@45
 cargo add hudi --features datafusion
 ```
 
