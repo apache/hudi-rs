@@ -137,18 +137,21 @@ impl RecordBatches {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Float64Array, Int64Array, StringArray};
-    use arrow_schema::{DataType, Field};
+    use super::*;
     use crate::config::error::ConfigError;
     use crate::metadata::meta_field::MetaField;
-    use super::*;
-    
+    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field};
+
     // Helper function to create a test data RecordBatch
     fn create_test_data_batch(num_rows: usize) -> RecordBatch {
         create_test_data_batch_with_ordering_field(num_rows, "value")
     }
-    
-    fn create_test_data_batch_with_ordering_field(num_rows: usize, ordering_field: &str) -> RecordBatch {
+
+    fn create_test_data_batch_with_ordering_field(
+        num_rows: usize,
+        ordering_field: &str,
+    ) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
@@ -157,7 +160,13 @@ mod tests {
 
         let ids: Vec<i64> = (0..num_rows as i64).collect();
         let names: Vec<Option<String>> = (0..num_rows)
-            .map(|i| if i % 2 == 0 { Some(format!("name_{}", i)) } else { None })
+            .map(|i| {
+                if i % 2 == 0 {
+                    Some(format!("name_{}", i))
+                } else {
+                    None
+                }
+            })
             .collect();
         let values: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.5).collect();
 
@@ -177,9 +186,8 @@ mod tests {
         ]));
 
         let record_keys: Vec<i64> = (0..num_rows as i64).collect();
-        let partition_paths: Vec<String> = (0..num_rows)
-            .map(|i| format!("partition_{}", i))
-            .collect();
+        let partition_paths: Vec<String> =
+            (0..num_rows).map(|i| format!("partition_{}", i)).collect();
         let ordering_vals: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.6).collect();
 
         let record_key_array = Arc::new(Int64Array::from(record_keys));
@@ -189,7 +197,8 @@ mod tests {
         RecordBatch::try_new(
             schema,
             vec![record_key_array, partition_path_array, ordering_val_array],
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     // Helper function to create empty data batch
@@ -344,11 +353,13 @@ mod tests {
     fn test_extend_with_data() {
         let mut record_batches1 = RecordBatches::new();
         record_batches1.push_data_batch(create_test_data_batch(5));
-        record_batches1.push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
+        record_batches1
+            .push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
 
         let mut record_batches2 = RecordBatches::new();
         record_batches2.push_data_batch(create_test_data_batch(8));
-        record_batches2.push_delete_batch(create_test_delete_batch(3), "20240102000000".to_string());
+        record_batches2
+            .push_delete_batch(create_test_delete_batch(3), "20240102000000".to_string());
 
         record_batches1.extend(record_batches2);
 
@@ -438,22 +449,38 @@ mod tests {
         let mut record_batches = RecordBatches::new();
 
         // Test that getters are consistent with internal state
-        assert_eq!(record_batches.num_data_batches(), record_batches.data_batches.len());
-        assert_eq!(record_batches.num_delete_batches(), record_batches.delete_batches.len());
+        assert_eq!(
+            record_batches.num_data_batches(),
+            record_batches.data_batches.len()
+        );
+        assert_eq!(
+            record_batches.num_delete_batches(),
+            record_batches.delete_batches.len()
+        );
 
         // Add some batches and test again
         record_batches.push_data_batch(create_test_data_batch(3));
         record_batches.push_data_batch(create_test_data_batch(4));
         record_batches.push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
 
-        assert_eq!(record_batches.num_data_batches(), record_batches.data_batches.len());
-        assert_eq!(record_batches.num_delete_batches(), record_batches.delete_batches.len());
+        assert_eq!(
+            record_batches.num_data_batches(),
+            record_batches.data_batches.len()
+        );
+        assert_eq!(
+            record_batches.num_delete_batches(),
+            record_batches.delete_batches.len()
+        );
 
         // Verify row counts match actual batch row counts
-        let expected_data_rows: usize = record_batches.data_batches.iter()
+        let expected_data_rows: usize = record_batches
+            .data_batches
+            .iter()
             .map(|batch| batch.num_rows())
             .sum();
-        let expected_delete_rows: usize = record_batches.delete_batches.iter()
+        let expected_delete_rows: usize = record_batches
+            .delete_batches
+            .iter()
             .map(|(batch, _)| batch.num_rows())
             .sum();
 
@@ -482,11 +509,14 @@ mod tests {
     #[test]
     fn test_concat_delete_batches_transformed_empty() {
         let record_batches = RecordBatches::new();
-        let hudi_configs = Arc::new(HudiConfigs::new([
-            (HudiTableConfig::PrecombineField.as_ref(), "orderingVal")
-        ]));
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::PrecombineField.as_ref(),
+            "orderingVal",
+        )]));
 
-        let result = record_batches.concat_delete_batches_transformed(hudi_configs).unwrap();
+        let result = record_batches
+            .concat_delete_batches_transformed(hudi_configs)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 0); // Empty schema
@@ -498,16 +528,22 @@ mod tests {
 
         // Need at least one data batch for schema reference
         let ordering_field = "ord_val";
-        record_batches.push_data_batch(create_test_data_batch_with_ordering_field(1, ordering_field));
+        record_batches.push_data_batch(create_test_data_batch_with_ordering_field(
+            1,
+            ordering_field,
+        ));
 
         // Add delete batch
         record_batches.push_delete_batch(create_test_delete_batch(3), "20240101000000".to_string());
 
-        let hudi_configs = Arc::new(HudiConfigs::new([
-            (HudiTableConfig::PrecombineField.as_ref(), ordering_field)
-        ]));
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::PrecombineField.as_ref(),
+            ordering_field,
+        )]));
 
-        let result = record_batches.concat_delete_batches_transformed(hudi_configs).unwrap();
+        let result = record_batches
+            .concat_delete_batches_transformed(hudi_configs)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.num_columns(), 4); // commit_time, record_key, partition_path, ordering_val
@@ -532,17 +568,21 @@ mod tests {
         record_batches.push_delete_batch(create_test_delete_batch(3), "20240102000000".to_string());
         record_batches.push_delete_batch(create_test_delete_batch(1), "20240103000000".to_string());
 
-        let hudi_configs = Arc::new(HudiConfigs::new([
-            (HudiTableConfig::PrecombineField.as_ref(), "value")
-        ]));
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::PrecombineField.as_ref(),
+            "value",
+        )]));
 
-        let result = record_batches.concat_delete_batches_transformed(hudi_configs).unwrap();
+        let result = record_batches
+            .concat_delete_batches_transformed(hudi_configs)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 6); // 2 + 3 + 1
         assert_eq!(result.num_columns(), 4);
 
         // Verify all commit times are preserved correctly
-        let commit_time_array = result.column(0)
+        let commit_time_array = result
+            .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -568,11 +608,14 @@ mod tests {
         record_batches.push_data_batch(create_test_data_batch(1));
         record_batches.push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
 
-        let hudi_configs = Arc::new(HudiConfigs::new([
-            (HudiTableConfig::PrecombineField.as_ref(), "custom_ts")
-        ]));
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::PrecombineField.as_ref(),
+            "custom_ts",
+        )]));
 
-        let result = record_batches.concat_delete_batches_transformed(hudi_configs).unwrap();
+        let result = record_batches
+            .concat_delete_batches_transformed(hudi_configs)
+            .unwrap();
 
         // Check that the custom ordering field name is used
         let schema = result.schema();
@@ -593,11 +636,11 @@ mod tests {
         match result {
             Err(CoreError::Config(ConfigError::NotFound(s))) => {
                 assert_eq!(s, HudiTableConfig::PrecombineField.as_ref());
-            },
+            }
             _ => panic!(
                 "Expected ConfigError::NotFound, got {:?}",
                 result.unwrap_err()
-            )
+            ),
         }
     }
 }
