@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+mod ordering;
 pub mod record_merger;
 
 use crate::config::error;

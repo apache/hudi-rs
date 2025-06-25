@@ -24,6 +24,7 @@ use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::LogFileScanner;
+use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::storage::Storage;
@@ -229,28 +230,29 @@ impl FileGroupReader {
         if base_file_only {
             self.read_file_slice_by_base_file_path(&relative_path).await
         } else {
-            let base_record_batch = self
-                .read_file_slice_by_base_file_path(&relative_path)
-                .await?;
-            let schema = base_record_batch.schema();
-            let mut all_record_batches = vec![base_record_batch];
-
             let log_file_paths = file_slice
                 .log_files
                 .iter()
                 .map(|log_file| file_slice.log_file_relative_path(log_file))
                 .collect::<Result<Vec<String>>>()?;
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let log_record_batches =
-                LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
-                    .scan(log_file_paths, &instant_range)
-                    .await?;
-            for log_record_batch in log_record_batches {
-                all_record_batches.extend(log_record_batch);
-            }
+            let log_batches = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                .scan(log_file_paths, &instant_range)
+                .await?;
 
-            let merger = RecordMerger::new(self.hudi_configs.clone());
-            merger.merge_record_batches(&schema, &all_record_batches)
+            let base_batch = self
+                .read_file_slice_by_base_file_path(&relative_path)
+                .await?;
+            let schema = base_batch.schema();
+            let num_data_batches = log_batches.num_data_batches() + 1;
+            let num_delete_batches = log_batches.num_delete_batches();
+            let mut all_batches =
+                RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
+            all_batches.push_data_batch(base_batch);
+            all_batches.extend(log_batches);
+
+            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
+            merger.merge_record_batches(all_batches)
         }
     }
 

@@ -19,8 +19,8 @@
 
 use crate::error::CoreError;
 use crate::file_group::log_file::log_format::LogFormatVersion;
+use crate::file_group::record_batches::RecordBatches;
 use crate::Result;
-use arrow_array::RecordBatch;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -155,7 +155,7 @@ pub struct LogBlock {
     pub format_version: LogFormatVersion,
     pub block_type: BlockType,
     pub header: HashMap<BlockMetadataKey, String>,
-    pub record_batches: Vec<RecordBatch>,
+    pub record_batches: RecordBatches,
     pub footer: HashMap<BlockMetadataKey, String>,
     pub skipped: bool,
 }
@@ -207,8 +207,30 @@ impl LogBlock {
         v.parse::<CommandBlock>()
     }
 
+    pub fn is_data_block(&self) -> bool {
+        matches!(
+            self.block_type,
+            BlockType::AvroData
+                | BlockType::HfileData
+                | BlockType::ParquetData
+                | BlockType::CdcData
+        )
+    }
+
+    pub fn is_delete_block(&self) -> bool {
+        self.block_type == BlockType::Delete
+    }
+
     pub fn is_rollback_block(&self) -> bool {
         matches!(self.command_block_type(), Ok(CommandBlock::Rollback))
+    }
+
+    pub fn num_batches(&self) -> usize {
+        self.record_batches.num_data_batches()
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.record_batches.num_data_rows()
     }
 }
 

@@ -50,6 +50,8 @@ pub mod expr;
 pub mod file_group;
 pub mod merge;
 pub mod metadata;
+mod record;
+pub mod schema;
 pub mod storage;
 pub mod table;
 pub mod timeline;

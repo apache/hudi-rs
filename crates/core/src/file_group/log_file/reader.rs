@@ -271,19 +271,27 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::PathBuf;
 
-    fn get_valid_log_avro() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_avro");
+    fn get_valid_log_avro_data() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
         (
             canonicalize(dir).unwrap().to_str().unwrap().to_string(),
             ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string(),
         )
     }
 
-    fn get_valid_log_parquet() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_parquet");
+    fn get_valid_log_parquet_data() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_parquet_data");
         (
             canonicalize(dir).unwrap().to_str().unwrap().to_string(),
             ".ee2ace10-7667-40f5-9848-0a144b5ea064-0_20250113230302428.log.1_0-188-387".to_string(),
+        )
+    }
+
+    fn get_valid_log_delete() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_delete");
+        (
+            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            ".6d3d1d6e-2298-4080-a0c1-494877d6f40a-0_20250618054711154.log.1_0-26-85".to_string(),
         )
     }
 
@@ -300,14 +308,14 @@ mod tests {
         file_name: &str,
     ) -> Result<LogFileReader<StorageReader>> {
         let dir_url = parse_uri(dir)?;
-        let hudi_configs = Arc::new(HudiConfigs::empty());
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::PrecombineField, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
         LogFileReader::new(hudi_configs, storage, file_name).await
     }
 
     #[tokio::test]
     async fn test_read_log_file_with_avro_data_block() -> Result<()> {
-        let (dir, file_name) = get_valid_log_avro();
+        let (dir, file_name) = get_valid_log_avro_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250316025828811", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
@@ -322,7 +330,7 @@ mod tests {
         assert!(block.schema().is_ok());
         assert!(block.command_block_type().is_err());
 
-        let batches = block.record_batches.as_slice();
+        let batches = block.record_batches.data_batches.as_slice();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
 
@@ -333,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_log_file_with_parquet_data_block() -> Result<()> {
-        let (dir, file_name) = get_valid_log_parquet();
+        let (dir, file_name) = get_valid_log_parquet_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250113230424191", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
@@ -348,10 +356,40 @@ mod tests {
         assert!(block.schema().is_ok());
         assert!(block.command_block_type().is_err());
 
-        let batches = block.record_batches.as_slice();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
+        let batches = &block.record_batches;
+        assert_eq!(batches.num_data_batches(), 1);
+        assert_eq!(batches.num_data_rows(), 1);
 
+        assert!(block.footer.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_log_file_with_delete_block() -> Result<()> {
+        let (dir, file_name) = get_valid_log_delete();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
+        let instant_range = InstantRange::up_to("20250618054714114", "utc");
+        let blocks = reader.read_all_blocks(&instant_range)?;
+        assert_eq!(blocks.len(), 1);
+
+        let block = &blocks[0];
+        assert_eq!(block.format_version, LogFormatVersion::V1);
+        assert_eq!(block.block_type, BlockType::Delete);
+        assert_eq!(block.header.len(), 2);
+        assert_eq!(block.instant_time()?, "20250618054714114");
+        assert!(block.target_instant_time().is_err());
+        assert!(block.schema().is_ok());
+        assert!(block.command_block_type().is_err());
+        assert!(!block.is_data_block());
+        assert!(block.is_delete_block());
+        assert!(!block.is_rollback_block());
+        assert_eq!(
+            block.num_batches(),
+            0,
+            "No data batches expected in delete block"
+        );
+        assert_eq!(block.num_rows(), 0, "No data rows expected in delete block");
         assert!(block.footer.is_empty());
 
         Ok(())
@@ -373,7 +411,7 @@ mod tests {
         assert_eq!(block.target_instant_time()?, "20250126040826878");
         assert!(block.schema().is_err());
         assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
-        assert!(block.record_batches.is_empty());
+        assert!(block.record_batches.has_rows());
         assert!(block.footer.is_empty());
 
         Ok(())
