@@ -60,9 +60,6 @@ pub enum CoreError {
     #[error("{0}")]
     InvalidValue(String),
 
-    #[error("{0}")]
-    JsonError(#[from] serde_json::Error),
-
     #[error(transparent)]
     ParquetError(#[from] parquet::errors::ParquetError),
 
