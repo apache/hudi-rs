@@ -145,7 +145,7 @@ impl Decoder {
         let mut delete_records_reader = reader.take(delete_records_num_bytes as u64);
         let del_list_schema = avro_schema_for_delete_record_list()?;
         let delete_record_list =
-            from_avro_datum(&del_list_schema, delete_records_reader.by_ref(), None)
+            from_avro_datum(del_list_schema, delete_records_reader.by_ref(), None)
                 .map_err(CoreError::AvroError)?;
 
         // Extract delete records from the parsed Avro value
