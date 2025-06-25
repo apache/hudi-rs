@@ -70,10 +70,6 @@ impl RecordBatches {
         record_batches
     }
 
-    pub fn has_rows(&self) -> bool {
-        self.num_data_rows == 0 && self.num_delete_rows == 0
-    }
-
     pub fn num_data_batches(&self) -> usize {
         self.data_batches.len()
     }

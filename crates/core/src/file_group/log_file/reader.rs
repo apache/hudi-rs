@@ -268,6 +268,7 @@ mod tests {
     use super::*;
     use crate::file_group::log_file::log_block::CommandBlock;
     use crate::storage::util::parse_uri;
+    use apache_avro::schema::Schema as AvroSchema;
     use std::fs::canonicalize;
     use std::path::PathBuf;
 
@@ -371,25 +372,48 @@ mod tests {
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250618054714114", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.len(), 1, "Expected one delete block");
 
         let block = &blocks[0];
-        assert_eq!(block.format_version, LogFormatVersion::V1);
-        assert_eq!(block.block_type, BlockType::Delete);
-        assert_eq!(block.header.len(), 2);
-        assert_eq!(block.instant_time()?, "20250618054714114");
-        assert!(block.target_instant_time().is_err());
-        assert!(block.schema().is_ok());
-        assert!(block.command_block_type().is_err());
+        assert_eq!(
+            block.format_version,
+            LogFormatVersion::V1,
+            "Expected V1 format version"
+        );
+        assert_eq!(
+            block.block_type,
+            BlockType::Delete,
+            "Expected Delete block type"
+        );
         assert!(!block.is_data_block());
         assert!(block.is_delete_block());
         assert!(!block.is_rollback_block());
-        assert_eq!(
-            block.num_batches(),
-            0,
-            "No data batches expected in delete block"
+
+        // check header
+        assert_eq!(block.header.len(), 2);
+        assert_eq!(block.instant_time()?, "20250618054714114");
+        assert!(
+            block.target_instant_time().is_err(),
+            "Target instant time should not be available for delete block"
         );
-        assert_eq!(block.num_rows(), 0, "No data rows expected in delete block");
+        let schema = block.schema()?;
+        let schema = AvroSchema::parse_str(schema)?;
+        assert_eq!(
+            schema.name().unwrap().to_string(),
+            "hoodie.v6_trips_8i3d.v6_trips_8i3d_record"
+        );
+        assert!(
+            block.command_block_type().is_err(),
+            "Command block type should not be available for delete block"
+        );
+
+        // Check record batches
+        assert_eq!(block.record_batches.num_data_batches(), 0);
+        assert_eq!(block.record_batches.num_delete_batches(), 1);
+        assert_eq!(block.record_batches.num_data_rows(), 0);
+        assert_eq!(block.record_batches.num_delete_rows(), 3);
+
+        // Check footer
         assert!(block.footer.is_empty());
 
         Ok(())
@@ -401,17 +425,45 @@ mod tests {
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250126040936578", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.len(), 1, "Expected one rollback block");
 
         let block = &blocks[0];
-        assert_eq!(block.format_version, LogFormatVersion::V1);
-        assert_eq!(block.block_type, BlockType::Command);
-        assert_eq!(block.header.len(), 3);
+        assert_eq!(
+            block.format_version,
+            LogFormatVersion::V1,
+            "Expected V1 format version"
+        );
+        assert_eq!(
+            block.block_type,
+            BlockType::Command,
+            "Expected Command block type for rollback"
+        );
+        assert!(!block.is_data_block());
+        assert!(!block.is_delete_block());
+        assert!(block.is_rollback_block());
+
+        // check header
+        assert_eq!(
+            block.header.len(),
+            3,
+            "Expected 3 header entries for rollback block"
+        );
         assert_eq!(block.instant_time()?, "20250126040936578");
         assert_eq!(block.target_instant_time()?, "20250126040826878");
-        assert!(block.schema().is_err());
+        assert_eq!(
+            block.schema().unwrap_err().to_string(),
+            "Schema not found",
+            "Schema should not be available for rollback block"
+        );
         assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
-        assert!(block.record_batches.has_rows());
+
+        // Check record batches
+        assert_eq!(block.record_batches.num_data_batches(), 0);
+        assert_eq!(block.record_batches.num_delete_batches(), 0);
+        assert_eq!(block.record_batches.num_data_rows(), 0);
+        assert_eq!(block.record_batches.num_delete_rows(), 0);
+
+        // Check footer
         assert!(block.footer.is_empty());
 
         Ok(())

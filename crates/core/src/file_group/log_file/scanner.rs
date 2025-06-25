@@ -59,9 +59,11 @@ impl LogFileScanner {
             for block in &blocks {
                 match block.block_type {
                     BlockType::AvroData | BlockType::ParquetData => {
-                        num_data_batches += block.num_batches();
+                        num_data_batches += block.record_batches.num_data_batches();
                     }
-                    BlockType::Delete => num_delete_batches += block.num_batches(),
+                    BlockType::Delete => {
+                        num_delete_batches += block.record_batches.num_delete_batches()
+                    }
                     BlockType::Command => {
                         if block.is_rollback_block() {
                             rollback_targets.insert(block.target_instant_time()?.to_string());

@@ -224,14 +224,6 @@ impl LogBlock {
     pub fn is_rollback_block(&self) -> bool {
         matches!(self.command_block_type(), Ok(CommandBlock::Rollback))
     }
-
-    pub fn num_batches(&self) -> usize {
-        self.record_batches.num_data_batches()
-    }
-
-    pub fn num_rows(&self) -> usize {
-        self.record_batches.num_data_rows()
-    }
 }
 
 #[cfg(test)]
