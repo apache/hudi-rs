@@ -111,8 +111,11 @@ impl RecordBatches {
         concat_batches(&schema, &self.data_batches).map_err(CoreError::ArrowError)
     }
 
-    pub fn concat_delete_batches(&self, hudi_configs: Arc<HudiConfigs>) -> Result<RecordBatch> {
-        let ordering_val_field_name = hudi_configs
+    pub fn concat_delete_batches_transformed(
+        &self,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Result<RecordBatch> {
+        let ordering_field = hudi_configs
             .get(HudiTableConfig::PrecombineField)?
             .to::<String>();
 
@@ -120,18 +123,43 @@ impl RecordBatches {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
         }
 
-        let delete_schema = Self::transform_delete_batch_schema(
-            self.data_batches[0].schema(),
-            &ordering_val_field_name,
-        );
         let mut delete_batches = Vec::with_capacity(self.delete_batches.len());
         for (batch, instant_time) in &self.delete_batches {
-            let batch =
-                Self::transform_delete_record_batch(batch, instant_time, &ordering_val_field_name)?;
+            let batch = Self::transform_delete_record_batch(batch, instant_time, &ordering_field)?;
             delete_batches.push(batch);
         }
 
+        let delete_schema =
+            Self::transform_delete_batch_schema(self.data_batches[0].schema(), &ordering_field);
         concat_batches(&delete_schema, &delete_batches).map_err(CoreError::ArrowError)
+    }
+
+    fn transform_delete_record_batch(
+        batch: &RecordBatch,
+        commit_time: &str,
+        ordering_field: &str,
+    ) -> Result<RecordBatch> {
+        let num_rows = batch.num_rows();
+
+        // Create the new _hoodie_commit_time column
+        let commit_time_array =
+            Arc::new(StringArray::from(vec![commit_time.to_string(); num_rows]));
+
+        // Get the original column data directly by position
+        let record_key_array = batch.column(0).clone(); // recordKey at pos 0
+        let partition_path_array = batch.column(1).clone(); // partitionPath at pos 1
+        let ordering_val_array = batch.column(2).clone(); // orderingVal at pos 2
+
+        // Create new columns vector with the new order
+        let new_columns = vec![
+            commit_time_array,
+            record_key_array,
+            partition_path_array,
+            ordering_val_array,
+        ];
+
+        let new_schema = Self::transform_delete_batch_schema(batch.schema(), ordering_field);
+        RecordBatch::try_new(new_schema, new_columns).map_err(CoreError::ArrowError)
     }
 
     fn transform_delete_batch_schema(
@@ -161,34 +189,5 @@ impl RecordBatches {
             )),
         ];
         SchemaRef::from(Schema::new(new_fields))
-    }
-
-    fn transform_delete_record_batch(
-        batch: &RecordBatch,
-        commit_time: &str,
-        ordering_val_field_name: &str,
-    ) -> Result<RecordBatch> {
-        let num_rows = batch.num_rows();
-
-        // Create the new _hoodie_commit_time column
-        let commit_time_array =
-            Arc::new(StringArray::from(vec![commit_time.to_string(); num_rows]));
-
-        // Get the original column data directly by position
-        let record_key_array = batch.column(0).clone(); // recordKey at pos 0
-        let partition_path_array = batch.column(1).clone(); // partitionPath at pos 1
-        let ordering_val_array = batch.column(2).clone(); // orderingVal at pos 2
-
-        // Create new columns vector with the new order
-        let new_columns = vec![
-            commit_time_array,
-            record_key_array,
-            partition_path_array,
-            ordering_val_array,
-        ];
-
-        let new_schema =
-            Self::transform_delete_batch_schema(batch.schema(), ordering_val_field_name);
-        RecordBatch::try_new(new_schema, new_columns).map_err(CoreError::ArrowError)
     }
 }

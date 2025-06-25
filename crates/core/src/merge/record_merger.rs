@@ -126,8 +126,8 @@ impl RecordMerger {
                     if record_batches.num_delete_rows() == 0 {
                         HashMap::new()
                     } else {
-                        let delete_batch =
-                            record_batches.concat_delete_batches(self.hudi_configs.clone())?;
+                        let delete_batch = record_batches
+                            .concat_delete_batches_transformed(self.hudi_configs.clone())?;
                         let mut delete_orderings: HashMap<OwnedRow, MaxOrderingInfo> =
                             HashMap::with_capacity(delete_batch.num_rows());
                         process_batch_for_max_orderings(

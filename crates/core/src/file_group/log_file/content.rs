@@ -23,7 +23,7 @@ use crate::file_group::log_file::avro::AvroDataBlockContentReader;
 use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
-use crate::schema::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
+use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
 use crate::Result;
 use apache_avro::{from_avro_datum, Schema as AvroSchema};
 use bytes::Bytes;
