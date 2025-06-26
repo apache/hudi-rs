@@ -143,7 +143,7 @@ mod tests {
 
     // Helper function to create a test data RecordBatch
     fn create_test_data_batch(num_rows: usize) -> RecordBatch {
-        create_test_data_batch_with_ordering_field(num_rows, "value")
+        create_test_data_batch_with_ordering_field(num_rows, "ord_val")
     }
 
     fn create_test_data_batch_with_ordering_field(
@@ -509,7 +509,7 @@ mod tests {
         let record_batches = RecordBatches::new();
         let hudi_configs = Arc::new(HudiConfigs::new([(
             HudiTableConfig::PrecombineField.as_ref(),
-            "orderingVal",
+            "any_ordering_field",
         )]));
 
         let result = record_batches
@@ -525,7 +525,7 @@ mod tests {
         let mut record_batches = RecordBatches::new();
 
         // Need at least one data batch for schema reference
-        let ordering_field = "ord_val";
+        let ordering_field = "seq_num";
         record_batches.push_data_batch(create_test_data_batch_with_ordering_field(
             1,
             ordering_field,
@@ -544,21 +544,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.num_rows(), 3);
-        assert_eq!(result.num_columns(), 3); // commit_time, record_key, partition_path
+        assert_eq!(result.num_columns(), 4); // commit_time, record_key, partition_path, seq_num
 
         // Check schema field names
         let schema = result.schema();
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
+        assert_eq!(schema.field(3).name(), ordering_field);
     }
 
     #[test]
     fn test_concat_delete_batches_transformed_multiple() {
         let mut record_batches = RecordBatches::new();
 
+        let ordering_field = "seq_num";
         // Need at least one data batch for schema reference
-        record_batches.push_data_batch(create_test_data_batch(1));
+        record_batches.push_data_batch(create_test_data_batch_with_ordering_field(
+            1,
+            ordering_field,
+        ));
 
         // Add multiple delete batches
         record_batches.push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
@@ -567,7 +572,7 @@ mod tests {
 
         let hudi_configs = Arc::new(HudiConfigs::new([(
             HudiTableConfig::PrecombineField.as_ref(),
-            "value",
+            ordering_field,
         )]));
 
         let result = record_batches
@@ -575,7 +580,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.num_rows(), 6); // 2 + 3 + 1
-        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.num_columns(), 4);
 
         // Verify all commit times are preserved correctly
         let commit_time_array = result
@@ -602,12 +607,16 @@ mod tests {
         let mut record_batches = RecordBatches::new();
 
         // Create data batch with custom ordering field
-        record_batches.push_data_batch(create_test_data_batch(1));
+        let ordering_field = "custom_ordering_field";
+        record_batches.push_data_batch(create_test_data_batch_with_ordering_field(
+            1,
+            ordering_field,
+        ));
         record_batches.push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
 
         let hudi_configs = Arc::new(HudiConfigs::new([(
             HudiTableConfig::PrecombineField.as_ref(),
-            "custom_ts",
+            ordering_field,
         )]));
 
         let result = record_batches
@@ -619,6 +628,7 @@ mod tests {
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
+        assert_eq!(schema.field(3).name(), ordering_field);
     }
 
     #[test]
