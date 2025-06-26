@@ -28,6 +28,13 @@ pub fn create_record_key_converter(schema: SchemaRef) -> Result<RowConverter> {
     create_row_converter(schema, [MetaField::RecordKey.as_ref()])
 }
 
+pub fn create_event_time_ordering_converter(
+    schema: SchemaRef,
+    ordering_field: &str,
+) -> Result<RowConverter> {
+    create_row_converter(schema, [ordering_field])
+}
+
 pub fn create_commit_time_ordering_converter(schema: SchemaRef) -> Result<RowConverter> {
     create_row_converter(schema, [MetaField::CommitTime.as_ref()])
 }
@@ -36,6 +43,17 @@ pub fn extract_record_keys(converter: &RowConverter, batch: &RecordBatch) -> Res
     let columns = get_column_arrays(batch, [MetaField::RecordKey.as_ref()])?;
     converter
         .convert_columns(&columns)
+        .map_err(CoreError::ArrowError)
+}
+
+pub fn extract_event_time_ordering_values(
+    converter: &RowConverter,
+    batch: &RecordBatch,
+    ordering_field: &str,
+) -> Result<Rows> {
+    let ordering_columns = get_column_arrays(batch, [ordering_field])?;
+    converter
+        .convert_columns(&ordering_columns)
         .map_err(CoreError::ArrowError)
 }
 

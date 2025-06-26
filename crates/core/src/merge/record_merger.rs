@@ -27,8 +27,9 @@ use crate::merge::ordering::{process_batch_for_max_orderings, MaxOrderingInfo};
 use crate::merge::RecordMergeStrategyValue;
 use crate::metadata::meta_field::MetaField;
 use crate::record::{
-    create_commit_time_ordering_converter, create_record_key_converter,
-    extract_commit_time_ordering_values, extract_record_keys,
+    create_commit_time_ordering_converter, create_event_time_ordering_converter,
+    create_record_key_converter, extract_commit_time_ordering_values,
+    extract_event_time_ordering_values, extract_record_keys,
 };
 use crate::util::arrow::lexsort_to_indices;
 use crate::util::arrow::ColumnAsArray;
@@ -111,15 +112,18 @@ impl RecordMerger {
                 let ordering_field = self.hudi_configs.get(PrecombineField)?.to::<String>();
                 let ordering_array = data_batch.get_array(&ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
-                let sorted_indices =
+                let desc_indices =
                     lexsort_to_indices(&[key_array, ordering_array, commit_seqno_array], true);
 
                 // Create shared converters for record keys and ordering values
                 let key_converter = create_record_key_converter(data_batch.schema())?;
-                let ordering_converter =
+                let ordering_field = self.hudi_configs.get(PrecombineField)?.to::<String>();
+                let event_time_converter =
+                    create_event_time_ordering_converter(data_batch.schema(), &ordering_field)?;
+                let commit_time_converter =
                     create_commit_time_ordering_converter(data_batch.schema())?;
 
-                // Process the delete batches to get the max ordering of each delete
+                // Process the delete batches to get the max ordering of each deleting key
                 let delete_orderings: HashMap<OwnedRow, MaxOrderingInfo> =
                     if record_batches.num_delete_rows() == 0 {
                         HashMap::new()
@@ -131,9 +135,10 @@ impl RecordMerger {
                         process_batch_for_max_orderings(
                             &delete_batch,
                             &mut delete_orderings,
-                            true,
                             &key_converter,
-                            &ordering_converter,
+                            &event_time_converter,
+                            &commit_time_converter,
+                            self.hudi_configs.clone(),
                         )?;
                         delete_orderings
                     };
@@ -142,25 +147,33 @@ impl RecordMerger {
                 let mut keep_mask_builder = BooleanArray::builder(num_records);
 
                 let record_keys = extract_record_keys(&key_converter, &data_batch)?;
-                let ordering_values =
-                    extract_commit_time_ordering_values(&ordering_converter, &data_batch)?;
+                let event_times = extract_event_time_ordering_values(
+                    &event_time_converter,
+                    &data_batch,
+                    &ordering_field,
+                )?;
+                let commit_times =
+                    extract_commit_time_ordering_values(&commit_time_converter, &data_batch)?;
 
                 let mut last_key: Option<Row> = None;
                 for i in 0..num_records {
                     // Iterator over sorted indices to process records in desc order
-                    let idx = sorted_indices.value(i) as usize;
-                    let current_key = record_keys.row(idx);
-                    let current_ordering = ordering_values.row(idx);
+                    let idx = desc_indices.value(i) as usize;
+                    let curr_key = record_keys.row(idx);
+                    let curr_event_time = event_times.row(idx);
+                    let curr_commit_time = commit_times.row(idx);
 
-                    let first_seen = last_key != Some(current_key);
+                    let first_seen = last_key != Some(curr_key);
                     if first_seen {
-                        last_key = Some(current_key);
+                        last_key = Some(curr_key);
 
-                        let should_keep = match delete_orderings.get(&current_key.owned()) {
+                        let should_keep = match delete_orderings.get(&curr_key.owned()) {
                             Some(delete_max_ordering) => {
-                                // If the record's ordering >= its delete ordering, keep it.
-                                // Otherwise, it's deleted and it should not be kept.
-                                current_ordering >= delete_max_ordering.ordering_value()
+                                // If the delete ordering is not greater than the record's ordering,
+                                // we keep the record.
+                                // Otherwise, we discard it as the delete is more recent.
+                                !delete_max_ordering
+                                    .is_greater_than(curr_event_time, curr_commit_time)
                             }
                             None => true, // There is no delete for this key, keep it.
                         };
@@ -176,7 +189,7 @@ impl RecordMerger {
                 // Filter the sorted indices based on the keep mask
                 // then take the records
                 let keep_mask = keep_mask_builder.finish();
-                let keep_indices = arrow::compute::filter(&sorted_indices, &keep_mask)?;
+                let keep_indices = arrow::compute::filter(&desc_indices, &keep_mask)?;
                 Ok(take_record_batch(&data_batch, &keep_indices)?)
             }
         }

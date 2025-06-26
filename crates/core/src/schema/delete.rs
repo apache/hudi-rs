@@ -128,13 +128,10 @@ pub fn avro_schema_for_delete_record_list() -> Result<&'static AvroSchema> {
 }
 
 /// Transforms a RecordBatch representing delete records into a new RecordBatch
-///
-/// ## Notes
-/// `ordering_field` is ignored as the delete ordering is determined by the commit time.
 pub fn transform_delete_record_batch(
     batch: &RecordBatch,
     commit_time: &str,
-    _ordering_field: &str,
+    ordering_field: &str,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
 
@@ -144,9 +141,15 @@ pub fn transform_delete_record_batch(
     // Get the original column data directly by position
     let record_key_array = batch.column(0).clone(); // recordKey at pos 0
     let partition_path_array = batch.column(1).clone(); // partitionPath at pos 1
+    let ordering_val_array = batch.column(2).clone(); // orderingVal at pos 2
 
     // Create new columns vector with the new order
-    let new_columns = vec![commit_time_array, record_key_array, partition_path_array];
+    let new_columns = vec![
+        commit_time_array,
+        record_key_array,
+        partition_path_array,
+        ordering_val_array,
+    ];
 
     let new_fields = vec![
         Arc::new(Field::new(
@@ -163,6 +166,11 @@ pub fn transform_delete_record_batch(
             MetaField::PartitionPath.as_ref(),
             DataType::Utf8,
             true,
+        )),
+        Arc::new(Field::new(
+            ordering_field,
+            batch.schema().field(2).data_type().clone(),
+            batch.schema().field(2).is_nullable(),
         )),
     ];
     let new_schema = SchemaRef::from(Schema::new(new_fields));
@@ -305,7 +313,7 @@ mod tests {
         }
     }
 
-    fn create_test_schema() -> SchemaRef {
+    fn create_test_delete_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("recordKey", DataType::Utf8, false),
             Field::new("partitionPath", DataType::Utf8, true),
@@ -314,8 +322,8 @@ mod tests {
     }
 
     // Helper function to create a test RecordBatch
-    fn create_test_record_batch() -> RecordBatch {
-        let schema = create_test_schema();
+    fn create_test_delete_record_batch() -> RecordBatch {
+        let schema = create_test_delete_schema();
 
         let record_keys = Arc::new(StringArray::from(vec!["key1", "key2", "key3"]));
         let partition_paths = Arc::new(StringArray::from(vec![
@@ -329,8 +337,8 @@ mod tests {
     }
 
     // Helper function to create empty RecordBatch
-    fn create_empty_record_batch() -> RecordBatch {
-        let schema = create_test_schema();
+    fn create_empty_delete_record_batch() -> RecordBatch {
+        let schema = create_test_delete_schema();
 
         let record_keys = Arc::new(StringArray::from(Vec::<&str>::new()));
         let partition_paths = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
@@ -341,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_transform_delete_record_batch_basic() {
-        let batch = create_test_record_batch();
+        let batch = create_test_delete_record_batch();
         let commit_time = "20240101000000";
         let ordering_field = "sequenceNumber";
 
@@ -350,14 +358,15 @@ mod tests {
         // Check number of rows preserved
         assert_eq!(result.num_rows(), 3);
 
-        // Check number of columns (should be 4: commit_time + original 3)
-        assert_eq!(result.num_columns(), 3);
+        // Check number of columns (should be 4: commit_time + original 2 + renamed ordering field)
+        assert_eq!(result.num_columns(), 4);
 
         // Check schema field names
         let schema = result.schema();
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
+        assert_eq!(schema.field(3).name(), ordering_field);
 
         // Check commit_time column values
         let commit_time_array = result
@@ -389,11 +398,21 @@ mod tests {
         assert_eq!(partition_path_array.value(0), "path1");
         assert_eq!(partition_path_array.value(1), "path2");
         assert_eq!(partition_path_array.value(2), "path3");
+
+        // Check ordering value column values preserved
+        let ordering_val_array = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ordering_val_array.value(0), 100);
+        assert_eq!(ordering_val_array.value(1), 200);
+        assert_eq!(ordering_val_array.value(2), 300);
     }
 
     #[test]
     fn test_transform_delete_record_batch_empty() {
-        let batch = create_empty_record_batch();
+        let batch = create_empty_delete_record_batch();
         let commit_time = "20240101000000";
         let ordering_field = "sequenceNumber";
 
@@ -401,27 +420,28 @@ mod tests {
 
         // Check empty batch handling
         assert_eq!(result.num_rows(), 0);
-        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.num_columns(), 4);
 
         // Check schema is still correct
         let schema = result.schema();
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
+        assert_eq!(schema.field(3).name(), "sequenceNumber");
 
         // Check all arrays are empty
-        for i in 0..3 {
+        for i in 0..4 {
             assert_eq!(result.column(i).len(), 0);
         }
     }
 
     #[test]
     fn test_commit_time_values() {
-        let batch = create_test_record_batch();
+        let batch = create_test_delete_record_batch();
         let commit_times = ["20240101000000", "20231225123045", "20240630235959"];
 
         for commit_time in commit_times {
-            let result = transform_delete_record_batch(&batch, commit_time, "orderingVal").unwrap();
+            let result = transform_delete_record_batch(&batch, commit_time, "seq").unwrap();
 
             let commit_time_array = result
                 .column(0)
