@@ -16,4 +16,20 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::error::{CoreError, Result};
+use crate::metadata::meta_field::MetaField;
+use arrow_schema::{Schema, SchemaRef};
+
 pub mod delete;
+
+pub fn prepend_meta_fields(schema: SchemaRef) -> Result<Schema> {
+    let meta_field_schema = MetaField::schema();
+    Schema::try_merge([meta_field_schema.as_ref().clone(), schema.as_ref().clone()])
+        .map_err(CoreError::ArrowError)
+}
+
+pub fn prepend_meta_fields_with_operation(schema: SchemaRef) -> Result<Schema> {
+    let meta_field_schema = MetaField::schema_with_operation();
+    Schema::try_merge([meta_field_schema.as_ref().clone(), schema.as_ref().clone()])
+        .map_err(CoreError::ArrowError)
+}

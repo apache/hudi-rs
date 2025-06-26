@@ -20,16 +20,18 @@ pub mod instant;
 pub(crate) mod selector;
 pub(crate) mod util;
 
+use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
 use crate::metadata::HUDI_METADATA_DIR;
+use crate::schema::prepend_meta_fields;
 use crate::storage::Storage;
 use crate::timeline::instant::Action;
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
-use arrow_schema::Schema;
+use arrow_schema::{Schema, SchemaRef};
 use instant::Instant;
 use log::debug;
 use serde_json::{Map, Value};
@@ -236,9 +238,9 @@ impl Timeline {
         )
     }
 
-    /// Get the latest Avro schema string from the [Timeline].
-    pub async fn get_latest_avro_schema(&self) -> Result<String> {
-        let commit_metadata = self.get_latest_commit_metadata().await?;
+    fn extract_avro_schema_from_commit_metadata(
+        commit_metadata: &Map<String, Value>,
+    ) -> Option<String> {
         commit_metadata
             .get("extraMetadata")
             .and_then(|v| v.as_object())
@@ -247,16 +249,33 @@ impl Timeline {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             })
-            .ok_or_else(|| {
-                CoreError::CommitMetadata(
-                    "Failed to resolve the latest schema: no schema found".to_string(),
-                )
-            })
+    }
+
+    /// Get the latest Avro schema string from the [Timeline].
+    pub async fn get_latest_avro_schema(&self) -> Result<String> {
+        let commit_metadata = self.get_latest_commit_metadata().await?;
+        Self::extract_avro_schema_from_commit_metadata(&commit_metadata).ok_or_else(|| {
+            CoreError::CommitMetadata(
+                "Failed to resolve the latest schema: no schema found".to_string(),
+            )
+        })
     }
 
     /// Get the latest [arrow_schema::Schema] from the [Timeline].
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
+
+        if let Some(avro_schema) = Self::extract_avro_schema_from_commit_metadata(&commit_metadata)
+        {
+            let avro_schema = apache_avro::schema::Schema::parse_str(&avro_schema)?;
+            let arrow_schema = to_arrow_schema(&avro_schema).map_err(|e| {
+                CoreError::CommitMetadata(format!(
+                    "Failed to convert the latest Avro schema: {}",
+                    e
+                ))
+            })?;
+            return prepend_meta_fields(SchemaRef::new(arrow_schema));
+        }
 
         let first_partition = commit_metadata
             .get("partitionToWriteStats")
