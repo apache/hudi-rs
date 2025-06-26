@@ -22,21 +22,28 @@ use crate::config::table::HudiTableConfig::{
     PopulatesMetaFields, PrecombineField, RecordMergeStrategy,
 };
 use crate::config::HudiConfigs;
+use crate::file_group::record_batches::RecordBatches;
+use crate::merge::ordering::{process_batch_for_max_orderings, MaxOrderingInfo};
 use crate::merge::RecordMergeStrategyValue;
 use crate::metadata::meta_field::MetaField;
+use crate::record::{
+    create_commit_time_ordering_converter, create_record_key_converter,
+    extract_commit_time_ordering_values, extract_record_keys,
+};
 use crate::util::arrow::lexsort_to_indices;
 use crate::util::arrow::ColumnAsArray;
 use crate::Result;
-use arrow::compute::take_record_batch;
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_row::{OwnedRow, Row};
 use arrow_schema::SchemaRef;
-use arrow_select::concat::concat_batches;
+use arrow_select::take::take_record_batch;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct RecordMerger {
+    pub schema: SchemaRef,
     pub hudi_configs: Arc<HudiConfigs>,
 }
 
@@ -75,19 +82,14 @@ impl RecordMerger {
         Ok(())
     }
 
-    pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
-        Self { hudi_configs }
+    pub fn new(schema: SchemaRef, hudi_configs: Arc<HudiConfigs>) -> Self {
+        Self {
+            schema,
+            hudi_configs,
+        }
     }
 
-    pub fn merge_record_batches(
-        &self,
-        schema: &SchemaRef,
-        batches: &[RecordBatch],
-    ) -> Result<RecordBatch> {
-        if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(schema.clone()));
-        }
-
+    pub fn merge_record_batches(&self, record_batches: RecordBatches) -> Result<RecordBatch> {
         let merge_strategy = self
             .hudi_configs
             .get_or_default(RecordMergeStrategy)
@@ -95,44 +97,87 @@ impl RecordMerger {
         let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
         match merge_strategy {
             RecordMergeStrategyValue::AppendOnly => {
-                let concat_batch = concat_batches(schema, batches)?;
-                Ok(concat_batch)
+                record_batches.concat_data_batches(self.schema.clone())
             }
             RecordMergeStrategyValue::OverwriteWithLatest => {
-                let concat_batch = concat_batches(schema, batches)?;
-                if concat_batch.num_rows() == 0 {
-                    return Ok(concat_batch);
+                let data_batch = record_batches.concat_data_batches(self.schema.clone())?;
+                let num_records = data_batch.num_rows();
+                if num_records == 0 {
+                    return Ok(data_batch.clone());
                 }
 
-                let precombine_field = self.hudi_configs.get(PrecombineField)?.to::<String>();
-                let precombine_array = concat_batch.get_array(&precombine_field)?;
-                let commit_seqno_array = concat_batch.get_array(MetaField::CommitSeqno.as_ref())?;
-                let sorted_indices = lexsort_to_indices(
-                    &[precombine_array.clone(), commit_seqno_array.clone()],
-                    true,
-                );
+                // Use sorting fields to get sorted indices of the data batch (inserts and updates)
+                let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
+                let ordering_field = self.hudi_configs.get(PrecombineField)?.to::<String>();
+                let ordering_array = data_batch.get_array(&ordering_field)?;
+                let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
+                let sorted_indices =
+                    lexsort_to_indices(&[key_array, ordering_array, commit_seqno_array], true);
 
-                let record_key_array =
-                    concat_batch.get_string_array(MetaField::RecordKey.as_ref())?;
-                let mut keys_and_latest_indices: HashMap<&str, u32> =
-                    HashMap::with_capacity(record_key_array.len());
-                for i in sorted_indices.values() {
-                    let record_key = record_key_array.value(*i as usize);
-                    if keys_and_latest_indices.contains_key(record_key) {
-                        // We sorted the precombine and commit seqno in descending order,
-                        // so if the record key is already in the map, the associated row index
-                        // will be already pointing to the latest version of that record.
-                        // Note that records with the same record key, precombine value,
-                        // and commit seqno are considered duplicates, and we keep whichever
-                        // comes first in the sorted indices.
-                        continue;
+                // Create shared converters for record keys and ordering values
+                let key_converter = create_record_key_converter(data_batch.schema())?;
+                let ordering_converter =
+                    create_commit_time_ordering_converter(data_batch.schema())?;
+
+                // Process the delete batches to get the max ordering of each delete
+                let delete_orderings: HashMap<OwnedRow, MaxOrderingInfo> =
+                    if record_batches.num_delete_rows() == 0 {
+                        HashMap::new()
                     } else {
-                        keys_and_latest_indices.insert(record_key, *i);
+                        let delete_batch = record_batches
+                            .concat_delete_batches_transformed(self.hudi_configs.clone())?;
+                        let mut delete_orderings: HashMap<OwnedRow, MaxOrderingInfo> =
+                            HashMap::with_capacity(delete_batch.num_rows());
+                        process_batch_for_max_orderings(
+                            &delete_batch,
+                            &mut delete_orderings,
+                            true,
+                            &key_converter,
+                            &ordering_converter,
+                        )?;
+                        delete_orderings
+                    };
+
+                // Build a mask for records that should be kept
+                let mut keep_mask_builder = BooleanArray::builder(num_records);
+
+                let record_keys = extract_record_keys(&key_converter, &data_batch)?;
+                let ordering_values =
+                    extract_commit_time_ordering_values(&ordering_converter, &data_batch)?;
+
+                let mut last_key: Option<Row> = None;
+                for i in 0..num_records {
+                    // Iterator over sorted indices to process records in desc order
+                    let idx = sorted_indices.value(i) as usize;
+                    let current_key = record_keys.row(idx);
+                    let current_ordering = ordering_values.row(idx);
+
+                    let first_seen = last_key != Some(current_key);
+                    if first_seen {
+                        last_key = Some(current_key);
+
+                        let should_keep = match delete_orderings.get(&current_key.owned()) {
+                            Some(delete_max_ordering) => {
+                                // If the record's ordering >= its delete ordering, keep it.
+                                // Otherwise, it's deleted and it should not be kept.
+                                current_ordering >= delete_max_ordering.ordering_value()
+                            }
+                            None => true, // There is no delete for this key, keep it.
+                        };
+
+                        keep_mask_builder.append_value(should_keep);
+                    } else {
+                        // If the record is not first seen,
+                        // we don't keep it as its latest version has been processed.
+                        keep_mask_builder.append_value(false);
                     }
                 }
-                let latest_indices: UInt32Array =
-                    keys_and_latest_indices.values().copied().collect();
-                Ok(take_record_batch(&concat_batch, &latest_indices)?)
+
+                // Filter the sorted indices based on the keep mask
+                // then take the records
+                let keep_mask = keep_mask_builder.finish();
+                let keep_indices = arrow::compute::filter(&sorted_indices, &keep_mask)?;
+                Ok(take_record_batch(&data_batch, &keep_indices)?)
             }
         }
     }
@@ -142,7 +187,7 @@ impl RecordMerger {
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
     fn create_configs(
         strategy: &str,
@@ -193,6 +238,7 @@ mod tests {
 
     fn create_test_schema(ts_nullable: bool) -> SchemaRef {
         create_schema(vec![
+            (MetaField::CommitTime.as_ref(), DataType::Utf8, false),
             (MetaField::CommitSeqno.as_ref(), DataType::Utf8, false),
             (MetaField::RecordKey.as_ref(), DataType::Utf8, false),
             ("ts", DataType::Int32, ts_nullable),
@@ -200,7 +246,10 @@ mod tests {
         ])
     }
 
-    fn get_sorted_rows(batch: &RecordBatch) -> Vec<(String, String, i32, i32)> {
+    fn get_sorted_rows(batch: &RecordBatch) -> Vec<(String, String, String, i32, i32)> {
+        let commit_time = batch
+            .get_string_array(MetaField::CommitTime.as_ref())
+            .unwrap();
         let seqno = batch
             .get_string_array(MetaField::CommitSeqno.as_ref())
             .unwrap();
@@ -220,13 +269,15 @@ mod tests {
             .unwrap()
             .clone();
 
-        let mut result: Vec<(String, String, i32, i32)> = seqno
+        let mut result: Vec<(String, String, String, i32, i32)> = commit_time
             .iter()
+            .zip(seqno.iter())
             .zip(keys.iter())
             .zip(timestamps.iter())
             .zip(values.iter())
-            .map(|(((s, k), t), v)| {
+            .map(|((((c, s), k), t), v)| {
                 (
+                    c.unwrap().to_string(),
                     s.unwrap().to_string(),
                     k.unwrap().to_string(),
                     t.unwrap(),
@@ -234,7 +285,7 @@ mod tests {
                 )
             })
             .collect();
-        result.sort_unstable_by_key(|(s, k, ts, _)| (k.clone(), *ts, s.clone()));
+        result.sort_unstable_by_key(|(c, s, k, ts, _)| (k.clone(), *ts, c.clone(), s.clone()));
         result
     }
 
@@ -243,17 +294,16 @@ mod tests {
         let schema = create_test_schema(false);
 
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        let merger = RecordMerger::new(Arc::new(configs));
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
 
         // Test empty input
-        let empty_result = merger.merge_record_batches(&schema, &[]).unwrap();
+        let empty_result = merger.merge_record_batches(RecordBatches::new()).unwrap();
         assert_eq!(empty_result.num_rows(), 0);
 
         // Test single empty batch
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let single_empty_result = merger
-            .merge_record_batches(&schema, &[empty_batch])
-            .unwrap();
+        let empty_batches = RecordBatches::new_with_data_batches([empty_batch]);
+        let single_empty_result = merger.merge_record_batches(empty_batches).unwrap();
         assert_eq!(single_empty_result.num_rows(), 0);
     }
 
@@ -265,6 +315,7 @@ mod tests {
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec!["c1", "c1"])),
                 Arc::new(StringArray::from(vec!["s1", "s1"])),
                 Arc::new(StringArray::from(vec!["k1", "k2"])),
                 Arc::new(Int32Array::from(vec![1, 2])),
@@ -277,6 +328,7 @@ mod tests {
         let batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec!["c2", "c2"])),
                 Arc::new(StringArray::from(vec!["s2", "s2"])),
                 Arc::new(StringArray::from(vec!["k1", "k3"])),
                 Arc::new(Int32Array::from(vec![3, 4])),
@@ -286,9 +338,9 @@ mod tests {
         .unwrap();
 
         let configs = create_configs("APPEND_ONLY", false, None);
-        let merger = RecordMerger::new(Arc::new(configs));
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
         let merged = merger
-            .merge_record_batches(&schema, &[batch1, batch2])
+            .merge_record_batches(RecordBatches::new_with_data_batches([batch1, batch2]))
             .unwrap();
 
         // Should contain all records in order without deduplication
@@ -298,10 +350,10 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                ("s1".to_string(), "k1".to_string(), 1, 10),
-                ("s2".to_string(), "k1".to_string(), 3, 30),
-                ("s1".to_string(), "k2".to_string(), 2, 20),
-                ("s2".to_string(), "k3".to_string(), 4, 40),
+                ("c1".to_string(), "s1".to_string(), "k1".to_string(), 1, 10),
+                ("c2".to_string(), "s2".to_string(), "k1".to_string(), 3, 30),
+                ("c1".to_string(), "s1".to_string(), "k2".to_string(), 2, 20),
+                ("c2".to_string(), "s2".to_string(), "k3".to_string(), 4, 40),
             ]
         );
     }
@@ -314,6 +366,7 @@ mod tests {
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec!["c1", "c1", "c1"])),
                 Arc::new(StringArray::from(vec!["s1", "s1", "s1"])),
                 Arc::new(StringArray::from(vec!["k1", "k2", "k3"])),
                 Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
@@ -326,6 +379,7 @@ mod tests {
         let batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec!["c2", "c2"])),
                 Arc::new(StringArray::from(vec!["s2", "s2"])),
                 Arc::new(StringArray::from(vec!["k1", "k2"])),
                 Arc::new(Int32Array::from(vec![None, Some(5)])),
@@ -335,10 +389,9 @@ mod tests {
         .unwrap();
 
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        let merger = RecordMerger::new(Arc::new(configs));
-        let merged = merger
-            .merge_record_batches(&schema, &[batch1, batch2])
-            .unwrap();
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let batches = RecordBatches::new_with_data_batches([batch1, batch2]);
+        let merged = merger.merge_record_batches(batches).unwrap();
 
         assert_eq!(merged.num_rows(), 3);
 
@@ -346,9 +399,9 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                ("s1".to_string(), "k1".to_string(), 1, 10), // Keep original since ts is null in 2nd batch
-                ("s2".to_string(), "k2".to_string(), 5, 50), // Take second value due to higher ts
-                ("s1".to_string(), "k3".to_string(), 3, 30), // Unchanged
+                ("c1".to_string(), "s1".to_string(), "k1".to_string(), 1, 10), // Keep original since ts is null in 2nd batch
+                ("c2".to_string(), "s2".to_string(), "k2".to_string(), 5, 50), // Take second value due to higher ts
+                ("c1".to_string(), "s1".to_string(), "k3".to_string(), 3, 30), // Unchanged
             ]
         );
     }
@@ -361,6 +414,7 @@ mod tests {
         let batch1 = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec!["c1", "c1", "c1"])),
                 Arc::new(StringArray::from(vec!["s1", "s1", "s1"])),
                 Arc::new(StringArray::from(vec!["k1", "k2", "k3"])),
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
@@ -373,6 +427,7 @@ mod tests {
         let batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(vec!["c2", "c2", "c2"])),
                 Arc::new(StringArray::from(vec!["s2", "s2", "s2"])),
                 Arc::new(StringArray::from(vec!["k1", "k2", "k3"])),
                 Arc::new(Int32Array::from(vec![4, 1, 3])),
@@ -382,10 +437,9 @@ mod tests {
         .unwrap();
 
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        let merger = RecordMerger::new(Arc::new(configs));
-        let merged = merger
-            .merge_record_batches(&schema, &[batch1, batch2])
-            .unwrap();
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let batches = RecordBatches::new_with_data_batches([batch1, batch2]);
+        let merged = merger.merge_record_batches(batches).unwrap();
 
         assert_eq!(merged.num_rows(), 3);
 
@@ -393,9 +447,9 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                ("s2".to_string(), "k1".to_string(), 4, 40), // Latest value due to ts=4
-                ("s1".to_string(), "k2".to_string(), 2, 20), // Original value since ts=1 < ts=2
-                ("s2".to_string(), "k3".to_string(), 3, 60), // Latest value due to equal ts and seqno=s2
+                ("c2".to_string(), "s2".to_string(), "k1".to_string(), 4, 40), // Latest value due to ts=4
+                ("c1".to_string(), "s1".to_string(), "k2".to_string(), 2, 20), // Original value since ts=1 < ts=2
+                ("c2".to_string(), "s2".to_string(), "k3".to_string(), 3, 60), // Latest value due to equal ts and seqno=s2
             ]
         );
     }

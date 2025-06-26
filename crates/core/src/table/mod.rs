@@ -1332,7 +1332,7 @@ mod tests {
         }
 
         #[test]
-        fn test_quickstart_trips_table() -> Result<()> {
+        fn test_quickstart_trips_table_inserts_updates() -> Result<()> {
             let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
             let hudi_table = Table::new_blocking(base_url.path())?;
 
@@ -1374,6 +1374,52 @@ mod tests {
                 "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
             );
             assert_eq!(uuid_rider_and_fare[0].2, 33.9);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_quickstart_trips_table_inserts_deletes() -> Result<()> {
+            let base_url = QuickstartTripsTable::V6Trips8I3D.url_to_mor_avro();
+            let hudi_table = Table::new_blocking(base_url.path())?;
+
+            let deleted_riders = ["rider-A", "rider-C", "rider-D"];
+
+            // verify deleted record as of the latest commit
+            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+            let riders = QuickstartTripsTable::uuid_rider_and_fare(&records)
+                .into_iter()
+                .map(|(_, rider, _)| rider)
+                .collect::<Vec<_>>();
+            assert!(riders
+                .iter()
+                .all(|rider| { !deleted_riders.contains(&rider.as_str()) }));
+
+            // verify deleted record as of the first commit
+            let commit_timestamps = hudi_table
+                .timeline
+                .completed_commits
+                .iter()
+                .map(|i| i.timestamp.as_str())
+                .collect::<Vec<_>>();
+            let first_commit = commit_timestamps[0];
+            let records = hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
+            let schema = &records[0].schema();
+            let records = concat_batches(schema, &records)?;
+            let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
+                .into_iter()
+                .filter(|(_, rider, _)| deleted_riders.contains(&rider.as_str()))
+                .collect::<Vec<_>>();
+            uuid_rider_and_fare.sort_unstable_by_key(|(_, rider, _)| rider.to_string());
+            assert_eq!(uuid_rider_and_fare.len(), 3);
+            assert_eq!(uuid_rider_and_fare[0].1, "rider-A");
+            assert_eq!(uuid_rider_and_fare[0].2, 19.10);
+            assert_eq!(uuid_rider_and_fare[1].1, "rider-C");
+            assert_eq!(uuid_rider_and_fare[1].2, 27.70);
+            assert_eq!(uuid_rider_and_fare[2].1, "rider-D");
+            assert_eq!(uuid_rider_and_fare[2].2, 33.90);
 
             Ok(())
         }

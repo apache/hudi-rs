@@ -25,6 +25,7 @@ pub mod builder;
 pub mod file_slice;
 pub mod log_file;
 pub mod reader;
+pub mod record_batches;
 
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;

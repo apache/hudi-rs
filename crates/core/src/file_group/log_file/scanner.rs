@@ -17,12 +17,12 @@
  * under the License.
  */
 use crate::config::HudiConfigs;
-use crate::file_group::log_file::log_block::LogBlock;
+use crate::file_group::log_file::log_block::{BlockType, LogBlock};
 use crate::file_group::log_file::reader::LogFileReader;
+use crate::file_group::record_batches::RecordBatches;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
 use crate::Result;
-use arrow_array::RecordBatch;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -44,9 +44,11 @@ impl LogFileScanner {
         &self,
         relative_paths: Vec<String>,
         instant_range: &InstantRange,
-    ) -> Result<Vec<Vec<RecordBatch>>> {
+    ) -> Result<RecordBatches> {
         let mut all_blocks: Vec<Vec<LogBlock>> = Vec::with_capacity(relative_paths.len());
         let mut rollback_targets: HashSet<String> = HashSet::new();
+        let mut num_data_batches = 0;
+        let mut num_delete_batches = 0;
 
         // collect all blocks and rollback targets
         for path in relative_paths {
@@ -55,27 +57,51 @@ impl LogFileScanner {
             let blocks = reader.read_all_blocks(instant_range)?;
 
             for block in &blocks {
-                if block.is_rollback_block() {
-                    rollback_targets.insert(block.target_instant_time()?.to_string());
+                match block.block_type {
+                    BlockType::AvroData | BlockType::ParquetData => {
+                        num_data_batches += block.record_batches.num_data_batches();
+                    }
+                    BlockType::Delete => {
+                        num_delete_batches += block.record_batches.num_delete_batches()
+                    }
+                    BlockType::Command => {
+                        if block.is_rollback_block() {
+                            rollback_targets.insert(block.target_instant_time()?.to_string());
+                        }
+                    }
+                    _ => {
+                        return Err(crate::error::CoreError::LogBlockError(format!(
+                            "Unexpected block type: {:?}",
+                            block.block_type
+                        )));
+                    }
                 }
             }
 
-            // only rollback and parquet data blocks are supported
-            // TODO: support more block types
             // push the whole vector to avoid cloning
+            // since we pre-allocate the capacity
+            // based on the number of relative paths
             all_blocks.push(blocks);
         }
 
         // collect valid record batches
-        let mut record_batches: Vec<Vec<RecordBatch>> = Vec::new();
+        let mut batches = RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
         for blocks in all_blocks {
             for block in blocks {
+                if block.is_rollback_block() {
+                    // Skip rollback blocks which contain no record batches
+                    continue;
+                }
+
                 if !rollback_targets.contains(block.instant_time()?) {
-                    record_batches.push(block.record_batches);
+                    batches.extend(block.record_batches);
+                } else {
+                    // If the block is a rollback target, we skip it
+                    // as it indicates that the data is no longer valid.
                 }
             }
         }
 
-        Ok(record_batches)
+        Ok(batches)
     }
 }

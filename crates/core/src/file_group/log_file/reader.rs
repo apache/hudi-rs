@@ -268,22 +268,31 @@ mod tests {
     use super::*;
     use crate::file_group::log_file::log_block::CommandBlock;
     use crate::storage::util::parse_uri;
+    use apache_avro::schema::Schema as AvroSchema;
     use std::fs::canonicalize;
     use std::path::PathBuf;
 
-    fn get_valid_log_avro() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_avro");
+    fn get_valid_log_avro_data() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
         (
             canonicalize(dir).unwrap().to_str().unwrap().to_string(),
             ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string(),
         )
     }
 
-    fn get_valid_log_parquet() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_parquet");
+    fn get_valid_log_parquet_data() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_parquet_data");
         (
             canonicalize(dir).unwrap().to_str().unwrap().to_string(),
             ".ee2ace10-7667-40f5-9848-0a144b5ea064-0_20250113230302428.log.1_0-188-387".to_string(),
+        )
+    }
+
+    fn get_valid_log_delete() -> (String, String) {
+        let dir = PathBuf::from("tests/data/log_files/valid_log_delete");
+        (
+            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            ".6d3d1d6e-2298-4080-a0c1-494877d6f40a-0_20250618054711154.log.1_0-26-85".to_string(),
         )
     }
 
@@ -300,14 +309,14 @@ mod tests {
         file_name: &str,
     ) -> Result<LogFileReader<StorageReader>> {
         let dir_url = parse_uri(dir)?;
-        let hudi_configs = Arc::new(HudiConfigs::empty());
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::PrecombineField, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
         LogFileReader::new(hudi_configs, storage, file_name).await
     }
 
     #[tokio::test]
     async fn test_read_log_file_with_avro_data_block() -> Result<()> {
-        let (dir, file_name) = get_valid_log_avro();
+        let (dir, file_name) = get_valid_log_avro_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250316025828811", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
@@ -322,7 +331,7 @@ mod tests {
         assert!(block.schema().is_ok());
         assert!(block.command_block_type().is_err());
 
-        let batches = block.record_batches.as_slice();
+        let batches = block.record_batches.data_batches.as_slice();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
 
@@ -333,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_log_file_with_parquet_data_block() -> Result<()> {
-        let (dir, file_name) = get_valid_log_parquet();
+        let (dir, file_name) = get_valid_log_parquet_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250113230424191", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
@@ -348,10 +357,63 @@ mod tests {
         assert!(block.schema().is_ok());
         assert!(block.command_block_type().is_err());
 
-        let batches = block.record_batches.as_slice();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
+        let batches = &block.record_batches;
+        assert_eq!(batches.num_data_batches(), 1);
+        assert_eq!(batches.num_data_rows(), 1);
 
+        assert!(block.footer.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_log_file_with_delete_block() -> Result<()> {
+        let (dir, file_name) = get_valid_log_delete();
+        let mut reader = create_log_file_reader(&dir, &file_name).await?;
+        let instant_range = InstantRange::up_to("20250618054714114", "utc");
+        let blocks = reader.read_all_blocks(&instant_range)?;
+        assert_eq!(blocks.len(), 1, "Expected one delete block");
+
+        let block = &blocks[0];
+        assert_eq!(
+            block.format_version,
+            LogFormatVersion::V1,
+            "Expected V1 format version"
+        );
+        assert_eq!(
+            block.block_type,
+            BlockType::Delete,
+            "Expected Delete block type"
+        );
+        assert!(!block.is_data_block());
+        assert!(block.is_delete_block());
+        assert!(!block.is_rollback_block());
+
+        // check header
+        assert_eq!(block.header.len(), 2);
+        assert_eq!(block.instant_time()?, "20250618054714114");
+        assert!(
+            block.target_instant_time().is_err(),
+            "Target instant time should not be available for delete block"
+        );
+        let schema = block.schema()?;
+        let schema = AvroSchema::parse_str(schema)?;
+        assert_eq!(
+            schema.name().unwrap().to_string(),
+            "hoodie.v6_trips_8i3d.v6_trips_8i3d_record"
+        );
+        assert!(
+            block.command_block_type().is_err(),
+            "Command block type should not be available for delete block"
+        );
+
+        // Check record batches
+        assert_eq!(block.record_batches.num_data_batches(), 0);
+        assert_eq!(block.record_batches.num_delete_batches(), 1);
+        assert_eq!(block.record_batches.num_data_rows(), 0);
+        assert_eq!(block.record_batches.num_delete_rows(), 3);
+
+        // Check footer
         assert!(block.footer.is_empty());
 
         Ok(())
@@ -363,17 +425,45 @@ mod tests {
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250126040936578", "utc");
         let blocks = reader.read_all_blocks(&instant_range)?;
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.len(), 1, "Expected one rollback block");
 
         let block = &blocks[0];
-        assert_eq!(block.format_version, LogFormatVersion::V1);
-        assert_eq!(block.block_type, BlockType::Command);
-        assert_eq!(block.header.len(), 3);
+        assert_eq!(
+            block.format_version,
+            LogFormatVersion::V1,
+            "Expected V1 format version"
+        );
+        assert_eq!(
+            block.block_type,
+            BlockType::Command,
+            "Expected Command block type for rollback"
+        );
+        assert!(!block.is_data_block());
+        assert!(!block.is_delete_block());
+        assert!(block.is_rollback_block());
+
+        // check header
+        assert_eq!(
+            block.header.len(),
+            3,
+            "Expected 3 header entries for rollback block"
+        );
         assert_eq!(block.instant_time()?, "20250126040936578");
         assert_eq!(block.target_instant_time()?, "20250126040826878");
-        assert!(block.schema().is_err());
+        assert_eq!(
+            block.schema().unwrap_err().to_string(),
+            "Schema not found",
+            "Schema should not be available for rollback block"
+        );
         assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
-        assert!(block.record_batches.is_empty());
+
+        // Check record batches
+        assert_eq!(block.record_batches.num_data_batches(), 0);
+        assert_eq!(block.record_batches.num_delete_batches(), 0);
+        assert_eq!(block.record_batches.num_data_rows(), 0);
+        assert_eq!(block.record_batches.num_delete_rows(), 0);
+
+        // Check footer
         assert!(block.footer.is_empty());
 
         Ok(())

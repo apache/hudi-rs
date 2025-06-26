@@ -1,0 +1,46 @@
+{
+  "namespace": "org.apache.hudi.avro.model",
+  "type": "record",
+  "name": "HoodieDeleteRecord",
+  "doc": "For a single delete record stored in the delete block in log block version 3",
+  "fields": [
+    {
+      "name": "recordKey",
+      "doc": "Record key in String",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "partitionPath",
+      "doc": "Partition path in String",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "orderingVal",
+      "doc": "Ordering value determining the order of merging on the same key",
+      "type": [
+        "null",
+        "int",
+        "long",
+        "float",
+        "double",
+        "bytes",
+        "string",
+        { "type": "bytes", "logicalType": "decimal", "precision":  30, "scale": 15 },
+        { "type": "int", "logicalType": "date" },
+        { "type": "int", "logicalType": "time-millis" },
+        { "type": "long", "logicalType": "time-micros" },
+        { "type": "long", "logicalType": "timestamp-millis" },
+        { "type": "long", "logicalType": "timestamp-micros" }
+      ],
+      "default": null
+    }
+  ]
+}

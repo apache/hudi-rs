@@ -25,6 +25,7 @@ header:
     - 'NOTICE'
     - '**/data/**'
     - '.github/PULL_REQUEST_TEMPLATE.md'
+    - 'crates/core/schemas/**'
 
   comment: on-failure
 

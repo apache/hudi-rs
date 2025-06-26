@@ -22,9 +22,10 @@ use crate::error::CoreError;
 use crate::file_group::log_file::avro::AvroDataBlockContentReader;
 use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
 use crate::file_group::log_file::log_format::LogFormatVersion;
+use crate::file_group::record_batches::RecordBatches;
+use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
 use crate::Result;
-use apache_avro::Schema as AvroSchema;
-use arrow_array::RecordBatch;
+use apache_avro::{from_avro_datum, Schema as AvroSchema};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use std::collections::HashMap;
@@ -51,7 +52,7 @@ impl Decoder {
         fallback_length: u64,
         block_type: &BlockType,
         header: &HashMap<BlockMetadataKey, String>,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<RecordBatches> {
         let content_length = if log_format_version.has_content_length() {
             let mut content_length_buf = [0u8; 8];
             reader.read_exact(&mut content_length_buf)?;
@@ -60,63 +61,154 @@ impl Decoder {
             fallback_length
         };
 
-        let mut reader = reader.by_ref().take(content_length);
+        let reader = reader.by_ref().take(content_length);
         match block_type {
-            BlockType::AvroData => {
-                let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
-                    CoreError::LogBlockError("Schema not found in block header".to_string())
-                })?;
-                let writer_schema = AvroSchema::parse_str(writer_schema)?;
-                self.decode_avro_record_content(reader, &writer_schema)
-            }
-            BlockType::ParquetData => self.decode_parquet_record_content(&mut reader),
-            BlockType::Command => Ok(Vec::new()),
+            BlockType::AvroData => self.decode_avro_record_content(reader, header),
+            BlockType::ParquetData => self.decode_parquet_record_content(reader),
+            BlockType::Delete => self.decode_delete_record_content(reader, header),
+            BlockType::Command => Ok(RecordBatches::new()),
             _ => Err(CoreError::LogBlockError(format!(
                 "Unsupported block type: {block_type:?}"
             ))),
         }
     }
 
+    fn validate_log_format_version(mut reader: impl Read) -> Result<()> {
+        let mut format_version_buf = [0u8; 4];
+        reader.read_exact(&mut format_version_buf)?;
+        let format_version = u32::from_be_bytes(format_version_buf);
+        let version = LogFormatVersion::try_from(format_version)?;
+        if version != LogFormatVersion::V3 {
+            return Err(CoreError::LogBlockError(format!(
+                "Only support log format version {} but got: {format_version}",
+                LogFormatVersion::V3 as u32
+            )));
+        }
+        Ok(())
+    }
+
     fn decode_avro_record_content(
         &self,
         mut reader: impl Read,
-        writer_schema: &AvroSchema,
-    ) -> Result<Vec<RecordBatch>> {
-        let mut format_version = [0u8; 4];
-        reader.read_exact(&mut format_version)?;
-        let format_version = u32::from_be_bytes(format_version);
-        if format_version != 3 {
-            return Err(CoreError::LogBlockError(format!(
-                "Unsupported delete record format version: {format_version}"
-            )));
-        }
+        header: &HashMap<BlockMetadataKey, String>,
+    ) -> Result<RecordBatches> {
+        Decoder::validate_log_format_version(&mut reader)?;
 
-        let mut record_count = [0u8; 4];
-        reader.read_exact(&mut record_count)?;
-        let record_count = u32::from_be_bytes(record_count);
+        let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+            CoreError::LogBlockError("Schema not found in block header".to_string())
+        })?;
+        let writer_schema = Arc::new(AvroSchema::parse_str(writer_schema)?);
+
+        let mut record_count_buf = [0u8; 4];
+        reader.read_exact(&mut record_count_buf)?;
+        let record_count = u32::from_be_bytes(record_count_buf);
 
         let record_content_reader =
-            AvroDataBlockContentReader::new(reader, writer_schema, record_count);
+            AvroDataBlockContentReader::new(reader, writer_schema.as_ref(), record_count);
         let mut avro_arrow_array_reader =
-            AvroArrowArrayReader::try_new(record_content_reader, writer_schema, None)?;
-        let mut batches = Vec::new();
+            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref(), None)?;
+        let mut batches =
+            RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
         while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
             let batch = batch.map_err(CoreError::ArrowError)?;
-            batches.push(batch);
+            batches.push_data_batch(batch);
         }
         Ok(batches)
     }
 
-    fn decode_parquet_record_content(&self, mut reader: impl Read) -> Result<Vec<RecordBatch>> {
+    fn decode_parquet_record_content(&self, mut reader: impl Read) -> Result<RecordBatches> {
         let mut content_bytes = Vec::new();
         reader.read_to_end(&mut content_bytes)?;
         let content_bytes = Bytes::from(content_bytes);
         let parquet_reader = ParquetRecordBatchReader::try_new(content_bytes, self.batch_size)?;
-        let mut batches = Vec::new();
+        let mut batches = RecordBatches::new();
         for item in parquet_reader {
             let batch = item.map_err(CoreError::ArrowError)?;
-            batches.push(batch);
+            batches.push_data_batch(batch);
         }
+        Ok(batches)
+    }
+
+    fn decode_delete_record_content(
+        &self,
+        mut reader: impl Read,
+        header: &HashMap<BlockMetadataKey, String>,
+    ) -> Result<RecordBatches> {
+        Decoder::validate_log_format_version(&mut reader)?;
+
+        // Read delete keys byte length
+        let mut delete_records_num_bytes = [0u8; 4];
+        reader.read_exact(&mut delete_records_num_bytes)?;
+        let delete_records_num_bytes = u32::from_be_bytes(delete_records_num_bytes);
+
+        // Read and parse delete keys as Avro
+        let mut delete_records_reader = reader.take(delete_records_num_bytes as u64);
+        let del_list_schema = avro_schema_for_delete_record_list()?;
+        let delete_record_list =
+            from_avro_datum(del_list_schema, delete_records_reader.by_ref(), None)
+                .map_err(CoreError::AvroError)?;
+
+        // Extract delete records from the parsed Avro value
+        let delete_records = {
+            let fields = match delete_record_list {
+                apache_avro::types::Value::Record(fields) => fields,
+                _ => {
+                    return Err(CoreError::LogBlockError(
+                        "Expected record type for delete record list".to_string(),
+                    ))
+                }
+            };
+
+            if fields.len() != 1 {
+                return Err(CoreError::LogBlockError(format!(
+                    "Expected one field in delete record list, got {}",
+                    fields.len()
+                )));
+            }
+
+            let (field_name, field_value) = &fields[0];
+            if field_name != "deleteRecordList" {
+                return Err(CoreError::LogBlockError(format!(
+                    "Expected field name 'deleteRecordList', got '{}'",
+                    field_name
+                )));
+            }
+
+            match field_value {
+                // TODO make a specialized AvroArrowArrayReader for delete block to take &[Value] so we don't need to clone here
+                apache_avro::types::Value::Array(arr) => arr.clone(),
+                _ => {
+                    return Err(CoreError::LogBlockError(
+                        "Expected 'deleteRecordList' to be an array type".to_string(),
+                    ))
+                }
+            }
+        };
+
+        if delete_records.is_empty() {
+            return Ok(RecordBatches::new());
+        }
+
+        // Generate schema based on the first delete record
+        let first_record = &delete_records[0];
+        let delete_record_schema = avro_schema_for_delete_record(first_record)?;
+
+        let num_delete_batches = delete_records.len() / self.batch_size + 1;
+        let mut batches = RecordBatches::new_with_capacity(0, num_delete_batches);
+        let mut reader = AvroArrowArrayReader::try_new(
+            delete_records.into_iter().map(Ok),
+            &delete_record_schema,
+            None,
+        )?;
+
+        let instant_time = header.get(&BlockMetadataKey::InstantTime).ok_or_else(|| {
+            CoreError::LogBlockError("Instant time not found in block header".to_string())
+        })?;
+        while let Some(batch_result) = reader.next_batch(self.batch_size) {
+            let batch = batch_result.map_err(CoreError::ArrowError)?;
+            batches.push_delete_batch(batch, instant_time.clone());
+        }
+
         Ok(batches)
     }
 }
@@ -186,14 +278,16 @@ mod tests {
         let decoder = Decoder::new(Arc::new(hudi_configs));
         let reader = Cursor::new(buf);
 
-        let batches = decoder.decode_avro_record_content(reader, &writer_schema)?;
+        let mut header = HashMap::new();
+        header.insert(BlockMetadataKey::Schema, schema_str.to_string());
+        let batches = decoder.decode_avro_record_content(reader, &header)?;
 
         // Verify results
-        assert!(!batches.is_empty(), "Should have at least one batch");
-        let batch = &batches[0];
-        assert_eq!(batch.num_rows(), 2, "Batch should have 2 rows");
+        assert_eq!(batches.num_data_batches(), 1, "Should have 1 batch");
+        assert_eq!(batches.num_data_rows(), 2, "Batch should have 2 rows");
 
         // Verify first row values
+        let batch = &batches.data_batches[0];
         let id_array = batch
             .column(0)
             .as_any()
@@ -243,8 +337,8 @@ mod tests {
         let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
 
         let batches = decoder.decode_parquet_record_content(&mut reader)?;
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(batches.num_data_batches(), 1);
+        assert_eq!(batches.num_data_rows(), 3);
 
         Ok(())
     }

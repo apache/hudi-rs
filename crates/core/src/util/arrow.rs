@@ -17,13 +17,14 @@
  * under the License.
  */
 
+use crate::error::CoreError;
 use crate::Result;
 use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
 use arrow::array::StringArray;
 use arrow_array::{Array, UInt32Array};
 use arrow_row::{RowConverter, SortField};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, SchemaRef};
 
 pub trait ColumnAsArray {
     fn get_array(&self, column_name: &str) -> Result<ArrayRef>;
@@ -66,6 +67,39 @@ pub fn lexsort_to_indices(arrays: &[ArrayRef], desc: bool) -> UInt32Array {
         sort.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
     }
     UInt32Array::from_iter_values(sort.iter().map(|(i, _)| *i as u32))
+}
+
+pub fn create_row_converter<I, S>(schema: SchemaRef, column_names: I) -> Result<RowConverter>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let sort_fields: Result<Vec<_>> = column_names
+        .into_iter()
+        .map(|col| {
+            let (_, field) = schema
+                .column_with_name(col.as_ref())
+                .ok_or_else(|| CoreError::Schema(format!("Column {} not found", col.as_ref())))?;
+            Ok(SortField::new(field.data_type().clone()))
+        })
+        .collect();
+    RowConverter::new(sort_fields?).map_err(CoreError::ArrowError)
+}
+
+pub fn get_column_arrays<I, S>(batch: &RecordBatch, column_names: I) -> Result<Vec<ArrayRef>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    column_names
+        .into_iter()
+        .map(|col| {
+            batch
+                .column_by_name(col.as_ref())
+                .cloned()
+                .ok_or_else(|| CoreError::Schema(format!("Column {} not found", col.as_ref())))
+        })
+        .collect()
 }
 
 #[cfg(test)]
