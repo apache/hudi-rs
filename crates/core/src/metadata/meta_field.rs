@@ -100,6 +100,27 @@ impl MetaField {
     pub fn schema_with_operation() -> SchemaRef {
         SCHEMA_WITH_OPERATION.clone()
     }
+
+    pub fn field_names() -> Vec<&'static str> {
+        vec![
+            MetaField::CommitTime.as_ref(),
+            MetaField::CommitSeqno.as_ref(),
+            MetaField::RecordKey.as_ref(),
+            MetaField::PartitionPath.as_ref(),
+            MetaField::FileName.as_ref(),
+        ]
+    }
+
+    pub fn field_names_with_operation() -> Vec<&'static str> {
+        vec![
+            MetaField::CommitTime.as_ref(),
+            MetaField::CommitSeqno.as_ref(),
+            MetaField::RecordKey.as_ref(),
+            MetaField::PartitionPath.as_ref(),
+            MetaField::FileName.as_ref(),
+            MetaField::Operation.as_ref(),
+        ]
+    }
 }
 
 #[cfg(test)]

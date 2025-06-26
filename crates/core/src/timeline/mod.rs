@@ -395,6 +395,7 @@ mod tests {
     use hudi_test::SampleTable;
 
     use crate::config::table::HudiTableConfig;
+    use crate::metadata::meta_field::MetaField;
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
         Timeline::new_from_storage(
@@ -469,5 +470,42 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
         assert!(err.to_string().contains("Failed to get commit metadata"));
+    }
+
+    #[tokio::test]
+    async fn get_avro_schema() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new("tests/data/timeline/commits_with_valid_schema")).unwrap(),
+        )
+        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
+
+        let avro_schema = timeline.get_latest_avro_schema().await;
+        assert!(avro_schema.is_ok());
+        assert_eq!(
+            avro_schema.unwrap(),
+            "{\"type\":\"record\",\"name\":\"v6_trips_record\",\"namespace\":\"hoodie.v6_trips\",\"fields\":[{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"uuid\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"rider\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"driver\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"fare\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}"
+        )
+    }
+
+    #[tokio::test]
+    async fn get_arrow_schema() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new("tests/data/timeline/commits_with_valid_schema")).unwrap(),
+        )
+        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
+
+        let arrow_schema = timeline.get_latest_schema().await;
+        assert!(arrow_schema.is_ok());
+        let arrow_schema = arrow_schema.unwrap();
+        let fields = arrow_schema
+            .fields
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>();
+        let mut expected_fields = MetaField::field_names();
+        expected_fields.extend_from_slice(&["ts", "uuid", "rider", "driver", "fare", "city"]);
+        assert_eq!(fields, expected_fields)
     }
 }
