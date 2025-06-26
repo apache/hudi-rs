@@ -127,10 +127,14 @@ pub fn avro_schema_for_delete_record_list() -> Result<&'static AvroSchema> {
         .map_err(|e| CoreError::Schema(e.to_string()))
 }
 
+/// Transforms a RecordBatch representing delete records into a new RecordBatch
+///
+/// ## Notes
+/// `ordering_field` is ignored as the delete ordering is determined by the commit time.
 pub fn transform_delete_record_batch(
     batch: &RecordBatch,
     commit_time: &str,
-    ordering_field: &str,
+    _ordering_field: &str,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
 
@@ -140,24 +144,10 @@ pub fn transform_delete_record_batch(
     // Get the original column data directly by position
     let record_key_array = batch.column(0).clone(); // recordKey at pos 0
     let partition_path_array = batch.column(1).clone(); // partitionPath at pos 1
-    let ordering_val_array = batch.column(2).clone(); // orderingVal at pos 2
 
     // Create new columns vector with the new order
-    let new_columns = vec![
-        commit_time_array,
-        record_key_array,
-        partition_path_array,
-        ordering_val_array,
-    ];
+    let new_columns = vec![commit_time_array, record_key_array, partition_path_array];
 
-    let new_schema = transform_delete_batch_schema(batch.schema(), ordering_field);
-    RecordBatch::try_new(new_schema, new_columns).map_err(CoreError::ArrowError)
-}
-
-pub fn transform_delete_batch_schema(
-    schema: SchemaRef,
-    ordering_val_field_name: &str,
-) -> SchemaRef {
     let new_fields = vec![
         Arc::new(Field::new(
             MetaField::CommitTime.as_ref(),
@@ -166,29 +156,24 @@ pub fn transform_delete_batch_schema(
         )),
         Arc::new(Field::new(
             MetaField::RecordKey.as_ref(),
-            schema.field(0).data_type().clone(),
+            DataType::Utf8,
             true,
         )),
         Arc::new(Field::new(
             MetaField::PartitionPath.as_ref(),
-            schema.field(1).data_type().clone(),
-            true,
-        )),
-        Arc::new(Field::new(
-            ordering_val_field_name,
-            schema.field(2).data_type().clone(),
+            DataType::Utf8,
             true,
         )),
     ];
-    SchemaRef::from(Schema::new(new_fields))
+    let new_schema = SchemaRef::from(Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_columns).map_err(CoreError::ArrowError)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use apache_avro::schema::{DecimalSchema, RecordField, RecordSchema};
-    use arrow_array::{Array, Int64Array, TimestampMicrosecondArray};
-    use arrow_schema::TimeUnit;
+    use arrow_array::{Array, Int64Array};
 
     fn validate_delete_fields(
         fields: &[RecordField],
@@ -328,18 +313,6 @@ mod tests {
         ]))
     }
 
-    fn create_test_schema_with_timestamp() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("recordKey", DataType::Utf8, false),
-            Field::new("partitionPath", DataType::Utf8, true),
-            Field::new(
-                "orderingVal",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]))
-    }
-
     // Helper function to create a test RecordBatch
     fn create_test_record_batch() -> RecordBatch {
         let schema = create_test_schema();
@@ -353,17 +326,6 @@ mod tests {
         let ordering_vals = Arc::new(Int64Array::from(vec![100, 200, 300]));
 
         RecordBatch::try_new(schema, vec![record_keys, partition_paths, ordering_vals]).unwrap()
-    }
-
-    // Helper function to create test RecordBatch with timestamp ordering
-    fn create_test_record_batch_with_timestamp() -> RecordBatch {
-        let schema = create_test_schema_with_timestamp();
-
-        let record_keys = Arc::new(StringArray::from(vec!["key1", "key2"]));
-        let partition_paths = Arc::new(StringArray::from(vec![Some("path1"), Some("path2")]));
-        let timestamps = Arc::new(TimestampMicrosecondArray::from(vec![1000000, 2000000]));
-
-        RecordBatch::try_new(schema, vec![record_keys, partition_paths, timestamps]).unwrap()
     }
 
     // Helper function to create empty RecordBatch
@@ -389,14 +351,13 @@ mod tests {
         assert_eq!(result.num_rows(), 3);
 
         // Check number of columns (should be 4: commit_time + original 3)
-        assert_eq!(result.num_columns(), 4);
+        assert_eq!(result.num_columns(), 3);
 
         // Check schema field names
         let schema = result.schema();
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
-        assert_eq!(schema.field(3).name(), ordering_field);
 
         // Check commit_time column values
         let commit_time_array = result
@@ -428,47 +389,6 @@ mod tests {
         assert_eq!(partition_path_array.value(0), "path1");
         assert_eq!(partition_path_array.value(1), "path2");
         assert_eq!(partition_path_array.value(2), "path3");
-
-        // Check ordering values preserved
-        let ordering_array = result
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ordering_array.value(0), 100);
-        assert_eq!(ordering_array.value(1), 200);
-        assert_eq!(ordering_array.value(2), 300);
-    }
-
-    #[test]
-    fn test_transform_delete_record_batch_with_timestamp() {
-        let batch = create_test_record_batch_with_timestamp();
-        let commit_time = "20240201120000";
-        let ordering_field = "ts";
-
-        let result = transform_delete_record_batch(&batch, commit_time, ordering_field).unwrap();
-
-        // Check schema types
-        let schema = result.schema();
-        assert_eq!(schema.field(0).data_type(), &DataType::Utf8); // commit_time
-        assert_eq!(schema.field(1).data_type(), &DataType::Utf8); // record_key
-        assert_eq!(schema.field(2).data_type(), &DataType::Utf8); // partition_path
-        assert_eq!(
-            schema.field(3).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        ); // timestamp ordering
-
-        // Check ordering field name
-        assert_eq!(schema.field(3).name(), "ts");
-
-        // Verify timestamp values preserved
-        let timestamp_array = result
-            .column(3)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        assert_eq!(timestamp_array.value(0), 1000000);
-        assert_eq!(timestamp_array.value(1), 2000000);
     }
 
     #[test]
@@ -481,77 +401,18 @@ mod tests {
 
         // Check empty batch handling
         assert_eq!(result.num_rows(), 0);
-        assert_eq!(result.num_columns(), 4);
+        assert_eq!(result.num_columns(), 3);
 
         // Check schema is still correct
         let schema = result.schema();
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
-        assert_eq!(schema.field(3).name(), ordering_field);
 
         // Check all arrays are empty
-        for i in 0..4 {
+        for i in 0..3 {
             assert_eq!(result.column(i).len(), 0);
         }
-    }
-
-    #[test]
-    fn test_transform_delete_batch_schema_basic() {
-        let original_schema = create_test_schema();
-
-        let ordering_field = "sequenceNumber";
-        let new_schema = transform_delete_batch_schema(original_schema.clone(), ordering_field);
-
-        // Check number of fields
-        assert_eq!(new_schema.fields().len(), 4);
-
-        // Check field names
-        assert_eq!(new_schema.field(0).name(), MetaField::CommitTime.as_ref());
-        assert_eq!(new_schema.field(1).name(), MetaField::RecordKey.as_ref());
-        assert_eq!(
-            new_schema.field(2).name(),
-            MetaField::PartitionPath.as_ref()
-        );
-        assert_eq!(new_schema.field(3).name(), ordering_field);
-
-        // Check data types are preserved from original schema
-        assert_eq!(new_schema.field(0).data_type(), &DataType::Utf8); // commit_time
-        assert_eq!(
-            new_schema.field(1).data_type(),
-            original_schema.field(0).data_type()
-        ); // record_key
-        assert_eq!(
-            new_schema.field(2).data_type(),
-            original_schema.field(1).data_type()
-        ); // partition_path
-        assert_eq!(
-            new_schema.field(3).data_type(),
-            original_schema.field(2).data_type()
-        ); // ordering_val
-
-        // Check nullability
-        assert!(new_schema.field(0).is_nullable()); // commit_time
-        assert!(new_schema.field(1).is_nullable()); // record_key
-        assert!(new_schema.field(2).is_nullable()); // partition_path
-        assert!(new_schema.field(3).is_nullable()); // ordering_val
-    }
-
-    #[test]
-    fn test_transform_delete_batch_schema_with_timestamp() {
-        let original_schema = create_test_schema_with_timestamp();
-
-        let ordering_field = "timestamp_field";
-        let new_schema = transform_delete_batch_schema(original_schema.clone(), ordering_field);
-
-        // Check timestamp type is preserved
-        assert_eq!(
-            new_schema.field(3).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-
-        // Check custom ordering field name
-        assert_eq!(new_schema.field(3).name(), "timestamp_field");
     }
 
     #[test]
@@ -572,20 +433,6 @@ mod tests {
             for i in 0..result.num_rows() {
                 assert_eq!(commit_time_array.value(i), commit_time);
             }
-        }
-    }
-
-    #[test]
-    fn test_different_ordering_field_names() {
-        let batch = create_test_record_batch();
-        let ordering_fields = ["ts", "timestamp", "ordering_value"];
-
-        for ordering_field in ordering_fields {
-            let result =
-                transform_delete_record_batch(&batch, "20240101000000", ordering_field).unwrap();
-
-            // Check that the ordering field name is correctly set
-            assert_eq!(result.schema().field(3).name(), ordering_field);
         }
     }
 }

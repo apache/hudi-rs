@@ -39,6 +39,8 @@ pub fn extract_test_table(zip_path: &Path) -> PathBuf {
 pub enum QuickstartTripsTable {
     #[strum(serialize = "v6_trips_8i1u")]
     V6Trips8I1U,
+    #[strum(serialize = "v6_trips_8i3d")]
+    V6Trips8I3D,
 }
 
 impl QuickstartTripsTable {
@@ -191,6 +193,10 @@ mod tests {
         for t in QuickstartTripsTable::iter() {
             match t {
                 QuickstartTripsTable::V6Trips8I1U => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
+                QuickstartTripsTable::V6Trips8I3D => {
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }

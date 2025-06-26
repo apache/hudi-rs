@@ -16,8 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::HudiTableConfig::PrecombineField;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::metadata::meta_field::MetaField;
 use crate::util::arrow::{create_row_converter, get_column_arrays};
@@ -25,18 +23,13 @@ use crate::Result;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, Rows};
 use arrow_schema::SchemaRef;
-use std::sync::Arc;
 
 pub fn create_record_key_converter(schema: SchemaRef) -> Result<RowConverter> {
     create_row_converter(schema, [MetaField::RecordKey.as_ref()])
 }
 
-pub fn create_event_ordering_converter(
-    schema: SchemaRef,
-    hudi_configs: Arc<HudiConfigs>,
-) -> Result<RowConverter> {
-    let ordering_field = hudi_configs.get(PrecombineField)?.to::<String>();
-    create_row_converter(schema, [&ordering_field, MetaField::CommitTime.as_ref()])
+pub fn create_commit_time_ordering_converter(schema: SchemaRef) -> Result<RowConverter> {
+    create_row_converter(schema, [MetaField::CommitTime.as_ref()])
 }
 
 pub fn extract_record_keys(converter: &RowConverter, batch: &RecordBatch) -> Result<Rows> {
@@ -46,14 +39,11 @@ pub fn extract_record_keys(converter: &RowConverter, batch: &RecordBatch) -> Res
         .map_err(CoreError::ArrowError)
 }
 
-pub fn extract_ordering_values(
+pub fn extract_commit_time_ordering_values(
     converter: &RowConverter,
     batch: &RecordBatch,
-    hudi_configs: Arc<HudiConfigs>,
 ) -> Result<Rows> {
-    let ordering_field = hudi_configs.get(PrecombineField)?.to::<String>();
-    let ordering_columns =
-        get_column_arrays(batch, [&ordering_field, MetaField::CommitTime.as_ref()])?;
+    let ordering_columns = get_column_arrays(batch, [MetaField::CommitTime.as_ref()])?;
     converter
         .convert_columns(&ordering_columns)
         .map_err(CoreError::ArrowError)

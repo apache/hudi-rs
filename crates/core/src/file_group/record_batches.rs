@@ -19,7 +19,7 @@
 use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::schema::delete::{transform_delete_batch_schema, transform_delete_record_batch};
+use crate::schema::delete::transform_delete_record_batch;
 use crate::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -119,7 +119,7 @@ impl RecordBatches {
             .get(HudiTableConfig::PrecombineField)?
             .to::<String>();
 
-        if self.num_delete_rows == 0 || self.data_batches.is_empty() {
+        if self.num_delete_rows == 0 {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
         }
 
@@ -129,9 +129,7 @@ impl RecordBatches {
             delete_batches.push(batch);
         }
 
-        let delete_schema =
-            transform_delete_batch_schema(self.data_batches[0].schema(), &ordering_field);
-        concat_batches(&delete_schema, &delete_batches).map_err(CoreError::ArrowError)
+        concat_batches(&delete_batches[0].schema(), &delete_batches).map_err(CoreError::ArrowError)
     }
 }
 
@@ -140,7 +138,7 @@ mod tests {
     use super::*;
     use crate::config::error::ConfigError;
     use crate::metadata::meta_field::MetaField;
-    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use arrow_array::{Float64Array, StringArray};
     use arrow_schema::{DataType, Field};
 
     // Helper function to create a test data RecordBatch
@@ -153,12 +151,12 @@ mod tests {
         ordering_field: &str,
     ) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, true),
             Field::new(ordering_field, DataType::Float64, false),
         ]));
 
-        let ids: Vec<i64> = (0..num_rows as i64).collect();
+        let ids: Vec<String> = (0..num_rows).map(|i| i.to_string()).collect();
         let names: Vec<Option<String>> = (0..num_rows)
             .map(|i| {
                 if i % 2 == 0 {
@@ -170,7 +168,7 @@ mod tests {
             .collect();
         let values: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.5).collect();
 
-        let id_array = Arc::new(Int64Array::from(ids));
+        let id_array = Arc::new(StringArray::from(ids));
         let name_array = Arc::new(StringArray::from(names));
         let value_array = Arc::new(Float64Array::from(values));
 
@@ -180,17 +178,17 @@ mod tests {
     // Helper function to create a test delete RecordBatch
     fn create_test_delete_batch(num_rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("recordKey", DataType::Int64, false),
+            Field::new("recordKey", DataType::Utf8, false),
             Field::new("partitionPath", DataType::Utf8, false),
             Field::new("orderingVal", DataType::Float64, false),
         ]));
 
-        let record_keys: Vec<i64> = (0..num_rows as i64).collect();
+        let record_keys: Vec<String> = (0..num_rows).map(|i| i.to_string()).collect();
         let partition_paths: Vec<String> =
             (0..num_rows).map(|i| format!("partition_{}", i)).collect();
         let ordering_vals: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.6).collect();
 
-        let record_key_array = Arc::new(Int64Array::from(record_keys));
+        let record_key_array = Arc::new(StringArray::from(record_keys));
         let partition_path_array = Arc::new(StringArray::from(partition_paths));
         let ordering_val_array = Arc::new(Float64Array::from(ordering_vals));
 
@@ -546,14 +544,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.num_rows(), 3);
-        assert_eq!(result.num_columns(), 4); // commit_time, record_key, partition_path, ordering_val
+        assert_eq!(result.num_columns(), 3); // commit_time, record_key, partition_path
 
         // Check schema field names
         let schema = result.schema();
         assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
         assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
         assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
-        assert_eq!(schema.field(3).name(), ordering_field);
     }
 
     #[test]
@@ -578,7 +575,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.num_rows(), 6); // 2 + 3 + 1
-        assert_eq!(result.num_columns(), 4);
+        assert_eq!(result.num_columns(), 3);
 
         // Verify all commit times are preserved correctly
         let commit_time_array = result
@@ -617,9 +614,11 @@ mod tests {
             .concat_delete_batches_transformed(hudi_configs)
             .unwrap();
 
-        // Check that the custom ordering field name is used
+        // Check schema field names
         let schema = result.schema();
-        assert_eq!(schema.field(3).name(), "custom_ts");
+        assert_eq!(schema.field(0).name(), MetaField::CommitTime.as_ref());
+        assert_eq!(schema.field(1).name(), MetaField::RecordKey.as_ref());
+        assert_eq!(schema.field(2).name(), MetaField::PartitionPath.as_ref());
     }
 
     #[test]

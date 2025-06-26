@@ -16,13 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::HudiConfigs;
-use crate::record::{extract_ordering_values, extract_record_keys};
+use crate::record::{extract_commit_time_ordering_values, extract_record_keys};
 use crate::Result;
 use arrow_array::RecordBatch;
 use arrow_row::{OwnedRow, Row, RowConverter};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct MaxOrderingInfo {
@@ -42,15 +40,13 @@ pub fn process_batch_for_max_orderings(
     is_delete_batch: bool,
     key_converter: &RowConverter,
     ordering_converter: &RowConverter,
-    hudi_configs: Arc<HudiConfigs>,
 ) -> Result<()> {
     if batch.num_rows() == 0 {
         return Ok(());
     }
-    println!("processing batch for max orderings: {:?}", batch);
 
     let keys = extract_record_keys(key_converter, batch)?;
-    let orderings = extract_ordering_values(ordering_converter, batch, hudi_configs.clone())?;
+    let orderings = extract_commit_time_ordering_values(ordering_converter, batch)?;
     for i in 0..batch.num_rows() {
         let key = keys.row(i).owned();
         let ordering = orderings.row(i).owned();

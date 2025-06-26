@@ -27,8 +27,8 @@ use crate::merge::ordering::{process_batch_for_max_orderings, MaxOrderingInfo};
 use crate::merge::RecordMergeStrategyValue;
 use crate::metadata::meta_field::MetaField;
 use crate::record::{
-    create_event_ordering_converter, create_record_key_converter, extract_ordering_values,
-    extract_record_keys,
+    create_commit_time_ordering_converter, create_record_key_converter,
+    extract_commit_time_ordering_values, extract_record_keys,
 };
 use crate::util::arrow::lexsort_to_indices;
 use crate::util::arrow::ColumnAsArray;
@@ -116,10 +116,8 @@ impl RecordMerger {
 
                 // Create shared converters for record keys and ordering values
                 let key_converter = create_record_key_converter(data_batch.schema())?;
-                let ordering_converter = create_event_ordering_converter(
-                    data_batch.schema(),
-                    self.hudi_configs.clone(),
-                )?;
+                let ordering_converter =
+                    create_commit_time_ordering_converter(data_batch.schema())?;
 
                 // Process the delete batches to get the max ordering of each delete
                 let delete_orderings: HashMap<OwnedRow, MaxOrderingInfo> =
@@ -136,7 +134,6 @@ impl RecordMerger {
                             true,
                             &key_converter,
                             &ordering_converter,
-                            self.hudi_configs.clone(),
                         )?;
                         delete_orderings
                     };
@@ -145,11 +142,8 @@ impl RecordMerger {
                 let mut keep_mask_builder = BooleanArray::builder(num_records);
 
                 let record_keys = extract_record_keys(&key_converter, &data_batch)?;
-                let ordering_values = extract_ordering_values(
-                    &ordering_converter,
-                    &data_batch,
-                    self.hudi_configs.clone(),
-                )?;
+                let ordering_values =
+                    extract_commit_time_ordering_values(&ordering_converter, &data_batch)?;
 
                 let mut last_key: Option<Row> = None;
                 for i in 0..num_records {
