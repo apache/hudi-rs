@@ -23,7 +23,7 @@ license.workspace = true
 rust-version.workspace = true
 keywords.workspace = true
 readme.workspace = true
-description = "Native Python binding for Apache Hudi, based on hudi-rs."
+description = "Native Python binding for Apache Hudi, based on Hudi-rs."
 homepage.workspace = true
 repository = "https://github.com/apache/hudi-rs/tree/main/python/"
 
@@ -45,7 +45,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 
 [dependencies.pyo3]
-version = "~0.23.0"
+version = "~0.23"
 features = ["extension-module", "abi3", "abi3-py39"]
 
 [lints.rust]
