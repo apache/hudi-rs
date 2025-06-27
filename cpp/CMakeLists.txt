@@ -16,7 +16,7 @@
 # under the License.
 
 cmake_minimum_required(VERSION 3.20)
-project(hudi-cpp VERSION 0.4.0)
+project(hudi-cpp VERSION 0.4.0-dev)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
