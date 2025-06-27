@@ -32,8 +32,8 @@ name = "hudi"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-hudi = { path = "../crates/hudi", version = "0.4.0" }
-hudi-test = { path = "../crates/test", version = "0.4.0" }
+hudi = { path = "../crates/hudi", version = "0.4.0-dev" }
+hudi-test = { path = "../crates/test", version = "0.4.0-dev" }
 cxx = { version = "1.0" }
 arrow = { workspace = true , features = ["ffi"]}
 arrow-array = { workspace = true , features = ["ffi"]}
