@@ -337,6 +337,8 @@ mod tests {
 
     use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
+    use hudi_core::metadata::meta_field::MetaField;
+    use hudi_test::assert_field_names_eq;
     use hudi_test::SampleTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
@@ -358,13 +360,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_empty_schema_from_empty_table() {
+    async fn test_get_create_schema_from_empty_table() {
         let table_provider =
             HudiDataSource::new_with_options(V6Empty.path_to_cow().as_str(), empty_options())
                 .await
                 .unwrap();
         let schema = table_provider.schema();
-        assert!(schema.fields().is_empty());
+        let mut expected_fields = MetaField::field_names().to_vec();
+        expected_fields.extend_from_slice(&["id", "name", "isActive"]);
+        assert_field_names_eq!(schema, expected_fields);
     }
 
     async fn register_test_table_with_session<I, K, V>(

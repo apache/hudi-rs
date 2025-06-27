@@ -233,8 +233,9 @@ impl OptionResolver {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let table_properties = parse_data_for_options(&bytes, "=")?;
 
-        // We currently treat all table properties as the highest precedence, which is valid for most cases.
-        // TODO: handle the case where the same key is present in both table properties and options
+        // Table properties on storage (hoodie.properties) should have the highest precedence,
+        // except for writer-changeable properties like enabling metadata table/indexes.
+        // TODO: return err when user-provided options conflict with table properties
         for (k, v) in table_properties {
             options.insert(k.to_string(), v.to_string());
         }

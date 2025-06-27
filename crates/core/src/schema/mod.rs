@@ -21,6 +21,7 @@ use crate::metadata::meta_field::MetaField;
 use arrow_schema::{Schema, SchemaRef};
 
 pub mod delete;
+pub mod resolver;
 
 pub fn prepend_meta_fields(schema: SchemaRef) -> Result<Schema> {
     let meta_field_schema = MetaField::schema();
@@ -28,6 +29,7 @@ pub fn prepend_meta_fields(schema: SchemaRef) -> Result<Schema> {
         .map_err(CoreError::ArrowError)
 }
 
+// TODO use this when applicable, like some table config says there is an operation field
 pub fn prepend_meta_fields_with_operation(schema: SchemaRef) -> Result<Schema> {
     let meta_field_schema = MetaField::schema_with_operation();
     Schema::try_merge([meta_field_schema.as_ref().clone(), schema.as_ref().clone()])
@@ -38,27 +40,26 @@ pub fn prepend_meta_fields_with_operation(schema: SchemaRef) -> Result<Schema> {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
+    use hudi_test::assert_field_names_eq;
     use std::sync::Arc;
 
     #[test]
     fn test_prepend_meta_fields() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, false)]);
         let new_schema = prepend_meta_fields(Arc::new(schema)).unwrap();
-        assert_eq!(new_schema.fields().len(), 6);
-
-        let field_names: Vec<_> = new_schema.fields().iter().map(|f| f.name()).collect();
-        assert_eq!(field_names[..5], MetaField::field_names());
-        assert_eq!(field_names[5], "field1");
+        assert_field_names_eq!(
+            new_schema,
+            [MetaField::field_names(), vec!["field1"]].concat()
+        )
     }
 
     #[test]
     fn test_prepend_meta_fields_with_operation() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, false)]);
         let new_schema = prepend_meta_fields_with_operation(Arc::new(schema)).unwrap();
-        assert_eq!(new_schema.fields().len(), 7);
-
-        let field_names: Vec<_> = new_schema.fields().iter().map(|f| f.name()).collect();
-        assert_eq!(field_names[..6], MetaField::field_names_with_operation());
-        assert_eq!(field_names[6], "field1");
+        assert_field_names_eq!(
+            new_schema,
+            [MetaField::field_names_with_operation(), vec!["field1"]].concat()
+        )
     }
 }

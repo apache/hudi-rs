@@ -100,6 +100,7 @@ use crate::config::HudiConfigs;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -218,8 +219,17 @@ impl Table {
     }
 
     /// Get the latest Avro schema string of the table.
+    ///
+    /// The implementation looks for the schema in the following order:
+    /// 1. Timeline commit metadata.
+    /// 2. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
+    ///
+    /// ### Note
+    ///
+    /// The schema returned does not contain Hudi's [MetaField]s,
+    /// which is different from the one returned by [Table::get_schema].
     pub async fn get_avro_schema(&self) -> Result<String> {
-        self.timeline.get_latest_avro_schema().await
+        resolve_avro_schema(self).await
     }
 
     /// Same as [Table::get_avro_schema], but blocking.
@@ -231,8 +241,13 @@ impl Table {
     }
 
     /// Get the latest [arrow_schema::Schema] of the table.
+    ///
+    /// The implementation looks for the schema in the following order:
+    /// 1. Timeline commit metadata.
+    /// 2. Base file schema.
+    /// 3. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
     pub async fn get_schema(&self) -> Result<Schema> {
-        self.timeline.get_latest_schema().await
+        resolve_schema(self).await
     }
 
     /// Same as [Table::get_schema], but blocking.
@@ -706,9 +721,10 @@ mod tests {
     };
     use crate::config::util::{empty_filters, empty_options};
     use crate::config::HUDI_CONF_DIR;
+    use crate::metadata::meta_field::MetaField;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
-    use hudi_test::SampleTable;
+    use hudi_test::{assert_field_names_eq, SampleTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -781,6 +797,37 @@ mod tests {
                 "Storage option value for key '{}' should not be empty",
                 key
             );
+        }
+    }
+
+    #[test]
+    fn hudi_table_get_schema_from_empty_table() {
+        for base_url in SampleTable::V6Empty.urls() {
+            let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+            let schema = hudi_table.get_schema_blocking().unwrap();
+            assert_field_names_eq!(
+                schema,
+                [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn hudi_table_get_avro_schema_from_empty_table() {
+        for base_url in SampleTable::V6Empty.urls() {
+            let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+            let avro_schema_str = hudi_table.get_avro_schema_blocking().unwrap();
+            let avro_schema_json =
+                serde_json::from_str::<serde_json::Value>(&avro_schema_str).unwrap();
+            let field_names: Vec<_> = avro_schema_json
+                .get("fields")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f.get("name").unwrap().as_str().unwrap())
+                .collect();
+            assert_eq!(field_names, &["id", "name", "isActive"])
         }
     }
 
