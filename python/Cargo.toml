@@ -35,7 +35,7 @@ doc = false
 [dependencies]
 hudi = { path = "../crates/hudi" }
 # arrow
-arrow = { workspace = true }
+arrow = { workspace = true, features = ["pyarrow"] }
 
 # "stdlib"
 thiserror = { workspace = true }
