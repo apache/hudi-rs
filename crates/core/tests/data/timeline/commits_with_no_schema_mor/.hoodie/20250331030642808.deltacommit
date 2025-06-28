@@ -89,6 +89,6 @@
     } ]
   },
   "compacted" : false,
-  "extraMetadata" : {},
+  "extraMetadata" : { },
   "operationType" : "UPSERT"
 }

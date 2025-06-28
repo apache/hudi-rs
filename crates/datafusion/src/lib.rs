@@ -366,9 +366,10 @@ mod tests {
                 .await
                 .unwrap();
         let schema = table_provider.schema();
-        let mut expected_fields = MetaField::field_names().to_vec();
-        expected_fields.extend_from_slice(&["id", "name", "isActive"]);
-        assert_field_names_eq!(schema, expected_fields);
+        assert_field_names_eq!(
+            schema,
+            [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
+        );
     }
 
     async fn register_test_table_with_session<I, K, V>(

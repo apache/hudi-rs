@@ -73,7 +73,7 @@ pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
         Err(CoreError::TimelineNoCommit) => {
             if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
                 let create_schema = create_schema.to::<String>();
-                Ok(clean_up_avro_schema_str(&create_schema))
+                Ok(sanitize_avro_schema_str(&create_schema))
             } else {
                 Err(CoreError::SchemaNotFound(
                     "No completed commit, and no create schema for the table.".to_string(),
@@ -172,12 +172,12 @@ async fn resolve_schema_from_base_file(
     }
 }
 
-fn clean_up_avro_schema_str(avro_schema_str: &str) -> String {
+fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
     avro_schema_str.trim().replace("\\:", ":")
 }
 
 fn arrow_schema_from_avro_schema_str(avro_schema_str: &str) -> Result<Schema> {
-    let s = clean_up_avro_schema_str(avro_schema_str);
+    let s = sanitize_avro_schema_str(avro_schema_str);
     let avro_schema = AvroSchema::parse_str(&s)
         .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema: {}", e)))?;
 

@@ -89,8 +89,6 @@
     } ]
   },
   "compacted" : false,
-  "extraMetadata" : {
-    "schema" : "{\"type\":\"record\",\"name\":\"hudi_table_record\",\"namespace\":\"hoodie.hudi_table\",\"fields\":[{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"uuid\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"rider\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"driver\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"fare\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}"
-  },
+  "extraMetadata" : { },
   "operationType" : "INSERT"
 }
