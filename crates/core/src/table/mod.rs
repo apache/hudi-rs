@@ -725,7 +725,7 @@ mod tests {
     use crate::metadata::meta_field::MetaField;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
-    use hudi_test::{assert_field_names_eq, SampleTable};
+    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -820,25 +820,19 @@ mod tests {
             let hudi_table = Table::new_blocking(base_url.path()).unwrap();
 
             // Validate the Arrow schema
-            let schema = hudi_table.get_schema_blocking().unwrap();
-            assert_field_names_eq!(
+            let schema = hudi_table.get_schema_blocking();
+            assert!(schema.is_ok());
+            let schema = schema.unwrap();
+            assert_arrow_field_names_eq!(
                 schema,
                 [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
             );
 
             // Validate the Avro schema
-            let avro_schema_str = hudi_table.get_avro_schema_blocking().unwrap();
-            let avro_schema_json =
-                serde_json::from_str::<serde_json::Value>(&avro_schema_str).unwrap();
-            let field_names: Vec<_> = avro_schema_json
-                .get("fields")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| f.get("name").unwrap().as_str().unwrap())
-                .collect();
-            assert_eq!(field_names, &["id", "name", "isActive"])
+            let avro_schema = hudi_table.get_avro_schema_blocking();
+            assert!(avro_schema.is_ok());
+            let avro_schema = avro_schema.unwrap();
+            assert_avro_field_names_eq!(&avro_schema, ["id", "name", "isActive"])
         }
     }
 
@@ -846,63 +840,49 @@ mod tests {
     fn hudi_table_get_schema() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-        let fields: Vec<String> = hudi_table
-            .get_schema_blocking()
-            .unwrap()
-            .flattened_fields()
-            .into_iter()
-            .map(|f| f.name().to_string())
-            .collect();
-        assert_eq!(
-            fields,
-            vec![
-                "_hoodie_commit_time",
-                "_hoodie_commit_seqno",
-                "_hoodie_record_key",
-                "_hoodie_partition_path",
-                "_hoodie_file_name",
-                "id",
-                "name",
-                "isActive",
-                "byteField",
-                "shortField",
-                "intField",
-                "longField",
-                "floatField",
-                "doubleField",
-                "decimalField",
-                "dateField",
-                "timestampField",
-                "binaryField",
-                "arrayField",
-                "element",
-                "arr_struct_f1",
-                "arr_struct_f2",
-                "mapField",
-                "map_field_value_struct_f1",
-                "map_field_value_struct_f2",
-                "structField",
-                "field1",
-                "field2",
-                "child_struct",
-                "child_field1",
-                "child_field2"
-            ]
+        let original_field_names = [
+            "id",
+            "name",
+            "isActive",
+            "byteField",
+            "shortField",
+            "intField",
+            "longField",
+            "floatField",
+            "doubleField",
+            "decimalField",
+            "dateField",
+            "timestampField",
+            "binaryField",
+            "arrayField",
+            "mapField",
+            "structField",
+        ];
+
+        // Check Arrow schema
+        let arrow_schema = hudi_table.get_schema_blocking();
+        assert!(arrow_schema.is_ok());
+        let arrow_schema = arrow_schema.unwrap();
+        assert_arrow_field_names_eq!(
+            arrow_schema,
+            [MetaField::field_names(), original_field_names.to_vec()].concat()
         );
+
+        // Check Avro schema
+        let avro_schema = hudi_table.get_avro_schema_blocking();
+        assert!(avro_schema.is_ok());
+        let avro_schema = avro_schema.unwrap();
+        assert_avro_field_names_eq!(&avro_schema, original_field_names);
     }
 
     #[test]
     fn hudi_table_get_partition_schema() {
         let base_url = SampleTable::V6TimebasedkeygenNonhivestyle.url_to_cow();
         let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-        let fields: Vec<String> = hudi_table
-            .get_partition_schema_blocking()
-            .unwrap()
-            .flattened_fields()
-            .into_iter()
-            .map(|f| f.name().to_string())
-            .collect();
-        assert_eq!(fields, vec!["ts_str"]);
+        let schema = hudi_table.get_partition_schema_blocking();
+        assert!(schema.is_ok());
+        let schema = schema.unwrap();
+        assert_arrow_field_names_eq!(schema, ["ts_str"]);
     }
 
     #[test]

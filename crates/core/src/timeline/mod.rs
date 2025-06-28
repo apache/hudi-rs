@@ -318,7 +318,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_test::{assert_field_names_eq, SampleTable};
+    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
@@ -398,6 +398,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_get_schema_returns_error_for_no_schema_and_write_stats() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_no_schema_and_write_stats",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
+
+        // Check Arrow schema
+        let arrow_schema = timeline.get_latest_schema().await;
+        assert!(arrow_schema.is_err());
+        assert!(matches!(arrow_schema.unwrap_err(), CoreError::CommitMetadata(_)), "Getting Arrow schema includes base file lookup, therefore expect CommitMetadata error when write stats are missing");
+
+        // Check Avro schema
+        let avro_schema = timeline.get_latest_avro_schema().await;
+        assert!(avro_schema.is_err());
+        assert!(matches!(avro_schema.unwrap_err(), CoreError::SchemaNotFound(_)), "Getting Avro schema does not include base file lookup, therefore expect SchemaNotFound error when `extraMetadata.schema` is missing");
+    }
+
+    #[tokio::test]
     async fn timeline_get_schema_from_commit_metadata() {
         let base_url = Url::from_file_path(
             canonicalize(Path::new(
@@ -412,7 +434,7 @@ mod tests {
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
-        assert_field_names_eq!(
+        assert_arrow_field_names_eq!(
             arrow_schema,
             [
                 MetaField::field_names(),
@@ -424,10 +446,11 @@ mod tests {
         // Check Avro schema
         let avro_schema = timeline.get_latest_avro_schema().await;
         assert!(avro_schema.is_ok());
-        assert_eq!(
-            avro_schema.unwrap(),
-            "{\"type\":\"record\",\"name\":\"v6_trips_record\",\"namespace\":\"hoodie.v6_trips\",\"fields\":[{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"uuid\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"rider\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"driver\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"fare\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}"
-        )
+        let avro_schema = avro_schema.unwrap();
+        assert_avro_field_names_eq!(
+            &avro_schema,
+            ["ts", "uuid", "rider", "driver", "fare", "city"]
+        );
     }
 
     #[tokio::test]
@@ -465,7 +488,7 @@ mod tests {
             let arrow_schema = timeline.get_latest_schema().await;
             assert!(arrow_schema.is_ok());
             let arrow_schema = arrow_schema.unwrap();
-            assert_field_names_eq!(
+            assert_arrow_field_names_eq!(
                 arrow_schema,
                 [
                     MetaField::field_names(),

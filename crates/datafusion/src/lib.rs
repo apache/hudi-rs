@@ -338,7 +338,7 @@ mod tests {
     use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_core::metadata::meta_field::MetaField;
-    use hudi_test::assert_field_names_eq;
+    use hudi_test::assert_arrow_field_names_eq;
     use hudi_test::SampleTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
@@ -366,7 +366,7 @@ mod tests {
                 .await
                 .unwrap();
         let schema = table_provider.schema();
-        assert_field_names_eq!(
+        assert_arrow_field_names_eq!(
             schema,
             [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
         );

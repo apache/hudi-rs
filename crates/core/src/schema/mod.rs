@@ -40,14 +40,14 @@ pub fn prepend_meta_fields_with_operation(schema: SchemaRef) -> Result<Schema> {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use hudi_test::assert_field_names_eq;
+    use hudi_test::assert_arrow_field_names_eq;
     use std::sync::Arc;
 
     #[test]
     fn test_prepend_meta_fields() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, false)]);
         let new_schema = prepend_meta_fields(Arc::new(schema)).unwrap();
-        assert_field_names_eq!(
+        assert_arrow_field_names_eq!(
             new_schema,
             [MetaField::field_names(), vec!["field1"]].concat()
         )
@@ -57,7 +57,7 @@ mod tests {
     fn test_prepend_meta_fields_with_operation() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, false)]);
         let new_schema = prepend_meta_fields_with_operation(Arc::new(schema)).unwrap();
-        assert_field_names_eq!(
+        assert_arrow_field_names_eq!(
             new_schema,
             [MetaField::field_names_with_operation(), vec!["field1"]].concat()
         )
