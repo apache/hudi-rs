@@ -398,29 +398,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_avro_schema() {
+    async fn timeline_get_schema_from_commit_metadata() {
         let base_url = Url::from_file_path(
-            canonicalize(Path::new("tests/data/timeline/commits_with_valid_schema")).unwrap(),
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_valid_schema_in_commit_metadata",
+            ))
+            .unwrap(),
         )
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
 
-        let avro_schema = timeline.get_latest_avro_schema().await;
-        assert!(avro_schema.is_ok());
-        assert_eq!(
-            avro_schema.unwrap(),
-            "{\"type\":\"record\",\"name\":\"v6_trips_record\",\"namespace\":\"hoodie.v6_trips\",\"fields\":[{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"uuid\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"rider\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"driver\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"fare\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}"
-        )
-    }
-
-    #[tokio::test]
-    async fn get_arrow_schema() {
-        let base_url = Url::from_file_path(
-            canonicalize(Path::new("tests/data/timeline/commits_with_valid_schema")).unwrap(),
-        )
-        .unwrap();
-        let timeline = create_test_timeline(base_url).await;
-
+        // Check Arrow schema
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
@@ -432,13 +420,43 @@ mod tests {
             ]
             .concat()
         );
+
+        // Check Avro schema
+        let avro_schema = timeline.get_latest_avro_schema().await;
+        assert!(avro_schema.is_ok());
+        assert_eq!(
+            avro_schema.unwrap(),
+            "{\"type\":\"record\",\"name\":\"v6_trips_record\",\"namespace\":\"hoodie.v6_trips\",\"fields\":[{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"uuid\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"rider\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"driver\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"fare\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}"
+        )
     }
 
     #[tokio::test]
-    async fn get_schema_from_base_file() {
+    async fn timeline_get_schema_from_empty_commit_metadata() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_empty_commit_metadata",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
+
+        // Check Arrow schema
+        let result = timeline.get_latest_schema().await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CoreError::CommitMetadata(_)));
+
+        // Check Avro schema
+        let result = timeline.get_latest_avro_schema().await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CoreError::CommitMetadata(_)));
+    }
+
+    #[tokio::test]
+    async fn timeline_get_schema_from_base_file() {
         let timeline_base_urls = [
-            "tests/data/timeline/commits_with_no_schema_cow",
-            "tests/data/timeline/commits_with_no_schema_mor",
+            "tests/data/timeline/commits_load_schema_from_base_file_cow",
+            "tests/data/timeline/commits_load_schema_from_base_file_mor",
         ];
         for base_url in timeline_base_urls {
             let base_url = Url::from_file_path(canonicalize(Path::new(base_url)).unwrap()).unwrap();

@@ -721,6 +721,7 @@ mod tests {
     };
     use crate::config::util::{empty_filters, empty_options};
     use crate::config::HUDI_CONF_DIR;
+    use crate::error::CoreError;
     use crate::metadata::meta_field::MetaField;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
@@ -801,21 +802,31 @@ mod tests {
     }
 
     #[test]
-    fn hudi_table_get_schema_from_empty_table() {
+    fn hudi_table_get_schema_from_empty_table_without_create_schema() {
+        let table = get_test_table_without_validation("table_props_no_create_schema");
+
+        let schema = table.get_schema_blocking();
+        assert!(schema.is_err());
+        assert!(matches!(schema.unwrap_err(), CoreError::SchemaNotFound(_)));
+
+        let schema = table.get_avro_schema_blocking();
+        assert!(schema.is_err());
+        assert!(matches!(schema.unwrap_err(), CoreError::SchemaNotFound(_)));
+    }
+
+    #[test]
+    fn hudi_table_get_schema_from_empty_table_resolves_to_table_create_schema() {
         for base_url in SampleTable::V6Empty.urls() {
             let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+            // Validate the Arrow schema
             let schema = hudi_table.get_schema_blocking().unwrap();
             assert_field_names_eq!(
                 schema,
                 [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
             );
-        }
-    }
 
-    #[test]
-    fn hudi_table_get_avro_schema_from_empty_table() {
-        for base_url in SampleTable::V6Empty.urls() {
-            let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+            // Validate the Avro schema
             let avro_schema_str = hudi_table.get_avro_schema_blocking().unwrap();
             let avro_schema_json =
                 serde_json::from_str::<serde_json::Value>(&avro_schema_str).unwrap();
