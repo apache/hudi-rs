@@ -24,7 +24,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = "^1"
-arrow = { version = "~54.1.0", features = ["pyarrow"] }
+tokio = "~1.45"
+arrow = { version = "~54.3" }
 
 hudi = { path = "../../../../crates/hudi" }
