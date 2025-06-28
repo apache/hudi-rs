@@ -30,8 +30,9 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
+use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
 use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
@@ -202,26 +203,29 @@ impl TableProvider for HudiDataSource {
 
         let base_url = self.table.base_url();
         let url = ObjectStoreUrl::parse(get_scheme_authority(&base_url))?;
-        let fsc = FileScanConfig::new(url, self.schema())
-            .with_file_groups(parquet_file_groups)
-            .with_projection(projection.cloned())
-            .with_limit(limit);
 
         let parquet_opts = TableParquetOptions {
             global: state.config_options().execution.parquet.clone(),
             column_specific_options: Default::default(),
             key_value_metadata: Default::default(),
         };
-        let mut exec_builder = ParquetExecBuilder::new_with_options(fsc, parquet_opts);
-
+        let table_schema = self.schema();
+        let mut parquet_source = ParquetSource::new(parquet_opts);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
-            let df_schema = DFSchema::try_from(self.schema())?;
+            let df_schema = DFSchema::try_from(table_schema.clone())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            exec_builder = exec_builder.with_predicate(predicate)
+            parquet_source = parquet_source.with_predicate(table_schema.clone(), predicate)
         }
 
-        Ok(exec_builder.build_arc())
+        let fsc = Arc::new(
+            FileScanConfig::new(url, table_schema, Arc::new(parquet_source))
+                .with_file_groups(parquet_file_groups)
+                .with_projection(projection.cloned())
+                .with_limit(limit),
+        );
+
+        Ok(Arc::new(DataSourceExec::new(fsc)))
     }
 
     fn supports_filters_pushdown(
