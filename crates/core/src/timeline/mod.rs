@@ -318,7 +318,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_test::SampleTable;
+    use hudi_test::{assert_field_names_eq, SampleTable};
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
@@ -424,13 +424,37 @@ mod tests {
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
-        let fields = arrow_schema
-            .fields
-            .iter()
-            .map(|f| f.name())
-            .collect::<Vec<_>>();
-        let mut expected_fields = MetaField::field_names();
-        expected_fields.extend_from_slice(&["ts", "uuid", "rider", "driver", "fare", "city"]);
-        assert_eq!(fields, expected_fields)
+        assert_field_names_eq!(
+            arrow_schema,
+            [
+                MetaField::field_names(),
+                vec!["ts", "uuid", "rider", "driver", "fare", "city"]
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schema_from_base_file() {
+        let timeline_base_urls = [
+            "tests/data/timeline/commits_with_no_schema_cow",
+            "tests/data/timeline/commits_with_no_schema_mor",
+        ];
+        for base_url in timeline_base_urls {
+            let base_url = Url::from_file_path(canonicalize(Path::new(base_url)).unwrap()).unwrap();
+            let timeline = create_test_timeline(base_url).await;
+
+            let arrow_schema = timeline.get_latest_schema().await;
+            assert!(arrow_schema.is_ok());
+            let arrow_schema = arrow_schema.unwrap();
+            assert_field_names_eq!(
+                arrow_schema,
+                [
+                    MetaField::field_names(),
+                    vec!["ts", "uuid", "rider", "driver", "fare", "city"]
+                ]
+                .concat()
+            );
+        }
     }
 }
