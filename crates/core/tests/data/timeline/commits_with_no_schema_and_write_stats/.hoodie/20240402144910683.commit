@@ -1,0 +1,6 @@
+{
+  "partitionToWriteStats" : { },
+  "compacted" : false,
+  "extraMetadata" : { },
+  "operationType" : "BULK_INSERT"
+}

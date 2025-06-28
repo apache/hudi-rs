@@ -1,0 +1,43 @@
+{
+  "partitionToWriteStats" : {
+    "city=san_francisco" : [ {
+      "fileId" : "d0304c53-6fd2-4b7a-a9d6-5ff632f79224-0",
+      "path" : "city=san_francisco/.d0304c53-6fd2-4b7a-a9d6-5ff632f79224-0_20250331030642808.log.1_0-26-85",
+      "cdcStats" : null,
+      "prevCommit" : "20250331030642808",
+      "numWrites" : 1,
+      "numDeletes" : 0,
+      "numUpdateWrites" : 1,
+      "numInserts" : 0,
+      "totalWriteBytes" : 1148,
+      "totalWriteErrors" : 0,
+      "tempPath" : null,
+      "partitionPath" : "city=san_francisco",
+      "totalLogRecords" : 0,
+      "totalLogFilesCompacted" : 0,
+      "totalLogSizeCompacted" : 0,
+      "totalUpdatedRecordsCompacted" : 0,
+      "totalLogBlocks" : 0,
+      "totalCorruptLogBlock" : 0,
+      "totalRollbackBlocks" : 0,
+      "fileSizeInBytes" : 1148,
+      "minEventTime" : null,
+      "maxEventTime" : null,
+      "runtimeStats" : {
+        "totalScanTime" : 0,
+        "totalUpsertTime" : 296,
+        "totalCreateTime" : 0
+      },
+      "logVersion" : 1,
+      "logOffset" : 0,
+      "baseFile" : "d0304c53-6fd2-4b7a-a9d6-5ff632f79224-0_0-13-60_20250331030642808.parquet",
+      "logFiles" : [ ".d0304c53-6fd2-4b7a-a9d6-5ff632f79224-0_20250331030642808.log.1_0-26-85" ],
+      "recordsStats" : {
+        "val" : null
+      }
+    } ]
+  },
+  "compacted" : false,
+  "extraMetadata" : { },
+  "operationType" : "UPSERT_PREPPED"
+}

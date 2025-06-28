@@ -42,6 +42,9 @@ pub enum CoreError {
     #[error("Data type error: {0}")]
     Schema(String),
 
+    #[error("{0}")]
+    SchemaNotFound(String),
+
     #[error("File group error: {0}")]
     FileGroup(String),
 
@@ -71,6 +74,9 @@ pub enum CoreError {
 
     #[error("Timeline error: {0}")]
     Timeline(String),
+
+    #[error("Timeline has no completed commit.")]
+    TimelineNoCommit,
 
     #[error("{0}")]
     TimestampParsingError(String),

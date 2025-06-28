@@ -65,3 +65,35 @@ pub fn set_fixed_timezone(tz: &str) {
 pub fn reset_timezone() {
     env::remove_var("TZ");
 }
+
+#[macro_export]
+macro_rules! assert_arrow_field_names_eq {
+    ($schema:expr, $expected:expr) => {{
+        let actual: Vec<_> = $schema.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(
+            actual, $expected,
+            "Schema field names do not match expected fields.\nActual: {:?}\nExpected: {:?}",
+            actual, $expected
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_avro_field_names_eq {
+    ($schema:expr, $expected:expr) => {{
+        let schema_json_value = serde_json::from_str::<serde_json::Value>($schema).unwrap();
+        let actual = schema_json_value
+            .get("fields")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.get("name").unwrap().as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, $expected,
+            "Schema field names do not match expected fields.\nActual: {:?}\nExpected: {:?}",
+            actual, $expected
+        );
+    }};
+}

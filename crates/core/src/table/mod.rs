@@ -100,6 +100,7 @@ use crate::config::HudiConfigs;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -218,8 +219,17 @@ impl Table {
     }
 
     /// Get the latest Avro schema string of the table.
+    ///
+    /// The implementation looks for the schema in the following order:
+    /// 1. Timeline commit metadata.
+    /// 2. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
+    ///
+    /// ### Note
+    ///
+    /// The schema returned does not contain Hudi's [MetaField]s,
+    /// which is different from the one returned by [Table::get_schema].
     pub async fn get_avro_schema(&self) -> Result<String> {
-        self.timeline.get_latest_avro_schema().await
+        resolve_avro_schema(self).await
     }
 
     /// Same as [Table::get_avro_schema], but blocking.
@@ -231,8 +241,13 @@ impl Table {
     }
 
     /// Get the latest [arrow_schema::Schema] of the table.
+    ///
+    /// The implementation looks for the schema in the following order:
+    /// 1. Timeline commit metadata.
+    /// 2. Base file schema.
+    /// 3. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
     pub async fn get_schema(&self) -> Result<Schema> {
-        self.timeline.get_latest_schema().await
+        resolve_schema(self).await
     }
 
     /// Same as [Table::get_schema], but blocking.
@@ -706,9 +721,11 @@ mod tests {
     };
     use crate::config::util::{empty_filters, empty_options};
     use crate::config::HUDI_CONF_DIR;
+    use crate::error::CoreError;
+    use crate::metadata::meta_field::MetaField;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
-    use hudi_test::SampleTable;
+    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -785,66 +802,87 @@ mod tests {
     }
 
     #[test]
+    fn hudi_table_get_schema_from_empty_table_without_create_schema() {
+        let table = get_test_table_without_validation("table_props_no_create_schema");
+
+        let schema = table.get_schema_blocking();
+        assert!(schema.is_err());
+        assert!(matches!(schema.unwrap_err(), CoreError::SchemaNotFound(_)));
+
+        let schema = table.get_avro_schema_blocking();
+        assert!(schema.is_err());
+        assert!(matches!(schema.unwrap_err(), CoreError::SchemaNotFound(_)));
+    }
+
+    #[test]
+    fn hudi_table_get_schema_from_empty_table_resolves_to_table_create_schema() {
+        for base_url in SampleTable::V6Empty.urls() {
+            let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+            // Validate the Arrow schema
+            let schema = hudi_table.get_schema_blocking();
+            assert!(schema.is_ok());
+            let schema = schema.unwrap();
+            assert_arrow_field_names_eq!(
+                schema,
+                [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
+            );
+
+            // Validate the Avro schema
+            let avro_schema = hudi_table.get_avro_schema_blocking();
+            assert!(avro_schema.is_ok());
+            let avro_schema = avro_schema.unwrap();
+            assert_avro_field_names_eq!(&avro_schema, ["id", "name", "isActive"])
+        }
+    }
+
+    #[test]
     fn hudi_table_get_schema() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-        let fields: Vec<String> = hudi_table
-            .get_schema_blocking()
-            .unwrap()
-            .flattened_fields()
-            .into_iter()
-            .map(|f| f.name().to_string())
-            .collect();
-        assert_eq!(
-            fields,
-            vec![
-                "_hoodie_commit_time",
-                "_hoodie_commit_seqno",
-                "_hoodie_record_key",
-                "_hoodie_partition_path",
-                "_hoodie_file_name",
-                "id",
-                "name",
-                "isActive",
-                "byteField",
-                "shortField",
-                "intField",
-                "longField",
-                "floatField",
-                "doubleField",
-                "decimalField",
-                "dateField",
-                "timestampField",
-                "binaryField",
-                "arrayField",
-                "element",
-                "arr_struct_f1",
-                "arr_struct_f2",
-                "mapField",
-                "map_field_value_struct_f1",
-                "map_field_value_struct_f2",
-                "structField",
-                "field1",
-                "field2",
-                "child_struct",
-                "child_field1",
-                "child_field2"
-            ]
+        let original_field_names = [
+            "id",
+            "name",
+            "isActive",
+            "byteField",
+            "shortField",
+            "intField",
+            "longField",
+            "floatField",
+            "doubleField",
+            "decimalField",
+            "dateField",
+            "timestampField",
+            "binaryField",
+            "arrayField",
+            "mapField",
+            "structField",
+        ];
+
+        // Check Arrow schema
+        let arrow_schema = hudi_table.get_schema_blocking();
+        assert!(arrow_schema.is_ok());
+        let arrow_schema = arrow_schema.unwrap();
+        assert_arrow_field_names_eq!(
+            arrow_schema,
+            [MetaField::field_names(), original_field_names.to_vec()].concat()
         );
+
+        // Check Avro schema
+        let avro_schema = hudi_table.get_avro_schema_blocking();
+        assert!(avro_schema.is_ok());
+        let avro_schema = avro_schema.unwrap();
+        assert_avro_field_names_eq!(&avro_schema, original_field_names);
     }
 
     #[test]
     fn hudi_table_get_partition_schema() {
         let base_url = SampleTable::V6TimebasedkeygenNonhivestyle.url_to_cow();
         let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-        let fields: Vec<String> = hudi_table
-            .get_partition_schema_blocking()
-            .unwrap()
-            .flattened_fields()
-            .into_iter()
-            .map(|f| f.name().to_string())
-            .collect();
-        assert_eq!(fields, vec!["ts_str"]);
+        let schema = hudi_table.get_partition_schema_blocking();
+        assert!(schema.is_ok());
+        let schema = schema.unwrap();
+        assert_arrow_field_names_eq!(schema, ["ts_str"]);
     }
 
     #[test]

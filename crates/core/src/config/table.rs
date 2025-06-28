@@ -56,6 +56,9 @@ pub enum HudiTableConfig {
     /// It is added as the last entry in hoodie.properties and then used to validate while reading table config.
     Checksum,
 
+    /// Avro schema used when creating the table.
+    CreateSchema,
+
     /// Database name that will be used for incremental query.
     /// If different databases have the same table name during incremental query,
     /// we can set it to limit the table name under a specific database
@@ -122,6 +125,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::BaseFileFormat => "hoodie.table.base.file.format",
             Self::BasePath => "hoodie.base.path",
             Self::Checksum => "hoodie.table.checksum",
+            Self::CreateSchema => "hoodie.table.create.schema",
             Self::DatabaseName => "hoodie.database.name",
             Self::DropsPartitionFields => "hoodie.datasource.write.drop.partition.columns",
             Self::IsHiveStylePartitioning => "hoodie.datasource.write.hive_style_partitioning",
@@ -186,6 +190,7 @@ impl ConfigParser for HudiTableConfig {
                     isize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Integer),
+            Self::CreateSchema => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::DatabaseName => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::DropsPartitionFields => get_result
                 .and_then(|v| {

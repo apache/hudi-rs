@@ -20,25 +20,24 @@ pub mod instant;
 pub(crate) mod selector;
 pub(crate) mod util;
 
-use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
 use crate::metadata::HUDI_METADATA_DIR;
-use crate::schema::prepend_meta_fields;
+use crate::schema::resolver::{
+    resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
+};
 use crate::storage::Storage;
 use crate::timeline::instant::Action;
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::Schema;
 use instant::Instant;
 use log::debug;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
@@ -214,10 +213,10 @@ impl Timeline {
             .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
     }
 
-    async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
+    pub(crate) async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
         match self.completed_commits.iter().next_back() {
             Some(instant) => self.get_instant_metadata(instant).await,
-            None => Ok(Map::new()),
+            None => Err(CoreError::TimelineNoCommit),
         }
     }
 
@@ -232,101 +231,28 @@ impl Timeline {
     ///
     /// Only completed commits are considered.
     pub fn get_latest_commit_timestamp(&self) -> Result<String> {
-        self.get_latest_commit_timestamp_as_option().map_or_else(
-            || Err(CoreError::Timeline("No commits found".to_string())),
-            |t| Ok(t.to_string()),
-        )
+        self.get_latest_commit_timestamp_as_option()
+            .map_or_else(|| Err(CoreError::TimelineNoCommit), |t| Ok(t.to_string()))
     }
 
-    fn extract_avro_schema_from_commit_metadata(
-        commit_metadata: &Map<String, Value>,
-    ) -> Option<String> {
-        commit_metadata
-            .get("extraMetadata")
-            .and_then(|v| v.as_object())
-            .and_then(|obj| {
-                obj.get("schema")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-    }
-
-    /// Get the latest Avro schema string from the [Timeline].
+    /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
+    ///
+    /// ### Note
+    /// This API behaves differently from [crate::table::Table::get_avro_schema],
+    /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
     pub async fn get_latest_avro_schema(&self) -> Result<String> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
-        Self::extract_avro_schema_from_commit_metadata(&commit_metadata).ok_or_else(|| {
-            CoreError::CommitMetadata(
-                "Failed to resolve the latest schema: no schema found".to_string(),
-            )
-        })
+        resolve_avro_schema_from_commit_metadata(&commit_metadata)
     }
 
     /// Get the latest [arrow_schema::Schema] from the [Timeline].
+    ///
+    /// ### Note
+    /// This API behaves differently from [crate::table::Table::get_schema],
+    /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
-
-        if let Some(avro_schema) = Self::extract_avro_schema_from_commit_metadata(&commit_metadata)
-        {
-            let avro_schema = apache_avro::schema::Schema::parse_str(&avro_schema)?;
-            let arrow_schema = to_arrow_schema(&avro_schema).map_err(|e| {
-                CoreError::CommitMetadata(format!(
-                    "Failed to convert the latest Avro schema: {}",
-                    e
-                ))
-            })?;
-            return prepend_meta_fields(SchemaRef::new(arrow_schema));
-        }
-
-        let first_partition = commit_metadata
-            .get("partitionToWriteStats")
-            .and_then(|v| v.as_object());
-
-        let partition_path = first_partition
-            .and_then(|obj| obj.keys().next())
-            .ok_or_else(|| {
-                CoreError::CommitMetadata(
-                    "Failed to resolve the latest schema: no partition path found".to_string(),
-                )
-            })?;
-
-        let first_value = first_partition
-            .and_then(|obj| obj.values().next())
-            .and_then(|value| value.as_array())
-            .and_then(|arr| arr.first());
-
-        let parquet_path = first_value.and_then(|v| v["path"].as_str());
-        match parquet_path {
-            Some(path) if path.ends_with(".parquet") => {
-                Ok(self.storage.get_parquet_file_schema(path).await?)
-            }
-            Some(_) => {
-                // TODO: properly handle deltacommit
-                let base_file = first_value
-                    .and_then(|v| v["baseFile"].as_str())
-                    .ok_or_else(|| {
-                        CoreError::CommitMetadata(
-                            "Failed to resolve the latest schema: no file path found".to_string(),
-                        )
-                    })?;
-                let parquet_file_path_buf = PathBuf::from_str(partition_path)
-                    .map_err(|e| {
-                        CoreError::CommitMetadata(format!(
-                            "Failed to resolve the latest schema: {}",
-                            e
-                        ))
-                    })?
-                    .join(base_file);
-                let path = parquet_file_path_buf.to_str().ok_or_else(|| {
-                    CoreError::CommitMetadata(
-                        "Failed to resolve the latest schema: invalid file path".to_string(),
-                    )
-                })?;
-                Ok(self.storage.get_parquet_file_schema(path).await?)
-            }
-            None => Err(CoreError::CommitMetadata(
-                "Failed to resolve the latest schema: no file path found".to_string(),
-            )),
-        }
+        resolve_schema_from_commit_metadata(&commit_metadata, self.storage.clone()).await
     }
 
     pub(crate) async fn get_replaced_file_groups_as_of(
@@ -392,7 +318,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_test::SampleTable;
+    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
@@ -420,11 +346,10 @@ mod tests {
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await;
         assert!(table_schema.is_err());
-        assert!(table_schema
-            .err()
-            .unwrap()
-            .to_string()
-            .starts_with("Commit metadata error: Failed to resolve the latest schema:"))
+        assert!(matches!(
+            table_schema.unwrap_err(),
+            CoreError::TimelineNoCommit
+        ))
     }
 
     #[tokio::test]
@@ -473,39 +398,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_avro_schema() {
+    async fn timeline_get_schema_returns_error_for_no_schema_and_write_stats() {
         let base_url = Url::from_file_path(
-            canonicalize(Path::new("tests/data/timeline/commits_with_valid_schema")).unwrap(),
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_no_schema_and_write_stats",
+            ))
+            .unwrap(),
         )
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
 
+        // Check Arrow schema
+        let arrow_schema = timeline.get_latest_schema().await;
+        assert!(arrow_schema.is_err());
+        assert!(matches!(arrow_schema.unwrap_err(), CoreError::CommitMetadata(_)), "Getting Arrow schema includes base file lookup, therefore expect CommitMetadata error when write stats are missing");
+
+        // Check Avro schema
         let avro_schema = timeline.get_latest_avro_schema().await;
-        assert!(avro_schema.is_ok());
-        assert_eq!(
-            avro_schema.unwrap(),
-            "{\"type\":\"record\",\"name\":\"v6_trips_record\",\"namespace\":\"hoodie.v6_trips\",\"fields\":[{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"uuid\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"rider\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"driver\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"fare\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}"
-        )
+        assert!(avro_schema.is_err());
+        assert!(matches!(avro_schema.unwrap_err(), CoreError::SchemaNotFound(_)), "Getting Avro schema does not include base file lookup, therefore expect SchemaNotFound error when `extraMetadata.schema` is missing");
     }
 
     #[tokio::test]
-    async fn get_arrow_schema() {
+    async fn timeline_get_schema_from_commit_metadata() {
         let base_url = Url::from_file_path(
-            canonicalize(Path::new("tests/data/timeline/commits_with_valid_schema")).unwrap(),
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_valid_schema_in_commit_metadata",
+            ))
+            .unwrap(),
         )
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
 
+        // Check Arrow schema
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
-        let fields = arrow_schema
-            .fields
-            .iter()
-            .map(|f| f.name())
-            .collect::<Vec<_>>();
-        let mut expected_fields = MetaField::field_names();
-        expected_fields.extend_from_slice(&["ts", "uuid", "rider", "driver", "fare", "city"]);
-        assert_eq!(fields, expected_fields)
+        assert_arrow_field_names_eq!(
+            arrow_schema,
+            [
+                MetaField::field_names(),
+                vec!["ts", "uuid", "rider", "driver", "fare", "city"]
+            ]
+            .concat()
+        );
+
+        // Check Avro schema
+        let avro_schema = timeline.get_latest_avro_schema().await;
+        assert!(avro_schema.is_ok());
+        let avro_schema = avro_schema.unwrap();
+        assert_avro_field_names_eq!(
+            &avro_schema,
+            ["ts", "uuid", "rider", "driver", "fare", "city"]
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_get_schema_from_empty_commit_metadata() {
+        let base_url = Url::from_file_path(
+            canonicalize(Path::new(
+                "tests/data/timeline/commits_with_empty_commit_metadata",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let timeline = create_test_timeline(base_url).await;
+
+        // Check Arrow schema
+        let result = timeline.get_latest_schema().await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CoreError::CommitMetadata(_)));
+
+        // Check Avro schema
+        let result = timeline.get_latest_avro_schema().await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CoreError::CommitMetadata(_)));
+    }
+
+    #[tokio::test]
+    async fn timeline_get_schema_from_base_file() {
+        let timeline_base_urls = [
+            "tests/data/timeline/commits_load_schema_from_base_file_cow",
+            "tests/data/timeline/commits_load_schema_from_base_file_mor",
+        ];
+        for base_url in timeline_base_urls {
+            let base_url = Url::from_file_path(canonicalize(Path::new(base_url)).unwrap()).unwrap();
+            let timeline = create_test_timeline(base_url).await;
+
+            let arrow_schema = timeline.get_latest_schema().await;
+            assert!(arrow_schema.is_ok());
+            let arrow_schema = arrow_schema.unwrap();
+            assert_arrow_field_names_eq!(
+                arrow_schema,
+                [
+                    MetaField::field_names(),
+                    vec!["ts", "uuid", "rider", "driver", "fare", "city"]
+                ]
+                .concat()
+            );
+        }
     }
 }
