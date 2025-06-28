@@ -36,7 +36,7 @@ repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "~54", features = ["pyarrow"] }
+arrow = { version = "~54" }
 arrow-arith = { version = "~54" }
 arrow-array = { version = "~54" }
 arrow-buffer = { version = "~54" }
@@ -60,26 +60,26 @@ datafusion-common = { version = "~45.0" }
 datafusion-physical-expr = { version = "~45.0" }
 
 # serde
-percent-encoding = { version = "2.3.1" }
+percent-encoding = { version = "2.3" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 
 # "stdlib"
-thiserror = { version = "2.0.11" }
+thiserror = { version = "2.0" }
 bytes = { version = "1" }
-chrono = { version = "=0.4.39" }
-lazy_static = { version = "1.5.0" }
+chrono = { version = "0.4" }
+lazy_static = { version = "1.5" }
 log = { version = "0.4" }
 num-traits = { version = "0.2" }
-once_cell = { version = "1.21.3" }
-paste = { version = "1.0.15" }
-strum = { version = "0.27.0", features = ["derive"] }
-strum_macros = "0.27.0"
+once_cell = { version = "1.21" }
+paste = { version = "1.0" }
+strum = { version = "0.27", features = ["derive"] }
+strum_macros = "0.27"
 url = { version = "2.5" }
 
 # runtime / async
-async-recursion = { version = "1.1.1" }
+async-recursion = { version = "1.1" }
 async-trait = { version = "0.1" }
 dashmap = { version = "6.1" }
 futures = { version = "0.3" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1.45", features = ["rt-multi-thread"] }
