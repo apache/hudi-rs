@@ -63,10 +63,10 @@ impl PartitionPruner {
         partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
     ) -> Result<Self> {
-        let and_filters = and_filters
+        let and_filters: Vec<SchemableFilter> = and_filters
             .iter()
-            .map(|filter| SchemableFilter::try_from((filter.clone(), partition_schema)))
-            .collect::<Result<Vec<SchemableFilter>>>()?;
+            .filter_map(|filter| SchemableFilter::try_from((filter.clone(), partition_schema)).ok())
+            .collect();
 
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs

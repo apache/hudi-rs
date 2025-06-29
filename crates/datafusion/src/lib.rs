@@ -471,7 +471,7 @@ mod tests {
             table_name
         )));
         assert!(plan_lines[4].starts_with(
-            "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND get_field(structField@3, field2) > 30"
+            "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND name@1 != Alice AND get_field(structField@3, field2) > 30"
         ));
         assert!(plan_lines[5].contains(&format!("input_partitions={}", planned_input_partitioned)));
     }
@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_datafusion_read_hudi_table() {
+    async fn test_datafusion_read_hudi_table_with_partition_filter_pushdown() {
         for (test_table, use_sql, planned_input_partitions) in &[
             (V6ComplexkeygenHivestyle, true, 2),
             (V6Nonpartitioned, true, 1),
@@ -507,7 +507,7 @@ mod tests {
             let sql = format!(
                 r#"
             SELECT id, name, isActive, structField.field2
-            FROM {} WHERE id % 2 = 0
+            FROM {} WHERE id % 2 = 0 AND name != 'Alice'
             AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
                 test_table.as_ref()
             );
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_datafusion_read_hudi_table_with_replacecommits() {
+    async fn test_datafusion_read_hudi_table_with_replacecommits_with_partition_filter_pushdown() {
         for (test_table, use_sql, planned_input_partitions) in
             &[(V6SimplekeygenNonhivestyleOverwritetable, true, 1)]
         {
@@ -544,7 +544,7 @@ mod tests {
             let sql = format!(
                 r#"
             SELECT id, name, isActive, structField.field2
-            FROM {} WHERE id % 2 = 0
+            FROM {} WHERE id % 2 = 0 AND name != 'Alice'
             AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
                 test_table.as_ref()
             );
