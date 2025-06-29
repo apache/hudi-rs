@@ -30,8 +30,9 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::parquet::ParquetExecBuilder;
+use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
 use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
@@ -202,26 +203,29 @@ impl TableProvider for HudiDataSource {
 
         let base_url = self.table.base_url();
         let url = ObjectStoreUrl::parse(get_scheme_authority(&base_url))?;
-        let fsc = FileScanConfig::new(url, self.schema())
-            .with_file_groups(parquet_file_groups)
-            .with_projection(projection.cloned())
-            .with_limit(limit);
 
         let parquet_opts = TableParquetOptions {
             global: state.config_options().execution.parquet.clone(),
             column_specific_options: Default::default(),
             key_value_metadata: Default::default(),
         };
-        let mut exec_builder = ParquetExecBuilder::new_with_options(fsc, parquet_opts);
-
+        let table_schema = self.schema();
+        let mut parquet_source = ParquetSource::new(parquet_opts);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
-            let df_schema = DFSchema::try_from(self.schema())?;
+            let df_schema = DFSchema::try_from(table_schema.clone())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            exec_builder = exec_builder.with_predicate(predicate)
+            parquet_source = parquet_source.with_predicate(table_schema.clone(), predicate)
         }
 
-        Ok(exec_builder.build_arc())
+        let fsc = Arc::new(
+            FileScanConfig::new(url, table_schema, Arc::new(parquet_source))
+                .with_file_groups(parquet_file_groups)
+                .with_projection(projection.cloned())
+                .with_limit(limit),
+        );
+
+        Ok(Arc::new(DataSourceExec::new(fsc)))
     }
 
     fn supports_filters_pushdown(
@@ -467,7 +471,7 @@ mod tests {
             table_name
         )));
         assert!(plan_lines[4].starts_with(
-            "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND get_field(structField@3, field2) > 30"
+            "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND name@1 != Alice AND get_field(structField@3, field2) > 30"
         ));
         assert!(plan_lines[5].contains(&format!("input_partitions={}", planned_input_partitioned)));
     }
@@ -486,7 +490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_datafusion_read_hudi_table() {
+    async fn test_datafusion_read_hudi_table_with_partition_filter_pushdown() {
         for (test_table, use_sql, planned_input_partitions) in &[
             (V6ComplexkeygenHivestyle, true, 2),
             (V6Nonpartitioned, true, 1),
@@ -503,7 +507,7 @@ mod tests {
             let sql = format!(
                 r#"
             SELECT id, name, isActive, structField.field2
-            FROM {} WHERE id % 2 = 0
+            FROM {} WHERE id % 2 = 0 AND name != 'Alice'
             AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
                 test_table.as_ref()
             );
@@ -527,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_datafusion_read_hudi_table_with_replacecommits() {
+    async fn test_datafusion_read_hudi_table_with_replacecommits_with_partition_filter_pushdown() {
         for (test_table, use_sql, planned_input_partitions) in
             &[(V6SimplekeygenNonhivestyleOverwritetable, true, 1)]
         {
@@ -540,7 +544,7 @@ mod tests {
             let sql = format!(
                 r#"
             SELECT id, name, isActive, structField.field2
-            FROM {} WHERE id % 2 = 0
+            FROM {} WHERE id % 2 = 0 AND name != 'Alice'
             AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
                 test_table.as_ref()
             );
