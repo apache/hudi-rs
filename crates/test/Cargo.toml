@@ -39,4 +39,4 @@ url = { workspace = true }
 
 # testing
 tempfile = "3.20.0"
-zip-extract = "0.3.0"
+zip-extract = "0.4.0"
