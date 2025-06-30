@@ -108,7 +108,7 @@ find_binary_files() {
     -not -path "*/test/data/*" \
     -not -path "*/tests/data/*" \
     -not -path "*/tests/table/*" \
-    -not -name "*.json" -not -name "*.xml" \
+    -not -name "*.json" -not -name "*.avsc" -not -name "*.xml" \
     -exec file -I '{}' \; |
     grep -viE 'directory|text/'
 }
