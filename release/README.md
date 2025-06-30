@@ -110,7 +110,24 @@ git commit -am "build(release): bump version to $RELEASE_VER"
 Once the "bump version" commit is pushed, the CI tests will be triggered and running.
 
 > [!IMPORTANT]
-> Perform any release related tests in addition to the CI if applicable before proceeding to the next step.
+> Perform any release-related tests in addition to the CI if applicable before proceeding to the next step.
+
+### Make a local tag
+
+Tag the revision locally for the RC. The tag should match to the version in the form of `release-*`. For example,
+
+- If the release is `0.1.0-rc.1`, the tag should `release-0.1.0-rc.1`
+- If the release is `2.0.0-beta.2`, the tag should `release-2.0.0-beta.2`
+
+> [!NOTE]
+> The local tag is required by the script for source release upload in the next step.
+> Do not push the tag to the remote yet.
+
+```shell
+RELEASE_VER=x.y.z-rc.1
+
+git tag release-$RELEASE_VER
+```
 
 ### Upload source release to SVN dev
 
@@ -144,11 +161,6 @@ RELEASE_VER=x.y.z-rc.1
 
 ### Push tag
 
-Push a tag to the commit that matches to the version in the form of `release-*`. For example,
-
-- If the release is `0.1.0-rc.1`, the tag should `release-0.1.0-rc.1`
-- If the release is `2.0.0-beta.2`, the tag should `release-2.0.0-beta.2`
-
 > [!CAUTION]
 > Pushing a matching tag to the upstream (apache) branch will trigger CI to publish the artifacts to crates.io and
 > pypi.org, which, if successful, is irreversible. Same versions are not allowed to publish more than once.
@@ -156,7 +168,6 @@ Push a tag to the commit that matches to the version in the form of `release-*`.
 ```shell
 RELEASE_VER=x.y.z-rc.1
 
-git tag release-$RELEASE_VER
 git push origin release-$RELEASE_VER
 ```
 
@@ -186,6 +197,11 @@ Paste the changelog output as a comment on the tracking issue.
 
 ### Start a `[VOTE]` thread
 
+> [!NOTE]
+> Update the template below in a text editor before pasting it to an email client to avoid hyperlink editing issue.
+
+Send to `dev@hudi.apache.org`.
+
 ```text
 [VOTE] hudi-rs 0.1.0, release candidate #2
 
@@ -206,6 +222,7 @@ The complete staging area is available for you to review:
 * Source code commit CI has passed [6]
 * Python artifacts have been published to pypi.org [7]
 * Rust artifacts have been published to crates.io [8]
+* Manual testing can be done as per the examples in README [9]
 
 The vote will be open for at least 72 hours. It is adopted by majority
 approval, with at least 3 PMC affirmative votes.
@@ -221,6 +238,7 @@ Release Manager
 [6] https://github.com/apache/hudi-rs/actions/runs/9901188924
 [7] https://pypi.org/project/hudi/0.1.0rc2/
 [8] https://crates.io/crates/hudi/0.1.0-rc.2
+[9] https://github.com/apache/hudi-rs?tab=readme-ov-file#usage-examples
 ```
 
 ## After VOTE passes
