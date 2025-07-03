@@ -44,12 +44,16 @@ view, instead, they will be linked to the corresponding issues.
 ## Prepare for development
 
 - Install Rust, e.g. as described [here](https://doc.rust-lang.org/cargo/getting-started/installation.html)
+- Install uv, the fast Python package manager, as described [here](https://docs.astral.sh/uv/getting-started/installation/)
 - Have a compatible Python version installed (check [`python/pyproject.toml`](./python/pyproject.toml) for current
   requirement)
 
 ## Commonly used dev commands
 
 For most of the time, use dev commands specified in the [`Makefile`](Makefile).
+
+> [!NOTE]
+> This project uses [uv](https://github.com/astral-sh/uv) as the Python package manager for faster dependency resolution and installation. All Python-related commands in the Makefile have been configured to use uv.
 
 To setup python virtual env, run
 
@@ -58,8 +62,8 @@ make setup-venv
 ```
 
 > [!NOTE]
-> This will run `python3` command to set up the virtual environment in `venv/`.
-> Activate the virtual environment by running `source venv/bin/activate` for example.
+> This will use uv to set up the virtual environment in `.venv/`.
+> Activate the virtual environment by running `source .venv/bin/activate` for example.
 
 Once a virtual environment is activated, build the project for development by
 

@@ -98,17 +98,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: python/pyproject.toml
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
       - name: Setup Python venv
         run: |
           make setup-venv
-          source venv/bin/activate
+          source .venv/bin/activate
           make build
           make develop
       - name: Python unit tests with coverage report
         run: |
-          source venv/bin/activate
+          source .venv/bin/activate
           coverage run --include 'python/hudi/*' -m pytest -v
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
       - name: Upload coverage report

@@ -19,7 +19,13 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
-VENV := venv
+# Check if uv is installed
+UV_CHECK := $(shell command -v uv 2> /dev/null)
+ifndef UV_CHECK
+$(error "uv is not installed. Please install it first: curl -LsSf https://astral.sh/uv/install.sh | sh")
+endif
+
+VENV := .venv
 PYTHON_DIR = python
 MATURIN_VERSION := $(shell grep 'requires =' $(PYTHON_DIR)/pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
@@ -27,12 +33,12 @@ PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3
 .PHONY: setup-venv
 setup-venv: ## Setup the virtualenv
 	$(info --- Setup virtualenv ---)
-	python3 -m venv $(VENV)
+	uv venv $(VENV)
 
 .PHONY: setup
 setup: ## Setup the requirements
 	$(info --- Setup dependencies ---)
-	pip install "$(MATURIN_VERSION)"
+	uv pip install "$(MATURIN_VERSION)"
 
 .PHONY: build
 build: setup ## Build Python binding of hudi-rs
