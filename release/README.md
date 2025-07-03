@@ -184,13 +184,13 @@ cargo install git-cliff
 Switch to the release branch (org: apache/hudi-rs), generate a changelog for the release by running the below script.
 
 ```shell
-# specify the previous release version
+PREV_RELEASE_VER=x.y.z
 
 # for mac
-git cliff release-{previous_release_version}..HEAD | pbcopy
+git cliff release-$PREV_RELEASE_VER..HEAD | pbcopy
 
 # for linux
-git cliff release-{previous_release_version}..HEAD | xclip
+git cliff release-$PREV_RELEASE_VER..HEAD | xclip
 ```
 
 Paste the changelog output as a comment on the tracking issue.
@@ -245,13 +245,15 @@ Release Manager
 
 ### Bump version in the release branch
 
-Remove the pre-release suffix from the version in the release branch.
+Switch to the release branch (org: apache/hudi-rs), remove the pre-release suffix from the version.
 
 ```shell
 RELEASE_VER=x.y.z
 
 cargo set-version $RELEASE_VER --manifest-path crates/hudi/Cargo.toml
 git commit -am "build(release): bump version to $RELEASE_VER"
+git push
+git tag release-$RELEASE_VER
 ```
 
 > [!IMPORTANT]
@@ -292,7 +294,6 @@ revert the last version bump commit, fix the reported error, and start a new rel
 ```shell
 RELEASE_VER=x.y.z
 
-git tag release-$RELEASE_VER
 git push origin release-$RELEASE_VER
 ```
 
@@ -300,34 +301,56 @@ Once the CI completes, check crates.io and pypi.org for the new release artifact
 
 ### Update the change log
 
-Use `git cliff` to prepend the current release's change to `changelog.md` in the main branch.
+Switch to the release branch (org: `apache/hudi-rs`), and run the below script to copy the changelog for the release to the clipboard.
+
+```shell
+PREV_RELEASE_VER=x.y.z
+
+# for mac
+git cliff release-$PREV_RELEASE_VER..HEAD | pbcopy
+
+# for linux
+git cliff release-$PREV_RELEASE_VER..HEAD | xclip
+```
+
+Go to your fork repo, create a new branch from main, prepend the copied output to `changelog.md` and create a PR to merge it to the `main` branch.
 
 ### Publish Release Notes
 
+Go to `https://github.com/apache/hudi-rs/releases/new` and draft a new release.
 
-
-Close the tracking issue and the milestone.
+- Make the release title the same as the release version, e.g., `0.1.0`
+- Paste the changelog content in the description
+- Add a level-1 heading `# What's changed` at the top of the description, and remove redundant copied headings
+- Close the tracking issue and the milestone
 
 ### Send `ANNOUNCE` email
 
+> [!NOTE]
+> Update the template below in a text editor before pasting it to an email client to avoid hyperlink editing issue.
+
+Send to `dev@hudi.apache.org` and `user@hudi.apache.org`.
+
 ```text
-subject: [ANNOUNCE] hudi-rs ${RELEASE_VER} released
+subject: [ANNOUNCE] Hudi-rs 0.4.0 released
 
 Hi all,
 
-The Apache Hudi community is pleased to announce the release ${RELEASE_VER} of
-hudi-rs <https://github.com/apache/hudi-rs>, the native Rust implementation for
-Apache Hudi, with Python API bindings.
+The Apache Hudi community is pleased to announce the release 0.4.0 of
+Hudi-rs (https://github.com/apache/hudi-rs), the native Rust implementation for
+Apache Hudi, with C++ and Python API bindings.
 
 Highlights for this release:
 
-<insert highlights here based on the changelog>
+- Add C++ bindings for File Group API to support reading file slices
+- Support reading MOR table having Avro data block and delete block (previously only Parquet log block was supported)
+- Support more timestamp formats for time-travel and incremental queries
 
 The release notes can be found here
-https://github.com/apache/hudi-rs/releases/tag/release-${RELEASE_VER}
+https://github.com/apache/hudi-rs/releases/tag/release-0.4.0
 
 The source releases are available here
-https://dist.apache.org/repos/dist/release/hudi/hudi-rs-${RELEASE_VER}/
+https://dist.apache.org/repos/dist/release/hudi/hudi-rs-0.4.0/
 
 Please refer to the readme for installation and usage examples
 https://github.com/apache/hudi-rs/blob/main/README.md
@@ -335,16 +358,15 @@ https://github.com/apache/hudi-rs/blob/main/README.md
 The Hudi community is active on these channels - we welcome you to engage 
 with us!
 
-- LinkedIn <https://www.linkedin.com/company/apache-hudi/>
-- X/Twitter <ht...@apachehudi>
-- YouTube <ht...@apachehudi>
-- Slack support
-<https://join.slack.com/t/apache-hudi/shared_invite/zt-2ggm1fub8-_yt4Reu9djwqqVRFC7X49g>
+- LinkedIn: https://www.linkedin.com/company/apache-hudi/
+- X/Twitter: https://x.com/apachehudi/
+- YouTube: https://www.youtube.com/@apachehudi
+- Slack support: https://join.slack.com/t/apache-hudi/shared_invite/zt-2ggm1fub8-_yt4Reu9djwqqVRFC7X49g
 
 For users in China, follow WeChat "ApacheHudi" 微信公众号 for news and blogs,
 and join DingTalk group 钉钉群 35087066 for questions.
 
 Cheers,
 
-<name>, Release manager
+{your name}, Release manager
 ```
