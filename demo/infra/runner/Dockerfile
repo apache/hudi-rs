@@ -23,7 +23,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 RUN uv venv /opt/.venv
 
-ENV PATH="/opt/.venv/bin:$PATH"
+ENV PATH="/root/.local/bin:$PATH"
 
 ENV VIRTUAL_ENV=/opt/.venv
 
