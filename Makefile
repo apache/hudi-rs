@@ -93,4 +93,4 @@ test-rust: ## Run tests on Rust
 .PHONY: test-python
 test-python: ## Run tests on Python
 	$(info --- Run Python tests ---)
-	pytest -s $(PYTHON_DIR)
+	uv run pytest -s $(PYTHON_DIR)
