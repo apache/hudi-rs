@@ -42,8 +42,6 @@ github:
       required_status_checks:
         strict: true
       required_linear_history: true
-      required_signatures: true
-      required_conversation_resolution: true
   pull_requests:
     allow_auto_merge: true
     allow_update_branch: true
