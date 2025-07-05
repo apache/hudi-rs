@@ -23,6 +23,7 @@
 .vscode
 
 # python
+.venv
 venv
 **/.python-version
 __pycache__

@@ -17,15 +17,19 @@
 
 FROM rust:1.84
 
-RUN apt-get update && apt-get install -y cmake python3-dev python3-venv
+RUN apt-get update && apt-get install -y cmake curl ca-certificates
 
-RUN python3 -m venv /opt/venv
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
 
-ENV PATH="/opt/venv/bin:$PATH"
+RUN sh /uv-installer.sh && rm /uv-installer.sh
 
-ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/root/.local/bin/:$PATH"
 
-RUN pip install --no-cache-dir --upgrade pip
+RUN uv python install
+
+RUN uv python list
+
+RUN uv venv /opt/.venv
 
 WORKDIR /opt
 
