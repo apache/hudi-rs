@@ -21,9 +21,9 @@ RUN apt-get update && apt-get install -y cmake python3-dev python3-venv curl
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-RUN uv venv /opt/.venv
+ENV PATH="$HOME/.local/bin:$PATH"
 
-ENV PATH="/root/.local/bin:$PATH"
+RUN uv venv /opt/.venv
 
 ENV VIRTUAL_ENV=/opt/.venv
 
