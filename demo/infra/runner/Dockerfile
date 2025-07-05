@@ -17,15 +17,17 @@
 
 FROM rust:1.84
 
-RUN apt-get update && apt-get install -y cmake python3-dev python3-venv curl
+RUN apt-get update && apt-get install -y cmake curl ca-certificates
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-ENV PATH="$HOME/.local/bin:$PATH"
+ENV PATH="/root/.local/bin/:$PATH"
+
+RUN uv python install
+
+RUN uv python list
 
 RUN uv venv /opt/.venv
-
-ENV VIRTUAL_ENV=/opt/.venv
 
 WORKDIR /opt
 
