@@ -16,7 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod active;
 pub mod instant;
+pub mod layout;
+pub mod lsm;
 pub(crate) mod selector;
 pub(crate) mod util;
 
@@ -24,17 +27,18 @@ use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
-use crate::metadata::HUDI_METADATA_DIR;
+
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
 use crate::storage::Storage;
 use crate::timeline::instant::Action;
+use crate::timeline::layout::{TimelineLayoutFactory, TimelineLayoutType};
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
 use arrow_schema::Schema;
 use instant::Instant;
-use log::debug;
+
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -47,6 +51,7 @@ pub struct Timeline {
     hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
     pub completed_commits: Vec<Instant>,
+    layout: TimelineLayoutType,
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
@@ -61,10 +66,12 @@ impl Timeline {
         completed_commits: Vec<Instant>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
+        let layout = TimelineLayoutFactory::create_layout(hudi_configs.clone(), storage.clone())?;
         Ok(Self {
             hudi_configs,
             storage,
             completed_commits,
+            layout,
         })
     }
 
@@ -73,57 +80,23 @@ impl Timeline {
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
+        let layout = TimelineLayoutFactory::create_layout(hudi_configs.clone(), storage.clone())?;
         let selector = TimelineSelector::completed_actions_in_range(
             DEFAULT_LOADING_ACTIONS,
             hudi_configs.clone(),
             None,
             None,
         )?;
-        let completed_commits = Self::load_instants(&selector, &storage, false).await?;
+        let completed_commits = layout.load_instants(&selector, false).await?;
         Ok(Self {
             hudi_configs,
             storage,
             completed_commits,
+            layout,
         })
     }
 
-    async fn load_instants(
-        selector: &TimelineSelector,
-        storage: &Storage,
-        desc: bool,
-    ) -> Result<Vec<Instant>> {
-        let files = storage.list_files(Some(HUDI_METADATA_DIR)).await?;
 
-        // For most cases, we load completed instants, so we can pre-allocate the vector with a
-        // capacity of 1/3 of the total number of listed files,
-        // ignoring requested and inflight instants.
-        let mut instants = Vec::with_capacity(files.len() / 3);
-
-        for file_info in files {
-            match selector.try_create_instant(file_info.name.as_str()) {
-                Ok(instant) => instants.push(instant),
-                Err(e) => {
-                    // Ignore files that are not valid or desired instants.
-                    debug!(
-                        "Instant not created from file {:?} due to: {:?}",
-                        file_info, e
-                    );
-                }
-            }
-        }
-
-        instants.sort_unstable();
-
-        // As of current impl., we don't mutate instants once timeline is created,
-        // so we can save some memory by shrinking the capacity.
-        instants.shrink_to_fit();
-
-        if desc {
-            Ok(instants.into_iter().rev().collect())
-        } else {
-            Ok(instants)
-        }
-    }
 
     /// Get the completed commit [Instant]s in the timeline.
     ///
@@ -136,7 +109,7 @@ impl Timeline {
     pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector =
             TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), None, None)?;
-        Self::load_instants(&selector, &self.storage, desc).await
+        self.layout.load_instants(&selector, desc).await
     }
 
     /// Get the completed deltacommit [Instant]s in the timeline.
@@ -152,7 +125,7 @@ impl Timeline {
             None,
             None,
         )?;
-        Self::load_instants(&selector, &self.storage, desc).await
+        self.layout.load_instants(&selector, desc).await
     }
 
     /// Get the completed replacecommit [Instant]s in the timeline.
@@ -166,7 +139,7 @@ impl Timeline {
             None,
             None,
         )?;
-        Self::load_instants(&selector, &self.storage, desc).await
+        self.layout.load_instants(&selector, desc).await
     }
 
     /// Get the completed clustering commit [Instant]s in the timeline.
@@ -180,7 +153,7 @@ impl Timeline {
             None,
             None,
         )?;
-        let instants = Self::load_instants(&selector, &self.storage, desc).await?;
+        let instants = self.layout.load_instants(&selector, desc).await?;
         let mut clustering_instants = Vec::new();
         for instant in instants {
             let metadata = self.get_instant_metadata(&instant).await?;
@@ -325,7 +298,10 @@ mod tests {
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
         Timeline::new_from_storage(
-            Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_url)])),
+            Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath, base_url.to_string()),
+                (HudiTableConfig::TableVersion, "6".to_string()),
+            ])),
             Arc::new(HashMap::new()),
         )
         .await
