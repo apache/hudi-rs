@@ -41,6 +41,10 @@ pub enum QuickstartTripsTable {
     V6Trips8I1U,
     #[strum(serialize = "v6_trips_8i3d")]
     V6Trips8I3D,
+    #[strum(serialize = "v8_trips_8i1u")]
+    V8Trips8I1U,
+    #[strum(serialize = "v8_trips_8i3d")]
+    V8Trips8I3D,
 }
 
 impl QuickstartTripsTable {
@@ -111,6 +115,14 @@ pub enum SampleTable {
     V6SimplekeygenNonhivestyle,
     V6SimplekeygenNonhivestyleOverwritetable,
     V6TimebasedkeygenNonhivestyle,
+    V8ComplexkeygenHivestyle,
+    V8Empty,
+    V8Nonpartitioned,
+    V8NonpartitionedRollback,
+    V8SimplekeygenHivestyleNoMetafields,
+    V8SimplekeygenNonhivestyle,
+    V8SimplekeygenNonhivestyleOverwritetable,
+    V8TimebasedkeygenNonhivestyle,
 }
 
 impl SampleTable {
