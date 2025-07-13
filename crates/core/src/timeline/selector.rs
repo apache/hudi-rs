@@ -532,10 +532,10 @@ mod tests {
             Instant::from_str("20240103153030999.commit").unwrap(),
         ];
         Timeline::new_from_completed_commits(
-            Arc::new(HudiConfigs::new([(
-                HudiTableConfig::BasePath,
-                "file:///tmp/base",
-            )])),
+            Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath, "file:///tmp/base".to_string()),
+                (HudiTableConfig::TableVersion, "6".to_string()),
+            ])),
             Arc::new(HashMap::new()),
             instants,
         )
