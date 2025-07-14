@@ -118,7 +118,6 @@ pub enum SampleTable {
     V8ComplexkeygenHivestyle,
     V8Empty,
     V8Nonpartitioned,
-    V8NonpartitionedRollback,
     V8SimplekeygenHivestyleNoMetafields,
     V8SimplekeygenNonhivestyle,
     V8SimplekeygenNonhivestyleOverwritetable,
@@ -212,6 +211,14 @@ mod tests {
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }
+                QuickstartTripsTable::V8Trips8I1U => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
+                QuickstartTripsTable::V8Trips8I3D => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
             }
         }
     }
@@ -225,6 +232,10 @@ mod tests {
                 }
                 SampleTable::V6NonpartitionedRollback => {
                     let path = t.zip_path("mor", Some("parquet"));
+                    assert!(path.exists());
+                }
+                ref table if table.as_ref().starts_with("v8") => {
+                    let path = t.zip_path("cow", None);
                     assert!(path.exists());
                 }
                 _ => {
