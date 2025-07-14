@@ -41,6 +41,10 @@ pub enum QuickstartTripsTable {
     V6Trips8I1U,
     #[strum(serialize = "v6_trips_8i3d")]
     V6Trips8I3D,
+    #[strum(serialize = "v8_trips_8i1u")]
+    V8Trips8I1U,
+    #[strum(serialize = "v8_trips_8i3d")]
+    V8Trips8I3D,
 }
 
 impl QuickstartTripsTable {
@@ -111,6 +115,13 @@ pub enum SampleTable {
     V6SimplekeygenNonhivestyle,
     V6SimplekeygenNonhivestyleOverwritetable,
     V6TimebasedkeygenNonhivestyle,
+    V8ComplexkeygenHivestyle,
+    V8Empty,
+    V8Nonpartitioned,
+    V8SimplekeygenHivestyleNoMetafields,
+    V8SimplekeygenNonhivestyle,
+    V8SimplekeygenNonhivestyleOverwritetable,
+    V8TimebasedkeygenNonhivestyle,
 }
 
 impl SampleTable {
@@ -200,6 +211,14 @@ mod tests {
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }
+                QuickstartTripsTable::V8Trips8I1U => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
+                QuickstartTripsTable::V8Trips8I3D => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
             }
         }
     }
@@ -213,6 +232,10 @@ mod tests {
                 }
                 SampleTable::V6NonpartitionedRollback => {
                     let path = t.zip_path("mor", Some("parquet"));
+                    assert!(path.exists());
+                }
+                ref table if table.as_ref().starts_with("v8") => {
+                    let path = t.zip_path("cow", None);
                     assert!(path.exists());
                 }
                 _ => {
