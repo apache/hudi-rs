@@ -75,8 +75,8 @@ impl FileGroupReader {
     /// Creates a new reader with the given base URI and options.
     ///
     /// # Arguments
-    ///     * `base_uri` - The base URI of the file group's residing table.
-    ///     * `options` - Additional options for the reader.
+    /// * `base_uri` - The base URI of the file group's residing table.
+    /// * `options` - Additional options for the reader.
     ///
     /// # Notes
     /// This API uses [`OptionResolver`] that loads table properties from storage to resolve options.
@@ -164,7 +164,7 @@ impl FileGroupReader {
     /// Reads the data from the base file at the given relative path.
     ///
     /// # Arguments
-    ///     * `relative_path` - The relative path to the base file.
+    /// * `relative_path` - The relative path to the base file.
     ///
     /// # Returns
     /// A record batch read from the base file.
@@ -216,7 +216,7 @@ impl FileGroupReader {
     /// Reads the data from the given file slice.
     ///
     /// # Arguments
-    ///     * `file_slice` - The file slice to read.
+    /// * `file_slice` - The file slice to read.
     ///
     /// # Returns
     /// A record batch read from the file slice.

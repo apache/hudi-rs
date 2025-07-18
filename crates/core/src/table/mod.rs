@@ -294,8 +294,8 @@ impl Table {
     /// Get all the [FileSlice]s in splits from the table.
     ///
     /// # Arguments
-    ///     * `n` - The number of chunks to split the file slices into.
-    ///     * `filters` - Partition filters to apply.
+    /// * `n` - The number of chunks to split the file slices into.
+    /// * `filters` - Partition filters to apply.
     pub async fn get_file_slices_splits<I, S>(
         &self,
         n: usize,
@@ -333,9 +333,9 @@ impl Table {
     /// Get all the [FileSlice]s in splits from the table at a given timestamp.
     ///
     /// # Arguments
-    ///     * `n` - The number of chunks to split the file slices into.
-    ///     * `timestamp` - The timestamp which file slices associated with.
-    ///     * `filters` - Partition filters to apply.
+    /// * `n` - The number of chunks to split the file slices into.
+    /// * `timestamp` - The timestamp which file slices associated with.
+    /// * `filters` - Partition filters to apply.
     pub async fn get_file_slices_splits_as_of<I, S>(
         &self,
         n: usize,
@@ -395,10 +395,10 @@ impl Table {
     /// Get all the [FileSlice]s in the table.
     ///
     /// # Arguments
-    ///     * `filters` - Partition filters to apply.
+    /// * `filters` - Partition filters to apply.
     ///
     /// # Notes
-    ///     * This API is useful for implementing snapshot query.
+    /// * This API is useful for implementing snapshot query.
     pub async fn get_file_slices<I, S>(&self, filters: I) -> Result<Vec<FileSlice>>
     where
         I: IntoIterator<Item = (S, S, S)>,
@@ -427,11 +427,11 @@ impl Table {
     /// Get all the [FileSlice]s in the table at a given timestamp.
     ///
     /// # Arguments
-    ///     * `timestamp` - The timestamp which file slices associated with.
-    ///     * `filters` - Partition filters to apply.
+    /// * `timestamp` - The timestamp which file slices associated with.
+    /// * `filters` - Partition filters to apply.
     ///
     /// # Notes
-    ///     * This API is useful for implementing time travel query.
+    /// * This API is useful for implementing time travel query.
     pub async fn get_file_slices_as_of<I, S>(
         &self,
         timestamp: &str,
@@ -482,11 +482,11 @@ impl Table {
     /// Get all the changed [FileSlice]s in the table between the given timestamps.
     ///
     /// # Arguments
-    ///     * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
-    ///     * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
+    /// * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
+    /// * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
     ///
     /// # Notes
-    ///     * This API is useful for implementing incremental query.
+    /// * This API is useful for implementing incremental query.
     pub async fn get_file_slices_between(
         &self,
         start_timestamp: Option<&str>,
@@ -565,7 +565,7 @@ impl Table {
     /// Get all the latest records in the table.
     ///
     /// # Arguments
-    ///     * `filters` - Partition filters to apply.
+    /// * `filters` - Partition filters to apply.
     pub async fn read_snapshot<I, S>(&self, filters: I) -> Result<Vec<RecordBatch>>
     where
         I: IntoIterator<Item = (S, S, S)>,
@@ -594,8 +594,8 @@ impl Table {
     /// Get all the records in the table at a given timestamp.
     ///
     /// # Arguments
-    ///     * `timestamp` - The timestamp which records associated with.
-    ///     * `filters` - Partition filters to apply.
+    /// * `timestamp` - The timestamp which records associated with.
+    /// * `filters` - Partition filters to apply.
     pub async fn read_snapshot_as_of<I, S>(
         &self,
         timestamp: &str,
@@ -648,8 +648,8 @@ impl Table {
     /// the time span being returned.
     ///
     /// # Arguments
-    ///     * `start_timestamp` - Only records that were inserted or updated after this timestamp will be returned.
-    ///     * `end_timestamp` - If provided, only records that were inserted or updated before or at this timestamp will be returned.
+    /// * `start_timestamp` - Only records that were inserted or updated after this timestamp will be returned.
+    /// * `end_timestamp` - If provided, only records that were inserted or updated before or at this timestamp will be returned.
     pub async fn read_incremental_records(
         &self,
         start_timestamp: &str,
