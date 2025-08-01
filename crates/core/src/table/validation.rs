@@ -45,9 +45,9 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
 
     // additional validation
     let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
-    if !(5..=6).contains(&table_version) {
+    if table_version != 6 {
         return Err(CoreError::Unsupported(
-            "Only support table version 5 and 6.".to_string(),
+            "Only support table version 6.".to_string(),
         ));
     }
 
