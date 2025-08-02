@@ -57,7 +57,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
+    pub const CLOUD_STORAGE_PREFIXES: [&'static str; 4] = ["AWS_", "AZURE_", "GOOGLE_", "HOODIE_ENV_"];
 
     pub fn new(
         options: Arc<HashMap<String, String>>,
