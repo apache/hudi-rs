@@ -521,14 +521,6 @@ impl HudiTable {
     }
 }
 
-impl From<&Table> for HudiTable {
-    fn from(t: &Table) -> Self {
-        HudiTable {
-            inner: t.to_owned(),
-        }
-    }
-}
-
 #[cfg(not(tarpaulin_include))]
 #[pyclass]
 pub struct HudiTimeline {
