@@ -19,7 +19,7 @@
 pub mod builder;
 pub mod instant;
 pub mod loader;
-pub mod lsm;
+pub mod lsm_tree;
 pub(crate) mod selector;
 pub(crate) mod util;
 
@@ -138,7 +138,8 @@ impl Timeline {
     pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector =
             TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), None, None)?;
-        self.load_instants_with_archive(&selector, desc, false).await
+        self.load_instants_with_archive(&selector, desc, false)
+            .await
     }
 
     /// Get the completed deltacommit [Instant]s in the timeline.
@@ -154,7 +155,8 @@ impl Timeline {
             None,
             None,
         )?;
-        self.load_instants_with_archive(&selector, desc, false).await
+        self.load_instants_with_archive(&selector, desc, false)
+            .await
     }
 
     /// Get the completed replacecommit [Instant]s in the timeline.
@@ -168,7 +170,8 @@ impl Timeline {
             None,
             None,
         )?;
-        self.load_instants_with_archive(&selector, desc, false).await
+        self.load_instants_with_archive(&selector, desc, false)
+            .await
     }
 
     /// Get the completed clustering commit [Instant]s in the timeline.
@@ -182,7 +185,9 @@ impl Timeline {
             None,
             None,
         )?;
-        let instants = self.load_instants_with_archive(&selector, desc, false).await?;
+        let instants = self
+            .load_instants_with_archive(&selector, desc, false)
+            .await?;
         let mut clustering_instants = Vec::new();
         for instant in instants {
             let metadata = self.get_instant_metadata(&instant).await?;

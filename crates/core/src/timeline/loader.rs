@@ -21,6 +21,7 @@ use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::timeline::instant::Instant;
+use crate::timeline::lsm_tree::LSM_TIMELINE_DIR;
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
 use log::debug;
@@ -65,6 +66,26 @@ impl TimelineLoader {
                 } else {
                     Ok(instants)
                 }
+            }
+            TimelineLoader::LayoutTwoActive(storage) => {
+                let files = storage.list_files(Some(LSM_TIMELINE_DIR)).await?;
+                let mut instants = Vec::new();
+
+                for file_info in files {
+                    if file_info.name.starts_with("history/") || file_info.name.starts_with('_') {
+                        continue;
+                    }
+                    match selector.try_create_instant(file_info.name.as_str()) {
+                        Ok(instant) => instants.push(instant),
+                        Err(e) => {
+                            debug!(
+                                "Instant not created from file {:?} due to: {:?}",
+                                file_info, e
+                            );
+                        }
+                    }
+                }
+                Ok(instants)
             }
             _ => Err(CoreError::Unsupported(
                 "Loading from this timeline layout is not implemented yet.".to_string(),
