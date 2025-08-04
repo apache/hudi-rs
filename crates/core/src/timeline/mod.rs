@@ -100,6 +100,33 @@ impl Timeline {
         self.active_loader.load_instants(selector, desc).await
     }
 
+    pub async fn load_instants_with_archive(
+        &self,
+        selector: &TimelineSelector,
+        desc: bool,
+        include_archived: bool,
+    ) -> Result<Vec<Instant>> {
+        // Always try active first
+        let mut instants = self.active_loader.load_instants(selector, desc).await?;
+
+        // Load archived/compacted if flag is set
+        if include_archived {
+            if let Some(archived_loader) = &self.archived_loader {
+                let archived_instants = archived_loader
+                    .load_archived_instants(selector, desc)
+                    .await?;
+                instants.extend(archived_instants);
+
+                // Re-sort after merging
+                instants.sort_unstable();
+                if desc {
+                    instants.reverse();
+                }
+            }
+        }
+        Ok(instants)
+    }
+
     /// Get the completed commit [Instant]s in the timeline.
     ///
     /// * For Copy-on-write tables, this includes commit instants.
@@ -111,7 +138,7 @@ impl Timeline {
     pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector =
             TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), None, None)?;
-        self.load_instants(&selector, desc).await
+        self.load_instants_with_archive(&selector, desc, false).await
     }
 
     /// Get the completed deltacommit [Instant]s in the timeline.
@@ -127,7 +154,7 @@ impl Timeline {
             None,
             None,
         )?;
-        self.load_instants(&selector, desc).await
+        self.load_instants_with_archive(&selector, desc, false).await
     }
 
     /// Get the completed replacecommit [Instant]s in the timeline.
@@ -141,7 +168,7 @@ impl Timeline {
             None,
             None,
         )?;
-        self.load_instants(&selector, desc).await
+        self.load_instants_with_archive(&selector, desc, false).await
     }
 
     /// Get the completed clustering commit [Instant]s in the timeline.
@@ -155,7 +182,7 @@ impl Timeline {
             None,
             None,
         )?;
-        let instants = self.load_instants(&selector, desc).await?;
+        let instants = self.load_instants_with_archive(&selector, desc, false).await?;
         let mut clustering_instants = Vec::new();
         for instant in instants {
             let metadata = self.get_instant_metadata(&instant).await?;
