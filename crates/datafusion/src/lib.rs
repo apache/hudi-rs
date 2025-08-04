@@ -272,7 +272,7 @@ impl TableProvider for HudiDataSource {
 ///     let ctx = SessionContext::new();
 ///     
 ///     // Register table using SQL command
-///     let create_table_sql = 
+///     let create_table_sql =
 ///         "CREATE EXTERNAL TABLE trips_table STORED AS HUDI LOCATION '/tmp/trips_table'";
 ///     ctx.sql(create_table_sql).await?;
 ///     
