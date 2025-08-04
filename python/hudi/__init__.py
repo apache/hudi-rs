@@ -17,6 +17,7 @@
 
 
 from hudi._internal import (
+    HudiDataSource,
     HudiFileGroupReader,
     HudiFileSlice,
     HudiInstant,
@@ -27,6 +28,7 @@ from hudi._internal import __version__ as __version__
 from hudi.table.builder import HudiTableBuilder
 
 __all__ = [
+    "HudiDataSource",
     "HudiFileGroupReader",
     "HudiFileSlice",
     "HudiInstant",

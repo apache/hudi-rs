@@ -349,3 +349,18 @@ def build_hudi_table(
         HudiTable: An instance of hudi table.
     """
     ...
+@dataclass(init=False)
+class HudiDataSource:
+    def __init__(
+        self,
+        base_uri: str,
+        options: Optional[List[Tuple[str, str]]] = None,
+    ):
+        """
+        Initializes the HudiDataSource.
+
+        Parameters:
+            base_uri (str): The base URI of the Hudi table.
+            options (Optional[List[Tuple[str, str]]]): Additional configuration options (optional).
+        """
+        ...
