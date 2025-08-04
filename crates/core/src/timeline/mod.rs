@@ -329,26 +329,48 @@ mod tests {
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
+    #[tokio::test]
+    async fn test_timeline_v8_nonpartitioned() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+        assert_eq!(timeline.completed_commits.len(), 2);
+        assert!(matches!(
+            timeline.active_loader,
+            TimelineLoader::LayoutTwoActive(_)
+        ));
+        assert!(matches!(
+            timeline.archived_loader,
+            Some(TimelineLoader::LayoutTwoCompacted(_))
+        ));
+    }
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
         let storage = Storage::new(
             Arc::new(HashMap::new()),
-            Arc::new(HudiConfigs::new([
-                (HudiTableConfig::BasePath, base_url.to_string()),
-                (HudiTableConfig::TableVersion, "6".to_string()),
-            ])),
+            Arc::new(HudiConfigs::new([(
+                HudiTableConfig::BasePath,
+                base_url.to_string(),
+            )])),
         )
         .unwrap();
-        let mut timeline = TimelineBuilder::new(
-            Arc::new(HudiConfigs::new([
-                (HudiTableConfig::BasePath, base_url.to_string()),
-                (HudiTableConfig::TableVersion, "6".to_string()),
-            ])),
-            storage,
+
+        let hudi_configs = HudiConfigs::new([(HudiTableConfig::BasePath, base_url.to_string())]);
+        let table_properties = crate::config::util::parse_data_for_options(
+            &storage
+                .get_file_data(".hoodie/hoodie.properties")
+                .await
+                .unwrap(),
+            "=",
         )
-        .build()
-        .await
         .unwrap();
+        let mut hudi_configs_map = hudi_configs.as_options();
+        hudi_configs_map.extend(table_properties);
+        let hudi_configs = Arc::new(HudiConfigs::new(hudi_configs_map));
+
+        let mut timeline = TimelineBuilder::new(hudi_configs, storage)
+            .build()
+            .await
+            .unwrap();
 
         let selector = TimelineSelector::completed_actions_in_range(
             DEFAULT_LOADING_ACTIONS,
