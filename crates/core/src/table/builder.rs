@@ -214,9 +214,8 @@ impl OptionResolver {
 
     /// Process a cloud environment variable and return the appropriate storage key
     fn process_cloud_env_var(&self, env_key: &str) -> Option<String> {
-        if env_key.starts_with("HOODIE_ENV_fs_DOT_s3a_DOT_") || env_key.starts_with("HOODIE_ENV_fs_DOT_s3_DOT_") {
-            let hudi_key = self.parse_hudi_env_var(env_key);
-            self.map_hudi_to_storage_key(&hudi_key)
+        if env_key.starts_with("HOODIE_ENV_") {
+            Some(self.parse_hudi_env_var(env_key))
         } else {
             Some(env_key.to_ascii_lowercase())
         }
@@ -290,13 +289,6 @@ impl OptionResolver {
             .replace("_DOT_", ".")
     }
 
-    fn map_hudi_to_storage_key(&self, hudi_key: &str) -> Option<String> {
-        match hudi_key {
-            "fs.s3a.access.key" | "fs.s3.awsAccessKeyId" => Some("aws_access_key_id".to_string()),
-            "fs.s3a.secret.key" | "fs.s3.awsSecretAccessKey" => Some("aws_secret_access_key".to_string()),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -421,32 +413,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_map_hudi_to_storage_key() {
-        let resolver = OptionResolver::new("test_uri");
-        
-        assert_eq!(
-            resolver.map_hudi_to_storage_key("fs.s3a.access.key"),
-            Some("aws_access_key_id".to_string())
-        );
-        assert_eq!(
-            resolver.map_hudi_to_storage_key("fs.s3a.secret.key"),
-            Some("aws_secret_access_key".to_string())
-        );
-        assert_eq!(
-            resolver.map_hudi_to_storage_key("fs.s3.awsAccessKeyId"),
-            Some("aws_access_key_id".to_string())
-        );
-        assert_eq!(
-            resolver.map_hudi_to_storage_key("fs.s3.awsSecretAccessKey"),
-            Some("aws_secret_access_key".to_string())
-        );
-    }
 
     #[test]
     fn test_resolve_cloud_env_vars_with_hudi_style() {
         std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
         
         std::env::set_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key", "test_access_key");
         std::env::set_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key", "test_secret_key");
@@ -454,8 +425,8 @@ mod tests {
         let mut resolver = OptionResolver::new("test_uri");
         resolver.resolve_cloud_env_vars();
         
-        assert_eq!(resolver.storage_options.get("aws_access_key_id"), Some(&"test_access_key".to_string()));
-        assert_eq!(resolver.storage_options.get("aws_secret_access_key"), Some(&"test_secret_key".to_string()));
+        assert_eq!(resolver.storage_options.get("fs.s3a.access.key"), Some(&"test_access_key".to_string()));
+        assert_eq!(resolver.storage_options.get("fs.s3a.secret.key"), Some(&"test_secret_key".to_string()));
                 
         std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
         std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
@@ -471,10 +442,10 @@ mod tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "standard_access_key");
         
         let mut resolver = OptionResolver::new("test_uri");
-        resolver.storage_options.insert("aws_access_key_id".to_string(), "manual_access_key".to_string());
+        resolver.storage_options.insert("fs.s3a.access.key".to_string(), "manual_access_key".to_string());
         resolver.resolve_cloud_env_vars();
         
-        assert_eq!(resolver.storage_options.get("aws_access_key_id"), Some(&"manual_access_key".to_string()));
+        assert_eq!(resolver.storage_options.get("fs.s3a.access.key"), Some(&"manual_access_key".to_string()));
         
         std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
         std::env::remove_var("AWS_ACCESS_KEY_ID");
