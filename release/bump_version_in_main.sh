@@ -43,7 +43,7 @@ bump_version() {
             ;;
     esac
 
-    echo "$major.$minor.$patch"
+    echo "$major.$minor.$patch-dev"
 }
 
 # Check if cargo-edit is installed
@@ -96,8 +96,31 @@ fi
 
 echo "Updated version of $crate to $new_version"
 
+# Update C++ CMakeLists.txt version
+cpp_cmake_file="cpp/CMakeLists.txt"
+if [ -f "$cpp_cmake_file" ]; then
+    # Use sed to update the project version line (drop -dev suffix for CMakeLists.txt)
+    cmake_version=${new_version%-dev}
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS sed requires empty string after -i
+        sed -i '' "s/^project(hudi-cpp VERSION [0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*)/project(hudi-cpp VERSION $cmake_version)/" "$cpp_cmake_file"
+    else
+        # Linux sed
+        sed -i "s/^project(hudi-cpp VERSION [0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*)/project(hudi-cpp VERSION $cmake_version)/" "$cpp_cmake_file"
+    fi
+    
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to update C++ version in $cpp_cmake_file"
+        exit 1
+    fi
+    
+    echo "Updated C++ version in $cpp_cmake_file to $cmake_version"
+else
+    echo "Warning: $cpp_cmake_file not found, skipping C++ version update"
+fi
+
 # Create a new branch
-branch_name="bump-$new_version"
+branch_name="bump-${new_version%-dev}"
 git checkout -b "$branch_name"
 
 if [ $? -ne 0 ]; then
