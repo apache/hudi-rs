@@ -72,3 +72,29 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::table::HudiTableConfig::{TableName, TableType, TableVersion};
+    use crate::config::HudiConfigs;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_table_version_5_unsupported() {
+        let mut options = HashMap::new();
+        options.insert(TableName.as_ref().to_string(), "test_table".to_string());
+        options.insert(TableType.as_ref().to_string(), "COPY_ON_WRITE".to_string());
+        options.insert(TableVersion.as_ref().to_string(), "5".to_string());
+        
+        let configs = HudiConfigs::new(options);
+        let result = validate_configs(&configs);
+        
+        assert!(result.is_err());
+        if let Err(CoreError::Unsupported(msg)) = result {
+            assert_eq!(msg, "Only support table version 6.");
+        } else {
+            panic!("Expected CoreError::Unsupported for table version 5");
+        }
+    }
+}
