@@ -520,6 +520,72 @@ impl Table {
             })
     }
 
+    /// Get all the changed [FileSlice]s in splits from the table between the given timestamps.
+    ///
+    /// # Arguments
+    ///     * `n` - The number of chunks to split the file slices into.
+    ///     * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
+    ///     * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing incremental query with read parallelism.
+    ///     * Uses the same splitting flow as the time-travel API to respect read parallelism config.
+    pub async fn get_file_slices_splits_between(
+        &self,
+        n: usize,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        // If the end timestamp is not provided, use the latest commit timestamp.
+        let Some(end) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
+        else {
+            // No latest commit timestamp means the table is empty.
+            return Ok(Vec::new());
+        };
+
+        let start = start_timestamp.unwrap_or(EARLIEST_START_TIMESTAMP);
+
+        self.get_file_slices_splits_between_internal(n, start, end)
+            .await
+    }
+
+    /// Same as [Table::get_file_slices_splits_between], but blocking.
+    pub fn get_file_slices_splits_between_blocking(
+        &self,
+        n: usize,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.get_file_slices_splits_between(n, start_timestamp, end_timestamp)
+                    .await
+            })
+    }
+
+    async fn get_file_slices_splits_between_internal(
+        &self,
+        n: usize,
+        start_timestamp: &str,
+        end_timestamp: &str,
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        let file_slices = self.get_file_slices_between_internal(start_timestamp, end_timestamp).await?;
+        if file_slices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let n = std::cmp::max(1, n);
+        let chunk_size = file_slices.len().div_ceil(n);
+
+        Ok(file_slices
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect())
+    }
+
     async fn get_file_slices_between_internal(
         &self,
         start_timestamp: &str,
@@ -1258,6 +1324,58 @@ mod tests {
             "de3550df-e12c-4591-9335-92ff992258a2-0"
         );
         assert!(file_slice_2.log_files.is_empty());
+    }
+
+    #[test]
+    fn empty_hudi_table_get_file_slices_splits_between() {
+        let base_url = SampleTable::V6Empty.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_between_blocking(2, Some(EARLIEST_START_TIMESTAMP), None)
+            .unwrap();
+        assert!(file_slices_splits.is_empty())
+    }
+
+    #[test]
+    fn hudi_table_get_file_slices_splits_between() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_between_blocking(2, None, Some("20250121000656060"))
+            .unwrap();
+        
+        assert_eq!(file_slices_splits.len(), 2);
+        let total_file_slices: usize = file_slices_splits.iter().map(|split| split.len()).sum();
+        assert_eq!(total_file_slices, 3);
+        assert_eq!(file_slices_splits[0].len(), 2);
+        assert_eq!(file_slices_splits[1].len(), 1);
+    }
+
+    #[test]
+    fn hudi_table_get_file_slices_splits_between_with_single_split() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_between_blocking(1, None, Some("20250121000656060"))
+            .unwrap();
+        
+        // Should have 1 split with all 3 file slices
+        assert_eq!(file_slices_splits.len(), 1);
+        assert_eq!(file_slices_splits[0].len(), 3);
+    }
+
+    #[test]
+    fn hudi_table_get_file_slices_splits_between_with_many_splits() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_between_blocking(10, None, Some("20250121000656060"))
+            .unwrap();
+        
+        assert_eq!(file_slices_splits.len(), 3);
+        for split in &file_slices_splits {
+            assert_eq!(split.len(), 1);
+        }
     }
 
     #[test]
