@@ -15,24 +15,18 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
+from datafusion import SessionContext
 
-from hudi._internal import (
-    HudiDataFusionDataSource,
-    HudiFileGroupReader,
-    HudiFileSlice,
-    HudiInstant,
-    HudiTable,
-    HudiTimeline,
-)
-from hudi._internal import __version__ as __version__
-from hudi.table.builder import HudiTableBuilder
+from hudi import HudiDataFusionDataSource
 
-__all__ = [
-    "HudiDataFusionDataSource",
-    "HudiFileGroupReader",
-    "HudiFileSlice",
-    "HudiInstant",
-    "HudiTable",
-    "HudiTableBuilder",
-    "HudiTimeline",
-]
+
+def test_datafusion_table_registry(get_sample_table):
+    table_path = get_sample_table
+
+    table = HudiDataFusionDataSource(
+        table_path, [("hoodie.read.use.read_optimized.mode", "true")]
+    )
+    ctx = SessionContext()
+    ctx.register_table_provider("trips", table)
+    df = ctx.sql("SELECT  city from trips order by city desc limit 1").to_arrow_table()
+    assert df.to_pylist() == [{"city": "sao_paulo"}]

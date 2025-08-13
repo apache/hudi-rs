@@ -20,6 +20,9 @@ use pyo3::prelude::*;
 
 mod internal;
 
+#[cfg(feature = "datafusion")]
+mod datafusion_internal;
+
 #[cfg(not(tarpaulin_include))]
 #[pymodule]
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -31,6 +34,12 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HudiInstant>()?;
     m.add_class::<HudiTable>()?;
     m.add_class::<HudiTimeline>()?;
+
+    #[cfg(feature = "datafusion")]
+    {
+        use datafusion_internal::HudiDataFusionDataSource;
+        m.add_class::<HudiDataFusionDataSource>()?;
+    }
 
     use internal::build_hudi_table;
     m.add_function(wrap_pyfunction!(build_hudi_table, m)?)?;
