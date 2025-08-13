@@ -18,18 +18,14 @@
  */
 
 use arrow::pyarrow::ToPyArrow;
-use datafusion::error::DataFusionError;
-use datafusion_ffi::table_provider::FFI_TableProvider;
-use hudi::HudiDataSource as InternalHudiDataSource;
-use pyo3::{types::PyCapsule, Bound};
 use std::collections::HashMap;
 use std::convert::From;
-use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
+#[cfg(feature = "datafusion")]
+use datafusion::error::DataFusionError;
 use hudi::error::CoreError;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
@@ -42,6 +38,7 @@ use hudi::timeline::Timeline;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use std::error::Error;
+
 create_exception!(_internal, HudiCoreError, PyException);
 
 fn convert_to_py_err<I>(err: I) -> PyErr
@@ -56,6 +53,7 @@ where
 pub enum PythonError {
     #[error("Error in Hudi core: {0}")]
     HudiCore(#[from] CoreError),
+    #[cfg(feature = "datafusion")]
     #[error("Error in Datafusion core: {0}")]
     DataFusionCore(#[from] DataFusionError),
 }
@@ -64,6 +62,7 @@ impl From<PythonError> for PyErr {
     fn from(err: PythonError) -> PyErr {
         match err {
             PythonError::HudiCore(err) => convert_to_py_err(err),
+            #[cfg(feature = "datafusion")]
             PythonError::DataFusionCore(err) => convert_to_py_err(err),
         }
     }
@@ -248,48 +247,6 @@ impl From<&Instant> for HudiInstant {
         HudiInstant {
             inner: i.to_owned(),
         }
-    }
-}
-
-#[cfg(not(tarpaulin_include))]
-#[pyclass(name = "HudiDataSource")]
-#[derive(Clone)]
-pub struct HudiDataSource {
-    table: InternalHudiDataSource,
-}
-
-#[cfg(not(tarpaulin_include))]
-#[pymethods]
-impl HudiDataSource {
-    #[new]
-    #[pyo3(signature = (base_uri, options=None))]
-    fn new(base_uri: &str, options: Option<Vec<(String, String)>>) -> PyResult<Self> {
-        let inner: InternalHudiDataSource = rt()
-            .block_on(InternalHudiDataSource::new_with_options(
-                base_uri,
-                options.unwrap_or_default(),
-            ))
-            .map_err(PythonError::from)?;
-        Ok(HudiDataSource { table: inner })
-    }
-
-    #[pyo3(signature = ())]
-    fn __datafusion_table_provider__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyCapsule>> {
-        let capsule_name = CString::new("datafusion_table_provider").map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid capsule name: {}", e))
-        })?;
-
-        // Clone the inner data source and wrap it in an Arc
-        let provider = Arc::new(self.table.clone());
-
-        // Create the FFI wrapper
-        let ffi_provider = FFI_TableProvider::new(provider, false, None);
-
-        // Create and return the PyCapsule
-        PyCapsule::new(py, ffi_provider, Some(capsule_name))
     }
 }
 
@@ -647,7 +604,7 @@ pub fn build_hudi_table(
 }
 
 #[cfg(not(tarpaulin_include))]
-fn rt() -> &'static Runtime {
+pub fn rt() -> &'static Runtime {
     static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
     TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
 }

@@ -17,13 +17,13 @@
 
 from datafusion import SessionContext
 
-from hudi import HudiDataSource
+from hudi import HudiDataFusionDataSource
 
 
 def test_datafusion_table_registry(get_sample_table):
     table_path = get_sample_table
 
-    table = HudiDataSource(
+    table = HudiDataFusionDataSource(
         table_path, [("hoodie.read.use.read_optimized.mode", "true")]
     )
     ctx = SessionContext()

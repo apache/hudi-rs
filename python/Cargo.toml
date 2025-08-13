@@ -33,12 +33,12 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
-hudi = { path = "../crates/hudi", features = ["datafusion"]}
+hudi = { path = "../crates/hudi"}
 # arrow
 arrow = { workspace = true, features = ["pyarrow"] }
 
-datafusion = { workspace = true }
-datafusion-ffi = { workspace = true }
+datafusion = { workspace = true, optional = true}
+datafusion-ffi = { workspace = true, optional = true}
 
 # "stdlib"
 thiserror = { workspace = true }
@@ -50,6 +50,10 @@ tokio = { workspace = true }
 [dependencies.pyo3]
 version = "~0.23"
 features = ["extension-module", "abi3", "abi3-py39"]
+
+[features]
+default = []
+datafusion = ["dep:datafusion","dep:datafusion-ffi","hudi/datafusion"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

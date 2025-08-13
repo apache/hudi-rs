@@ -37,7 +37,6 @@ classifiers = [
 dependencies = [
     "pyarrow>=11.0.0",
     "pyarrow-hotfix",
-    "datafusion==46.0.0",
 ]
 
 dynamic = ["version"]
@@ -52,6 +51,9 @@ devel = [
 lint = [
     "ruff==0.12",
     "mypy==1.15",   
+]
+datafusion = [
+    "datafusion==46.0.0",
 ]
 
 [tool.maturin]

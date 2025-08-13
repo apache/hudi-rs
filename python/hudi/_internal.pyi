@@ -350,14 +350,14 @@ def build_hudi_table(
     """
     ...
 @dataclass(init=False)
-class HudiDataSource:
+class HudiDataFusionDataSource:
     def __init__(
         self,
         base_uri: str,
         options: Optional[List[Tuple[str, str]]] = None,
     ):
         """
-        Initializes the HudiDataSource.
+        Initializes the HudiDataFusionDataSource.
 
         Parameters:
             base_uri (str): The base URI of the Hudi table.
