@@ -275,6 +275,14 @@ Update `src/main.rs` with the code snippet below then `cargo run`.
 
 </details>
 
+<details>
+<summary>Add python hudi with datafusion feature to your application to query a Hudi table.</summary>
+
+```shell
+pip install hudi[datafusion]
+```
+</details>
+
 #### Rust
 ```rust
 use std::sync::Arc;
@@ -299,9 +307,9 @@ async fn main() -> Result<()> {
 #### Python
 ```python
     from datafusion import SessionContext
-    from hudi import HudiDataSource
+    from hudi import HudiDataFusionDataSource
 
-    table = HudiDataSource(
+    table = HudiDataFusionDataSource(
         "/tmp/trips_table", [("hoodie.read.use.read_optimized.mode", "true")]
     )
     ctx = SessionContext()
