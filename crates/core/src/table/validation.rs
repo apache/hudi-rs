@@ -86,10 +86,10 @@ mod tests {
         options.insert(TableName.as_ref().to_string(), "test_table".to_string());
         options.insert(TableType.as_ref().to_string(), "COPY_ON_WRITE".to_string());
         options.insert(TableVersion.as_ref().to_string(), "5".to_string());
-        
+
         let configs = HudiConfigs::new(options);
         let result = validate_configs(&configs);
-        
+
         assert!(result.is_err());
         if let Err(CoreError::Unsupported(msg)) = result {
             assert_eq!(msg, "Only support table version 6.");
