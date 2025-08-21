@@ -28,3 +28,22 @@ where
         target.entry(key.clone()).or_insert_with(|| value.clone());
     }
 }
+
+/// Split a vector into approximately equal chunks based on the specified number of splits.
+///
+/// # Arguments
+/// * `items` - The vector to split
+/// * `num_splits` - The desired number of chunks (will be clamped to at least 1)
+pub fn split_into_chunks<T: Clone>(items: Vec<T>, num_splits: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let n = std::cmp::max(1, num_splits);
+    let chunk_size = items.len().div_ceil(n);
+
+    items
+        .chunks(chunk_size)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}

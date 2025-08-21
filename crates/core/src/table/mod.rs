@@ -106,6 +106,7 @@ use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
+use crate::util::collection::split_into_chunks;
 use crate::Result;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
@@ -379,17 +380,7 @@ impl Table {
         filters: &[Filter],
     ) -> Result<Vec<Vec<FileSlice>>> {
         let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
-        if file_slices.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let n = std::cmp::max(1, num_splits);
-        let chunk_size = file_slices.len().div_ceil(n);
-
-        Ok(file_slices
-            .chunks(chunk_size)
-            .map(|chunk| chunk.to_vec())
-            .collect())
+        Ok(split_into_chunks(file_slices, num_splits))
     }
 
     /// Get all the [FileSlice]s in the table.
@@ -575,17 +566,7 @@ impl Table {
         let file_slices = self
             .get_file_slices_between_internal(start_timestamp, end_timestamp)
             .await?;
-        if file_slices.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let n = std::cmp::max(1, num_splits);
-        let chunk_size = file_slices.len().div_ceil(n);
-
-        Ok(file_slices
-            .chunks(chunk_size)
-            .map(|chunk| chunk.to_vec())
-            .collect())
+        Ok(split_into_chunks(file_slices, num_splits))
     }
 
     async fn get_file_slices_between_internal(
