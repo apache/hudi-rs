@@ -294,11 +294,11 @@ impl Table {
     /// Get all the [FileSlice]s in splits from the table.
     ///
     /// # Arguments
-    ///     * `n` - The number of chunks to split the file slices into.
+    ///     * `num_splits` - The number of chunks to split the file slices into.
     ///     * `filters` - Partition filters to apply.
     pub async fn get_file_slices_splits<I, S>(
         &self,
-        n: usize,
+        num_splits: usize,
         filters: I,
     ) -> Result<Vec<Vec<FileSlice>>>
     where
@@ -307,7 +307,7 @@ impl Table {
     {
         if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
-            self.get_file_slices_splits_internal(n, timestamp, &filters)
+            self.get_file_slices_splits_internal(num_splits, timestamp, &filters)
                 .await
         } else {
             Ok(Vec::new())
@@ -317,7 +317,7 @@ impl Table {
     /// Same as [Table::get_file_slices_splits], but blocking.
     pub fn get_file_slices_splits_blocking<I, S>(
         &self,
-        n: usize,
+        num_splits: usize,
         filters: I,
     ) -> Result<Vec<Vec<FileSlice>>>
     where
@@ -327,18 +327,18 @@ impl Table {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(async { self.get_file_slices_splits(n, filters).await })
+            .block_on(async { self.get_file_slices_splits(num_splits, filters).await })
     }
 
     /// Get all the [FileSlice]s in splits from the table at a given timestamp.
     ///
     /// # Arguments
-    ///     * `n` - The number of chunks to split the file slices into.
+    ///     * `num_splits` - The number of chunks to split the file slices into.
     ///     * `timestamp` - The timestamp which file slices associated with.
     ///     * `filters` - Partition filters to apply.
     pub async fn get_file_slices_splits_as_of<I, S>(
         &self,
-        n: usize,
+        num_splits: usize,
         timestamp: &str,
         filters: I,
     ) -> Result<Vec<Vec<FileSlice>>>
@@ -348,14 +348,14 @@ impl Table {
     {
         let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
-        self.get_file_slices_splits_internal(n, &timestamp, &filters)
+        self.get_file_slices_splits_internal(num_splits, &timestamp, &filters)
             .await
     }
 
     /// Same as [Table::get_file_slices_splits_as_of], but blocking.
     pub fn get_file_slices_splits_as_of_blocking<I, S>(
         &self,
-        n: usize,
+        num_splits: usize,
         timestamp: &str,
         filters: I,
     ) -> Result<Vec<Vec<FileSlice>>>
@@ -367,14 +367,14 @@ impl Table {
             .enable_all()
             .build()?
             .block_on(async {
-                self.get_file_slices_splits_as_of(n, timestamp, filters)
+                self.get_file_slices_splits_as_of(num_splits, timestamp, filters)
                     .await
             })
     }
 
     async fn get_file_slices_splits_internal(
         &self,
-        n: usize,
+        num_splits: usize,
         timestamp: &str,
         filters: &[Filter],
     ) -> Result<Vec<Vec<FileSlice>>> {
@@ -383,7 +383,7 @@ impl Table {
             return Ok(Vec::new());
         }
 
-        let n = std::cmp::max(1, n);
+        let n = std::cmp::max(1, num_splits);
         let chunk_size = file_slices.len().div_ceil(n);
 
         Ok(file_slices
@@ -523,7 +523,7 @@ impl Table {
     /// Get all the changed [FileSlice]s in splits from the table between the given timestamps.
     ///
     /// # Arguments
-    ///     * `n` - The number of chunks to split the file slices into.
+    ///     * `num_splits` - The number of chunks to split the file slices into.
     ///     * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
     ///     * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
     ///
@@ -532,7 +532,7 @@ impl Table {
     ///     * Uses the same splitting flow as the time-travel API to respect read parallelism config.
     pub async fn get_file_slices_splits_between(
         &self,
-        n: usize,
+        num_splits: usize,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<Vec<FileSlice>>> {
@@ -546,14 +546,14 @@ impl Table {
 
         let start = start_timestamp.unwrap_or(EARLIEST_START_TIMESTAMP);
 
-        self.get_file_slices_splits_between_internal(n, start, end)
+        self.get_file_slices_splits_between_internal(num_splits, start, end)
             .await
     }
 
     /// Same as [Table::get_file_slices_splits_between], but blocking.
     pub fn get_file_slices_splits_between_blocking(
         &self,
-        n: usize,
+        num_splits: usize,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<Vec<FileSlice>>> {
@@ -561,23 +561,25 @@ impl Table {
             .enable_all()
             .build()?
             .block_on(async {
-                self.get_file_slices_splits_between(n, start_timestamp, end_timestamp)
+                self.get_file_slices_splits_between(num_splits, start_timestamp, end_timestamp)
                     .await
             })
     }
 
     async fn get_file_slices_splits_between_internal(
         &self,
-        n: usize,
+        num_splits: usize,
         start_timestamp: &str,
         end_timestamp: &str,
     ) -> Result<Vec<Vec<FileSlice>>> {
-        let file_slices = self.get_file_slices_between_internal(start_timestamp, end_timestamp).await?;
+        let file_slices = self
+            .get_file_slices_between_internal(start_timestamp, end_timestamp)
+            .await?;
         if file_slices.is_empty() {
             return Ok(Vec::new());
         }
 
-        let n = std::cmp::max(1, n);
+        let n = std::cmp::max(1, num_splits);
         let chunk_size = file_slices.len().div_ceil(n);
 
         Ok(file_slices
@@ -1343,7 +1345,7 @@ mod tests {
         let file_slices_splits = hudi_table
             .get_file_slices_splits_between_blocking(2, None, Some("20250121000656060"))
             .unwrap();
-        
+
         assert_eq!(file_slices_splits.len(), 2);
         let total_file_slices: usize = file_slices_splits.iter().map(|split| split.len()).sum();
         assert_eq!(total_file_slices, 3);
@@ -1358,7 +1360,7 @@ mod tests {
         let file_slices_splits = hudi_table
             .get_file_slices_splits_between_blocking(1, None, Some("20250121000656060"))
             .unwrap();
-        
+
         // Should have 1 split with all 3 file slices
         assert_eq!(file_slices_splits.len(), 1);
         assert_eq!(file_slices_splits[0].len(), 3);
@@ -1371,7 +1373,7 @@ mod tests {
         let file_slices_splits = hudi_table
             .get_file_slices_splits_between_blocking(10, None, Some("20250121000656060"))
             .unwrap();
-        
+
         assert_eq!(file_slices_splits.len(), 3);
         for split in &file_slices_splits {
             assert_eq!(split.len(), 1);
