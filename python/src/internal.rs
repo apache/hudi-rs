@@ -24,6 +24,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
+#[cfg(feature = "datafusion")]
+use datafusion::error::DataFusionError;
 use hudi::error::CoreError;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
@@ -35,10 +37,14 @@ use hudi::timeline::instant::Instant;
 use hudi::timeline::Timeline;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
+use std::error::Error;
 
 create_exception!(_internal, HudiCoreError, PyException);
 
-fn convert_to_py_err(err: CoreError) -> PyErr {
+fn convert_to_py_err<I>(err: I) -> PyErr
+where
+    I: Error,
+{
     // TODO(xushiyan): match and map all sub types
     HudiCoreError::new_err(err.to_string())
 }
@@ -47,12 +53,17 @@ fn convert_to_py_err(err: CoreError) -> PyErr {
 pub enum PythonError {
     #[error("Error in Hudi core: {0}")]
     HudiCore(#[from] CoreError),
+    #[cfg(feature = "datafusion")]
+    #[error("Error in Datafusion core: {0}")]
+    DataFusionCore(#[from] DataFusionError),
 }
 
 impl From<PythonError> for PyErr {
     fn from(err: PythonError) -> PyErr {
         match err {
             PythonError::HudiCore(err) => convert_to_py_err(err),
+            #[cfg(feature = "datafusion")]
+            PythonError::DataFusionCore(err) => convert_to_py_err(err),
         }
     }
 }
@@ -593,7 +604,7 @@ pub fn build_hudi_table(
 }
 
 #[cfg(not(tarpaulin_include))]
-fn rt() -> &'static Runtime {
+pub fn rt() -> &'static Runtime {
     static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
     TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
 }
