@@ -39,8 +39,8 @@ pub fn split_into_chunks<T: Clone>(items: Vec<T>, num_splits: usize) -> Vec<Vec<
         return Vec::new();
     }
 
-    let n = std::cmp::max(1, num_splits);
-    let chunk_size = items.len().div_ceil(n);
+    let splits = std::cmp::max(1, num_splits);
+    let chunk_size = items.len().div_ceil(splits);
 
     items
         .chunks(chunk_size)
