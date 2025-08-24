@@ -52,6 +52,9 @@ lint = [
     "ruff==0.12",
     "mypy==1.15",   
 ]
+datafusion = [
+    "datafusion==46.0.0",
+]
 
 [tool.maturin]
 module-name = "hudi._internal"

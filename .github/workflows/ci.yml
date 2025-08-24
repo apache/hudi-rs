@@ -60,7 +60,7 @@ jobs:
       image: xd009642/tarpaulin:0.32.7
       options: --security-opt seccomp=unconfined
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
       - name: Rust unit tests with coverage report
@@ -93,7 +93,7 @@ jobs:
             python-version: '3.9'
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         
       - name: install uv and set the python version
         uses: astral-sh/setup-uv@v6
@@ -133,7 +133,7 @@ jobs:
           app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ rust-tests, python-tests ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           pattern: cov-report-*
