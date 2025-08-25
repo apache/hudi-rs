@@ -204,9 +204,7 @@ impl OptionResolver {
                 .any(|prefix| key.starts_with(prefix))
             {
                 if let Some(storage_key) = self.process_cloud_env_var(&key) {
-                    if !self.storage_options.contains_key(&storage_key) {
-                        self.storage_options.insert(storage_key, value);
-                    }
+                    self.storage_options.entry(storage_key).or_insert(value);
                 }
             }
         }
