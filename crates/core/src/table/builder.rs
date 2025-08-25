@@ -202,10 +202,20 @@ impl OptionResolver {
             if Storage::CLOUD_STORAGE_PREFIXES
                 .iter()
                 .any(|prefix| key.starts_with(prefix))
-                && !self.storage_options.contains_key(&key.to_ascii_lowercase())
             {
-                self.storage_options.insert(key.to_ascii_lowercase(), value);
+                if let Some(storage_key) = self.process_cloud_env_var(&key) {
+                    self.storage_options.entry(storage_key).or_insert(value);
+                }
             }
+        }
+    }
+
+    /// Process a cloud environment variable and return the appropriate storage key
+    fn process_cloud_env_var(&self, env_key: &str) -> Option<String> {
+        if env_key.starts_with("HOODIE_ENV_") {
+            Some(self.parse_hudi_env_var(env_key))
+        } else {
+            Some(env_key.to_ascii_lowercase())
         }
     }
 
@@ -266,6 +276,15 @@ impl OptionResolver {
         }
 
         Ok(())
+    }
+
+    /// Parse Hudi environment variable format: HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key
+    /// Returns: fs.s3a.access.key
+    fn parse_hudi_env_var(&self, env_key: &str) -> String {
+        env_key
+            .strip_prefix("HOODIE_ENV_")
+            .unwrap_or(env_key)
+            .replace("_DOT_", ".")
     }
 }
 
@@ -367,5 +386,82 @@ mod tests {
             resolver.storage_options["AWS_ENDPOINT"],
             "s3.us-east-1.amazonaws.com"
         );
+    }
+
+    #[test]
+    fn test_parse_hudi_env_var() {
+        let resolver = OptionResolver::new("test_uri");
+
+        assert_eq!(
+            resolver.parse_hudi_env_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key"),
+            "fs.s3a.access.key"
+        );
+        assert_eq!(
+            resolver.parse_hudi_env_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key"),
+            "fs.s3a.secret.key"
+        );
+        assert_eq!(
+            resolver.parse_hudi_env_var("HOODIE_ENV_fs_DOT_s3_DOT_awsAccessKeyId"),
+            "fs.s3.awsAccessKeyId"
+        );
+        assert_eq!(
+            resolver.parse_hudi_env_var("HOODIE_ENV_fs_DOT_s3_DOT_awsSecretAccessKey"),
+            "fs.s3.awsSecretAccessKey"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cloud_env_vars_with_hudi_style() {
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+
+        std::env::set_var(
+            "HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key",
+            "test_access_key",
+        );
+        std::env::set_var(
+            "HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key",
+            "test_secret_key",
+        );
+
+        let mut resolver = OptionResolver::new("test_uri");
+        resolver.resolve_cloud_env_vars();
+
+        assert_eq!(
+            resolver.storage_options.get("fs.s3a.access.key"),
+            Some(&"test_access_key".to_string())
+        );
+        assert_eq!(
+            resolver.storage_options.get("fs.s3a.secret.key"),
+            Some(&"test_secret_key".to_string())
+        );
+
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+    }
+
+    #[test]
+    fn test_resolve_cloud_env_vars_precedence() {
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+
+        // Test that manually set storage options take precedence over env vars
+        std::env::set_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key", "env_access_key");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "standard_access_key");
+
+        let mut resolver = OptionResolver::new("test_uri");
+        resolver.storage_options.insert(
+            "fs.s3a.access.key".to_string(),
+            "manual_access_key".to_string(),
+        );
+        resolver.resolve_cloud_env_vars();
+
+        assert_eq!(
+            resolver.storage_options.get("fs.s3a.access.key"),
+            Some(&"manual_access_key".to_string())
+        );
+
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
     }
 }
