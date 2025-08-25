@@ -237,7 +237,10 @@ class HudiTable:
         """
         ...
     def get_file_slices_splits_as_of(
-        self, num_splits: int, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+        self,
+        num_splits: int,
+        timestamp: str,
+        filters: Optional[List[Tuple[str, str, str]]],
     ) -> List[List[HudiFileSlice]]:
         """
         Retrieves all file slices in the Hudi table as of a timestamp in 'num_splits' splits, optionally filtered by given filters.
