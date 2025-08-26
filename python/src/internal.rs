@@ -330,10 +330,10 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (n, filters=None))]
+    #[pyo3(signature = (num_splits, filters=None))]
     fn get_file_slices_splits(
         &self,
-        n: usize,
+        num_splits: usize,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
@@ -341,7 +341,7 @@ impl HudiTable {
             let file_slices = rt()
                 .block_on(
                     self.inner
-                        .get_file_slices_splits(n, filters.unwrap_or_default()),
+                        .get_file_slices_splits(num_splits, filters.unwrap_or_default()),
                 )
                 .map_err(PythonError::from)?;
             Ok(file_slices
@@ -351,10 +351,10 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (n, timestamp, filters=None))]
+    #[pyo3(signature = (num_splits, timestamp, filters=None))]
     fn get_file_slices_splits_as_of(
         &self,
-        n: usize,
+        num_splits: usize,
         timestamp: &str,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
@@ -362,7 +362,7 @@ impl HudiTable {
         py.allow_threads(|| {
             let file_slices = rt()
                 .block_on(self.inner.get_file_slices_splits_as_of(
-                    n,
+                    num_splits,
                     timestamp,
                     filters.unwrap_or_default(),
                 ))
