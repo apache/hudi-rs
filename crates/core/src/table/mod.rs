@@ -106,13 +106,18 @@ use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
-use crate::util::collection::split_into_chunks;
+use crate::util::collection::split_into_chunks_by_moving;
 use crate::Result;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
+use futures::Stream;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
+
+/// Stream-based file slice reader for lazy consumption
+pub type FileSliceStream = Pin<Box<dyn Stream<Item = Result<Vec<FileSlice>>> + Send>>;
 
 /// The main struct that provides table APIs for interacting with a Hudi table.
 #[derive(Clone, Debug)]
@@ -380,7 +385,7 @@ impl Table {
         filters: &[Filter],
     ) -> Result<Vec<Vec<FileSlice>>> {
         let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
-        Ok(split_into_chunks(file_slices, num_splits))
+        Ok(split_into_chunks_by_moving(file_slices, num_splits))
     }
 
     /// Get all the [FileSlice]s in the table.
@@ -566,7 +571,7 @@ impl Table {
         let file_slices = self
             .get_file_slices_between_internal(start_timestamp, end_timestamp)
             .await?;
-        Ok(split_into_chunks(file_slices, num_splits))
+        Ok(split_into_chunks_by_moving(file_slices, num_splits))
     }
 
     async fn get_file_slices_between_internal(
@@ -586,6 +591,89 @@ impl Table {
         }
 
         Ok(file_slices)
+    }
+
+    /// Get file slices as a stream for lazy consumption
+    /// Returns a stream where each item is a batch of FileSlices
+    pub fn get_file_slices_stream<I, S>(&self, batch_size: usize, filters: I) -> FileSliceStream
+    where
+        I: IntoIterator<Item = (S, S, S)> + Send + 'static,
+        S: AsRef<str> + Send + 'static,
+    {
+        let table = self.clone();
+        let filters = match from_str_tuples(filters) {
+            Ok(f) => f,
+            Err(e) => {
+                return Box::pin(async_stream::stream! {
+                    yield Err(e);
+                });
+            }
+        };
+
+        Box::pin(async_stream::stream! {
+            let timestamp = match table.timeline.get_latest_commit_timestamp_as_option() {
+                Some(ts) => ts,
+                None => {
+                    return;
+                }
+            };
+
+            let all_slices = match table.get_file_slices_internal(timestamp, &filters).await {
+                Ok(slices) => slices,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            for batch in all_slices.chunks(batch_size) {
+                yield Ok(batch.to_vec());
+            }
+        })
+    }
+
+    /// Get file slices as splits stream for lazy consumption
+    pub fn get_file_slices_splits_stream<I, S>(
+        &self,
+        num_splits: usize,
+        filters: I,
+    ) -> FileSliceStream
+    where
+        I: IntoIterator<Item = (S, S, S)> + Send + 'static,
+        S: AsRef<str> + Send + 'static,
+    {
+        let table = self.clone();
+        let filters = match from_str_tuples(filters) {
+            Ok(f) => f,
+            Err(e) => {
+                return Box::pin(async_stream::stream! {
+                    yield Err(e);
+                });
+            }
+        };
+
+        Box::pin(async_stream::stream! {
+            let timestamp = match table.timeline.get_latest_commit_timestamp_as_option() {
+                Some(ts) => ts,
+                None => {
+                    return;
+                }
+            };
+
+            let all_slices = match table.get_file_slices_internal(timestamp, &filters).await {
+                Ok(slices) => slices,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            let splits = split_into_chunks_by_moving(all_slices, num_splits);
+
+            for split in splits {
+                yield Ok(split);
+            }
+        })
     }
 
     /// Create a [FileGroupReader] using the [Table]'s Hudi configs, and overwriting options.

@@ -80,6 +80,7 @@ url = { version = "~2.5.4" }
 
 # runtime / async
 async-recursion = { version = "~1.1.1" }
+async-stream = { version = "~0.3" }
 async-trait = { version = "~0.1" }
 dashmap = { version = "~6.1" }
 futures = { version = "~0.3" }

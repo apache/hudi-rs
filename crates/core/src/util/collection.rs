@@ -29,7 +29,7 @@ where
     }
 }
 
-/// Split a vector into approximately equal chunks based on the specified number of splits.
+/// Split a vector into approximately equal chunks based on the specified number of splits by cloning.
 ///
 /// # Arguments
 /// * `items` - The vector to split
@@ -46,6 +46,30 @@ pub fn split_into_chunks<T: Clone>(items: Vec<T>, num_splits: usize) -> Vec<Vec<
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect()
+}
+
+/// Split a vector into approximately equal chunks based on the specified number of splits by moving.
+///
+/// # Arguments
+/// * `items` - The vector to split
+/// * `num_splits` - The desired number of chunks (will be clamped to at least 1)
+pub fn split_into_chunks_by_moving<T>(mut items: Vec<T>, num_splits: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let num_splits = std::cmp::max(1, num_splits);
+    let chunk_size = items.len().div_ceil(num_splits);
+
+    let mut result = Vec::with_capacity(num_splits);
+
+    while !items.is_empty() {
+        let take_count = std::cmp::min(chunk_size, items.len());
+        let chunk = items.drain(..take_count).collect();
+        result.push(chunk);
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -81,6 +105,44 @@ mod tests {
     fn test_split_into_chunks_normal_case() {
         let items = vec![1, 2, 3, 4, 5];
         let result = split_into_chunks(items, 2);
+        assert_eq!(result.len(), 2, "Should return 2 chunks");
+        assert_eq!(result[0], vec![1, 2, 3], "First chunk should have 3 items");
+        assert_eq!(result[1], vec![4, 5], "Second chunk should have 2 items");
+    }
+
+    #[test]
+    fn test_split_into_chunks_by_moving_zero_splits() {
+        let items = vec![1, 2, 3, 4, 5];
+        let result = split_into_chunks_by_moving(items, 0);
+        assert_eq!(result.len(), 1, "Zero splits should be clamped to 1");
+        assert_eq!(
+            result[0],
+            vec![1, 2, 3, 4, 5],
+            "All items should be in single chunk"
+        );
+    }
+
+    #[test]
+    fn test_split_into_chunks_by_moving_empty_input() {
+        let items: Vec<i32> = vec![];
+        let result = split_into_chunks_by_moving(items, 2);
+        assert!(result.is_empty(), "Empty input should return empty result");
+    }
+
+    #[test]
+    fn test_split_into_chunks_by_moving_more_splits_than_items() {
+        let items = vec![1, 2, 3];
+        let result = split_into_chunks_by_moving(items, 5);
+        assert_eq!(result.len(), 3, "Should return 3 chunks (one per item)");
+        assert_eq!(result[0], vec![1]);
+        assert_eq!(result[1], vec![2]);
+        assert_eq!(result[2], vec![3]);
+    }
+
+    #[test]
+    fn test_split_into_chunks_by_moving_normal_case() {
+        let items = vec![1, 2, 3, 4, 5];
+        let result = split_into_chunks_by_moving(items, 2);
         assert_eq!(result.len(), 2, "Should return 2 chunks");
         assert_eq!(result[0], vec![1, 2, 3], "First chunk should have 3 items");
         assert_eq!(result[1], vec![4, 5], "Second chunk should have 2 items");
