@@ -21,6 +21,7 @@ from hudi._internal import (
     HudiFileGroupReader,
     HudiFileSlice,
     HudiInstant,
+    HudiQueryType,
     HudiTable,
     HudiTimeline,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "HudiFileGroupReader",
     "HudiFileSlice",
     "HudiInstant",
+    "HudiQueryType",
     "HudiTable",
     "HudiTableBuilder",
     "HudiTimeline",

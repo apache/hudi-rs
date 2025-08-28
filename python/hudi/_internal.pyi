@@ -133,6 +133,18 @@ class HudiInstant:
     @property
     def epoch_mills(self) -> int: ...
 
+class HudiQueryType:
+    """
+    Standardized query types for Hudi table read operations.
+
+    `str(query_type)` returns the canonical Hudi value: ``"snapshot"``,
+    ``"read_optimized"``, or ``"incremental"``.
+    """
+
+    Snapshot: "HudiQueryType"
+    ReadOptimized: "HudiQueryType"
+    Incremental: "HudiQueryType"
+
 @dataclass(init=False)
 class HudiTable:
     """

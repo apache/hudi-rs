@@ -92,6 +92,7 @@ pub mod file_pruner;
 pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
+pub mod query;
 mod read_options;
 mod validation;
 

@@ -26,6 +26,7 @@ use tokio::runtime::Runtime;
 
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
+use hudi::QueryType;
 use hudi::error::CoreError;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
@@ -67,6 +68,50 @@ impl From<PythonError> for PyErr {
             #[cfg(feature = "datafusion")]
             PythonError::DataFusionCore(err) => convert_to_py_err(err),
         }
+    }
+}
+
+/// Standardized query types for Hudi table read operations.
+///
+/// Mirrors [`hudi::QueryType`] for use from Python.
+#[cfg(not(tarpaulin_include))]
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum HudiQueryType {
+    Snapshot,
+    ReadOptimized,
+    Incremental,
+}
+
+impl From<HudiQueryType> for QueryType {
+    fn from(qt: HudiQueryType) -> Self {
+        match qt {
+            HudiQueryType::Snapshot => QueryType::Snapshot,
+            HudiQueryType::ReadOptimized => QueryType::ReadOptimized,
+            HudiQueryType::Incremental => QueryType::Incremental,
+        }
+    }
+}
+
+impl From<QueryType> for HudiQueryType {
+    fn from(qt: QueryType) -> Self {
+        match qt {
+            QueryType::Snapshot => HudiQueryType::Snapshot,
+            QueryType::ReadOptimized => HudiQueryType::ReadOptimized,
+            QueryType::Incremental => HudiQueryType::Incremental,
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiQueryType {
+    fn __str__(&self) -> String {
+        QueryType::from(self.clone()).as_ref().to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("HudiQueryType.{self:?}")
     }
 }
 
