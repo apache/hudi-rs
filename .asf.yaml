@@ -33,6 +33,7 @@ github:
     wiki: false
     issues: true
     projects: true
+    discussions: true
   enabled_merge_buttons:
     squash: true
     merge: false
@@ -52,3 +53,4 @@ notifications:
   commits:      commits@hudi.apache.org
   issues:       commits@hudi.apache.org
   pullrequests: commits@hudi.apache.org
+  discussions:  dev@hudi.apache.org
