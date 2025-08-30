@@ -101,7 +101,7 @@ impl HudiDataSource {
         self.table
             .hudi_configs
             .get_or_default(InputPartitions)
-            .to::<usize>()
+            .into()
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.

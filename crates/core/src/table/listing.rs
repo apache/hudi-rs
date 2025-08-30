@@ -61,10 +61,10 @@ impl FileLister {
     }
 
     async fn list_file_groups_for_partition(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
-        let base_file_format = self
+        let base_file_format: String = self
             .hudi_configs
             .get_or_default(BaseFileFormat)
-            .to::<String>();
+            .into();
 
         let listed_file_metadata = self.storage.list_files(Some(partition_path)).await?;
 
@@ -167,7 +167,7 @@ impl FileLister {
         let parallelism = self
             .hudi_configs
             .get_or_default(ListingParallelism)
-            .to::<usize>();
+            .into();
         stream::iter(pruned_partition_paths)
             .map(|p| async move {
                 let file_groups = self.list_file_groups_for_partition(&p).await?;

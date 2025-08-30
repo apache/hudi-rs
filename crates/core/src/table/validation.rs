@@ -30,7 +30,7 @@ use strum::IntoEnumIterator;
 pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> {
     if hudi_configs
         .get_or_default(SkipConfigValidation)
-        .to::<bool>()
+        .into()
     {
         return Ok(());
     }
@@ -44,14 +44,14 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
     }
 
     // additional validation
-    let table_version = hudi_configs.get(TableVersion)?.to::<isize>();
+    let table_version: isize = hudi_configs.get(TableVersion)?.into();
     if table_version != 6 {
         return Err(CoreError::Unsupported(
             "Only support table version 6.".to_string(),
         ));
     }
 
-    let timeline_layout_version = hudi_configs.get(TimelineLayoutVersion)?.to::<isize>();
+    let timeline_layout_version: isize = hudi_configs.get(TimelineLayoutVersion)?.into();
     if timeline_layout_version != 1 {
         return Err(CoreError::Unsupported(
             "Only support timeline layout version 1.".to_string(),
@@ -60,7 +60,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
 
     let drops_partition_cols = hudi_configs
         .get_or_default(DropsPartitionFields)
-        .to::<bool>();
+        .into();
     if drops_partition_cols {
         return Err(CoreError::Unsupported(format!(
             "Only support when `{}` is disabled",

@@ -55,9 +55,9 @@ impl LogFileReader<StorageReader> {
         relative_path: &str,
     ) -> Result<Self> {
         let reader = storage.get_storage_reader(relative_path).await?;
-        let timezone = hudi_configs
+        let timezone: String = hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
-            .to::<String>();
+            .into();
         Ok(Self {
             hudi_configs,
             storage,

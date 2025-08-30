@@ -33,15 +33,18 @@ pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
 pub const EMPTY_PARTITION_PATH: &str = "";
 
 pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
-    let has_partition_fields = !hudi_configs
-        .get_or_default(PartitionFields)
-        .to::<Vec<String>>()
-        .is_empty();
+    let has_partition_fields = {
+        let partition_fields: Vec<String> = hudi_configs
+            .get_or_default(PartitionFields)
+            .into();
+        !partition_fields.is_empty()
+    };
 
     let uses_non_partitioned_key_gen = hudi_configs
         .try_get(KeyGeneratorClass)
         .map(|key_gen| {
-            key_gen.to::<String>() == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
+            let key_gen_str: String = key_gen.into();
+            key_gen_str == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
         })
         .unwrap_or(false);
 
@@ -71,10 +74,10 @@ impl PartitionPruner {
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs
             .get_or_default(HudiTableConfig::IsHiveStylePartitioning)
-            .to();
+            .into();
         let is_url_encoded: bool = hudi_configs
             .get_or_default(HudiTableConfig::IsPartitionPathUrlencoded)
-            .to();
+            .into();
         Ok(PartitionPruner {
             schema,
             is_hive_style,

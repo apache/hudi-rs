@@ -142,20 +142,26 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            InputPartitions.parse_value(&options).unwrap().to::<usize>(),
+            { let value: usize = InputPartitions.parse_value(&options).unwrap().into(); value },
             100
         );
         assert_eq!(
-            ListingParallelism
-                .parse_value(&options)
-                .unwrap()
-                .to::<usize>(),
+            {
+                let value: usize = ListingParallelism
+                    .parse_value(&options)
+                    .unwrap()
+                    .into();
+                value
+            },
             100
         );
-        assert!(UseReadOptimizedMode
-            .parse_value(&options)
-            .unwrap()
-            .to::<bool>());
+        assert!({
+            let value: bool = UseReadOptimizedMode
+                .parse_value(&options)
+                .unwrap()
+                .into();
+            value
+        });
     }
 
     #[test]
@@ -170,9 +176,12 @@ mod tests {
             ParseInt(_, _, _)
         ));
         assert_eq!(
-            InputPartitions
-                .parse_value_or_default(&options)
-                .to::<usize>(),
+            {
+                let value: usize = InputPartitions
+                    .parse_value_or_default(&options)
+                    .into();
+                value
+            },
             0
         );
         assert!(matches!(
@@ -180,17 +189,23 @@ mod tests {
             ParseInt(_, _, _)
         ));
         assert_eq!(
-            ListingParallelism
-                .parse_value_or_default(&options)
-                .to::<usize>(),
+            {
+                let value: usize = ListingParallelism
+                    .parse_value_or_default(&options)
+                    .into();
+                value
+            },
             10
         );
         assert!(matches!(
             UseReadOptimizedMode.parse_value(&options).unwrap_err(),
             ParseBool(_, _, _)
         ));
-        assert!(!UseReadOptimizedMode
-            .parse_value_or_default(&options)
-            .to::<bool>())
+        assert!({
+            let value: bool = UseReadOptimizedMode
+                .parse_value_or_default(&options)
+                .into();
+            !value
+        })
     }
 }

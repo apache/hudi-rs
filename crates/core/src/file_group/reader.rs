@@ -107,10 +107,10 @@ impl FileGroupReader {
         &self,
         records: &RecordBatch,
     ) -> Result<Option<BooleanArray>> {
-        let populates_meta_fields = self
+        let populates_meta_fields: bool = self
             .hudi_configs
             .get_or_default(HudiTableConfig::PopulatesMetaFields)
-            .to::<bool>();
+            .into();
         if !populates_meta_fields {
             // If meta fields are not populated, commit time filtering is not applicable.
             return Ok(None);
@@ -121,7 +121,7 @@ impl FileGroupReader {
         if let Some(start) = self
             .hudi_configs
             .try_get(HudiReadConfig::FileGroupStartTimestamp)
-            .map(|v| v.to::<String>())
+            .map(|v| -> String { v.into() })
         {
             let filter: Filter =
                 Filter::try_from((MetaField::CommitTime.as_ref(), ">", start.as_str()))?;
@@ -137,7 +137,7 @@ impl FileGroupReader {
         if let Some(end) = self
             .hudi_configs
             .try_get(HudiReadConfig::FileGroupEndTimestamp)
-            .map(|v| v.to::<String>())
+            .map(|v| -> String { v.into() })
         {
             let filter = Filter::try_from((MetaField::CommitTime.as_ref(), "<=", end.as_str()))?;
             let filter = SchemableFilter::try_from((filter, schema.as_ref()))?;
@@ -201,15 +201,15 @@ impl FileGroupReader {
         let timezone = self
             .hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
-            .to::<String>();
+            .into();
         let start_timestamp = self
             .hudi_configs
             .try_get(HudiReadConfig::FileGroupStartTimestamp)
-            .map(|v| v.to::<String>());
+            .map(|v| -> String { v.into() });
         let end_timestamp = self
             .hudi_configs
             .try_get(HudiReadConfig::FileGroupEndTimestamp)
-            .map(|v| v.to::<String>());
+            .map(|v| -> String { v.into() });
         InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
     }
 
@@ -226,7 +226,7 @@ impl FileGroupReader {
             || self
                 .hudi_configs
                 .get_or_default(HudiReadConfig::UseReadOptimizedMode)
-                .to::<bool>();
+                .into();
         if base_file_only {
             self.read_file_slice_by_base_file_path(&relative_path).await
         } else {
