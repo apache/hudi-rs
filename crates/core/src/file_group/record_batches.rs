@@ -115,9 +115,9 @@ impl RecordBatches {
         &self,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<RecordBatch> {
-        let ordering_field = hudi_configs
+        let ordering_field: String = hudi_configs
             .get(HudiTableConfig::PrecombineField)?
-            .to::<String>();
+            .into();
 
         if self.num_delete_rows == 0 {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));

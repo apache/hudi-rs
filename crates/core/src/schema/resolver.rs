@@ -43,7 +43,7 @@ pub async fn resolve_schema(table: &Table) -> Result<Schema> {
         }
         Err(CoreError::TimelineNoCommit) => {
             if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
-                let avro_schema_str = create_schema.to::<String>();
+                let avro_schema_str: String = create_schema.into();
                 let arrow_schema = arrow_schema_from_avro_schema_str(&avro_schema_str)?;
                 prepend_meta_fields(SchemaRef::new(arrow_schema))
             } else {
@@ -72,7 +72,7 @@ pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
         Ok(metadata) => resolve_avro_schema_from_commit_metadata(&metadata),
         Err(CoreError::TimelineNoCommit) => {
             if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
-                let create_schema = create_schema.to::<String>();
+                let create_schema: String = create_schema.into();
                 Ok(sanitize_avro_schema_str(&create_schema))
             } else {
                 Err(CoreError::SchemaNotFound(
