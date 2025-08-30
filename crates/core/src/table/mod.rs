@@ -198,7 +198,7 @@ impl Table {
         self.hudi_configs
             .get(HudiTableConfig::TableName)
             .expect(&err_msg)
-            .to::<String>()
+            .into()
     }
 
     pub fn table_type(&self) -> String {
@@ -206,7 +206,7 @@ impl Table {
         self.hudi_configs
             .get(HudiTableConfig::TableType)
             .expect(&err_msg)
-            .to::<String>()
+            .into()
     }
 
     pub fn is_mor(&self) -> bool {
@@ -216,7 +216,7 @@ impl Table {
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
-            .to::<String>()
+            .into()
     }
 
     /// Get the latest Avro schema string of the table.
@@ -261,12 +261,13 @@ impl Table {
 
     /// Get the latest partition [arrow_schema::Schema] of the table.
     pub async fn get_partition_schema(&self) -> Result<Schema> {
-        let partition_fields: HashSet<String> = self
-            .hudi_configs
-            .get_or_default(PartitionFields)
-            .to::<Vec<String>>()
-            .into_iter()
-            .collect();
+        let partition_fields: HashSet<String> = {
+            let fields: Vec<String> = self
+                .hudi_configs
+                .get_or_default(PartitionFields)
+                .into();
+            fields.into_iter().collect()
+        };
 
         let schema = self.get_schema().await?;
         let partition_fields: Vec<Arc<Field>> = schema
@@ -1012,35 +1013,41 @@ mod tests {
     fn get_default_for_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
-        assert_eq!(
-            configs.get_or_default(BaseFileFormat).to::<String>(),
-            "parquet"
-        );
+        assert_eq!({
+            let value: String = configs.get_or_default(BaseFileFormat).into();
+            value
+        }, "parquet");
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
-        assert_eq!(
-            configs.get_or_default(DatabaseName).to::<String>(),
-            "default"
-        );
-        assert!(!configs.get_or_default(DropsPartitionFields).to::<bool>());
+        assert_eq!({
+            let value: String = configs.get_or_default(DatabaseName).into();
+            value
+        }, "default");
+        assert!({
+            let value: bool = configs.get_or_default(DropsPartitionFields).into();
+            !value
+        });
         assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
-        assert!(configs
-            .get_or_default(PartitionFields)
-            .to::<Vec<String>>()
-            .is_empty());
+        assert!({
+            let value: Vec<String> = configs.get_or_default(PartitionFields).into();
+            value.is_empty()
+        });
         assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
-        assert!(configs.get_or_default(PopulatesMetaFields).to::<bool>());
+        assert!({
+            let value: bool = configs.get_or_default(PopulatesMetaFields).into();
+            value
+        });
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(TableName)).is_err());
         assert_eq!(
-            configs.get_or_default(TableType).to::<String>(),
+            { let value: String = configs.get_or_default(TableType).into(); value },
             "COPY_ON_WRITE"
         );
         assert!(panic::catch_unwind(|| configs.get_or_default(TableVersion)).is_err());
         assert!(panic::catch_unwind(|| configs.get_or_default(TimelineLayoutVersion)).is_err());
         assert_eq!(
-            configs.get_or_default(TimelineTimezone).to::<String>(),
+            { let value: String = configs.get_or_default(TimelineTimezone).into(); value },
             "utc"
         );
     }
@@ -1050,37 +1057,37 @@ mod tests {
         let table = get_test_table_without_validation("table_props_valid");
         let configs = table.hudi_configs;
         assert_eq!(
-            configs.get(BaseFileFormat).unwrap().to::<String>(),
+            { let value: String = configs.get(BaseFileFormat).unwrap().into(); value },
             "parquet"
         );
-        assert_eq!(configs.get(Checksum).unwrap().to::<isize>(), 3761586722);
-        assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "db");
-        assert!(!configs.get(DropsPartitionFields).unwrap().to::<bool>());
-        assert!(!configs.get(IsHiveStylePartitioning).unwrap().to::<bool>());
-        assert!(!configs.get(IsPartitionPathUrlencoded).unwrap().to::<bool>());
+        assert_eq!({ let value: isize = configs.get(Checksum).unwrap().into(); value }, 3761586722);
+        assert_eq!({ let value: String = configs.get(DatabaseName).unwrap().into(); value }, "db");
+        assert!({ let value: bool = configs.get(DropsPartitionFields).unwrap().into(); !value });
+        assert!({ let value: bool = configs.get(IsHiveStylePartitioning).unwrap().into(); !value });
+        assert!({ let value: bool = configs.get(IsPartitionPathUrlencoded).unwrap().into(); !value });
         assert_eq!(
-            configs.get(KeyGeneratorClass).unwrap().to::<String>(),
+            { let value: String = configs.get(KeyGeneratorClass).unwrap().into(); value },
             "org.apache.hudi.keygen.SimpleKeyGenerator"
         );
         assert_eq!(
-            configs.get(PartitionFields).unwrap().to::<Vec<String>>(),
+            { let value: Vec<String> = configs.get(PartitionFields).unwrap().into(); value },
             vec!["city"]
         );
-        assert_eq!(configs.get(PrecombineField).unwrap().to::<String>(), "ts");
-        assert!(configs.get(PopulatesMetaFields).unwrap().to::<bool>());
+        assert_eq!({ let value: String = configs.get(PrecombineField).unwrap().into(); value }, "ts");
+        assert!({ let value: bool = configs.get(PopulatesMetaFields).unwrap().into(); value });
         assert_eq!(
-            configs.get(RecordKeyFields).unwrap().to::<Vec<String>>(),
+            { let value: Vec<String> = configs.get(RecordKeyFields).unwrap().into(); value },
             vec!["uuid"]
         );
-        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+        assert_eq!({ let value: String = configs.get(TableName).unwrap().into(); value }, "trips");
         assert_eq!(
-            configs.get(TableType).unwrap().to::<String>(),
+            { let value: String = configs.get(TableType).unwrap().into(); value },
             "COPY_ON_WRITE"
         );
-        assert_eq!(configs.get(TableVersion).unwrap().to::<isize>(), 6);
-        assert_eq!(configs.get(TimelineLayoutVersion).unwrap().to::<isize>(), 1);
+        assert_eq!({ let value: isize = configs.get(TableVersion).unwrap().into(); value }, 6);
+        assert_eq!({ let value: isize = configs.get(TimelineLayoutVersion).unwrap().into(); value }, 1);
         assert_eq!(
-            configs.get(TimelineTimezone).unwrap().to::<String>(),
+            { let value: String = configs.get(TimelineTimezone).unwrap().into(); value },
             "local"
         );
     }
@@ -1092,7 +1099,7 @@ mod tests {
         let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
-        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+        assert_eq!({ let value: String = configs.get(TableName).unwrap().into(); value }, "trips");
 
         // Environment variable HUDI_CONF_DIR points to nothing
         let base_path = env::current_dir().unwrap();
@@ -1102,7 +1109,7 @@ mod tests {
         let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
         assert!(configs.get(TableType).is_err());
-        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+        assert_eq!({ let value: String = configs.get(TableName).unwrap().into(); value }, "trips");
 
         // With global config
         let base_path = env::current_dir().unwrap();
@@ -1110,12 +1117,12 @@ mod tests {
         env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
         let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
-        assert_eq!(configs.get(DatabaseName).unwrap().to::<String>(), "tmpdb");
+        assert_eq!({ let value: String = configs.get(DatabaseName).unwrap().into(); value }, "tmpdb");
         assert_eq!(
-            configs.get(TableType).unwrap().to::<String>(),
+            { let value: String = configs.get(TableType).unwrap().into(); value },
             "MERGE_ON_READ"
         );
-        assert_eq!(configs.get(TableName).unwrap().to::<String>(), "trips");
+        assert_eq!({ let value: String = configs.get(TableName).unwrap().into(); value }, "trips");
         env::remove_var(HUDI_CONF_DIR)
     }
 

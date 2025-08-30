@@ -62,9 +62,9 @@ pub fn process_batch_for_max_orderings(
         return Ok(());
     }
 
-    let ordering_field = hudi_configs
+    let ordering_field: String = hudi_configs
         .get(HudiTableConfig::PrecombineField)?
-        .to::<String>();
+        .into();
 
     let keys = extract_record_keys(key_converter, batch)?;
     let event_times =

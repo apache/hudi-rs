@@ -92,16 +92,6 @@ pub enum HudiConfigValue {
 }
 
 impl HudiConfigValue {
-    /// Covert [HudiConfigValue] logical type to the representing data type in Rust.
-    ///
-    /// - [`HudiConfigValue::Boolean`] -> [bool]
-    /// - [`HudiConfigValue::Integer`] -> [isize]
-    /// - [`HudiConfigValue::UInteger`] -> [usize]
-    /// - [`HudiConfigValue::String`] -> [String]
-    /// - [`HudiConfigValue::List`] -> [`Vec<String>`]
-    pub fn to<T: 'static + std::fmt::Debug + From<HudiConfigValue>>(self) -> T {
-        T::from(self)
-    }
 
     /// A convenience method to convert [HudiConfigValue] to [Url] when the value is a [String] and is intended to be a URL.
     /// Panic if the value is not a [String].
