@@ -223,13 +223,13 @@ class HudiTable:
         """
         ...
     def get_file_slices_splits(
-        self, n: int, filters: Optional[List[Tuple[str, str, str]]]
+        self, num_splits: int, filters: Optional[List[Tuple[str, str, str]]]
     ) -> List[List[HudiFileSlice]]:
         """
-        Retrieves all file slices in the Hudi table in 'n' splits, optionally filtered by given filters.
+        Retrieves all file slices in the Hudi table in 'num_splits' splits, optionally filtered by given filters.
 
         Parameters:
-            n (int): The number of parts to split the file slices into.
+            num_splits (int): The number of parts to split the file slices into.
             filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
 
         Returns:
@@ -237,10 +237,13 @@ class HudiTable:
         """
         ...
     def get_file_slices_splits_as_of(
-        self, n: int, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
+        self,
+        num_splits: int,
+        timestamp: str,
+        filters: Optional[List[Tuple[str, str, str]]],
     ) -> List[List[HudiFileSlice]]:
         """
-        Retrieves all file slices in the Hudi table as of a timestamp in 'n' splits, optionally filtered by given filters.
+        Retrieves all file slices in the Hudi table as of a timestamp in 'num_splits' splits, optionally filtered by given filters.
         """
         ...
     def get_file_slices(
@@ -349,3 +352,18 @@ def build_hudi_table(
         HudiTable: An instance of hudi table.
     """
     ...
+@dataclass(init=False)
+class HudiDataFusionDataSource:
+    def __init__(
+        self,
+        base_uri: str,
+        options: Optional[List[Tuple[str, str]]] = None,
+    ):
+        """
+        Initializes the HudiDataFusionDataSource.
+
+        Parameters:
+            base_uri (str): The base URI of the Hudi table.
+            options (Optional[List[Tuple[str, str]]]): Additional configuration options (optional).
+        """
+        ...

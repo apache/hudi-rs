@@ -27,7 +27,7 @@ jobs:
     name: Validate git tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: compare git tag with cargo metadata
         run: |
           CURR_VER=$( grep version Cargo.toml | head -n 1 | awk '{print $3}' | tr -d '"' )
@@ -49,7 +49,7 @@ jobs:
           - "hudi-datafusion"
           - "hudi"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - run: |
            rustup toolchain add --profile=minimal stable
@@ -70,7 +70,7 @@ jobs:
         target: [ x86_64-apple-darwin, aarch64-apple-darwin ]
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -90,7 +90,7 @@ jobs:
     needs: validate-release-tag
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -110,7 +110,7 @@ jobs:
     needs: validate-release-tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
