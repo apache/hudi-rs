@@ -201,6 +201,11 @@ impl TimelineSelector {
         Self::completed_actions_in_range(&[Action::ReplaceCommit], hudi_configs, start, end)
     }
 
+    /// Whether the selector has any time filter (start or end) applied.
+    pub fn has_time_filter(&self) -> bool {
+        self.start_datetime.is_some() || self.end_datetime.is_some()
+    }
+
     pub fn should_include_action(&self, action: &Action) -> bool {
         self.actions.is_empty() || self.actions.contains(action)
     }

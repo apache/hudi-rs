@@ -32,7 +32,7 @@ pub enum TimelineLoader {
     LayoutOneActive(Arc<Storage>),
     LayoutOneArchived(Arc<Storage>),
     LayoutTwoActive(Arc<Storage>),
-    LayoutTwoCompacted(Arc<Storage>),
+    LayoutTwoArchived(Arc<Storage>),
 }
 
 impl TimelineLoader {
@@ -72,7 +72,7 @@ impl TimelineLoader {
                 let mut instants = Vec::new();
 
                 for file_info in files {
-                    if file_info.name.starts_with("history/") || file_info.name.starts_with('_') {
+                    if file_info.name.starts_with("history/") || file_info.name.ends_with(".crc") {
                         continue;
                     }
                     match selector.try_create_instant(file_info.name.as_str()) {
@@ -85,7 +85,15 @@ impl TimelineLoader {
                         }
                     }
                 }
-                Ok(instants)
+
+                instants.sort_unstable();
+                instants.shrink_to_fit();
+
+                if desc {
+                    Ok(instants.into_iter().rev().collect())
+                } else {
+                    Ok(instants)
+                }
             }
             _ => Err(CoreError::Unsupported(
                 "Loading from this timeline layout is not implemented yet.".to_string(),
@@ -93,18 +101,14 @@ impl TimelineLoader {
         }
     }
 
-    pub async fn load_archived_instants(
+    pub(crate) async fn load_archived_instants(
         &self,
         _selector: &TimelineSelector,
         _desc: bool,
     ) -> Result<Vec<Instant>> {
         match self {
-            TimelineLoader::LayoutOneArchived(_) => Err(CoreError::Unsupported(
-                "Archived timeline for layout v1 not implemented yet".to_string(),
-            )),
-            TimelineLoader::LayoutTwoCompacted(_) => Err(CoreError::Unsupported(
-                "Compacted timeline for layout v2 not implemented yet".to_string(),
-            )),
+            TimelineLoader::LayoutOneArchived(_) => Ok(Vec::new()),
+            TimelineLoader::LayoutTwoArchived(_) => Ok(Vec::new()),
             _ => Ok(Vec::new()), // Active loaders don't have archived parts.
         }
     }

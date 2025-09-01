@@ -31,6 +31,13 @@ pub struct TimelineManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
+/// Entry in an LSM timeline manifest.
+/// Each entry describes a compacted timeline file covering a time range
+/// in the LSM history directory.
+/// - `file_name`: relative path of the compacted timeline file under history
+/// - `min_instant`/`max_instant`: smallest/largest instant timestamps covered
+/// - `level`: LSM level where this file resides
+/// - `file_size`: size in bytes of the file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub file_name: String,

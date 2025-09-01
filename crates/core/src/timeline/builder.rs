@@ -69,7 +69,7 @@ impl TimelineBuilder {
 
         match layout_version {
             1 => {
-                if !(5..=8).contains(&table_version) {
+                if !(6..=8).contains(&table_version) {
                     return Err(CoreError::Unsupported(format!(
                         "Unsupported table version {} with timeline layout version {}",
                         table_version, layout_version
@@ -89,7 +89,7 @@ impl TimelineBuilder {
                 }
                 Ok((
                     TimelineLoader::LayoutTwoActive(self.storage.clone()),
-                    Some(TimelineLoader::LayoutTwoCompacted(self.storage.clone())),
+                    Some(TimelineLoader::LayoutTwoArchived(self.storage.clone())),
                 ))
             }
             _ => Err(CoreError::Unsupported(format!(

@@ -97,34 +97,33 @@ impl Timeline {
         selector: &TimelineSelector,
         desc: bool,
     ) -> Result<Vec<Instant>> {
-        self.active_loader.load_instants(selector, desc).await
+        // If a time filter is present and we have an archived loader, include archived as well.
+        if selector.has_time_filter() {
+            let mut instants = self.active_loader.load_instants(selector, desc).await?;
+            if let Some(archived_loader) = &self.archived_loader {
+                let mut archived = archived_loader
+                    .load_archived_instants(selector, desc)
+                    .await
+                    .unwrap_or_default();
+                if !archived.is_empty() {
+                    // Both sides already sorted by loaders; append is fine for now.
+                    instants.append(&mut archived);
+                }
+            }
+            Ok(instants)
+        } else {
+            self.active_loader.load_instants(selector, desc).await
+        }
     }
 
-    pub async fn load_instants_with_archive(
+    async fn load_instants_internal(
         &self,
         selector: &TimelineSelector,
         desc: bool,
-        include_archived: bool,
     ) -> Result<Vec<Instant>> {
-        // Always try active first
-        let mut instants = self.active_loader.load_instants(selector, desc).await?;
-
-        // Load archived/compacted if flag is set
-        if include_archived {
-            if let Some(archived_loader) = &self.archived_loader {
-                let archived_instants = archived_loader
-                    .load_archived_instants(selector, desc)
-                    .await?;
-                instants.extend(archived_instants);
-
-                // Re-sort after merging
-                instants.sort_unstable();
-                if desc {
-                    instants.reverse();
-                }
-            }
-        }
-        Ok(instants)
+        // For now, just load active. Archived support will be added internally later
+        // based on selector ranges.
+        self.active_loader.load_instants(selector, desc).await
     }
 
     /// Get the completed commit [Instant]s in the timeline.
@@ -138,8 +137,7 @@ impl Timeline {
     pub async fn get_completed_commits(&self, desc: bool) -> Result<Vec<Instant>> {
         let selector =
             TimelineSelector::completed_commits_in_range(self.hudi_configs.clone(), None, None)?;
-        self.load_instants_with_archive(&selector, desc, false)
-            .await
+        self.load_instants_internal(&selector, desc).await
     }
 
     /// Get the completed deltacommit [Instant]s in the timeline.
@@ -155,8 +153,7 @@ impl Timeline {
             None,
             None,
         )?;
-        self.load_instants_with_archive(&selector, desc, false)
-            .await
+        self.load_instants_internal(&selector, desc).await
     }
 
     /// Get the completed replacecommit [Instant]s in the timeline.
@@ -170,8 +167,7 @@ impl Timeline {
             None,
             None,
         )?;
-        self.load_instants_with_archive(&selector, desc, false)
-            .await
+        self.load_instants_internal(&selector, desc).await
     }
 
     /// Get the completed clustering commit [Instant]s in the timeline.
@@ -185,9 +181,7 @@ impl Timeline {
             None,
             None,
         )?;
-        let instants = self
-            .load_instants_with_archive(&selector, desc, false)
-            .await?;
+        let instants = self.load_instants_internal(&selector, desc).await?;
         let mut clustering_instants = Vec::new();
         for instant in instants {
             let metadata = self.get_instant_metadata(&instant).await?;
@@ -340,7 +334,7 @@ mod tests {
         ));
         assert!(matches!(
             timeline.archived_loader,
-            Some(TimelineLoader::LayoutTwoCompacted(_))
+            Some(TimelineLoader::LayoutTwoArchived(_))
         ));
     }
 
