@@ -43,12 +43,20 @@ use crate::config::{ConfigParser, HudiConfigValue};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiInternalConfig {
     SkipConfigValidation,
+    /// Enable reading archived timeline (v1) and LSM history (v2)
+    TimelineArchivedReadEnabled,
+    /// Behavior when archived timeline is requested but not available/enabled: "error" or "continue"
+    TimelineArchivedUnavailableBehavior,
 }
 
 impl AsRef<str> for HudiInternalConfig {
     fn as_ref(&self) -> &str {
         match self {
             Self::SkipConfigValidation => "hoodie.internal.skip.config.validation",
+            Self::TimelineArchivedReadEnabled => "hoodie.internal.timeline.archived.enabled",
+            Self::TimelineArchivedUnavailableBehavior => {
+                "hoodie.internal.timeline.archived.unavailable.behavior"
+            }
         }
     }
 }
@@ -65,6 +73,11 @@ impl ConfigParser for HudiInternalConfig {
     fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
             Self::SkipConfigValidation => Some(HudiConfigValue::Boolean(false)),
+            Self::TimelineArchivedReadEnabled => Some(HudiConfigValue::Boolean(false)),
+            // default to continue (graceful) when archived is unavailable/disabled
+            Self::TimelineArchivedUnavailableBehavior => {
+                Some(HudiConfigValue::String("continue".to_string()))
+            }
         }
     }
 
@@ -80,6 +93,14 @@ impl ConfigParser for HudiInternalConfig {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Boolean),
+            Self::TimelineArchivedReadEnabled => get_result
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::Boolean),
+            Self::TimelineArchivedUnavailableBehavior => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
         }
     }
 }

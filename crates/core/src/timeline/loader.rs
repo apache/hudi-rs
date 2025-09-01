@@ -17,6 +17,10 @@
  * under the License.
  */
 
+use crate::config::internal::HudiInternalConfig::{
+    TimelineArchivedReadEnabled, TimelineArchivedUnavailableBehavior,
+};
+use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
@@ -103,13 +107,46 @@ impl TimelineLoader {
 
     pub(crate) async fn load_archived_instants(
         &self,
-        _selector: &TimelineSelector,
-        _desc: bool,
+        selector: &TimelineSelector,
+        desc: bool,
     ) -> Result<Vec<Instant>> {
+        // Config wiring: if archived read not enabled, return behavior based on policy
+        let storage = match self {
+            TimelineLoader::LayoutOneArchived(storage)
+            | TimelineLoader::LayoutTwoArchived(storage) => storage.clone(),
+            _ => return Ok(Vec::new()), // Active loaders don't have archived parts
+        };
+
+        let configs: Arc<HudiConfigs> = storage.hudi_configs.clone();
+        let enabled = configs
+            .get_or_default(TimelineArchivedReadEnabled)
+            .to::<bool>();
+        if !enabled {
+            let behavior = configs
+                .get_or_default(TimelineArchivedUnavailableBehavior)
+                .to::<String>()
+                .to_ascii_lowercase();
+            return match behavior.as_str() {
+                "error" => Err(CoreError::Unsupported(
+                    "Archived timeline read is disabled; shorten time range or enable archived read"
+                        .to_string(),
+                )),
+                _ => Ok(Vec::new()), // continue silently with empty archived
+            };
+        }
+
         match self {
-            TimelineLoader::LayoutOneArchived(_) => Ok(Vec::new()),
-            TimelineLoader::LayoutTwoArchived(_) => Ok(Vec::new()),
-            _ => Ok(Vec::new()), // Active loaders don't have archived parts.
+            TimelineLoader::LayoutOneArchived(storage) => {
+                // TODO: Implement v1 archived reader (hoodie.archivelog.folder). For now, return empty.
+                let _ = (storage, selector, desc);
+                Ok(Vec::new())
+            }
+            TimelineLoader::LayoutTwoArchived(storage) => {
+                // TODO: Implement v2 LSM history reader (hoodie.timeline.history.path). For now, return empty.
+                let _ = (storage, selector, desc);
+                Ok(Vec::new())
+            }
+            _ => Ok(Vec::new()),
         }
     }
 }
