@@ -28,7 +28,10 @@ mod datafusion_internal;
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
-    use internal::{HudiFileGroupReader, HudiFileSlice, HudiInstant, PyHudiReadConfig, HudiTable, PyHudiTableConfig, HudiTimeline};
+    use internal::{
+        HudiFileGroupReader, HudiFileSlice, HudiInstant, HudiTable, HudiTimeline, PyHudiReadConfig,
+        PyHudiTableConfig,
+    };
     m.add_class::<HudiFileGroupReader>()?;
     m.add_class::<HudiFileSlice>()?;
     m.add_class::<HudiInstant>()?;

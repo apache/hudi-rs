@@ -24,6 +24,7 @@ __version__: str
 
 class HudiTableConfig(Enum):
     """Configurations for Hudi tables, most of them are persisted in `hoodie.properties`."""
+
     BASE_FILE_FORMAT = "hoodie.table.base.file.format"
     BASE_PATH = "hoodie.base.path"
     CHECKSUM = "hoodie.table.checksum"
@@ -46,6 +47,7 @@ class HudiTableConfig(Enum):
 
 class HudiReadConfig(Enum):
     """Configurations for reading Hudi tables."""
+
     FILE_GROUP_START_TIMESTAMP = "hoodie.read.file_group.start_timestamp"
     FILE_GROUP_END_TIMESTAMP = "hoodie.read.file_group.end_timestamp"
     INPUT_PARTITIONS = "hoodie.read.input.partitions"

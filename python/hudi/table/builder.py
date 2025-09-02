@@ -57,7 +57,9 @@ class HudiTableBuilder:
         target_attr = getattr(self, f"{category}_options") if category else self.options
         target_attr.update(options)
 
-    def with_hudi_option(self, k: Union[str, HudiTableConfig, HudiReadConfig], v: str) -> "HudiTableBuilder":
+    def with_hudi_option(
+        self, k: Union[str, HudiTableConfig, HudiReadConfig], v: str
+    ) -> "HudiTableBuilder":
         """
         Adds a Hudi option to the builder.
 
@@ -114,7 +116,9 @@ class HudiTableBuilder:
         self._add_options(storage_options, "storage")
         return self
 
-    def with_option(self, k: Union[str, HudiTableConfig, HudiReadConfig], v: str) -> "HudiTableBuilder":
+    def with_option(
+        self, k: Union[str, HudiTableConfig, HudiReadConfig], v: str
+    ) -> "HudiTableBuilder":
         """
         Adds a generic option to the builder.
 
