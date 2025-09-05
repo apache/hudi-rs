@@ -40,6 +40,16 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHudiTableConfig>()?;
     m.add_class::<HudiTimeline>()?;
 
+    let table_config_type = m.getattr("HudiTableConfig")?;
+    for (name, instance) in PyHudiTableConfig::get_class_attributes() {
+        table_config_type.setattr(name, instance)?;
+    }
+
+    let read_config_type = m.getattr("HudiReadConfig")?;
+    for (name, instance) in PyHudiReadConfig::get_class_attributes() {
+        read_config_type.setattr(name, instance)?;
+    }
+
     #[cfg(feature = "datafusion")]
     {
         use datafusion_internal::HudiDataFusionDataSource;

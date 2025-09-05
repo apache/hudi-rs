@@ -37,6 +37,7 @@ use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::timeline::instant::Instant;
 use hudi::timeline::Timeline;
+use hudi_macros::AutoBind;
 use pyo3::exceptions::PyException;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use std::error::Error;
@@ -606,133 +607,19 @@ pub fn build_hudi_table(
 }
 
 #[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug, AutoBind)]
+#[auto_bind(pyo3)]
 #[pyclass(name = "HudiTableConfig")]
-#[derive(Clone, Debug)]
 pub struct PyHudiTableConfig {
     inner: HudiTableConfig,
 }
 
 #[cfg(not(tarpaulin_include))]
-#[pymethods]
-impl PyHudiTableConfig {
-    #[classattr]
-    const BASE_FILE_FORMAT: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::BaseFileFormat,
-    };
-    #[classattr]
-    const BASE_PATH: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::BasePath,
-    };
-    #[classattr]
-    const CHECKSUM: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::Checksum,
-    };
-    #[classattr]
-    const CREATE_SCHEMA: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::CreateSchema,
-    };
-    #[classattr]
-    const DATABASE_NAME: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::DatabaseName,
-    };
-    #[classattr]
-    const DROPS_PARTITION_FIELDS: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::DropsPartitionFields,
-    };
-    #[classattr]
-    const IS_HIVE_STYLE_PARTITIONING: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::IsHiveStylePartitioning,
-    };
-    #[classattr]
-    const IS_PARTITION_PATH_URLENCODED: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::IsPartitionPathUrlencoded,
-    };
-    #[classattr]
-    const KEY_GENERATOR_CLASS: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::KeyGeneratorClass,
-    };
-    #[classattr]
-    const PARTITION_FIELDS: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::PartitionFields,
-    };
-    #[classattr]
-    const PRECOMBINE_FIELD: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::PrecombineField,
-    };
-    #[classattr]
-    const POPULATES_META_FIELDS: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::PopulatesMetaFields,
-    };
-    #[classattr]
-    const RECORD_KEY_FIELDS: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::RecordKeyFields,
-    };
-    #[classattr]
-    const RECORD_MERGE_STRATEGY: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::RecordMergeStrategy,
-    };
-    #[classattr]
-    const TABLE_NAME: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::TableName,
-    };
-    #[classattr]
-    const TABLE_TYPE: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::TableType,
-    };
-    #[classattr]
-    const TABLE_VERSION: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::TableVersion,
-    };
-    #[classattr]
-    const TIMELINE_LAYOUT_VERSION: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::TimelineLayoutVersion,
-    };
-    #[classattr]
-    const TIMELINE_TIMEZONE: PyHudiTableConfig = PyHudiTableConfig {
-        inner: HudiTableConfig::TimelineTimezone,
-    };
-
-    #[getter]
-    fn value(&self) -> String {
-        self.inner.as_ref().to_string()
-    }
-}
-
-#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug, AutoBind)]
+#[auto_bind(pyo3)]
 #[pyclass(name = "HudiReadConfig")]
-#[derive(Clone, Debug)]
 pub struct PyHudiReadConfig {
     inner: HudiReadConfig,
-}
-
-#[cfg(not(tarpaulin_include))]
-#[pymethods]
-impl PyHudiReadConfig {
-    #[classattr]
-    const FILE_GROUP_START_TIMESTAMP: PyHudiReadConfig = PyHudiReadConfig {
-        inner: HudiReadConfig::FileGroupStartTimestamp,
-    };
-    #[classattr]
-    const FILE_GROUP_END_TIMESTAMP: PyHudiReadConfig = PyHudiReadConfig {
-        inner: HudiReadConfig::FileGroupEndTimestamp,
-    };
-    #[classattr]
-    const INPUT_PARTITIONS: PyHudiReadConfig = PyHudiReadConfig {
-        inner: HudiReadConfig::InputPartitions,
-    };
-    #[classattr]
-    const LISTING_PARALLELISM: PyHudiReadConfig = PyHudiReadConfig {
-        inner: HudiReadConfig::ListingParallelism,
-    };
-    #[classattr]
-    const USE_READ_OPTIMIZED_MODE: PyHudiReadConfig = PyHudiReadConfig {
-        inner: HudiReadConfig::UseReadOptimizedMode,
-    };
-
-    #[getter]
-    fn value(&self) -> String {
-        self.inner.as_ref().to_string()
-    }
 }
 
 #[cfg(not(tarpaulin_include))]
