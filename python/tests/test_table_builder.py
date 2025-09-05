@@ -18,7 +18,7 @@
 import pyarrow as pa
 import pytest
 
-from hudi import HudiTableBuilder
+from hudi import HudiReadConfig, HudiTableBuilder, HudiTableConfig
 
 
 @pytest.fixture
@@ -141,3 +141,221 @@ def test_setting_table_options(
         table.hudi_options().get("hoodie.read.file_group.start_timestamp")
         == "resolved value"
     )
+
+
+def test_with_hudi_option_enum(builder):
+    """Test that HudiTableConfig and HudiReadConfig enums work with with_hudi_option."""
+    builder.with_hudi_option(HudiTableConfig.TABLE_NAME, "test_table")
+    assert builder.hudi_options["hoodie.table.name"] == "test_table"
+
+    builder.with_hudi_option(HudiReadConfig.INPUT_PARTITIONS, "5")
+    assert builder.hudi_options["hoodie.read.input.partitions"] == "5"
+
+
+def test_with_option_enum(builder):
+    """Test that HudiTableConfig and HudiReadConfig enums work with with_option."""
+    builder.with_option(HudiTableConfig.BASE_FILE_FORMAT, "parquet")
+    assert builder.options["hoodie.table.base.file.format"] == "parquet"
+
+    builder.with_option(HudiReadConfig.LISTING_PARALLELISM, "10")
+    assert builder.options["hoodie.read.listing.parallelism"] == "10"
+
+
+def test_enum_values_match_expected_strings():
+    """Test that enum values match the expected configuration key strings."""
+    assert HudiTableConfig.TABLE_NAME.value == "hoodie.table.name"
+    assert HudiTableConfig.TABLE_TYPE.value == "hoodie.table.type"
+    assert HudiTableConfig.BASE_FILE_FORMAT.value == "hoodie.table.base.file.format"
+
+    assert HudiReadConfig.INPUT_PARTITIONS.value == "hoodie.read.input.partitions"
+    assert HudiReadConfig.LISTING_PARALLELISM.value == "hoodie.read.listing.parallelism"
+    assert (
+        HudiReadConfig.USE_READ_OPTIMIZED_MODE.value
+        == "hoodie.read.use.read_optimized.mode"
+    )
+    assert (
+        HudiReadConfig.FILE_GROUP_START_TIMESTAMP.value
+        == "hoodie.read.file_group.start_timestamp"
+    )
+    assert (
+        HudiReadConfig.FILE_GROUP_END_TIMESTAMP.value
+        == "hoodie.read.file_group.end_timestamp"
+    )
+
+
+def test_auto_generated_enum_completeness():
+    """Test that all expected enum variants are auto-generated."""
+    expected_table_config_variants = [
+        "BASE_FILE_FORMAT",
+        "BASE_PATH",
+        "CHECKSUM",
+        "CREATE_SCHEMA",
+        "DATABASE_NAME",
+        "DROPS_PARTITION_FIELDS",
+        "IS_HIVE_STYLE_PARTITIONING",
+        "IS_PARTITION_PATH_URLENCODED",
+        "KEY_GENERATOR_CLASS",
+        "PARTITION_FIELDS",
+        "PRECOMBINE_FIELD",
+        "POPULATES_META_FIELDS",
+        "RECORD_KEY_FIELDS",
+        "RECORD_MERGE_STRATEGY",
+        "TABLE_NAME",
+        "TABLE_TYPE",
+        "TABLE_VERSION",
+        "TIMELINE_LAYOUT_VERSION",
+        "TIMELINE_TIMEZONE",
+    ]
+
+    for variant in expected_table_config_variants:
+        assert hasattr(HudiTableConfig, variant), f"HudiTableConfig missing {variant}"
+        enum_instance = getattr(HudiTableConfig, variant)
+        assert hasattr(enum_instance, "value"), (
+            f"{variant} instance missing 'value' property"
+        )
+        assert isinstance(enum_instance.value, str), f"{variant}.value is not a string"
+
+    expected_read_config_variants = [
+        "FILE_GROUP_START_TIMESTAMP",
+        "FILE_GROUP_END_TIMESTAMP",
+        "INPUT_PARTITIONS",
+        "LISTING_PARALLELISM",
+        "USE_READ_OPTIMIZED_MODE",
+    ]
+
+    for variant in expected_read_config_variants:
+        assert hasattr(HudiReadConfig, variant), f"HudiReadConfig missing {variant}"
+        enum_instance = getattr(HudiReadConfig, variant)
+        assert hasattr(enum_instance, "value"), (
+            f"{variant} instance missing 'value' property"
+        )
+        assert isinstance(enum_instance.value, str), f"{variant}.value is not a string"
+
+
+def test_auto_generated_enum_methods():
+    """Test that auto-generated enum methods work correctly."""
+    table_variants = HudiTableConfig.all_variants()
+    assert isinstance(table_variants, list), "all_variants() should return a list"
+    assert len(table_variants) == 19, "HudiTableConfig should have 19 variants"
+
+    read_variants = HudiReadConfig.all_variants()
+    assert isinstance(read_variants, list), "all_variants() should return a list"
+    assert len(read_variants) == 5, "HudiReadConfig should have 5 variants"
+
+    table_instance = HudiTableConfig.TABLE_NAME
+    assert str(table_instance) == "hoodie.table.name"
+    assert "HudiTableConfig" in repr(table_instance)
+    assert "hoodie.table.name" in repr(table_instance)
+
+    read_instance = HudiReadConfig.INPUT_PARTITIONS
+    assert str(read_instance) == "hoodie.read.input.partitions"
+    assert "HudiReadConfig" in repr(read_instance)
+    assert "hoodie.read.input.partitions" in repr(read_instance)
+
+
+def test_auto_generated_enum_equality():
+    """Test that auto-generated enum instances support equality."""
+    table1 = HudiTableConfig.TABLE_NAME
+    table2 = HudiTableConfig.TABLE_NAME
+    assert table1 == table2
+
+    table_name = HudiTableConfig.TABLE_NAME
+    table_type = HudiTableConfig.TABLE_TYPE
+    assert table_name != table_type
+
+    table_config = HudiTableConfig.TABLE_NAME
+    read_config = HudiReadConfig.INPUT_PARTITIONS
+    assert table_config != read_config
+
+
+def test_no_manual_duplication_regression():
+    """Test that we haven't accidentally kept manual enum definitions."""
+    import inspect
+
+    # Get all class attributes of HudiTableConfig - filter out methods and properties
+    table_attrs = []
+    for attr in dir(HudiTableConfig):
+        if attr.startswith("_") or attr in [
+            "all_variants"
+        ]:  # Skip special methods and class methods
+            continue
+        attr_value = getattr(HudiTableConfig, attr)
+        # Skip methods, classmethods, staticmethods, and properties
+        if (
+            inspect.ismethod(attr_value)
+            or inspect.isfunction(attr_value)
+            or isinstance(attr_value, (classmethod, staticmethod, property))
+            or inspect.isdatadescriptor(attr_value)
+            or hasattr(attr_value, "__self__")
+        ):  # Skip bound methods
+            continue
+        table_attrs.append(attr)
+
+    # Get all class attributes of HudiReadConfig - filter out methods and properties
+    read_attrs = []
+    for attr in dir(HudiReadConfig):
+        if attr.startswith("_") or attr in [
+            "all_variants"
+        ]:  # Skip special methods and class methods
+            continue
+        attr_value = getattr(HudiReadConfig, attr)
+        # Skip methods, classmethods, staticmethods, and properties
+        if (
+            inspect.ismethod(attr_value)
+            or inspect.isfunction(attr_value)
+            or isinstance(attr_value, (classmethod, staticmethod, property))
+            or inspect.isdatadescriptor(attr_value)
+            or hasattr(attr_value, "__self__")
+        ):  # Skip bound methods
+            continue
+        read_attrs.append(attr)
+
+    # All attributes should be auto-generated enum instances
+    for attr in table_attrs:
+        instance = getattr(HudiTableConfig, attr)
+        assert hasattr(instance, "value"), (
+            f"Table config {attr} should have 'value' property"
+        )
+        assert isinstance(instance.value, str), (
+            f"Table config {attr}.value should be a string"
+        )
+        assert instance.value.startswith("hoodie."), (
+            f"Table config {attr}.value should start with 'hoodie.'"
+        )
+
+    for attr in read_attrs:
+        instance = getattr(HudiReadConfig, attr)
+        assert hasattr(instance, "value"), (
+            f"Read config {attr} should have 'value' property"
+        )
+        assert isinstance(instance.value, str), (
+            f"Read config {attr}.value should be a string"
+        )
+        assert instance.value.startswith("hoodie."), (
+            f"Read config {attr}.value should start with 'hoodie.'"
+        )
+
+    assert len(table_attrs) == 19, (
+        f"Expected 19 table config variants, got {len(table_attrs)}: {table_attrs}"
+    )
+    assert len(read_attrs) == 5, (
+        f"Expected 5 read config variants, got {len(read_attrs)}: {read_attrs}"
+    )
+
+
+def test_mixed_string_and_enum_usage(builder):
+    """Test that strings and enums can be used together."""
+    builder.with_hudi_option("custom.string.key", "string_value")
+    builder.with_hudi_option(HudiTableConfig.TABLE_NAME, "enum_table")
+
+    assert builder.hudi_options["custom.string.key"] == "string_value"
+    assert builder.hudi_options["hoodie.table.name"] == "enum_table"
+
+
+def test_backward_compatibility(builder):
+    """Test that existing string-based API still works."""
+    builder.with_hudi_option("hoodie.table.name", "string_table")
+    builder.with_option("hoodie.read.input.partitions", "8")
+
+    assert builder.hudi_options["hoodie.table.name"] == "string_table"
+    assert builder.options["hoodie.read.input.partitions"] == "8"

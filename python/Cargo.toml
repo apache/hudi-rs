@@ -34,6 +34,8 @@ doc = false
 
 [dependencies]
 hudi = { path = "../crates/hudi"}
+hudi-macros = { path = "../crates/macros", features = ["pyo3"] }
+strum = { workspace = true }
 # arrow
 arrow = { workspace = true, features = ["pyarrow"] }
 
