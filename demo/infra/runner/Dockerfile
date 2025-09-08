@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.84
+FROM rust:1.85
 
 RUN apt-get update && apt-get install -y cmake curl ca-certificates
 
