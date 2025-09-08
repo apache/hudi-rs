@@ -45,6 +45,6 @@ jobs:
           echo "${{ github.event.pull_request.title }}" | npx commitlint
 
       - name: Labeling
-        uses: actions/labeler@v5
+        uses: actions/labeler@v6
         # disable until figuring out a way to do this without pull_request_target
         if: false
