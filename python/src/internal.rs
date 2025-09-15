@@ -123,6 +123,20 @@ impl HudiFileGroupReader {
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }
+
+    fn read_file_slice_from_paths(
+        &self,
+        base_file_path: &str,
+        log_file_paths: Vec<String>,
+        py: Python,
+    ) -> PyResult<PyObject> {
+        rt().block_on(
+            self.inner
+                .read_file_slice_from_paths(base_file_path, log_file_paths),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
