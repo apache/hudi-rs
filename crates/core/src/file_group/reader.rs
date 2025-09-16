@@ -496,6 +496,7 @@ mod tests {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
+        // Test with actual test files and empty log files - should trigger base_file_only logic
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths = vec![];
 
@@ -510,35 +511,6 @@ mod tests {
             }
             Err(_) => {
                 // This might fail if the test data doesn't exist, which is acceptable for a unit test
-            }
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
-        let base_uri = get_base_uri_with_valid_props_minimum();
-        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
-
-        let base_file_path = TEST_SAMPLE_BASE_FILE;
-        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
-
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
-
-        // The actual file reading might fail due to missing test data, which is expected
-        match result {
-            Ok(_batch) => {
-                // Test passes if we get a valid batch
-            }
-            Err(e) => {
-                // Expected for missing test data - verify it's a storage/file not found error
-                let error_msg = e.to_string();
-                assert!(
-                    error_msg.contains("not found") || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
-                );
             }
         }
 
@@ -566,6 +538,35 @@ mod tests {
             }
             Err(e) => {
                 // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("not found") || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {}",
+                    error_msg
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+
+        // The actual file reading might fail due to missing test data, which is expected
+        match result {
+            Ok(_batch) => {
+                // Test passes if we get a valid batch
+            }
+            Err(e) => {
+                // Expected for missing test data - verify it's a storage/file not found error
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("No such file"),
@@ -620,6 +621,54 @@ mod tests {
 
         let empty_logs: Vec<String> = vec![];
         let _result3 = reader.read_file_slice_from_paths_blocking(base_file_path, empty_logs);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_read_optimized_forces_base_only() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
+        )?;
+
+        let base_file_path = "test.parquet";
+        // Even with log files provided, read-optimized mode should ignore them
+        let log_paths = vec!["log1.log".to_string(), "log2.log".to_string()];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_paths);
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Failed to read path"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_with_non_empty_logs_attempts_merge() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        // Explicitly disable read-optimized mode to force merge path
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "false")],
+        )?;
+
+        let base_file_path = "test.parquet";
+        let log_paths = vec!["log1.log".to_string()];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_paths);
+
+        // We expect this to fail, but it should exercise the merge logic path
+        assert!(result.is_err());
+        // The error could be either base file not found or log scanner issues
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Failed to read path")
+                || error_msg.contains("not found")
+                || error_msg.contains("No such file")
+        );
 
         Ok(())
     }
