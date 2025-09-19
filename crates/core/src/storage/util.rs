@@ -43,6 +43,22 @@ pub fn get_scheme_authority(url: &Url) -> String {
     format!("{}://{}", url.scheme(), url.authority())
 }
 
+/// Converts backslashes to forward slashes for cross-platform compatibility.
+pub fn normalize_path_for_storage(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Joins path segments with forward slashes.
+pub fn join_storage_path(segments: &[&str]) -> String {
+    let joined = segments
+        .iter()
+        .map(|s| s.trim_matches('/').trim_matches('\\'))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    normalize_path_for_storage(&joined)
+}
+
 /// Joins a base URL with a list of segments.
 pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     let mut url = base_url.clone();
@@ -124,5 +140,25 @@ mod tests {
         let base_url = Url::from_str("foo:text/plain,bar").unwrap();
         let result = join_url_segments(&base_url, &["foo"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_path_for_storage() {
+        assert_eq!(normalize_path_for_storage("path\\to\\file"), "path/to/file");
+        assert_eq!(normalize_path_for_storage("path/to/file"), "path/to/file");
+        assert_eq!(normalize_path_for_storage("path\\to/mixed\\separators"), "path/to/mixed/separators");
+        assert_eq!(normalize_path_for_storage(""), "");
+        assert_eq!(normalize_path_for_storage(".hoodie\\file.commit"), ".hoodie/file.commit");
+    }
+
+    #[test]
+    fn test_join_storage_path() {
+        assert_eq!(join_storage_path(&[".hoodie", "file.commit"]), ".hoodie/file.commit");
+        assert_eq!(join_storage_path(&["path", "to", "file"]), "path/to/file");
+        assert_eq!(join_storage_path(&["/path/", "/to/", "/file/"]), "path/to/file");
+        assert_eq!(join_storage_path(&["path\\to", "file"]), "path/to/file");
+        assert_eq!(join_storage_path(&[""]), "");
+        assert_eq!(join_storage_path(&["", "path", "", "file", ""]), "path/file");
+        assert_eq!(join_storage_path(&["part1", "part2", "subpart"]), "part1/part2/subpart");
     }
 }

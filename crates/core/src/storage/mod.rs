@@ -40,7 +40,7 @@ use crate::storage::error::StorageError::{Creation, InvalidPath};
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
-use crate::storage::util::join_url_segments;
+use crate::storage::util::{join_storage_path, join_url_segments};
 
 pub mod error;
 pub mod file_metadata;
@@ -273,15 +273,12 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
         leaf_dirs.push(subdir.unwrap_or_default().to_owned());
     } else {
         for child_dir in child_dirs {
-            let mut next_subdir = PathBuf::new();
-            if let Some(curr) = subdir {
-                next_subdir.push(curr);
-            }
-            next_subdir.push(child_dir);
-            let next_subdir = next_subdir
-                .to_str()
-                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {:?}", next_subdir)))?;
-            let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
+            let next_subdir = if let Some(curr) = subdir {
+                join_storage_path(&[curr, &child_dir])
+            } else {
+                child_dir
+            };
+            let curr_leaf_dir = get_leaf_dirs(storage, Some(&next_subdir)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }
     }
