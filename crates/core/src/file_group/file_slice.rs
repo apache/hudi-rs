@@ -78,7 +78,10 @@ impl FileSlice {
     }
 
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
-        Ok(join_storage_path(&[self.partition_path.as_str(), file_name]))
+        Ok(join_storage_path(&[
+            self.partition_path.as_str(),
+            file_name,
+        ]))
     }
 
     /// Returns the relative path of the [BaseFile] in the [FileSlice].

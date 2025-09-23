@@ -146,19 +146,37 @@ mod tests {
     fn test_normalize_path_for_storage() {
         assert_eq!(normalize_path_for_storage("path\\to\\file"), "path/to/file");
         assert_eq!(normalize_path_for_storage("path/to/file"), "path/to/file");
-        assert_eq!(normalize_path_for_storage("path\\to/mixed\\separators"), "path/to/mixed/separators");
+        assert_eq!(
+            normalize_path_for_storage("path\\to/mixed\\separators"),
+            "path/to/mixed/separators"
+        );
         assert_eq!(normalize_path_for_storage(""), "");
-        assert_eq!(normalize_path_for_storage(".hoodie\\file.commit"), ".hoodie/file.commit");
+        assert_eq!(
+            normalize_path_for_storage(".hoodie\\file.commit"),
+            ".hoodie/file.commit"
+        );
     }
 
     #[test]
     fn test_join_storage_path() {
-        assert_eq!(join_storage_path(&[".hoodie", "file.commit"]), ".hoodie/file.commit");
+        assert_eq!(
+            join_storage_path(&[".hoodie", "file.commit"]),
+            ".hoodie/file.commit"
+        );
         assert_eq!(join_storage_path(&["path", "to", "file"]), "path/to/file");
-        assert_eq!(join_storage_path(&["/path/", "/to/", "/file/"]), "path/to/file");
+        assert_eq!(
+            join_storage_path(&["/path/", "/to/", "/file/"]),
+            "path/to/file"
+        );
         assert_eq!(join_storage_path(&["path\\to", "file"]), "path/to/file");
         assert_eq!(join_storage_path(&[""]), "");
-        assert_eq!(join_storage_path(&["", "path", "", "file", ""]), "path/file");
-        assert_eq!(join_storage_path(&["part1", "part2", "subpart"]), "part1/part2/subpart");
+        assert_eq!(
+            join_storage_path(&["", "path", "", "file", ""]),
+            "path/file"
+        );
+        assert_eq!(
+            join_storage_path(&["part1", "part2", "subpart"]),
+            "part1/part2/subpart"
+        );
     }
 }
