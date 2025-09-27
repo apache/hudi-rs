@@ -19,7 +19,6 @@
 
 use paste::paste;
 use std::collections::HashMap;
-use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -159,10 +158,13 @@ impl OptionResolver {
     /// env vars, and global Hudi configs. The precedence order is as follows:
     ///
     /// 1. hoodie.properties
-    /// 2. Explicit options provided by the user
-    /// 3. Generic options provided by the user
-    /// 4. Env vars
-    /// 5. Global Hudi configs
+    /// 2. User-provided options
+    ///    - Explicit Hudi options provided by the user
+    ///    - Generic options provided by the user
+    /// 3. Env vars for storage options
+    ///    - With HOODIE_ENV_ prefix
+    ///    - Cloud storage options specified via env vars
+    /// 4. Global Hudi configs
     ///
     /// [note] Error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
@@ -170,7 +172,7 @@ impl OptionResolver {
 
         // If any user-provided options are intended for cloud storage and in uppercase,
         // convert them to lowercase. This is to allow `object_store` to pick them up.
-        self.resolve_cloud_env_vars();
+        self.resolve_env_vars();
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
         // We can now resolve the hudi options
@@ -197,14 +199,27 @@ impl OptionResolver {
         extend_if_absent(&mut self.storage_options, &generic_other_opts)
     }
 
-    fn resolve_cloud_env_vars(&mut self) {
-        for (key, value) in env::vars() {
-            if Storage::CLOUD_STORAGE_PREFIXES
+    /// Resolve env vars for keys starting with `HOODIE_ENV_` or cloud storage options.
+    ///
+    /// For example: `HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key` will be converted to `fs.s3a.access.key`.
+    ///
+    /// Also supports standard cloud storage env vars like `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.
+    ///
+    /// [note] All keys will be converted to lowercase.
+    fn resolve_env_vars(&mut self) {
+        for (env_key, env_value) in std::env::vars() {
+            let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
+                Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
+            } else if Storage::CLOUD_STORAGE_PREFIXES
                 .iter()
-                .any(|prefix| key.starts_with(prefix))
-                && !self.storage_options.contains_key(&key.to_ascii_lowercase())
+                .any(|prefix| env_key.starts_with(prefix))
             {
-                self.storage_options.insert(key.to_ascii_lowercase(), value);
+                Some(env_key.to_ascii_lowercase())
+            } else {
+                None
+            };
+            if let Some(key) = lower_option_key {
+                self.storage_options.entry(key).or_insert(env_value);
             }
         }
     }
@@ -247,7 +262,7 @@ impl OptionResolver {
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
     ) -> Result<()> {
-        let global_config_path = env::var(HUDI_CONF_DIR)
+        let global_config_path = std::env::var(HUDI_CONF_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
             .join("hudi-defaults.conf");
@@ -367,5 +382,60 @@ mod tests {
             resolver.storage_options["AWS_ENDPOINT"],
             "s3.us-east-1.amazonaws.com"
         );
+    }
+
+    #[test]
+    fn test_resolve_cloud_env_vars_with_hudi_style() {
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+
+        std::env::set_var(
+            "HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key",
+            "test_access_key",
+        );
+        std::env::set_var(
+            "HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key",
+            "test_secret_key",
+        );
+
+        let mut resolver = OptionResolver::new("test_uri");
+        resolver.resolve_env_vars();
+
+        assert_eq!(
+            resolver.storage_options.get("fs.s3a.access.key"),
+            Some(&"test_access_key".to_string())
+        );
+        assert_eq!(
+            resolver.storage_options.get("fs.s3a.secret.key"),
+            Some(&"test_secret_key".to_string())
+        );
+
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+    }
+
+    #[test]
+    fn test_resolve_cloud_env_vars_precedence() {
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+
+        // Test that manually set storage options take precedence over env vars
+        std::env::set_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key", "env_access_key");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "standard_access_key");
+
+        let mut resolver = OptionResolver::new("test_uri");
+        resolver.storage_options.insert(
+            "fs.s3a.access.key".to_string(),
+            "manual_access_key".to_string(),
+        );
+        resolver.resolve_env_vars();
+
+        assert_eq!(
+            resolver.storage_options.get("fs.s3a.access.key"),
+            Some(&"manual_access_key".to_string())
+        );
+
+        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
     }
 }
