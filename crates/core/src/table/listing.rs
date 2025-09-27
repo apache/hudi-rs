@@ -57,7 +57,7 @@ impl FileLister {
     }
 
     fn should_exclude_for_listing(file_name: &str) -> bool {
-        file_name.starts_with(PARTITION_METAFIELD_PREFIX) || file_name.ends_with(".crc")
+        file_name.starts_with(PARTITION_METAFIELD_PREFIX)
     }
 
     async fn list_file_groups_for_partition(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
