@@ -68,7 +68,7 @@ serde_json = { version = "~1.0" }
 # "stdlib"
 thiserror = { version = "~2.0.11" }
 bytes = { version = "~1.10" }
-chrono = { version = "=0.4.39" }
+chrono = { version = "=0.4.42" }
 lazy_static = { version = "~1.5.0" }
 log = { version = "~0.4" }
 num-traits = { version = "~0.2" }
