@@ -149,7 +149,7 @@ impl TimelineSelector {
     fn get_timezone_from_configs(hudi_configs: &HudiConfigs) -> String {
         hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
-            .to::<String>()
+            .into()
     }
 
     fn parse_datetime(timezone: &str, timestamp: Option<&str>) -> Result<Option<DateTime<Utc>>> {

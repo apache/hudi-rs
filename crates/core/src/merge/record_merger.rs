@@ -51,14 +51,10 @@ pub struct RecordMerger {
 impl RecordMerger {
     /// Validates the given [HudiConfigs] against the [RecordMergeStrategy].
     pub fn validate_configs(hudi_configs: &HudiConfigs) -> ConfigResult<()> {
-        let merge_strategy = hudi_configs
-            .get_or_default(RecordMergeStrategy)
-            .to::<String>();
+        let merge_strategy: String = hudi_configs.get_or_default(RecordMergeStrategy).into();
         let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
 
-        let populate_meta_fields = hudi_configs
-            .get_or_default(PopulatesMetaFields)
-            .to::<bool>();
+        let populate_meta_fields: bool = hudi_configs.get_or_default(PopulatesMetaFields).into();
         if !populate_meta_fields && merge_strategy != RecordMergeStrategyValue::AppendOnly {
             return Err(ConfigError::InvalidValue(format!(
                 "When {:?} is false, {:?} must be {:?}.",
@@ -91,10 +87,7 @@ impl RecordMerger {
     }
 
     pub fn merge_record_batches(&self, record_batches: RecordBatches) -> Result<RecordBatch> {
-        let merge_strategy = self
-            .hudi_configs
-            .get_or_default(RecordMergeStrategy)
-            .to::<String>();
+        let merge_strategy: String = self.hudi_configs.get_or_default(RecordMergeStrategy).into();
         let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
         match merge_strategy {
             RecordMergeStrategyValue::AppendOnly => {
@@ -109,7 +102,7 @@ impl RecordMerger {
 
                 // Use sorting fields to get sorted indices of the data batch (inserts and updates)
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
-                let ordering_field = self.hudi_configs.get(PrecombineField)?.to::<String>();
+                let ordering_field: String = self.hudi_configs.get(PrecombineField)?.into();
                 let ordering_array = data_batch.get_array(&ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
                 let desc_indices =
@@ -117,7 +110,7 @@ impl RecordMerger {
 
                 // Create shared converters for record keys and ordering values
                 let key_converter = create_record_key_converter(data_batch.schema())?;
-                let ordering_field = self.hudi_configs.get(PrecombineField)?.to::<String>();
+                let ordering_field: String = self.hudi_configs.get(PrecombineField)?.into();
                 let event_time_converter =
                     create_event_time_ordering_converter(data_batch.schema(), &ordering_field)?;
                 let commit_time_converter =
