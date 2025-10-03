@@ -483,25 +483,21 @@ mod tests {
             (HudiTableConfig::PopulatesMetaFields, "false"),
             (HudiTableConfig::PrecombineField, "ts"),
         ]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
         assert_eq!(
-            {
-                let value: String = hudi_configs
-                    .get_or_default(HudiTableConfig::RecordMergeStrategy)
-                    .into();
-                value
-            },
+            actual,
             RecordMergeStrategyValue::AppendOnly.as_ref(),
             "Should derive as append-only due to populatesMetaFields=false"
         );
 
         let hudi_configs = HudiConfigs::new(vec![(HudiTableConfig::PopulatesMetaFields, "true")]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
         assert_eq!(
-            {
-                let value: String = hudi_configs
-                    .get_or_default(HudiTableConfig::RecordMergeStrategy)
-                    .into();
-                value
-            },
+            actual,
             RecordMergeStrategyValue::AppendOnly.as_ref(),
             "Should derive as append-only due to missing precombine field"
         );
@@ -510,14 +506,12 @@ mod tests {
             (HudiTableConfig::PopulatesMetaFields, "true"),
             (HudiTableConfig::PrecombineField, "ts"),
         ]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
         assert_eq!(
-            {
-                let value: String = hudi_configs
-                    .get_or_default(HudiTableConfig::RecordMergeStrategy)
-                    .into();
-                value
-            },
-            RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
+            actual,
+            RecordMergeStrategyValue::OverwriteWithLatest.as_ref()
         );
     }
 }

@@ -61,10 +61,7 @@ impl FileLister {
     }
 
     async fn list_file_groups_for_partition(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
-        let base_file_format: String = self
-            .hudi_configs
-            .get_or_default(BaseFileFormat)
-            .into();
+        let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
 
         let listed_file_metadata = self.storage.list_files(Some(partition_path)).await?;
 
@@ -164,10 +161,7 @@ impl FileLister {
 
         let pruned_partition_paths = self.list_relevant_partition_paths().await?;
         let file_groups_map = Arc::new(DashMap::with_capacity(pruned_partition_paths.len()));
-        let parallelism = self
-            .hudi_configs
-            .get_or_default(ListingParallelism)
-            .into();
+        let parallelism = self.hudi_configs.get_or_default(ListingParallelism).into();
         stream::iter(pruned_partition_paths)
             .map(|p| async move {
                 let file_groups = self.list_file_groups_for_partition(&p).await?;

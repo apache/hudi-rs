@@ -28,10 +28,7 @@ use crate::merge::record_merger::RecordMerger;
 use strum::IntoEnumIterator;
 
 pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> {
-    if hudi_configs
-        .get_or_default(SkipConfigValidation)
-        .into()
-    {
+    if hudi_configs.get_or_default(SkipConfigValidation).into() {
         return Ok(());
     }
 
@@ -58,9 +55,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
         ));
     }
 
-    let drops_partition_cols = hudi_configs
-        .get_or_default(DropsPartitionFields)
-        .into();
+    let drops_partition_cols = hudi_configs.get_or_default(DropsPartitionFields).into();
     if drops_partition_cols {
         return Err(CoreError::Unsupported(format!(
             "Only support when `{}` is disabled",

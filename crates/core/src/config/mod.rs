@@ -92,7 +92,6 @@ pub enum HudiConfigValue {
 }
 
 impl HudiConfigValue {
-
     /// A convenience method to convert [HudiConfigValue] to [Url] when the value is a [String] and is intended to be a URL.
     /// Panic if the value is not a [String].
     pub fn to_url(self) -> StorageResult<Url> {

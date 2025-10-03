@@ -51,14 +51,10 @@ pub struct RecordMerger {
 impl RecordMerger {
     /// Validates the given [HudiConfigs] against the [RecordMergeStrategy].
     pub fn validate_configs(hudi_configs: &HudiConfigs) -> ConfigResult<()> {
-        let merge_strategy: String = hudi_configs
-            .get_or_default(RecordMergeStrategy)
-            .into();
+        let merge_strategy: String = hudi_configs.get_or_default(RecordMergeStrategy).into();
         let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
 
-        let populate_meta_fields: bool = hudi_configs
-            .get_or_default(PopulatesMetaFields)
-            .into();
+        let populate_meta_fields: bool = hudi_configs.get_or_default(PopulatesMetaFields).into();
         if !populate_meta_fields && merge_strategy != RecordMergeStrategyValue::AppendOnly {
             return Err(ConfigError::InvalidValue(format!(
                 "When {:?} is false, {:?} must be {:?}.",
@@ -91,10 +87,7 @@ impl RecordMerger {
     }
 
     pub fn merge_record_batches(&self, record_batches: RecordBatches) -> Result<RecordBatch> {
-        let merge_strategy: String = self
-            .hudi_configs
-            .get_or_default(RecordMergeStrategy)
-            .into();
+        let merge_strategy: String = self.hudi_configs.get_or_default(RecordMergeStrategy).into();
         let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
         match merge_strategy {
             RecordMergeStrategyValue::AppendOnly => {

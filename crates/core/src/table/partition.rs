@@ -34,9 +34,7 @@ pub const EMPTY_PARTITION_PATH: &str = "";
 
 pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
     let has_partition_fields = {
-        let partition_fields: Vec<String> = hudi_configs
-            .get_or_default(PartitionFields)
-            .into();
+        let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
         !partition_fields.is_empty()
     };
 
