@@ -15,11 +15,44 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import pyarrow  # type: ignore
 
 __version__: str
+
+class HudiTableConfig(Enum):
+    """Configurations for Hudi tables, most of them are persisted in `hoodie.properties`."""
+
+    BASE_FILE_FORMAT = "hoodie.table.base.file.format"
+    BASE_PATH = "hoodie.base.path"
+    CHECKSUM = "hoodie.table.checksum"
+    CREATE_SCHEMA = "hoodie.table.create.schema"
+    DATABASE_NAME = "hoodie.database.name"
+    DROPS_PARTITION_FIELDS = "hoodie.datasource.write.drop.partition.columns"
+    IS_HIVE_STYLE_PARTITIONING = "hoodie.datasource.write.hive_style_partitioning"
+    IS_PARTITION_PATH_URLENCODED = "hoodie.datasource.write.partitionpath.urlencode"
+    KEY_GENERATOR_CLASS = "hoodie.table.keygenerator.class"
+    PARTITION_FIELDS = "hoodie.table.partition.fields"
+    PRECOMBINE_FIELD = "hoodie.table.precombine.field"
+    POPULATES_META_FIELDS = "hoodie.populate.meta.fields"
+    RECORD_KEY_FIELDS = "hoodie.table.recordkey.fields"
+    RECORD_MERGE_STRATEGY = "hoodie.table.record.merge.strategy"
+    TABLE_NAME = "hoodie.table.name"
+    TABLE_TYPE = "hoodie.table.type"
+    TABLE_VERSION = "hoodie.table.version"
+    TIMELINE_LAYOUT_VERSION = "hoodie.timeline.layout.version"
+    TIMELINE_TIMEZONE = "hoodie.table.timeline.timezone"
+
+class HudiReadConfig(Enum):
+    """Configurations for reading Hudi tables."""
+
+    FILE_GROUP_START_TIMESTAMP = "hoodie.read.file_group.start_timestamp"
+    FILE_GROUP_END_TIMESTAMP = "hoodie.read.file_group.end_timestamp"
+    INPUT_PARTITIONS = "hoodie.read.input.partitions"
+    LISTING_PARALLELISM = "hoodie.read.listing.parallelism"
+    USE_READ_OPTIMIZED_MODE = "hoodie.read.use.read_optimized.mode"
 
 @dataclass(init=False)
 class HudiFileGroupReader:
