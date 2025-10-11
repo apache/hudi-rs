@@ -40,7 +40,7 @@ use crate::storage::error::StorageError::{Creation, InvalidPath};
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
-use crate::storage::util::{join_storage_path, join_url_segments};
+use crate::storage::util::{join_path_for_cloud, join_path_for_local_fs, join_url_segments};
 
 pub mod error;
 pub mod file_metadata;
@@ -95,6 +95,20 @@ impl Storage {
             Arc::new(HashMap::new()),
             Arc::new(HudiConfigs::new(hudi_options)),
         )
+    }
+
+    /// Joins path segments into a storage path based on the storage type.
+    ///
+    /// # Arguments
+    /// * `segments` - Path segments to join
+    ///
+    /// # Returns
+    /// A normalized path string
+    pub fn join_path(&self, segments: &[&str]) -> String {
+        match self.base_url.scheme() {
+            "file" => join_path_for_local_fs(segments),
+            _ => join_path_for_cloud(segments),
+        }
     }
 
     #[cfg(feature = "datafusion")]
@@ -274,7 +288,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
     } else {
         for child_dir in child_dirs {
             let next_subdir = if let Some(curr) = subdir {
-                join_storage_path(&[curr, &child_dir])
+                storage.join_path(&[curr, &child_dir])
             } else {
                 child_dir
             };

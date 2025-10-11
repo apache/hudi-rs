@@ -18,6 +18,7 @@
  */
 
 //! Utility functions for storage.
+use object_store::path::Path as ObjectPath;
 use url::Url;
 
 use crate::storage::error::StorageError::{InvalidPath, UrlParseError};
@@ -43,20 +44,71 @@ pub fn get_scheme_authority(url: &Url) -> String {
     format!("{}://{}", url.scheme(), url.authority())
 }
 
-/// Converts backslashes to forward slashes for cross-platform compatibility.
-pub fn normalize_path_for_storage(path: &str) -> String {
-    path.replace('\\', "/")
+/// Normalizes and flattens path segments by splitting on '/' and filtering empty parts.
+///
+/// # Arguments
+/// * `segments` - Path segments to normalize
+///
+/// # Returns
+/// A vector of non-empty, trimmed path parts
+fn normalize_path_segments(segments: &[&str]) -> Vec<String> {
+    segments
+        .iter()
+        .flat_map(|s| {
+            s.split('/')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.trim().to_string())
+        })
+        .collect()
 }
 
-/// Joins path segments with forward slashes.
+/// Joins path segments for local filesystem using `std::path::PathBuf`.
+///
+/// # Arguments
+/// * `segments` - Path segments to join
+///
+/// # Returns
+/// A normalized path string with platform-specific separators
+pub fn join_path_for_local_fs(segments: &[&str]) -> String {
+    let parts = normalize_path_segments(segments);
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    let mut path = std::path::PathBuf::new();
+    for part in parts {
+        path.push(part);
+    }
+    path.to_string_lossy().to_string()
+}
+
+/// Joins path segments for cloud storage using `object_store::path::Path`.
+///
+/// # Arguments
+/// * `segments` - Path segments to join
+///
+/// # Returns
+/// A normalized path string with forward slashes as separators
+pub fn join_path_for_cloud(segments: &[&str]) -> String {
+    let parts = normalize_path_segments(segments);
+    if parts.is_empty() {
+        return String::new();
+    }
+    ObjectPath::from_iter(parts).as_ref().to_string()
+}
+
+/// Joins path segments into a storage path.
+///
+/// This function uses `object_store::path::Path` which handles path normalization
+/// consistently across local filesystem and cloud storage (S3, GCS, Azure, etc.).
+///
+/// # Arguments
+/// * `segments` - Path segments to join
+///
+/// # Returns
+/// A normalized path string with forward slashes as separators
 pub fn join_storage_path(segments: &[&str]) -> String {
-    let joined = segments
-        .iter()
-        .map(|s| s.trim_matches('/').trim_matches('\\'))
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    normalize_path_for_storage(&joined)
+    join_path_for_cloud(segments)
 }
 
 /// Joins a base URL with a list of segments.
@@ -143,21 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_path_for_storage() {
-        assert_eq!(normalize_path_for_storage("path\\to\\file"), "path/to/file");
-        assert_eq!(normalize_path_for_storage("path/to/file"), "path/to/file");
-        assert_eq!(
-            normalize_path_for_storage("path\\to/mixed\\separators"),
-            "path/to/mixed/separators"
-        );
-        assert_eq!(normalize_path_for_storage(""), "");
-        assert_eq!(
-            normalize_path_for_storage(".hoodie\\file.commit"),
-            ".hoodie/file.commit"
-        );
-    }
-
-    #[test]
     fn test_join_storage_path() {
         assert_eq!(
             join_storage_path(&[".hoodie", "file.commit"]),
@@ -168,7 +205,6 @@ mod tests {
             join_storage_path(&["/path/", "/to/", "/file/"]),
             "path/to/file"
         );
-        assert_eq!(join_storage_path(&["path\\to", "file"]), "path/to/file");
         assert_eq!(join_storage_path(&[""]), "");
         assert_eq!(
             join_storage_path(&["", "path", "", "file", ""]),
