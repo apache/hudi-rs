@@ -294,7 +294,7 @@ impl Table {
     ///
     /// # Arguments
     ///     * `num_splits` - The number of chunks to split the file slices into.
-    ///     * `filters` - Partition filters to apply.
+    ///     * `filters` - Filters to apply. Automatically separated into partition and data filters.
     pub async fn get_file_slices_splits<I, S>(
         &self,
         num_splits: usize,
@@ -306,8 +306,14 @@ impl Table {
     {
         if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
             let filters = from_str_tuples(filters)?;
-            self.get_file_slices_splits_internal(num_splits, timestamp, &filters)
-                .await
+            let (partition_filters, data_filters) = self.separate_filters(&filters).await?;
+            self.get_file_slices_splits_internal(
+                num_splits,
+                timestamp,
+                &partition_filters,
+                &data_filters,
+            )
+            .await
         } else {
             Ok(Vec::new())
         }
@@ -334,7 +340,7 @@ impl Table {
     /// # Arguments
     ///     * `num_splits` - The number of chunks to split the file slices into.
     ///     * `timestamp` - The timestamp which file slices associated with.
-    ///     * `filters` - Partition filters to apply.
+    ///     * `filters` - Filters to apply. Automatically separated into partition and data filters.
     pub async fn get_file_slices_splits_as_of<I, S>(
         &self,
         num_splits: usize,
@@ -347,8 +353,14 @@ impl Table {
     {
         let timestamp = format_timestamp(timestamp, &self.timezone())?;
         let filters = from_str_tuples(filters)?;
-        self.get_file_slices_splits_internal(num_splits, &timestamp, &filters)
-            .await
+        let (partition_filters, data_filters) = self.separate_filters(&filters).await?;
+        self.get_file_slices_splits_internal(
+            num_splits,
+            &timestamp,
+            &partition_filters,
+            &data_filters,
+        )
+        .await
     }
 
     /// Same as [Table::get_file_slices_splits_as_of], but blocking.
@@ -371,14 +383,110 @@ impl Table {
             })
     }
 
+    /// Separates filters into partition filters and data filters based on the partition schema.
+    ///
+    /// Partition filters target columns in the partition schema (fast path pruning).
+    /// Data filters target regular data columns (data skipping using Parquet statistics).
+    async fn separate_filters(&self, filters: &[Filter]) -> Result<(Vec<Filter>, Vec<Filter>)> {
+        let partition_schema = self.get_partition_schema().await?;
+        let partition_columns: HashSet<_> = partition_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+
+        let mut partition_filters = Vec::new();
+        let mut data_filters = Vec::new();
+
+        for filter in filters {
+            if partition_columns.contains(filter.field_name.as_str()) {
+                partition_filters.push(filter.clone());
+            } else {
+                data_filters.push(filter.clone());
+            }
+        }
+
+        Ok((partition_filters, data_filters))
+    }
+
     async fn get_file_slices_splits_internal(
         &self,
         num_splits: usize,
         timestamp: &str,
-        filters: &[Filter],
+        partition_filters: &[Filter],
+        data_filters: &[Filter],
     ) -> Result<Vec<Vec<FileSlice>>> {
-        let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
+        let file_slices = self
+            .get_file_slices_with_data_filters_internal(timestamp, partition_filters, data_filters)
+            .await?;
         Ok(split_into_chunks(file_slices, num_splits))
+    }
+
+    async fn get_file_slices_with_data_filters_internal(
+        &self,
+        timestamp: &str,
+        partition_filters: &[Filter],
+        data_filters: &[Filter],
+    ) -> Result<Vec<FileSlice>> {
+        let file_slices = self
+            .get_file_slices_internal(timestamp, partition_filters)
+            .await?;
+
+        if data_filters.is_empty() {
+            return Ok(file_slices);
+        }
+
+        let mut filtered_slices = Vec::new();
+        for file_slice in file_slices {
+            let base_file = &file_slice.base_file;
+
+            // Get the file metadata to construct the relative path
+            let Some(ref file_metadata) = base_file.file_metadata else {
+                // If no metadata, conservatively include the file slice
+                filtered_slices.push(file_slice);
+                continue;
+            };
+
+            let relative_path = if file_slice.partition_path.is_empty() {
+                file_metadata.name.clone()
+            } else {
+                format!("{}/{}", file_slice.partition_path, file_metadata.name)
+            };
+
+            let parquet_metadata = match self
+                .file_system_view
+                .storage
+                .get_parquet_file_metadata(&relative_path)
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    // If we can't read metadata, conservatively include the file
+                    filtered_slices.push(file_slice);
+                    continue;
+                }
+            };
+
+            // Extract column statistics from Parquet metadata
+            let column_stats =
+                match crate::expr::column_stats::FileColumnStats::from_parquet_metadata(
+                    &parquet_metadata,
+                ) {
+                    Ok(stats) => stats,
+                    Err(_) => {
+                        // If we can't extract stats, conservatively include the file
+                        filtered_slices.push(file_slice);
+                        continue;
+                    }
+                };
+
+            // Check if the file should be included based on column statistics
+            if column_stats.should_include_file(data_filters) {
+                filtered_slices.push(file_slice);
+            }
+        }
+
+        Ok(filtered_slices)
     }
 
     /// Get all the [FileSlice]s in the table.
@@ -1146,6 +1254,136 @@ mod tests {
         assert_eq!(file_slices_splits.len(), 2);
         assert_eq!(file_slices_splits[0].len(), 2);
         assert_eq!(file_slices_splits[1].len(), 1);
+    }
+
+    #[test]
+    fn hudi_table_get_file_slices_splits_with_filters() {
+        // Test partition-only filters
+        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+        // byteField is a partition column - should prune partitions
+        let filters = vec![("byteField", ">=", "10"), ("byteField", "<", "30")];
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_blocking(2, filters)
+            .unwrap();
+
+        let all_slices: Vec<_> = file_slices_splits.iter().flatten().collect();
+        let partition_paths: Vec<_> = all_slices
+            .iter()
+            .map(|s| s.partition_path.as_str())
+            .collect();
+
+        assert_eq!(
+            partition_paths.len(),
+            2,
+            "Should include partitions 10 and 20"
+        );
+        assert!(partition_paths.contains(&"10"));
+        assert!(partition_paths.contains(&"20"));
+        assert!(!partition_paths.contains(&"30"));
+
+        // Test data-only filters on non-partitioned table
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+        // byteField is a data column - should use Parquet statistics
+        // Data: [0, 1, 1, 1], so range [0, 1] should include files
+        let filters = vec![("byteField", ">=", "0"), ("byteField", "<=", "1")];
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_blocking(2, filters)
+            .unwrap();
+
+        let total_slices: usize = file_slices_splits.iter().map(|s| s.len()).sum();
+        assert_eq!(
+            total_slices, 1,
+            "Should include 1 file with matching statistics"
+        );
+
+        // Test mixed partition and data filters
+        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+        let filters = vec![
+            ("byteField", ">=", "10"), // partition filter
+            ("byteField", "<", "30"),  // partition filter
+            ("id", ">=", "1"),         // data filter
+        ];
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_blocking(2, filters)
+            .unwrap();
+
+        let all_slices: Vec<_> = file_slices_splits.iter().flatten().collect();
+        assert!(
+            !all_slices.is_empty(),
+            "Should have file slices after both partition and data filtering"
+        );
+
+        let partition_paths: Vec<_> = all_slices
+            .iter()
+            .map(|s| s.partition_path.as_str())
+            .collect();
+
+        // Verify partition pruning worked
+        assert!(
+            !partition_paths.contains(&"30"),
+            "Partition 30 should be pruned"
+        );
+        assert!(
+            partition_paths.contains(&"10") || partition_paths.contains(&"20"),
+            "Should contain partition 10 or 20"
+        );
+    }
+
+    #[test]
+    fn hudi_table_get_file_slices_splits_data_filter_excludes_files() {
+        // Test that data filters exclude files when statistics show no overlap
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+        // byteField data: [0, 1, 1, 1], so byteField > 100 should exclude all files
+        let filters = vec![("byteField", ">", "100")];
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_blocking(2, filters)
+            .unwrap();
+
+        let total_slices: usize = file_slices_splits.iter().map(|s| s.len()).sum();
+        assert_eq!(
+            total_slices, 0,
+            "Should exclude all files based on statistics"
+        );
+    }
+
+    #[test]
+    fn hudi_table_get_file_slices_splits_with_complex_mixed_filters() {
+        // Test complex scenario with multiple partition and data filters
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+        // byteField and shortField are partition columns, id is data column
+        let filters = vec![
+            ("byteField", ">=", "10"),   // partition filter
+            ("byteField", "<", "30"),    // partition filter
+            ("shortField", "!=", "100"), // partition filter
+            ("id", ">=", "1"),           // data filter
+        ];
+        let file_slices_splits = hudi_table
+            .get_file_slices_splits_blocking(2, filters)
+            .unwrap();
+
+        // Should apply partition pruning first, then data skipping
+        assert!(!file_slices_splits.is_empty());
+
+        let all_slices: Vec<_> = file_slices_splits.iter().flatten().collect();
+        let partition_paths: Vec<_> = all_slices
+            .iter()
+            .map(|s| s.partition_path.as_str())
+            .collect();
+
+        // Should only have byteField=10 with shortField=300 (not 100)
+        assert!(partition_paths.iter().all(|p| (p.contains("byteField=10")
+            || p.contains("byteField=20"))
+            && !p.contains("byteField=30")));
     }
 
     #[test]
