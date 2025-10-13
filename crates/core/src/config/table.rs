@@ -117,6 +117,12 @@ pub enum HudiTableConfig {
     ///
     /// - [`TimelineTimezoneValue`] - Possible values for this configuration.
     TimelineTimezone,
+
+    /// Folder for archived timeline files for layout v1 (default: .hoodie/archived)
+    ArchiveLogFolder,
+
+    /// Path for LSM timeline history for layout v2 (default: .hoodie/timeline/history)
+    TimelineHistoryPath,
 }
 
 impl AsRef<str> for HudiTableConfig {
@@ -141,6 +147,8 @@ impl AsRef<str> for HudiTableConfig {
             Self::TableVersion => "hoodie.table.version",
             Self::TimelineLayoutVersion => "hoodie.timeline.layout.version",
             Self::TimelineTimezone => "hoodie.table.timeline.timezone",
+            Self::ArchiveLogFolder => "hoodie.archivelog.folder",
+            Self::TimelineHistoryPath => "hoodie.timeline.history.path",
         }
     }
 }
@@ -166,6 +174,9 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineTimezone => Some(HudiConfigValue::String(
                 TimelineTimezoneValue::UTC.as_ref().to_string(),
             )),
+            // Fallbacks are handled in callers; no defaults here
+            Self::ArchiveLogFolder => None,
+            Self::TimelineHistoryPath => None,
             _ => None,
         }
     }
@@ -238,6 +249,8 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineTimezone => get_result
                 .and_then(TimelineTimezoneValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
+            Self::ArchiveLogFolder => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::TimelineHistoryPath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
         }
     }
 
