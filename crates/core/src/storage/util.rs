@@ -28,7 +28,25 @@ use crate::storage::Result;
 pub fn parse_uri(uri: &str) -> Result<Url> {
     let mut url = match Url::parse(uri) {
         Ok(url) => url,
-        Err(e) => Url::from_directory_path(uri).map_err(|_| UrlParseError(e))?,
+        Err(e) => {
+            let path = std::path::Path::new(uri);
+
+            let absolute_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|_| UrlParseError(e))?
+                    .join(path)
+            };
+
+            let final_path = if absolute_path.exists() {
+                absolute_path
+            } else {
+                absolute_path.canonicalize().unwrap_or(absolute_path)
+            };
+
+            Url::from_file_path(&final_path).map_err(|_| UrlParseError(e))?
+        }
     };
 
     if url.path().ends_with('/') {
@@ -214,5 +232,78 @@ mod tests {
             join_storage_path(&["part1", "part2", "subpart"]),
             "part1/part2/subpart"
         );
+    }
+
+    #[test]
+    fn test_parse_uri_path_handling() {
+        // Relative path made absolute
+        let result = parse_uri("my_data/hudi_table").unwrap();
+        assert_eq!(result.scheme(), "file");
+        let path = result.path();
+        assert!(
+            path.starts_with('/') || path.contains(":/"),
+            "Path should be absolute but got: {}",
+            path
+        );
+        assert!(path.contains("my_data"));
+        assert!(path.contains("hudi_table"));
+
+        // Current directory relative
+        let result = parse_uri(".").unwrap();
+        assert_eq!(result.scheme(), "file");
+        let path = result.path();
+        assert!(
+            path.starts_with('/') || path.contains(":/"),
+            "Current dir should resolve to absolute path"
+        );
+
+        // Non-existent path
+        let nonexistent = "/this/path/definitely/does/not/exist/xyz123";
+        let result = parse_uri(nonexistent).unwrap();
+        assert_eq!(result.scheme(), "file");
+        assert!(result.path().contains("this/path/definitely"));
+
+        // Temp directory
+        let temp_dir = std::env::temp_dir();
+        let temp_path_str = temp_dir.to_string_lossy().to_string();
+        let result = parse_uri(&temp_path_str).unwrap();
+        assert_eq!(result.scheme(), "file");
+        assert!(!result.path().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_parse_uri_windows_paths() {
+        // Windows absolute path
+        let result = parse_uri(r"C:\Users\test\data").unwrap();
+        assert_eq!(result.scheme(), "file");
+        let path = result.path();
+        assert!(
+            path.contains("Users") && path.contains("test") && path.contains("data"),
+            "Path should contain all components but got: {}",
+            path
+        );
+
+        // Windows temp path
+        let temp_dir = std::env::temp_dir();
+        let temp_str = temp_dir.to_string_lossy().to_string();
+        let result = parse_uri(&temp_str);
+        assert!(
+            result.is_ok(),
+            "Windows temp path should parse successfully"
+        );
+        if let Ok(url) = result {
+            assert_eq!(url.scheme(), "file");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_parse_uri_unix_symlinks() {
+        // Symlinks not resolved for existing paths
+        let result = parse_uri("/tmp").unwrap();
+        assert_eq!(result.scheme(), "file");
+        let path = result.path();
+        assert!(path.ends_with("tmp") || path.contains("/tmp"));
     }
 }
