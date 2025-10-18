@@ -31,6 +31,11 @@ RUN uv python list
 
 RUN uv venv /opt/.venv
 
+ENV VIRTUAL_ENV=/opt/.venv
+ENV PATH="/opt/.venv/bin:$PATH"
+
+RUN uv pip install --only-binary=all 'pyarrow==20.0.0'
+
 WORKDIR /opt
 
 CMD tail -f /dev/null
