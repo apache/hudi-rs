@@ -26,7 +26,6 @@ urls = { repository = "https://github.com/apache/hudi-rs/tree/main/python/" }
 requires-python = ">=3.9"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 license = "Apache-2.0"
-license-files = ["../LICENSE", "../NOTICE"]
 classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
