@@ -79,6 +79,9 @@ percent-encoding = { workspace = true }
 [dev-dependencies]
 hudi-test = { path = "../test" }
 
+[lints.clippy]
+result_large_err = "allow"
+
 [features]
 datafusion = [
     "dep:datafusion",
