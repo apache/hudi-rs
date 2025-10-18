@@ -34,8 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "pyarrow>=11.0.0",
-    "pyarrow-hotfix",
+    "pyarrow==15.0.2",
 ]
 
 dynamic = ["version"]
@@ -50,6 +49,7 @@ packages = ["hudi", "hudi.table"]
 "pyarrow.parquet" = ["*"]
 "pyarrow.src" = ["*"]
 "pyarrow.tests" = ["*"]
+"pyarrow.tests.interchange" = ["*"]
 "pyarrow.vendored" = ["*"]
 
 [project.optional-dependencies]
