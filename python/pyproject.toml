@@ -40,6 +40,18 @@ dependencies = [
 
 dynamic = ["version"]
 
+[tool.setuptools]
+packages = ["hudi", "hudi.table"]
+
+[tool.setuptools.exclude-package-data]
+"pyarrow" = ["*"]
+"pyarrow.includes" = ["*"]
+"pyarrow.interchange" = ["*"]
+"pyarrow.parquet" = ["*"]
+"pyarrow.src" = ["*"]
+"pyarrow.tests" = ["*"]
+"pyarrow.vendored" = ["*"]
+
 [project.optional-dependencies]
 devel = [
     "pytest==8.4.2",
@@ -57,6 +69,9 @@ datafusion = [
 
 [tool.maturin]
 module-name = "hudi._internal"
+manifest-path = "Cargo.toml"
+python-source = "."
+skip-auditwheel = true
 
 [tool.ruff]
 target-version = 'py39'
