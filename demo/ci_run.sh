@@ -44,27 +44,21 @@ app_path_in_container="/opt/hudi-rs/demo/apps/$app_path"
 if [ "$app_path" = "datafusion" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/.venv/bin/activate && \
-    cd /opt/hudi-rs && \
-    uv pip install --only-binary=all 'pyarrow==15.0.2' && \
-    make setup develop && \
+    cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
     cargo run -- --no-build --no-tests
     "
 elif [ "$app_path" = "hudi-table-api/rust" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/.venv/bin/activate && \
-    cd /opt/hudi-rs && \
-    uv pip install --only-binary=all 'pyarrow==15.0.2' && \
-    make setup develop && \
+    cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
     cargo run -- --no-build --no-tests
     "
 elif [ "$app_path" = "hudi-table-api/python" ]; then
   docker compose exec -T runner /bin/bash -c "
     source /opt/.venv/bin/activate && \
-    cd /opt/hudi-rs && \
-    uv pip install --only-binary=all 'pyarrow==15.0.2' && \
-    make setup develop && \
+    cd /opt/hudi-rs && make setup develop && \
     cd $app_path_in_container && \
     python -m src.main
     "

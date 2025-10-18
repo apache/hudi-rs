@@ -27,6 +27,7 @@ requires-python = ">=3.9"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 license = "Apache-2.0"
 classifiers = [
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -34,23 +35,11 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "pyarrow==15.0.2",
+    "pyarrow>=11.0.0,<21.0.0",
+    "pyarrow-hotfix",
 ]
 
 dynamic = ["version"]
-
-[tool.setuptools]
-packages = ["hudi", "hudi.table"]
-
-[tool.setuptools.exclude-package-data]
-"pyarrow" = ["*"]
-"pyarrow.includes" = ["*"]
-"pyarrow.interchange" = ["*"]
-"pyarrow.parquet" = ["*"]
-"pyarrow.src" = ["*"]
-"pyarrow.tests" = ["*"]
-"pyarrow.tests.interchange" = ["*"]
-"pyarrow.vendored" = ["*"]
 
 [project.optional-dependencies]
 devel = [
@@ -69,9 +58,6 @@ datafusion = [
 
 [tool.maturin]
 module-name = "hudi._internal"
-manifest-path = "Cargo.toml"
-python-source = "."
-skip-auditwheel = true
 
 [tool.ruff]
 target-version = 'py39'
