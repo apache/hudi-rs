@@ -64,6 +64,21 @@ class HudiFileGroupReader:
         """
         ...
 
+    def read_file_slice_from_paths(
+        self, base_file_path: str, log_file_paths: List[str]
+    ) -> "pyarrow.RecordBatch":
+        """
+        Read a file slice from a base file and a list of log files.
+
+        Args:
+            base_file_path (str): The relative path to the base file.
+            log_file_paths (List[str]): A list of relative paths to log files.
+
+        Returns:
+            pyarrow.RecordBatch: The merged record batch from base file and log files.
+        """
+        ...
+
 @dataclass(init=False)
 class HudiFileSlice:
     """
