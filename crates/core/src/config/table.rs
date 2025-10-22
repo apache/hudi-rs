@@ -174,9 +174,10 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineTimezone => Some(HudiConfigValue::String(
                 TimelineTimezoneValue::UTC.as_ref().to_string(),
             )),
-            // Fallbacks are handled in callers; no defaults here
-            Self::ArchiveLogFolder => None,
-            Self::TimelineHistoryPath => None,
+            Self::ArchiveLogFolder =>
+                Some(HudiConfigValue::String(".hoodie/archived".to_string())),
+            Self::TimelineHistoryPath =>
+                Some(HudiConfigValue::String(".hoodie/timeline/history".to_string())),
             _ => None,
         }
     }

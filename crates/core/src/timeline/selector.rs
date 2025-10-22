@@ -536,15 +536,15 @@ mod tests {
         let storage = Storage::new(
             Arc::new(HashMap::new()),
             Arc::new(HudiConfigs::new([
-                (HudiTableConfig::BasePath, "file:///tmp/base".to_string()),
-                (HudiTableConfig::TableVersion, "6".to_string()),
+                (HudiTableConfig::BasePath, "file:///tmp/base"),
+                (HudiTableConfig::TableVersion, "6"),
             ])),
         )
         .unwrap();
         let mut timeline = TimelineBuilder::new(
             Arc::new(HudiConfigs::new([
-                (HudiTableConfig::BasePath, "file:///tmp/base".to_string()),
-                (HudiTableConfig::TableVersion, "6".to_string()),
+                (HudiTableConfig::BasePath, "file:///tmp/base"),
+                (HudiTableConfig::TableVersion, "6"),
             ])),
             storage,
         )

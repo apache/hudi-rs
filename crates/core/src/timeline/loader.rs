@@ -77,6 +77,7 @@ impl TimelineLoader {
                 let mut instants = Vec::new();
 
                 for file_info in files {
+                    // TODO: make `storage.list_files` api support such filtering, like ignore crc and return files only
                     if file_info.name.starts_with("history/") || file_info.name.ends_with(".crc") {
                         continue;
                     }
@@ -137,18 +138,12 @@ impl TimelineLoader {
         match self {
             TimelineLoader::LayoutOneArchived(storage) => {
                 // Resolve archive folder from configs or fallback
-                let archive_dir = configs
-                    .try_get(ArchiveLogFolder)
-                    .map(|v| v.into())
-                    .unwrap_or_else(|| ".hoodie/archived".to_string());
+                let archive_dir: String = configs.get_or_default(ArchiveLogFolder).into();
 
                 // List files and try creating instants through selector
                 let files = storage.list_files(Some(&archive_dir)).await?;
                 let mut instants = Vec::new();
                 for file_info in files {
-                    if file_info.name.ends_with(".crc") {
-                        continue;
-                    }
                     if let Ok(instant) = selector.try_create_instant(file_info.name.as_str()) {
                         instants.push(instant);
                     }
