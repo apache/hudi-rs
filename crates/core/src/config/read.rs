@@ -141,21 +141,12 @@ mod tests {
                 "true".to_string(),
             ),
         ]);
-        assert_eq!(
-            InputPartitions.parse_value(&options).unwrap().to::<usize>(),
-            100
-        );
-        assert_eq!(
-            ListingParallelism
-                .parse_value(&options)
-                .unwrap()
-                .to::<usize>(),
-            100
-        );
-        assert!(UseReadOptimizedMode
-            .parse_value(&options)
-            .unwrap()
-            .to::<bool>());
+        let actual: usize = InputPartitions.parse_value(&options).unwrap().into();
+        assert_eq!(actual, 100);
+        let actual: usize = ListingParallelism.parse_value(&options).unwrap().into();
+        assert_eq!(actual, 100);
+        let actual: bool = UseReadOptimizedMode.parse_value(&options).unwrap().into();
+        assert!(actual);
     }
 
     #[test]
@@ -169,28 +160,19 @@ mod tests {
             InputPartitions.parse_value(&options).unwrap_err(),
             ParseInt(_, _, _)
         ));
-        assert_eq!(
-            InputPartitions
-                .parse_value_or_default(&options)
-                .to::<usize>(),
-            0
-        );
+        let actual: usize = InputPartitions.parse_value_or_default(&options).into();
+        assert_eq!(actual, 0);
         assert!(matches!(
             ListingParallelism.parse_value(&options).unwrap_err(),
             ParseInt(_, _, _)
         ));
-        assert_eq!(
-            ListingParallelism
-                .parse_value_or_default(&options)
-                .to::<usize>(),
-            10
-        );
+        let actual: usize = ListingParallelism.parse_value_or_default(&options).into();
+        assert_eq!(actual, 10);
         assert!(matches!(
             UseReadOptimizedMode.parse_value(&options).unwrap_err(),
             ParseBool(_, _, _)
         ));
-        assert!(!UseReadOptimizedMode
-            .parse_value_or_default(&options)
-            .to::<bool>())
+        let actual: bool = UseReadOptimizedMode.parse_value_or_default(&options).into();
+        assert!(!actual)
     }
 }

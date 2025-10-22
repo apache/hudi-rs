@@ -258,9 +258,9 @@ impl ConfigParser for HudiTableConfig {
         self.parse_value(configs).unwrap_or_else(|_| {
             match self {
                 Self::RecordMergeStrategy => {
-                    let populates_meta_fields = HudiTableConfig::PopulatesMetaFields
+                    let populates_meta_fields: bool = HudiTableConfig::PopulatesMetaFields
                         .parse_value_or_default(configs)
-                        .to::<bool>();
+                        .into();
                     if !populates_meta_fields {
                         // When populatesMetaFields is false, meta fields such as record key and
                         // partition path are null, the table is supposed to be append-only.
@@ -496,19 +496,21 @@ mod tests {
             (HudiTableConfig::PopulatesMetaFields, "false"),
             (HudiTableConfig::PrecombineField, "ts"),
         ]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
         assert_eq!(
-            hudi_configs
-                .get_or_default(HudiTableConfig::RecordMergeStrategy)
-                .to::<String>(),
+            actual,
             RecordMergeStrategyValue::AppendOnly.as_ref(),
             "Should derive as append-only due to populatesMetaFields=false"
         );
 
         let hudi_configs = HudiConfigs::new(vec![(HudiTableConfig::PopulatesMetaFields, "true")]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
         assert_eq!(
-            hudi_configs
-                .get_or_default(HudiTableConfig::RecordMergeStrategy)
-                .to::<String>(),
+            actual,
             RecordMergeStrategyValue::AppendOnly.as_ref(),
             "Should derive as append-only due to missing precombine field"
         );
@@ -517,11 +519,12 @@ mod tests {
             (HudiTableConfig::PopulatesMetaFields, "true"),
             (HudiTableConfig::PrecombineField, "ts"),
         ]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
         assert_eq!(
-            hudi_configs
-                .get_or_default(HudiTableConfig::RecordMergeStrategy)
-                .to::<String>(),
-            RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
+            actual,
+            RecordMergeStrategyValue::OverwriteWithLatest.as_ref()
         );
     }
 }

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.85
+FROM rust:1.87
 
 RUN apt-get update && apt-get install -y cmake curl ca-certificates
 
@@ -25,11 +25,16 @@ RUN sh /uv-installer.sh && rm /uv-installer.sh
 
 ENV PATH="/root/.local/bin/:$PATH"
 
-RUN uv python install
+RUN uv python install 3.13
 
 RUN uv python list
 
 RUN uv venv /opt/.venv
+
+ENV VIRTUAL_ENV=/opt/.venv
+ENV PATH="/opt/.venv/bin:$PATH"
+
+RUN uv pip install --only-binary=all 'pyarrow==20.0.0'
 
 WORKDIR /opt
 

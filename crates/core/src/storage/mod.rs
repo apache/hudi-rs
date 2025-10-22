@@ -250,6 +250,11 @@ impl Storage {
             let name = location
                 .filename()
                 .ok_or_else(|| InvalidPath(format!("Failed to get file name from {location:?}")))?;
+
+            if name.ends_with(".crc") {
+                continue;
+            }
+
             file_metadata.push(FileMetadata::new(name.to_string(), obj_meta.size));
         }
         Ok(file_metadata)
@@ -400,6 +405,20 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(file_info_3, vec![FileMetadata::new("c.parquet", 0)],);
+    }
+
+    #[tokio::test]
+    async fn storage_list_files_excludes_crc_files() {
+        let base_url = Url::from_directory_path(
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
+        )
+        .unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+
+        let files = storage.list_files(None).await.unwrap();
+
+        assert!(!files.iter().any(|f| f.name.ends_with(".crc")));
+        assert_eq!(files, vec![FileMetadata::new("a.parquet", 0)]);
     }
 
     #[tokio::test]
