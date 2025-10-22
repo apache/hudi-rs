@@ -51,8 +51,8 @@ impl TimelineBuilder {
     }
 
     fn resolve_loader_config(&self) -> Result<(TimelineLoader, Option<TimelineLoader>)> {
-        let table_version = match self.hudi_configs.get(TableVersion) {
-            Ok(v) => v.to::<isize>(),
+        let table_version: isize = match self.hudi_configs.get(TableVersion) {
+            Ok(v) => v.into(),
             Err(_) => {
                 return Ok((
                     TimelineLoader::LayoutOneActive(self.storage.clone()),
@@ -61,11 +61,11 @@ impl TimelineBuilder {
             }
         };
 
-        let layout_version = self
+        let layout_version: isize = self
             .hudi_configs
             .try_get(TimelineLayoutVersion)
-            .map(|v| v.to::<isize>())
-            .unwrap_or_else(|| if table_version == 8 { 2 } else { 1 });
+            .map(|v| v.into())
+            .unwrap_or_else(|| if table_version == 8 { 2isize } else { 1isize });
 
         match layout_version {
             1 => {

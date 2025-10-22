@@ -119,14 +119,12 @@ impl TimelineLoader {
         };
 
         let configs: Arc<HudiConfigs> = storage.hudi_configs.clone();
-        let enabled = configs
-            .get_or_default(TimelineArchivedReadEnabled)
-            .to::<bool>();
+        let enabled: bool = configs.get_or_default(TimelineArchivedReadEnabled).into();
         if !enabled {
-            let behavior = configs
+            let behavior: String = configs
                 .get_or_default(TimelineArchivedUnavailableBehavior)
-                .to::<String>()
-                .to_ascii_lowercase();
+                .into();
+            let behavior = behavior.to_ascii_lowercase();
             return match behavior.as_str() {
                 "error" => Err(CoreError::Unsupported(
                     "Archived timeline read is disabled; shorten time range or enable archived read"
@@ -141,7 +139,7 @@ impl TimelineLoader {
                 // Resolve archive folder from configs or fallback
                 let archive_dir = configs
                     .try_get(ArchiveLogFolder)
-                    .map(|v| v.to::<String>())
+                    .map(|v| v.into())
                     .unwrap_or_else(|| ".hoodie/archived".to_string());
 
                 // List files and try creating instants through selector
