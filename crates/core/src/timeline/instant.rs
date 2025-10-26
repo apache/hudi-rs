@@ -19,7 +19,7 @@
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
-use crate::storage::util::join_storage_path;
+use crate::storage::util::join_path_segments;
 use crate::Result;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::cmp::Ordering;
@@ -216,7 +216,7 @@ impl Instant {
     }
 
     pub fn relative_path(&self) -> Result<String> {
-        Ok(join_storage_path(&[HUDI_METADATA_DIR, &self.file_name()]))
+        Ok(join_path_segments(&[HUDI_METADATA_DIR, &self.file_name()])?)
     }
 
     pub fn is_replacecommit(&self) -> bool {

@@ -19,12 +19,12 @@
 
 use paste::paste;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
+use crate::storage::util::join_base_path_with_relative_path;
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::validation::validate_configs;
@@ -262,13 +262,12 @@ impl OptionResolver {
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
     ) -> Result<()> {
-        let global_config_path = std::env::var(HUDI_CONF_DIR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
-            .join("hudi-defaults.conf");
+        let hudi_conf_dir = std::env::var(HUDI_CONF_DIR).unwrap_or("/etc/hudi/conf".to_string());
+        let global_config_path =
+            join_base_path_with_relative_path(&hudi_conf_dir, "hudi-defaults.conf")?;
 
         if let Ok(bytes) = storage
-            .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
+            .get_file_data_from_absolute_path(&global_config_path)
             .await
         {
             if let Ok(global_configs) = parse_data_for_options(&bytes, " \t=") {

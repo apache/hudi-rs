@@ -18,7 +18,8 @@
  */
 
 //! Utility functions for storage.
-use object_store::path::Path as ObjectPath;
+
+use std::path::PathBuf;
 use url::Url;
 
 use crate::storage::error::StorageError::{InvalidPath, UrlParseError};
@@ -28,25 +29,7 @@ use crate::storage::Result;
 pub fn parse_uri(uri: &str) -> Result<Url> {
     let mut url = match Url::parse(uri) {
         Ok(url) => url,
-        Err(e) => {
-            let path = std::path::Path::new(uri);
-
-            let absolute_path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map_err(|_| UrlParseError(e))?
-                    .join(path)
-            };
-
-            let final_path = if absolute_path.exists() {
-                absolute_path
-            } else {
-                absolute_path.canonicalize().unwrap_or(absolute_path)
-            };
-
-            Url::from_file_path(&final_path).map_err(|_| UrlParseError(e))?
-        }
+        Err(e) => Url::from_directory_path(uri).map_err(|_| UrlParseError(e))?,
     };
 
     if url.path().ends_with('/') {
@@ -62,88 +45,130 @@ pub fn get_scheme_authority(url: &Url) -> String {
     format!("{}://{}", url.scheme(), url.authority())
 }
 
-/// Normalizes and flattens path segments by splitting on '/' and filtering empty parts.
-///
-/// # Arguments
-/// * `segments` - Path segments to normalize
-///
-/// # Returns
-/// A vector of non-empty, trimmed path parts
-fn normalize_path_segments(segments: &[&str]) -> Vec<String> {
-    segments
-        .iter()
-        .flat_map(|s| {
-            s.split('/')
-                .filter(|part| !part.is_empty())
-                .map(|part| part.trim().to_string())
-        })
-        .collect()
-}
-
-/// Joins path segments for local filesystem using `std::path::PathBuf`.
-///
-/// # Arguments
-/// * `segments` - Path segments to join
-///
-/// # Returns
-/// A normalized path string with platform-specific separators
-pub fn join_path_for_local_fs(segments: &[&str]) -> String {
-    let parts = normalize_path_segments(segments);
-    if parts.is_empty() {
-        return String::new();
-    }
-
-    let mut path = std::path::PathBuf::new();
-    for part in parts {
-        path.push(part);
-    }
-    path.to_string_lossy().to_string()
-}
-
-/// Joins path segments for cloud storage using `object_store::path::Path`.
-///
-/// # Arguments
-/// * `segments` - Path segments to join
-///
-/// # Returns
-/// A normalized path string with forward slashes as separators
-pub fn join_path_for_cloud(segments: &[&str]) -> String {
-    let parts = normalize_path_segments(segments);
-    if parts.is_empty() {
-        return String::new();
-    }
-    ObjectPath::from_iter(parts).as_ref().to_string()
-}
-
-/// Joins path segments into a storage path.
-///
-/// This function uses `object_store::path::Path` which handles path normalization
-/// consistently across local filesystem and cloud storage (S3, GCS, Azure, etc.).
-///
-/// # Arguments
-/// * `segments` - Path segments to join
-///
-/// # Returns
-/// A normalized path string with forward slashes as separators
-pub fn join_storage_path(segments: &[&str]) -> String {
-    join_path_for_cloud(segments)
-}
-
 /// Joins a base URL with a list of segments.
+///
+/// # Arguments
+/// * `base_url` - Base URL to join segments with
+/// * `segments` - Path segments to append
+///
+/// # Returns
+/// The joined URL, or an error if the URL cannot be a base
 pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     let mut url = base_url.clone();
 
-    if url.path().ends_with('/') {
-        url.path_segments_mut().unwrap().pop();
+    // Verify URL can be used as a base and get mutable path segments
+    let url_str = url.to_string();
+    let mut path_segments = url
+        .path_segments_mut()
+        .map_err(|_| InvalidPath(format!("URL '{}' cannot be a base", url_str)))?;
+
+    // Remove trailing empty segment if path ends with '/'
+    path_segments.pop_if_empty();
+
+    // Add new segments, normalizing backslashes to forward slashes
+    for segment in segments {
+        // Normalize backslashes to forward slashes for URLs
+        let normalized = segment.replace('\\', "/");
+        for part in normalized.split('/') {
+            if !part.is_empty() {
+                path_segments.push(part);
+            }
+        }
     }
 
-    for &seg in segments {
-        let segs: Vec<_> = seg.split('/').filter(|&s| !s.is_empty()).collect();
-        let err = InvalidPath(format!("Url {:?} cannot be a base", url));
-        url.path_segments_mut().map_err(|_| err)?.extend(segs);
-    }
+    drop(path_segments); // Release mutable borrow
 
     Ok(url)
+}
+
+/// Joins path segments into a single path string.
+///
+/// # Arguments
+/// * `segments` - Path segments to join
+///
+/// # Returns
+/// The joined path as a string, or an error if the path contains invalid UTF-8
+pub fn join_path_segments(segments: &[&str]) -> Result<String> {
+    let path = PathBuf::from_iter(Vec::from(segments));
+    path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| InvalidPath(format!("Path contains invalid UTF-8: {:?}", path)))
+}
+
+pub fn join_base_path_with_relative_path(base: &str, relative: &str) -> Result<String> {
+    join_base_path_with_segments(base, &[relative])
+}
+
+/// Joins a base path with segments, handling URLs, Windows paths, and Unix paths.
+///
+/// # Arguments
+/// * `base` - Base path (URL like "s3://bucket", Windows like "C:\foo", or Unix like "/tmp")
+/// * `segments` - Path segments to append
+///
+/// # Returns
+/// The joined path as a string, or an error if the input is invalid
+pub fn join_base_path_with_segments(base: &str, segments: &[&str]) -> Result<String> {
+    // 1) Windows absolute path check FIRST (before URL parsing)
+    //    This prevents "C:/foo" from being parsed as a URL with scheme "C"
+    if is_windows_drive_path(base) {
+        let mut path = PathBuf::from(base);
+        for segment in segments {
+            // Split by both separators for flexibility
+            for part in segment.split(&['/', '\\']) {
+                if !part.is_empty() {
+                    path.push(part);
+                }
+            }
+        }
+        return Ok(path.to_string_lossy().into_owned());
+    }
+
+    // 2) Try URL mode: parse base as absolute URL
+    if let Ok(mut url) = Url::parse(base) {
+        // Verify URL can be used as a base (has path segments)
+        let mut path_segments = url
+            .path_segments_mut()
+            .map_err(|_| InvalidPath(format!("URL '{}' cannot be a base", base)))?;
+
+        path_segments.pop_if_empty();
+
+        for segment in segments {
+            // Normalize backslashes to forward slashes for URLs
+            let normalized = segment.replace('\\', "/");
+            for part in normalized.split('/') {
+                if !part.is_empty() {
+                    path_segments.push(part);
+                }
+            }
+        }
+        drop(path_segments); // Release mutable borrow
+
+        return Ok(url.to_string());
+    }
+
+    // 3) Fallback: Unix absolute/relative filesystem paths
+    //    Use PathBuf for proper platform handling
+    let mut path = PathBuf::from(base);
+    for segment in segments {
+        // Split by both separators for flexibility
+        for part in segment.split(&['/', '\\']) {
+            if !part.is_empty() {
+                path.push(part);
+            }
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Detects if a string starts like a Windows drive path: `C:\` or `C:/`
+fn is_windows_drive_path(path: &str) -> bool {
+    let mut chars = path.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(drive), Some(':'), third) if drive.is_ascii_alphabetic() => {
+            third.map(|c| c == '\\' || c == '/').unwrap_or(true)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -213,97 +238,164 @@ mod tests {
     }
 
     #[test]
-    fn test_join_storage_path() {
+    fn test_join_url_segments_backslash_normalization() {
+        let base_url = Url::from_str("s3://bucket/data").unwrap();
+
+        // Backslashes should be normalized to forward slashes
         assert_eq!(
-            join_storage_path(&[".hoodie", "file.commit"]),
-            ".hoodie/file.commit"
+            join_url_segments(&base_url, &[r"dir\subdir", "file.txt"]).unwrap(),
+            Url::from_str("s3://bucket/data/dir/subdir/file.txt").unwrap()
         );
-        assert_eq!(join_storage_path(&["path", "to", "file"]), "path/to/file");
+
+        // Mixed slashes
         assert_eq!(
-            join_storage_path(&["/path/", "/to/", "/file/"]),
-            "path/to/file"
-        );
-        assert_eq!(join_storage_path(&[""]), "");
-        assert_eq!(
-            join_storage_path(&["", "path", "", "file", ""]),
-            "path/file"
-        );
-        assert_eq!(
-            join_storage_path(&["part1", "part2", "subpart"]),
-            "part1/part2/subpart"
+            join_url_segments(&base_url, &[r"dir\sub/dir", r"more\files"]).unwrap(),
+            Url::from_str("s3://bucket/data/dir/sub/dir/more/files").unwrap()
         );
     }
 
     #[test]
-    fn test_parse_uri_path_handling() {
-        // Relative path made absolute
-        let result = parse_uri("my_data/hudi_table").unwrap();
-        assert_eq!(result.scheme(), "file");
-        let path = result.path();
-        assert!(
-            path.starts_with('/') || path.contains(":/"),
-            "Path should be absolute but got: {}",
-            path
-        );
-        assert!(path.contains("my_data"));
-        assert!(path.contains("hudi_table"));
-
-        // Current directory relative
-        let result = parse_uri(".").unwrap();
-        assert_eq!(result.scheme(), "file");
-        let path = result.path();
-        assert!(
-            path.starts_with('/') || path.contains(":/"),
-            "Current dir should resolve to absolute path"
+    fn test_join_base_path_with_segments_url() {
+        // S3 URL
+        assert_eq!(
+            join_base_path_with_segments("s3://bucket/prefix", &["foo", "bar"]).unwrap(),
+            "s3://bucket/prefix/foo/bar"
         );
 
-        // Non-existent path
-        let nonexistent = "/this/path/definitely/does/not/exist/xyz123";
-        let result = parse_uri(nonexistent).unwrap();
-        assert_eq!(result.scheme(), "file");
-        assert!(result.path().contains("this/path/definitely"));
+        // File URL
+        assert_eq!(
+            join_base_path_with_segments("file:///tmp", &["foo", "bar.txt"]).unwrap(),
+            "file:///tmp/foo/bar.txt"
+        );
 
-        // Temp directory
-        let temp_dir = std::env::temp_dir();
-        let temp_path_str = temp_dir.to_string_lossy().to_string();
-        let result = parse_uri(&temp_path_str).unwrap();
-        assert_eq!(result.scheme(), "file");
-        assert!(!result.path().is_empty());
+        // URL with backslashes in segments (should normalize to forward slashes)
+        assert_eq!(
+            join_base_path_with_segments("s3://bucket/data", &["dir\\subdir", "file.txt"]).unwrap(),
+            "s3://bucket/data/dir/subdir/file.txt"
+        );
+
+        // URL with empty segments
+        assert_eq!(
+            join_base_path_with_segments("s3://bucket", &["", "foo", "", "bar"]).unwrap(),
+            "s3://bucket/foo/bar"
+        );
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
-    fn test_parse_uri_windows_paths() {
-        // Windows absolute path
-        let result = parse_uri(r"C:\Users\test\data").unwrap();
-        assert_eq!(result.scheme(), "file");
-        let path = result.path();
-        assert!(
-            path.contains("Users") && path.contains("test") && path.contains("data"),
-            "Path should contain all components but got: {}",
-            path
-        );
+    fn test_join_base_path_with_segments_windows() {
+        // Windows path with backslash
+        let result =
+            join_base_path_with_segments(r"C:\Users\test", &["Documents", "file.txt"]).unwrap();
+        assert!(result.contains("Users"));
+        assert!(result.contains("test"));
+        assert!(result.contains("Documents"));
+        assert!(result.contains("file.txt"));
 
-        // Windows temp path
-        let temp_dir = std::env::temp_dir();
-        let temp_str = temp_dir.to_string_lossy().to_string();
-        let result = parse_uri(&temp_str);
-        assert!(
-            result.is_ok(),
-            "Windows temp path should parse successfully"
-        );
-        if let Ok(url) = result {
-            assert_eq!(url.scheme(), "file");
-        }
+        // Windows path with forward slash
+        let result =
+            join_base_path_with_segments("C:/Users/test", &["Documents", "file.txt"]).unwrap();
+        assert!(result.contains("Users"));
+        assert!(result.contains("test"));
+        assert!(result.contains("Documents"));
+        assert!(result.contains("file.txt"));
+
+        // Windows path with mixed separators in segments
+        let result =
+            join_base_path_with_segments(r"D:\data", &["dir/subdir", r"more\files"]).unwrap();
+        assert!(result.contains("data"));
+        assert!(result.contains("dir"));
+        assert!(result.contains("subdir"));
+        assert!(result.contains("more"));
+        assert!(result.contains("files"));
+
+        // Just drive letter
+        let result = join_base_path_with_segments("C:", &["temp", "file.txt"]).unwrap();
+        assert!(result.contains("temp"));
+        assert!(result.contains("file.txt"));
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_parse_uri_unix_symlinks() {
-        // Symlinks not resolved for existing paths
-        let result = parse_uri("/tmp").unwrap();
-        assert_eq!(result.scheme(), "file");
-        let path = result.path();
-        assert!(path.ends_with("tmp") || path.contains("/tmp"));
+    fn test_join_base_path_with_segments_unix() {
+        // Unix absolute path
+        assert_eq!(
+            join_base_path_with_segments("/tmp/data", &["foo", "bar.txt"]).unwrap(),
+            "/tmp/data/foo/bar.txt"
+        );
+
+        // Unix path with backslashes in segments (treated as path separators)
+        let result =
+            join_base_path_with_segments("/home/user", &[r"dir\subdir", "file.txt"]).unwrap();
+        assert!(result.contains("home"));
+        assert!(result.contains("user"));
+        assert!(result.contains("dir"));
+        assert!(result.contains("subdir"));
+        assert!(result.contains("file.txt"));
+
+        // Unix path with empty segments
+        assert_eq!(
+            join_base_path_with_segments("/tmp", &["", "foo", "", "bar"]).unwrap(),
+            "/tmp/foo/bar"
+        );
+    }
+
+    #[test]
+    fn test_join_base_path_with_segments_relative() {
+        // Relative path
+        let result = join_base_path_with_segments("./data", &["foo", "bar.txt"]).unwrap();
+        assert!(result.contains("data"));
+        assert!(result.contains("foo"));
+        assert!(result.contains("bar.txt"));
+
+        // Relative path without prefix
+        let result = join_base_path_with_segments("data/dir", &["foo", "bar.txt"]).unwrap();
+        assert!(result.contains("data"));
+        assert!(result.contains("dir"));
+        assert!(result.contains("foo"));
+        assert!(result.contains("bar.txt"));
+    }
+
+    #[test]
+    fn test_join_base_path_with_segments_error_cases() {
+        // Cannot-be-a-base URL
+        let result = join_base_path_with_segments("mailto:test@example.com", &["foo"]);
+        assert!(result.is_err());
+
+        // Another cannot-be-a-base URL
+        let result = join_base_path_with_segments("data:text/plain,hello", &["bar"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_windows_drive_path() {
+        // Valid Windows paths
+        assert!(is_windows_drive_path("C:\\"));
+        assert!(is_windows_drive_path("C:/"));
+        assert!(is_windows_drive_path("D:\\path"));
+        assert!(is_windows_drive_path("E:/path"));
+        assert!(is_windows_drive_path("C:"));
+        assert!(is_windows_drive_path("z:"));
+        assert!(is_windows_drive_path("Z:\\"));
+
+        // Invalid Windows paths
+        assert!(!is_windows_drive_path("C"));
+        assert!(!is_windows_drive_path("/C:/"));
+        assert!(!is_windows_drive_path("CC:/"));
+        assert!(!is_windows_drive_path("1:/"));
+        assert!(!is_windows_drive_path("/tmp"));
+        assert!(!is_windows_drive_path("s3://bucket"));
+    }
+
+    #[test]
+    fn test_join_base_path_with_relative_path() {
+        // Test the wrapper function
+        assert_eq!(
+            join_base_path_with_relative_path("s3://bucket/data", "file.txt").unwrap(),
+            "s3://bucket/data/file.txt"
+        );
+
+        assert_eq!(
+            join_base_path_with_relative_path("/tmp", "file.txt").unwrap(),
+            "/tmp/file.txt"
+        );
     }
 }

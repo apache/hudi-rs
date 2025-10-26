@@ -275,51 +275,34 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use std::fs::canonicalize;
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use url::Url;
 
     fn get_non_existent_base_uri() -> String {
         "file:///non-existent-path/table".to_string()
     }
 
     fn get_base_uri_with_valid_props() -> String {
-        let url = Url::from_file_path(
-            canonicalize(
-                PathBuf::from("tests")
-                    .join("data")
-                    .join("table_props_valid"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        url.as_ref().to_string()
+        canonicalize("tests/data/table_props_valid")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     fn get_base_uri_with_valid_props_minimum() -> String {
-        let url = Url::from_file_path(
-            canonicalize(
-                PathBuf::from("tests")
-                    .join("data")
-                    .join("table_props_valid_minimum"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        url.as_ref().to_string()
+        canonicalize("tests/data/table_props_valid_minimum")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     fn get_base_uri_with_invalid_props() -> String {
-        let url = Url::from_file_path(
-            canonicalize(
-                PathBuf::from("tests")
-                    .join("data")
-                    .join("table_props_invalid"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        url.as_ref().to_string()
+        canonicalize("tests/data/table_props_invalid")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]

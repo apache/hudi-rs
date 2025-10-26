@@ -19,7 +19,7 @@
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::storage::util::join_storage_path;
+use crate::storage::util::join_path_segments;
 use crate::storage::Storage;
 use crate::Result;
 use std::collections::BTreeSet;
@@ -78,10 +78,10 @@ impl FileSlice {
     }
 
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
-        Ok(join_storage_path(&[
+        Ok(join_path_segments(&[
             self.partition_path.as_str(),
             file_name,
-        ]))
+        ])?)
     }
 
     /// Returns the relative path of the [BaseFile] in the [FileSlice].
