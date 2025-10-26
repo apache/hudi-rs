@@ -19,12 +19,12 @@
 
 use paste::paste;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HudiConfigs, HUDI_CONF_DIR};
+use crate::storage::util::{join_url_segments, parse_uri};
 use crate::storage::Storage;
 use crate::table::fs_view::FileSystemView;
 use crate::table::validation::validate_configs;
@@ -262,21 +262,22 @@ impl OptionResolver {
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
     ) -> Result<()> {
-        let global_config_path = std::env::var(HUDI_CONF_DIR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
-            .join("hudi-defaults.conf");
+        let global_hudi_conf = parse_uri(
+            &std::env::var(HUDI_CONF_DIR).unwrap_or_else(|_| "/etc/hudi/conf".to_string()),
+        )
+        .and_then(|url| join_url_segments(&url, &["hudi-defaults.conf"]))?;
 
         if let Ok(bytes) = storage
-            .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
+            .get_file_data_from_url_path(global_hudi_conf.path())
             .await
         {
             if let Ok(global_configs) = parse_data_for_options(&bytes, " \t=") {
-                for (key, value) in global_configs {
-                    if key.starts_with("hoodie.") && !options.contains_key(&key) {
-                        options.insert(key.to_string(), value.to_string());
-                    }
-                }
+                global_configs
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with("hoodie."))
+                    .for_each(|(key, value)| {
+                        options.entry(key).or_insert(value);
+                    });
             }
         }
 

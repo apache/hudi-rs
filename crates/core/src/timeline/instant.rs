@@ -19,11 +19,10 @@
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
-use crate::storage::error::StorageError;
+use crate::storage::util::join_path_segments;
 use crate::Result;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::cmp::Ordering;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,16 +216,7 @@ impl Instant {
     }
 
     pub fn relative_path(&self) -> Result<String> {
-        let mut commit_file_path = PathBuf::from(HUDI_METADATA_DIR);
-        commit_file_path.push(self.file_name());
-        commit_file_path
-            .to_str()
-            .ok_or(StorageError::InvalidPath(format!(
-                "Failed to get file path for {:?}",
-                self
-            )))
-            .map_err(CoreError::Storage)
-            .map(|s| s.to_string())
+        Ok(join_path_segments(&[HUDI_METADATA_DIR, &self.file_name()])?)
     }
 
     pub fn is_replacecommit(&self) -> bool {

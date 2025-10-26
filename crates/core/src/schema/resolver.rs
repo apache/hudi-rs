@@ -20,13 +20,12 @@ use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::table::HudiTableConfig;
 use crate::error::{CoreError, Result};
 use crate::schema::prepend_meta_fields;
+use crate::storage::util::join_path_segments;
 use crate::storage::Storage;
 use crate::table::Table;
 use apache_avro::schema::Schema as AvroSchema;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::{Map, Value};
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 /// Resolves the [`arrow_schema::Schema`] for a given Hudi table.
@@ -154,17 +153,8 @@ async fn resolve_schema_from_base_file(
                         "Failed to resolve the latest schema: no file path found".to_string(),
                     )
                 })?;
-            let parquet_file_path_buf = PathBuf::from_str(partition_path)
-                .map_err(|e| {
-                    CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {}", e))
-                })?
-                .join(base_file);
-            let path = parquet_file_path_buf.to_str().ok_or_else(|| {
-                CoreError::CommitMetadata(
-                    "Failed to resolve the latest schema: invalid file path".to_string(),
-                )
-            })?;
-            Ok(storage.get_parquet_file_schema(path).await?)
+            let parquet_file_path = join_path_segments(&[partition_path, base_file])?;
+            Ok(storage.get_parquet_file_schema(&parquet_file_path).await?)
         }
         None => Err(CoreError::CommitMetadata(
             "Failed to resolve the latest schema: no file path found".to_string(),

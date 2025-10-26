@@ -173,8 +173,8 @@ impl Storage {
         Ok(bytes)
     }
 
-    pub async fn get_file_data_from_absolute_path(&self, absolute_path: &str) -> Result<Bytes> {
-        let obj_path = ObjPath::from_absolute_path(PathBuf::from(absolute_path))?;
+    pub async fn get_file_data_from_url_path(&self, path: impl AsRef<str>) -> Result<Bytes> {
+        let obj_path = ObjPath::from_url_path(path)?;
         let result = self.object_store.get(&obj_path).await?;
         let bytes = result.bytes().await?;
         Ok(bytes)
@@ -283,10 +283,12 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
                 next_subdir.push(curr);
             }
             next_subdir.push(child_dir);
-            let next_subdir = next_subdir
+            let next_subdir_str = next_subdir
                 .to_str()
                 .ok_or_else(|| InvalidPath(format!("Failed to convert path: {:?}", next_subdir)))?;
-            let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
+            // Normalize to forward slashes for consistency across platforms
+            let next_subdir_normalized = next_subdir_str.replace('\\', "/");
+            let curr_leaf_dir = get_leaf_dirs(storage, Some(&next_subdir_normalized)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }
     }

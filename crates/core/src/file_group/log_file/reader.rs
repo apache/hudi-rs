@@ -289,36 +289,47 @@ mod tests {
     use crate::storage::util::parse_uri;
     use apache_avro::schema::Schema as AvroSchema;
     use std::fs::canonicalize;
-    use std::path::PathBuf;
 
     fn get_valid_log_avro_data() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
         (
-            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            canonicalize("tests/data/log_files/valid_log_avro_data")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
             ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string(),
         )
     }
 
     fn get_valid_log_parquet_data() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_parquet_data");
         (
-            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            canonicalize("tests/data/log_files/valid_log_parquet_data")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
             ".ee2ace10-7667-40f5-9848-0a144b5ea064-0_20250113230302428.log.1_0-188-387".to_string(),
         )
     }
 
     fn get_valid_log_delete() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_delete");
         (
-            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            canonicalize("tests/data/log_files/valid_log_delete")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
             ".6d3d1d6e-2298-4080-a0c1-494877d6f40a-0_20250618054711154.log.1_0-26-85".to_string(),
         )
     }
 
     fn get_valid_log_rollback() -> (String, String) {
-        let dir = PathBuf::from("tests/data/log_files/valid_log_rollback");
         (
-            canonicalize(dir).unwrap().to_str().unwrap().to_string(),
+            canonicalize("tests/data/log_files/valid_log_rollback")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
             ".0712b9f9-d2d5-4cae-bcf4-8fd7146af503-0_20250126040823628.log.2_1-0-1".to_string(),
         )
     }

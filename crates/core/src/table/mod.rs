@@ -775,7 +775,6 @@ mod tests {
     use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
-    use std::path::PathBuf;
     use std::{env, panic};
 
     /// Test helper to create a new `Table` instance without validating the configuration.
@@ -784,12 +783,9 @@ mod tests {
     ///
     /// * `table_dir_name` - Name of the table root directory; all under `crates/core/tests/data/`.
     fn get_test_table_without_validation(table_dir_name: &str) -> Table {
-        let base_url = Url::from_file_path(
-            canonicalize(PathBuf::from("tests").join("data").join(table_dir_name)).unwrap(),
-        )
-        .unwrap();
+        let base_path = canonicalize("tests/data").unwrap().join(table_dir_name);
         Table::new_with_options_blocking(
-            base_url.as_str(),
+            base_path.to_str().unwrap(),
             [("hoodie.internal.skip.config.validation", "true")],
         )
         .unwrap()

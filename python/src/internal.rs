@@ -20,7 +20,6 @@
 use arrow::pyarrow::ToPyArrow;
 use std::collections::HashMap;
 use std::convert::From;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
@@ -30,7 +29,7 @@ use hudi::error::CoreError;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::file_group::FileGroup;
-use hudi::storage::error::StorageError;
+use hudi::storage::util::join_path_segments;
 use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::timeline::instant::Instant;
@@ -151,35 +150,14 @@ pub struct HudiFileSlice {
 #[pymethods]
 impl HudiFileSlice {
     fn base_file_relative_path(&self) -> PyResult<String> {
-        let path = PathBuf::from(&self.partition_path)
-            .join(&self.base_file_name)
-            .to_str()
-            .map(String::from)
-            .ok_or_else(|| {
-                StorageError::InvalidPath(format!(
-                    "Failed to get base file relative path for file slice: {:?}",
-                    self
-                ))
-            })
-            .map_err(CoreError::from)
-            .map_err(PythonError::from)?;
+        let path = join_path_segments(&[&self.partition_path, &self.base_file_name])
+            .map_err(convert_to_py_err)?;
         Ok(path)
     }
     fn log_files_relative_paths(&self) -> PyResult<Vec<String>> {
         let mut paths = Vec::<String>::new();
         for name in self.log_file_names.iter() {
-            let p = PathBuf::from(&self.partition_path)
-                .join(name)
-                .to_str()
-                .map(String::from)
-                .ok_or_else(|| {
-                    StorageError::InvalidPath(format!(
-                        "Failed to get log file relative path for file slice: {:?}",
-                        self
-                    ))
-                })
-                .map_err(CoreError::from)
-                .map_err(PythonError::from)?;
+            let p = join_path_segments(&[&self.partition_path, name]).map_err(convert_to_py_err)?;
             paths.push(p)
         }
         Ok(paths)
