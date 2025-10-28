@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod commit;
+pub mod replace_commit;
 pub mod meta_field;
 
 pub const HUDI_METADATA_DIR: &str = ".hoodie";

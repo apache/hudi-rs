@@ -45,6 +45,7 @@ parquet = { workspace = true }
 
 # avro
 apache-avro = { workspace = true }
+apache-avro-derive = { workspace = true }
 
 # serde
 serde = { workspace = true }
