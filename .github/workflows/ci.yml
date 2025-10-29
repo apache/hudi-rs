@@ -157,6 +157,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Pre-pull base images
+        run: |
+          docker pull quay.io/minio/minio:latest
+      - name: Cache integration build artifacts (cargo/target/uv)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            .cargo/registry
+            .cargo/git
+            python/target
+            .uv-cache
+          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
+          restore-keys: |
+            integration-${{ runner.os }}-
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo

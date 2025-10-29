@@ -17,6 +17,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+# Enable BuildKit for faster, cache-friendly builds
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
 
 docker compose up --build -d
 
