@@ -21,6 +21,10 @@
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
+# Ensure containers write files as the same uid/gid as the host to avoid permission issues
+export HOST_UID=$(id -u)
+export HOST_GID=$(id -g)
+
 docker compose up --build -d
 
 max_attempts=30
@@ -78,3 +82,6 @@ else
   echo "Unknown app path: $app_path"
   exit 1
 fi
+
+# Always tear down the compose stack to release file locks and avoid cache save issues
+docker compose down -v || true

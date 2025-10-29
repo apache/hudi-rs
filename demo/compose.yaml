@@ -57,6 +57,7 @@ services:
     build:
       context: ./infra/runner
     container_name: runner
+    user: "${HOST_UID}:${HOST_GID}"
     volumes:
       - ../.:/opt/hudi-rs
     environment:
