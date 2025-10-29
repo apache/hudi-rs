@@ -28,12 +28,27 @@ mod datafusion_internal;
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
-    use internal::{HudiFileGroupReader, HudiFileSlice, HudiInstant, HudiTable, HudiTimeline};
+    use internal::{
+        HudiFileGroupReader, HudiFileSlice, HudiInstant, HudiTable, HudiTimeline, PyHudiReadConfig,
+        PyHudiTableConfig,
+    };
     m.add_class::<HudiFileGroupReader>()?;
     m.add_class::<HudiFileSlice>()?;
     m.add_class::<HudiInstant>()?;
+    m.add_class::<PyHudiReadConfig>()?;
     m.add_class::<HudiTable>()?;
+    m.add_class::<PyHudiTableConfig>()?;
     m.add_class::<HudiTimeline>()?;
+
+    let table_config_type = m.getattr("HudiTableConfig")?;
+    for (name, instance) in PyHudiTableConfig::get_class_attributes() {
+        table_config_type.setattr(name, instance)?;
+    }
+
+    let read_config_type = m.getattr("HudiReadConfig")?;
+    for (name, instance) in PyHudiReadConfig::get_class_attributes() {
+        read_config_type.setattr(name, instance)?;
+    }
 
     #[cfg(feature = "datafusion")]
     {
