@@ -17,6 +17,7 @@
  * under the License.
  */
 
+pub mod column_stats;
 pub mod filter;
 
 use crate::error::CoreError;
