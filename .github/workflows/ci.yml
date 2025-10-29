@@ -94,6 +94,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      
+      # Cache Rust dependencies and build artifacts
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache based on Python version and OS for better hit rate
+          shared-key: "python-binding-${{ matrix.os }}-py${{ matrix.python-version }}"
+          # Save cache even on failure to speed up retries
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
         
       - name: install uv and set the python version
         uses: astral-sh/setup-uv@v7
@@ -101,17 +110,30 @@ jobs:
           version: "0.7.19"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - name: Setup Python venv
+          cache-dependency-glob: "python/pyproject.toml"
+          
+      - name: Setup Python venv and build
         run: |
           make setup-venv
           source .venv/bin/activate
           make build
           make develop
+          
+      - name: Python unit tests
+        # Only compute coverage for one matrix combination to save time
+        if: ${{ !((matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13')) }}
+        run: |
+          source .venv/bin/activate
+          pytest -v
+          
       - name: Python unit tests with coverage report
+        # Only compute coverage for ubuntu-24.04 with Python 3.13
+        if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
         run: |
           source .venv/bin/activate
           coverage run --include 'python/hudi/*' -m pytest -v
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
+          
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
@@ -119,6 +141,7 @@ jobs:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
           if-no-files-found: 'error'
+          
       - name: Upload wheel files
         uses: actions/upload-artifact@v4
         with:
