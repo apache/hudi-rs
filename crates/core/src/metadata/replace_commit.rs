@@ -92,4 +92,36 @@ mod tests {
         let ids: Vec<(&String, &String)> = metadata.iter_replace_file_ids().collect();
         assert_eq!(ids.len(), 4);
     }
+
+    #[test]
+    fn test_from_json_bytes() {
+        let json_str = r#"{
+            "partitionToReplaceFileIds": {
+                "30": ["a-0"],
+                "20": ["b-0"]
+            },
+            "version": 1,
+            "operationType": "REPLACE_COMMIT"
+        }"#;
+
+        let metadata = HoodieReplaceCommitMetadata::from_json_bytes(json_str.as_bytes()).unwrap();
+        assert_eq!(metadata.version, Some(1));
+        assert_eq!(metadata.operation_type, Some("REPLACE_COMMIT".to_string()));
+    }
+
+    #[test]
+    fn test_from_json_bytes_invalid() {
+        let invalid_json = b"invalid json";
+        let result = HoodieReplaceCommitMetadata::from_json_bytes(invalid_json);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::CommitMetadata(_))));
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids_empty() {
+        let json = json!({});
+        let metadata: HoodieReplaceCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 0);
+    }
 }

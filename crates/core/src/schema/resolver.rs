@@ -182,3 +182,89 @@ fn extract_avro_schema_from_commit_metadata(
                 .map(|s| s.to_string())
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_resolve_avro_schema_from_commit_metadata_with_schema() {
+        let metadata = json!({
+            "extraMetadata": {
+                "schema": r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let result = resolve_avro_schema_from_commit_metadata(&metadata);
+        assert!(result.is_ok());
+        let schema = result.unwrap();
+        assert!(schema.contains("TestRecord"));
+    }
+
+    #[test]
+    fn test_resolve_avro_schema_from_commit_metadata_empty() {
+        let metadata = Map::new();
+        let result = resolve_avro_schema_from_commit_metadata(&metadata);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::CommitMetadata(_))));
+    }
+
+    #[test]
+    fn test_resolve_avro_schema_from_commit_metadata_no_schema() {
+        let metadata = json!({
+            "extraMetadata": {
+                "other": "value"
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let result = resolve_avro_schema_from_commit_metadata(&metadata);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::SchemaNotFound(_))));
+    }
+
+    #[test]
+    fn test_sanitize_avro_schema_str() {
+        let schema_with_escape = r#"test\:schema"#;
+        let sanitized = sanitize_avro_schema_str(schema_with_escape);
+        assert_eq!(sanitized, "test:schema");
+
+        let schema_with_whitespace = "  test schema  ";
+        let sanitized = sanitize_avro_schema_str(schema_with_whitespace);
+        assert_eq!(sanitized, "test schema");
+    }
+
+    #[test]
+    fn test_extract_avro_schema_from_commit_metadata() {
+        let metadata = json!({
+            "extraMetadata": {
+                "schema": "test_schema"
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let schema = extract_avro_schema_from_commit_metadata(&metadata);
+        assert_eq!(schema, Some("test_schema".to_string()));
+    }
+
+    #[test]
+    fn test_extract_avro_schema_from_commit_metadata_none() {
+        let metadata = json!({
+            "other": "value"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let schema = extract_avro_schema_from_commit_metadata(&metadata);
+        assert_eq!(schema, None);
+    }
+}

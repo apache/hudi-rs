@@ -274,4 +274,158 @@ mod tests {
             panic!("Expected Record schema");
         }
     }
+
+    #[test]
+    fn test_from_json_bytes() {
+        let json_str = r#"{
+            "version": 1,
+            "operationType": "UPSERT",
+            "partitionToWriteStats": {
+                "p1": [{
+                    "fileId": "file1",
+                    "path": "p1/file1.parquet"
+                }]
+            },
+            "compacted": false
+        }"#;
+
+        let metadata = HoodieCommitMetadata::from_json_bytes(json_str.as_bytes()).unwrap();
+        assert_eq!(metadata.version, Some(1));
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+    }
+
+    #[test]
+    fn test_from_json_bytes_invalid() {
+        let invalid_json = b"invalid json";
+        let result = HoodieCommitMetadata::from_json_bytes(invalid_json);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::CommitMetadata(_))));
+    }
+
+    #[test]
+    fn test_get_partition_write_stats() {
+        let json = json!({
+            "partitionToWriteStats": {
+                "p1": [{
+                    "fileId": "file1",
+                    "path": "p1/file1.parquet"
+                }],
+                "p2": [{
+                    "fileId": "file2",
+                    "path": "p2/file2.parquet"
+                }]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        
+        // Test getting existing partition
+        let p1_stats = metadata.get_partition_write_stats("p1").unwrap();
+        assert_eq!(p1_stats.len(), 1);
+        assert_eq!(p1_stats[0].file_id, Some("file1".to_string()));
+
+        // Test getting non-existent partition
+        assert!(metadata.get_partition_write_stats("p3").is_none());
+    }
+
+    #[test]
+    fn test_get_partitions_with_writes() {
+        let json = json!({
+            "partitionToWriteStats": {
+                "p1": [{
+                    "fileId": "file1",
+                    "path": "p1/file1.parquet"
+                }],
+                "p2": [{
+                    "fileId": "file2",
+                    "path": "p2/file2.parquet"
+                }]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let mut partitions = metadata.get_partitions_with_writes();
+        partitions.sort();
+        assert_eq!(partitions, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    #[test]
+    fn test_get_partitions_with_writes_empty() {
+        let json = json!({});
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let partitions = metadata.get_partitions_with_writes();
+        assert_eq!(partitions.len(), 0);
+    }
+
+    #[test]
+    fn test_get_partition_replace_file_ids() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "30": ["d398fae1-c0e6-4098-8124-f55f7098bdba-0"],
+                "20": ["88163884-fef0-4aab-865d-c72327a8a1d5-0"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+
+        // Test getting existing partition
+        let file_ids_30 = metadata.get_partition_replace_file_ids("30").unwrap();
+        assert_eq!(file_ids_30.len(), 1);
+        assert_eq!(file_ids_30[0], "d398fae1-c0e6-4098-8124-f55f7098bdba-0");
+
+        // Test getting non-existent partition
+        assert!(metadata.get_partition_replace_file_ids("40").is_none());
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "30": ["file1"],
+                "20": ["file2"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let mut partitions = metadata.get_partitions_with_replacements();
+        partitions.sort();
+        assert_eq!(partitions, vec!["20".to_string(), "30".to_string()]);
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements_empty() {
+        let json = json!({});
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let partitions = metadata.get_partitions_with_replacements();
+        assert_eq!(partitions.len(), 0);
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1", "file2"],
+                "p2": ["file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 3);
+
+        let file_ids: Vec<_> = metadata.iter_replace_file_ids()
+            .map(|(_, file_id)| file_id.as_str())
+            .collect();
+        assert!(file_ids.contains(&"file1"));
+        assert!(file_ids.contains(&"file2"));
+        assert!(file_ids.contains(&"file3"));
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids_empty() {
+        let json = json!({});
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 0);
+    }
 }

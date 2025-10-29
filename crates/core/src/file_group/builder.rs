@@ -115,6 +115,37 @@ pub fn build_replaced_file_groups(
 #[cfg(test)]
 mod tests {
 
+    mod test_file_group_merger {
+        use super::super::*;
+        use crate::file_group::FileGroup;
+
+        #[test]
+        fn test_merge_file_groups() {
+            let mut existing = HashSet::new();
+            let fg1 = FileGroup::new("file1".to_string(), "p1".to_string());
+            existing.insert(fg1);
+
+            let new_groups = vec![
+                FileGroup::new("file2".to_string(), "p1".to_string()),
+                FileGroup::new("file3".to_string(), "p2".to_string()),
+            ];
+
+            existing.merge(new_groups).unwrap();
+            assert_eq!(existing.len(), 3);
+        }
+
+        #[test]
+        fn test_merge_empty() {
+            let mut existing = HashSet::new();
+            let fg1 = FileGroup::new("file1".to_string(), "p1".to_string());
+            existing.insert(fg1);
+
+            let new_groups: Vec<FileGroup> = vec![];
+            existing.merge(new_groups).unwrap();
+            assert_eq!(existing.len(), 1);
+        }
+    }
+
     mod test_build_file_groups {
         use super::super::*;
         use serde_json::{json, Map, Value};
