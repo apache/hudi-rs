@@ -63,7 +63,8 @@ impl HoodieReplaceCommitMetadata {
     /// Iterate over all replace file IDs across all partitions
     pub fn iter_replace_file_ids(&self) -> impl Iterator<Item = (&String, &String)> {
         self.partition_to_replace_file_ids
-            .iter()
+            .as_ref()
+            .into_iter()
             .flat_map(|replace_ids| {
                 replace_ids.iter().flat_map(|(partition, file_ids)| {
                     file_ids.iter().map(move |file_id| (partition, file_id))

@@ -63,7 +63,6 @@ pub struct HoodieWriteStat {
 /// # Example
 /// ```
 /// use hudi_core::metadata::commit::HoodieCommitMetadata;
-/// use apache_avro::Schema;
 ///
 /// // Get the Avro schema
 /// let schema = HoodieCommitMetadata::get_schema();
@@ -132,17 +131,21 @@ impl HoodieCommitMetadata {
 
     /// Iterate over all write stats across all partitions
     pub fn iter_write_stats(&self) -> impl Iterator<Item = (&String, &HoodieWriteStat)> {
-        self.partition_to_write_stats.iter().flat_map(|stats| {
-            stats.iter().flat_map(|(partition, write_stats)| {
-                write_stats.iter().map(move |stat| (partition, stat))
+        self.partition_to_write_stats
+            .as_ref()
+            .into_iter()
+            .flat_map(|stats| {
+                stats.iter().flat_map(|(partition, write_stats)| {
+                    write_stats.iter().map(move |stat| (partition, stat))
+                })
             })
-        })
     }
 
     /// Iterate over all replace file IDs across all partitions
     pub fn iter_replace_file_ids(&self) -> impl Iterator<Item = (&String, &String)> {
         self.partition_to_replace_file_ids
-            .iter()
+            .as_ref()
+            .into_iter()
             .flat_map(|replace_ids| {
                 replace_ids.iter().flat_map(|(partition, file_ids)| {
                     file_ids.iter().map(move |file_id| (partition, file_id))
