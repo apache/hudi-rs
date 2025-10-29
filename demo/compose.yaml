@@ -57,9 +57,13 @@ services:
     build:
       context: ./infra/runner
     container_name: runner
+    user: "${HOST_UID}:${HOST_GID}"
     volumes:
       - ../.:/opt/hudi-rs
     environment:
+      # Persist Rust and Python caches inside the mounted repo to speed up rebuilds
+      CARGO_HOME: /opt/hudi-rs/.cargo
+      UV_CACHE_DIR: /opt/hudi-rs/.uv-cache
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_ENDPOINT_URL: http://minio:9000
