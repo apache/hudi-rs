@@ -84,4 +84,4 @@ else
 fi
 
 # Always tear down the compose stack to release file locks and avoid cache save issues
-docker compose down -v || true
+docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
