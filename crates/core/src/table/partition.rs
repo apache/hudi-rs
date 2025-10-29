@@ -20,6 +20,8 @@ use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
 use crate::error::CoreError::InvalidPartitionPath;
 use crate::expr::filter::{Filter, SchemableFilter};
+use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
+use crate::keygen::KeyGeneratorFilterTransformer;
 use crate::Result;
 
 use arrow_array::{ArrayRef, Scalar};
@@ -64,7 +66,12 @@ impl PartitionPruner {
         partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
     ) -> Result<Self> {
-        let and_filters: Vec<SchemableFilter> = and_filters
+        // Transform filters based on key generator configuration
+        let transformed_filters =
+            Self::transform_filters_for_keygen(and_filters, partition_schema, hudi_configs)?;
+
+        // Convert to SchemableFilter
+        let and_filters: Vec<SchemableFilter> = transformed_filters
             .iter()
             .filter_map(|filter| SchemableFilter::try_from((filter.clone(), partition_schema)).ok())
             .collect();
@@ -82,6 +89,63 @@ impl PartitionPruner {
             is_url_encoded,
             and_filters,
         })
+    }
+
+    /// Transforms user filters on data columns to filters on partition path columns
+    /// based on the configured key generator.
+    ///
+    /// For example, with TimestampBasedKeyGenerator:
+    /// - Input filter: `ts_str >= "2023-04-01T12:01:00.123Z"`
+    /// - Output filters: `year >= "2023"` (and potentially month, day, hour filters)
+    ///
+    /// For other key generators (Simple, Complex, etc.), filters are passed through unchanged (TODO).
+    fn transform_filters_for_keygen(
+        filters: &[Filter],
+        _partition_schema: &Schema,
+        hudi_configs: &HudiConfigs,
+    ) -> Result<Vec<Filter>> {
+        // Check if key generator is configured
+        let keygen_class: Option<String> =
+            hudi_configs.try_get(KeyGeneratorClass).map(|v| v.into());
+
+        // If TimestampBasedKeyGenerator is configured, transform filters
+        if let Some(class) = keygen_class {
+            if class.contains("TimestampBasedKeyGenerator") {
+                // Try to create the transformer
+                match TimestampBasedKeyGenerator::from_configs(hudi_configs) {
+                    Ok(transformer) => {
+                        return Self::apply_transformer_to_filters(filters, &transformer);
+                    }
+                    Err(e) => {
+                        // Log the error but continue without transformation
+                        eprintln!(
+                            "Warning: Failed to create TimestampBasedKeyGenerator: {}. \
+                             Filters will not be transformed.",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // No transformation needed - return filters as-is
+        Ok(filters.to_vec())
+    }
+
+    /// Applies the key generator transformer to all filters.
+    fn apply_transformer_to_filters(
+        filters: &[Filter],
+        transformer: &dyn KeyGeneratorFilterTransformer,
+    ) -> Result<Vec<Filter>> {
+        let mut transformed = Vec::new();
+
+        for filter in filters {
+            // Transform filter (may produce multiple partition filters)
+            let partition_filters = transformer.transform_filter(filter)?;
+            transformed.extend(partition_filters);
+        }
+
+        Ok(transformed)
     }
 
     /// Creates an empty partition pruner that does not filter any partitions.
@@ -360,5 +424,175 @@ mod tests {
             assert_eq!(filter.field.name(), "count");
             assert_eq!(filter.operator, ExprOperator::from_str(op).unwrap());
         }
+    }
+
+    #[test]
+    fn test_transform_filters_for_keygen_timestamp_based() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+
+        let partition_schema = Schema::new(vec![
+            Field::new("year", DataType::Utf8, false),
+            Field::new("month", DataType::Utf8, false),
+            Field::new("day", DataType::Utf8, false),
+        ]);
+
+        let user_filter = Filter {
+            field_name: "ts_str".to_string(),
+            operator: ExprOperator::Gte,
+            field_value: "2023-04-15T12:00:00.000Z".to_string(),
+        };
+
+        let transformed = PartitionPruner::transform_filters_for_keygen(
+            &[user_filter],
+            &partition_schema,
+            &configs,
+        )
+        .unwrap();
+
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].field_name, "year");
+        assert_eq!(transformed[0].operator, ExprOperator::Gte);
+        assert_eq!(transformed[0].field_value, "2023");
+    }
+
+    #[test]
+    fn test_transform_filters_for_keygen_equality() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "event_time"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "UNIX_TIMESTAMP"),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "false"),
+        ]);
+
+        let partition_schema = Schema::new(vec![
+            Field::new("yyyy", DataType::Utf8, false),
+            Field::new("MM", DataType::Utf8, false),
+            Field::new("dd", DataType::Utf8, false),
+        ]);
+
+        let user_filter = Filter {
+            field_name: "event_time".to_string(),
+            operator: ExprOperator::Eq,
+            field_value: "1706140800000".to_string(), // 2024-01-25 00:00:00
+        };
+
+        let transformed = PartitionPruner::transform_filters_for_keygen(
+            &[user_filter],
+            &partition_schema,
+            &configs,
+        )
+        .unwrap();
+
+        assert_eq!(transformed.len(), 3);
+        assert_eq!(transformed[0].field_name, "yyyy");
+        assert_eq!(transformed[0].field_value, "2024");
+        assert_eq!(transformed[1].field_name, "MM");
+        assert_eq!(transformed[1].field_value, "01");
+        assert_eq!(transformed[2].field_name, "dd");
+        assert_eq!(transformed[2].field_value, "25");
+    }
+
+    #[test]
+    fn test_transform_filters_for_keygen_no_transformation() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Setup: SimpleKeyGenerator (no transformation needed)
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "region"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.SimpleKeyGenerator",
+            ),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+
+        let partition_schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
+
+        let user_filter = Filter {
+            field_name: "region".to_string(),
+            operator: ExprOperator::Eq,
+            field_value: "us-west".to_string(),
+        };
+
+        let transformed = PartitionPruner::transform_filters_for_keygen(
+            &[user_filter.clone()],
+            &partition_schema,
+            &configs,
+        )
+        .unwrap();
+
+        // Should return filter unchanged
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].field_name, user_filter.field_name);
+        assert_eq!(transformed[0].field_value, user_filter.field_value);
+    }
+
+    #[test]
+    fn test_partition_pruner_with_timestamp_keygen() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Full integration test: PartitionPruner with TimestampBasedKeyGenerator
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ]);
+
+        let partition_schema = Schema::new(vec![
+            Field::new("year", DataType::Utf8, false),
+            Field::new("month", DataType::Utf8, false),
+            Field::new("day", DataType::Utf8, false),
+        ]);
+
+        let user_filter = Filter {
+            field_name: "ts".to_string(),
+            operator: ExprOperator::Gte,
+            field_value: "2024-01-15T00:00:00Z".to_string(),
+        };
+
+        let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
+
+        // Verify filters were transformed and applied
+        assert!(!pruner.is_empty());
+
+        // Should include partitions >= 2024
+        assert!(pruner.should_include("year=2024/month=01/day=15"));
+        assert!(pruner.should_include("year=2024/month=06/day=30"));
+        assert!(pruner.should_include("year=2025/month=01/day=01"));
+
+        // Should exclude partitions < 2024
+        assert!(!pruner.should_include("year=2023/month=12/day=31"));
+        assert!(!pruner.should_include("year=2022/month=01/day=01"));
     }
 }
