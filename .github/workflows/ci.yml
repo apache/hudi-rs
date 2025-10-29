@@ -63,6 +63,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # Only cache cargo registry and git, not target directory
+          # Tarpaulin needs clean builds for accurate coverage
+          cache-targets: false
+          # Reduce cache size by cleaning old artifacts
+          cache-all-crates: false
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
