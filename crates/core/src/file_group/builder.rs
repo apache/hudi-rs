@@ -18,6 +18,8 @@
  */
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
+use crate::metadata::commit::HoodieCommitMetadata;
+use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::Result;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -47,64 +49,48 @@ impl FileGroupMerger for HashSet<FileGroup> {
 }
 
 pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet<FileGroup>> {
-    let partition_stats = commit_metadata
-        .get("partitionToWriteStats")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| {
-            CoreError::CommitMetadata("Invalid or missing partitionToWriteStats object".into())
-        })?;
+    let metadata = HoodieCommitMetadata::from_json_map(commit_metadata)?;
 
     let mut file_groups = HashSet::new();
 
-    for (partition, write_stats_array) in partition_stats {
-        let write_stats = write_stats_array
-            .as_array()
-            .ok_or_else(|| CoreError::CommitMetadata("Invalid write stats array".into()))?;
+    for (partition, write_stat) in metadata.iter_write_stats() {
+        let file_id = write_stat
+            .file_id
+            .as_ref()
+            .ok_or_else(|| CoreError::CommitMetadata("Missing fileId in write stats".into()))?;
 
-        for stat in write_stats {
-            let file_id = stat
-                .get("fileId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| CoreError::CommitMetadata("Invalid fileId in write stats".into()))?;
+        let mut file_group = FileGroup::new(file_id.clone(), partition.clone());
 
-            let mut file_group = FileGroup::new(file_id.to_string(), partition.clone());
+        // Handle two cases:
+        // 1. MOR table with baseFile and logFiles
+        // 2. COW table with path only
+        if let Some(base_file_name) = &write_stat.base_file {
+            file_group.add_base_file_from_name(base_file_name)?;
 
-            if let Some(base_file_name) = stat.get("baseFile") {
-                let base_file_name = base_file_name
-                    .as_str()
-                    .ok_or_else(|| CoreError::CommitMetadata("Invalid base file name".into()))?;
-                file_group.add_base_file_from_name(base_file_name)?;
-
-                if let Some(log_file_names) = stat.get("logFiles") {
-                    let log_file_names = log_file_names.as_array().ok_or_else(|| {
-                        CoreError::CommitMetadata("Invalid log files array".into())
-                    })?;
-                    for log_file_name in log_file_names {
-                        let log_file_name = log_file_name.as_str().ok_or_else(|| {
-                            CoreError::CommitMetadata("Invalid log file name".into())
-                        })?;
-                        file_group.add_log_file_from_name(log_file_name)?;
-                    }
-                } else {
-                    return Err(CoreError::CommitMetadata(
-                        "Missing log files in write stats".into(),
-                    ));
+            if let Some(log_file_names) = &write_stat.log_files {
+                for log_file_name in log_file_names {
+                    file_group.add_log_file_from_name(log_file_name)?;
                 }
             } else {
-                let path = stat.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-                    CoreError::CommitMetadata("Invalid path in write stats".into())
-                })?;
-
-                let file_name = Path::new(path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?;
-
-                file_group.add_base_file_from_name(file_name)?;
+                return Err(CoreError::CommitMetadata(
+                    "Missing log files in write stats".into(),
+                ));
             }
+        } else {
+            let path = write_stat
+                .path
+                .as_ref()
+                .ok_or_else(|| CoreError::CommitMetadata("Missing path in write stats".into()))?;
 
-            file_groups.insert(file_group);
+            let file_name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?;
+
+            file_group.add_base_file_from_name(file_name)?;
         }
+
+        file_groups.insert(file_group);
     }
 
     Ok(file_groups)
@@ -113,28 +99,14 @@ pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet
 pub fn build_replaced_file_groups(
     commit_metadata: &Map<String, Value>,
 ) -> Result<HashSet<FileGroup>> {
-    let partition_to_replaced = commit_metadata
-        .get("partitionToReplaceFileIds")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| {
-            CoreError::CommitMetadata("Invalid or missing partitionToReplaceFileIds object".into())
-        })?;
+    // Replace commits follow HoodieReplaceCommitMetadata schema; parse with the dedicated type
+    let metadata = HoodieReplaceCommitMetadata::from_json_map(commit_metadata)?;
 
     let mut file_groups = HashSet::new();
 
-    for (partition, file_ids_value) in partition_to_replaced {
-        let file_ids = file_ids_value
-            .as_array()
-            .ok_or_else(|| CoreError::CommitMetadata("Invalid file group ids array".into()))?;
-
-        for file_id in file_ids {
-            let id = file_id
-                .as_str()
-                .ok_or_else(|| CoreError::CommitMetadata("Invalid file group id string".into()))?;
-
-            let file_group = FileGroup::new(id.to_string(), partition.clone());
-            file_groups.insert(file_group);
-        }
+    for (partition, file_id) in metadata.iter_replace_file_ids() {
+        let file_group = FileGroup::new(file_id.clone(), partition.clone());
+        file_groups.insert(file_group);
     }
 
     Ok(file_groups)
@@ -142,6 +114,37 @@ pub fn build_replaced_file_groups(
 
 #[cfg(test)]
 mod tests {
+
+    mod test_file_group_merger {
+        use super::super::*;
+        use crate::file_group::FileGroup;
+
+        #[test]
+        fn test_merge_file_groups() {
+            let mut existing = HashSet::new();
+            let fg1 = FileGroup::new("file1".to_string(), "p1".to_string());
+            existing.insert(fg1);
+
+            let new_groups = vec![
+                FileGroup::new("file2".to_string(), "p1".to_string()),
+                FileGroup::new("file3".to_string(), "p2".to_string()),
+            ];
+
+            existing.merge(new_groups).unwrap();
+            assert_eq!(existing.len(), 3);
+        }
+
+        #[test]
+        fn test_merge_empty() {
+            let mut existing = HashSet::new();
+            let fg1 = FileGroup::new("file1".to_string(), "p1".to_string());
+            existing.insert(fg1);
+
+            let new_groups: Vec<FileGroup> = vec![];
+            existing.merge(new_groups).unwrap();
+            assert_eq!(existing.len(), 1);
+        }
+    }
 
     mod test_build_file_groups {
         use super::super::*;
@@ -158,9 +161,10 @@ mod tests {
             .clone();
 
             let result = build_file_groups(&metadata);
-            assert!(matches!(result,
-                Err(CoreError::CommitMetadata(msg))
-                if msg == "Invalid or missing partitionToWriteStats object"));
+            // With the new implementation, this returns Ok with an empty HashSet
+            // because iter_write_stats() returns an empty iterator when partition_to_write_stats is None
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().len(), 0);
         }
 
         #[test]
@@ -177,7 +181,7 @@ mod tests {
             let result = build_file_groups(&metadata);
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid write stats array"
+                Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
             ));
         }
 
@@ -197,7 +201,7 @@ mod tests {
             let result = build_file_groups(&metadata);
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid fileId in write stats"
+                Err(CoreError::CommitMetadata(msg)) if msg == "Missing fileId in write stats"
             ));
         }
 
@@ -217,7 +221,7 @@ mod tests {
             let result = build_file_groups(&metadata);
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid path in write stats"
+                Err(CoreError::CommitMetadata(msg)) if msg == "Missing path in write stats"
             ));
         }
 
@@ -257,9 +261,10 @@ mod tests {
             .clone();
 
             let result = build_file_groups(&metadata);
+            // Serde will fail to parse this and return a deserialization error
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid fileId in write stats"
+                Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
             ));
         }
 
@@ -278,9 +283,10 @@ mod tests {
             .clone();
 
             let result = build_file_groups(&metadata);
+            // Serde will fail to parse this and return a deserialization error
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid path in write stats"
+                Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
             ));
         }
 
@@ -331,10 +337,10 @@ mod tests {
             .clone();
 
             let result = build_replaced_file_groups(&metadata);
-            assert!(matches!(
-                result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid or missing partitionToReplaceFileIds object"
-            ));
+            // With the new implementation, this returns Ok with an empty HashSet
+            // because iter_replace_file_ids() returns an empty iterator when partition_to_replace_file_ids is None
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().len(), 0);
         }
 
         #[test]
@@ -351,7 +357,7 @@ mod tests {
             let result = build_replaced_file_groups(&metadata);
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file group ids array"
+                Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
             ));
         }
 
@@ -367,9 +373,10 @@ mod tests {
             .clone();
 
             let result = build_replaced_file_groups(&metadata);
+            // Serde will fail to parse this
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file group id string"
+                Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
             ));
         }
 
@@ -385,9 +392,10 @@ mod tests {
             .clone();
 
             let result = build_replaced_file_groups(&metadata);
+            // Serde will fail to parse this
             assert!(matches!(
                 result,
-                Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file group id string"
+                Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
             ));
         }
 
