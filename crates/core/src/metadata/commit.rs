@@ -318,7 +318,7 @@ mod tests {
         });
 
         let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
-        
+
         // Test getting existing partition
         let p1_stats = metadata.get_partition_write_stats("p1").unwrap();
         assert_eq!(p1_stats.len(), 1);
@@ -413,7 +413,8 @@ mod tests {
         let count = metadata.iter_replace_file_ids().count();
         assert_eq!(count, 3);
 
-        let file_ids: Vec<_> = metadata.iter_replace_file_ids()
+        let file_ids: Vec<_> = metadata
+            .iter_replace_file_ids()
             .map(|(_, file_id)| file_id.as_str())
             .collect();
         assert!(file_ids.contains(&"file1"));

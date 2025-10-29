@@ -14,7 +14,7 @@
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
  * KIND, either express or implied.  See the License for the
  * specific language governing permissions and limitations
- * under the License.  
+ * under the License.
  */
 
 use crate::error::CoreError;
@@ -48,14 +48,16 @@ pub struct HoodieReplaceCommitMetadata {
 impl HoodieReplaceCommitMetadata {
     /// Parse replace commit metadata from a serde_json Map
     pub fn from_json_map(map: &Map<String, Value>) -> Result<Self> {
-        serde_json::from_value(Value::Object(map.clone()))
-            .map_err(|e| CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e)))
+        serde_json::from_value(Value::Object(map.clone())).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e))
+        })
     }
 
     /// Parse replace commit metadata from JSON bytes
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e)))
+        serde_json::from_slice(bytes).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e))
+        })
     }
 
     /// Iterate over all replace file IDs across all partitions
@@ -63,9 +65,9 @@ impl HoodieReplaceCommitMetadata {
         self.partition_to_replace_file_ids
             .iter()
             .flat_map(|replace_ids| {
-                replace_ids
-                    .iter()
-                    .flat_map(|(partition, file_ids)| file_ids.iter().map(move |file_id| (partition, file_id)))
+                replace_ids.iter().flat_map(|(partition, file_ids)| {
+                    file_ids.iter().map(move |file_id| (partition, file_id))
+                })
             })
     }
 }
