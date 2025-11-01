@@ -71,7 +71,7 @@ elif [ "$app_path" = "hudi-table-api/python" ]; then
     "
 elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "
-    cd /opt/hudi-rs/cpp && cargo build --release && \
+    cd /opt/hudi-rs/cpp && ../build-wrapper.sh cargo build --release && \
     cd $app_path_in_container && \
     mkdir build && cd build && \
     cmake .. && \
