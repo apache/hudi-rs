@@ -43,12 +43,12 @@ setup: ## Setup the requirements
 .PHONY: build
 build: setup ## Build Python binding of hudi-rs
 	$(info --- Build Python binding ---)
-	maturin build --features datafusion $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
+	./build-wrapper.sh maturin build --features datafusion $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
 
 .PHONY: develop
 develop: setup ## Install Python binding of hudi-rs
 	$(info --- Develop with Python binding ---)
-	maturin develop --extras=devel,datafusion --features datafusion $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
+	./build-wrapper.sh maturin develop --extras=devel,datafusion --features datafusion $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
 
 .PHONY: format
 format: format-rust format-python ## Format Rust and Python code
@@ -56,7 +56,7 @@ format: format-rust format-python ## Format Rust and Python code
 .PHONY: format-rust
 format-rust: ## Format Rust code
 	$(info --- Format Rust code ---)
-	cargo fmt --all
+	./build-wrapper.sh cargo fmt --all
 
 .PHONY: format-python
 format-python: ## Format Python code
@@ -69,9 +69,9 @@ check: check-rust check-python ## Run check on Rust and Python
 .PHONY: check-rust
 check-rust: ## Run check on Rust
 	$(info --- Check Rust clippy ---)
-	cargo clippy --all-targets --all-features --workspace --no-deps -- -D warnings
+	./build-wrapper.sh cargo clippy --all-targets --all-features --workspace --no-deps -- -D warnings
 	$(info --- Check Rust format ---)
-	cargo fmt --all -- --check
+	./build-wrapper.sh cargo fmt --all -- --check
 
 .PHONY: check-python
 check-python: ## Run check on Python
@@ -88,7 +88,7 @@ test: test-rust test-python ## Run tests on Rust and Python
 .PHONY: test-rust
 test-rust: ## Run tests on Rust
 	$(info --- Run Rust tests ---)
-	cargo test --no-fail-fast --all-targets --all-features --workspace
+	./build-wrapper.sh cargo test --no-fail-fast --all-targets --all-features --workspace
 
 .PHONY: test-python
 test-python: ## Run tests on Python
