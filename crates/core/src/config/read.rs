@@ -37,7 +37,7 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// use hudi_core::table::Table as HudiTable;
 ///
 /// let options = [(InputPartitions, "2")];
-/// HudiTable::new_with_options("/tmp/hudi_data", options)
+/// HudiTable::new_with_options_blocking("/tmp/hudi_data", options);
 /// ```
 ///
 

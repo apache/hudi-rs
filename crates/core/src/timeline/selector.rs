@@ -201,6 +201,11 @@ impl TimelineSelector {
         Self::completed_actions_in_range(&[Action::ReplaceCommit], hudi_configs, start, end)
     }
 
+    /// Whether the selector has any time filter (start or end) applied.
+    pub fn has_time_filter(&self) -> bool {
+        self.start_datetime.is_some() || self.end_datetime.is_some()
+    }
+
     pub fn should_include_action(&self, action: &Action) -> bool {
         self.actions.is_empty() || self.actions.contains(action)
     }
@@ -306,6 +311,11 @@ mod tests {
     use super::*;
     use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
+    use crate::storage::Storage;
+    use crate::timeline::builder::TimelineBuilder;
+    use crate::timeline::instant::{Action, Instant, State};
+    use crate::timeline::Timeline;
+    use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -523,7 +533,25 @@ mod tests {
     }
 
     async fn create_test_timeline() -> Timeline {
-        let instants = vec![
+        let storage = Storage::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath, "file:///tmp/base"),
+                (HudiTableConfig::TableVersion, "6"),
+            ])),
+        )
+        .unwrap();
+        let mut timeline = TimelineBuilder::new(
+            Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath, "file:///tmp/base"),
+                (HudiTableConfig::TableVersion, "6"),
+            ])),
+            storage,
+        )
+        .build()
+        .await
+        .unwrap();
+        timeline.completed_commits = vec![
             Instant::from_str("20240103153000.commit").unwrap(),
             Instant::from_str("20240103153010999.commit").unwrap(),
             Instant::from_str("20240103153020999.commit.requested").unwrap(),
@@ -531,16 +559,7 @@ mod tests {
             Instant::from_str("20240103153020999.commit").unwrap(),
             Instant::from_str("20240103153030999.commit").unwrap(),
         ];
-        Timeline::new_from_completed_commits(
-            Arc::new(HudiConfigs::new([(
-                HudiTableConfig::BasePath,
-                "file:///tmp/base",
-            )])),
-            Arc::new(HashMap::new()),
-            instants,
-        )
-        .await
-        .unwrap()
+        timeline
     }
 
     #[tokio::test]
