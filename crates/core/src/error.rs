@@ -84,6 +84,9 @@ pub enum CoreError {
     #[error("{0}")]
     Unsupported(String),
 
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     #[error(transparent)]
     Utf8Error(#[from] std::str::Utf8Error),
 }
