@@ -52,7 +52,7 @@ parquet = { version = "~54.2.0", features = ["async", "object_store"] }
 
 # avro
 apache-avro = { version = "~0.17.0", features = ["derive"] }
-apache-avro-derive = { version = "~0.17.0" }
+apache-avro-derive = { version = "~0.20.0" }
 
 # datafusion
 datafusion = { version = "~46.0.0" }
