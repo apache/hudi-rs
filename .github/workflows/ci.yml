@@ -60,7 +60,7 @@ jobs:
       image: xd009642/tarpaulin:0.32.7
       options: --security-opt seccomp=unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -99,7 +99,7 @@ jobs:
             python-version: '3.9'
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       
       # Cache Rust dependencies and build artifacts
       - name: Cache Rust dependencies
@@ -162,7 +162,7 @@ jobs:
           app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Pre-pull base images
@@ -199,7 +199,7 @@ jobs:
     needs: [ rust-tests, python-tests ]
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v5
         with:
           pattern: cov-report-*
