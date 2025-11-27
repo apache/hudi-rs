@@ -25,7 +25,21 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 export HOST_UID=$(id -u)
 export HOST_GID=$(id -g)
 
-docker compose up --build -d
+# Check for cached image flag
+USE_CACHED_IMAGE=false
+if [ "$2" = "--use-cached-image" ]; then
+  USE_CACHED_IMAGE=true
+fi
+
+# Start services with or without rebuild
+if [ "$USE_CACHED_IMAGE" = "true" ] && docker images -q hudi-rs-runner:cached 2>/dev/null; then
+  echo "Using pre-built cached runner image"
+  docker tag hudi-rs-runner:cached demo-runner:latest
+  docker compose up -d --no-build
+else
+  echo "Building runner image from scratch"
+  docker compose up --build -d
+fi
 
 max_attempts=30
 attempt=0
@@ -49,26 +63,56 @@ fi
 
 app_path_in_container="/opt/hudi-rs/demo/apps/$app_path"
 if [ "$app_path" = "datafusion" ]; then
-  docker compose exec -T runner /bin/bash -c "
-    source /opt/.venv/bin/activate && \
-    cd /opt/hudi-rs && make setup develop && \
-    cd $app_path_in_container && \
-    cargo run -- --no-build --no-tests
-    "
+  if [ "$USE_CACHED_IMAGE" = "true" ]; then
+    # Bindings already built in cached image
+    docker compose exec -T runner /bin/bash -c "
+      source /opt/.venv/bin/activate && \
+      cd $app_path_in_container && \
+      cargo run -- --no-build --no-tests
+      "
+  else
+    # Build bindings first
+    docker compose exec -T runner /bin/bash -c "
+      source /opt/.venv/bin/activate && \
+      cd /opt/hudi-rs && make setup develop && \
+      cd $app_path_in_container && \
+      cargo run -- --no-build --no-tests
+      "
+  fi
 elif [ "$app_path" = "hudi-table-api/rust" ]; then
-  docker compose exec -T runner /bin/bash -c "
-    source /opt/.venv/bin/activate && \
-    cd /opt/hudi-rs && make setup develop && \
-    cd $app_path_in_container && \
-    cargo run -- --no-build --no-tests
-    "
+  if [ "$USE_CACHED_IMAGE" = "true" ]; then
+    # Bindings already built in cached image
+    docker compose exec -T runner /bin/bash -c "
+      source /opt/.venv/bin/activate && \
+      cd $app_path_in_container && \
+      cargo run -- --no-build --no-tests
+      "
+  else
+    # Build bindings first
+    docker compose exec -T runner /bin/bash -c "
+      source /opt/.venv/bin/activate && \
+      cd /opt/hudi-rs && make setup develop && \
+      cd $app_path_in_container && \
+      cargo run -- --no-build --no-tests
+      "
+  fi
 elif [ "$app_path" = "hudi-table-api/python" ]; then
-  docker compose exec -T runner /bin/bash -c "
-    source /opt/.venv/bin/activate && \
-    cd /opt/hudi-rs && make setup develop && \
-    cd $app_path_in_container && \
-    python -m src.main
-    "
+  if [ "$USE_CACHED_IMAGE" = "true" ]; then
+    # Bindings already built in cached image
+    docker compose exec -T runner /bin/bash -c "
+      source /opt/.venv/bin/activate && \
+      cd $app_path_in_container && \
+      python -m src.main
+      "
+  else
+    # Build bindings first
+    docker compose exec -T runner /bin/bash -c "
+      source /opt/.venv/bin/activate && \
+      cd /opt/hudi-rs && make setup develop && \
+      cd $app_path_in_container && \
+      python -m src.main
+      "
+  fi
 elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "
     cd /opt/hudi-rs/cpp && ../build-wrapper.sh cargo build --release && \

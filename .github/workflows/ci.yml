@@ -79,6 +79,80 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  prepare-integration-build:
+    needs: check-integration-needed
+    if: needs.check-integration-needed.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pre-pull base images
+        run: |
+          docker pull rust:1.87
+          docker pull quay.io/minio/minio:latest
+
+      - name: Prepare cache directories
+        run: |
+          mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
+          sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
+
+      - name: Cache integration dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            .cargo/registry
+            .cargo/git
+            python/target
+            .uv-cache
+          key: integration-prep-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml') }}
+          restore-keys: integration-prep-${{ runner.os }}-
+
+      - name: Build and cache runner image with bindings
+        run: |
+          cd demo
+          export DOCKER_BUILDKIT=1
+          export HOST_UID=$(id -u)
+          export HOST_GID=$(id -g)
+
+          docker compose build runner
+          docker compose up -d runner
+
+          # Wait for container ready
+          max_attempts=30
+          attempt=0
+          until [ "$(docker inspect -f '{{.State.Status}}' runner)" = "running" ] || [ $attempt -eq $max_attempts ]; do
+            attempt=$(( $attempt + 1 ))
+            echo "Waiting for container... (attempt $attempt of $max_attempts)"
+            sleep 1
+          done
+
+          # Pre-compile bindings once
+          docker compose exec -T runner /bin/bash -c "
+            source /opt/.venv/bin/activate && \
+            cd /opt/hudi-rs && \
+            make setup develop
+          "
+
+          # Save built image as artifact
+          docker commit runner hudi-rs-runner:cached
+          docker save hudi-rs-runner:cached | gzip > /tmp/runner-image.tar.gz
+          docker compose down -v
+
+      - name: Upload built runner image
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-image
+          path: /tmp/runner-image.tar.gz
+          retention-days: 1
+
+      - name: Fix cache ownership
+        if: always()
+        run: sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache || true
+
   rust-tests:
     strategy:
       fail-fast: false
@@ -186,7 +260,7 @@ jobs:
           if-no-files-found: 'error'
 
   integration-tests:
-    needs: check-integration-needed
+    needs: [check-integration-needed, prepare-integration-build]
     if: needs.check-integration-needed.outputs.should_run == 'true'
     strategy:
         fail-fast: false
@@ -195,16 +269,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Download built runner image
+        uses: actions/download-artifact@v5
+        with:
+          name: runner-image
+          path: /tmp
+
+      - name: Load runner image
+        run: docker load -i /tmp/runner-image.tar.gz
+
       - name: Pre-pull base images
-        run: |
-          docker pull quay.io/minio/minio:latest
-      - name: Prepare cache directories with correct permissions
+        run: docker pull quay.io/minio/minio:latest
+
+      - name: Prepare cache directories
         run: |
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
           sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
-      - name: Cache integration build artifacts (cargo/target/uv)
+
+      - name: Cache integration build artifacts
         uses: actions/cache@v4
         with:
           path: |
@@ -213,17 +299,17 @@ jobs:
             .cargo/git
             python/target
             .uv-cache
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
-          restore-keys: |
-            integration-${{ runner.os }}-
+          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml') }}
+          restore-keys: integration-${{ runner.os }}-
+
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
-          ./ci_run.sh ${{ matrix.app-path }}
-      - name: Fix cache ownership before save
+          ./ci_run.sh ${{ matrix.app-path }} --use-cached-image
+
+      - name: Fix cache ownership
         if: always()
-        run: |
-          sudo chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/.cargo $GITHUB_WORKSPACE/target $GITHUB_WORKSPACE/python/target $GITHUB_WORKSPACE/.uv-cache || true
+        run: sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache || true
 
   publish-coverage:
     name: Publish coverage reports to codecov.io
