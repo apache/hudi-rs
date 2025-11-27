@@ -49,6 +49,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-integration-needed:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.filter.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check if integration tests needed
+        id: filter
+        run: |
+          # Always run on main branch or non-PR events
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Get PR labels
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name' || echo "")
+
+          # Skip only if ONLY documentation or chore labels (no code labels)
+          if echo "$LABELS" | grep -qE "^(documentation|chore)$" && \
+             ! echo "$LABELS" | grep -qE "^(rust|python|demo|ci)$"; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "Skipping integration tests - only docs/chore changes"
+          else
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   rust-tests:
     strategy:
       fail-fast: false
@@ -156,6 +186,8 @@ jobs:
           if-no-files-found: 'error'
 
   integration-tests:
+    needs: check-integration-needed
+    if: needs.check-integration-needed.outputs.should_run == 'true'
     strategy:
         fail-fast: false
         matrix:
