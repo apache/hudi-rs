@@ -89,6 +89,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-integration-${{ runner.os }}-${{ hashFiles('demo/infra/runner/Dockerfile') }}
+          restore-keys: buildx-integration-${{ runner.os }}-
+
       - name: Pre-pull base images
         run: |
           docker pull rust:1.87
@@ -118,7 +125,19 @@ jobs:
           export HOST_UID=$(id -u)
           export HOST_GID=$(id -g)
 
-          docker compose build runner
+          # Build with Docker Buildx layer caching
+          docker buildx build \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            -t demo-runner:latest \
+            --load \
+            ./infra/runner
+
+          # Rotate cache to avoid size growth
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+          # Start the runner container
           docker compose up -d runner
 
           # Wait for container ready
