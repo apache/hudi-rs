@@ -64,17 +64,18 @@ jobs:
             exit 0
           fi
 
-          # Get PR labels
+          # Get PR labels using jq for robust processing
           PR_NUMBER=${{ github.event.pull_request.number }}
-          LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name' || echo "")
+          DOCS_CHORE_LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name | select(. == "documentation" or . == "chore")' | wc -l)
+          CODE_LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name | select(. == "rust" or . == "python" or . == "demo" or . == "ci")' | wc -l)
 
           # Skip only if ONLY documentation or chore labels (no code labels)
-          if echo "$LABELS" | grep -qE "^(documentation|chore)$" && \
-             ! echo "$LABELS" | grep -qE "^(rust|python|demo|ci)$"; then
+          if [ "$DOCS_CHORE_LABELS" -gt 0 ] && [ "$CODE_LABELS" -eq 0 ]; then
             echo "should_run=false" >> $GITHUB_OUTPUT
             echo "Skipping integration tests - only docs/chore changes"
           else
             echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "Running integration tests - code changes detected"
           fi
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,7 +94,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
-          key: buildx-integration-${{ runner.os }}-${{ hashFiles('demo/infra/runner/Dockerfile') }}
+          key: buildx-integration-${{ runner.os }}-${{ hashFiles('demo/infra/runner/Dockerfile', 'rust-toolchain.toml') }}
           restore-keys: buildx-integration-${{ runner.os }}-
 
       - name: Pre-pull base images
@@ -133,8 +134,9 @@ jobs:
             --load \
             ./infra/runner
 
-          # Rotate cache to avoid size growth
-          rm -rf /tmp/.buildx-cache
+          # Rotate cache to avoid size growth (atomic rename to prevent data loss)
+          rm -rf /tmp/.buildx-cache-old || true
+          mv /tmp/.buildx-cache /tmp/.buildx-cache-old || true
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
           # Start the runner container
@@ -149,12 +151,22 @@ jobs:
             sleep 1
           done
 
+          if [ $attempt -eq $max_attempts ]; then
+            echo "Container failed to start in time"
+            docker compose down -v
+            exit 1
+          fi
+
           # Pre-compile bindings once
-          docker compose exec -T runner /bin/bash -c "
+          if ! docker compose exec -T runner /bin/bash -c "
             source /opt/.venv/bin/activate && \
             cd /opt/hudi-rs && \
             make setup develop
-          "
+          "; then
+            echo "Failed to build bindings, not creating cached image"
+            docker compose down -v
+            exit 1
+          fi
 
           # Save built image as artifact
           docker commit runner hudi-rs-runner:cached
@@ -302,6 +314,8 @@ jobs:
         run: docker load -i /tmp/runner-image.tar.gz
 
       - name: Pre-pull base images
+        # Pre-pull minio even though it was pulled in prepare job
+        # This ensures the image is available in case cache misses occur
         run: docker pull quay.io/minio/minio:latest
 
       - name: Prepare cache directories

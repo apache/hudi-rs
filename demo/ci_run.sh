@@ -32,10 +32,16 @@ if [ "$2" = "--use-cached-image" ]; then
 fi
 
 # Start services with or without rebuild
-if [ "$USE_CACHED_IMAGE" = "true" ] && docker images -q hudi-rs-runner:cached 2>/dev/null; then
-  echo "Using pre-built cached runner image"
-  docker tag hudi-rs-runner:cached demo-runner:latest
-  docker compose up -d --no-build
+if [ "$USE_CACHED_IMAGE" = "true" ]; then
+  if docker images -q hudi-rs-runner:cached 2>/dev/null | grep -q .; then
+    echo "Using pre-built cached runner image"
+    docker tag hudi-rs-runner:cached demo-runner:latest
+    docker compose up -d --no-build
+  else
+    echo "WARNING: --use-cached-image specified but hudi-rs-runner:cached not found"
+    echo "Falling back to building runner image from scratch"
+    docker compose up --build -d
+  fi
 else
   echo "Building runner image from scratch"
   docker compose up --build -d
@@ -53,6 +59,18 @@ done
 if [ $attempt -eq $max_attempts ]; then
   echo "Container failed to become ready in time"
   exit 1
+fi
+
+# Validate cached image has bindings if using cached image
+if [ "$USE_CACHED_IMAGE" = "true" ]; then
+  echo "Validating cached image has Python bindings..."
+  if ! docker compose exec -T runner /bin/bash -c "source /opt/.venv/bin/activate && python -c 'import hudi' 2>/dev/null"; then
+    echo "ERROR: Cached image is missing Python bindings"
+    echo "The cached image may be corrupted. Please rebuild without --use-cached-image flag"
+    docker compose down -v
+    exit 1
+  fi
+  echo "Cached image validation successful"
 fi
 
 app_path=$1
