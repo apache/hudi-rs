@@ -15,35 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: PR
+name: PR Labeler
 
 on:
-  pull_request:
-    types: [ opened, edited, reopened, synchronize ]
-    branches:
-      - main
+  pull_request_target:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  check-pr:
+  label:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          ref: ${{ github.event.pull_request.base.ref }}  # Security: checkout main, not PR code
 
-      - name: Linting commit
-        run: |
-          npm i -g conventional-changelog-conventionalcommits
-          npm i -g commitlint@latest
-          echo "${{ github.event.pull_request.title }}" | npx commitlint
-
-      - name: Labeling
-        uses: actions/labeler@v6
-        if: false  # Temporarily disabled - permissions issue
+      - uses: actions/labeler@v6

@@ -135,8 +135,10 @@ jobs:
             ./infra/runner
 
           # Rotate cache to avoid size growth (atomic rename to prevent data loss)
-          rm -rf /tmp/.buildx-cache-old || true
-          mv /tmp/.buildx-cache /tmp/.buildx-cache-old || true
+          if [ -d /tmp/.buildx-cache ]; then
+            rm -rf /tmp/.buildx-cache-old || true
+            mv /tmp/.buildx-cache /tmp/.buildx-cache-old || true
+          fi
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
           # Start the runner container
@@ -159,6 +161,7 @@ jobs:
 
           # Pre-compile bindings once
           if ! docker compose exec -T runner /bin/bash -c "
+            export PATH=/root/.local/bin:\$PATH && \
             source /opt/.venv/bin/activate && \
             cd /opt/hudi-rs && \
             make setup develop
