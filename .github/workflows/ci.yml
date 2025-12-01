@@ -63,6 +63,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # Only cache cargo registry and git, not target directory
+          # Tarpaulin needs clean builds for accurate coverage
+          cache-targets: false
+          # Reduce cache size by cleaning old artifacts
+          cache-all-crates: false
       - name: Rust unit tests with coverage report
         run: |
           cargo tarpaulin \
@@ -94,6 +100,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      
+      # Cache Rust dependencies and build artifacts
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache based on Python version and OS for better hit rate
+          shared-key: "python-binding-${{ matrix.os }}-py${{ matrix.python-version }}"
+          # Save cache even on failure to speed up retries
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
         
       - name: install uv and set the python version
         uses: astral-sh/setup-uv@v7
@@ -101,17 +116,30 @@ jobs:
           version: "0.7.19"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - name: Setup Python venv
+          cache-dependency-glob: "python/pyproject.toml"
+          
+      - name: Setup Python venv and build
         run: |
           make setup-venv
           source .venv/bin/activate
           make build
           make develop
+          
+      - name: Python unit tests
+        # Only compute coverage for one matrix combination to save time
+        if: ${{ !((matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13')) }}
+        run: |
+          source .venv/bin/activate
+          pytest -v
+          
       - name: Python unit tests with coverage report
+        # Only compute coverage for ubuntu-24.04 with Python 3.13
+        if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
         run: |
           source .venv/bin/activate
           coverage run --include 'python/hudi/*' -m pytest -v
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
+          
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
@@ -119,6 +147,7 @@ jobs:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
           if-no-files-found: 'error'
+          
       - name: Upload wheel files
         uses: actions/upload-artifact@v4
         with:
@@ -134,10 +163,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Pre-pull base images
+        run: |
+          docker pull quay.io/minio/minio:latest
+      - name: Prepare cache directories with correct permissions
+        run: |
+          mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
+          sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
+      - name: Cache integration build artifacts (cargo/target/uv)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            .cargo/registry
+            .cargo/git
+            python/target
+            .uv-cache
+          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
+          restore-keys: |
+            integration-${{ runner.os }}-
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
           ./ci_run.sh ${{ matrix.app-path }}
+      - name: Fix cache ownership before save
+        if: always()
+        run: |
+          sudo chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/.cargo $GITHUB_WORKSPACE/target $GITHUB_WORKSPACE/python/target $GITHUB_WORKSPACE/.uv-cache || true
 
   publish-coverage:
     name: Publish coverage reports to codecov.io

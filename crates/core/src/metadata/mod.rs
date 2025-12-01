@@ -16,7 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod commit;
 pub mod meta_field;
+pub mod replace_commit;
 
 pub const HUDI_METADATA_DIR: &str = ".hoodie";
 pub const DELTALAKE_METADATA_DIR: &str = "_delta_log";

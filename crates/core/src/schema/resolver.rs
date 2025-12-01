@@ -19,6 +19,7 @@
 use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::table::HudiTableConfig;
 use crate::error::{CoreError, Result};
+use crate::metadata::commit::HoodieCommitMetadata;
 use crate::schema::prepend_meta_fields;
 use crate::storage::Storage;
 use crate::table::Table;
@@ -121,55 +122,40 @@ async fn resolve_schema_from_base_file(
     commit_metadata: &Map<String, Value>,
     storage: Arc<Storage>,
 ) -> Result<Schema> {
-    let first_partition = commit_metadata
-        .get("partitionToWriteStats")
-        .and_then(|v| v.as_object());
+    let metadata = HoodieCommitMetadata::from_json_map(commit_metadata)?;
 
-    let partition_path = first_partition
-        .and_then(|obj| obj.keys().next())
-        .ok_or_else(|| {
+    // Get the first write stat from any partition
+    let (partition, first_stat) = metadata.iter_write_stats().next().ok_or_else(|| {
+        CoreError::CommitMetadata(
+            "Failed to resolve the latest schema: no write status in commit metadata".to_string(),
+        )
+    })?;
+
+    // Try to get the base file path from either 'path' or 'baseFile' field
+    if let Some(path) = &first_stat.path {
+        if path.ends_with(".parquet") {
+            return Ok(storage.get_parquet_file_schema(path).await?);
+        }
+    }
+
+    // Handle deltacommit case with baseFile
+    if let Some(base_file) = &first_stat.base_file {
+        let parquet_file_path_buf = PathBuf::from_str(partition)
+            .map_err(|e| {
+                CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {}", e))
+            })?
+            .join(base_file);
+        let path = parquet_file_path_buf.to_str().ok_or_else(|| {
             CoreError::CommitMetadata(
-                "Failed to resolve the latest schema: no write status in commit metadata"
-                    .to_string(),
+                "Failed to resolve the latest schema: invalid file path".to_string(),
             )
         })?;
-
-    let first_value = first_partition
-        .and_then(|obj| obj.values().next())
-        .and_then(|value| value.as_array())
-        .and_then(|arr| arr.first());
-
-    let base_file_path = first_value.and_then(|v| v["path"].as_str());
-    match base_file_path {
-        Some(path) if path.ends_with(".parquet") => {
-            Ok(storage.get_parquet_file_schema(path).await?)
-        }
-        Some(_) => {
-            // deltacommit case
-            // TODO: properly parse deltacommit structure
-            let base_file = first_value
-                .and_then(|v| v["baseFile"].as_str())
-                .ok_or_else(|| {
-                    CoreError::CommitMetadata(
-                        "Failed to resolve the latest schema: no file path found".to_string(),
-                    )
-                })?;
-            let parquet_file_path_buf = PathBuf::from_str(partition_path)
-                .map_err(|e| {
-                    CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {}", e))
-                })?
-                .join(base_file);
-            let path = parquet_file_path_buf.to_str().ok_or_else(|| {
-                CoreError::CommitMetadata(
-                    "Failed to resolve the latest schema: invalid file path".to_string(),
-                )
-            })?;
-            Ok(storage.get_parquet_file_schema(path).await?)
-        }
-        None => Err(CoreError::CommitMetadata(
-            "Failed to resolve the latest schema: no file path found".to_string(),
-        )),
+        return Ok(storage.get_parquet_file_schema(path).await?);
     }
+
+    Err(CoreError::CommitMetadata(
+        "Failed to resolve the latest schema: no file path found".to_string(),
+    ))
 }
 
 fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
@@ -195,4 +181,90 @@ fn extract_avro_schema_from_commit_metadata(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_resolve_avro_schema_from_commit_metadata_with_schema() {
+        let metadata = json!({
+            "extraMetadata": {
+                "schema": r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let result = resolve_avro_schema_from_commit_metadata(&metadata);
+        assert!(result.is_ok());
+        let schema = result.unwrap();
+        assert!(schema.contains("TestRecord"));
+    }
+
+    #[test]
+    fn test_resolve_avro_schema_from_commit_metadata_empty() {
+        let metadata = Map::new();
+        let result = resolve_avro_schema_from_commit_metadata(&metadata);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::CommitMetadata(_))));
+    }
+
+    #[test]
+    fn test_resolve_avro_schema_from_commit_metadata_no_schema() {
+        let metadata = json!({
+            "extraMetadata": {
+                "other": "value"
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let result = resolve_avro_schema_from_commit_metadata(&metadata);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::SchemaNotFound(_))));
+    }
+
+    #[test]
+    fn test_sanitize_avro_schema_str() {
+        let schema_with_escape = r#"test\:schema"#;
+        let sanitized = sanitize_avro_schema_str(schema_with_escape);
+        assert_eq!(sanitized, "test:schema");
+
+        let schema_with_whitespace = "  test schema  ";
+        let sanitized = sanitize_avro_schema_str(schema_with_whitespace);
+        assert_eq!(sanitized, "test schema");
+    }
+
+    #[test]
+    fn test_extract_avro_schema_from_commit_metadata() {
+        let metadata = json!({
+            "extraMetadata": {
+                "schema": "test_schema"
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let schema = extract_avro_schema_from_commit_metadata(&metadata);
+        assert_eq!(schema, Some("test_schema".to_string()));
+    }
+
+    #[test]
+    fn test_extract_avro_schema_from_commit_metadata_none() {
+        let metadata = json!({
+            "other": "value"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let schema = extract_avro_schema_from_commit_metadata(&metadata);
+        assert_eq!(schema, None);
+    }
 }
