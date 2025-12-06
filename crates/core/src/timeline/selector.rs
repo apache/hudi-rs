@@ -142,6 +142,10 @@ pub struct TimelineSelector {
     states: Vec<State>,
     actions: Vec<Action>,
     include_archived: bool,
+    /// Timeline layout version determines instant format validation:
+    /// - Layout 1 (pre-v8): expects `{timestamp}.{action}` for completed instants
+    /// - Layout 2 (v8+): expects `{requestedTimestamp}_{completedTimestamp}.{action}` for completed instants
+    timeline_layout_version: isize,
 }
 
 #[allow(dead_code)]
@@ -150,6 +154,25 @@ impl TimelineSelector {
         hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into()
+    }
+
+    fn get_timeline_layout_version_from_configs(hudi_configs: &HudiConfigs) -> isize {
+        // Try to get layout version from config, otherwise infer from table version
+        if let Some(layout_version) = hudi_configs.try_get(HudiTableConfig::TimelineLayoutVersion) {
+            layout_version.into()
+        } else {
+            // Apply same default logic as TimelineBuilder:
+            // v8+ tables default to layout 2, earlier versions default to layout 1
+            let table_version: isize = hudi_configs
+                .try_get(HudiTableConfig::TableVersion)
+                .map(|v| v.into())
+                .unwrap_or(6); // Conservative default if table version is somehow missing
+            if table_version >= 8 {
+                2
+            } else {
+                1
+            }
+        }
     }
 
     fn parse_datetime(timezone: &str, timestamp: Option<&str>) -> Result<Option<DateTime<Utc>>> {
@@ -165,6 +188,7 @@ impl TimelineSelector {
         end: Option<&str>,
     ) -> Result<Self> {
         let timezone = Self::get_timezone_from_configs(&hudi_configs);
+        let timeline_layout_version = Self::get_timeline_layout_version_from_configs(&hudi_configs);
         let start_datetime = Self::parse_datetime(&timezone, start)?;
         let end_datetime = Self::parse_datetime(&timezone, end)?;
         Ok(Self {
@@ -174,6 +198,7 @@ impl TimelineSelector {
             states: vec![State::Completed],
             actions: actions.to_vec(),
             include_archived: false,
+            timeline_layout_version,
         })
     }
 
@@ -215,7 +240,7 @@ impl TimelineSelector {
     }
 
     pub fn try_create_instant(&self, file_name: &str) -> Result<Instant> {
-        let (timestamp, action_suffix) = file_name.split_once('.').ok_or_else(|| {
+        let (timestamp_part, action_suffix) = file_name.split_once('.').ok_or_else(|| {
             CoreError::Timeline(format!(
                 "Instant not created due to invalid file name: {file_name}"
             ))
@@ -234,6 +259,40 @@ impl TimelineSelector {
                 "Instant not created for due to unmatched state: {file_name}"
             )));
         }
+
+        // Handle v8+ completed instant format: {requestedTimestamp}_{completedTimestamp}.{action}
+        // Validate format based on timeline layout version and instant state
+        let (timestamp, completed_timestamp) = if let Some((requested_ts, completed_ts)) =
+            timestamp_part.split_once('_')
+        {
+            // Found underscore format - this should be a v8+ (layout 2) completed instant
+            if self.timeline_layout_version == 1 && state == State::Completed {
+                return Err(CoreError::Timeline(format!(
+                    "Unexpected v8+ instant format in timeline layout v1: {file_name}"
+                )));
+            }
+
+            // Validate both timestamps
+            if requested_ts.len() != 17 && requested_ts.len() != 14 {
+                return Err(CoreError::Timeline(format!(
+                    "Invalid requested timestamp in v8+ format: {file_name}"
+                )));
+            }
+            if completed_ts.len() != 17 && completed_ts.len() != 14 {
+                return Err(CoreError::Timeline(format!(
+                    "Invalid completed timestamp in v8+ format: {file_name}"
+                )));
+            }
+            (requested_ts, Some(completed_ts.to_string()))
+        } else {
+            // No underscore format - this should be a pre-v8 instant OR a non-completed v8+ instant
+            if self.timeline_layout_version == 2 && state == State::Completed {
+                return Err(CoreError::Timeline(format!(
+                    "Expected v8+ instant format (with completed timestamp) in timeline layout v2 for completed instant: {file_name}"
+                )));
+            }
+            (timestamp_part, None)
+        };
 
         let dt = Instant::parse_datetime(timestamp, &self.timezone)?;
         if let Some(start) = self.start_datetime {
@@ -256,6 +315,7 @@ impl TimelineSelector {
 
         Ok(Instant {
             timestamp: timestamp.to_string(),
+            completed_timestamp,
             epoch_millis: dt.timestamp_millis(),
             action,
             state,
@@ -480,6 +540,7 @@ mod tests {
             states: states.to_vec(),
             actions: actions.to_vec(),
             include_archived: false,
+            timeline_layout_version: 1, // Default to layout v1 for tests
         }
     }
 
@@ -574,6 +635,7 @@ mod tests {
             end_datetime: None,
             timezone: "UTC".to_string(),
             include_archived: false,
+            timeline_layout_version: 1,
         };
         assert!(selector.select(&timeline).unwrap().is_empty());
     }
@@ -589,7 +651,74 @@ mod tests {
             end_datetime: end.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             timezone: "UTC".to_string(),
             include_archived: false,
+            timeline_layout_version: 1,
         }
+    }
+
+    #[test]
+    fn test_layout_version_validation() {
+        // Test layout v1 - should reject v8+ format for completed instants
+        let selector_v1 = TimelineSelector {
+            timezone: "UTC".to_string(),
+            start_datetime: None,
+            end_datetime: None,
+            states: vec![State::Completed],
+            actions: vec![Action::DeltaCommit],
+            include_archived: false,
+            timeline_layout_version: 1,
+        };
+
+        // v8+ format should be rejected for layout v1
+        let result = selector_v1.try_create_instant("20240103153000_20240103153001.deltacommit");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unexpected v8+ instant format in timeline layout v1"));
+
+        // pre-v8 format should work for layout v1
+        assert!(selector_v1
+            .try_create_instant("20240103153000.deltacommit")
+            .is_ok());
+
+        // Test layout v2 - should reject pre-v8 format for completed instants
+        let selector_v2 = TimelineSelector {
+            timezone: "UTC".to_string(),
+            start_datetime: None,
+            end_datetime: None,
+            states: vec![State::Completed],
+            actions: vec![Action::DeltaCommit],
+            include_archived: false,
+            timeline_layout_version: 2,
+        };
+
+        // pre-v8 format should be rejected for layout v2 completed instants
+        let result = selector_v2.try_create_instant("20240103153000.deltacommit");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Expected v8+ instant format"));
+
+        // v8+ format should work for layout v2
+        assert!(selector_v2
+            .try_create_instant("20240103153000_20240103153001.deltacommit")
+            .is_ok());
+
+        // Non-completed instants (inflight, requested) should work with standard format in both layouts
+        let selector_v2_inflight = TimelineSelector {
+            timezone: "UTC".to_string(),
+            start_datetime: None,
+            end_datetime: None,
+            states: vec![State::Inflight],
+            actions: vec![Action::DeltaCommit],
+            include_archived: false,
+            timeline_layout_version: 2,
+        };
+
+        assert!(selector_v2_inflight
+            .try_create_instant("20240103153000.deltacommit.inflight")
+            .is_ok());
     }
 
     #[tokio::test]

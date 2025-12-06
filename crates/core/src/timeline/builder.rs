@@ -81,7 +81,7 @@ impl TimelineBuilder {
                 ))
             }
             2 => {
-                if table_version != 8 {
+                if table_version < 8 {
                     return Err(CoreError::Unsupported(format!(
                         "Unsupported table version {} with timeline layout version {}",
                         table_version, layout_version

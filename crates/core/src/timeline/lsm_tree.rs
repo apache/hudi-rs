@@ -17,13 +17,13 @@
  * under the License.
  */
 
+use crate::config::table::HudiTableConfig::{TimelineHistoryPath, TimelinePath};
 use crate::error::CoreError;
+use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-pub const LSM_TIMELINE_DIR: &str = ".hoodie/timeline";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineManifest {
@@ -47,6 +47,8 @@ pub struct ManifestEntry {
     pub file_size: i64,
 }
 
+/// LSM tree for v8+ timeline history management.
+/// The paths are resolved from configs on-the-fly via `hoodie.timeline.path` and `hoodie.timeline.history.path`.
 pub struct LSMTree {
     storage: Arc<Storage>,
 }
@@ -56,8 +58,26 @@ impl LSMTree {
         Self { storage }
     }
 
+    /// Returns the timeline directory path, resolved from configs.
+    pub fn timeline_dir(&self) -> String {
+        let timeline_path: String = self.storage.hudi_configs.get_or_default(TimelinePath).into();
+        format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
+    }
+
+    /// Returns the history directory path, resolved from configs.
+    pub fn history_dir(&self) -> String {
+        let timeline_path: String = self.storage.hudi_configs.get_or_default(TimelinePath).into();
+        let history_path: String = self
+            .storage
+            .hudi_configs
+            .get_or_default(TimelineHistoryPath)
+            .into();
+        format!("{}/{}/{}", HUDI_METADATA_DIR, timeline_path, history_path)
+    }
+
     pub async fn read_manifest(&self) -> Result<Option<TimelineManifest>> {
-        let version_path = format!("{}/history/_version_", LSM_TIMELINE_DIR);
+        let history_dir = self.history_dir();
+        let version_path = format!("{}/_version_", history_dir);
         if let Ok(data) = self.storage.get_file_data(&version_path).await {
             let version_str =
                 String::from_utf8(data.to_vec()).map_err(|e| CoreError::Timeline(e.to_string()))?;
@@ -65,7 +85,7 @@ impl LSMTree {
                 .trim()
                 .parse::<i64>()
                 .map_err(|e| CoreError::Timeline(e.to_string()))?;
-            let manifest_path = format!("{}/history/manifest_{}", LSM_TIMELINE_DIR, version);
+            let manifest_path = format!("{}/manifest_{}", history_dir, version);
             let data = self.storage.get_file_data(&manifest_path).await?;
             let manifest: TimelineManifest =
                 serde_json::from_slice(&data).map_err(|e| CoreError::Timeline(e.to_string()))?;

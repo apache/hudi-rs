@@ -27,7 +27,7 @@ use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
-
+use crate::metadata::commit::HoodieCommitMetadata;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
@@ -198,20 +198,52 @@ impl Timeline {
         Ok(clustering_instants)
     }
 
+    /// Returns true if the timeline uses v8+ Avro format for instant metadata.
+    fn uses_avro_format(&self) -> bool {
+        matches!(
+            self.active_loader,
+            TimelineLoader::LayoutTwoActive(_) | TimelineLoader::LayoutTwoArchived(_)
+        )
+    }
+
+    /// Returns the base directory for timeline instants based on the active loader configuration.
+    fn get_timeline_base_dir(&self) -> String {
+        self.active_loader.get_timeline_dir()
+    }
+
     async fn get_instant_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
-        let path = instant.relative_path()?;
+        let base_dir = self.get_timeline_base_dir();
+        let path = instant.relative_path_with_base(&base_dir)?;
         let bytes = self.storage.get_file_data(path.as_str()).await?;
 
-        serde_json::from_slice(&bytes)
-            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+        if self.uses_avro_format() {
+            // v8+ tables use Avro format for instant metadata
+            let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
+            metadata.to_json_map()
+        } else {
+            // pre-v8 tables use JSON format
+            serde_json::from_slice(&bytes)
+                .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+        }
     }
 
     /// Get the instant metadata in JSON format.
     pub async fn get_instant_metadata_in_json(&self, instant: &Instant) -> Result<String> {
-        let path = instant.relative_path()?;
+        let base_dir = self.get_timeline_base_dir();
+        let path = instant.relative_path_with_base(&base_dir)?;
         let bytes = self.storage.get_file_data(path.as_str()).await?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+
+        if self.uses_avro_format() {
+            // v8+ tables: deserialize Avro, then serialize to JSON
+            let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
+            serde_json::to_string(&metadata).map_err(|e| {
+                CoreError::Timeline(format!("Failed to serialize commit metadata to JSON: {}", e))
+            })
+        } else {
+            // pre-v8 tables: return raw JSON bytes as string
+            String::from_utf8(bytes.to_vec())
+                .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
+        }
     }
 
     pub(crate) async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
@@ -330,11 +362,11 @@ mod tests {
         assert_eq!(timeline.completed_commits.len(), 2);
         assert!(matches!(
             timeline.active_loader,
-            TimelineLoader::LayoutTwoActive(_)
+            TimelineLoader::LayoutTwoActive(..)
         ));
         assert!(matches!(
             timeline.archived_loader,
-            Some(TimelineLoader::LayoutTwoArchived(_))
+            Some(TimelineLoader::LayoutTwoArchived(..))
         ));
     }
 

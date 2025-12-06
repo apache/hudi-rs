@@ -19,17 +19,23 @@
 
 use crate::error::CoreError;
 use crate::Result;
+use apache_avro::from_value;
+use apache_avro::Reader as AvroReader;
 use apache_avro_derive::AvroSchema as DeriveAvroSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::io::Cursor;
 
 /// Represents statistics for a single file write operation in a commit
 ///
 /// This struct is automatically derived to/from Avro schema using apache-avro-derive.
 /// The Avro schema can be accessed via `HoodieWriteStat::get_schema()`.
-#[derive(Debug, Clone, Serialize, Deserialize, DeriveAvroSchema)]
-#[serde(rename_all = "camelCase")]
+///
+/// Note: For v8+ tables with Avro format, additional fields may be present in the data
+/// that are not captured here. Use `#[serde(default)]` to handle missing fields gracefully.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeriveAvroSchema)]
+#[serde(rename_all = "camelCase", default)]
 #[avro(namespace = "org.apache.hudi.avro.model")]
 pub struct HoodieWriteStat {
     #[avro(rename = "fileId")]
@@ -53,6 +59,43 @@ pub struct HoodieWriteStat {
     pub total_write_bytes: Option<i64>,
     #[avro(rename = "totalWriteErrors")]
     pub total_write_errors: Option<i64>,
+    // Additional fields from v8+ Avro schema
+    #[avro(rename = "partitionPath")]
+    pub partition_path: Option<String>,
+    #[avro(rename = "totalLogRecords")]
+    pub total_log_records: Option<i64>,
+    #[avro(rename = "totalLogFiles")]
+    pub total_log_files: Option<i64>,
+    #[avro(rename = "totalUpdatedRecordsCompacted")]
+    pub total_updated_records_compacted: Option<i64>,
+    #[avro(rename = "totalLogBlocks")]
+    pub total_log_blocks: Option<i64>,
+    #[avro(rename = "totalCorruptLogBlock")]
+    pub total_corrupt_log_block: Option<i64>,
+    #[avro(rename = "totalRollbackBlocks")]
+    pub total_rollback_blocks: Option<i64>,
+    #[avro(rename = "fileSizeInBytes")]
+    pub file_size_in_bytes: Option<i64>,
+    #[avro(rename = "logVersion")]
+    pub log_version: Option<i32>,
+    #[avro(rename = "logOffset")]
+    pub log_offset: Option<i64>,
+    #[avro(rename = "prevBaseFile")]
+    pub prev_base_file: Option<String>,
+    #[avro(rename = "minEventTime")]
+    pub min_event_time: Option<i64>,
+    #[avro(rename = "maxEventTime")]
+    pub max_event_time: Option<i64>,
+    #[avro(rename = "totalLogFilesCompacted")]
+    pub total_log_files_compacted: Option<i64>,
+    #[avro(rename = "totalLogReadTimeMs")]
+    pub total_log_read_time_ms: Option<i64>,
+    #[avro(rename = "totalLogSizeCompacted")]
+    pub total_log_size_compacted: Option<i64>,
+    #[avro(rename = "tempPath")]
+    pub temp_path: Option<String>,
+    #[avro(rename = "numUpdates")]
+    pub num_updates: Option<i64>,
 }
 
 /// Represents the metadata for a Hudi commit
@@ -68,8 +111,8 @@ pub struct HoodieWriteStat {
 /// let schema = HoodieCommitMetadata::get_schema();
 /// println!("Schema: {}", schema.canonical_form());
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, DeriveAvroSchema)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeriveAvroSchema)]
+#[serde(rename_all = "camelCase", default)]
 #[avro(namespace = "org.apache.hudi.avro.model")]
 pub struct HoodieCommitMetadata {
     pub version: Option<i32>,
@@ -97,6 +140,47 @@ impl HoodieCommitMetadata {
         serde_json::from_slice(bytes).map_err(|e| {
             CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e))
         })
+    }
+
+    /// Parse commit metadata from Avro bytes (v8+ format)
+    ///
+    /// The Avro data should be in Avro Object Container format with an embedded schema.
+    /// This format is used by table version 8 and later for commit/deltacommit instants.
+    pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
+        let cursor = Cursor::new(bytes);
+        let reader = AvroReader::new(cursor).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to create Avro reader: {}", e))
+        })?;
+
+        // The commit metadata file should contain exactly one record
+        for value_result in reader {
+            let value = value_result.map_err(|e| {
+                CoreError::CommitMetadata(format!("Failed to read Avro record: {}", e))
+            })?;
+            return from_value::<Self>(&value).map_err(|e| {
+                CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {}", e))
+            });
+        }
+
+        Err(CoreError::CommitMetadata(
+            "Avro file contains no records".to_string(),
+        ))
+    }
+
+    /// Convert commit metadata to a JSON Map for compatibility with existing code
+    ///
+    /// This is useful when the metadata is read from Avro format but needs to be
+    /// processed by code that expects a serde_json Map.
+    pub fn to_json_map(&self) -> Result<Map<String, Value>> {
+        let value = serde_json::to_value(self).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to convert to JSON value: {}", e))
+        })?;
+        match value {
+            Value::Object(map) => Ok(map),
+            _ => Err(CoreError::CommitMetadata(
+                "Expected JSON object".to_string(),
+            )),
+        }
     }
 
     /// Get the write stats for a specific partition

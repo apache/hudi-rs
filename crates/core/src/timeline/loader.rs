@@ -20,13 +20,12 @@
 use crate::config::internal::HudiInternalConfig::{
     TimelineArchivedReadEnabled, TimelineArchivedUnavailableBehavior,
 };
-use crate::config::table::HudiTableConfig::ArchiveLogFolder;
+use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPath, TimelinePath};
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::timeline::instant::Instant;
-use crate::timeline::lsm_tree::LSM_TIMELINE_DIR;
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
 use log::debug;
@@ -41,6 +40,47 @@ pub enum TimelineLoader {
 }
 
 impl TimelineLoader {
+    /// Returns the storage for this loader.
+    fn storage(&self) -> &Arc<Storage> {
+        match self {
+            TimelineLoader::LayoutOneActive(s)
+            | TimelineLoader::LayoutOneArchived(s)
+            | TimelineLoader::LayoutTwoActive(s)
+            | TimelineLoader::LayoutTwoArchived(s) => s,
+        }
+    }
+
+    /// Returns the base directory for timeline instants based on the loader type.
+    /// - Layout One (pre-v8): `.hoodie/`
+    /// - Layout Two (v8+): configurable via `hoodie.timeline.path` (default: `.hoodie/timeline/`)
+    pub fn get_timeline_dir(&self) -> String {
+        match self {
+            TimelineLoader::LayoutOneActive(_) | TimelineLoader::LayoutOneArchived(_) => {
+                HUDI_METADATA_DIR.to_string()
+            }
+            TimelineLoader::LayoutTwoActive(storage) | TimelineLoader::LayoutTwoArchived(storage) => {
+                let timeline_path: String =
+                    storage.hudi_configs.get_or_default(TimelinePath).into();
+                format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
+            }
+        }
+    }
+
+    /// Returns the history directory for v8+ (Layout Two) loaders.
+    /// Resolves from configs: `.hoodie/{timeline_path}/{history_path}`
+    fn get_history_dir(&self) -> Option<String> {
+        match self {
+            TimelineLoader::LayoutTwoActive(storage) | TimelineLoader::LayoutTwoArchived(storage) => {
+                let timeline_path: String =
+                    storage.hudi_configs.get_or_default(TimelinePath).into();
+                let history_path: String =
+                    storage.hudi_configs.get_or_default(TimelineHistoryPath).into();
+                Some(format!("{}/{}/{}", HUDI_METADATA_DIR, timeline_path, history_path))
+            }
+            _ => None,
+        }
+    }
+
     pub async fn load_instants(
         &self,
         selector: &TimelineSelector,
@@ -73,7 +113,8 @@ impl TimelineLoader {
                 }
             }
             TimelineLoader::LayoutTwoActive(storage) => {
-                let files = storage.list_files(Some(LSM_TIMELINE_DIR)).await?;
+                let timeline_dir = self.get_timeline_dir();
+                let files = storage.list_files(Some(&timeline_dir)).await?;
                 let mut instants = Vec::new();
 
                 for file_info in files {
@@ -154,9 +195,9 @@ impl TimelineLoader {
                 }
                 Ok(instants)
             }
-            TimelineLoader::LayoutTwoArchived(storage) => {
-                // TODO: Implement v2 LSM history reader (hoodie.timeline.history.path). For now, return empty.
-                let _ = (storage, selector, desc);
+            TimelineLoader::LayoutTwoArchived(_) => {
+                // TODO: Implement v2 LSM history reader. For now, return empty.
+                let _ = (selector, desc);
                 Ok(Vec::new())
             }
             _ => Ok(Vec::new()),
