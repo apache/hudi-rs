@@ -92,6 +92,22 @@ impl Timeline {
         Ok(timeline)
     }
 
+    /// Load instants from the timeline based on the selector criteria.
+    ///
+    /// # Archived Timeline Loading
+    ///
+    /// Archived instants are loaded only when BOTH conditions are met:
+    /// 1. The selector has a time filter (start or end timestamp)
+    /// 2. `TimelineArchivedReadEnabled` config is set to `true`
+    ///
+    /// This double-gate design ensures:
+    /// - Queries without time filters only read active timeline (optimization)
+    /// - Historical time-range queries can include archived data when explicitly enabled
+    ///
+    /// # Arguments
+    ///
+    /// * `selector` - The criteria for selecting instants (actions, states, time range)
+    /// * `desc` - If true, return instants in descending order by timestamp
     pub async fn load_instants(
         &self,
         selector: &TimelineSelector,
@@ -103,8 +119,7 @@ impl Timeline {
             if let Some(archived_loader) = &self.archived_loader {
                 let mut archived = archived_loader
                     .load_archived_instants(selector, desc)
-                    .await
-                    .unwrap_or_default();
+                    .await?;
                 if !archived.is_empty() {
                     // Both sides already sorted by loaders; append is fine for now.
                     instants.append(&mut archived);

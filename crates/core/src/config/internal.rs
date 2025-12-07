@@ -43,10 +43,18 @@ use crate::config::{ConfigParser, HudiConfigValue};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiInternalConfig {
     SkipConfigValidation,
-    /// Enable reading archived timeline (v1) and LSM history (v2)
+    /// Enable reading archived timeline (v1) and LSM history (v2).
+    ///
+    /// When enabled, timeline queries with time range filters will include archived instants
+    /// in addition to active instants. When disabled (default), only active timeline is read.
+    ///
+    /// Note: Archived instants are only loaded when BOTH conditions are met:
+    /// 1. This config is set to `true`
+    /// 2. The query specifies a time range filter (start or end timestamp)
+    ///
+    /// Queries without time filters (e.g., `get_completed_commits()`) will never load
+    /// archived instants, regardless of this setting.
     TimelineArchivedReadEnabled,
-    /// Behavior when archived timeline is requested but not available/enabled: "error" or "continue"
-    TimelineArchivedUnavailableBehavior,
 }
 
 impl AsRef<str> for HudiInternalConfig {
@@ -54,9 +62,6 @@ impl AsRef<str> for HudiInternalConfig {
         match self {
             Self::SkipConfigValidation => "hoodie.internal.skip.config.validation",
             Self::TimelineArchivedReadEnabled => "hoodie.internal.timeline.archived.enabled",
-            Self::TimelineArchivedUnavailableBehavior => {
-                "hoodie.internal.timeline.archived.unavailable.behavior"
-            }
         }
     }
 }
@@ -74,10 +79,6 @@ impl ConfigParser for HudiInternalConfig {
         match self {
             Self::SkipConfigValidation => Some(HudiConfigValue::Boolean(false)),
             Self::TimelineArchivedReadEnabled => Some(HudiConfigValue::Boolean(false)),
-            // default to continue (graceful) when archived is unavailable/disabled
-            Self::TimelineArchivedUnavailableBehavior => {
-                Some(HudiConfigValue::String("continue".to_string()))
-            }
         }
     }
 
@@ -98,9 +99,6 @@ impl ConfigParser for HudiInternalConfig {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Boolean),
-            Self::TimelineArchivedUnavailableBehavior => {
-                get_result.map(|v| HudiConfigValue::String(v.to_string()))
-            }
         }
     }
 }

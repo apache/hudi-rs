@@ -17,9 +17,7 @@
  * under the License.
  */
 
-use crate::config::internal::HudiInternalConfig::{
-    TimelineArchivedReadEnabled, TimelineArchivedUnavailableBehavior,
-};
+use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
 use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPath, TimelinePath};
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -156,33 +154,41 @@ impl TimelineLoader {
         }
     }
 
+    /// Load archived timeline instants based on selector criteria.
+    ///
+    /// # Behavior
+    ///
+    /// - Returns empty Vec if this is an active loader (not an archived loader)
+    /// - Returns empty Vec if `TimelineArchivedReadEnabled` config is `false` (default)
+    /// - Attempts to load archived instants if config is `true`, propagating any errors
+    ///
+    /// # Arguments
+    ///
+    /// * `selector` - The criteria for selecting instants (actions, states, time range)
+    /// * `desc` - If true, return instants in descending order by timestamp
     pub(crate) async fn load_archived_instants(
         &self,
         selector: &TimelineSelector,
         desc: bool,
     ) -> Result<Vec<Instant>> {
-        // Config wiring: if archived read not enabled, return behavior based on policy
+        // Early return for active loaders - they don't have archived parts
         let storage = match self {
             TimelineLoader::LayoutOneArchived(storage)
             | TimelineLoader::LayoutTwoArchived(storage) => storage.clone(),
-            _ => return Ok(Vec::new()), // Active loaders don't have archived parts
+            _ => return Ok(Vec::new()),
         };
 
-        let configs: Arc<HudiConfigs> = storage.hudi_configs.clone();
-        let enabled: bool = configs.get_or_default(TimelineArchivedReadEnabled).into();
+        // Check if archived read is enabled - if not, silently return empty
+        let enabled: bool = storage
+            .hudi_configs
+            .get_or_default(TimelineArchivedReadEnabled)
+            .into();
         if !enabled {
-            let behavior: String = configs
-                .get_or_default(TimelineArchivedUnavailableBehavior)
-                .into();
-            let behavior = behavior.to_ascii_lowercase();
-            return match behavior.as_str() {
-                "error" => Err(CoreError::Unsupported(
-                    "Archived timeline read is disabled; shorten time range or enable archived read"
-                        .to_string(),
-                )),
-                _ => Ok(Vec::new()), // continue silently with empty archived
-            };
+            return Ok(Vec::new());
         }
+
+        // Archived read is enabled - attempt to load and propagate any errors
+        let configs: Arc<HudiConfigs> = storage.hudi_configs.clone();
 
         match self {
             TimelineLoader::LayoutOneArchived(storage) => {
