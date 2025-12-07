@@ -601,4 +601,57 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_to_json_map() {
+        let metadata = HoodieCommitMetadata {
+            version: Some(1),
+            operation_type: Some("INSERT".to_string()),
+            ..Default::default()
+        };
+
+        let json_map = metadata.to_json_map().unwrap();
+        assert!(json_map.contains_key("version"));
+        assert!(json_map.contains_key("operationType"));
+    }
+
+    #[test]
+    fn test_from_json_map() {
+        let mut map = Map::new();
+        map.insert("version".to_string(), json!(2));
+        map.insert("operationType".to_string(), json!("UPSERT"));
+
+        let metadata = HoodieCommitMetadata::from_json_map(&map).unwrap();
+        assert_eq!(metadata.version, Some(2));
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements_sorting() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1"],
+                "p2": ["file2", "file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let mut partitions = metadata.get_partitions_with_replacements();
+        partitions.sort();
+        assert_eq!(partitions, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids_multiple_partitions() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1"],
+                "p2": ["file2", "file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 3); // 1 from p1, 2 from p2
+    }
 }

@@ -678,4 +678,25 @@ mod tests {
             assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
         }
     }
+
+    #[tokio::test]
+    async fn test_get_latest_commit_timestamp() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let timestamp = timeline.get_latest_commit_timestamp().unwrap();
+        assert!(!timestamp.is_empty());
+        // Should be in timeline timestamp format
+        assert!(timestamp.len() >= 14);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_commit_timestamp_as_option() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let timestamp = timeline.get_latest_commit_timestamp_as_option();
+        assert!(timestamp.is_some());
+        assert!(!timestamp.unwrap().is_empty());
+    }
 }

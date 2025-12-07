@@ -484,4 +484,58 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_v8_instant_with_completed_timestamp() -> Result<()> {
+        // v8+ format: {requestedTimestamp}_{completedTimestamp}.{action}
+        let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
+        assert_eq!(instant.timestamp, "20240101120000000");
+        assert_eq!(
+            instant.completed_timestamp,
+            Some("20240101120005000".to_string())
+        );
+        assert_eq!(instant.action, Action::Commit);
+        assert_eq!(instant.state, State::Completed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_v8_instant_underscore_format_requires_completed_state() {
+        // Underscore format with non-completed state should fail
+        let result = Instant::from_str("20240101120000000_20240101120005000.commit.inflight");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("only valid for completed"));
+    }
+
+    #[test]
+    fn test_file_name_with_completed_timestamp() -> Result<()> {
+        let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
+        let file_name = instant.file_name();
+        assert_eq!(file_name, "20240101120000000_20240101120005000.commit");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_datetime_with_milliseconds() -> Result<()> {
+        let dt = Instant::parse_datetime("20240315142530500", "UTC")?;
+        assert_eq!(dt.timestamp_millis() % 1000, 500);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_timestamp_errors() {
+        // Too short
+        let result = Instant::from_str("2024.commit");
+        assert!(result.is_err());
+
+        // Too long (not 14 or 17)
+        let result = Instant::from_str("202403151425301.commit");
+        assert!(result.is_err());
+    }
 }
