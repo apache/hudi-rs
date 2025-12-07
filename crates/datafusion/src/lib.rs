@@ -54,26 +54,29 @@ use hudi_core::table::Table as HudiTable;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,no_run
 /// use std::sync::Arc;
 ///
 /// use datafusion::error::Result;
 /// use datafusion::prelude::{DataFrame, SessionContext};
 /// use hudi_datafusion::HudiDataSource;
 ///
-/// // Initialize a new DataFusion session context
-/// let ctx = SessionContext::new();
+/// #[tokio::main]
+/// async fn main() -> Result<()> {
+///     // Initialize a new DataFusion session context
+///     let ctx = SessionContext::new();
 ///
-/// // Create a new HudiDataSource with specific read options
-/// let hudi = HudiDataSource::new_with_options(
-///     "/tmp/trips_table",
-///     [("hoodie.read.input.partitions", 5)]).await?;
+///     // Create a new HudiDataSource with specific read options
+///     let hudi = HudiDataSource::new_with_options(
+///         "/tmp/trips_table",
+///         [("hoodie.read.input.partitions", "5")]).await?;
 ///
-/// // Register the Hudi table with the session context
-/// ctx.register_table("trips_table", Arc::new(hudi))?;
-/// let df: DataFrame = ctx.sql("SELECT * from trips_table where city = 'san_francisco'").await?;
-/// df.show().await?;
-///
+///     // Register the Hudi table with the session context
+///     ctx.register_table("trips_table", Arc::new(hudi))?;
+///     let df: DataFrame = ctx.sql("SELECT * from trips_table where city = 'san_francisco'").await?;
+///     df.show().await?;
+///     Ok(())
+/// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct HudiDataSource {
@@ -254,30 +257,27 @@ impl TableProvider for HudiDataSource {
 ///
 /// Creating a new `HudiTableFactory` instance:
 ///
-/// ```rust
+/// ```rust,no_run
 /// use datafusion::prelude::SessionContext;
+/// use datafusion::catalog::TableProviderFactory;
+/// use datafusion::sql::parser::CreateExternalTable;
 /// use hudi_datafusion::HudiTableFactory;
 ///
-/// // Initialize a new HudiTableFactory
-/// let factory = HudiTableFactory::new();
+/// #[tokio::main]
+/// async fn main() -> datafusion::error::Result<()> {
+///     // Initialize a new HudiTableFactory
+///     let factory = HudiTableFactory::new();
 ///     
-/// // The factory can be used to create Hudi tables
-/// let table = factory.create_table(...)?;
-///
-///
-/// // Using `CREATE EXTERNAL TABLE` to register Hudi table:
-/// let test_table =  factory.create_table(...)?; // Table with path + url
-/// let ctx = SessionContext::new();
-///
-/// // Register table in session using `CREATE EXTERNAL TABLE` command
-/// let create_table_sql = format!(
-///     "CREATE EXTERNAL TABLE {} STORED AS HUDI LOCATION '{}' {}",
-///     test_table.as_ref(),
-///     test_table.path(),
-///     concat_as_sql_options(options)
-/// );
-/// ctx.sql(create_table_sql.as_str()).await?; // Query against this table
-///
+///     // Initialize a new DataFusion session context
+///     let ctx = SessionContext::new();
+///     
+///     // Register table using SQL command
+///     let create_table_sql =
+///         "CREATE EXTERNAL TABLE trips_table STORED AS HUDI LOCATION '/tmp/trips_table'";
+///     ctx.sql(create_table_sql).await?;
+///     
+///     Ok(())
+/// }
 /// ```
 #[derive(Debug)]
 pub struct HudiTableFactory {}

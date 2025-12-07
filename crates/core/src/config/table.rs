@@ -117,6 +117,17 @@ pub enum HudiTableConfig {
     ///
     /// - [`TimelineTimezoneValue`] - Possible values for this configuration.
     TimelineTimezone,
+
+    /// Folder for archived timeline files for layout v1 (default: .hoodie/archived)
+    ArchiveLogFolder,
+
+    /// Path for timeline directory for layout v2 (v8+), relative to .hoodie/ (default: timeline)
+    /// The full path will be `.hoodie/{TimelinePath}`
+    TimelinePath,
+
+    /// Path for LSM timeline history for layout v2, relative to timeline path (default: history)
+    /// The full path will be `.hoodie/{TimelinePath}/{TimelineHistoryPath}`
+    TimelineHistoryPath,
 }
 
 impl AsRef<str> for HudiTableConfig {
@@ -141,6 +152,9 @@ impl AsRef<str> for HudiTableConfig {
             Self::TableVersion => "hoodie.table.version",
             Self::TimelineLayoutVersion => "hoodie.timeline.layout.version",
             Self::TimelineTimezone => "hoodie.table.timeline.timezone",
+            Self::ArchiveLogFolder => "hoodie.archivelog.folder",
+            Self::TimelinePath => "hoodie.timeline.path",
+            Self::TimelineHistoryPath => "hoodie.timeline.history.path",
         }
     }
 }
@@ -166,6 +180,9 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineTimezone => Some(HudiConfigValue::String(
                 TimelineTimezoneValue::UTC.as_ref().to_string(),
             )),
+            Self::ArchiveLogFolder => Some(HudiConfigValue::String(".hoodie/archived".to_string())),
+            Self::TimelinePath => Some(HudiConfigValue::String("timeline".to_string())),
+            Self::TimelineHistoryPath => Some(HudiConfigValue::String("history".to_string())),
             _ => None,
         }
     }
@@ -238,6 +255,9 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineTimezone => get_result
                 .and_then(TimelineTimezoneValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
+            Self::ArchiveLogFolder => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::TimelinePath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::TimelineHistoryPath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
         }
     }
 
