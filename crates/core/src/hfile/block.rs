@@ -263,37 +263,49 @@ impl<'a> Iterator for DataBlockIterator<'a> {
     }
 }
 
-/// Read a variable-length encoded integer from bytes.
+/// Read a Hadoop VLong encoded integer from bytes.
+/// This is the encoding used in HFile root/leaf index blocks.
 /// Returns (value, bytes_consumed).
+///
+/// Hadoop VLong format:
+/// - First byte determines total size
+/// - If first byte >= -112 (signed), value fits in single byte
+/// - Otherwise, -111 - first_byte gives number of additional data bytes
 pub fn read_var_long(bytes: &[u8], offset: usize) -> (u64, usize) {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    let mut pos = offset;
+    let first_byte = bytes[offset];
+    let size = var_long_size_on_disk_single(first_byte);
 
-    loop {
-        if pos >= bytes.len() {
-            break;
-        }
-        let b = bytes[pos] as u64;
-        pos += 1;
-        result |= (b & 0x7F) << shift;
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
+    if size == 1 {
+        // Single byte encoding: value is the byte itself (as signed, then cast to u64)
+        return (first_byte as i8 as i64 as u64, 1);
     }
 
-    (result, pos - offset)
+    // Multi-byte encoding: read size-1 bytes as big-endian
+    let mut value: u64 = 0;
+    for i in 0..size - 1 {
+        value = (value << 8) | (bytes[offset + 1 + i] as u64);
+    }
+
+    // Check if negative (first byte < -120 in signed representation)
+    let is_negative = (first_byte as i8) < -120;
+    if is_negative {
+        (!value, size)
+    } else {
+        (value, size)
+    }
 }
 
-/// Calculate the size of a variable-length encoded integer.
+/// Calculate the size of a Hadoop VLong encoded integer from the first byte.
+fn var_long_size_on_disk_single(first_byte: u8) -> usize {
+    let signed = first_byte as i8;
+    if signed >= -112 {
+        1
+    } else {
+        (-111 - signed as i32) as usize
+    }
+}
+
+/// Calculate the size of a Hadoop VLong encoded integer.
 pub fn var_long_size_on_disk(bytes: &[u8], offset: usize) -> usize {
-    let mut pos = offset;
-    while pos < bytes.len() && bytes[pos] & 0x80 != 0 {
-        pos += 1;
-    }
-    if pos < bytes.len() {
-        pos += 1; // Include the last byte
-    }
-    pos - offset
+    var_long_size_on_disk_single(bytes[offset])
 }

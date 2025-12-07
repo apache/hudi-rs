@@ -601,75 +601,78 @@ impl HFileReader {
     }
 
     /// Scan within the current block to find the key.
+    /// Uses iteration instead of recursion to avoid stack overflow with many blocks.
     fn scan_block_for_key(&mut self, lookup_key: &Utf8Key) -> Result<SeekResult> {
-        let block = match &self.current_block {
-            Some(b) => b,
-            None => return Ok(SeekResult::Eof),
-        };
+        loop {
+            let block = match &self.current_block {
+                Some(b) => b,
+                None => return Ok(SeekResult::Eof),
+            };
 
-        let block_start = self.current_block_entry.as_ref().unwrap().offset as usize;
-        let mut offset = self.cursor.offset - block_start - BLOCK_HEADER_SIZE;
-        let mut last_offset = offset;
-        let mut last_kv = self.cursor.cached_kv.clone();
+            let block_start = self.current_block_entry.as_ref().unwrap().offset as usize;
+            let mut offset = self.cursor.offset - block_start - BLOCK_HEADER_SIZE;
+            let mut last_offset = offset;
+            let mut last_kv = self.cursor.cached_kv.clone();
 
-        while block.is_valid_offset(offset) {
-            let kv = block.read_key_value(offset);
-            let cmp = compare_keys(kv.key(), lookup_key);
+            while block.is_valid_offset(offset) {
+                let kv = block.read_key_value(offset);
+                let cmp = compare_keys(kv.key(), lookup_key);
 
-            match cmp {
-                std::cmp::Ordering::Equal => {
-                    self.cursor.offset = block_start + BLOCK_HEADER_SIZE + offset;
-                    self.cursor.cached_kv = Some(kv);
-                    return Ok(SeekResult::Found);
-                }
-                std::cmp::Ordering::Greater => {
-                    // Key at offset > lookup key
-                    // Set cursor to previous position
-                    if let Some(prev_kv) = last_kv {
-                        self.cursor.offset = block_start + BLOCK_HEADER_SIZE + last_offset;
-                        self.cursor.cached_kv = Some(prev_kv);
+                match cmp {
+                    std::cmp::Ordering::Equal => {
+                        self.cursor.offset = block_start + BLOCK_HEADER_SIZE + offset;
+                        self.cursor.cached_kv = Some(kv);
+                        return Ok(SeekResult::Found);
                     }
-                    if self.is_at_first_key_of_block() {
-                        return Ok(SeekResult::BeforeBlockFirstKey);
+                    std::cmp::Ordering::Greater => {
+                        // Key at offset > lookup key
+                        // Set cursor to previous position
+                        if let Some(prev_kv) = last_kv {
+                            self.cursor.offset = block_start + BLOCK_HEADER_SIZE + last_offset;
+                            self.cursor.cached_kv = Some(prev_kv);
+                        }
+                        if self.is_at_first_key_of_block() {
+                            return Ok(SeekResult::BeforeBlockFirstKey);
+                        }
+                        return Ok(SeekResult::InRange);
+                    }
+                    std::cmp::Ordering::Less => {
+                        last_offset = offset;
+                        last_kv = Some(kv.clone());
+                        offset += kv.record_size();
+                    }
+                }
+            }
+
+            // Reached end of block - need to check if there are more blocks
+            let current_entry = self.current_block_entry.clone().unwrap();
+            let next_entry = self.get_next_block_entry(&current_entry);
+
+            match next_entry {
+                Some(entry) => {
+                    // Move to next block and continue scanning (iterate instead of recurse)
+                    self.current_block_entry = Some(entry.clone());
+                    self.load_data_block(&entry)?;
+                    self.cursor.offset = entry.offset as usize + BLOCK_HEADER_SIZE;
+                    self.cursor.cached_kv = None;
+                    // Continue the loop to scan the next block
+                }
+                None => {
+                    // No more blocks - this is the last block
+                    // Check if lookup key is past the last key in the file
+                    if let Some(kv) = last_kv {
+                        if compare_keys(kv.key(), lookup_key) == std::cmp::Ordering::Less {
+                            // We're past the last key in the file
+                            self.cursor.eof = true;
+                            self.cursor.cached_kv = None;
+                            return Ok(SeekResult::Eof);
+                        }
+                        // Otherwise, stay at the last key
+                        self.cursor.offset = block_start + BLOCK_HEADER_SIZE + last_offset;
+                        self.cursor.cached_kv = Some(kv);
                     }
                     return Ok(SeekResult::InRange);
                 }
-                std::cmp::Ordering::Less => {
-                    last_offset = offset;
-                    last_kv = Some(kv.clone());
-                    offset += kv.record_size();
-                }
-            }
-        }
-
-        // Reached end of block - need to check if there are more blocks
-        let current_entry = self.current_block_entry.clone().unwrap();
-        let next_entry = self.get_next_block_entry(&current_entry);
-
-        match next_entry {
-            Some(entry) => {
-                // Move to next block and continue scanning
-                self.current_block_entry = Some(entry.clone());
-                self.load_data_block(&entry)?;
-                self.cursor.offset = entry.offset as usize + BLOCK_HEADER_SIZE;
-                self.cursor.cached_kv = None;
-                self.scan_block_for_key(lookup_key)
-            }
-            None => {
-                // No more blocks - this is the last block
-                // Check if lookup key is past the last key in the file
-                if let Some(kv) = last_kv {
-                    if compare_keys(kv.key(), lookup_key) == std::cmp::Ordering::Less {
-                        // We're past the last key in the file
-                        self.cursor.eof = true;
-                        self.cursor.cached_kv = None;
-                        return Ok(SeekResult::Eof);
-                    }
-                    // Otherwise, stay at the last key
-                    self.cursor.offset = block_start + BLOCK_HEADER_SIZE + last_offset;
-                    self.cursor.cached_kv = Some(kv);
-                }
-                Ok(SeekResult::InRange)
             }
         }
     }
@@ -1329,5 +1332,426 @@ mod tests {
         // Can use records after reader has moved
         drop(reader);
         assert_eq!(record1.key_as_str(), Some("hudi-key-000000000"));
+    }
+
+    // ================== Additional Test Files ==================
+
+    // Priority 1: Different Block Sizes
+
+    #[test]
+    fn test_read_512kb_blocks_gzip() {
+        // 512KB block size, GZIP compression, 20000 entries
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 20000);
+    }
+
+    #[test]
+    fn test_512kb_blocks_sequential_read() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Read first 10 entries
+        for i in 0..10 {
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            let expected_key = format!("hudi-key-{:09}", i);
+            let expected_value = format!("hudi-value-{:09}", i);
+
+            assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
+            assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
+
+            if i < 9 {
+                assert!(reader.next().expect("Failed to move next"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_512kb_blocks_seek() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to key in second block (block 0 ends at ~8886)
+        let lookup = Utf8Key::new("hudi-key-000008888");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000008888");
+    }
+
+    #[test]
+    fn test_read_64kb_blocks_uncompressed() {
+        // 64KB block size, no compression, 5000 entries
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 5000);
+    }
+
+    #[test]
+    fn test_64kb_blocks_sequential_read() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Read first 10 entries
+        for i in 0..10 {
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            let expected_key = format!("hudi-key-{:09}", i);
+            let expected_value = format!("hudi-value-{:09}", i);
+
+            assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
+            assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
+
+            if i < 9 {
+                assert!(reader.next().expect("Failed to move next"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_64kb_blocks_seek() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to key in second block (block 0 ends at ~1110)
+        let lookup = Utf8Key::new("hudi-key-000001688");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000001688");
+    }
+
+    // Priority 2: Edge Cases
+
+    #[test]
+    fn test_read_non_unique_keys() {
+        // 200 unique keys, each with 21 values (1 primary + 20 duplicates)
+        // Total: 200 * 21 = 4200 entries
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 4200);
+    }
+
+    #[test]
+    fn test_non_unique_keys_sequential_read() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // First entry for key 0
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000000000");
+        assert_eq!(
+            std::str::from_utf8(kv.value()).unwrap(),
+            "hudi-value-000000000"
+        );
+
+        // Next 20 entries should be duplicates with _0 to _19 suffix
+        for j in 0..20 {
+            assert!(reader.next().expect("Failed to move next"));
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000000000");
+            let expected_value = format!("hudi-value-000000000_{}", j);
+            assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
+        }
+
+        // Next entry should be key 1
+        assert!(reader.next().expect("Failed to move next"));
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000000001");
+    }
+
+    #[test]
+    fn test_non_unique_keys_seek() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to a key - should find the first occurrence
+        let lookup = Utf8Key::new("hudi-key-000000005");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000000005");
+        // First occurrence has the base value
+        assert_eq!(
+            std::str::from_utf8(kv.value()).unwrap(),
+            "hudi-value-000000005"
+        );
+    }
+
+    #[test]
+    fn test_read_fake_first_key() {
+        // File with fake first keys in meta index block
+        // Keys have suffix "-abcdefghij"
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 20000);
+    }
+
+    #[test]
+    fn test_fake_first_key_sequential_read() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Read first 10 entries - keys have "-abcdefghij" suffix
+        for i in 0..10 {
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            let expected_key = format!("hudi-key-{:09}-abcdefghij", i);
+            let expected_value = format!("hudi-value-{:09}", i);
+
+            assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
+            assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
+
+            if i < 9 {
+                assert!(reader.next().expect("Failed to move next"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_fake_first_key_seek_exact() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to exact key with suffix
+        let lookup = Utf8Key::new("hudi-key-000000099-abcdefghij");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(
+            kv.key().content_as_str().unwrap(),
+            "hudi-key-000000099-abcdefghij"
+        );
+    }
+
+    #[test]
+    fn test_fake_first_key_seek_before_block_first() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // First, move to a known position
+        let lookup = Utf8Key::new("hudi-key-000000469-abcdefghij");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        // Now seek to a key that falls between fake first key and actual first key of next block
+        // Block 2 has fake first key "hudi-key-00000047" but actual first key "hudi-key-000000470-abcdefghij"
+        let lookup = Utf8Key::new("hudi-key-000000470");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        // This should return BeforeBlockFirstKey since the lookup key is >= fake first key
+        // but < actual first key
+        assert_eq!(result, SeekResult::BeforeBlockFirstKey);
+    }
+
+    // Priority 3: Multi-level Index
+
+    #[test]
+    fn test_read_large_keys_2level_index() {
+        // Large keys (>100 bytes), 2-level data block index
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 20000);
+    }
+
+    #[test]
+    fn test_large_keys_2level_sequential_read() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let large_key_prefix = "hudi-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Read first 5 entries
+        for i in 0..5 {
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            let expected_key = format!("{}{:09}", large_key_prefix, i);
+            let expected_value = format!("hudi-value-{:09}", i);
+
+            assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
+            assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
+
+            if i < 4 {
+                assert!(reader.next().expect("Failed to move next"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_keys_2level_seek() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let large_key_prefix = "hudi-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to a key deep in the file
+        let lookup_key = format!("{}000005340", large_key_prefix);
+        let lookup = Utf8Key::new(&lookup_key);
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), lookup_key);
+    }
+
+    #[test]
+    fn test_large_keys_2level_iterate_all() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let mut count = 0;
+        for result in reader.iter().expect("Failed to create iterator") {
+            let _ = result.expect("Failed to read kv");
+            count += 1;
+        }
+
+        assert_eq!(count, 20000);
+    }
+
+    #[test]
+    fn test_read_large_keys_3level_index() {
+        // Large keys, 3-level deep data block index
+        let bytes =
+            read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 10000);
+    }
+
+    #[test]
+    fn test_large_keys_3level_sequential_read() {
+        let bytes =
+            read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let large_key_prefix = "hudi-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Read first 5 entries
+        for i in 0..5 {
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            let expected_key = format!("{}{:09}", large_key_prefix, i);
+            let expected_value = format!("hudi-value-{:09}", i);
+
+            assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
+            assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
+
+            if i < 4 {
+                assert!(reader.next().expect("Failed to move next"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_keys_3level_seek() {
+        let bytes =
+            read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let large_key_prefix = "hudi-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to a key deep in the file
+        let lookup_key = format!("{}000005340", large_key_prefix);
+        let lookup = Utf8Key::new(&lookup_key);
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), lookup_key);
+    }
+
+    #[test]
+    fn test_large_keys_3level_iterate_all() {
+        let bytes =
+            read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let mut count = 0;
+        for result in reader.iter().expect("Failed to create iterator") {
+            let _ = result.expect("Failed to read kv");
+            count += 1;
+        }
+
+        assert_eq!(count, 10000);
+    }
+
+    #[test]
+    fn test_large_keys_3level_last_key() {
+        let bytes =
+            read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let large_key_prefix = "hudi-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek to last key
+        let lookup_key = format!("{}000009999", large_key_prefix);
+        let lookup = Utf8Key::new(&lookup_key);
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+        assert_eq!(kv.key().content_as_str().unwrap(), lookup_key);
+        assert_eq!(
+            std::str::from_utf8(kv.value()).unwrap(),
+            "hudi-value-000009999"
+        );
+
+        // Next should return false (EOF)
+        assert!(!reader.next().expect("Failed to move next"));
+    }
+
+    #[test]
+    fn test_large_keys_3level_seek_eof() {
+        let bytes =
+            read_test_hfile("hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let large_key_prefix = "hudi-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
+
+        assert!(reader.seek_to_first().expect("Failed to seek"));
+
+        // Seek past last key
+        let lookup_key = format!("{}000009999a", large_key_prefix);
+        let lookup = Utf8Key::new(&lookup_key);
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Eof);
     }
 }
