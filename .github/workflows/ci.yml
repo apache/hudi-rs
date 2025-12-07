@@ -49,40 +49,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-integration-needed:
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.filter.outputs.should_run }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Check if integration tests needed
-        id: filter
-        run: |
-          # Always run on main branch or non-PR events
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Get PR labels using jq for robust processing
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          DOCS_CHORE_LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name | select(. == "documentation" or . == "chore")' | wc -l)
-          CODE_LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name | select(. == "rust" or . == "python" or . == "demo" or . == "ci")' | wc -l)
-
-          # Skip only if ONLY documentation or chore labels (no code labels)
-          if [ "$DOCS_CHORE_LABELS" -gt 0 ] && [ "$CODE_LABELS" -eq 0 ]; then
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "Skipping integration tests - only docs/chore changes"
-          else
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "Running integration tests - code changes detected"
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
   prepare-integration-build:
-    needs: check-integration-needed
-    if: needs.check-integration-needed.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -312,8 +279,7 @@ jobs:
           if-no-files-found: 'error'
 
   integration-tests:
-    needs: [check-integration-needed, prepare-integration-build]
-    if: needs.check-integration-needed.outputs.should_run == 'true'
+    needs: [prepare-integration-build]
     strategy:
         fail-fast: false
         matrix:

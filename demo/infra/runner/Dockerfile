@@ -19,11 +19,10 @@ FROM rust:1.87
 
 RUN apt-get update && apt-get install -y cmake curl ca-certificates
 
+# Install uv to a globally accessible location (not /root/.local/bin)
+# This allows the container to run as any user (HOST_UID:HOST_GID)
 ADD https://astral.sh/uv/install.sh /uv-installer.sh
-
-RUN sh /uv-installer.sh && rm /uv-installer.sh
-
-ENV PATH="/root/.local/bin/:$PATH"
+RUN UV_INSTALL_DIR=/usr/local/bin sh /uv-installer.sh && rm /uv-installer.sh
 
 RUN uv python install 3.13
 
