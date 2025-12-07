@@ -70,12 +70,7 @@ jobs:
           # Reduce cache size by cleaning old artifacts
           cache-all-crates: false
       - name: Rust unit tests with coverage report
-        run: |
-          cargo tarpaulin \
-            --engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
-            --exclude-files cpp/src/* \
-            --exclude-files crates/core/src/avro_to_arrow/* \
-            -o xml --output-dir ./cov-reports --skip-clean
+        run: make coverage-xml
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
