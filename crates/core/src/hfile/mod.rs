@@ -18,8 +18,9 @@
  */
 //! HFile reader implementation.
 //!
-//! HFile is a **base file format** based on SSTable, optimized for
-//! range scans and point lookups.
+//! HFile is an SSTable based row-oriented file format, optimized for
+//! range scans and point lookups. HFile is used as the base file format
+//! for Hudi's metadata table.
 //!
 //! See [Hudi's HFile format specification](https://github.com/apache/hudi/blob/master/hudi-io/hfile_format.md).
 //!
