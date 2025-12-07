@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
 use crate::config::table::HudiTableConfig::{TableVersion, TimelineLayoutVersion};
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -51,13 +52,30 @@ impl TimelineBuilder {
     }
 
     fn resolve_loader_config(&self) -> Result<(TimelineLoader, Option<TimelineLoader>)> {
+        // Check if archived timeline reading is enabled
+        let archived_enabled: bool = self
+            .hudi_configs
+            .get_or_default(TimelineArchivedReadEnabled)
+            .into();
+
         let table_version: isize = match self.hudi_configs.get(TableVersion) {
             Ok(v) => v.into(),
             Err(_) => {
+                let archived_loader = if archived_enabled {
+                    Some(TimelineLoader::new_layout_one_archived(
+                        self.hudi_configs.clone(),
+                        self.storage.clone(),
+                    ))
+                } else {
+                    None
+                };
                 return Ok((
-                    TimelineLoader::LayoutOneActive(self.storage.clone()),
-                    Some(TimelineLoader::LayoutOneArchived(self.storage.clone())),
-                ))
+                    TimelineLoader::new_layout_one_active(
+                        self.hudi_configs.clone(),
+                        self.storage.clone(),
+                    ),
+                    archived_loader,
+                ));
             }
         };
 
@@ -75,9 +93,20 @@ impl TimelineBuilder {
                         table_version, layout_version
                     )));
                 }
+                let archived_loader = if archived_enabled {
+                    Some(TimelineLoader::new_layout_one_archived(
+                        self.hudi_configs.clone(),
+                        self.storage.clone(),
+                    ))
+                } else {
+                    None
+                };
                 Ok((
-                    TimelineLoader::LayoutOneActive(self.storage.clone()),
-                    Some(TimelineLoader::LayoutOneArchived(self.storage.clone())),
+                    TimelineLoader::new_layout_one_active(
+                        self.hudi_configs.clone(),
+                        self.storage.clone(),
+                    ),
+                    archived_loader,
                 ))
             }
             2 => {
@@ -87,9 +116,20 @@ impl TimelineBuilder {
                         table_version, layout_version
                     )));
                 }
+                let archived_loader = if archived_enabled {
+                    Some(TimelineLoader::new_layout_two_archived(
+                        self.hudi_configs.clone(),
+                        self.storage.clone(),
+                    ))
+                } else {
+                    None
+                };
                 Ok((
-                    TimelineLoader::LayoutTwoActive(self.storage.clone()),
-                    Some(TimelineLoader::LayoutTwoArchived(self.storage.clone())),
+                    TimelineLoader::new_layout_two_active(
+                        self.hudi_configs.clone(),
+                        self.storage.clone(),
+                    ),
+                    archived_loader,
                 ))
             }
             _ => Err(CoreError::Unsupported(format!(

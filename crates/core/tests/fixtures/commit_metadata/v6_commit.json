@@ -1,0 +1,38 @@
+{
+  "partitionToWriteStats" : {
+    "" : [ {
+      "fileId" : "a079bdb3-731c-4894-b855-abfcd6921007-0",
+      "path" : "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+      "cdcStats" : null,
+      "prevCommit" : "20240418173550988",
+      "numWrites" : 4,
+      "numDeletes" : 0,
+      "numUpdateWrites" : 1,
+      "numInserts" : 1,
+      "totalWriteBytes" : 441520,
+      "totalWriteErrors" : 0,
+      "tempPath" : null,
+      "partitionPath" : "",
+      "totalLogRecords" : 0,
+      "totalLogFilesCompacted" : 0,
+      "totalLogSizeCompacted" : 0,
+      "totalUpdatedRecordsCompacted" : 0,
+      "totalLogBlocks" : 0,
+      "totalCorruptLogBlock" : 0,
+      "totalRollbackBlocks" : 0,
+      "fileSizeInBytes" : 441520,
+      "minEventTime" : null,
+      "maxEventTime" : null,
+      "runtimeStats" : {
+        "totalScanTime" : 0,
+        "totalUpsertTime" : 105,
+        "totalCreateTime" : 0
+      }
+    } ]
+  },
+  "compacted" : false,
+  "extraMetadata" : {
+    "schema" : "{\"type\":\"record\",\"name\":\"v6_nonpartitioned_record\",\"namespace\":\"hoodie.v6_nonpartitioned\",\"fields\":[{\"name\":\"id\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"name\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"isActive\",\"type\":[\"null\",\"boolean\"],\"default\":null},{\"name\":\"byteField\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"shortField\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"intField\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"longField\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"floatField\",\"type\":[\"null\",\"float\"],\"default\":null},{\"name\":\"doubleField\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"decimalField\",\"type\":[\"null\",{\"type\":\"fixed\",\"name\":\"fixed\",\"namespace\":\"hoodie.v6_nonpartitioned.v6_nonpartitioned_record.decimalField\",\"size\":5,\"logicalType\":\"decimal\",\"precision\":10,\"scale\":5}],\"default\":null},{\"name\":\"dateField\",\"type\":[\"null\",{\"type\":\"int\",\"logicalType\":\"date\"}],\"default\":null},{\"name\":\"timestampField\",\"type\":[\"null\",{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}],\"default\":null},{\"name\":\"binaryField\",\"type\":[\"null\",\"bytes\"],\"default\":null},{\"name\":\"arrayField\",\"type\":[\"null\",{\"type\":\"array\",\"items\":[\"null\",{\"type\":\"record\",\"name\":\"arrayField\",\"namespace\":\"hoodie.v6_nonpartitioned.v6_nonpartitioned_record\",\"fields\":[{\"name\":\"arr_struct_f1\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"arr_struct_f2\",\"type\":[\"null\",\"int\"],\"default\":null}]}]}],\"default\":null},{\"name\":\"mapField\",\"type\":[\"null\",{\"type\":\"map\",\"values\":[\"null\",{\"type\":\"record\",\"name\":\"mapField\",\"namespace\":\"hoodie.v6_nonpartitioned.v6_nonpartitioned_record\",\"fields\":[{\"name\":\"map_field_value_struct_f1\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"map_field_value_struct_f2\",\"type\":[\"null\",\"boolean\"],\"default\":null}]}]}],\"default\":null},{\"name\":\"structField\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"structField\",\"namespace\":\"hoodie.v6_nonpartitioned.v6_nonpartitioned_record\",\"fields\":[{\"name\":\"field1\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"field2\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"child_struct\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"child_struct\",\"namespace\":\"hoodie.v6_nonpartitioned.v6_nonpartitioned_record.structField\",\"fields\":[{\"name\":\"child_field1\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"child_field2\",\"type\":[\"null\",\"boolean\"],\"default\":null}]}],\"default\":null}]}],\"default\":null}]}"
+  },
+  "operationType" : "UPSERT"
+}

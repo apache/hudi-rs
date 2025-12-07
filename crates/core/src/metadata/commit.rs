@@ -106,6 +106,7 @@ pub struct HoodieWriteStat {
 /// # Example
 /// ```
 /// use hudi_core::metadata::commit::HoodieCommitMetadata;
+/// use apache_avro::schema::AvroSchema;
 ///
 /// // Get the Avro schema
 /// let schema = HoodieCommitMetadata::get_schema();
@@ -515,36 +516,89 @@ mod tests {
     }
 
     #[test]
-    fn test_avro_file_contains_single_record() {
-        use apache_avro::Reader as AvroReader;
-        use std::io::Cursor;
-
-        // Read actual v8 deltacommit file from test data
+    fn test_parse_v6_commit_json() {
+        // Test parsing v6 COW table commit metadata (JSON format)
         let file_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../test/data/quickstart_trips_table/mor/avro/v8_trips_8i1u/.hoodie/timeline/20250713011913147_20250713011913490.deltacommit"
+            "/tests/fixtures/commit_metadata/v6_commit.json"
         );
+        let bytes = std::fs::read(file_path).expect("Failed to read test fixture");
 
-        if !std::path::Path::new(file_path).exists() {
-            // Skip test if file doesn't exist
-            return;
-        }
+        let metadata = HoodieCommitMetadata::from_json_bytes(&bytes)
+            .expect("Failed to parse v6 commit metadata");
 
-        let bytes = std::fs::read(file_path).expect("Failed to read test file");
-        let cursor = Cursor::new(&bytes);
-        let reader = AvroReader::new(cursor).expect("Failed to create Avro reader");
+        // Validate important fields
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+        assert_eq!(metadata.compacted, Some(false));
 
-        // Count the number of records
-        let mut count = 0;
-        for value_result in reader {
-            value_result.expect("Failed to read record");
-            count += 1;
-        }
+        // Validate partition write stats
+        let write_stats = metadata
+            .get_partition_write_stats("")
+            .expect("Should have write stats for empty partition");
+        assert_eq!(write_stats.len(), 1);
 
-        // Verify that the file contains exactly one record
+        let stat = &write_stats[0];
         assert_eq!(
-            count, 1,
-            "Avro commit metadata file should contain exactly 1 record"
+            stat.file_id,
+            Some("a079bdb3-731c-4894-b855-abfcd6921007-0".to_string())
         );
+        assert_eq!(stat.num_writes, Some(4));
+        assert_eq!(stat.num_inserts, Some(1));
+        assert_eq!(stat.num_deletes, Some(0));
+        assert_eq!(stat.num_update_writes, Some(1));
+        assert_eq!(stat.total_write_bytes, Some(441520));
+        assert_eq!(stat.prev_commit, Some("20240418173550988".to_string()));
+    }
+
+    #[test]
+    fn test_parse_v8_deltacommit_avro() {
+        // Test parsing v8 MOR table deltacommit metadata (Avro format)
+        let file_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/commit_metadata/v8_deltacommit.avro"
+        );
+        let bytes = std::fs::read(file_path).expect("Failed to read test fixture");
+
+        let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)
+            .expect("Failed to parse v8 deltacommit metadata");
+
+        // Validate important fields
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+
+        // Validate partition write stats - v8 MOR table should have stats
+        assert!(metadata.partition_to_write_stats.is_some());
+        let partition_map = metadata.partition_to_write_stats.as_ref().unwrap();
+
+        // Should have write stats for multiple partitions
+        assert!(
+            !partition_map.is_empty(),
+            "Should have write stats for at least one partition"
+        );
+
+        // Validate at least one partition has valid stats
+        for (partition, stats) in partition_map {
+            if !stats.is_empty() {
+                let stat = &stats[0];
+                // file_id should be present
+                assert!(
+                    stat.file_id.is_some(),
+                    "file_id should be present in partition {}",
+                    partition
+                );
+                // For UPSERT operation, num_inserts or num_update_writes should be present
+                if let Some(num_inserts) = stat.num_inserts {
+                    assert!(num_inserts >= 0, "num_inserts should be >= 0");
+                }
+                if let Some(num_updates) = stat.num_update_writes {
+                    assert!(num_updates >= 0, "num_update_writes should be >= 0");
+                }
+                // Verify partition_path field exists (v8+ specific field)
+                assert!(
+                    stat.partition_path.is_some(),
+                    "partition_path should be present in v8+ format"
+                );
+                break;
+            }
+        }
     }
 }

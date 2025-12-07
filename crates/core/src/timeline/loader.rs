@@ -17,73 +17,133 @@
  * under the License.
  */
 
-use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
 use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPath, TimelinePath};
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
 use crate::Result;
 use log::debug;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
-pub enum TimelineLoader {
-    LayoutOneActive(Arc<Storage>),
-    LayoutOneArchived(Arc<Storage>),
-    LayoutTwoActive(Arc<Storage>),
-    LayoutTwoArchived(Arc<Storage>),
+pub struct TimelineLoader {
+    hudi_configs: Arc<HudiConfigs>,
+    storage: Arc<Storage>,
+    layout: TimelineLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineLayout {
+    V1Active,
+    V1Archived,
+    V2Active,
+    V2Archived,
 }
 
 #[allow(dead_code)]
 impl TimelineLoader {
-    /// Returns the storage for this loader.
-    fn storage(&self) -> &Arc<Storage> {
-        match self {
-            TimelineLoader::LayoutOneActive(s)
-            | TimelineLoader::LayoutOneArchived(s)
-            | TimelineLoader::LayoutTwoActive(s)
-            | TimelineLoader::LayoutTwoArchived(s) => s,
+    /// Create a new Layout One Active loader
+    pub fn new_layout_one_active(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+        Self {
+            hudi_configs,
+            storage,
+            layout: TimelineLayout::V1Active,
         }
     }
 
-    /// Returns the base directory for timeline instants based on the loader type.
-    /// - Layout One (pre-v8): `.hoodie/`
-    /// - Layout Two (v8+): configurable via `hoodie.timeline.path` (default: `.hoodie/timeline/`)
-    pub fn get_timeline_dir(&self) -> String {
-        match self {
-            TimelineLoader::LayoutOneActive(_) | TimelineLoader::LayoutOneArchived(_) => {
-                HUDI_METADATA_DIR.to_string()
-            }
-            TimelineLoader::LayoutTwoActive(storage)
-            | TimelineLoader::LayoutTwoArchived(storage) => {
-                let timeline_path: String =
-                    storage.hudi_configs.get_or_default(TimelinePath).into();
+    /// Create a new Layout One Archived loader
+    pub fn new_layout_one_archived(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+        Self {
+            hudi_configs,
+            storage,
+            layout: TimelineLayout::V1Archived,
+        }
+    }
+
+    /// Create a new Layout Two Active loader
+    pub fn new_layout_two_active(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+        Self {
+            hudi_configs,
+            storage,
+            layout: TimelineLayout::V2Active,
+        }
+    }
+
+    /// Create a new Layout Two Archived loader
+    pub fn new_layout_two_archived(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+        Self {
+            hudi_configs,
+            storage,
+            layout: TimelineLayout::V2Archived,
+        }
+    }
+
+    /// Returns the storage for this loader.
+    fn storage(&self) -> &Arc<Storage> {
+        &self.storage
+    }
+
+    /// Check if this is a Layout Two Active loader (for testing/assertions)
+    #[cfg(test)]
+    pub(crate) fn is_layout_two_active(&self) -> bool {
+        matches!(self.layout, TimelineLayout::V2Active)
+    }
+
+    /// Check if this is a Layout Two Archived loader (for testing/assertions)
+    #[cfg(test)]
+    pub(crate) fn is_layout_two_archived(&self) -> bool {
+        matches!(self.layout, TimelineLayout::V2Archived)
+    }
+
+    /// Returns the directory for active timeline instants.
+    ///
+    /// - Layout One (v6-v8): `.hoodie/`
+    /// - Layout Two (v8+): `.hoodie/{timeline_path}` (configurable via `hoodie.timeline.path`, default: `timeline`)
+    fn get_active_timeline_dir(&self) -> String {
+        match self.layout {
+            TimelineLayout::V1Active | TimelineLayout::V1Archived => HUDI_METADATA_DIR.to_string(),
+            TimelineLayout::V2Active | TimelineLayout::V2Archived => {
+                let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
                 format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
             }
         }
     }
 
-    /// Returns the history directory for v8+ (Layout Two) loaders.
-    /// Resolves from configs: `.hoodie/{timeline_path}/{history_path}`
-    fn get_history_dir(&self) -> Option<String> {
-        match self {
-            TimelineLoader::LayoutTwoActive(storage)
-            | TimelineLoader::LayoutTwoArchived(storage) => {
-                let timeline_path: String =
-                    storage.hudi_configs.get_or_default(TimelinePath).into();
-                let history_path: String = storage
-                    .hudi_configs
-                    .get_or_default(TimelineHistoryPath)
-                    .into();
-                Some(format!(
-                    "{}/{}/{}",
-                    HUDI_METADATA_DIR, timeline_path, history_path
-                ))
+    /// Returns the directory for archived timeline instants.
+    ///
+    /// - Layout One (v6-v8): configurable via `hoodie.archivelog.folder` (default: `.hoodie/archived`)
+    /// - Layout Two (v8+): `.hoodie/{timeline_path}/{history_path}` (LSM history)
+    fn get_archived_timeline_dir(&self) -> String {
+        match self.layout {
+            TimelineLayout::V1Active | TimelineLayout::V1Archived => {
+                // Layout 1 uses hoodie.archivelog.folder for archived timeline
+                self.hudi_configs.get_or_default(ArchiveLogFolder).into()
             }
-            _ => None,
+            TimelineLayout::V2Active | TimelineLayout::V2Archived => {
+                // Layout 2 uses LSM history directory
+                let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
+                let history_path: String =
+                    self.hudi_configs.get_or_default(TimelineHistoryPath).into();
+                format!("{}/{}/{}", HUDI_METADATA_DIR, timeline_path, history_path)
+            }
+        }
+    }
+
+    /// Returns the appropriate timeline directory based on loader type (active vs archived).
+    ///
+    /// This is a convenience method that delegates to either `get_active_timeline_dir`
+    /// or `get_archived_timeline_dir` depending on the layout.
+    pub fn get_timeline_dir(&self) -> String {
+        match self.layout {
+            TimelineLayout::V1Active | TimelineLayout::V2Active => self.get_active_timeline_dir(),
+            TimelineLayout::V1Archived | TimelineLayout::V2Archived => {
+                self.get_archived_timeline_dir()
+            }
         }
     }
 
@@ -92,9 +152,9 @@ impl TimelineLoader {
         selector: &TimelineSelector,
         desc: bool,
     ) -> Result<Vec<Instant>> {
-        match self {
-            TimelineLoader::LayoutOneActive(storage) => {
-                let files = storage.list_files(Some(HUDI_METADATA_DIR)).await?;
+        match self.layout {
+            TimelineLayout::V1Active => {
+                let files = self.storage.list_files(Some(HUDI_METADATA_DIR)).await?;
                 let mut instants = Vec::with_capacity(files.len() / 3);
 
                 for file_info in files {
@@ -118,9 +178,9 @@ impl TimelineLoader {
                     Ok(instants)
                 }
             }
-            TimelineLoader::LayoutTwoActive(storage) => {
+            TimelineLayout::V2Active => {
                 let timeline_dir = self.get_timeline_dir();
-                let files = storage.list_files(Some(&timeline_dir)).await?;
+                let files = self.storage.list_files(Some(&timeline_dir)).await?;
                 let mut instants = Vec::new();
 
                 for file_info in files {
@@ -159,8 +219,10 @@ impl TimelineLoader {
     /// # Behavior
     ///
     /// - Returns empty Vec if this is an active loader (not an archived loader)
-    /// - Returns empty Vec if `TimelineArchivedReadEnabled` config is `false` (default)
-    /// - Attempts to load archived instants if config is `true`, propagating any errors
+    /// - Attempts to load archived instants, propagating any errors
+    ///
+    /// Note: This method assumes the archived loader was created only when
+    /// `TimelineArchivedReadEnabled` is true. The config check is done in the builder.
     ///
     /// # Arguments
     ///
@@ -172,31 +234,18 @@ impl TimelineLoader {
         desc: bool,
     ) -> Result<Vec<Instant>> {
         // Early return for active loaders - they don't have archived parts
-        let storage = match self {
-            TimelineLoader::LayoutOneArchived(storage)
-            | TimelineLoader::LayoutTwoArchived(storage) => storage.clone(),
-            _ => return Ok(Vec::new()),
-        };
-
-        // Check if archived read is enabled - if not, silently return empty
-        let enabled: bool = storage
-            .hudi_configs
-            .get_or_default(TimelineArchivedReadEnabled)
-            .into();
-        if !enabled {
-            return Ok(Vec::new());
+        match self.layout {
+            TimelineLayout::V1Active | TimelineLayout::V2Active => return Ok(Vec::new()),
+            _ => {}
         }
 
-        // Archived read is enabled - attempt to load and propagate any errors
-        let configs: Arc<HudiConfigs> = storage.hudi_configs.clone();
-
-        match self {
-            TimelineLoader::LayoutOneArchived(storage) => {
+        match self.layout {
+            TimelineLayout::V1Archived => {
                 // Resolve archive folder from configs or fallback
-                let archive_dir: String = configs.get_or_default(ArchiveLogFolder).into();
+                let archive_dir: String = self.hudi_configs.get_or_default(ArchiveLogFolder).into();
 
                 // List files and try creating instants through selector
-                let files = storage.list_files(Some(&archive_dir)).await?;
+                let files = self.storage.list_files(Some(&archive_dir)).await?;
                 let mut instants = Vec::new();
                 for file_info in files {
                     if let Ok(instant) = selector.try_create_instant(file_info.name.as_str()) {
@@ -209,12 +258,67 @@ impl TimelineLoader {
                 }
                 Ok(instants)
             }
-            TimelineLoader::LayoutTwoArchived(_) => {
+            TimelineLayout::V2Archived => {
                 // TODO: Implement v2 LSM history reader. For now, return empty.
                 let _ = (selector, desc);
                 Ok(Vec::new())
             }
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Load instant metadata from storage and parse based on the layout version.
+    ///
+    /// Layout Version 1 (v6-v8): JSON format
+    /// Layout Version 2 (v8+): Avro format
+    ///
+    /// Returns the metadata as a JSON Map for uniform processing.
+    pub(crate) async fn load_instant_metadata(
+        &self,
+        instant: &Instant,
+    ) -> Result<Map<String, Value>> {
+        let timeline_dir = self.get_timeline_dir();
+        let path = instant.relative_path_with_base(&timeline_dir)?;
+        let bytes = self.storage.get_file_data(path.as_str()).await?;
+
+        match self.layout {
+            TimelineLayout::V1Active | TimelineLayout::V1Archived => {
+                // Layout 1: JSON format
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    CoreError::Timeline(format!("Failed to parse JSON commit metadata: {}", e))
+                })
+            }
+            TimelineLayout::V2Active | TimelineLayout::V2Archived => {
+                // Layout 2: Avro format
+                let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
+                metadata.to_json_map()
+            }
+        }
+    }
+
+    /// Load instant metadata and return as a JSON string.
+    ///
+    /// Layout Version 1 (v6-v8): Return raw JSON bytes
+    /// Layout Version 2 (v8+): Parse Avro and serialize to JSON
+    pub(crate) async fn load_instant_metadata_as_json(&self, instant: &Instant) -> Result<String> {
+        let timeline_dir = self.get_timeline_dir();
+        let path = instant.relative_path_with_base(&timeline_dir)?;
+        let bytes = self.storage.get_file_data(path.as_str()).await?;
+
+        match self.layout {
+            TimelineLayout::V1Active | TimelineLayout::V1Archived => {
+                // Layout 1: JSON format - return raw bytes as string
+                String::from_utf8(bytes.to_vec()).map_err(|e| {
+                    CoreError::Timeline(format!("Failed to convert JSON bytes to string: {}", e))
+                })
+            }
+            TimelineLayout::V2Active | TimelineLayout::V2Archived => {
+                // Layout 2: Avro format - deserialize then serialize to JSON
+                let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
+                serde_json::to_string(&metadata).map_err(|e| {
+                    CoreError::Timeline(format!("Failed to serialize metadata to JSON: {}", e))
+                })
+            }
         }
     }
 }

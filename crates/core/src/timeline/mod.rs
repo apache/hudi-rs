@@ -27,7 +27,6 @@ use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
-use crate::metadata::commit::HoodieCommitMetadata;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
@@ -213,55 +212,15 @@ impl Timeline {
         Ok(clustering_instants)
     }
 
-    /// Returns true if the timeline uses v8+ Avro format for instant metadata.
-    fn uses_avro_format(&self) -> bool {
-        matches!(
-            self.active_loader,
-            TimelineLoader::LayoutTwoActive(_) | TimelineLoader::LayoutTwoArchived(_)
-        )
-    }
-
-    /// Returns the base directory for timeline instants based on the active loader configuration.
-    fn get_timeline_base_dir(&self) -> String {
-        self.active_loader.get_timeline_dir()
-    }
-
     async fn get_instant_metadata(&self, instant: &Instant) -> Result<Map<String, Value>> {
-        let base_dir = self.get_timeline_base_dir();
-        let path = instant.relative_path_with_base(&base_dir)?;
-        let bytes = self.storage.get_file_data(path.as_str()).await?;
-
-        if self.uses_avro_format() {
-            // v8+ tables use Avro format for instant metadata
-            let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
-            metadata.to_json_map()
-        } else {
-            // pre-v8 tables use JSON format
-            serde_json::from_slice(&bytes)
-                .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
-        }
+        self.active_loader.load_instant_metadata(instant).await
     }
 
     /// Get the instant metadata in JSON format.
     pub async fn get_instant_metadata_in_json(&self, instant: &Instant) -> Result<String> {
-        let base_dir = self.get_timeline_base_dir();
-        let path = instant.relative_path_with_base(&base_dir)?;
-        let bytes = self.storage.get_file_data(path.as_str()).await?;
-
-        if self.uses_avro_format() {
-            // v8+ tables: deserialize Avro, then serialize to JSON
-            let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
-            serde_json::to_string(&metadata).map_err(|e| {
-                CoreError::Timeline(format!(
-                    "Failed to serialize commit metadata to JSON: {}",
-                    e
-                ))
-            })
-        } else {
-            // pre-v8 tables: return raw JSON bytes as string
-            String::from_utf8(bytes.to_vec())
-                .map_err(|e| CoreError::Timeline(format!("Failed to get commit metadata: {}", e)))
-        }
+        self.active_loader
+            .load_instant_metadata_as_json(instant)
+            .await
     }
 
     pub(crate) async fn get_latest_commit_metadata(&self) -> Result<Map<String, Value>> {
@@ -378,14 +337,57 @@ mod tests {
         let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
         let timeline = create_test_timeline(base_url).await;
         assert_eq!(timeline.completed_commits.len(), 2);
-        assert!(matches!(
-            timeline.active_loader,
-            TimelineLoader::LayoutTwoActive(..)
-        ));
-        assert!(matches!(
-            timeline.archived_loader,
-            Some(TimelineLoader::LayoutTwoArchived(..))
-        ));
+        assert!(timeline.active_loader.is_layout_two_active());
+        // Archived loader should be None when TimelineArchivedReadEnabled is false (default)
+        assert!(timeline.archived_loader.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_timeline_v8_with_archived_enabled() {
+        use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
+
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+
+        // Build initial configs with base path and archived read enabled
+        let mut options_map = HashMap::new();
+        options_map.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_url.to_string(),
+        );
+        options_map.insert(
+            TimelineArchivedReadEnabled.as_ref().to_string(),
+            "true".to_string(),
+        );
+
+        let storage = Storage::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::new(options_map.clone())),
+        )
+        .unwrap();
+
+        let table_properties = crate::config::util::parse_data_for_options(
+            &storage
+                .get_file_data(".hoodie/hoodie.properties")
+                .await
+                .unwrap(),
+            "=",
+        )
+        .unwrap();
+        options_map.extend(table_properties);
+        let hudi_configs = Arc::new(HudiConfigs::new(options_map));
+
+        let timeline = TimelineBuilder::new(hudi_configs, storage)
+            .build()
+            .await
+            .unwrap();
+
+        // When TimelineArchivedReadEnabled is true, archived loader should be created
+        assert!(timeline.active_loader.is_layout_two_active());
+        assert!(timeline
+            .archived_loader
+            .as_ref()
+            .map(|l| l.is_layout_two_archived())
+            .unwrap_or(false));
     }
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
@@ -480,7 +482,12 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
-        assert!(err.to_string().contains("Failed to get commit metadata"));
+        // Error message changed to be more specific about JSON parsing
+        assert!(
+            err.to_string()
+                .contains("Failed to parse JSON commit metadata")
+                || err.to_string().contains("EOF while parsing")
+        );
 
         let instant = Instant::from_str("20240402144910683.commit").unwrap();
 
@@ -489,7 +496,12 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Timeline(_)));
-        assert!(err.to_string().contains("Failed to get commit metadata"));
+        // Error message changed to be more specific about JSON parsing
+        assert!(
+            err.to_string()
+                .contains("Failed to parse JSON commit metadata")
+                || err.to_string().contains("expected value")
+        );
     }
 
     #[tokio::test]
