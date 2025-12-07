@@ -48,6 +48,7 @@ pub mod config;
 pub mod error;
 pub mod expr;
 pub mod file_group;
+pub mod keygen;
 pub mod merge;
 pub mod metadata;
 mod record;
