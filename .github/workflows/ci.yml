@@ -54,7 +54,7 @@ jobs:
     outputs:
       should_run: ${{ steps.filter.outputs.should_run }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Check if integration tests needed
         id: filter
         run: |
@@ -85,7 +85,7 @@ jobs:
     if: needs.check-integration-needed.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -119,7 +119,7 @@ jobs:
           key: integration-prep-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml') }}
           restore-keys: integration-prep-${{ runner.os }}-
 
-      - name: Build and cache runner image with bindings
+      - name: Build runner image and pre-compile bindings
         run: |
           cd demo
           export DOCKER_BUILDKIT=1
@@ -134,14 +134,14 @@ jobs:
             --load \
             ./infra/runner
 
-          # Rotate cache to avoid size growth (atomic rename to prevent data loss)
+          # Rotate cache to avoid size growth
           if [ -d /tmp/.buildx-cache ]; then
             rm -rf /tmp/.buildx-cache-old || true
             mv /tmp/.buildx-cache /tmp/.buildx-cache-old || true
           fi
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
-          # Start the runner container
+          # Start the runner container (mounts host directories for build cache)
           docker compose up -d runner
 
           # Wait for container ready
@@ -159,28 +159,45 @@ jobs:
             exit 1
           fi
 
-          # Pre-compile bindings once
+          # Pre-compile bindings - artifacts will be in the mounted volume (host filesystem)
           if ! docker compose exec -T runner /bin/bash -c "
             export PATH=/root/.local/bin:\$PATH && \
             source /opt/.venv/bin/activate && \
             cd /opt/hudi-rs && \
             make setup develop
           "; then
-            echo "Failed to build bindings, not creating cached image"
+            echo "Failed to build bindings"
             docker compose down -v
             exit 1
           fi
 
-          # Save built image as artifact
-          docker commit runner hudi-rs-runner:cached
-          docker save hudi-rs-runner:cached | gzip > /tmp/runner-image.tar.gz
+          # Verify bindings were built successfully
+          docker compose exec -T runner /bin/bash -c "
+            source /opt/.venv/bin/activate && \
+            python -c 'import hudi; print(\"Python bindings OK\")'
+          "
+
           docker compose down -v
 
-      - name: Upload built runner image
+          # Save the runner image (without build artifacts - those are in cache)
+          docker save demo-runner:latest | gzip > /tmp/runner-image.tar.gz
+
+      - name: Upload runner image
         uses: actions/upload-artifact@v4
         with:
           name: runner-image
           path: /tmp/runner-image.tar.gz
+          retention-days: 1
+
+      - name: Upload build cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-build-cache
+          path: |
+            target
+            python/target
+            .cargo
+            .uv-cache
           retention-days: 1
 
       - name: Fix cache ownership
@@ -306,41 +323,37 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download built runner image
-        uses: actions/download-artifact@v5
+      - name: Download runner image
+        uses: actions/download-artifact@v4
         with:
           name: runner-image
           path: /tmp
 
+      - name: Download build cache
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-build-cache
+          path: .
+
       - name: Load runner image
-        run: docker load -i /tmp/runner-image.tar.gz
+        run: |
+          docker load -i /tmp/runner-image.tar.gz
+          # Tag it so compose uses the pre-built image
+          docker tag demo-runner:latest demo-runner:cached
 
       - name: Pre-pull base images
-        # Pre-pull minio even though it was pulled in prepare job
-        # This ensures the image is available in case cache misses occur
         run: docker pull quay.io/minio/minio:latest
 
-      - name: Prepare cache directories
+      - name: Fix cache ownership
         run: |
+          # Ensure directories exist and have correct ownership for container access
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
-          sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
-
-      - name: Cache integration build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-            .cargo/registry
-            .cargo/git
-            python/target
-            .uv-cache
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml') }}
-          restore-keys: integration-${{ runner.os }}-
+          sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache || true
 
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
-          ./ci_run.sh ${{ matrix.app-path }} --use-cached-image
+          ./ci_run.sh ${{ matrix.app-path }} --use-cached-build
 
       - name: Fix cache ownership
         if: always()
@@ -353,7 +366,7 @@ jobs:
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v4
         with:
           pattern: cov-report-*
           merge-multiple: true

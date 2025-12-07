@@ -54,6 +54,7 @@ services:
 
   # execution environment for running tests
   runner:
+    image: demo-runner:latest
     build:
       context: ./infra/runner
     container_name: runner

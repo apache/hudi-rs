@@ -25,20 +25,24 @@ export COMPOSE_DOCKER_CLI_BUILD=1
 export HOST_UID=$(id -u)
 export HOST_GID=$(id -g)
 
-# Check for cached image flag
-USE_CACHED_IMAGE=false
-if [ "$2" = "--use-cached-image" ]; then
-  USE_CACHED_IMAGE=true
+# Check for cached build flag (pre-compiled artifacts available in mounted volume)
+USE_CACHED_BUILD=false
+if [ "$2" = "--use-cached-build" ]; then
+  USE_CACHED_BUILD=true
 fi
 
 # Start services with or without rebuild
-if [ "$USE_CACHED_IMAGE" = "true" ]; then
-  if docker images -q hudi-rs-runner:cached 2>/dev/null | grep -q .; then
-    echo "Using pre-built cached runner image"
-    docker tag hudi-rs-runner:cached demo-runner:latest
+if [ "$USE_CACHED_BUILD" = "true" ]; then
+  # In CI, the runner image is pre-built and tagged as demo-runner:cached
+  if docker images -q demo-runner:cached 2>/dev/null | grep -q .; then
+    echo "Using pre-built runner image (demo-runner:cached)"
+    docker tag demo-runner:cached demo-runner:latest
+    docker compose up -d --no-build
+  elif docker images -q demo-runner:latest 2>/dev/null | grep -q .; then
+    echo "Using existing demo-runner:latest image"
     docker compose up -d --no-build
   else
-    echo "WARNING: --use-cached-image specified but hudi-rs-runner:cached not found"
+    echo "WARNING: --use-cached-build specified but no pre-built image found"
     echo "Falling back to building runner image from scratch"
     docker compose up --build -d
   fi
@@ -61,28 +65,28 @@ if [ $attempt -eq $max_attempts ]; then
   exit 1
 fi
 
-# Validate cached image has bindings if using cached image
-if [ "$USE_CACHED_IMAGE" = "true" ]; then
-  echo "Validating cached image has Python bindings..."
+# Validate that Python bindings are available (either pre-built in cache or need to be built)
+if [ "$USE_CACHED_BUILD" = "true" ]; then
+  echo "Validating cached build has Python bindings..."
   if ! docker compose exec -T runner /bin/bash -c "source /opt/.venv/bin/activate && python -c 'import hudi' 2>/dev/null"; then
-    echo "ERROR: Cached image is missing Python bindings"
-    echo "The cached image may be corrupted. Please rebuild without --use-cached-image flag"
-    docker compose down -v
-    exit 1
+    echo "WARNING: Python bindings not found in cached build"
+    echo "Build artifacts may not have been restored correctly. Rebuilding..."
+    USE_CACHED_BUILD=false
+  else
+    echo "Cached build validation successful - Python bindings available"
   fi
-  echo "Cached image validation successful"
 fi
 
 app_path=$1
 if [ -z "$app_path" ]; then
-  echo "Usage: $0 <path_to_app>"
+  echo "Usage: $0 <path_to_app> [--use-cached-build]"
   exit 1
 fi
 
 app_path_in_container="/opt/hudi-rs/demo/apps/$app_path"
 if [ "$app_path" = "datafusion" ]; then
-  if [ "$USE_CACHED_IMAGE" = "true" ]; then
-    # Bindings already built in cached image
+  if [ "$USE_CACHED_BUILD" = "true" ]; then
+    # Bindings already built in cached build artifacts (mounted volume)
     docker compose exec -T runner /bin/bash -c "
       source /opt/.venv/bin/activate && \
       cd $app_path_in_container && \
@@ -98,15 +102,13 @@ if [ "$app_path" = "datafusion" ]; then
       "
   fi
 elif [ "$app_path" = "hudi-table-api/rust" ]; then
-  if [ "$USE_CACHED_IMAGE" = "true" ]; then
-    # Bindings already built in cached image
+  if [ "$USE_CACHED_BUILD" = "true" ]; then
     docker compose exec -T runner /bin/bash -c "
       source /opt/.venv/bin/activate && \
       cd $app_path_in_container && \
       cargo run -- --no-build --no-tests
       "
   else
-    # Build bindings first
     docker compose exec -T runner /bin/bash -c "
       source /opt/.venv/bin/activate && \
       cd /opt/hudi-rs && make setup develop && \
@@ -115,15 +117,13 @@ elif [ "$app_path" = "hudi-table-api/rust" ]; then
       "
   fi
 elif [ "$app_path" = "hudi-table-api/python" ]; then
-  if [ "$USE_CACHED_IMAGE" = "true" ]; then
-    # Bindings already built in cached image
+  if [ "$USE_CACHED_BUILD" = "true" ]; then
     docker compose exec -T runner /bin/bash -c "
       source /opt/.venv/bin/activate && \
       cd $app_path_in_container && \
       python -m src.main
       "
   else
-    # Build bindings first
     docker compose exec -T runner /bin/bash -c "
       source /opt/.venv/bin/activate && \
       cd /opt/hudi-rs && make setup develop && \
@@ -135,7 +135,7 @@ elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
   docker compose exec -T runner /bin/bash -c "
     cd /opt/hudi-rs/cpp && ../build-wrapper.sh cargo build --release && \
     cd $app_path_in_container && \
-    mkdir build && cd build && \
+    mkdir -p build && cd build && \
     cmake .. && \
     make && \
     ./file_group_api_cpp
