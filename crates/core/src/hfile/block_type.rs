@@ -118,3 +118,110 @@ impl std::fmt::Display for HFileBlockType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_magic_bytes() {
+        assert_eq!(HFileBlockType::Data.magic(), b"DATABLK*");
+        assert_eq!(HFileBlockType::LeafIndex.magic(), b"IDXLEAF2");
+        assert_eq!(HFileBlockType::Meta.magic(), b"METABLKc");
+        assert_eq!(HFileBlockType::IntermediateIndex.magic(), b"IDXINTE2");
+        assert_eq!(HFileBlockType::RootIndex.magic(), b"IDXROOT2");
+        assert_eq!(HFileBlockType::FileInfo.magic(), b"FILEINF2");
+        assert_eq!(HFileBlockType::Trailer.magic(), b"TRABLK\"$");
+    }
+
+    #[test]
+    fn test_from_magic_data_block() {
+        let magic = b"DATABLK*";
+        assert_eq!(
+            HFileBlockType::from_magic(magic).unwrap(),
+            HFileBlockType::Data
+        );
+    }
+
+    #[test]
+    fn test_from_magic_data_block_encoded() {
+        // Encoded data block magic
+        let magic = b"DATABLKE";
+        assert_eq!(
+            HFileBlockType::from_magic(magic).unwrap(),
+            HFileBlockType::Data
+        );
+    }
+
+    #[test]
+    fn test_from_magic_all_types() {
+        assert_eq!(
+            HFileBlockType::from_magic(b"IDXLEAF2").unwrap(),
+            HFileBlockType::LeafIndex
+        );
+        assert_eq!(
+            HFileBlockType::from_magic(b"METABLKc").unwrap(),
+            HFileBlockType::Meta
+        );
+        assert_eq!(
+            HFileBlockType::from_magic(b"IDXINTE2").unwrap(),
+            HFileBlockType::IntermediateIndex
+        );
+        assert_eq!(
+            HFileBlockType::from_magic(b"IDXROOT2").unwrap(),
+            HFileBlockType::RootIndex
+        );
+        assert_eq!(
+            HFileBlockType::from_magic(b"FILEINF2").unwrap(),
+            HFileBlockType::FileInfo
+        );
+        assert_eq!(
+            HFileBlockType::from_magic(b"TRABLK\"$").unwrap(),
+            HFileBlockType::Trailer
+        );
+    }
+
+    #[test]
+    fn test_from_magic_too_short() {
+        let err = HFileBlockType::from_magic(b"DATA").unwrap_err();
+        assert!(matches!(err, HFileError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_from_magic_invalid() {
+        let err = HFileBlockType::from_magic(b"INVALID!").unwrap_err();
+        assert!(matches!(err, HFileError::InvalidBlockMagic { .. }));
+    }
+
+    #[test]
+    fn test_check_magic_success() {
+        let bytes = b"DATABLK*extra_data_here";
+        assert!(HFileBlockType::Data.check_magic(bytes).is_ok());
+    }
+
+    #[test]
+    fn test_check_magic_too_short() {
+        let err = HFileBlockType::Data.check_magic(b"DATA").unwrap_err();
+        assert!(matches!(err, HFileError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn test_check_magic_mismatch() {
+        let err = HFileBlockType::Data.check_magic(b"IDXROOT2").unwrap_err();
+        assert!(matches!(err, HFileError::InvalidBlockMagic { .. }));
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!(format!("{}", HFileBlockType::Data), "DATA");
+        assert_eq!(format!("{}", HFileBlockType::LeafIndex), "LEAF_INDEX");
+        assert_eq!(format!("{}", HFileBlockType::Meta), "META");
+        assert_eq!(
+            format!("{}", HFileBlockType::IntermediateIndex),
+            "INTERMEDIATE_INDEX"
+        );
+        assert_eq!(format!("{}", HFileBlockType::RootIndex), "ROOT_INDEX");
+        assert_eq!(format!("{}", HFileBlockType::FileInfo), "FILE_INFO");
+        assert_eq!(format!("{}", HFileBlockType::Trailer), "TRAILER");
+    }
+}

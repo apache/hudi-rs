@@ -1754,4 +1754,150 @@ mod tests {
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Eof);
     }
+
+    // ================== Additional Coverage Tests ==================
+
+    #[test]
+    fn test_is_seeked() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert!(!reader.is_seeked());
+        reader.seek_to_first().expect("Failed to seek");
+        assert!(reader.is_seeked());
+    }
+
+    #[test]
+    fn test_get_key_value_not_seeked() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Not seeked yet
+        let result = reader.get_key_value().expect("Failed to get kv");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_next_not_seeked() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // next() without seek should return false
+        assert!(!reader.next().expect("Failed to next"));
+    }
+
+    #[test]
+    fn test_seek_before_first_key() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        reader.seek_to_first().expect("Failed to seek");
+
+        // Seek to a key before the first key in the file
+        let lookup = Utf8Key::new("aaa"); // Before "hudi-key-000000000"
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::BeforeFileFirstKey);
+    }
+
+    #[test]
+    fn test_seek_in_range() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        reader.seek_to_first().expect("Failed to seek");
+
+        // First move past the first key to avoid BeforeBlockFirstKey result
+        let lookup = Utf8Key::new("hudi-key-000000100");
+        reader.seek_to(&lookup).expect("Failed to seek");
+
+        // Now seek to a key that doesn't exist but is in range (between 100 and 101)
+        let lookup = Utf8Key::new("hudi-key-000000100a");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::InRange);
+    }
+
+    #[test]
+    fn test_lookup_records_empty_keys() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let results = reader.lookup_records(&[]).expect("Failed to lookup");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_records_not_found() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let results = reader
+            .lookup_records(&["nonexistent-key"])
+            .expect("Failed to lookup");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "nonexistent-key");
+        assert!(results[0].1.is_none());
+    }
+
+    #[test]
+    fn test_lookup_records_found() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let results = reader
+            .lookup_records(&["hudi-key-000000000", "hudi-key-000000001"])
+            .expect("Failed to lookup");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "hudi-key-000000000");
+        assert!(results[0].1.is_some());
+        assert_eq!(results[1].0, "hudi-key-000000001");
+        assert!(results[1].1.is_some());
+    }
+
+    #[test]
+    fn test_collect_records_by_prefix_no_matches() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let records = reader
+            .collect_records_by_prefix("nonexistent-prefix-")
+            .expect("Failed to collect");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_collect_records_by_prefix_found() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // All keys start with "hudi-key-00000000" for keys 0-9
+        let records = reader
+            .collect_records_by_prefix("hudi-key-00000000")
+            .expect("Failed to collect");
+        // Keys 0-9 match this prefix
+        assert_eq!(records.len(), 10);
+    }
+
+    #[test]
+    fn test_trailer_info() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        assert_eq!(reader.num_entries(), 5000);
+        // Just verify we can access trailer info
+        assert!(reader.num_entries() > 0);
+    }
+
+    #[test]
+    fn test_seek_result_enum() {
+        // Test SeekResult values
+        assert_eq!(SeekResult::BeforeBlockFirstKey as i32, -2);
+        assert_eq!(SeekResult::BeforeFileFirstKey as i32, -1);
+        assert_eq!(SeekResult::Found as i32, 0);
+        assert_eq!(SeekResult::InRange as i32, 1);
+        assert_eq!(SeekResult::Eof as i32, 2);
+
+        // Test Debug implementation
+        let _ = format!("{:?}", SeekResult::Found);
+    }
 }

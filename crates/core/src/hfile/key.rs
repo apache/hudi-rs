@@ -301,4 +301,168 @@ mod tests {
         assert!(k1 < k2);
         assert_eq!(k1, k3);
     }
+
+    #[test]
+    fn test_utf8_key_from_str() {
+        let k1: Utf8Key = "test".into();
+        let k2 = Utf8Key::from("test");
+        assert_eq!(k1, k2);
+        assert_eq!(k1.as_str(), "test");
+        assert_eq!(k1.as_bytes(), b"test");
+    }
+
+    #[test]
+    fn test_utf8_key_from_string() {
+        let s = String::from("hello");
+        let k: Utf8Key = s.into();
+        assert_eq!(k.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_utf8_key_display() {
+        let k = Utf8Key::new("mykey");
+        assert_eq!(format!("{}", k), "Utf8Key{mykey}");
+    }
+
+    #[test]
+    fn test_key_new() {
+        // Create a key with length prefix: 2 bytes for length (0, 4) + 4 bytes content "test"
+        let bytes = vec![0, 4, b't', b'e', b's', b't', 0, 0]; // extra bytes at end
+        let key = Key::new(&bytes, 0, 6);
+
+        assert_eq!(key.content_length(), 4);
+        assert_eq!(key.content(), b"test");
+        assert_eq!(key.content_as_str().unwrap(), "test");
+        assert_eq!(key.length(), 6);
+    }
+
+    #[test]
+    fn test_key_from_bytes() {
+        let bytes = vec![0, 3, b'a', b'b', b'c'];
+        let key = Key::from_bytes(bytes);
+
+        assert_eq!(key.content_length(), 3);
+        assert_eq!(key.content(), b"abc");
+    }
+
+    #[test]
+    fn test_key_content_empty() {
+        // Test with buffer too small for length prefix
+        let bytes = vec![0];
+        let key = Key::new(&bytes, 0, 1);
+        assert_eq!(key.content_length(), 0);
+    }
+
+    #[test]
+    fn test_key_content_out_of_bounds() {
+        // Key claims content length of 10 but only has 3 bytes
+        let bytes = vec![0, 10, b'a', b'b', b'c'];
+        let key = Key::from_bytes(bytes);
+        // content() should return empty slice when out of bounds
+        assert_eq!(key.content(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_key_equality() {
+        let bytes1 = vec![0, 3, b'a', b'b', b'c'];
+        let bytes2 = vec![0, 3, b'a', b'b', b'c'];
+        let bytes3 = vec![0, 3, b'x', b'y', b'z'];
+
+        let k1 = Key::from_bytes(bytes1);
+        let k2 = Key::from_bytes(bytes2);
+        let k3 = Key::from_bytes(bytes3);
+
+        assert_eq!(k1, k2);
+        assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn test_key_ordering() {
+        let k1 = Key::from_bytes(vec![0, 3, b'a', b'b', b'c']);
+        let k2 = Key::from_bytes(vec![0, 3, b'a', b'b', b'd']);
+        let k3 = Key::from_bytes(vec![0, 3, b'a', b'b', b'c']);
+
+        assert!(k1 < k2);
+        assert_eq!(k1.cmp(&k3), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_key_hash() {
+        use std::collections::HashSet;
+
+        let k1 = Key::from_bytes(vec![0, 3, b'a', b'b', b'c']);
+        let k2 = Key::from_bytes(vec![0, 3, b'a', b'b', b'c']);
+
+        let mut set = HashSet::new();
+        set.insert(k1);
+        assert!(set.contains(&k2));
+    }
+
+    #[test]
+    fn test_key_display() {
+        let k1 = Key::from_bytes(vec![0, 4, b't', b'e', b's', b't']);
+        assert_eq!(format!("{}", k1), "Key{test}");
+
+        // Binary key (invalid UTF-8)
+        let k2 = Key::from_bytes(vec![0, 3, 0xFF, 0xFE, 0xFD]);
+        assert_eq!(format!("{}", k2), "Key{<binary>}");
+    }
+
+    #[test]
+    fn test_key_bytes() {
+        let original = vec![0, 3, b'a', b'b', b'c'];
+        let key = Key::from_bytes(original.clone());
+        assert_eq!(key.bytes(), &original);
+    }
+
+    #[test]
+    fn test_keyvalue_parse() {
+        // Build a KeyValue structure:
+        // 4 bytes key length (11) + 4 bytes value length (5)
+        // + key: 2 bytes content length (4) + 4 bytes "test" + 5 extra key bytes
+        // + value: 5 bytes "value"
+        // + 1 byte MVCC timestamp
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&11i32.to_be_bytes()); // key length
+        bytes.extend_from_slice(&5i32.to_be_bytes()); // value length
+        bytes.extend_from_slice(&[0, 4]); // key content length (4)
+        bytes.extend_from_slice(b"test"); // key content
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0]); // extra key bytes
+        bytes.extend_from_slice(b"value"); // value
+        bytes.push(0); // MVCC timestamp
+
+        let kv = KeyValue::parse(&bytes, 0);
+
+        assert_eq!(kv.key().content_as_str().unwrap(), "test");
+        assert_eq!(kv.value(), b"value");
+        assert_eq!(kv.key_length(), 11);
+        assert_eq!(kv.value_length(), 5);
+        assert_eq!(kv.record_size(), 8 + 11 + 5 + 1); // header + key + value + mvcc
+    }
+
+    #[test]
+    fn test_keyvalue_display() {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&6i32.to_be_bytes()); // key length
+        bytes.extend_from_slice(&3i32.to_be_bytes()); // value length
+        bytes.extend_from_slice(&[0, 4]); // key content length
+        bytes.extend_from_slice(b"test"); // key content
+        bytes.extend_from_slice(b"val"); // value
+        bytes.push(0); // MVCC
+
+        let kv = KeyValue::parse(&bytes, 0);
+        assert!(format!("{}", kv).contains("test"));
+    }
+
+    #[test]
+    fn test_compare_keys() {
+        let key = Key::from_bytes(vec![0, 3, b'a', b'b', b'c']);
+        let lookup1 = Utf8Key::new("abc");
+        let lookup2 = Utf8Key::new("abd");
+        let lookup3 = Utf8Key::new("abb");
+
+        assert_eq!(compare_keys(&key, &lookup1), Ordering::Equal);
+        assert_eq!(compare_keys(&key, &lookup2), Ordering::Less);
+        assert_eq!(compare_keys(&key, &lookup3), Ordering::Greater);
+    }
 }
