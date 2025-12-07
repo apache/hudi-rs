@@ -85,3 +85,9 @@ async-trait = { version = "~0.1" }
 dashmap = { version = "~6.1" }
 futures = { version = "~0.3" }
 tokio = { version = "~1.45", features = ["rt-multi-thread"] }
+
+# protobuf
+prost = { version = "~0.13" }
+
+# compression
+flate2 = { version = "^1.1" }
