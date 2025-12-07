@@ -25,6 +25,7 @@ use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+#[cfg(not(tarpaulin_include))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineManifest {
     pub version: i64,
@@ -38,6 +39,7 @@ pub struct TimelineManifest {
 /// - `min_instant`/`max_instant`: smallest/largest instant timestamps covered
 /// - `level`: LSM level where this file resides
 /// - `file_size`: size in bytes of the file
+#[cfg(not(tarpaulin_include))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub file_name: String,
@@ -49,10 +51,12 @@ pub struct ManifestEntry {
 
 /// LSM tree for v8+ timeline history management.
 /// The paths are resolved from configs on-the-fly via `hoodie.timeline.path` and `hoodie.timeline.history.path`.
+#[cfg(not(tarpaulin_include))]
 pub struct LSMTree {
     storage: Arc<Storage>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl LSMTree {
     pub fn new(storage: Arc<Storage>) -> Self {
         Self { storage }

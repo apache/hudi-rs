@@ -520,7 +520,7 @@ mod tests {
         // Test parsing v6 COW table commit metadata (JSON format)
         let file_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/commit_metadata/v6_commit.json"
+            "/tests/data/commit_metadata/v6_commit.json"
         );
         let bytes = std::fs::read(file_path).expect("Failed to read test fixture");
 
@@ -555,7 +555,7 @@ mod tests {
         // Test parsing v8 MOR table deltacommit metadata (Avro format)
         let file_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/commit_metadata/v8_deltacommit.avro"
+            "/tests/data/commit_metadata/v8_deltacommit.avro"
         );
         let bytes = std::fs::read(file_path).expect("Failed to read test fixture");
 
