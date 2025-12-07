@@ -30,7 +30,7 @@ jobs:
   check-code:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Check license header
         uses: apache/skywalking-eyes/header@v0.8.0
