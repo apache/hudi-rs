@@ -25,26 +25,19 @@ use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
-use crate::file_group::record_batches::RecordBatches;
 use crate::storage::reader::StorageReader;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
 use crate::Result;
-use bytes::BytesMut;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::io::{self, Read, Seek};
 use std::sync::Arc;
 
-pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024 * 1024;
-
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct LogFileReader<R: Read + Seek> {
     hudi_configs: Arc<HudiConfigs>,
-    storage: Arc<Storage>,
     reader: R,
-    buffer: BytesMut,
     timezone: String,
 }
 
@@ -60,9 +53,7 @@ impl LogFileReader<StorageReader> {
             .into();
         Ok(Self {
             hudi_configs,
-            storage,
             reader,
-            buffer: BytesMut::with_capacity(DEFAULT_BUFFER_SIZE),
             timezone,
         })
     }
@@ -153,14 +144,14 @@ impl<R: Read + Seek> LogFileReader<R> {
         BlockType::try_from(type_buf)
     }
 
-    /// First, read 4 bytes for the number of entries in the metadata section (header or footer).
+    /// Read block metadata (header or footer).
     ///
-    /// Then for each entry,
-    /// 1. Read 4 bytes for the key
-    /// 2. Read 4 bytes for the value's length
-    /// 3. Read the bytes of the length for the value
-    ///
-    /// See also [`BlockMetadataKey`].
+    /// Format:
+    /// 1. 4 bytes: number of entries
+    /// 2. For each entry:
+    ///    - 4 bytes: key ordinal (see [`BlockMetadataKey`])
+    ///    - 4 bytes: value length
+    ///    - N bytes: value string
     fn read_block_metadata(
         &mut self,
         metadata_type: BlockMetadataType,
@@ -250,18 +241,15 @@ impl<R: Read + Seek> LogFileReader<R> {
                 .seek(SeekFrom::Start(target))
                 .map_err(CoreError::ReadLogFileError)?;
 
-            return Ok(Some(LogBlock {
+            return Ok(Some(LogBlock::new_skipped(
                 format_version,
                 block_type,
                 header,
-                record_batches: RecordBatches::new(),
-                footer: HashMap::new(),
-                skipped: true,
-            }));
+            )));
         }
 
         let decoder = Decoder::new(self.hudi_configs.clone());
-        let record_batches = decoder.decode_content(
+        let content = decoder.decode_content(
             self.reader.by_ref(),
             &format_version,
             block_length,
@@ -271,20 +259,20 @@ impl<R: Read + Seek> LogFileReader<R> {
         let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
         let _ = self.read_total_block_length(&format_version)?;
 
-        Ok(Some(LogBlock {
+        Ok(Some(LogBlock::new(
             format_version,
             block_type,
             header,
-            record_batches,
+            content,
             footer,
-            skipped: false,
-        }))
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::table::HudiTableConfig;
     use crate::file_group::log_file::log_block::CommandBlock;
     use crate::storage::util::parse_uri;
     use apache_avro::schema::Schema as AvroSchema;
@@ -350,7 +338,7 @@ mod tests {
         assert!(block.schema().is_ok());
         assert!(block.command_block_type().is_err());
 
-        let batches = block.record_batches.data_batches.as_slice();
+        let batches = block.record_batches().unwrap().data_batches.as_slice();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
 
@@ -376,7 +364,7 @@ mod tests {
         assert!(block.schema().is_ok());
         assert!(block.command_block_type().is_err());
 
-        let batches = &block.record_batches;
+        let batches = block.record_batches().unwrap();
         assert_eq!(batches.num_data_batches(), 1);
         assert_eq!(batches.num_data_rows(), 1);
 
@@ -427,10 +415,11 @@ mod tests {
         );
 
         // Check record batches
-        assert_eq!(block.record_batches.num_data_batches(), 0);
-        assert_eq!(block.record_batches.num_delete_batches(), 1);
-        assert_eq!(block.record_batches.num_data_rows(), 0);
-        assert_eq!(block.record_batches.num_delete_rows(), 3);
+        let batches = block.record_batches().unwrap();
+        assert_eq!(batches.num_data_batches(), 0);
+        assert_eq!(batches.num_delete_batches(), 1);
+        assert_eq!(batches.num_data_rows(), 0);
+        assert_eq!(batches.num_delete_rows(), 3);
 
         // Check footer
         assert!(block.footer.is_empty());
@@ -476,11 +465,8 @@ mod tests {
         );
         assert_eq!(block.command_block_type()?, CommandBlock::Rollback);
 
-        // Check record batches
-        assert_eq!(block.record_batches.num_data_batches(), 0);
-        assert_eq!(block.record_batches.num_delete_batches(), 0);
-        assert_eq!(block.record_batches.num_data_rows(), 0);
-        assert_eq!(block.record_batches.num_delete_rows(), 0);
+        // Command blocks have no record content
+        assert!(block.record_batches().is_none());
 
         // Check footer
         assert!(block.footer.is_empty());
@@ -502,8 +488,8 @@ mod tests {
         assert!(maybe_block.is_some(), "Expected a block to be read");
         let block = maybe_block.unwrap();
         assert!(block.skipped, "Block should be marked as skipped");
-        assert_eq!(block.record_batches.num_data_batches(), 0);
-        assert_eq!(block.record_batches.num_delete_batches(), 0);
+        // Skipped blocks have empty content
+        assert!(block.record_batches().is_none());
 
         // next call should hit EOF
         let next = reader.read_next_block(&instant_range)?;
