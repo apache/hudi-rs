@@ -243,7 +243,12 @@ impl Instant {
             (_, State::Completed) => {
                 // For v8+ completed instants with completed_timestamp, use the underscore format
                 if let Some(completed_ts) = &self.completed_timestamp {
-                    format!("{}_{}.{}", self.timestamp, completed_ts, self.action.as_ref())
+                    format!(
+                        "{}_{}.{}",
+                        self.timestamp,
+                        completed_ts,
+                        self.action.as_ref()
+                    )
                 } else {
                     format!("{}.{}", self.timestamp, self.action.as_ref())
                 }

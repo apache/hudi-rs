@@ -237,7 +237,10 @@ impl Timeline {
             // v8+ tables: deserialize Avro, then serialize to JSON
             let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
             serde_json::to_string(&metadata).map_err(|e| {
-                CoreError::Timeline(format!("Failed to serialize commit metadata to JSON: {}", e))
+                CoreError::Timeline(format!(
+                    "Failed to serialize commit metadata to JSON: {}",
+                    e
+                ))
             })
         } else {
             // pre-v8 tables: return raw JSON bytes as string

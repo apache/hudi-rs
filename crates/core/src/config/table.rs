@@ -180,8 +180,7 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineTimezone => Some(HudiConfigValue::String(
                 TimelineTimezoneValue::UTC.as_ref().to_string(),
             )),
-            Self::ArchiveLogFolder =>
-                Some(HudiConfigValue::String(".hoodie/archived".to_string())),
+            Self::ArchiveLogFolder => Some(HudiConfigValue::String(".hoodie/archived".to_string())),
             Self::TimelinePath => Some(HudiConfigValue::String("timeline".to_string())),
             Self::TimelineHistoryPath => Some(HudiConfigValue::String("history".to_string())),
             _ => None,

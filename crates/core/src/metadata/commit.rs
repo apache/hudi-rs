@@ -153,18 +153,15 @@ impl HoodieCommitMetadata {
         })?;
 
         // The commit metadata file should contain exactly one record
-        for value_result in reader {
-            let value = value_result.map_err(|e| {
-                CoreError::CommitMetadata(format!("Failed to read Avro record: {}", e))
-            })?;
-            return from_value::<Self>(&value).map_err(|e| {
-                CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {}", e))
-            });
-        }
+        let mut records = reader;
+        let value = records
+            .next()
+            .ok_or_else(|| CoreError::CommitMetadata("Avro file contains no records".to_string()))?
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to read Avro record: {}", e)))?;
 
-        Err(CoreError::CommitMetadata(
-            "Avro file contains no records".to_string(),
-        ))
+        from_value::<Self>(&value).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {}", e))
+        })
     }
 
     /// Convert commit metadata to a JSON Map for compatibility with existing code
@@ -515,5 +512,39 @@ mod tests {
         let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
         let count = metadata.iter_replace_file_ids().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_avro_file_contains_single_record() {
+        use apache_avro::Reader as AvroReader;
+        use std::io::Cursor;
+
+        // Read actual v8 deltacommit file from test data
+        let file_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test/data/quickstart_trips_table/mor/avro/v8_trips_8i1u/.hoodie/timeline/20250713011913147_20250713011913490.deltacommit"
+        );
+
+        if !std::path::Path::new(file_path).exists() {
+            // Skip test if file doesn't exist
+            return;
+        }
+
+        let bytes = std::fs::read(file_path).expect("Failed to read test file");
+        let cursor = Cursor::new(&bytes);
+        let reader = AvroReader::new(cursor).expect("Failed to create Avro reader");
+
+        // Count the number of records
+        let mut count = 0;
+        for value_result in reader {
+            value_result.expect("Failed to read record");
+            count += 1;
+        }
+
+        // Verify that the file contains exactly one record
+        assert_eq!(
+            count, 1,
+            "Avro commit metadata file should contain exactly 1 record"
+        );
     }
 }

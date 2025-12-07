@@ -39,6 +39,7 @@ pub enum TimelineLoader {
     LayoutTwoArchived(Arc<Storage>),
 }
 
+#[allow(dead_code)]
 impl TimelineLoader {
     /// Returns the storage for this loader.
     fn storage(&self) -> &Arc<Storage> {
@@ -58,7 +59,8 @@ impl TimelineLoader {
             TimelineLoader::LayoutOneActive(_) | TimelineLoader::LayoutOneArchived(_) => {
                 HUDI_METADATA_DIR.to_string()
             }
-            TimelineLoader::LayoutTwoActive(storage) | TimelineLoader::LayoutTwoArchived(storage) => {
+            TimelineLoader::LayoutTwoActive(storage)
+            | TimelineLoader::LayoutTwoArchived(storage) => {
                 let timeline_path: String =
                     storage.hudi_configs.get_or_default(TimelinePath).into();
                 format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
@@ -70,12 +72,18 @@ impl TimelineLoader {
     /// Resolves from configs: `.hoodie/{timeline_path}/{history_path}`
     fn get_history_dir(&self) -> Option<String> {
         match self {
-            TimelineLoader::LayoutTwoActive(storage) | TimelineLoader::LayoutTwoArchived(storage) => {
+            TimelineLoader::LayoutTwoActive(storage)
+            | TimelineLoader::LayoutTwoArchived(storage) => {
                 let timeline_path: String =
                     storage.hudi_configs.get_or_default(TimelinePath).into();
-                let history_path: String =
-                    storage.hudi_configs.get_or_default(TimelineHistoryPath).into();
-                Some(format!("{}/{}/{}", HUDI_METADATA_DIR, timeline_path, history_path))
+                let history_path: String = storage
+                    .hudi_configs
+                    .get_or_default(TimelineHistoryPath)
+                    .into();
+                Some(format!(
+                    "{}/{}/{}",
+                    HUDI_METADATA_DIR, timeline_path, history_path
+                ))
             }
             _ => None,
         }

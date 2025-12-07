@@ -60,13 +60,21 @@ impl LSMTree {
 
     /// Returns the timeline directory path, resolved from configs.
     pub fn timeline_dir(&self) -> String {
-        let timeline_path: String = self.storage.hudi_configs.get_or_default(TimelinePath).into();
+        let timeline_path: String = self
+            .storage
+            .hudi_configs
+            .get_or_default(TimelinePath)
+            .into();
         format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
     }
 
     /// Returns the history directory path, resolved from configs.
     pub fn history_dir(&self) -> String {
-        let timeline_path: String = self.storage.hudi_configs.get_or_default(TimelinePath).into();
+        let timeline_path: String = self
+            .storage
+            .hudi_configs
+            .get_or_default(TimelinePath)
+            .into();
         let history_path: String = self
             .storage
             .hudi_configs
