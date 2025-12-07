@@ -23,11 +23,11 @@
 //! **Example**
 //!
 //! ```rust
-//! use hudi_core::config::read::HudiReadConfig::{AsOfTimestamp, InputPartitions};
+//! use hudi_core::config::read::HudiReadConfig::InputPartitions;
 //! use hudi_core::table::Table as HudiTable;
 //!
-//! let options = [(InputPartitions, "2"), (AsOfTimestamp, "20240101010100000")];
-//! HudiTable::new_with_options("/tmp/hudi_data", options);
+//! let options = [(InputPartitions, "2")];
+//! HudiTable::new_with_options_blocking("/tmp/hudi_data", options);
 //! ```
 //!
 //! # The [table] module is responsible for managing Hudi tables.

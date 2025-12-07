@@ -98,10 +98,19 @@ impl AsRef<str> for State {
 }
 
 /// An [Instant] represents a point in time when an action was performed on the table.
+///
+/// For table version 8+, completed instants have a different filename format:
+/// `{requestedTimestamp}_{completedTimestamp}.{action}` instead of `{timestamp}.{action}`.
+/// The `timestamp` field stores the requested timestamp, and `completed_timestamp` stores
+/// the completion timestamp for v8+ completed instants.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Instant {
+    /// The timestamp when the action was requested (used for ordering and identification).
+    /// TODO rename to requested_timestamp for clarity in v8+?
     pub timestamp: String,
+    /// The timestamp when the action completed (only present for v8+ completed instants).
+    pub completed_timestamp: Option<String>,
     pub action: Action,
     pub state: State,
     pub epoch_millis: i64,
@@ -132,19 +141,47 @@ impl FromStr for Instant {
 
 impl Instant {
     pub fn try_from_file_name_and_timezone(file_name: &str, timezone: &str) -> Result<Self> {
-        let (timestamp, action_suffix) = file_name
+        let (timestamp_part, action_suffix) = file_name
             .split_once('.')
             .ok_or_else(|| CoreError::Timeline(format!("Invalid file name: {}", file_name)))?;
-        Self::validate_timestamp(timestamp)?;
-        let dt = Self::parse_datetime(timestamp, timezone)?;
+
         let (action, state) = Self::parse_action_and_state(action_suffix)?;
 
-        Ok(Self {
-            timestamp: timestamp.to_string(),
-            state,
-            action,
-            epoch_millis: dt.timestamp_millis(),
-        })
+        // Check for v8+ completed instant format: {requestedTimestamp}_{completedTimestamp}.{action}
+        // This format is only used for completed instants (state == Completed)
+        if let Some((requested_ts, completed_ts)) = timestamp_part.split_once('_') {
+            // This is a v8+ completed instant with both requested and completed timestamps
+            Self::validate_timestamp(requested_ts)?;
+            Self::validate_timestamp(completed_ts)?;
+            let dt = Self::parse_datetime(requested_ts, timezone)?;
+
+            if state != State::Completed {
+                return Err(CoreError::Timeline(format!(
+                    "Underscore timestamp format is only valid for completed instants: {}",
+                    file_name
+                )));
+            }
+
+            Ok(Self {
+                timestamp: requested_ts.to_string(),
+                completed_timestamp: Some(completed_ts.to_string()),
+                state,
+                action,
+                epoch_millis: dt.timestamp_millis(),
+            })
+        } else {
+            // pre v8 format: {timestamp}.{action}[.{state}]
+            Self::validate_timestamp(timestamp_part)?;
+            let dt = Self::parse_datetime(timestamp_part, timezone)?;
+
+            Ok(Self {
+                timestamp: timestamp_part.to_string(),
+                completed_timestamp: None,
+                state,
+                action,
+                epoch_millis: dt.timestamp_millis(),
+            })
+        }
     }
 
     fn validate_timestamp(timestamp: &str) -> Result<()> {
@@ -203,7 +240,19 @@ impl Instant {
 
     pub fn file_name(&self) -> String {
         match (&self.action, &self.state) {
-            (_, State::Completed) => format!("{}.{}", self.timestamp, self.action.as_ref()),
+            (_, State::Completed) => {
+                // For v8+ completed instants with completed_timestamp, use the underscore format
+                if let Some(completed_ts) = &self.completed_timestamp {
+                    format!(
+                        "{}_{}.{}",
+                        self.timestamp,
+                        completed_ts,
+                        self.action.as_ref()
+                    )
+                } else {
+                    format!("{}.{}", self.timestamp, self.action.as_ref())
+                }
+            }
             (Action::Commit, State::Inflight) => {
                 format!("{}.{}", self.timestamp, self.state.as_ref())
             }
@@ -216,8 +265,16 @@ impl Instant {
         }
     }
 
+    /// Get the relative path with the default `.hoodie/` base directory.
+    /// For v8+ tables with Layout Version 2, use `relative_path_with_base` instead.
     pub fn relative_path(&self) -> Result<String> {
-        let mut commit_file_path = PathBuf::from(HUDI_METADATA_DIR);
+        self.relative_path_with_base(HUDI_METADATA_DIR)
+    }
+
+    /// Get the relative path with a specified base directory.
+    /// Use `.hoodie/` for pre-v8 tables (Layout Version 1) or `.hoodie/timeline/` for v8+ tables (Layout Version 2).
+    pub fn relative_path_with_base(&self, base_dir: &str) -> Result<String> {
+        let mut commit_file_path = PathBuf::from(base_dir);
         commit_file_path.push(self.file_name());
         commit_file_path
             .to_str()
@@ -378,5 +435,107 @@ mod tests {
             Some(tz) => std::env::set_var("TZ", tz),
             None => std::env::remove_var("TZ"),
         }
+    }
+
+    #[test]
+    fn test_parse_action_and_state() -> Result<()> {
+        // Test action with state suffix
+        let (action, state) = Instant::parse_action_and_state("commit.inflight")?;
+        assert_eq!(action, Action::Commit);
+        assert_eq!(state, State::Inflight);
+
+        let (action, state) = Instant::parse_action_and_state("deltacommit.requested")?;
+        assert_eq!(action, Action::DeltaCommit);
+        assert_eq!(state, State::Requested);
+
+        // Test standalone "inflight" special case
+        let (action, state) = Instant::parse_action_and_state("inflight")?;
+        assert_eq!(action, Action::Commit);
+        assert_eq!(state, State::Inflight);
+
+        // Test completed state (no suffix)
+        let (action, state) = Instant::parse_action_and_state("commit")?;
+        assert_eq!(action, Action::Commit);
+        assert_eq!(state, State::Completed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_relative_path_with_base() -> Result<()> {
+        let instant = Instant::from_str("20240101120000.commit")?;
+
+        let path = instant.relative_path_with_base(".hoodie")?;
+        assert_eq!(path, ".hoodie/20240101120000.commit");
+
+        let path = instant.relative_path_with_base(".hoodie/timeline")?;
+        assert_eq!(path, ".hoodie/timeline/20240101120000.commit");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_replacecommit() -> Result<()> {
+        let replace_instant = Instant::from_str("20240101120000.replacecommit")?;
+        assert!(replace_instant.is_replacecommit());
+
+        let commit_instant = Instant::from_str("20240101120000.commit")?;
+        assert!(!commit_instant.is_replacecommit());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_v8_instant_with_completed_timestamp() -> Result<()> {
+        // v8+ format: {requestedTimestamp}_{completedTimestamp}.{action}
+        let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
+        assert_eq!(instant.timestamp, "20240101120000000");
+        assert_eq!(
+            instant.completed_timestamp,
+            Some("20240101120005000".to_string())
+        );
+        assert_eq!(instant.action, Action::Commit);
+        assert_eq!(instant.state, State::Completed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_v8_instant_underscore_format_requires_completed_state() {
+        // Underscore format with non-completed state should fail
+        let result = Instant::from_str("20240101120000000_20240101120005000.commit.inflight");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("only valid for completed"));
+    }
+
+    #[test]
+    fn test_file_name_with_completed_timestamp() -> Result<()> {
+        let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
+        let file_name = instant.file_name();
+        assert_eq!(file_name, "20240101120000000_20240101120005000.commit");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_datetime_with_milliseconds() -> Result<()> {
+        let dt = Instant::parse_datetime("20240315142530500", "UTC")?;
+        assert_eq!(dt.timestamp_millis() % 1000, 500);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_timestamp_errors() {
+        // Too short
+        let result = Instant::from_str("2024.commit");
+        assert!(result.is_err());
+
+        // Too long (not 14 or 17)
+        let result = Instant::from_str("202403151425301.commit");
+        assert!(result.is_err());
     }
 }

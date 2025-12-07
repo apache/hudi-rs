@@ -37,18 +37,31 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// use hudi_core::table::Table as HudiTable;
 ///
 /// let options = [(SkipConfigValidation, "true")];
-/// HudiTable::new_with_options("/tmp/hudi_data", options)
+/// HudiTable::new_with_options_blocking("/tmp/hudi_data", options);
 /// ```
 ///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiInternalConfig {
     SkipConfigValidation,
+    /// Enable reading archived timeline (v1) and LSM history (v2).
+    ///
+    /// When enabled, timeline queries with time range filters will include archived instants
+    /// in addition to active instants. When disabled (default), only active timeline is read.
+    ///
+    /// Note: Archived instants are only loaded when BOTH conditions are met:
+    /// 1. This config is set to `true`
+    /// 2. The query specifies a time range filter (start or end timestamp)
+    ///
+    /// Queries without time filters (e.g., `get_completed_commits()`) will never load
+    /// archived instants, regardless of this setting.
+    TimelineArchivedReadEnabled,
 }
 
 impl AsRef<str> for HudiInternalConfig {
     fn as_ref(&self) -> &str {
         match self {
             Self::SkipConfigValidation => "hoodie.internal.skip.config.validation",
+            Self::TimelineArchivedReadEnabled => "hoodie.internal.timeline.archived.enabled",
         }
     }
 }
@@ -65,6 +78,7 @@ impl ConfigParser for HudiInternalConfig {
     fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
             Self::SkipConfigValidation => Some(HudiConfigValue::Boolean(false)),
+            Self::TimelineArchivedReadEnabled => Some(HudiConfigValue::Boolean(false)),
         }
     }
 
@@ -76,6 +90,11 @@ impl ConfigParser for HudiInternalConfig {
 
         match self {
             Self::SkipConfigValidation => get_result
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::Boolean),
+            Self::TimelineArchivedReadEnabled => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })

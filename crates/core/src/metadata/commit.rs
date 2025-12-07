@@ -19,17 +19,23 @@
 
 use crate::error::CoreError;
 use crate::Result;
+use apache_avro::from_value;
+use apache_avro::Reader as AvroReader;
 use apache_avro_derive::AvroSchema as DeriveAvroSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::io::Cursor;
 
 /// Represents statistics for a single file write operation in a commit
 ///
 /// This struct is automatically derived to/from Avro schema using apache-avro-derive.
 /// The Avro schema can be accessed via `HoodieWriteStat::get_schema()`.
-#[derive(Debug, Clone, Serialize, Deserialize, DeriveAvroSchema)]
-#[serde(rename_all = "camelCase")]
+///
+/// Note: For v8+ tables with Avro format, additional fields may be present in the data
+/// that are not captured here. Use `#[serde(default)]` to handle missing fields gracefully.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeriveAvroSchema)]
+#[serde(rename_all = "camelCase", default)]
 #[avro(namespace = "org.apache.hudi.avro.model")]
 pub struct HoodieWriteStat {
     #[avro(rename = "fileId")]
@@ -53,6 +59,43 @@ pub struct HoodieWriteStat {
     pub total_write_bytes: Option<i64>,
     #[avro(rename = "totalWriteErrors")]
     pub total_write_errors: Option<i64>,
+    // Additional fields from v8+ Avro schema
+    #[avro(rename = "partitionPath")]
+    pub partition_path: Option<String>,
+    #[avro(rename = "totalLogRecords")]
+    pub total_log_records: Option<i64>,
+    #[avro(rename = "totalLogFiles")]
+    pub total_log_files: Option<i64>,
+    #[avro(rename = "totalUpdatedRecordsCompacted")]
+    pub total_updated_records_compacted: Option<i64>,
+    #[avro(rename = "totalLogBlocks")]
+    pub total_log_blocks: Option<i64>,
+    #[avro(rename = "totalCorruptLogBlock")]
+    pub total_corrupt_log_block: Option<i64>,
+    #[avro(rename = "totalRollbackBlocks")]
+    pub total_rollback_blocks: Option<i64>,
+    #[avro(rename = "fileSizeInBytes")]
+    pub file_size_in_bytes: Option<i64>,
+    #[avro(rename = "logVersion")]
+    pub log_version: Option<i32>,
+    #[avro(rename = "logOffset")]
+    pub log_offset: Option<i64>,
+    #[avro(rename = "prevBaseFile")]
+    pub prev_base_file: Option<String>,
+    #[avro(rename = "minEventTime")]
+    pub min_event_time: Option<i64>,
+    #[avro(rename = "maxEventTime")]
+    pub max_event_time: Option<i64>,
+    #[avro(rename = "totalLogFilesCompacted")]
+    pub total_log_files_compacted: Option<i64>,
+    #[avro(rename = "totalLogReadTimeMs")]
+    pub total_log_read_time_ms: Option<i64>,
+    #[avro(rename = "totalLogSizeCompacted")]
+    pub total_log_size_compacted: Option<i64>,
+    #[avro(rename = "tempPath")]
+    pub temp_path: Option<String>,
+    #[avro(rename = "numUpdates")]
+    pub num_updates: Option<i64>,
 }
 
 /// Represents the metadata for a Hudi commit
@@ -63,13 +106,14 @@ pub struct HoodieWriteStat {
 /// # Example
 /// ```
 /// use hudi_core::metadata::commit::HoodieCommitMetadata;
+/// use apache_avro::schema::AvroSchema;
 ///
 /// // Get the Avro schema
 /// let schema = HoodieCommitMetadata::get_schema();
 /// println!("Schema: {}", schema.canonical_form());
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, DeriveAvroSchema)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeriveAvroSchema)]
+#[serde(rename_all = "camelCase", default)]
 #[avro(namespace = "org.apache.hudi.avro.model")]
 pub struct HoodieCommitMetadata {
     pub version: Option<i32>,
@@ -97,6 +141,44 @@ impl HoodieCommitMetadata {
         serde_json::from_slice(bytes).map_err(|e| {
             CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e))
         })
+    }
+
+    /// Parse commit metadata from Avro bytes (v8+ format)
+    ///
+    /// The Avro data should be in Avro Object Container format with an embedded schema.
+    /// This format is used by table version 8 and later for commit/deltacommit instants.
+    pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
+        let cursor = Cursor::new(bytes);
+        let reader = AvroReader::new(cursor).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to create Avro reader: {}", e))
+        })?;
+
+        // The commit metadata file should contain exactly one record
+        let mut records = reader;
+        let value = records
+            .next()
+            .ok_or_else(|| CoreError::CommitMetadata("Avro file contains no records".to_string()))?
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to read Avro record: {}", e)))?;
+
+        from_value::<Self>(&value).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {}", e))
+        })
+    }
+
+    /// Convert commit metadata to a JSON Map for compatibility with existing code
+    ///
+    /// This is useful when the metadata is read from Avro format but needs to be
+    /// processed by code that expects a serde_json Map.
+    pub fn to_json_map(&self) -> Result<Map<String, Value>> {
+        let value = serde_json::to_value(self).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to convert to JSON value: {}", e))
+        })?;
+        match value {
+            Value::Object(map) => Ok(map),
+            _ => Err(CoreError::CommitMetadata(
+                "Expected JSON object".to_string(),
+            )),
+        }
     }
 
     /// Get the write stats for a specific partition
@@ -431,5 +513,145 @@ mod tests {
         let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
         let count = metadata.iter_replace_file_ids().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_parse_v6_commit_json() {
+        // Test parsing v6 COW table commit metadata (JSON format)
+        let file_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/commit_metadata/v6_commit.json"
+        );
+        let bytes = std::fs::read(file_path).expect("Failed to read test fixture");
+
+        let metadata = HoodieCommitMetadata::from_json_bytes(&bytes)
+            .expect("Failed to parse v6 commit metadata");
+
+        // Validate important fields
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+        assert_eq!(metadata.compacted, Some(false));
+
+        // Validate partition write stats
+        let write_stats = metadata
+            .get_partition_write_stats("")
+            .expect("Should have write stats for empty partition");
+        assert_eq!(write_stats.len(), 1);
+
+        let stat = &write_stats[0];
+        assert_eq!(
+            stat.file_id,
+            Some("a079bdb3-731c-4894-b855-abfcd6921007-0".to_string())
+        );
+        assert_eq!(stat.num_writes, Some(4));
+        assert_eq!(stat.num_inserts, Some(1));
+        assert_eq!(stat.num_deletes, Some(0));
+        assert_eq!(stat.num_update_writes, Some(1));
+        assert_eq!(stat.total_write_bytes, Some(441520));
+        assert_eq!(stat.prev_commit, Some("20240418173550988".to_string()));
+    }
+
+    #[test]
+    fn test_parse_v8_deltacommit_avro() {
+        // Test parsing v8 MOR table deltacommit metadata (Avro format)
+        let file_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/commit_metadata/v8_deltacommit.avro"
+        );
+        let bytes = std::fs::read(file_path).expect("Failed to read test fixture");
+
+        let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)
+            .expect("Failed to parse v8 deltacommit metadata");
+
+        // Validate important fields
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+
+        // Validate partition write stats - v8 MOR table should have stats
+        assert!(metadata.partition_to_write_stats.is_some());
+        let partition_map = metadata.partition_to_write_stats.as_ref().unwrap();
+
+        // Should have write stats for multiple partitions
+        assert!(
+            !partition_map.is_empty(),
+            "Should have write stats for at least one partition"
+        );
+
+        // Validate at least one partition has valid stats
+        for (partition, stats) in partition_map {
+            if !stats.is_empty() {
+                let stat = &stats[0];
+                // file_id should be present
+                assert!(
+                    stat.file_id.is_some(),
+                    "file_id should be present in partition {}",
+                    partition
+                );
+                // For UPSERT operation, num_inserts or num_update_writes should be present
+                if let Some(num_inserts) = stat.num_inserts {
+                    assert!(num_inserts >= 0, "num_inserts should be >= 0");
+                }
+                if let Some(num_updates) = stat.num_update_writes {
+                    assert!(num_updates >= 0, "num_update_writes should be >= 0");
+                }
+                // Verify partition_path field exists (v8+ specific field)
+                assert!(
+                    stat.partition_path.is_some(),
+                    "partition_path should be present in v8+ format"
+                );
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_to_json_map() {
+        let metadata = HoodieCommitMetadata {
+            version: Some(1),
+            operation_type: Some("INSERT".to_string()),
+            ..Default::default()
+        };
+
+        let json_map = metadata.to_json_map().unwrap();
+        assert!(json_map.contains_key("version"));
+        assert!(json_map.contains_key("operationType"));
+    }
+
+    #[test]
+    fn test_from_json_map() {
+        let mut map = Map::new();
+        map.insert("version".to_string(), json!(2));
+        map.insert("operationType".to_string(), json!("UPSERT"));
+
+        let metadata = HoodieCommitMetadata::from_json_map(&map).unwrap();
+        assert_eq!(metadata.version, Some(2));
+        assert_eq!(metadata.operation_type, Some("UPSERT".to_string()));
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements_sorting() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1"],
+                "p2": ["file2", "file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let mut partitions = metadata.get_partitions_with_replacements();
+        partitions.sort();
+        assert_eq!(partitions, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids_multiple_partitions() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1"],
+                "p2": ["file2", "file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 3); // 1 from p1, 2 from p2
     }
 }
