@@ -322,3 +322,145 @@ impl TimelineLoader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::table::HudiTableConfig;
+    use crate::config::HudiConfigs;
+    use std::collections::HashMap;
+
+    fn create_test_configs() -> Arc<HudiConfigs> {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            "/tmp/test".to_string(),
+        );
+        Arc::new(HudiConfigs::new(options))
+    }
+
+    fn create_test_storage(configs: Arc<HudiConfigs>) -> Arc<Storage> {
+        Storage::new(Arc::new(HashMap::new()), configs).unwrap()
+    }
+
+    #[test]
+    fn test_layout_one_active_directory() {
+        let configs = create_test_configs();
+        let storage = create_test_storage(configs.clone());
+        let loader = TimelineLoader::new_layout_one_active(configs, storage);
+
+        assert_eq!(loader.get_active_timeline_dir(), HUDI_METADATA_DIR);
+        assert_eq!(loader.get_timeline_dir(), HUDI_METADATA_DIR);
+    }
+
+    #[test]
+    fn test_layout_one_archived_directory() {
+        let configs = create_test_configs();
+        let storage = create_test_storage(configs.clone());
+        let loader = TimelineLoader::new_layout_one_archived(configs, storage);
+
+        // Default archived folder
+        let expected = ".hoodie/archived";
+        assert_eq!(loader.get_archived_timeline_dir(), expected);
+        assert_eq!(loader.get_timeline_dir(), expected);
+    }
+
+    #[test]
+    fn test_layout_two_active_directory() {
+        let configs = create_test_configs();
+        let storage = create_test_storage(configs.clone());
+        let loader = TimelineLoader::new_layout_two_active(configs, storage);
+
+        // Default timeline path
+        let expected = format!("{}/timeline", HUDI_METADATA_DIR);
+        assert_eq!(loader.get_active_timeline_dir(), expected);
+        assert_eq!(loader.get_timeline_dir(), expected);
+    }
+
+    #[test]
+    fn test_layout_two_archived_directory() {
+        let configs = create_test_configs();
+        let storage = create_test_storage(configs.clone());
+        let loader = TimelineLoader::new_layout_two_archived(configs, storage);
+
+        // Default timeline path and history path
+        let expected = format!("{}/timeline/history", HUDI_METADATA_DIR);
+        assert_eq!(loader.get_archived_timeline_dir(), expected);
+        assert_eq!(loader.get_timeline_dir(), expected);
+    }
+
+    #[test]
+    fn test_custom_archive_folder() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            "/tmp/test".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::ArchiveLogFolder.as_ref().to_string(),
+            ".hoodie/custom_archive".to_string(),
+        );
+        let configs = Arc::new(HudiConfigs::new(options));
+        let storage = create_test_storage(configs.clone());
+        let loader = TimelineLoader::new_layout_one_archived(configs, storage);
+
+        assert_eq!(loader.get_archived_timeline_dir(), ".hoodie/custom_archive");
+    }
+
+    #[test]
+    fn test_custom_timeline_paths() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            "/tmp/test".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::TimelinePath.as_ref().to_string(),
+            "custom_timeline".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::TimelineHistoryPath.as_ref().to_string(),
+            "custom_history".to_string(),
+        );
+        let configs = Arc::new(HudiConfigs::new(options));
+        let storage = create_test_storage(configs.clone());
+
+        let loader = TimelineLoader::new_layout_two_active(configs.clone(), storage.clone());
+        assert_eq!(
+            loader.get_active_timeline_dir(),
+            format!("{}/custom_timeline", HUDI_METADATA_DIR)
+        );
+
+        let archived_loader = TimelineLoader::new_layout_two_archived(configs, storage);
+        assert_eq!(
+            archived_loader.get_archived_timeline_dir(),
+            format!("{}/custom_timeline/custom_history", HUDI_METADATA_DIR)
+        );
+    }
+
+    #[test]
+    fn test_layout_type_checks() {
+        let configs = create_test_configs();
+        let storage = create_test_storage(configs.clone());
+
+        let v2_active = TimelineLoader::new_layout_two_active(configs.clone(), storage.clone());
+        assert!(v2_active.is_layout_two_active());
+        assert!(!v2_active.is_layout_two_archived());
+
+        let v2_archived = TimelineLoader::new_layout_two_archived(configs, storage);
+        assert!(!v2_archived.is_layout_two_active());
+        assert!(v2_archived.is_layout_two_archived());
+    }
+
+    #[test]
+    fn test_storage_access() {
+        let configs = create_test_configs();
+        let storage = create_test_storage(configs.clone());
+        let storage_ptr = Arc::as_ptr(&storage);
+
+        let loader = TimelineLoader::new_layout_one_active(configs, storage);
+
+        // Verify storage is accessible and is the same instance
+        assert_eq!(Arc::as_ptr(loader.storage()), storage_ptr);
+    }
+}

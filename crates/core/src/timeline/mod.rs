@@ -332,6 +332,7 @@ mod tests {
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
+    use crate::timeline::instant::{Action, State};
     #[tokio::test]
     async fn test_timeline_v8_nonpartitioned() {
         let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
@@ -603,6 +604,78 @@ mod tests {
                 ]
                 .concat()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_completed_commits() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let commits = timeline.get_completed_commits(false).await.unwrap();
+        assert!(!commits.is_empty());
+        // All should be commits in completed state
+        for instant in &commits {
+            assert_eq!(instant.action, Action::Commit);
+            assert_eq!(instant.state, State::Completed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_completed_deltacommits() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let deltacommits = timeline.get_completed_deltacommits(false).await.unwrap();
+        // All should be deltacommits (or empty if none exist)
+        for instant in &deltacommits {
+            assert_eq!(instant.action, Action::DeltaCommit);
+            assert_eq!(instant.state, State::Completed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_completed_replacecommits() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let replacecommits = timeline.get_completed_replacecommits(false).await.unwrap();
+        // All should be replacecommits (or empty if none exist)
+        for instant in &replacecommits {
+            assert!(instant.action.is_replacecommit());
+            assert_eq!(instant.state, State::Completed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_commits_descending_order() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let commits_asc = timeline.get_completed_commits(false).await.unwrap();
+        let commits_desc = timeline.get_completed_commits(true).await.unwrap();
+
+        assert_eq!(commits_asc.len(), commits_desc.len());
+        if !commits_asc.is_empty() {
+            // Verify descending order is reverse of ascending
+            assert_eq!(commits_asc.first(), commits_desc.last());
+            assert_eq!(commits_asc.last(), commits_desc.first());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_instant_metadata_in_json() {
+        let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+        let timeline = create_test_timeline(base_url).await;
+
+        let commits = timeline.get_completed_commits(false).await.unwrap();
+        if let Some(instant) = commits.first() {
+            let json = timeline
+                .get_instant_metadata_in_json(instant)
+                .await
+                .unwrap();
+            // Should be valid JSON
+            assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
         }
     }
 }

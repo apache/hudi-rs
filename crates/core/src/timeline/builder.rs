@@ -139,3 +139,206 @@ impl TimelineBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::table::HudiTableConfig;
+    use std::collections::HashMap;
+
+    fn create_test_configs(options: HashMap<String, String>) -> Arc<HudiConfigs> {
+        let mut opts = options;
+        opts.entry(HudiTableConfig::BasePath.as_ref().to_string())
+            .or_insert("/tmp/test".to_string());
+        Arc::new(HudiConfigs::new(opts))
+    }
+
+    fn create_test_storage(configs: Arc<HudiConfigs>) -> Arc<Storage> {
+        Storage::new(Arc::new(HashMap::new()), configs).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_build_without_table_version() {
+        let configs = create_test_configs(HashMap::new());
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        // Should default to layout one active
+        assert!(!timeline.active_loader.is_layout_two_active());
+        assert!(timeline.archived_loader.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_table_version_6() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "6".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        // v6 should use layout one
+        assert!(!timeline.active_loader.is_layout_two_active());
+        assert!(timeline.archived_loader.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_table_version_8_defaults_to_layout_2() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "8".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        // v8 without explicit layout version defaults to layout 2
+        assert!(timeline.active_loader.is_layout_two_active());
+        assert!(timeline.archived_loader.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_explicit_layout_version_1() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "8".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::TimelineLayoutVersion.as_ref().to_string(),
+            "1".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        // Explicit layout version 1
+        assert!(!timeline.active_loader.is_layout_two_active());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_archived_enabled() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "8".to_string(),
+        );
+        options.insert(
+            TimelineArchivedReadEnabled.as_ref().to_string(),
+            "true".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        assert!(timeline.active_loader.is_layout_two_active());
+        assert!(timeline.archived_loader.is_some());
+        assert!(timeline
+            .archived_loader
+            .as_ref()
+            .unwrap()
+            .is_layout_two_archived());
+    }
+
+    #[tokio::test]
+    async fn test_build_layout_1_with_archived() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "7".to_string(),
+        );
+        options.insert(
+            TimelineArchivedReadEnabled.as_ref().to_string(),
+            "true".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        assert!(!timeline.active_loader.is_layout_two_active());
+        assert!(timeline.archived_loader.is_some());
+        assert!(!timeline
+            .archived_loader
+            .as_ref()
+            .unwrap()
+            .is_layout_two_archived());
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_table_version_with_layout_1() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "5".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::TimelineLayoutVersion.as_ref().to_string(),
+            "1".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let result = builder.build().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported table version 5"));
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_table_version_with_layout_2() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "7".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::TimelineLayoutVersion.as_ref().to_string(),
+            "2".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let result = builder.build().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported table version 7"));
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_layout_version() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "8".to_string(),
+        );
+        options.insert(
+            HudiTableConfig::TimelineLayoutVersion.as_ref().to_string(),
+            "3".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let result = builder.build().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported timeline layout version: 3"));
+    }
+}

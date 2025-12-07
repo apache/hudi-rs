@@ -436,4 +436,52 @@ mod tests {
             None => std::env::remove_var("TZ"),
         }
     }
+
+    #[test]
+    fn test_parse_action_and_state() -> Result<()> {
+        // Test action with state suffix
+        let (action, state) = Instant::parse_action_and_state("commit.inflight")?;
+        assert_eq!(action, Action::Commit);
+        assert_eq!(state, State::Inflight);
+
+        let (action, state) = Instant::parse_action_and_state("deltacommit.requested")?;
+        assert_eq!(action, Action::DeltaCommit);
+        assert_eq!(state, State::Requested);
+
+        // Test standalone "inflight" special case
+        let (action, state) = Instant::parse_action_and_state("inflight")?;
+        assert_eq!(action, Action::Commit);
+        assert_eq!(state, State::Inflight);
+
+        // Test completed state (no suffix)
+        let (action, state) = Instant::parse_action_and_state("commit")?;
+        assert_eq!(action, Action::Commit);
+        assert_eq!(state, State::Completed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_relative_path_with_base() -> Result<()> {
+        let instant = Instant::from_str("20240101120000.commit")?;
+
+        let path = instant.relative_path_with_base(".hoodie")?;
+        assert_eq!(path, ".hoodie/20240101120000.commit");
+
+        let path = instant.relative_path_with_base(".hoodie/timeline")?;
+        assert_eq!(path, ".hoodie/timeline/20240101120000.commit");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_replacecommit() -> Result<()> {
+        let replace_instant = Instant::from_str("20240101120000.replacecommit")?;
+        assert!(replace_instant.is_replacecommit());
+
+        let commit_instant = Instant::from_str("20240101120000.commit")?;
+        assert!(!commit_instant.is_replacecommit());
+
+        Ok(())
+    }
 }
