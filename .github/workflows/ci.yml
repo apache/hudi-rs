@@ -196,7 +196,8 @@ jobs:
           path: |
             target
             python/target
-            .cargo
+            .cargo/registry
+            .cargo/git
             .uv-cache
           retention-days: 1
 
