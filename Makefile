@@ -33,6 +33,26 @@ define check_uv
 	fi
 endef
 
+# Check if cargo-tarpaulin is installed (only enforced for coverage targets)
+TARPAULIN_CHECK := $(shell command -v cargo-tarpaulin 2> /dev/null)
+define check_tarpaulin
+	@if [ -z "$(TARPAULIN_CHECK)" ]; then \
+		echo "Error: cargo-tarpaulin is not installed. Run: cargo install cargo-tarpaulin"; \
+		exit 1; \
+	fi
+endef
+
+# =============================================================================
+# Coverage Configuration
+# =============================================================================
+COV_OUTPUT_DIR := ./cov-reports
+COV_THRESHOLD ?= 60
+COV_EXCLUDE := \
+	--exclude-files 'cpp/src/*' \
+	--exclude-files 'crates/core/src/avro_to_arrow/*'
+TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
+	--all-features --workspace $(COV_EXCLUDE) --skip-clean
+
 .PHONY: help
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -109,26 +129,32 @@ test-python: ## Run tests on Python
 coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
 
 .PHONY: coverage-rust
-coverage-rust: ## Generate HTML coverage report for Rust (requires cargo-tarpaulin)
-	$(info --- Generate Rust coverage report ---)
-	$(info --- Install cargo-tarpaulin if missing: cargo install cargo-tarpaulin ---)
-	./build-wrapper.sh cargo tarpaulin \
-		--engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
-		--exclude-files 'cpp/src/*' \
-		--exclude-files 'crates/core/src/avro_to_arrow/*' \
-		-o Html --output-dir ./cov-reports
-	$(info --- Coverage report generated at ./cov-reports/tarpaulin-report.html ---)
+coverage-rust: ## Generate HTML coverage report for Rust
+	$(call check_tarpaulin)
+	@mkdir -p $(COV_OUTPUT_DIR)
+	./build-wrapper.sh cargo tarpaulin $(TARPAULIN_COMMON) \
+		-o Html --output-dir $(COV_OUTPUT_DIR)
+	@echo "Coverage report generated at $(COV_OUTPUT_DIR)/tarpaulin-report.html"
 
 .PHONY: coverage-xml
-coverage-xml: ## Generate XML coverage report for Rust (same as CI)
-	$(info --- Generate Rust XML coverage report ---)
-	./build-wrapper.sh cargo tarpaulin \
-		--engine llvm --no-dead-code --no-fail-fast --all-features --workspace \
-		--exclude-files 'cpp/src/*' \
-		--exclude-files 'crates/core/src/avro_to_arrow/*' \
-		-o xml --output-dir ./cov-reports --skip-clean
+coverage-xml: ## Generate XML coverage report for Rust (CI format)
+	$(call check_tarpaulin)
+	@mkdir -p $(COV_OUTPUT_DIR)
+	./build-wrapper.sh cargo tarpaulin $(TARPAULIN_COMMON) \
+		-o xml --output-dir $(COV_OUTPUT_DIR)
+
+.PHONY: coverage-open
+coverage-open: coverage-rust ## Generate and open HTML coverage report in browser
+	@command -v open >/dev/null 2>&1 && open $(COV_OUTPUT_DIR)/tarpaulin-report.html || \
+	 command -v xdg-open >/dev/null 2>&1 && xdg-open $(COV_OUTPUT_DIR)/tarpaulin-report.html || \
+	 echo "Open $(COV_OUTPUT_DIR)/tarpaulin-report.html manually"
+
+.PHONY: coverage-check
+coverage-check: ## Fail if coverage is below threshold (COV_THRESHOLD=60)
+	$(call check_tarpaulin)
+	./build-wrapper.sh cargo tarpaulin $(TARPAULIN_COMMON) \
+		--fail-under $(COV_THRESHOLD)
 
 .PHONY: clean-coverage
-clean-coverage: ## Clean coverage reports
-	$(info --- Clean coverage reports ---)
-	rm -rf ./cov-reports
+clean-coverage: ## Remove coverage reports
+	rm -rf $(COV_OUTPUT_DIR)
