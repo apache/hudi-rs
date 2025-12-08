@@ -46,11 +46,11 @@ devel = [
     "pytest==8.4.2",
     "coverage==7.10.7",
     "ruff==0.14.1",
-    "mypy==1.18.2",
+    "mypy==1.19.0",
 ] 
 lint = [
     "ruff==0.14.1",
-    "mypy==1.18.2",   
+    "mypy==1.19.0",   
 ]
 datafusion = [
     "datafusion==46.0.0",
