@@ -170,18 +170,36 @@ impl FileGroup {
 
     /// Add a [LogFile] to the corresponding [FileSlice] in the [FileGroup].
     ///
+    /// For table version 6 (pre-1.0 spec):
+    ///   Log file's timestamp matches the base file's commit timestamp exactly.
+    ///
+    /// For table version 8+ (1.0 spec):
+    ///   Log file's timestamp is its own write instant, which may differ from the base file's
+    ///   timestamp. We find the FileSlice with the closest timestamp <= log file's timestamp.
+    ///
     /// TODO: support adding log files to file group without base files.
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
-        let commit_timestamp = log_file.base_commit_timestamp.as_str();
-        if let Some(file_slice) = self.file_slices.get_mut(commit_timestamp) {
+        let log_timestamp = log_file.timestamp.as_str();
+
+        // Try exact match first (works for both v6 and v8 when timestamps happen to match)
+        if let Some(file_slice) = self.file_slices.get_mut(log_timestamp) {
             file_slice.log_files.insert(log_file);
-            Ok(self)
-        } else {
-            Err(CoreError::FileGroup(format!(
-                "Instant time {commit_timestamp} not found in File Group {}",
-                self.file_id
-            )))
+            return Ok(self);
         }
+
+        // For v8 (1.0 spec): find the FileSlice with the closest timestamp <= log's timestamp
+        // This handles the case where log file's timestamp is its own write instant,
+        // not the base file's commit timestamp.
+        let log_ts = log_timestamp.to_string();
+        if let Some((_, file_slice)) = self.file_slices.range_mut(..=log_ts).next_back() {
+            file_slice.log_files.insert(log_file);
+            return Ok(self);
+        }
+
+        Err(CoreError::FileGroup(format!(
+            "No suitable FileSlice found for log file with timestamp {} in File Group {}",
+            log_timestamp, self.file_id
+        )))
     }
 
     /// Add multiple [LogFile]s to the corresponding [FileSlice]s in the [FileGroup].

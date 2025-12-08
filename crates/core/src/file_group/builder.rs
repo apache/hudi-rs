@@ -62,20 +62,21 @@ pub fn build_file_groups(commit_metadata: &Map<String, Value>) -> Result<HashSet
         let mut file_group = FileGroup::new(file_id.clone(), partition.clone());
 
         // Handle two cases:
-        // 1. MOR table with baseFile and logFiles
+        // 1. MOR table with baseFile and optionally logFiles
         // 2. COW table with path only
         if let Some(base_file_name) = &write_stat.base_file {
             file_group.add_base_file_from_name(base_file_name)?;
 
+            // Log files are optional - MOR tables may have:
+            // - No log files yet (initial insert)
+            // - Some log files (after updates)
+            // - Empty log files list
             if let Some(log_file_names) = &write_stat.log_files {
                 for log_file_name in log_file_names {
                     file_group.add_log_file_from_name(log_file_name)?;
                 }
-            } else {
-                return Err(CoreError::CommitMetadata(
-                    "Missing log files in write stats".into(),
-                ));
             }
+            // Note: log_files being None is valid for MOR tables
         } else {
             let path = write_stat
                 .path
