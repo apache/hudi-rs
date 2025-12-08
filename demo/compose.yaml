@@ -54,6 +54,7 @@ services:
 
   # execution environment for running tests
   runner:
+    image: demo-runner:latest
     build:
       context: ./infra/runner
     container_name: runner
@@ -70,6 +71,3 @@ services:
       AWS_ALLOW_HTTP: true
       AWS_REGION: us-east-1 # minio default
 
-networks:
-  demo_network:
-    driver: bridge
