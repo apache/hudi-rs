@@ -59,3 +59,5 @@ pub mod timeline;
 pub mod util;
 
 use error::Result;
+
+pub use crate::table::query::QueryType;
