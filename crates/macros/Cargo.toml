@@ -15,23 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
+[package]
+name = "hudi-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+readme = "README.md"
+description = "Procedural macros for generating language bindings from Hudi Rust enums"
+homepage.workspace = true
+repository = "https://github.com/apache/hudi-rs/tree/main/crates/macros/"
 
-/.idea
-.vscode
+[lib]
+proc-macro = true
 
-# python
-.venv
-venv
-**/.python-version
-__pycache__
-uv.lock
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+strum = { workspace = true }
 
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
+[features]
+default = []
+pyo3 = []
+jni = []
+cpp = []
