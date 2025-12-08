@@ -34,3 +34,4 @@ __pycache__
 # coverage files
 *.profraw
 cobertura.xml
+/cov-reports/

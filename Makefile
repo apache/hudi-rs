@@ -19,24 +19,53 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
-# Check if uv is installed
-UV_CHECK := $(shell command -v uv 2> /dev/null)
-ifndef UV_CHECK
-$(error "uv is not installed. Please install it first: curl -LsSf https://astral.sh/uv/install.sh | sh")
-endif
-
 VENV := .venv
 PYTHON_DIR = python
 MATURIN_VERSION := $(shell grep 'requires =' $(PYTHON_DIR)/pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
 
+# Check if uv is installed (only enforced for Python-related targets)
+UV_CHECK := $(shell command -v uv 2> /dev/null)
+define check_uv
+	@if [ -z "$(UV_CHECK)" ]; then \
+		echo "Error: uv is not installed. Please install it first: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+		exit 1; \
+	fi
+endef
+
+# Check if cargo-tarpaulin is installed (only enforced for coverage targets)
+TARPAULIN_CHECK := $(shell command -v cargo-tarpaulin 2> /dev/null)
+define check_tarpaulin
+	@if [ -z "$(TARPAULIN_CHECK)" ]; then \
+		echo "Error: cargo-tarpaulin is not installed. Run: cargo install cargo-tarpaulin"; \
+		exit 1; \
+	fi
+endef
+
+# =============================================================================
+# Coverage Configuration
+# =============================================================================
+COV_OUTPUT_DIR := ./cov-reports
+COV_THRESHOLD ?= 60
+COV_EXCLUDE := \
+	--exclude-files 'cpp/src/*' \
+	--exclude-files 'crates/core/src/avro_to_arrow/*'
+TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
+	--all-features --workspace $(COV_EXCLUDE) --skip-clean
+
+.PHONY: help
+help: ## Show this help message
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
 .PHONY: setup-venv
 setup-venv: ## Setup the virtualenv
+	$(call check_uv)
 	$(info --- Setup virtualenv ---)
 	uv venv $(VENV)
 
 .PHONY: setup
 setup: ## Setup the requirements
+	$(call check_uv)
 	$(info --- Setup dependencies ---)
 	uv pip install "$(MATURIN_VERSION)"
 
@@ -92,5 +121,40 @@ test-rust: ## Run tests on Rust
 
 .PHONY: test-python
 test-python: ## Run tests on Python
+	$(call check_uv)
 	$(info --- Run Python tests ---)
 	uv run pytest -s $(PYTHON_DIR)
+
+.PHONY: coverage
+coverage: coverage-rust ## Generate coverage report (alias for coverage-rust)
+
+.PHONY: coverage-rust
+coverage-rust: ## Generate HTML coverage report for Rust
+	$(call check_tarpaulin)
+	@mkdir -p $(COV_OUTPUT_DIR)
+	./build-wrapper.sh cargo tarpaulin $(TARPAULIN_COMMON) \
+		-o Html --output-dir $(COV_OUTPUT_DIR)
+	@echo "Coverage report generated at $(COV_OUTPUT_DIR)/tarpaulin-report.html"
+
+.PHONY: coverage-xml
+coverage-xml: ## Generate XML coverage report for Rust (CI format)
+	$(call check_tarpaulin)
+	@mkdir -p $(COV_OUTPUT_DIR)
+	./build-wrapper.sh cargo tarpaulin $(TARPAULIN_COMMON) \
+		-o xml --output-dir $(COV_OUTPUT_DIR)
+
+.PHONY: coverage-open
+coverage-open: coverage-rust ## Generate and open HTML coverage report in browser
+	@command -v open >/dev/null 2>&1 && open $(COV_OUTPUT_DIR)/tarpaulin-report.html || \
+	 command -v xdg-open >/dev/null 2>&1 && xdg-open $(COV_OUTPUT_DIR)/tarpaulin-report.html || \
+	 echo "Open $(COV_OUTPUT_DIR)/tarpaulin-report.html manually"
+
+.PHONY: coverage-check
+coverage-check: ## Fail if coverage is below threshold (COV_THRESHOLD=60)
+	$(call check_tarpaulin)
+	./build-wrapper.sh cargo tarpaulin $(TARPAULIN_COMMON) \
+		--fail-under $(COV_THRESHOLD)
+
+.PHONY: clean-coverage
+clean-coverage: ## Remove coverage reports
+	rm -rf $(COV_OUTPUT_DIR)
