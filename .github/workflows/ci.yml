@@ -173,7 +173,7 @@ jobs:
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
           sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
       - name: Cache integration build artifacts (cargo/target/uv)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             target
