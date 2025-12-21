@@ -30,10 +30,20 @@ mod log_format;
 pub mod reader;
 pub mod scanner;
 
+/// Represents a Hudi log file (delta log).
+///
+/// The `timestamp` field has different semantics depending on table version:
+/// - **Table version 6 (pre-1.0 spec)**: The base commit timestamp that this log file belongs to.
+/// - **Table version 8+ (1.0 spec)**: The request instant timestamp of the deltacommit that wrote
+///   this log file.
 #[derive(Clone, Debug)]
 pub struct LogFile {
     pub file_id: String,
-    pub base_commit_timestamp: String,
+    /// The timestamp embedded in the log file name.
+    ///
+    /// For v6 tables: base commit timestamp (matches the base file's commit timestamp).
+    /// For v8+ tables: request instant timestamp of the deltacommit that wrote this log file.
+    pub timestamp: String,
     pub extension: String,
     pub version: String,
     pub write_token: String,
@@ -48,7 +58,7 @@ impl LogFile {
     /// File name format:
     ///
     /// ```text
-    /// .[File Id]_[Base Commit Timestamp].[Log File Extension].[Log File Version]_[File Write Token]
+    /// .[File Id]_[Base commit or deltacommit's timestamp].[Log File Extension].[Log File Version]_[File Write Token]
     /// ```
     /// TODO support `.cdc` suffix
     fn parse_file_name(file_name: &str) -> Result<(String, String, String, String, String)> {
@@ -73,12 +83,12 @@ impl LogFile {
             return Err(CoreError::FileGroup(err_msg.clone()));
         }
 
-        let base_commit_timestamp = parts[0];
+        let timestamp = parts[0];
         let log_file_extension = parts[1];
         let log_file_version = parts[2];
 
         if file_id.is_empty()
-            || base_commit_timestamp.is_empty()
+            || timestamp.is_empty()
             || log_file_extension.is_empty()
             || log_file_version.is_empty()
             || file_write_token.is_empty()
@@ -88,7 +98,7 @@ impl LogFile {
 
         Ok((
             file_id.to_string(),
-            base_commit_timestamp.to_string(),
+            timestamp.to_string(),
             log_file_extension.to_string(),
             log_file_version.to_string(),
             file_write_token.to_string(),
@@ -98,10 +108,10 @@ impl LogFile {
     #[inline]
     pub fn file_name(&self) -> String {
         format!(
-            "{prefix}{file_id}_{base_commit_timestamp}.{extension}.{version}_{write_token}",
+            "{prefix}{file_id}_{timestamp}.{extension}.{version}_{write_token}",
             prefix = LOG_FILE_PREFIX,
             file_id = self.file_id,
-            base_commit_timestamp = self.base_commit_timestamp,
+            timestamp = self.timestamp,
             extension = self.extension,
             version = self.version,
             write_token = self.write_token
@@ -114,11 +124,11 @@ impl FromStr for LogFile {
 
     /// Parse a log file name into a [LogFile].
     fn from_str(file_name: &str) -> Result<Self, Self::Err> {
-        let (file_id, base_commit_timestamp, extension, version, write_token) =
+        let (file_id, timestamp, extension, version, write_token) =
             Self::parse_file_name(file_name)?;
         Ok(LogFile {
             file_id,
-            base_commit_timestamp,
+            timestamp,
             extension,
             version,
             write_token,
@@ -132,11 +142,11 @@ impl TryFrom<FileMetadata> for LogFile {
 
     fn try_from(metadata: FileMetadata) -> Result<Self> {
         let file_name = metadata.name.as_str();
-        let (file_id, base_commit_timestamp, extension, version, write_token) =
+        let (file_id, timestamp, extension, version, write_token) =
             Self::parse_file_name(file_name)?;
         Ok(LogFile {
             file_id,
-            base_commit_timestamp,
+            timestamp,
             extension,
             version,
             write_token,
@@ -167,10 +177,10 @@ impl PartialOrd for LogFile {
 
 impl Ord for LogFile {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Compare fields in order: base_commit_timestamp, version, write_token
+        // Compare fields in order: timestamp, version, write_token
         // TODO support `.cdc` suffix
-        self.base_commit_timestamp
-            .cmp(&other.base_commit_timestamp)
+        self.timestamp
+            .cmp(&other.timestamp)
             .then(self.version.cmp(&other.version))
             .then(self.write_token.cmp(&other.write_token))
     }
@@ -193,7 +203,7 @@ mod tests {
         let log_file = LogFile::from_str(filename).unwrap();
 
         assert_eq!(log_file.file_id, "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0");
-        assert_eq!(log_file.base_commit_timestamp, "20250109233025121");
+        assert_eq!(log_file.timestamp, "20250109233025121");
         assert_eq!(log_file.extension, "log");
         assert_eq!(log_file.version, "1");
         assert_eq!(log_file.write_token, "0-51-115");
@@ -265,7 +275,7 @@ mod tests {
         // Same timestamp, different version
         let log1 = LogFile {
             file_id: "ee2ace10-7667-40f5-9848-0a144b5ea064-0".to_string(),
-            base_commit_timestamp: "20250113230302428".to_string(),
+            timestamp: "20250113230302428".to_string(),
             extension: "log".to_string(),
             version: "1".to_string(),
             write_token: "0-188-387".to_string(),
@@ -274,7 +284,7 @@ mod tests {
 
         let log2 = LogFile {
             file_id: "ee2ace10-7667-40f5-9848-0a144b5ea064-0".to_string(),
-            base_commit_timestamp: "20250113230302428".to_string(),
+            timestamp: "20250113230302428".to_string(),
             extension: "log".to_string(),
             version: "2".to_string(),
             write_token: "0-188-387".to_string(),
@@ -284,7 +294,7 @@ mod tests {
         // Different timestamp
         let log3 = LogFile {
             file_id: "ee2ace10-7667-40f5-9848-0a144b5ea064-0".to_string(),
-            base_commit_timestamp: "20250113230424191".to_string(),
+            timestamp: "20250113230424191".to_string(),
             extension: "log".to_string(),
             version: "1".to_string(),
             write_token: "0-188-387".to_string(),
@@ -294,7 +304,7 @@ mod tests {
         // Same timestamp and version, different write token
         let log4 = LogFile {
             file_id: "ee2ace10-7667-40f5-9848-0a144b5ea064-0".to_string(),
-            base_commit_timestamp: "20250113230302428".to_string(),
+            timestamp: "20250113230302428".to_string(),
             extension: "log".to_string(),
             version: "1".to_string(),
             write_token: "1-188-387".to_string(),

@@ -21,13 +21,31 @@ use crate::Result;
 
 pub const MAGIC: &[u8] = b"#HUDI#";
 
+/// Log format version (file-level).
+///
+/// This is the version of the log file format itself (read from the file header after MAGIC).
+/// Modern Hudi tables (v6+) use V1 as the log format version.
+///
+/// For the internal block content version (first 4 bytes of each block's content),
+/// see [`LogBlockVersion`](crate::file_group::log_file::log_block::LogBlockVersion).
+///
+/// Feature flags by version:
+///
+/// | Feature            | V0  | V1  |
+/// |--------------------|-----|-----|
+/// | has_block_type     | ✗   | ✓   |
+/// | has_header         | ✗   | ✓   |
+/// | has_content_length | ✗   | ✓   |
+/// | has_footer         | ✗   | ✓   |
+/// | has_log_block_len  | ✗   | ✓   |
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum LogFormatVersion {
+    /// Legacy format with minimal structure (no block type, header, footer, etc.).
     V0 = 0,
+    /// Current version for modern Hudi tables (v6+).
+    /// Has block type, header, content length, footer, and total log block length.
     V1 = 1,
-    V2 = 2,
-    V3 = 3,
 }
 
 impl TryFrom<[u8; 4]> for LogFormatVersion {
@@ -46,8 +64,6 @@ impl TryFrom<u32> for LogFormatVersion {
         match value {
             0 => Ok(Self::V0),
             1 => Ok(Self::V1),
-            2 => Ok(Self::V2),
-            3 => Ok(Self::V3),
             _ => Err(CoreError::LogFormatError(format!(
                 "Invalid log format version: {value}"
             ))),
@@ -97,19 +113,11 @@ mod tests {
             LogFormatVersion::try_from([0, 0, 0, 1]).unwrap(),
             LogFormatVersion::V1
         );
-        assert_eq!(
-            LogFormatVersion::try_from([0, 0, 0, 2]).unwrap(),
-            LogFormatVersion::V2
-        );
-        assert_eq!(
-            LogFormatVersion::try_from([0, 0, 0, 3]).unwrap(),
-            LogFormatVersion::V3
-        );
 
         // Test invalid version
-        let err = LogFormatVersion::try_from([0, 0, 0, 4]).unwrap_err();
+        let err = LogFormatVersion::try_from([0, 0, 0, 2]).unwrap_err();
         assert!(matches!(err, CoreError::LogFormatError(_)));
-        assert!(err.to_string().contains("Invalid log format version: 4"));
+        assert!(err.to_string().contains("Invalid log format version: 2"));
     }
 
     #[test]
@@ -123,19 +131,11 @@ mod tests {
             LogFormatVersion::try_from(1u32).unwrap(),
             LogFormatVersion::V1
         );
-        assert_eq!(
-            LogFormatVersion::try_from(2u32).unwrap(),
-            LogFormatVersion::V2
-        );
-        assert_eq!(
-            LogFormatVersion::try_from(3u32).unwrap(),
-            LogFormatVersion::V3
-        );
 
         // Test invalid version
-        let err = LogFormatVersion::try_from(4u32).unwrap_err();
+        let err = LogFormatVersion::try_from(2u32).unwrap_err();
         assert!(matches!(err, CoreError::LogFormatError(_)));
-        assert!(err.to_string().contains("Invalid log format version: 4"));
+        assert!(err.to_string().contains("Invalid log format version: 2"));
     }
 
     #[test]
@@ -156,25 +156,5 @@ mod tests {
         assert!(version.has_content_length());
         assert!(version.has_footer());
         assert!(version.has_total_log_block_length());
-    }
-
-    #[test]
-    fn test_version_feature_flags_v2() {
-        let version = LogFormatVersion::V2;
-        assert!(version.has_block_type());
-        assert!(version.has_header());
-        assert!(version.has_content_length());
-        assert!(!version.has_footer());
-        assert!(!version.has_total_log_block_length());
-    }
-
-    #[test]
-    fn test_version_feature_flags_v3() {
-        let version = LogFormatVersion::V3;
-        assert!(version.has_block_type());
-        assert!(version.has_header());
-        assert!(version.has_content_length());
-        assert!(!version.has_footer());
-        assert!(!version.has_total_log_block_length());
     }
 }

@@ -17,7 +17,7 @@
  * under the License.
  */
 
-CREATE TABLE v8_trips_8i3d
+CREATE TABLE v8_trips_8i3u1d
 (
     ts     BIGINT,
     uuid   STRING,
@@ -31,11 +31,12 @@ TBLPROPERTIES (
     type = 'mor',
     primaryKey = 'uuid',
     preCombineField = 'ts',
-    'hoodie.metadata.enable' = 'false',
+    'hoodie.metadata.enable' = 'true',
+    'hoodie.metadata.record.index.enable' = 'true',
     'hoodie.parquet.small.file.limit' = '0'
 );
 
-INSERT INTO v8_trips_8i3d
+INSERT INTO v8_trips_8i3u1d
 VALUES (1695159649087, '334e26e9-8355-45cc-97c6-c31daf0df330', 'rider-A', 'driver-K', 19.10, 'san_francisco'),
        (1695091554788, 'e96c4396-3fad-413a-a942-4cb36106d721', 'rider-C', 'driver-M', 27.70, 'san_francisco'),
        (1695046462179, '9909a8b1-2d15-4d3d-8ec9-efc48c536a00', 'rider-D', 'driver-L', 33.90, 'san_francisco'),
@@ -45,4 +46,14 @@ VALUES (1695159649087, '334e26e9-8355-45cc-97c6-c31daf0df330', 'rider-A', 'drive
        (1695173887231, '3eeb61f7-c2b0-4636-99bd-5d7a5a1d2c04', 'rider-I', 'driver-S', 41.06, 'chennai'),
        (1695115999911, 'c8abbe79-8d89-47ea-b4ce-4d224bae5bfa', 'rider-J', 'driver-T', 17.85, 'chennai');
 
-DELETE FROM v8_trips_8i3d WHERE rider in ('rider-A', 'rider-C', 'rider-D');
+CREATE INDEX rider_idx ON v8_trips_8i3u1d (rider);
+
+UPDATE v8_trips_8i3u1d SET fare = 0 WHERE rider = 'rider-A';
+
+DELETE FROM v8_trips_8i3u1d WHERE rider = 'rider-F';
+
+UPDATE v8_trips_8i3u1d SET fare = 0 WHERE rider = 'rider-J';
+
+DELETE FROM v8_trips_8i3u1d WHERE rider = 'rider-J';
+
+UPDATE v8_trips_8i3u1d SET fare = 0 WHERE rider = 'rider-G';
