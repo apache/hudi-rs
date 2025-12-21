@@ -23,7 +23,7 @@ use crate::config::HudiConfigs;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
-use crate::file_group::log_file::scanner::LogFileScanner;
+use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
@@ -236,9 +236,19 @@ impl FileGroupReader {
                 .map(|log_file| file_slice.log_file_relative_path(log_file))
                 .collect::<Result<Vec<String>>>()?;
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let log_batches = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
+
+            let log_batches = match scan_result {
+                ScanResult::RecordBatches(batches) => batches,
+                ScanResult::Empty => RecordBatches::default(),
+                ScanResult::HFileRecords(_) => {
+                    return Err(crate::error::CoreError::LogBlockError(
+                        "Unexpected HFile records in regular table log files".into(),
+                    ));
+                }
+            };
 
             let base_batch = self
                 .read_file_slice_by_base_file_path(&relative_path)

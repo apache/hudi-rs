@@ -27,6 +27,74 @@ use crate::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// Result of scanning log files.
+///
+/// The scanner auto-detects the block type and returns the appropriate variant:
+/// - `RecordBatches`: Arrow record batches from Avro/Parquet data blocks (regular table reads)
+/// - `HFileRecords`: HFile key-value records from HFile data blocks (metadata table reads)
+/// - `Empty`: No data blocks found (only command blocks or empty files)
+#[derive(Debug)]
+pub enum ScanResult {
+    /// Arrow RecordBatches from Avro/Parquet data blocks.
+    /// Used for regular table reads.
+    RecordBatches(RecordBatches),
+    /// HFile key-value records from HFile data blocks.
+    /// Used for metadata table reads.
+    /// Note: Records are NOT merged by key - caller is responsible for merging.
+    HFileRecords(Vec<HFileRecord>),
+    /// No data blocks found.
+    Empty,
+}
+
+impl ScanResult {
+    /// Returns true if the result contains Arrow record batches.
+    #[must_use]
+    pub fn is_record_batches(&self) -> bool {
+        matches!(self, ScanResult::RecordBatches(_))
+    }
+
+    /// Returns true if the result contains HFile records.
+    #[must_use]
+    pub fn is_hfile_records(&self) -> bool {
+        matches!(self, ScanResult::HFileRecords(_))
+    }
+
+    /// Returns true if the result is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, ScanResult::Empty)
+    }
+
+    /// Unwrap as RecordBatches, panicking if not that variant.
+    #[must_use]
+    pub fn unwrap_record_batches(self) -> RecordBatches {
+        match self {
+            ScanResult::RecordBatches(batches) => batches,
+            _ => panic!("called unwrap_record_batches on non-RecordBatches variant"),
+        }
+    }
+
+    /// Unwrap as HFileRecords, panicking if not that variant.
+    #[must_use]
+    pub fn unwrap_hfile_records(self) -> Vec<HFileRecord> {
+        match self {
+            ScanResult::HFileRecords(records) => records,
+            _ => panic!("called unwrap_hfile_records on non-HFileRecords variant"),
+        }
+    }
+}
+
+/// Internal content type for detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentType {
+    /// Avro/Parquet/Delete blocks -> RecordBatches
+    Records,
+    /// HFile blocks -> HFileRecords
+    HFile,
+    /// No data blocks
+    Empty,
+}
+
 /// Result of collecting blocks from multiple log files.
 struct CollectedBlocks {
     /// All blocks organized by log file.
@@ -99,26 +167,55 @@ impl LogFileScanner {
         })
     }
 
-    /// Scan log files for Arrow record batches (Avro/Parquet data blocks).
+    /// Detect the content type from collected blocks.
     ///
-    /// This method is used for regular table reads where the log files contain
-    /// Avro or Parquet encoded data that can be converted to Arrow RecordBatch.
-    ///
-    /// For metadata table log files with HFile blocks, use `scan_hfile_records` instead.
-    pub async fn scan(
-        &self,
-        relative_paths: Vec<String>,
-        instant_range: &InstantRange,
-    ) -> Result<RecordBatches> {
-        let collected = self.collect_blocks(relative_paths, instant_range).await?;
+    /// Returns an error if the log files contain mixed block types (both Arrow-based
+    /// and HFile blocks), which is invalid.
+    fn detect_content_type(&self, collected: &CollectedBlocks) -> Result<ContentType> {
+        let mut has_record_blocks = false;
+        let mut has_hfile_blocks = false;
 
-        // Pre-count batches for capacity and validate block types
+        for blocks in &collected.all_blocks {
+            for block in blocks {
+                match block.block_type {
+                    BlockType::AvroData | BlockType::ParquetData | BlockType::Delete | BlockType::CdcData => {
+                        has_record_blocks = true;
+                    }
+                    BlockType::HfileData => {
+                        has_hfile_blocks = true;
+                    }
+                    BlockType::Command | BlockType::Corrupted => {
+                        // Command and corrupted blocks don't affect content type
+                    }
+                }
+
+                // Check for mixed types as early as possible
+                if has_record_blocks && has_hfile_blocks {
+                    return Err(crate::error::CoreError::LogBlockError(
+                        "Log files contain mixed block types (both Arrow-based and HFile blocks), which is invalid".into(),
+                    ));
+                }
+            }
+        }
+
+        if has_hfile_blocks {
+            Ok(ContentType::HFile)
+        } else if has_record_blocks {
+            Ok(ContentType::Records)
+        } else {
+            Ok(ContentType::Empty)
+        }
+    }
+
+    /// Collect Arrow record batches from blocks.
+    fn collect_record_batches(&self, collected: CollectedBlocks) -> Result<ScanResult> {
+        // Pre-count batches for capacity
         let mut num_data_batches = 0;
         let mut num_delete_batches = 0;
         for blocks in &collected.all_blocks {
             for block in blocks {
                 match block.block_type {
-                    BlockType::AvroData | BlockType::ParquetData => {
+                    BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData => {
                         if let Some(records) = block.content.as_records() {
                             num_data_batches += records.num_data_batches();
                         }
@@ -128,18 +225,7 @@ impl LogFileScanner {
                             num_delete_batches += records.num_delete_batches();
                         }
                     }
-                    BlockType::Command => {}
-                    BlockType::HfileData => {
-                        return Err(crate::error::CoreError::LogBlockError(
-                            "HFile data blocks should be scanned with scan_hfile_records".into(),
-                        ));
-                    }
-                    _ => {
-                        return Err(crate::error::CoreError::LogBlockError(format!(
-                            "Unexpected block type: {:?}",
-                            block.block_type
-                        )));
-                    }
+                    _ => {}
                 }
             }
         }
@@ -152,44 +238,18 @@ impl LogFileScanner {
             }
         }
 
-        Ok(batches)
+        Ok(ScanResult::RecordBatches(batches))
     }
 
-    /// Scan log files for HFile records (metadata table log files).
-    ///
-    /// This method is used for metadata table reads where the log files contain
-    /// HFile encoded key-value pairs that should NOT be converted to Arrow.
-    ///
-    /// The returned records are NOT merged by key - the caller (metadata table reader)
-    /// is responsible for merging records with the same key (keeping the latest value).
-    pub async fn scan_hfile_records(
-        &self,
-        relative_paths: Vec<String>,
-        instant_range: &InstantRange,
-    ) -> Result<Vec<HFileRecord>> {
-        let collected = self.collect_blocks(relative_paths, instant_range).await?;
-
-        // Pre-count records for capacity and validate block types
+    /// Collect HFile records from blocks.
+    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<ScanResult> {
+        // Pre-count records for capacity
         let mut total_records = 0;
         for blocks in &collected.all_blocks {
             for block in blocks {
-                match block.block_type {
-                    BlockType::HfileData => {
-                        if let Some(records) = block.content.as_hfile_records() {
-                            total_records += records.len();
-                        }
-                    }
-                    BlockType::Command => {}
-                    BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
-                        return Err(crate::error::CoreError::LogBlockError(
-                            "Non-HFile data blocks should be scanned with scan method".into(),
-                        ));
-                    }
-                    _ => {
-                        return Err(crate::error::CoreError::LogBlockError(format!(
-                            "Unexpected block type: {:?}",
-                            block.block_type
-                        )));
+                if block.block_type == BlockType::HfileData {
+                    if let Some(records) = block.content.as_hfile_records() {
+                        total_records += records.len();
                     }
                 }
             }
@@ -203,6 +263,34 @@ impl LogFileScanner {
             }
         }
 
-        Ok(records)
+        Ok(ScanResult::HFileRecords(records))
+    }
+
+    /// Scan log files and return the appropriate content type.
+    ///
+    /// The scanner auto-detects the block type and returns:
+    /// - `ScanResult::RecordBatches` for Avro/Parquet/Delete data blocks (regular table reads)
+    /// - `ScanResult::HFileRecords` for HFile data blocks (metadata table reads)
+    /// - `ScanResult::Empty` if no data blocks found
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log files contain mixed block types (both Arrow-based
+    /// and HFile blocks), which indicates data corruption or misconfiguration.
+    pub async fn scan(
+        &self,
+        relative_paths: Vec<String>,
+        instant_range: &InstantRange,
+    ) -> Result<ScanResult> {
+        let collected = self.collect_blocks(relative_paths, instant_range).await?;
+
+        // Detect content type from blocks
+        let content_type = self.detect_content_type(&collected)?;
+
+        match content_type {
+            ContentType::Records => self.collect_record_batches(collected),
+            ContentType::HFile => self.collect_hfile_records(collected),
+            ContentType::Empty => Ok(ScanResult::Empty),
+        }
     }
 }
