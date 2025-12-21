@@ -424,7 +424,10 @@ mod tests {
         let all_partitions = merged
             .get("__all_partitions__")
             .expect("Should have __all_partitions__");
-        assert_eq!(all_partitions.record_type, MetadataRecordType::AllPartitions);
+        assert_eq!(
+            all_partitions.record_type,
+            MetadataRecordType::AllPartitions
+        );
         assert_eq!(
             all_partitions.files.len(),
             3,
@@ -445,7 +448,11 @@ mod tests {
             .keys()
             .filter(|n| n.ends_with(".parquet"))
             .collect();
-        assert_eq!(chennai_parquets.len(), 2, "Chennai should have 2 parquet files");
+        assert_eq!(
+            chennai_parquets.len(),
+            2,
+            "Chennai should have 2 parquet files"
+        );
 
         let chennai_logs: Vec<_> = chennai
             .files
@@ -455,14 +462,20 @@ mod tests {
         assert_eq!(chennai_logs.len(), 2, "Chennai should have 2 log files");
 
         for (name, info) in &chennai.files {
-            assert!(name.contains(CHENNAI_UUID), "File should contain Chennai UUID: {}", name);
+            assert!(
+                name.contains(CHENNAI_UUID),
+                "File should contain Chennai UUID: {}",
+                name
+            );
             assert!(!info.is_deleted, "File should not be deleted");
             assert!(info.size > 0, "File size should be > 0");
         }
 
         // Validate san_francisco partition
         // Log files contain: 2 parquet files + 1 log file = 3 active files
-        let sf = merged.get("city=san_francisco").expect("Should have san_francisco");
+        let sf = merged
+            .get("city=san_francisco")
+            .expect("Should have san_francisco");
         assert_eq!(sf.record_type, MetadataRecordType::Files);
         assert_eq!(sf.files.len(), 3, "San Francisco should have 3 files");
 
@@ -477,7 +490,11 @@ mod tests {
         assert_eq!(sf_logs.len(), 1, "SF should have 1 log file");
 
         for (name, info) in &sf.files {
-            assert!(name.contains(SAN_FRANCISCO_UUID), "File should contain SF UUID: {}", name);
+            assert!(
+                name.contains(SAN_FRANCISCO_UUID),
+                "File should contain SF UUID: {}",
+                name
+            );
             assert!(!info.is_deleted);
         }
 
@@ -498,7 +515,11 @@ mod tests {
         assert_eq!(sp_logs.len(), 2, "SP should have 2 log files");
 
         for (name, info) in &sp.files {
-            assert!(name.contains(SAO_PAULO_UUID), "File should contain SP UUID: {}", name);
+            assert!(
+                name.contains(SAO_PAULO_UUID),
+                "File should contain SP UUID: {}",
+                name
+            );
             assert!(!info.is_deleted);
         }
 

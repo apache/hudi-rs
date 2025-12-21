@@ -2096,7 +2096,11 @@ mod tests {
                         .into_iter()
                         .filter(|f| f.ends_with(".parquet"))
                         .collect();
-                    assert_eq!(parquet_files.len(), 2, "chennai should have 2 parquet files");
+                    assert_eq!(
+                        parquet_files.len(),
+                        2,
+                        "chennai should have 2 parquet files"
+                    );
                     for file in &parquet_files {
                         assert!(
                             file.contains("6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc"),
@@ -2113,7 +2117,11 @@ mod tests {
                         .into_iter()
                         .filter(|f| f.ends_with(".parquet"))
                         .collect();
-                    assert_eq!(parquet_files.len(), 2, "san_francisco should have 2 parquet files");
+                    assert_eq!(
+                        parquet_files.len(),
+                        2,
+                        "san_francisco should have 2 parquet files"
+                    );
                     for file in &parquet_files {
                         assert!(
                             file.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
@@ -2128,7 +2136,11 @@ mod tests {
                         .into_iter()
                         .filter(|f| f.ends_with(".parquet"))
                         .collect();
-                    assert_eq!(parquet_files.len(), 2, "sao_paulo should have 2 parquet files");
+                    assert_eq!(
+                        parquet_files.len(),
+                        2,
+                        "sao_paulo should have 2 parquet files"
+                    );
                     for file in &parquet_files {
                         assert!(
                             file.contains("8aa68f7e-afd6-4c94-b86c-8a886552e08d"),
@@ -2152,14 +2164,20 @@ mod tests {
         // Seek to san_francisco partition (has parquet + log files in MOR table)
         reader.seek_to_first().expect("Failed to seek");
         let lookup = Utf8Key::new("city=san_francisco");
-        assert_eq!(reader.seek_to(&lookup).expect("Failed to seek"), SeekResult::Found);
+        assert_eq!(
+            reader.seek_to(&lookup).expect("Failed to seek"),
+            SeekResult::Found
+        );
 
         let record = reader.get_record().expect("Failed to get record").unwrap();
         let files_record = decode_files_partition_record(&schema_reader, &record)
             .expect("Failed to decode san_francisco record");
 
         // Verify file extraction and sizes (MOR table has parquet + log files)
-        assert!(files_record.files.len() >= 2, "san_francisco should have at least 2 files");
+        assert!(
+            files_record.files.len() >= 2,
+            "san_francisco should have at least 2 files"
+        );
         assert!(files_record.total_size() > 0, "Total size should be > 0");
 
         // Filter to parquet files only for specific validation
@@ -2169,7 +2187,11 @@ mod tests {
             .filter(|(name, _)| name.ends_with(".parquet"))
             .collect();
 
-        assert_eq!(parquet_files.len(), 2, "san_francisco should have 2 parquet files");
+        assert_eq!(
+            parquet_files.len(),
+            2,
+            "san_francisco should have 2 parquet files"
+        );
 
         for (file_name, file_info) in &parquet_files {
             assert!(
@@ -2205,7 +2227,10 @@ mod tests {
         // Reset and seek to non-existent key between valid keys
         reader.seek_to_first().expect("Failed to seek");
         let result = reader.seek_to(&Utf8Key::new("city=berlin")).expect("seek");
-        assert!(matches!(result, SeekResult::InRange | SeekResult::BeforeBlockFirstKey));
+        assert!(matches!(
+            result,
+            SeekResult::InRange | SeekResult::BeforeBlockFirstKey
+        ));
     }
 
     /// Test prefix scan for partition file listings.
@@ -2226,8 +2251,8 @@ mod tests {
         let mut total_parquet_files = 0;
         let mut total_size: i64 = 0;
         for record in &records {
-            let files_record =
-                decode_files_partition_record(&schema_reader, record).expect("Failed to decode record");
+            let files_record = decode_files_partition_record(&schema_reader, record)
+                .expect("Failed to decode record");
             let active = files_record.active_file_names();
             assert!(!active.is_empty(), "Partition should have files");
 
@@ -2238,8 +2263,10 @@ mod tests {
         }
 
         // Total parquet: 2 (chennai) + 2 (san_francisco) + 2 (sao_paulo) = 6 files
-        assert_eq!(total_parquet_files, 6, "Total parquet files across all partitions");
+        assert_eq!(
+            total_parquet_files, 6,
+            "Total parquet files across all partitions"
+        );
         assert!(total_size > 0, "Total size across partitions should be > 0");
     }
-
 }

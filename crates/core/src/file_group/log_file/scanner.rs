@@ -178,7 +178,10 @@ impl LogFileScanner {
         for blocks in &collected.all_blocks {
             for block in blocks {
                 match block.block_type {
-                    BlockType::AvroData | BlockType::ParquetData | BlockType::Delete | BlockType::CdcData => {
+                    BlockType::AvroData
+                    | BlockType::ParquetData
+                    | BlockType::Delete
+                    | BlockType::CdcData => {
                         has_record_blocks = true;
                     }
                     BlockType::HfileData => {

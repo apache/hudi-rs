@@ -587,4 +587,342 @@ mod tests {
         assert!(matches!(err, CoreError::LogBlockError(_)));
         assert!(err.to_string().contains("Invalid log block version: 4"));
     }
+
+    #[test]
+    fn test_log_block_content_is_records() {
+        let empty = LogBlockContent::Empty;
+        assert!(!empty.is_records());
+        assert!(!empty.is_hfile_records());
+        assert!(empty.is_empty());
+
+        let records = LogBlockContent::Records(RecordBatches::default());
+        assert!(records.is_records());
+        assert!(!records.is_hfile_records());
+        assert!(!records.is_empty());
+
+        let hfile = LogBlockContent::HFileRecords(vec![]);
+        assert!(!hfile.is_records());
+        assert!(hfile.is_hfile_records());
+        assert!(!hfile.is_empty());
+    }
+
+    #[test]
+    fn test_log_block_content_as_methods() {
+        let empty = LogBlockContent::Empty;
+        assert!(empty.as_records().is_none());
+        assert!(empty.as_hfile_records().is_none());
+
+        let records = LogBlockContent::Records(RecordBatches::default());
+        assert!(records.as_records().is_some());
+        assert!(records.as_hfile_records().is_none());
+
+        let hfile = LogBlockContent::HFileRecords(vec![]);
+        assert!(hfile.as_records().is_none());
+        assert!(hfile.as_hfile_records().is_some());
+    }
+
+    #[test]
+    fn test_log_block_content_into_methods() {
+        let empty = LogBlockContent::Empty;
+        assert!(empty.into_records().is_none());
+
+        let empty = LogBlockContent::Empty;
+        assert!(empty.into_hfile_records().is_none());
+
+        let records = LogBlockContent::Records(RecordBatches::default());
+        assert!(records.into_records().is_some());
+
+        let hfile = LogBlockContent::HFileRecords(vec![]);
+        assert!(hfile.into_hfile_records().is_some());
+
+        // Test that into_records on HFileRecords returns None
+        let hfile = LogBlockContent::HFileRecords(vec![]);
+        assert!(hfile.into_records().is_none());
+
+        // Test that into_hfile_records on Records returns None
+        let records = LogBlockContent::Records(RecordBatches::default());
+        assert!(records.into_hfile_records().is_none());
+    }
+
+    #[test]
+    fn test_log_block_new() {
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, "12345".to_string())]);
+        let footer = HashMap::new();
+        let content = LogBlockContent::Empty;
+
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header.clone(),
+            content,
+            footer.clone(),
+        );
+
+        assert_eq!(block.format_version, LogFormatVersion::V1);
+        assert_eq!(block.block_type, BlockType::Command);
+        assert!(!block.skipped);
+        assert!(block.content.is_empty());
+    }
+
+    #[test]
+    fn test_log_block_new_skipped() {
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, "12345".to_string())]);
+
+        let block = LogBlock::new_skipped(LogFormatVersion::V1, BlockType::AvroData, header);
+
+        assert_eq!(block.format_version, LogFormatVersion::V1);
+        assert_eq!(block.block_type, BlockType::AvroData);
+        assert!(block.skipped);
+        assert!(block.content.is_empty());
+        assert!(block.footer.is_empty());
+    }
+
+    #[test]
+    fn test_log_block_record_batches_and_hfile_records() {
+        // Test record_batches on Records content
+        let records_content = LogBlockContent::Records(RecordBatches::default());
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            records_content,
+            HashMap::new(),
+        );
+        assert!(block.record_batches().is_some());
+        assert!(block.hfile_records().is_none());
+
+        // Test hfile_records on HFileRecords content
+        let hfile_content = LogBlockContent::HFileRecords(vec![]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::HfileData,
+            HashMap::new(),
+            hfile_content,
+            HashMap::new(),
+        );
+        assert!(block.record_batches().is_none());
+        assert!(block.hfile_records().is_some());
+    }
+
+    #[test]
+    fn test_log_block_instant_time() {
+        // Test success case
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, "20231214120000".to_string())]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert_eq!(block.instant_time().unwrap(), "20231214120000");
+
+        // Test missing instant time
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.instant_time().is_err());
+    }
+
+    #[test]
+    fn test_log_block_target_instant_time() {
+        // Test success case for command block
+        let header = HashMap::from([
+            (BlockMetadataKey::InstantTime, "20231214120000".to_string()),
+            (
+                BlockMetadataKey::TargetInstantTime,
+                "20231214110000".to_string(),
+            ),
+            (BlockMetadataKey::CommandBlockType, "0".to_string()),
+        ]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert_eq!(block.target_instant_time().unwrap(), "20231214110000");
+
+        // Test error for non-command block
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.target_instant_time().is_err());
+
+        // Test missing target instant time
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, "20231214120000".to_string())]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.target_instant_time().is_err());
+    }
+
+    #[test]
+    fn test_log_block_schema() {
+        // Test success case
+        let header = HashMap::from([(
+            BlockMetadataKey::Schema,
+            "{\"type\":\"record\"}".to_string(),
+        )]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert_eq!(block.schema().unwrap(), "{\"type\":\"record\"}");
+
+        // Test missing schema
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.schema().is_err());
+    }
+
+    #[test]
+    fn test_log_block_command_block_type() {
+        // Test success case - rollback command
+        let header = HashMap::from([
+            (BlockMetadataKey::InstantTime, "20231214120000".to_string()),
+            (BlockMetadataKey::CommandBlockType, "0".to_string()),
+        ]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert_eq!(block.command_block_type().unwrap(), CommandBlock::Rollback);
+
+        // Test error for non-command block
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.command_block_type().is_err());
+
+        // Test missing command block type
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, "20231214120000".to_string())]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.command_block_type().is_err());
+    }
+
+    #[test]
+    fn test_log_block_is_data_block() {
+        // Test data block types
+        for block_type in [
+            BlockType::AvroData,
+            BlockType::HfileData,
+            BlockType::ParquetData,
+            BlockType::CdcData,
+        ] {
+            let block = LogBlock::new(
+                LogFormatVersion::V1,
+                block_type,
+                HashMap::new(),
+                LogBlockContent::Empty,
+                HashMap::new(),
+            );
+            assert!(block.is_data_block());
+        }
+
+        // Test non-data block types
+        for block_type in [BlockType::Command, BlockType::Delete, BlockType::Corrupted] {
+            let block = LogBlock::new(
+                LogFormatVersion::V1,
+                block_type,
+                HashMap::new(),
+                LogBlockContent::Empty,
+                HashMap::new(),
+            );
+            assert!(!block.is_data_block());
+        }
+    }
+
+    #[test]
+    fn test_log_block_is_delete_block() {
+        let delete_block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Delete,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(delete_block.is_delete_block());
+
+        let avro_block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(!avro_block.is_delete_block());
+    }
+
+    #[test]
+    fn test_log_block_is_rollback_block() {
+        // Test rollback block
+        let header = HashMap::from([
+            (BlockMetadataKey::InstantTime, "20231214120000".to_string()),
+            (BlockMetadataKey::CommandBlockType, "0".to_string()),
+        ]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(block.is_rollback_block());
+
+        // Test non-rollback block (non-command)
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            HashMap::new(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(!block.is_rollback_block());
+
+        // Test command block without rollback type
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, "20231214120000".to_string())]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::Command,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert!(!block.is_rollback_block());
+    }
 }

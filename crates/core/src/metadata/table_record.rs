@@ -151,10 +151,7 @@ impl FilesPartitionRecord {
 
     /// Check if a file exists and is not deleted.
     pub fn has_active_file(&self, name: &str) -> bool {
-        self.files
-            .get(name)
-            .map(|f| !f.is_deleted)
-            .unwrap_or(false)
+        self.files.get(name).map(|f| !f.is_deleted).unwrap_or(false)
     }
 
     /// Get total size of active files in bytes.
@@ -243,30 +240,30 @@ pub fn decode_files_partition_record_with_schema(
 /// The filesystemMetadata field is a map where:
 /// - Keys are file names (or partition names for ALL_PARTITIONS)
 /// - Values are HoodieMetadataFileInfo records with {size, isDeleted}
-pub fn extract_filesystem_metadata(avro_value: &AvroValue) -> HashMap<String, HoodieMetadataFileInfo> {
+pub fn extract_filesystem_metadata(
+    avro_value: &AvroValue,
+) -> HashMap<String, HoodieMetadataFileInfo> {
     let mut files = HashMap::new();
 
     // Get the filesystemMetadata field (may be a union with null)
     let fs_metadata = match avro_value {
-        AvroValue::Record(fields) => {
-            fields.iter().find_map(|(name, val)| {
-                if name == "filesystemMetadata" {
-                    match val {
-                        AvroValue::Map(map) => Some(map),
-                        AvroValue::Union(_, inner) => {
-                            if let AvroValue::Map(map) = inner.as_ref() {
-                                Some(map)
-                            } else {
-                                None
-                            }
+        AvroValue::Record(fields) => fields.iter().find_map(|(name, val)| {
+            if name == "filesystemMetadata" {
+                match val {
+                    AvroValue::Map(map) => Some(map),
+                    AvroValue::Union(_, inner) => {
+                        if let AvroValue::Map(map) = inner.as_ref() {
+                            Some(map)
+                        } else {
+                            None
                         }
-                        _ => None,
                     }
-                } else {
-                    None
+                    _ => None,
                 }
-            })
-        }
+            } else {
+                None
+            }
+        }),
         _ => None,
     };
 
@@ -315,7 +312,11 @@ fn extract_file_info(name: &str, value: &AvroValue) -> Option<HoodieMetadataFile
         }
     }
 
-    Some(HoodieMetadataFileInfo::new(name.to_string(), size, is_deleted))
+    Some(HoodieMetadataFileInfo::new(
+        name.to_string(),
+        size,
+        is_deleted,
+    ))
 }
 
 /// Extract i64 from an Avro value (handles union types).
@@ -349,7 +350,9 @@ fn extract_bool(value: &AvroValue) -> Option<bool> {
 /// # Returns
 /// A `FilesPartitionRecord` with the decoded file information.
 /// Note: record_type defaults to Files since it cannot be determined without Avro.
-pub fn decode_files_partition_record_fallback(record: &HFileRecord) -> Result<FilesPartitionRecord> {
+pub fn decode_files_partition_record_fallback(
+    record: &HFileRecord,
+) -> Result<FilesPartitionRecord> {
     let key = record
         .key_as_str()
         .ok_or_else(|| CoreError::MetadataTable("Invalid UTF-8 key".to_string()))?
@@ -602,13 +605,25 @@ mod tests {
 
     #[test]
     fn test_metadata_record_type_from_i32() {
-        assert_eq!(MetadataRecordType::from(1), MetadataRecordType::AllPartitions);
+        assert_eq!(
+            MetadataRecordType::from(1),
+            MetadataRecordType::AllPartitions
+        );
         assert_eq!(MetadataRecordType::from(2), MetadataRecordType::Files);
         assert_eq!(MetadataRecordType::from(3), MetadataRecordType::ColumnStats);
-        assert_eq!(MetadataRecordType::from(4), MetadataRecordType::BloomFilters);
+        assert_eq!(
+            MetadataRecordType::from(4),
+            MetadataRecordType::BloomFilters
+        );
         assert_eq!(MetadataRecordType::from(5), MetadataRecordType::RecordIndex);
-        assert_eq!(MetadataRecordType::from(6), MetadataRecordType::PartitionStats);
-        assert_eq!(MetadataRecordType::from(7), MetadataRecordType::SecondaryIndex);
+        assert_eq!(
+            MetadataRecordType::from(6),
+            MetadataRecordType::PartitionStats
+        );
+        assert_eq!(
+            MetadataRecordType::from(7),
+            MetadataRecordType::SecondaryIndex
+        );
         assert_eq!(MetadataRecordType::from(99), MetadataRecordType::Unknown);
     }
 
@@ -652,7 +667,9 @@ mod tests {
         let bytes = std::fs::read(&path).expect("Failed to read test file");
         let reader = HFileReader::new(bytes.clone()).expect("Failed to create reader");
         let mut reader_mut = HFileReader::new(bytes).expect("Failed to create reader");
-        let records = reader_mut.collect_records().expect("Failed to collect records");
+        let records = reader_mut
+            .collect_records()
+            .expect("Failed to collect records");
 
         // Test ALL_PARTITIONS record
         let all_partitions_record = records
@@ -679,8 +696,8 @@ mod tests {
             .find(|r| r.key_as_str() == Some("city=chennai"))
             .expect("chennai record not found");
 
-        let files_record = decode_files_partition_record(&reader, chennai_record)
-            .expect("Failed to decode FILES");
+        let files_record =
+            decode_files_partition_record(&reader, chennai_record).expect("Failed to decode FILES");
 
         assert_eq!(files_record.record_type, MetadataRecordType::Files);
         assert!(!files_record.is_all_partitions());
@@ -688,11 +705,17 @@ mod tests {
         // Debug: Print all files found
         println!("Chennai files ({}):", files_record.files.len());
         for (name, info) in &files_record.files {
-            println!("  - {} (size={}, deleted={})", name, info.size, info.is_deleted);
+            println!(
+                "  - {} (size={}, deleted={})",
+                name, info.size, info.is_deleted
+            );
         }
 
         // The test table may have more files (base + log files)
-        assert!(files_record.files.len() >= 2, "chennai should have at least 2 files");
+        assert!(
+            files_record.files.len() >= 2,
+            "chennai should have at least 2 files"
+        );
 
         // Validate file info (size should be > 0 for actual files)
         // Count parquet files with the expected UUID
@@ -702,7 +725,11 @@ mod tests {
             .filter(|(name, _)| name.ends_with(".parquet"))
             .collect();
 
-        assert_eq!(parquet_files.len(), 2, "chennai should have 2 parquet files");
+        assert_eq!(
+            parquet_files.len(),
+            2,
+            "chennai should have 2 parquet files"
+        );
 
         for (file_name, file_info) in &parquet_files {
             assert!(
@@ -710,7 +737,11 @@ mod tests {
                 "File should contain chennai UUID: {}",
                 file_name
             );
-            assert!(file_info.size > 0, "File size should be > 0: {:?}", file_info);
+            assert!(
+                file_info.size > 0,
+                "File size should be > 0: {:?}",
+                file_info
+            );
             assert!(!file_info.is_deleted, "File should not be deleted");
         }
 
@@ -747,4 +778,246 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_hoodie_metadata_file_info_new() {
+        let info = HoodieMetadataFileInfo::new("test.parquet".to_string(), 12345, false);
+        assert_eq!(info.name, "test.parquet");
+        assert_eq!(info.size, 12345);
+        assert!(!info.is_deleted);
+
+        let deleted_info = HoodieMetadataFileInfo::new("deleted.parquet".to_string(), 0, true);
+        assert_eq!(deleted_info.name, "deleted.parquet");
+        assert_eq!(deleted_info.size, 0);
+        assert!(deleted_info.is_deleted);
+    }
+
+    #[test]
+    fn test_files_partition_record_all_file_names() {
+        let mut files = HashMap::new();
+        files.insert(
+            "file1.parquet".to_string(),
+            HoodieMetadataFileInfo::new("file1.parquet".to_string(), 1000, false),
+        );
+        files.insert(
+            "file2.parquet".to_string(),
+            HoodieMetadataFileInfo::new("file2.parquet".to_string(), 500, true),
+        );
+        files.insert(
+            "file3.parquet".to_string(),
+            HoodieMetadataFileInfo::new("file3.parquet".to_string(), 2000, false),
+        );
+
+        let record = FilesPartitionRecord {
+            key: "partition".to_string(),
+            record_type: MetadataRecordType::Files,
+            files,
+        };
+
+        let all_names = record.all_file_names();
+        assert_eq!(all_names.len(), 3);
+        assert!(all_names.contains(&"file1.parquet"));
+        assert!(all_names.contains(&"file2.parquet"));
+        assert!(all_names.contains(&"file3.parquet"));
+    }
+
+    #[test]
+    fn test_files_partition_record_partition_names_for_non_all_partitions() {
+        let mut files = HashMap::new();
+        files.insert(
+            "file.parquet".to_string(),
+            HoodieMetadataFileInfo::new("file.parquet".to_string(), 1000, false),
+        );
+
+        let record = FilesPartitionRecord {
+            key: "city=chennai".to_string(),
+            record_type: MetadataRecordType::Files,
+            files,
+        };
+
+        // partition_names() should return empty for non-AllPartitions record
+        let partition_names = record.partition_names();
+        assert!(partition_names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_avro_schema_success() {
+        let schema_json =
+            r#"{"type": "record", "name": "Test", "fields": [{"name": "id", "type": "int"}]}"#;
+        let result = parse_avro_schema(schema_json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_avro_schema_error() {
+        let invalid_json = "not valid json";
+        let result = parse_avro_schema(invalid_json);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid Avro schema"));
+    }
+
+    #[test]
+    fn test_decode_avro_value_empty_value() {
+        let schema_json =
+            r#"{"type": "record", "name": "Test", "fields": [{"name": "id", "type": "int"}]}"#;
+        let schema = parse_avro_schema(schema_json).unwrap();
+        let result = decode_avro_value(&[], &schema);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Empty value"));
+    }
+
+    #[test]
+    fn test_get_record_type_no_type_field() {
+        // Record without type field should return Unknown
+        let value = AvroValue::Record(vec![("other".to_string(), AvroValue::Int(42))]);
+        let result = get_record_type(&value);
+        assert_eq!(result, MetadataRecordType::Unknown);
+    }
+
+    #[test]
+    fn test_get_record_type_non_record() {
+        // Non-record value should return Unknown
+        let value = AvroValue::String("test".to_string());
+        let result = get_record_type(&value);
+        assert_eq!(result, MetadataRecordType::Unknown);
+    }
+
+    #[test]
+    fn test_get_record_type_union_int() {
+        // Union containing Int should work
+        let value = AvroValue::Record(vec![(
+            "type".to_string(),
+            AvroValue::Union(0, Box::new(AvroValue::Int(2))),
+        )]);
+        let result = get_record_type(&value);
+        assert_eq!(result, MetadataRecordType::Files);
+    }
+
+    #[test]
+    fn test_extract_long_int_value() {
+        let value = AvroValue::Int(42);
+        assert_eq!(extract_long(&value), Some(42));
+    }
+
+    #[test]
+    fn test_extract_long_long_value() {
+        let value = AvroValue::Long(123456789);
+        assert_eq!(extract_long(&value), Some(123456789));
+    }
+
+    #[test]
+    fn test_extract_long_union() {
+        let value = AvroValue::Union(0, Box::new(AvroValue::Long(999)));
+        assert_eq!(extract_long(&value), Some(999));
+    }
+
+    #[test]
+    fn test_extract_long_invalid() {
+        let value = AvroValue::String("not a number".to_string());
+        assert_eq!(extract_long(&value), None);
+    }
+
+    #[test]
+    fn test_extract_bool_boolean() {
+        assert_eq!(extract_bool(&AvroValue::Boolean(true)), Some(true));
+        assert_eq!(extract_bool(&AvroValue::Boolean(false)), Some(false));
+    }
+
+    #[test]
+    fn test_extract_bool_union() {
+        let value = AvroValue::Union(0, Box::new(AvroValue::Boolean(true)));
+        assert_eq!(extract_bool(&value), Some(true));
+    }
+
+    #[test]
+    fn test_extract_bool_invalid() {
+        let value = AvroValue::String("not a bool".to_string());
+        assert_eq!(extract_bool(&value), None);
+    }
+
+    #[test]
+    fn test_extract_filesystem_metadata_non_record() {
+        // Non-record Avro value should return empty map
+        let value = AvroValue::String("not a record".to_string());
+        let result = extract_filesystem_metadata(&value);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_filesystem_metadata_no_field() {
+        // Record without filesystemMetadata field should return empty map
+        let value = AvroValue::Record(vec![("other".to_string(), AvroValue::Int(42))]);
+        let result = extract_filesystem_metadata(&value);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_decode_files_partition_record_fallback_tombstone() {
+        // Create a tombstone record (empty value)
+        let record = HFileRecord::new(b"test_partition".to_vec(), vec![]);
+        let result =
+            decode_files_partition_record_fallback(&record).expect("Failed to decode tombstone");
+        assert_eq!(result.key, "test_partition");
+        assert_eq!(result.record_type, MetadataRecordType::Files);
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn test_decode_files_partition_record_fallback_all_partitions_key() {
+        // Create a record with __all_partitions__ key with non-empty value
+        // (empty value is tombstone and always returns Files type)
+        let value = b"some_partition_data".to_vec();
+        let record = HFileRecord::new(b"__all_partitions__".to_vec(), value);
+        let result = decode_files_partition_record_fallback(&record)
+            .expect("Failed to decode __all_partitions__");
+        assert_eq!(result.key, "__all_partitions__");
+        assert_eq!(result.record_type, MetadataRecordType::AllPartitions);
+        // Files may or may not be extracted depending on pattern matching
+    }
+
+    #[test]
+    fn test_is_valid_hudi_filename() {
+        // Valid parquet file
+        assert!(is_valid_hudi_filename(
+            "abcd1234-0000-1111-2222-333344445555_0-0-0_20231214.parquet"
+        ));
+
+        // Invalid - not parquet or log
+        assert!(!is_valid_hudi_filename(
+            "abcd1234-0000-1111-2222-333344445555.txt"
+        ));
+
+        // Invalid - not enough parts
+        assert!(!is_valid_hudi_filename("short.parquet"));
+
+        // Invalid - first part not 8 hex chars
+        assert!(!is_valid_hudi_filename(
+            "abc-0000-1111-2222-333344445555.parquet"
+        ));
+    }
+
+    #[test]
+    fn test_find_filename_start() {
+        let text = "prefix/abcd1234-file.parquet";
+        let start = find_filename_start(text);
+        assert_eq!(&text[start..], "abcd1234-file.parquet");
+    }
+
+    #[test]
+    fn test_find_log_filename_end() {
+        let text = "1-0_20231214abc";
+        let end = find_log_filename_end(text);
+        assert_eq!(&text[..end], "1-0_20231214");
+    }
+
+    #[test]
+    fn test_extract_file_names_from_bytes_parquet() {
+        // Simulate bytes containing a parquet filename
+        // Use a non-filename character (like space or /) as delimiter before the filename
+        let bytes = b"some data/abcd1234-0000-1111-2222-333344445555_0-0-0_20231214.parquet more";
+        let files = extract_file_names_from_bytes(bytes);
+        assert_eq!(files.len(), 1, "Should extract exactly one parquet file");
+        assert!(files.contains_key("abcd1234-0000-1111-2222-333344445555_0-0-0_20231214.parquet"));
+    }
 }
