@@ -60,6 +60,9 @@ pub enum CoreError {
     #[error("HFile error: {0}")]
     HFile(String),
 
+    #[error("Metadata table error: {0}")]
+    MetadataTable(String),
+
     #[error("{0}")]
     InvalidPartitionPath(String),
 

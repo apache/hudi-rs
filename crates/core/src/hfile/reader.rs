@@ -30,7 +30,9 @@ use crate::hfile::key::{compare_keys, Key, KeyValue, Utf8Key};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
 use crate::hfile::trailer::HFileTrailer;
+use apache_avro::Schema as AvroSchema;
 use prost::Message;
+use std::cell::OnceCell;
 
 /// Magic bytes indicating protobuf format in file info block
 const PBUF_MAGIC: &[u8; 4] = b"PBUF";
@@ -60,6 +62,13 @@ const FILE_INFO_MAX_MVCC_TS: &str = "MAX_MEMSTORE_TS_KEY";
 /// Key-value version indicating MVCC timestamp support
 const KEY_VALUE_VERSION_WITH_MVCC_TS: i32 = 1;
 
+/// File info key for Avro schema
+const FILE_INFO_SCHEMA: &str = "schema";
+/// File info key for min record key
+const FILE_INFO_MIN_RECORD_KEY: &str = "minRecordKey";
+/// File info key for max record key
+const FILE_INFO_MAX_RECORD_KEY: &str = "maxRecordKey";
+
 /// HFile reader that supports sequential reads and seeks.
 pub struct HFileReader {
     /// Raw file bytes
@@ -76,6 +85,8 @@ pub struct HFileReader {
     file_info: BTreeMap<String, Vec<u8>>,
     /// Last key in the file
     last_key: Option<Key>,
+    /// Cached Avro schema (parsed lazily from file info)
+    cached_schema: OnceCell<AvroSchema>,
     /// Current cursor position
     cursor: Cursor,
     /// Currently loaded data block
@@ -111,6 +122,7 @@ impl HFileReader {
             meta_block_index: BTreeMap::new(),
             file_info: BTreeMap::new(),
             last_key: None,
+            cached_schema: OnceCell::new(),
             cursor: Cursor::default(),
             current_block: None,
             current_block_entry: None,
@@ -473,6 +485,51 @@ impl HFileReader {
         }
 
         Ok(Some(block.data))
+    }
+
+    /// Get the Avro schema embedded in this HFile.
+    ///
+    /// The schema is cached after the first successful parse.
+    /// Returns `None` if no schema is present in the file info.
+    pub fn get_avro_schema(&self) -> Result<Option<&AvroSchema>> {
+        // Check if schema exists in file info
+        let schema_bytes = match self.file_info.get(FILE_INFO_SCHEMA) {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+
+        // Try to get from cache, or parse and cache
+        if let Some(schema) = self.cached_schema.get() {
+            return Ok(Some(schema));
+        }
+
+        // Parse schema from JSON
+        let schema_str = std::str::from_utf8(schema_bytes)
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {}", e)))?;
+
+        let schema = AvroSchema::parse_str(schema_str)
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid Avro schema: {}", e)))?;
+
+        // Cache the schema (ignore if already set by another thread)
+        let _ = self.cached_schema.set(schema);
+
+        Ok(self.cached_schema.get())
+    }
+
+    /// Get the min and max record keys from file info.
+    ///
+    /// These keys can be used for range pruning - if a lookup key is outside
+    /// the [min, max] range, the file can be skipped entirely.
+    ///
+    /// Returns `None` if min/max keys are not present in file info.
+    pub fn read_min_max_record_keys(&self) -> Option<(String, String)> {
+        let min_key = self.file_info.get(FILE_INFO_MIN_RECORD_KEY)?;
+        let max_key = self.file_info.get(FILE_INFO_MAX_RECORD_KEY)?;
+
+        let min_str = std::str::from_utf8(min_key).ok()?;
+        let max_str = std::str::from_utf8(max_key).ok()?;
+
+        Some((min_str.to_string(), max_str.to_string()))
     }
 
     /// Seek to the beginning of the file.
@@ -1900,4 +1957,289 @@ mod tests {
         // Test Debug implementation
         let _ = format!("{:?}", SeekResult::Found);
     }
+
+    // ================== Metadata Table HFile Tests ==================
+    //
+    // These tests validate reading HFile from a Hudi metadata table's
+    // "files" partition. The test data is from quickstart_trips_table
+    // v8_trips_8i3u1d (8 inserts, 3 updates, 1 delete):
+    //
+    // Table schema: ts, uuid, rider, driver, fare, city
+    // Partitions: city=chennai, city=san_francisco, city=sao_paulo
+    // MOR table with metadata table enabled
+    //
+    // The HFile contains 4 records:
+    // 1. "__all_partitions__" - List of all partition paths
+    // 2. "city=chennai" - 2 parquet files (UUID: 6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc)
+    // 3. "city=san_francisco" - 2 parquet files (UUID: 036ded81-9ed4-479f-bcea-7145dfa0079b)
+    // 4. "city=sao_paulo" - 2 parquet files (UUID: 8aa68f7e-afd6-4c94-b86c-8a886552e08d)
+
+    use crate::metadata::table_record::decode_files_partition_record;
+    use hudi_test::QuickstartTripsTable;
+
+    /// Get the path to the files partition directory in the test table.
+    fn files_partition_dir() -> PathBuf {
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        PathBuf::from(table_path)
+            .join(".hoodie")
+            .join("metadata")
+            .join("files")
+    }
+
+    /// Find the latest HFile in the files partition directory.
+    /// HFile names follow pattern: files-0000-0_X-X-X_TIMESTAMP.hfile
+    /// We pick the one with the latest timestamp.
+    fn files_partition_hfile_path() -> PathBuf {
+        let dir = files_partition_dir();
+        let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("Failed to read directory {:?}: {}", dir, e))
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|ext| ext == "hfile")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // Sort by filename to get the latest (timestamps are in filename)
+        hfiles.sort_by_key(|e| e.file_name());
+
+        hfiles
+            .last()
+            .map(|e| e.path())
+            .unwrap_or_else(|| panic!("No HFile found in {:?}", dir))
+    }
+
+    fn read_metadata_table_hfile() -> Vec<u8> {
+        let path = files_partition_hfile_path();
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {:?}", path))
+    }
+
+    /// Test reading and validating metadata table HFile structure.
+    ///
+    /// Validates entry count, keys in sorted order, and value structure.
+    #[test]
+    fn test_metadata_table_hfile_structure() {
+        let bytes = read_metadata_table_hfile();
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Verify entry count: 1 for __all_partitions__ + 3 for partition paths
+        assert_eq!(reader.num_entries(), 4);
+
+        // Collect and verify keys in sorted order
+        let records = reader.collect_records().expect("Failed to collect records");
+        let keys: Vec<&str> = records
+            .iter()
+            .map(|r| r.key_as_str().expect("Key should be UTF-8"))
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "__all_partitions__",
+                "city=chennai",
+                "city=san_francisco",
+                "city=sao_paulo"
+            ]
+        );
+
+        // Verify all values are non-empty (not tombstones)
+        for record in &records {
+            assert!(!record.is_deleted());
+            assert!(record.value.len() > 50);
+        }
+    }
+
+    /// Test decoding file listings from partition records.
+    ///
+    /// Validates actual file names by decoding Avro values and
+    /// verifying against known files in the Hudi table.
+    #[test]
+    fn test_metadata_table_hfile_file_listings() {
+        let bytes = read_metadata_table_hfile();
+        // Create one reader for schema access, another for record collection
+        let schema_reader = HFileReader::new(bytes.clone()).expect("Failed to create reader");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let records = reader.collect_records().expect("Failed to collect records");
+
+        // Expected files per partition (from the actual Hudi table v8_trips_8i3u1d)
+        // city=chennai: 2 parquet files (6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc)
+        // city=san_francisco: 2 parquet files (036ded81-9ed4-479f-bcea-7145dfa0079b)
+        // city=sao_paulo: 2 parquet files (8aa68f7e-afd6-4c94-b86c-8a886552e08d)
+
+        for record in &records {
+            let key = record.key_as_str().expect("Key should be UTF-8");
+            let files_record = decode_files_partition_record(&schema_reader, record)
+                .unwrap_or_else(|e| panic!("Failed to decode record for key {}: {}", key, e));
+
+            match key {
+                "__all_partitions__" => {
+                    // Validate ALL_PARTITIONS record type and partitions
+                    assert_eq!(
+                        files_record.record_type,
+                        crate::metadata::table_record::MetadataRecordType::AllPartitions
+                    );
+                    assert!(files_record.is_all_partitions());
+                    assert_eq!(files_record.partition_names().len(), 3);
+                }
+                "city=chennai" => {
+                    assert_eq!(
+                        files_record.record_type,
+                        crate::metadata::table_record::MetadataRecordType::Files
+                    );
+                    // Filter to parquet files only (MOR tables also have log files)
+                    let parquet_files: Vec<_> = files_record
+                        .active_file_names()
+                        .into_iter()
+                        .filter(|f| f.ends_with(".parquet"))
+                        .collect();
+                    assert_eq!(parquet_files.len(), 2, "chennai should have 2 parquet files");
+                    for file in &parquet_files {
+                        assert!(
+                            file.contains("6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc"),
+                            "chennai file ID mismatch: {}",
+                            file
+                        );
+                    }
+                    // Validate file sizes are populated
+                    assert!(files_record.total_size() > 0);
+                }
+                "city=san_francisco" => {
+                    let parquet_files: Vec<_> = files_record
+                        .active_file_names()
+                        .into_iter()
+                        .filter(|f| f.ends_with(".parquet"))
+                        .collect();
+                    assert_eq!(parquet_files.len(), 2, "san_francisco should have 2 parquet files");
+                    for file in &parquet_files {
+                        assert!(
+                            file.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
+                            "san_francisco file ID mismatch: {}",
+                            file
+                        );
+                    }
+                }
+                "city=sao_paulo" => {
+                    let parquet_files: Vec<_> = files_record
+                        .active_file_names()
+                        .into_iter()
+                        .filter(|f| f.ends_with(".parquet"))
+                        .collect();
+                    assert_eq!(parquet_files.len(), 2, "sao_paulo should have 2 parquet files");
+                    for file in &parquet_files {
+                        assert!(
+                            file.contains("8aa68f7e-afd6-4c94-b86c-8a886552e08d"),
+                            "sao_paulo file ID mismatch: {}",
+                            file
+                        );
+                    }
+                }
+                _ => panic!("Unexpected key: {}", key),
+            }
+        }
+    }
+
+    /// Test file info extraction from san_francisco partition.
+    #[test]
+    fn test_metadata_table_hfile_partition_file_extraction() {
+        let bytes = read_metadata_table_hfile();
+        let schema_reader = HFileReader::new(bytes.clone()).expect("Failed to create reader");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Seek to san_francisco partition (has parquet + log files in MOR table)
+        reader.seek_to_first().expect("Failed to seek");
+        let lookup = Utf8Key::new("city=san_francisco");
+        assert_eq!(reader.seek_to(&lookup).expect("Failed to seek"), SeekResult::Found);
+
+        let record = reader.get_record().expect("Failed to get record").unwrap();
+        let files_record = decode_files_partition_record(&schema_reader, &record)
+            .expect("Failed to decode san_francisco record");
+
+        // Verify file extraction and sizes (MOR table has parquet + log files)
+        assert!(files_record.files.len() >= 2, "san_francisco should have at least 2 files");
+        assert!(files_record.total_size() > 0, "Total size should be > 0");
+
+        // Filter to parquet files only for specific validation
+        let parquet_files: Vec<_> = files_record
+            .files
+            .iter()
+            .filter(|(name, _)| name.ends_with(".parquet"))
+            .collect();
+
+        assert_eq!(parquet_files.len(), 2, "san_francisco should have 2 parquet files");
+
+        for (file_name, file_info) in &parquet_files {
+            assert!(
+                file_name.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
+                "File should match san_francisco UUID: {}",
+                file_name
+            );
+            assert!(file_info.size > 0, "File size should be > 0");
+            assert!(!file_info.is_deleted, "File should not be deleted");
+        }
+    }
+
+    /// Test seek operations on metadata table HFile.
+    #[test]
+    fn test_metadata_table_hfile_seek_operations() {
+        let bytes = read_metadata_table_hfile();
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        reader.seek_to_first().expect("Failed to seek");
+
+        // Seek before first key
+        assert_eq!(
+            reader.seek_to(&Utf8Key::new("AAA")).expect("seek"),
+            SeekResult::BeforeFileFirstKey
+        );
+
+        // Seek after last key
+        assert_eq!(
+            reader.seek_to(&Utf8Key::new("zzz")).expect("seek"),
+            SeekResult::Eof
+        );
+
+        // Reset and seek to non-existent key between valid keys
+        reader.seek_to_first().expect("Failed to seek");
+        let result = reader.seek_to(&Utf8Key::new("city=berlin")).expect("seek");
+        assert!(matches!(result, SeekResult::InRange | SeekResult::BeforeBlockFirstKey));
+    }
+
+    /// Test prefix scan for partition file listings.
+    #[test]
+    fn test_metadata_table_hfile_prefix_scan_with_file_validation() {
+        let bytes = read_metadata_table_hfile();
+        let schema_reader = HFileReader::new(bytes.clone()).expect("Failed to create reader");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Scan for partition keys
+        let records = reader
+            .collect_records_by_prefix("city=")
+            .expect("Failed to collect by prefix");
+
+        assert_eq!(records.len(), 3);
+
+        // Verify each partition has valid file listings
+        let mut total_parquet_files = 0;
+        let mut total_size: i64 = 0;
+        for record in &records {
+            let files_record =
+                decode_files_partition_record(&schema_reader, record).expect("Failed to decode record");
+            let active = files_record.active_file_names();
+            assert!(!active.is_empty(), "Partition should have files");
+
+            // Count only parquet files (MOR tables also have log files)
+            let parquet_count = active.iter().filter(|f| f.ends_with(".parquet")).count();
+            total_parquet_files += parquet_count;
+            total_size += files_record.total_size();
+        }
+
+        // Total parquet: 2 (chennai) + 2 (san_francisco) + 2 (sao_paulo) = 6 files
+        assert_eq!(total_parquet_files, 6, "Total parquet files across all partitions");
+        assert!(total_size > 0, "Total size across partitions should be > 0");
+    }
+
 }
