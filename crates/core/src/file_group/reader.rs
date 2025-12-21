@@ -20,6 +20,7 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
+use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
@@ -287,19 +288,29 @@ impl FileGroupReader {
         base_file_path: &str,
         log_file_paths: Vec<String>,
     ) -> Result<RecordBatch> {
-        let base_file_only = log_file_paths.is_empty()
-            || self
-                .hudi_configs
-                .get_or_default(HudiReadConfig::UseReadOptimizedMode)
-                .to::<bool>();
+        let use_read_optimized: bool = self
+            .hudi_configs
+            .get_or_default(HudiReadConfig::UseReadOptimizedMode)
+            .into();
+        let base_file_only = log_file_paths.is_empty() || use_read_optimized;
 
         if base_file_only {
             self.read_file_slice_by_base_file_path(base_file_path).await
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let log_batches = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
+
+            let log_batches = match scan_result {
+                ScanResult::RecordBatches(batches) => batches,
+                ScanResult::Empty => RecordBatches::new(),
+                ScanResult::HFileRecords(_) => {
+                    return Err(CoreError::LogBlockError(
+                        "Unexpected HFile records in regular table log file scan".to_string(),
+                    ));
+                }
+            };
 
             let base_batch = self
                 .read_file_slice_by_base_file_path(base_file_path)

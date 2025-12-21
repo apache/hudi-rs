@@ -149,6 +149,7 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use hudi_test::util::{reset_timezone, set_fixed_timezone};
+    use serial_test::serial;
 
     fn set_singapore_timezone() {
         set_fixed_timezone("Asia/Singapore");
@@ -172,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_parse_epoch_time() {
         // Test epoch time in seconds (10 digits or fewer)
         let result = parse_epoch_time("1710512730", &TimelineTimezoneValue::UTC).unwrap();
@@ -203,6 +205,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_parse_rfc3339_format() {
         // RFC3339 with timezone offset
         let result =
@@ -275,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_format_timestamp_epoch_time() {
         set_singapore_timezone();
 
@@ -297,6 +301,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_format_timestamp_rfc3339() {
         set_singapore_timezone();
 
@@ -325,6 +330,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_format_timestamp_comprehensive() {
         set_singapore_timezone();
 
@@ -425,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_timezone_conversion_consistency() {
         set_singapore_timezone();
 
@@ -449,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_edge_cases() {
         set_singapore_timezone();
 
