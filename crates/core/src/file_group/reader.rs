@@ -248,15 +248,23 @@ impl FileGroupReader {
     ///
     /// # Arguments
     /// * `base_file_path` - The relative path to the base file.
-    /// * `log_file_paths` - A list of relative paths to log files.
+    /// * `log_file_paths` - An iterator of relative paths to log files.
     ///
     /// # Returns
     /// A record batch read from the base file merged with log files.
-    pub async fn read_file_slice_from_paths(
+    pub async fn read_file_slice_from_paths<I, S>(
         &self,
         base_file_path: &str,
-        log_file_paths: Vec<String>,
-    ) -> Result<RecordBatch> {
+        log_file_paths: I,
+    ) -> Result<RecordBatch>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let log_file_paths: Vec<String> = log_file_paths
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
         let use_read_optimized: bool = self
             .hudi_configs
             .get_or_default(HudiReadConfig::UseReadOptimizedMode)
@@ -298,11 +306,15 @@ impl FileGroupReader {
     }
 
     /// Same as [FileGroupReader::read_file_slice_from_paths], but blocking.
-    pub fn read_file_slice_from_paths_blocking(
+    pub fn read_file_slice_from_paths_blocking<I, S>(
         &self,
         base_file_path: &str,
-        log_file_paths: Vec<String>,
-    ) -> Result<RecordBatch> {
+        log_file_paths: I,
+    ) -> Result<RecordBatch>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
@@ -478,7 +490,7 @@ mod tests {
 
         // Test with actual test files and empty log files - should trigger base_file_only logic
         let base_file_path = TEST_SAMPLE_BASE_FILE;
-        let log_file_paths = vec![];
+        let log_file_paths: Vec<&str> = vec![];
 
         let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
 
@@ -566,7 +578,7 @@ mod tests {
 
         // Test with non-existent base file
         let base_file_path = "non_existent_file.parquet";
-        let log_file_paths = vec![];
+        let log_file_paths: Vec<&str> = vec![];
 
         let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
 
