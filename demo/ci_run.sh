@@ -34,12 +34,16 @@ fi
 # Start services with or without rebuild
 if [ "$USE_CACHED_BUILD" = "true" ]; then
   # In CI, the runner image is pre-built and tagged as demo-runner:cached
+  # Note: we still need to build mc (minio client) as it's not cached, but it's small
   if docker images -q demo-runner:cached 2>/dev/null | grep -q .; then
     echo "Using pre-built runner image (demo-runner:cached)"
     docker tag demo-runner:cached demo-runner:latest
+    # Build mc but not runner (runner is already cached)
+    docker compose build mc
     docker compose up -d --no-build
   elif docker images -q demo-runner:latest 2>/dev/null | grep -q .; then
     echo "Using existing demo-runner:latest image"
+    docker compose build mc
     docker compose up -d --no-build
   else
     echo "WARNING: --use-cached-build specified but no pre-built image found"

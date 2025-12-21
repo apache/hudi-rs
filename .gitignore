@@ -19,6 +19,10 @@
 /target
 **/target
 
+# CI/Docker cache directories
+.cargo/
+.uv-cache/
+
 /.idea
 .vscode
 
