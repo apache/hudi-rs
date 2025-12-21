@@ -302,12 +302,87 @@ impl LogFileScanner {
 mod tests {
     use super::*;
     use crate::config::HudiConfigs;
+    use crate::file_group::record_batches::RecordBatches;
     use crate::hfile::HFileReader;
     use crate::metadata::table_record::decode_files_partition_record_with_schema;
     use crate::storage::util::parse_uri;
     use apache_avro::Schema as AvroSchema;
     use hudi_test::QuickstartTripsTable;
     use std::path::PathBuf;
+
+    // ============================================================================
+    // ScanResult unit tests
+    // ============================================================================
+
+    #[test]
+    fn test_scan_result_is_record_batches() {
+        let batches = ScanResult::RecordBatches(RecordBatches::new());
+        assert!(batches.is_record_batches());
+        assert!(!batches.is_hfile_records());
+        assert!(!batches.is_empty());
+    }
+
+    #[test]
+    fn test_scan_result_is_hfile_records() {
+        let records = ScanResult::HFileRecords(vec![]);
+        assert!(!records.is_record_batches());
+        assert!(records.is_hfile_records());
+        assert!(!records.is_empty());
+    }
+
+    #[test]
+    fn test_scan_result_is_empty() {
+        let empty = ScanResult::Empty;
+        assert!(!empty.is_record_batches());
+        assert!(!empty.is_hfile_records());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_scan_result_unwrap_record_batches_success() {
+        let batches = ScanResult::RecordBatches(RecordBatches::new());
+        let unwrapped = batches.unwrap_record_batches();
+        assert_eq!(unwrapped.num_data_batches(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "called unwrap_record_batches on non-RecordBatches variant")]
+    fn test_scan_result_unwrap_record_batches_panic_on_hfile() {
+        let records = ScanResult::HFileRecords(vec![]);
+        let _ = records.unwrap_record_batches();
+    }
+
+    #[test]
+    #[should_panic(expected = "called unwrap_record_batches on non-RecordBatches variant")]
+    fn test_scan_result_unwrap_record_batches_panic_on_empty() {
+        let empty = ScanResult::Empty;
+        let _ = empty.unwrap_record_batches();
+    }
+
+    #[test]
+    fn test_scan_result_unwrap_hfile_records_success() {
+        let records = ScanResult::HFileRecords(vec![]);
+        let unwrapped = records.unwrap_hfile_records();
+        assert!(unwrapped.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "called unwrap_hfile_records on non-HFileRecords variant")]
+    fn test_scan_result_unwrap_hfile_records_panic_on_record_batches() {
+        let batches = ScanResult::RecordBatches(RecordBatches::new());
+        let _ = batches.unwrap_hfile_records();
+    }
+
+    #[test]
+    #[should_panic(expected = "called unwrap_hfile_records on non-HFileRecords variant")]
+    fn test_scan_result_unwrap_hfile_records_panic_on_empty() {
+        let empty = ScanResult::Empty;
+        let _ = empty.unwrap_hfile_records();
+    }
+
+    // ============================================================================
+    // Integration tests
+    // ============================================================================
 
     /// Get the metadata table directory (base path for storage).
     fn metadata_table_dir() -> PathBuf {

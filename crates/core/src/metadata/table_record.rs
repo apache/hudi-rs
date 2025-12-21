@@ -748,4 +748,144 @@ mod tests {
         let result = extract_filesystem_metadata(&value);
         assert!(result.is_empty());
     }
+
+    #[test]
+    fn test_extract_filesystem_metadata_union_with_non_map() {
+        // filesystemMetadata as Union containing non-Map value should return empty
+        let value = AvroValue::Record(vec![(
+            "filesystemMetadata".to_string(),
+            AvroValue::Union(0, Box::new(AvroValue::Null)),
+        )]);
+        let result = extract_filesystem_metadata(&value);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_filesystem_metadata_union_with_map() {
+        // filesystemMetadata as Union containing Map should work
+        use std::collections::HashMap as StdMap;
+        let mut map = StdMap::new();
+        map.insert(
+            "test.parquet".to_string(),
+            AvroValue::Record(vec![
+                ("size".to_string(), AvroValue::Long(1000)),
+                ("isDeleted".to_string(), AvroValue::Boolean(false)),
+            ]),
+        );
+        let value = AvroValue::Record(vec![(
+            "filesystemMetadata".to_string(),
+            AvroValue::Union(1, Box::new(AvroValue::Map(map))),
+        )]);
+        let result = extract_filesystem_metadata(&value);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("test.parquet"));
+        let info = result.get("test.parquet").unwrap();
+        assert_eq!(info.size, 1000);
+        assert!(!info.is_deleted);
+    }
+
+    #[test]
+    fn test_extract_filesystem_metadata_other_value_type() {
+        // filesystemMetadata with invalid type (e.g., String) should return empty
+        let value = AvroValue::Record(vec![(
+            "filesystemMetadata".to_string(),
+            AvroValue::String("not a map".to_string()),
+        )]);
+        let result = extract_filesystem_metadata(&value);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_file_info_non_record_non_union() {
+        // extract_file_info with non-Record/Union value returns None
+        let value = AvroValue::String("not a record".to_string());
+        let result = extract_file_info("test.parquet", &value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_file_info_union_with_non_record() {
+        // Union containing non-Record should return None
+        let value = AvroValue::Union(0, Box::new(AvroValue::String("not a record".to_string())));
+        let result = extract_file_info("test.parquet", &value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_file_info_union_with_record() {
+        // Union containing Record should work
+        let value = AvroValue::Union(
+            1,
+            Box::new(AvroValue::Record(vec![
+                ("size".to_string(), AvroValue::Long(5000)),
+                ("isDeleted".to_string(), AvroValue::Boolean(true)),
+            ])),
+        );
+        let result = extract_file_info("deleted.parquet", &value);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.name, "deleted.parquet");
+        assert_eq!(info.size, 5000);
+        assert!(info.is_deleted);
+    }
+
+    #[test]
+    fn test_get_avro_int_union_with_non_int() {
+        // Union containing non-Int should return None
+        let value = AvroValue::Record(vec![(
+            "type".to_string(),
+            AvroValue::Union(0, Box::new(AvroValue::String("not int".to_string()))),
+        )]);
+        let result = get_avro_int(&value, "type");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_avro_int_non_int_non_union() {
+        // Field with non-Int and non-Union value should return None
+        let value = AvroValue::Record(vec![(
+            "type".to_string(),
+            AvroValue::String("not int".to_string()),
+        )]);
+        let result = get_avro_int(&value, "type");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_avro_int_direct_int() {
+        // Direct Int value should work
+        let value = AvroValue::Record(vec![("type".to_string(), AvroValue::Int(3))]);
+        let result = get_avro_int(&value, "type");
+        assert_eq!(result, Some(3));
+    }
+
+    #[test]
+    fn test_decode_files_partition_record_with_schema_tombstone() {
+        // Test tombstone record (empty value)
+        let record = crate::hfile::HFileRecord::new(b"deleted_partition".to_vec(), vec![]);
+        let schema = parse_avro_schema(
+            r#"{"type": "record", "name": "Test", "fields": [{"name": "type", "type": "int"}]}"#,
+        )
+        .unwrap();
+        let result = decode_files_partition_record_with_schema(&record, &schema);
+        assert!(result.is_ok());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.key, "deleted_partition");
+        assert_eq!(decoded.record_type, MetadataRecordType::Files);
+        assert!(decoded.files.is_empty());
+    }
+
+    #[test]
+    fn test_decode_files_partition_record_with_schema_invalid_key() {
+        // Test record with invalid UTF-8 key
+        let record = crate::hfile::HFileRecord::new(vec![0xff, 0xfe], b"value".to_vec());
+        let schema = parse_avro_schema(
+            r#"{"type": "record", "name": "Test", "fields": [{"name": "type", "type": "int"}]}"#,
+        )
+        .unwrap();
+        let result = decode_files_partition_record_with_schema(&record, &schema);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Invalid UTF-8 key"));
+    }
 }
