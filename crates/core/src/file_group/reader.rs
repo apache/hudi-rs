@@ -222,49 +222,18 @@ impl FileGroupReader {
     /// # Returns
     /// A record batch read from the file slice.
     pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        let relative_path = file_slice.base_file_relative_path()?;
-        let base_file_only = !file_slice.has_log_file()
-            || self
-                .hudi_configs
-                .get_or_default(HudiReadConfig::UseReadOptimizedMode)
-                .into();
-        if base_file_only {
-            self.read_file_slice_by_base_file_path(&relative_path).await
-        } else {
-            let log_file_paths = file_slice
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let log_file_paths = if file_slice.has_log_file() {
+            file_slice
                 .log_files
                 .iter()
                 .map(|log_file| file_slice.log_file_relative_path(log_file))
-                .collect::<Result<Vec<String>>>()?;
-            let instant_range = self.create_instant_range_for_log_file_scan();
-            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
-                .scan(log_file_paths, &instant_range)
-                .await?;
-
-            let log_batches = match scan_result {
-                ScanResult::RecordBatches(batches) => batches,
-                ScanResult::Empty => RecordBatches::default(),
-                ScanResult::HFileRecords(_) => {
-                    return Err(crate::error::CoreError::LogBlockError(
-                        "Unexpected HFile records in regular table log files".into(),
-                    ));
-                }
-            };
-
-            let base_batch = self
-                .read_file_slice_by_base_file_path(&relative_path)
-                .await?;
-            let schema = base_batch.schema();
-            let num_data_batches = log_batches.num_data_batches() + 1;
-            let num_delete_batches = log_batches.num_delete_batches();
-            let mut all_batches =
-                RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-            all_batches.push_data_batch(base_batch);
-            all_batches.extend(log_batches);
-
-            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)
-        }
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            vec![]
+        };
+        self.read_file_slice_from_paths(&base_file_path, log_file_paths)
+            .await
     }
 
     /// Same as [FileGroupReader::read_file_slice], but blocking.
@@ -307,7 +276,7 @@ impl FileGroupReader {
                 ScanResult::Empty => RecordBatches::new(),
                 ScanResult::HFileRecords(_) => {
                     return Err(CoreError::LogBlockError(
-                        "Unexpected HFile records in regular table log file scan".to_string(),
+                        "Unexpected HFile records in regular table log file".to_string(),
                     ));
                 }
             };
