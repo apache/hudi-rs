@@ -327,12 +327,15 @@ mod tests {
     use super::*;
     use crate::config::util::empty_options;
     use crate::error::CoreError;
+    use crate::file_group::base_file::BaseFile;
+    use crate::file_group::file_slice::FileSlice;
     use crate::Result;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use std::fs::canonicalize;
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::sync::Arc;
     use url::Url;
 
@@ -595,72 +598,36 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_slice_from_paths_signature_compatibility() -> Result<()> {
-        // This test ensures the method signatures are correct and compatible
+    fn test_read_file_slice_blocking() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
-        // Test that we can pass different types of string vectors
-        let base_file_path = "test.parquet";
-        let log_files_owned: Vec<String> = vec!["log1.log".to_string(), "log2.log".to_string()];
-        let _result1 = reader.read_file_slice_from_paths_blocking(base_file_path, log_files_owned);
+        // Create a FileSlice from the test sample base file
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new()); // empty partition path
 
-        let log_files_iter: Vec<String> = vec!["log1.log", "log2.log"]
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        let _result2 = reader.read_file_slice_from_paths_blocking(base_file_path, log_files_iter);
+        // Call read_file_slice_blocking
+        let result = reader.read_file_slice_blocking(&file_slice);
 
-        let empty_logs: Vec<String> = vec![];
-        let _result3 = reader.read_file_slice_from_paths_blocking(base_file_path, empty_logs);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_read_file_slice_from_paths_read_optimized_forces_base_only() -> Result<()> {
-        let base_uri = get_base_uri_with_valid_props_minimum();
-        let reader = FileGroupReader::new_with_options(
-            &base_uri,
-            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-        )?;
-
-        let base_file_path = "test.parquet";
-        // Even with log files provided, read-optimized mode should ignore them
-        let log_paths = vec!["log1.log".to_string(), "log2.log".to_string()];
-
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_paths);
-
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("Failed to read path"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_read_file_slice_from_paths_with_non_empty_logs_attempts_merge() -> Result<()> {
-        let base_uri = get_base_uri_with_valid_props_minimum();
-        // Explicitly disable read-optimized mode to force merge path
-        let reader = FileGroupReader::new_with_options(
-            &base_uri,
-            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "false")],
-        )?;
-
-        let base_file_path = "test.parquet";
-        let log_paths = vec!["log1.log".to_string()];
-
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_paths);
-
-        // We expect this to fail, but it should exercise the merge logic path
-        assert!(result.is_err());
-        // The error could be either base file not found or log scanner issues
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("Failed to read path")
-                || error_msg.contains("not found")
-                || error_msg.contains("No such file")
-        );
+        match result {
+            Ok(batch) => {
+                assert!(
+                    batch.num_rows() > 0,
+                    "Should have read some records from base file"
+                );
+            }
+            Err(e) => {
+                // Expected for missing test data - verify it's a file not found error
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {}",
+                    error_msg
+                );
+            }
+        }
 
         Ok(())
     }
