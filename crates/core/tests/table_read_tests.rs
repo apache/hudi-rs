@@ -533,26 +533,45 @@ mod v8_tables {
         }
 
         #[test]
-        fn test_quickstart_trips_inserts_deletes() -> Result<()> {
-            let base_url = QuickstartTripsTable::V8Trips8I3D.url_to_mor_avro();
+        fn test_quickstart_trips_inserts_updates_deletes() -> Result<()> {
+            // V8Trips8I3U1D: 8 inserts, 3 updates (A, J, G fare=0), 2 deletes (F, J)
+            let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
             let hudi_table = Table::new_blocking(base_url.path())?;
 
-            let deleted_riders = ["rider-A", "rider-C", "rider-D"];
+            let deleted_riders = ["rider-F", "rider-J"];
 
-            // verify deleted record as of the latest commit
+            // verify deleted records are not present in latest snapshot
             let records = hudi_table.read_snapshot_blocking(empty_filters())?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
-            let riders = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .map(|(_, rider, _)| rider)
-                .collect::<Vec<_>>();
-            // All deleted riders should not be present
+            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records);
+            let riders: Vec<_> = uuid_rider_and_fare
+                .iter()
+                .map(|(_, rider, _)| rider.as_str())
+                .collect();
+
+            // Deleted riders should not be present
             assert!(riders
                 .iter()
-                .all(|rider| { !deleted_riders.contains(&rider.as_str()) }));
+                .all(|rider| { !deleted_riders.contains(rider) }));
 
-            // verify deleted record as of the first commit (before delete)
+            // Should have 6 active riders (8 - 2 deleted)
+            assert_eq!(riders.len(), 6);
+
+            // Verify updated fares (rider-A and rider-G have fare=0)
+            let rider_a = uuid_rider_and_fare
+                .iter()
+                .find(|(_, r, _)| r == "rider-A")
+                .expect("rider-A should exist");
+            assert_eq!(rider_a.2, 0.0, "rider-A fare should be updated to 0");
+
+            let rider_g = uuid_rider_and_fare
+                .iter()
+                .find(|(_, r, _)| r == "rider-G")
+                .expect("rider-G should exist");
+            assert_eq!(rider_g.2, 0.0, "rider-G fare should be updated to 0");
+
+            // verify deleted records were present in first commit (before updates/deletes)
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -568,14 +587,13 @@ mod v8_tables {
                 .filter(|(_, rider, _)| deleted_riders.contains(&rider.as_str()))
                 .collect::<Vec<_>>();
             uuid_rider_and_fare.sort_unstable_by_key(|(_, rider, _)| rider.to_string());
-            // All 3 riders should be present before delete
-            assert_eq!(uuid_rider_and_fare.len(), 3);
-            assert_eq!(uuid_rider_and_fare[0].1, "rider-A");
-            assert_eq!(uuid_rider_and_fare[0].2, 19.10);
-            assert_eq!(uuid_rider_and_fare[1].1, "rider-C");
-            assert_eq!(uuid_rider_and_fare[1].2, 27.70);
-            assert_eq!(uuid_rider_and_fare[2].1, "rider-D");
-            assert_eq!(uuid_rider_and_fare[2].2, 33.90);
+
+            // Both deleted riders should be present before delete
+            assert_eq!(uuid_rider_and_fare.len(), 2);
+            assert_eq!(uuid_rider_and_fare[0].1, "rider-F");
+            assert_eq!(uuid_rider_and_fare[0].2, 34.15);
+            assert_eq!(uuid_rider_and_fare[1].1, "rider-J");
+            assert_eq!(uuid_rider_and_fare[1].2, 17.85);
 
             Ok(())
         }

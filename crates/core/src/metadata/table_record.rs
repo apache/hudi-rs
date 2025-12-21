@@ -183,6 +183,30 @@ pub fn decode_files_partition_record(
     reader: &HFileReader,
     record: &HFileRecord,
 ) -> Result<FilesPartitionRecord> {
+    // Get schema from HFile reader
+    let schema = reader
+        .get_avro_schema()
+        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {}", e)))?
+        .ok_or_else(|| CoreError::MetadataTable("No Avro schema in HFile".to_string()))?;
+
+    decode_files_partition_record_with_schema(record, schema)
+}
+
+/// Decode an HFile record value from the files partition using a provided Avro schema.
+///
+/// This is useful when you have the schema separately (e.g., from a different HFile
+/// or cached) and want to decode multiple records without repeated schema lookups.
+///
+/// # Arguments
+/// * `record` - The HFile record containing the Avro-serialized value
+/// * `schema` - The Avro schema for HoodieMetadataRecord
+///
+/// # Returns
+/// A `FilesPartitionRecord` with the decoded file information including record type.
+pub fn decode_files_partition_record_with_schema(
+    record: &HFileRecord,
+    schema: &AvroSchema,
+) -> Result<FilesPartitionRecord> {
     let key = record
         .key_as_str()
         .ok_or_else(|| CoreError::MetadataTable("Invalid UTF-8 key".to_string()))?
@@ -197,12 +221,6 @@ pub fn decode_files_partition_record(
             files: HashMap::new(),
         });
     }
-
-    // Get schema from HFile reader
-    let schema = reader
-        .get_avro_schema()
-        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {}", e)))?
-        .ok_or_else(|| CoreError::MetadataTable("No Avro schema in HFile".to_string()))?;
 
     // Decode using Avro
     let avro_value = decode_avro_value(value, schema)?;
@@ -225,7 +243,7 @@ pub fn decode_files_partition_record(
 /// The filesystemMetadata field is a map where:
 /// - Keys are file names (or partition names for ALL_PARTITIONS)
 /// - Values are HoodieMetadataFileInfo records with {size, isDeleted}
-fn extract_filesystem_metadata(avro_value: &AvroValue) -> HashMap<String, HoodieMetadataFileInfo> {
+pub fn extract_filesystem_metadata(avro_value: &AvroValue) -> HashMap<String, HoodieMetadataFileInfo> {
     let mut files = HashMap::new();
 
     // Get the filesystemMetadata field (may be a union with null)

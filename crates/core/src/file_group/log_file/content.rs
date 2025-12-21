@@ -236,12 +236,10 @@ impl Decoder {
     /// - Values are Avro-serialized payloads decoded on demand
     ///
     /// The HFile content structure:
-    /// - 4 bytes: internal block version (must be V3)
-    /// - Remaining: HFile data (read entirely into memory for HFileReader)
+    /// - Raw HFile data (no version prefix, unlike Avro blocks)
     fn decode_hfile_record_content(&self, mut reader: impl Read) -> Result<Vec<HFileRecord>> {
-        Decoder::validate_log_block_version(&mut reader)?;
-
-        // Read remaining bytes as HFile content
+        // Note: HFile blocks do NOT have the 4-byte log block version prefix
+        // that Avro blocks have. The content is raw HFile data.
         let mut hfile_bytes = Vec::new();
         reader.read_to_end(&mut hfile_bytes)?;
 

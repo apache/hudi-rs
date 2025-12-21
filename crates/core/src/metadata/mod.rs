@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod commit;
+pub mod merger;
 pub mod meta_field;
 pub mod replace_commit;
 pub mod table_record;
