@@ -41,8 +41,6 @@ pub enum QuickstartTripsTable {
     V6Trips8I1U,
     #[strum(serialize = "v6_trips_8i3d")]
     V6Trips8I3D,
-    #[strum(serialize = "v8_trips_8i1u")]
-    V8Trips8I1U,
     #[strum(serialize = "v8_trips_8i3u1d")]
     V8Trips8I3U1D,
 }
@@ -208,10 +206,6 @@ mod tests {
                     assert!(path.exists());
                 }
                 QuickstartTripsTable::V6Trips8I3D => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                QuickstartTripsTable::V8Trips8I1U => {
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }

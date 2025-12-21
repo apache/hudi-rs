@@ -484,55 +484,6 @@ mod v8_tables {
         use super::*;
 
         #[test]
-        fn test_quickstart_trips_inserts_updates() -> Result<()> {
-            let base_url = QuickstartTripsTable::V8Trips8I1U.url_to_mor_avro();
-            let hudi_table = Table::new_blocking(base_url.path())?;
-
-            let updated_rider = "rider-D";
-
-            // verify updated record as of the latest commit
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .filter(|(_, rider, _)| rider == updated_rider)
-                .collect::<Vec<_>>();
-            assert_eq!(uuid_rider_and_fare.len(), 1);
-            assert_eq!(
-                uuid_rider_and_fare[0].0,
-                "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
-            );
-            // Updated fare should be 25.0 (after the update)
-            assert_eq!(uuid_rider_and_fare[0].2, 25.0);
-
-            // verify updated record as of the first commit (before update)
-            let commit_timestamps = hudi_table
-                .timeline
-                .completed_commits
-                .iter()
-                .map(|i| i.timestamp.as_str())
-                .collect::<Vec<_>>();
-            let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .filter(|(_, rider, _)| rider == updated_rider)
-                .collect::<Vec<_>>();
-            assert_eq!(uuid_rider_and_fare.len(), 1);
-            assert_eq!(
-                uuid_rider_and_fare[0].0,
-                "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
-            );
-            // Original fare should be 33.9 (before the update)
-            assert_eq!(uuid_rider_and_fare[0].2, 33.9);
-
-            Ok(())
-        }
-
-        #[test]
         fn test_quickstart_trips_inserts_updates_deletes() -> Result<()> {
             // V8Trips8I3U1D: 8 inserts, 3 updates (A, J, G fare=0), 2 deletes (F, J)
             let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
