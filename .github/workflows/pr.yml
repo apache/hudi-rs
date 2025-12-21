@@ -31,7 +31,7 @@ jobs:
   check-pr:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v5
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -46,4 +46,5 @@ jobs:
 
       - name: Labeling
         uses: actions/labeler@v6
-        if: false  # Temporarily disabled - permissions issue
+        # disable until figuring out a way to do this without pull_request_target
+        if: false
