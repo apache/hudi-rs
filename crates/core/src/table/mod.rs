@@ -237,7 +237,6 @@ impl Table {
     /// Create a metadata table instance for this data table.
     ///
     /// Uses all partitions from `hoodie.table.metadata.partitions` configuration.
-    /// To filter specific partitions, use [`new_metadata_table_with_partitions`].
     ///
     /// # Errors
     ///

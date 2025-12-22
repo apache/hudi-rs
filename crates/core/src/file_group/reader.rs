@@ -912,20 +912,7 @@ mod tests {
         // Should still have 4 keys after merging
         assert_eq!(merged.len(), 4, "Should have 4 partition keys after merge");
 
-        // Validate chennai partition - should have more files after merging log updates
-        let chennai = merged.get("city=chennai").unwrap();
-        assert_eq!(chennai.record_type, MetadataRecordType::Files);
-        let active_files = chennai.active_file_names();
-        assert!(
-            active_files.len() >= 2,
-            "Chennai should have at least 2 active files, got {}",
-            active_files.len()
-        );
-
-        // Validate total size is positive
-        assert!(chennai.total_size() > 0, "Total size should be > 0");
-
-        // Validate all partition keys have Files record type (except __all_partitions__)
+        // Validate all partition keys have correct record types
         for (key, record) in &merged {
             if key == "__all_partitions__" {
                 assert_eq!(record.record_type, MetadataRecordType::AllPartitions);
@@ -934,25 +921,21 @@ mod tests {
             }
         }
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_read_file_slice_from_mdt_paths_file_validation() -> Result<()> {
-        let reader = create_mdt_reader()?;
-        let base_file = find_mdt_base_file();
-
-        let merged = reader
-            .read_file_slice_from_mdt_paths_blocking(&base_file, MDT_FILES_LOG_FILES.to_vec())?;
-
         // Expected UUIDs for each partition's files
         const CHENNAI_UUID: &str = "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc";
         const SAN_FRANCISCO_UUID: &str = "036ded81-9ed4-479f-bcea-7145dfa0079b";
         const SAO_PAULO_UUID: &str = "8aa68f7e-afd6-4c94-b86c-8a886552e08d";
 
-        // Validate chennai files contain expected UUID
+        // Validate chennai partition
         let chennai = merged.get("city=chennai").unwrap();
-        for file_name in chennai.active_file_names() {
+        let active_files = chennai.active_file_names();
+        assert!(
+            active_files.len() >= 2,
+            "Chennai should have at least 2 active files, got {}",
+            active_files.len()
+        );
+        assert!(chennai.total_size() > 0, "Total size should be > 0");
+        for file_name in &active_files {
             assert!(
                 file_name.contains(CHENNAI_UUID),
                 "Chennai file should contain UUID: {}",
@@ -960,7 +943,7 @@ mod tests {
             );
         }
 
-        // Validate san_francisco files contain expected UUID
+        // Validate san_francisco partition
         let sf = merged.get("city=san_francisco").unwrap();
         for file_name in sf.active_file_names() {
             assert!(
@@ -970,7 +953,7 @@ mod tests {
             );
         }
 
-        // Validate sao_paulo files contain expected UUID
+        // Validate sao_paulo partition
         let sp = merged.get("city=sao_paulo").unwrap();
         for file_name in sp.active_file_names() {
             assert!(

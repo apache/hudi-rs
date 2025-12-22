@@ -129,7 +129,7 @@ pub enum HudiTableConfig {
     /// The full path will be `.hoodie/{TimelinePath}/{TimelineHistoryPath}`
     TimelineHistoryPath,
 
-    /// Enable the internal metadata table which serves table metadata like level file listings.
+    /// Enable the internal metadata table which serves table metadata like file listings.
     ///
     /// When enabled, file listings are read from the metadata table instead of storage,
     /// which can significantly improve performance for tables with many partitions.
