@@ -30,6 +30,7 @@ use crate::hfile::key::{compare_keys, Key, KeyValue, Utf8Key};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
 use crate::hfile::trailer::HFileTrailer;
+use crate::storage::Storage;
 use apache_avro::Schema as AvroSchema;
 use prost::Message;
 use std::cell::OnceCell;
@@ -130,6 +131,35 @@ impl HFileReader {
 
         reader.initialize_metadata()?;
         Ok(reader)
+    }
+
+    /// Open an HFile from storage.
+    ///
+    /// This is an async factory method that reads the file from storage
+    /// and creates an HFileReader.
+    ///
+    /// # Arguments
+    /// * `storage` - The storage to read from
+    /// * `relative_path` - The relative path to the HFile
+    ///
+    /// # Example
+    /// ```ignore
+    /// let reader = HFileReader::open(&storage, "files/data.hfile").await?;
+    /// for record in reader.iter()? {
+    ///     println!("{:?}", record?);
+    /// }
+    /// ```
+    pub async fn open(storage: &Storage, relative_path: &str) -> Result<Self> {
+        let bytes = storage
+            .get_file_data(relative_path)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!(
+                    "Failed to read HFile {}: {:?}",
+                    relative_path, e
+                ))
+            })?;
+        Self::new(bytes.to_vec())
     }
 
     /// Initialize metadata by reading index blocks and file info.

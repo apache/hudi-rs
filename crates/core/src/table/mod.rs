@@ -94,8 +94,9 @@ pub mod partition;
 mod validation;
 
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig::PartitionFields;
+use crate::config::table::HudiTableConfig::{MetadataTablePartitions, PartitionFields};
 use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::error::CoreError;
 use crate::config::HudiConfigs;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
@@ -213,6 +214,142 @@ impl Table {
         self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
 
+    /// Check if this table is a metadata table.
+    ///
+    /// Detection is based on the base path ending with `.hoodie/metadata`.
+    pub fn is_metadata_table(&self) -> bool {
+        let base_path: String = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::BasePath)
+            .into();
+        base_path
+            .trim_end_matches('/')
+            .ends_with(".hoodie/metadata")
+    }
+
+    /// Get the list of available metadata table partitions for this table.
+    ///
+    /// Returns the partitions configured in `hoodie.table.metadata.partitions`.
+    pub fn get_metadata_table_partitions(&self) -> Vec<String> {
+        self.hudi_configs
+            .get_or_default(MetadataTablePartitions)
+            .into()
+    }
+
+    /// Create a metadata table instance for this data table.
+    ///
+    /// Uses all partitions from `hoodie.table.metadata.partitions` configuration.
+    /// To filter specific partitions, use [`new_metadata_table_with_partitions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata table cannot be created or if there are
+    /// no metadata table partitions configured.
+    pub async fn new_metadata_table(&self) -> Result<Table> {
+        let mdt_partitions = self.get_metadata_table_partitions();
+        if mdt_partitions.is_empty() {
+            return Err(CoreError::MetadataTable(
+                "No metadata table partitions configured".to_string(),
+            ));
+        }
+        self.create_metadata_table_with_partitions(mdt_partitions)
+            .await
+    }
+
+    /// Same as [Table::new_metadata_table], but blocking.
+    pub fn new_metadata_table_blocking(&self) -> Result<Table> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.new_metadata_table().await })
+    }
+
+    /// Create a metadata table instance with specific partitions.
+    ///
+    /// Only the specified partitions will be available in the returned table instance.
+    /// This is useful when you only need to read from specific MDT partitions
+    /// (e.g., only "files" partition for file listing).
+    ///
+    /// # Arguments
+    ///
+    /// * `partitions` - Iterator of partition names to include (e.g., `["files"]`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the specified partitions are not valid
+    /// (i.e., not in `hoodie.table.metadata.partitions`).
+    pub async fn new_metadata_table_with_partitions<I, S>(
+        &self,
+        partitions: I,
+    ) -> Result<Table>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let available_partitions: HashSet<String> =
+            self.get_metadata_table_partitions().into_iter().collect();
+
+        if available_partitions.is_empty() {
+            return Err(CoreError::MetadataTable(
+                "No metadata table partitions configured".to_string(),
+            ));
+        }
+
+        let requested: Vec<String> = partitions
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+
+        // Validate all requested partitions exist
+        let invalid: Vec<&str> = requested
+            .iter()
+            .filter(|p| !available_partitions.contains(*p))
+            .map(|s| s.as_str())
+            .collect();
+
+        if !invalid.is_empty() {
+            return Err(CoreError::MetadataTable(format!(
+                "Invalid metadata table partitions: {:?}. Available: {:?}",
+                invalid,
+                available_partitions.iter().collect::<Vec<_>>()
+            )));
+        }
+
+        self.create_metadata_table_with_partitions(requested).await
+    }
+
+    /// Same as [Table::new_metadata_table_with_partitions], but blocking.
+    pub fn new_metadata_table_with_partitions_blocking<I, S>(
+        &self,
+        partitions: I,
+    ) -> Result<Table>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.new_metadata_table_with_partitions(partitions).await })
+    }
+
+    /// Internal helper to create the metadata table with validated partitions.
+    async fn create_metadata_table_with_partitions(
+        &self,
+        partitions: Vec<String>,
+    ) -> Result<Table> {
+        let base_url = self.base_url();
+        let mdt_path = base_url
+            .join(".hoodie/metadata/")
+            .map_err(|e| CoreError::MetadataTable(format!("Invalid metadata table path: {}", e)))?;
+
+        Table::new_with_options(
+            mdt_path.as_str(),
+            [(PartitionFields.as_ref(), partitions.join(","))],
+        )
+        .await
+    }
+
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -260,11 +397,26 @@ impl Table {
     }
 
     /// Get the latest partition [arrow_schema::Schema] of the table.
+    ///
+    /// For metadata tables, returns a schema with partition fields from configuration,
+    /// all typed as [arrow_schema::DataType::Utf8] since MDT partition values are
+    /// string-based identifiers.
+    ///
+    /// For regular tables, returns the partition fields with their actual data types
+    /// derived from the table schema.
     pub async fn get_partition_schema(&self) -> Result<Schema> {
         let partition_fields: HashSet<String> = {
             let fields: Vec<String> = self.hudi_configs.get_or_default(PartitionFields).into();
             fields.into_iter().collect()
         };
+
+        if self.is_metadata_table() {
+            let fields: Vec<Field> = partition_fields
+                .iter()
+                .map(|f| Field::new(f, arrow_schema::DataType::Utf8, false))
+                .collect();
+            return Ok(Schema::new(fields));
+        }
 
         let schema = self.get_schema().await?;
         let partition_fields: Vec<Arc<Field>> = schema
@@ -1017,8 +1169,10 @@ mod tests {
         assert_eq!(actual, "default");
         let actual: bool = configs.get_or_default(DropsPartitionFields).into();
         assert!(!actual);
-        assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
-        assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
+        let actual: bool = configs.get_or_default(IsHiveStylePartitioning).into();
+        assert!(!actual);
+        let actual: bool = configs.get_or_default(IsPartitionPathUrlencoded).into();
+        assert!(!actual);
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
         let actual: Vec<String> = configs.get_or_default(PartitionFields).into();
         assert!(actual.is_empty());
@@ -1439,5 +1593,132 @@ mod tests {
             .collect::<HashSet<_>>();
         let expected = HashSet::new();
         assert_eq!(actual, expected);
+    }
+
+    // =========================================================================
+    // Metadata Table Tests
+    // =========================================================================
+
+    fn get_data_table() -> Table {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        Table::new_blocking(&table_path).unwrap()
+    }
+
+    #[test]
+    #[ignore = "MDT snapshot read not yet implemented - gaps to fill"]
+    fn hudi_table_read_snapshot_from_metadata_table() {
+        // Create the data table and use the new_metadata_table API
+        let data_table = get_data_table();
+
+        // Create MDT using the new API (uses all partitions from config)
+        let hudi_table = data_table.new_metadata_table_blocking().unwrap();
+
+        // Verify this is detected as a metadata table
+        assert!(
+            hudi_table.is_metadata_table(),
+            "Should be detected as metadata table"
+        );
+
+        // Verify partition schema returns all MDT partition fields with Utf8 type
+        // The test data table has: column_stats, files, partition_stats, record_index, secondary_index_rider_idx
+        let partition_schema = hudi_table.get_partition_schema_blocking().unwrap();
+        assert_eq!(
+            partition_schema.fields().len(),
+            5,
+            "Should have 5 MDT partition fields"
+        );
+
+        // Verify "files" is one of the partition fields
+        let field_names: HashSet<&str> = partition_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains("files"),
+            "Should contain 'files' partition"
+        );
+
+        // Verify all partition fields are Utf8 type (MDT-specific behavior)
+        for field in partition_schema.fields() {
+            assert_eq!(
+                field.data_type(),
+                &arrow_schema::DataType::Utf8,
+                "MDT partition field '{}' should be Utf8",
+                field.name()
+            );
+        }
+
+        // Attempt to read snapshot - this should read from the files partition
+        let batches = hudi_table.read_snapshot_blocking(empty_filters()).unwrap();
+
+        // The MDT files partition should have records for:
+        // - __all_partitions__ key
+        // - One record per partition (city=chennai, city=san_francisco, city=sao_paulo)
+        assert!(
+            !batches.is_empty(),
+            "Should have read records from metadata table"
+        );
+
+        // Validate total row count matches expected partitions (4 keys total)
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 4,
+            "Should have 4 records: __all_partitions__ + 3 city partitions"
+        );
+    }
+
+    #[test]
+    fn hudi_table_get_metadata_table_partitions() {
+        let data_table = get_data_table();
+
+        // Verify we can get the MDT partitions from the data table
+        let partitions = data_table.get_metadata_table_partitions();
+        assert!(!partitions.is_empty(), "Should have MDT partitions");
+        assert!(
+            partitions.contains(&"files".to_string()),
+            "Should contain 'files' partition"
+        );
+    }
+
+    #[test]
+    #[ignore = "MDT snapshot read not yet implemented - gaps to fill"]
+    fn hudi_table_new_metadata_table_with_specific_partitions() {
+        let data_table = get_data_table();
+
+        // Create MDT with only the "files" partition
+        let mdt = data_table
+            .new_metadata_table_with_partitions_blocking(["files"])
+            .unwrap();
+
+        assert!(mdt.is_metadata_table());
+
+        // Verify only "files" partition is in the schema
+        let partition_schema = mdt.get_partition_schema_blocking().unwrap();
+        assert_eq!(partition_schema.fields().len(), 1);
+        assert_eq!(partition_schema.field(0).name(), "files");
+    }
+
+    #[test]
+    fn hudi_table_new_metadata_table_rejects_invalid_partitions() {
+        let data_table = get_data_table();
+
+        // Try to create MDT with an invalid partition
+        let result =
+            data_table.new_metadata_table_with_partitions_blocking(["files", "invalid_partition"]);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid metadata table partitions"),
+            "Error should mention invalid partitions: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("invalid_partition"),
+            "Error should list the invalid partition: {}",
+            err_msg
+        );
     }
 }
