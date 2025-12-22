@@ -102,6 +102,7 @@ use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::metadata::table_record::FilesPartitionRecord;
+use crate::metadata::MDT_PARTITION_FIELD;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::storage::util::join_url_segments;
 use crate::table::builder::TableBuilder;
@@ -259,7 +260,11 @@ impl Table {
         }
 
         let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
-        Table::new_with_options(mdt_url.as_str(), [(PartitionFields.as_ref(), "partition")]).await
+        Table::new_with_options(
+            mdt_url.as_str(),
+            [(PartitionFields.as_ref(), MDT_PARTITION_FIELD)],
+        )
+        .await
     }
 
     /// Same as [Table::new_metadata_table], but blocking.
@@ -327,7 +332,7 @@ impl Table {
     pub async fn get_partition_schema(&self) -> Result<Schema> {
         if self.is_metadata_table() {
             return Ok(Schema::new(vec![Field::new(
-                "partition",
+                MDT_PARTITION_FIELD,
                 arrow_schema::DataType::Utf8,
                 false,
             )]));
@@ -699,12 +704,17 @@ impl Table {
             return Ok(HashMap::new());
         };
 
-        let filters = from_str_tuples([("partition", "=", "files")])?;
+        let filters = from_str_tuples([(
+            MDT_PARTITION_FIELD,
+            "=",
+            FilesPartitionRecord::PARTITION_NAME,
+        )])?;
         let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
 
         if file_slices.len() != 1 {
             return Err(CoreError::MetadataTable(format!(
-                "Expected 1 file slice for files partition, got {}",
+                "Expected 1 file slice for {} partition, got {}",
+                FilesPartitionRecord::PARTITION_NAME,
                 file_slices.len()
             )));
         }

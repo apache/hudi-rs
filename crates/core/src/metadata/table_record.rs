@@ -121,6 +121,9 @@ pub struct FilesPartitionRecord {
 }
 
 impl FilesPartitionRecord {
+    /// The partition name in the metadata table that stores file listings.
+    pub const PARTITION_NAME: &'static str = "files";
+
     /// Check if this is an ALL_PARTITIONS record.
     pub fn is_all_partitions(&self) -> bool {
         self.record_type == MetadataRecordType::AllPartitions
