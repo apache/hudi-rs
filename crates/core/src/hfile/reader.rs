@@ -150,15 +150,9 @@ impl HFileReader {
     /// }
     /// ```
     pub async fn open(storage: &Storage, relative_path: &str) -> Result<Self> {
-        let bytes = storage
-            .get_file_data(relative_path)
-            .await
-            .map_err(|e| {
-                HFileError::InvalidFormat(format!(
-                    "Failed to read HFile {}: {:?}",
-                    relative_path, e
-                ))
-            })?;
+        let bytes = storage.get_file_data(relative_path).await.map_err(|e| {
+            HFileError::InvalidFormat(format!("Failed to read HFile {}: {:?}", relative_path, e))
+        })?;
         Self::new(bytes.to_vec())
     }
 

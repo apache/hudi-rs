@@ -16,6 +16,25 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-pub mod arrow;
-pub mod collection;
-pub mod path;
+
+/// Check if the given path is a metadata table path.
+///
+/// Detection is based on the path ending with `.hoodie/metadata`.
+pub fn is_metadata_table_path(path: &str) -> bool {
+    path.trim_end_matches('/').ends_with(".hoodie/metadata")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_metadata_table_path() {
+        assert!(is_metadata_table_path("/data/my_table/.hoodie/metadata"));
+        assert!(is_metadata_table_path("/data/my_table/.hoodie/metadata/"));
+        assert!(is_metadata_table_path("s3://bucket/table/.hoodie/metadata"));
+        assert!(!is_metadata_table_path("/data/my_table"));
+        assert!(!is_metadata_table_path("/data/my_table/.hoodie"));
+        assert!(!is_metadata_table_path("/data/.hoodie/metadata/files"));
+    }
+}

@@ -96,8 +96,8 @@ mod validation;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::{MetadataTablePartitions, PartitionFields};
 use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::error::CoreError;
 use crate::config::HudiConfigs;
+use crate::error::CoreError;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -222,9 +222,7 @@ impl Table {
             .hudi_configs
             .get_or_default(HudiTableConfig::BasePath)
             .into();
-        base_path
-            .trim_end_matches('/')
-            .ends_with(".hoodie/metadata")
+        crate::util::path::is_metadata_table_path(&base_path)
     }
 
     /// Get the list of available metadata table partitions for this table.
@@ -252,8 +250,17 @@ impl Table {
                 "No metadata table partitions configured".to_string(),
             ));
         }
-        self.create_metadata_table_with_partitions(mdt_partitions)
-            .await
+
+        let base_url = self.base_url();
+        let mdt_path = base_url
+            .join(".hoodie/metadata/")
+            .map_err(|e| CoreError::MetadataTable(format!("Invalid metadata table path: {}", e)))?;
+
+        Table::new_with_options(
+            mdt_path.as_str(),
+            [(PartitionFields.as_ref(), mdt_partitions.join(","))],
+        )
+        .await
     }
 
     /// Same as [Table::new_metadata_table], but blocking.
@@ -262,92 +269,6 @@ impl Table {
             .enable_all()
             .build()?
             .block_on(async { self.new_metadata_table().await })
-    }
-
-    /// Create a metadata table instance with specific partitions.
-    ///
-    /// Only the specified partitions will be available in the returned table instance.
-    /// This is useful when you only need to read from specific MDT partitions
-    /// (e.g., only "files" partition for file listing).
-    ///
-    /// # Arguments
-    ///
-    /// * `partitions` - Iterator of partition names to include (e.g., `["files"]`)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any of the specified partitions are not valid
-    /// (i.e., not in `hoodie.table.metadata.partitions`).
-    pub async fn new_metadata_table_with_partitions<I, S>(
-        &self,
-        partitions: I,
-    ) -> Result<Table>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let available_partitions: HashSet<String> =
-            self.get_metadata_table_partitions().into_iter().collect();
-
-        if available_partitions.is_empty() {
-            return Err(CoreError::MetadataTable(
-                "No metadata table partitions configured".to_string(),
-            ));
-        }
-
-        let requested: Vec<String> = partitions
-            .into_iter()
-            .map(|s| s.as_ref().to_string())
-            .collect();
-
-        // Validate all requested partitions exist
-        let invalid: Vec<&str> = requested
-            .iter()
-            .filter(|p| !available_partitions.contains(*p))
-            .map(|s| s.as_str())
-            .collect();
-
-        if !invalid.is_empty() {
-            return Err(CoreError::MetadataTable(format!(
-                "Invalid metadata table partitions: {:?}. Available: {:?}",
-                invalid,
-                available_partitions.iter().collect::<Vec<_>>()
-            )));
-        }
-
-        self.create_metadata_table_with_partitions(requested).await
-    }
-
-    /// Same as [Table::new_metadata_table_with_partitions], but blocking.
-    pub fn new_metadata_table_with_partitions_blocking<I, S>(
-        &self,
-        partitions: I,
-    ) -> Result<Table>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(async { self.new_metadata_table_with_partitions(partitions).await })
-    }
-
-    /// Internal helper to create the metadata table with validated partitions.
-    async fn create_metadata_table_with_partitions(
-        &self,
-        partitions: Vec<String>,
-    ) -> Result<Table> {
-        let base_url = self.base_url();
-        let mdt_path = base_url
-            .join(".hoodie/metadata/")
-            .map_err(|e| CoreError::MetadataTable(format!("Invalid metadata table path: {}", e)))?;
-
-        Table::new_with_options(
-            mdt_path.as_str(),
-            [(PartitionFields.as_ref(), partitions.join(","))],
-        )
-        .await
     }
 
     pub fn timezone(&self) -> String {
@@ -1612,17 +1533,17 @@ mod tests {
         let data_table = get_data_table();
 
         // Create MDT using the new API (uses all partitions from config)
-        let hudi_table = data_table.new_metadata_table_blocking().unwrap();
+        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
 
         // Verify this is detected as a metadata table
         assert!(
-            hudi_table.is_metadata_table(),
+            metadata_table.is_metadata_table(),
             "Should be detected as metadata table"
         );
 
         // Verify partition schema returns all MDT partition fields with Utf8 type
         // The test data table has: column_stats, files, partition_stats, record_index, secondary_index_rider_idx
-        let partition_schema = hudi_table.get_partition_schema_blocking().unwrap();
+        let partition_schema = metadata_table.get_partition_schema_blocking().unwrap();
         assert_eq!(
             partition_schema.fields().len(),
             5,
@@ -1651,7 +1572,9 @@ mod tests {
         }
 
         // Attempt to read snapshot - this should read from the files partition
-        let batches = hudi_table.read_snapshot_blocking(empty_filters()).unwrap();
+        let batches = metadata_table
+            .read_snapshot_blocking(empty_filters())
+            .unwrap();
 
         // The MDT files partition should have records for:
         // - __all_partitions__ key
@@ -1679,46 +1602,6 @@ mod tests {
         assert!(
             partitions.contains(&"files".to_string()),
             "Should contain 'files' partition"
-        );
-    }
-
-    #[test]
-    #[ignore = "MDT snapshot read not yet implemented - gaps to fill"]
-    fn hudi_table_new_metadata_table_with_specific_partitions() {
-        let data_table = get_data_table();
-
-        // Create MDT with only the "files" partition
-        let mdt = data_table
-            .new_metadata_table_with_partitions_blocking(["files"])
-            .unwrap();
-
-        assert!(mdt.is_metadata_table());
-
-        // Verify only "files" partition is in the schema
-        let partition_schema = mdt.get_partition_schema_blocking().unwrap();
-        assert_eq!(partition_schema.fields().len(), 1);
-        assert_eq!(partition_schema.field(0).name(), "files");
-    }
-
-    #[test]
-    fn hudi_table_new_metadata_table_rejects_invalid_partitions() {
-        let data_table = get_data_table();
-
-        // Try to create MDT with an invalid partition
-        let result =
-            data_table.new_metadata_table_with_partitions_blocking(["files", "invalid_partition"]);
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Invalid metadata table partitions"),
-            "Error should mention invalid partitions: {}",
-            err_msg
-        );
-        assert!(
-            err_msg.contains("invalid_partition"),
-            "Error should list the invalid partition: {}",
-            err_msg
         );
     }
 }

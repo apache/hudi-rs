@@ -355,13 +355,6 @@ pub enum BaseFileFormatValue {
     HFile,
 }
 
-impl BaseFileFormatValue {
-    /// Check if this format is only valid for metadata tables.
-    pub fn is_metadata_table_only(&self) -> bool {
-        matches!(self, Self::HFile)
-    }
-}
-
 impl FromStr for BaseFileFormatValue {
     type Err = ConfigError;
 
@@ -477,10 +470,6 @@ mod tests {
             BaseFileFormatValue::from_str("orc").unwrap_err(),
             UnsupportedValue(_)
         ));
-
-        // Validate is_metadata_table_only
-        assert!(!BaseFileFormatValue::Parquet.is_metadata_table_only());
-        assert!(BaseFileFormatValue::HFile.is_metadata_table_only());
     }
 
     #[test]

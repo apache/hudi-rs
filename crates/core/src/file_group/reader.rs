@@ -337,9 +337,7 @@ impl FileGroupReader {
             .hudi_configs
             .get_or_default(HudiTableConfig::BasePath)
             .into();
-        base_path
-            .trim_end_matches('/')
-            .ends_with(".hoodie/metadata")
+        crate::util::path::is_metadata_table_path(&base_path)
     }
 
     /// Reads a metadata table file slice and returns merged FilesPartitionRecords.
@@ -797,9 +795,7 @@ mod tests {
     fn get_metadata_table_base_uri() -> String {
         use hudi_test::QuickstartTripsTable;
         let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
-        let mdt_path = PathBuf::from(table_path)
-            .join(".hoodie")
-            .join("metadata");
+        let mdt_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
         let url = Url::from_file_path(canonicalize(&mdt_path).unwrap()).unwrap();
         url.as_ref().to_string()
     }
@@ -885,8 +881,7 @@ mod tests {
 
         // Read base file only (no log files)
         let log_files: Vec<&str> = vec![];
-        let merged = reader
-            .read_file_slice_from_mdt_paths_blocking(&base_file, log_files)?;
+        let merged = reader.read_file_slice_from_mdt_paths_blocking(&base_file, log_files)?;
 
         // Should have 4 keys: __all_partitions__ + 3 city partitions
         assert_eq!(merged.len(), 4, "Should have 4 partition keys");
@@ -911,10 +906,8 @@ mod tests {
         let base_file = find_mdt_base_file();
 
         // Read base file + all log files
-        let merged = reader.read_file_slice_from_mdt_paths_blocking(
-            &base_file,
-            MDT_FILES_LOG_FILES.to_vec(),
-        )?;
+        let merged = reader
+            .read_file_slice_from_mdt_paths_blocking(&base_file, MDT_FILES_LOG_FILES.to_vec())?;
 
         // Should still have 4 keys after merging
         assert_eq!(merged.len(), 4, "Should have 4 partition keys after merge");
@@ -949,10 +942,8 @@ mod tests {
         let reader = create_mdt_reader()?;
         let base_file = find_mdt_base_file();
 
-        let merged = reader.read_file_slice_from_mdt_paths_blocking(
-            &base_file,
-            MDT_FILES_LOG_FILES.to_vec(),
-        )?;
+        let merged = reader
+            .read_file_slice_from_mdt_paths_blocking(&base_file, MDT_FILES_LOG_FILES.to_vec())?;
 
         // Expected UUIDs for each partition's files
         const CHENNAI_UUID: &str = "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc";
@@ -997,10 +988,8 @@ mod tests {
         let reader = create_mdt_reader()?;
 
         // Test with non-existent base file
-        let result = reader.read_file_slice_from_mdt_paths_blocking(
-            "files/nonexistent.hfile",
-            Vec::<&str>::new(),
-        );
+        let result = reader
+            .read_file_slice_from_mdt_paths_blocking("files/nonexistent.hfile", Vec::<&str>::new());
 
         assert!(result.is_err(), "Should error on non-existent file");
         let err = result.unwrap_err().to_string();

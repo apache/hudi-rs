@@ -18,14 +18,15 @@
  */
 use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
 use crate::config::read::HudiReadConfig;
+use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::{
     BaseFileFormat, BasePath, DropsPartitionFields, TableVersion, TimelineLayoutVersion,
 };
-use crate::config::table::BaseFileFormatValue;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::merge::record_merger::RecordMerger;
+use crate::util::path::is_metadata_table_path;
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -73,18 +74,13 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
     // Validate HFile format is only used for metadata tables
     if let Ok(base_file_format_str) = hudi_configs.get(BaseFileFormat) {
         let format_str: String = base_file_format_str.into();
-        if let Ok(format) = BaseFileFormatValue::from_str(&format_str) {
-            if format.is_metadata_table_only() {
-                let base_path: String = hudi_configs.get_or_default(BasePath).into();
-                let is_mdt = base_path
-                    .trim_end_matches('/')
-                    .ends_with(".hoodie/metadata");
-                if !is_mdt {
-                    return Err(CoreError::Unsupported(format!(
-                        "Base file format '{}' is only valid for metadata tables",
-                        format_str
-                    )));
-                }
+        if let Ok(BaseFileFormatValue::HFile) = BaseFileFormatValue::from_str(&format_str) {
+            let base_path: String = hudi_configs.get_or_default(BasePath).into();
+            if !is_metadata_table_path(&base_path) {
+                return Err(CoreError::Unsupported(format!(
+                    "Base file format '{}' is only valid for metadata tables",
+                    format_str
+                )));
             }
         }
     }
@@ -214,10 +210,7 @@ mod tests {
         options.insert(TableVersion.as_ref().to_string(), "8".to_string());
         options.insert(TimelineLayoutVersion.as_ref().to_string(), "2".to_string());
         options.insert(BaseFileFormat.as_ref().to_string(), "hfile".to_string());
-        options.insert(
-            "hoodie.base.path".to_string(),
-            "/data/my_table".to_string(),
-        );
+        options.insert("hoodie.base.path".to_string(), "/data/my_table".to_string());
 
         let configs = HudiConfigs::new(options);
         let result = validate_configs(&configs);
