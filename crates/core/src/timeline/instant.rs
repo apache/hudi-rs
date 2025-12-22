@@ -606,7 +606,10 @@ mod tests {
         // Valid date format should still parse correctly (not treated as epoch)
         let dt = Instant::parse_datetime("20240101120000000", "UTC")?;
         // This is Jan 1, 2024, 12:00:00.000 UTC - NOT epoch 20240101120000000
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-01 12:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-01-01 12:00:00"
+        );
 
         Ok(())
     }

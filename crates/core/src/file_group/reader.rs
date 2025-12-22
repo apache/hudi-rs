@@ -846,7 +846,8 @@ mod tests {
 
         // Read base file only (no log files)
         let log_files: Vec<&str> = vec![];
-        let merged = reader.read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, log_files)?;
+        let merged =
+            reader.read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, log_files)?;
 
         // Initial base file only has __all_partitions__ record
         // City partition records are added through log files
@@ -867,8 +868,10 @@ mod tests {
         let reader = create_mdt_reader()?;
 
         // Read base file + all log files
-        let merged = reader
-            .read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, MDT_FILES_LOG_FILES.to_vec())?;
+        let merged = reader.read_file_slice_from_mdt_paths_blocking(
+            MDT_FILES_BASE_FILE,
+            MDT_FILES_LOG_FILES.to_vec(),
+        )?;
 
         // Should still have 4 keys after merging
         assert_eq!(merged.len(), 4, "Should have 4 partition keys after merge");
