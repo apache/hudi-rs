@@ -194,9 +194,35 @@ impl Instant {
         Ok(())
     }
 
+    /// Parse a timestamp string into a UTC DateTime.
+    ///
+    /// Supports two formats:
+    /// 1. Date format: `yyyyMMddHHmmss` (14 chars) or `yyyyMMddHHmmssSSS` (17 chars)
+    /// 2. Epoch milliseconds: 17-digit number representing milliseconds since Unix epoch
+    ///    (used by metadata table for timestamps like `00000000000000000`)
+    ///
+    /// The function tries date format first, then falls back to epoch milliseconds
+    /// if the date parsing fails (e.g., invalid month/day like `00`).
     pub fn parse_datetime(timestamp: &str, timezone: &str) -> Result<DateTime<Utc>> {
-        let naive_dt = Self::parse_naive_datetime(timestamp)?;
-        Self::convert_to_timezone(naive_dt, timezone)
+        // First try parsing as yyyyMMddHHmmssSSS date format
+        if let Ok(naive_dt) = Self::parse_naive_datetime(timestamp) {
+            return Self::convert_to_timezone(naive_dt, timezone);
+        }
+
+        // Fallback: treat as epoch milliseconds (zero-padded 17-digit number)
+        // This handles metadata table timestamps like 00000000000000000, 00000000000000001, etc.
+        if timestamp.len() == 17 && timestamp.chars().all(|c| c.is_ascii_digit()) {
+            let epoch_ms: i64 = timestamp
+                .parse()
+                .map_err(|e| CoreError::Timeline(format!("Invalid epoch timestamp: {}", e)))?;
+            return DateTime::from_timestamp_millis(epoch_ms)
+                .ok_or_else(|| CoreError::Timeline("Invalid epoch millis".to_string()));
+        }
+
+        Err(CoreError::Timeline(format!(
+            "Cannot parse timestamp '{}': not a valid date format or epoch millis",
+            timestamp
+        )))
     }
 
     fn parse_naive_datetime(timestamp: &str) -> Result<NaiveDateTime> {
@@ -537,5 +563,51 @@ mod tests {
         // Too long (not 14 or 17)
         let result = Instant::from_str("202403151425301.commit");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_epoch_millis() -> Result<()> {
+        // Epoch 0 (1970-01-01 00:00:00.000 UTC)
+        let dt = Instant::parse_datetime("00000000000000000", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 0);
+
+        // Epoch 1ms
+        let dt = Instant::parse_datetime("00000000000000001", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 1);
+
+        // Epoch 1000ms (1 second)
+        let dt = Instant::parse_datetime("00000000000001000", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 1000);
+
+        // A larger epoch value
+        let dt = Instant::parse_datetime("00001734567890123", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 1734567890123);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_datetime_epoch_ordering() -> Result<()> {
+        // Verify ordering: epoch 0 < epoch 1 < epoch 2 < ... < real timestamp
+        let epoch_0 = Instant::parse_datetime("00000000000000000", "UTC")?;
+        let epoch_1 = Instant::parse_datetime("00000000000000001", "UTC")?;
+        let epoch_2 = Instant::parse_datetime("00000000000000002", "UTC")?;
+        let real_ts = Instant::parse_datetime("20240315142530500", "UTC")?;
+
+        assert!(epoch_0 < epoch_1);
+        assert!(epoch_1 < epoch_2);
+        assert!(epoch_2 < real_ts);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_datetime_date_format_still_works() -> Result<()> {
+        // Valid date format should still parse correctly (not treated as epoch)
+        let dt = Instant::parse_datetime("20240101120000000", "UTC")?;
+        // This is Jan 1, 2024, 12:00:00.000 UTC - NOT epoch 20240101120000000
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-01-01 12:00:00");
+
+        Ok(())
     }
 }

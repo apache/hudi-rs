@@ -810,43 +810,6 @@ mod tests {
         FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
     }
 
-    /// Find the files partition directory.
-    fn files_partition_dir() -> PathBuf {
-        use hudi_test::QuickstartTripsTable;
-        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
-        PathBuf::from(table_path)
-            .join(".hoodie")
-            .join("metadata")
-            .join("files")
-    }
-
-    /// Dynamically find the HFile base file in the files partition.
-    /// Returns the relative path from metadata table root (e.g., "files/files-xxx.hfile").
-    fn find_mdt_base_file() -> String {
-        let dir = files_partition_dir();
-        let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("Failed to read directory {:?}: {}", dir, e))
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .map(|ext| ext == "hfile")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        // Sort by filename to get the latest (timestamps are in filename)
-        hfiles.sort_by_key(|e| e.file_name());
-
-        let hfile_name = hfiles
-            .last()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .unwrap_or_else(|| panic!("No HFile found in {:?}", dir));
-
-        format!("files/{}", hfile_name)
-    }
-
     #[test]
     fn test_is_metadata_table_detection() -> Result<()> {
         // Regular table should return false
@@ -860,6 +823,9 @@ mod tests {
 
         Ok(())
     }
+
+    /// Initial HFile base file for the files partition (all zeros timestamp).
+    const MDT_FILES_BASE_FILE: &str = "files/files-0000-0_0-955-2690_00000000000000000.hfile";
 
     /// Log files for the V8Trips8I3U1D test table's files partition.
     const MDT_FILES_LOG_FILES: &[&str] = &[
@@ -877,23 +843,19 @@ mod tests {
         use crate::metadata::table_record::MetadataRecordType;
 
         let reader = create_mdt_reader()?;
-        let base_file = find_mdt_base_file();
 
         // Read base file only (no log files)
         let log_files: Vec<&str> = vec![];
-        let merged = reader.read_file_slice_from_mdt_paths_blocking(&base_file, log_files)?;
+        let merged = reader.read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, log_files)?;
 
-        // Should have 4 keys: __all_partitions__ + 3 city partitions
-        assert_eq!(merged.len(), 4, "Should have 4 partition keys");
+        // Initial base file only has __all_partitions__ record
+        // City partition records are added through log files
+        assert_eq!(merged.len(), 1, "Base file should have 1 key");
         assert!(merged.contains_key("__all_partitions__"));
-        assert!(merged.contains_key("city=chennai"));
-        assert!(merged.contains_key("city=san_francisco"));
-        assert!(merged.contains_key("city=sao_paulo"));
 
         // Validate __all_partitions__ record
         let all_parts = merged.get("__all_partitions__").unwrap();
         assert_eq!(all_parts.record_type, MetadataRecordType::AllPartitions);
-        assert_eq!(all_parts.partition_names().len(), 3);
 
         Ok(())
     }
@@ -903,11 +865,10 @@ mod tests {
         use crate::metadata::table_record::MetadataRecordType;
 
         let reader = create_mdt_reader()?;
-        let base_file = find_mdt_base_file();
 
         // Read base file + all log files
         let merged = reader
-            .read_file_slice_from_mdt_paths_blocking(&base_file, MDT_FILES_LOG_FILES.to_vec())?;
+            .read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, MDT_FILES_LOG_FILES.to_vec())?;
 
         // Should still have 4 keys after merging
         assert_eq!(merged.len(), 4, "Should have 4 partition keys after merge");

@@ -1597,10 +1597,30 @@ mod tests {
 
         // Verify we can get the MDT partitions from the data table
         let partitions = data_table.get_metadata_table_partitions();
-        assert!(!partitions.is_empty(), "Should have MDT partitions");
-        assert!(
-            partitions.contains(&"files".to_string()),
-            "Should contain 'files' partition"
+
+        // The test table has 5 MDT partitions configured
+        assert_eq!(
+            partitions.len(),
+            5,
+            "Should have 5 MDT partitions, got: {:?}",
+            partitions
         );
+
+        // Verify all expected partitions are present
+        let expected = [
+            "column_stats",
+            "files",
+            "partition_stats",
+            "record_index",
+            "secondary_index_rider_idx",
+        ];
+        for partition in &expected {
+            assert!(
+                partitions.contains(&partition.to_string()),
+                "Should contain '{}' partition, got: {:?}",
+                partition,
+                partitions
+            );
+        }
     }
 }
