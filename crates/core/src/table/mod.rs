@@ -702,21 +702,20 @@ impl Table {
         let filters = from_str_tuples([("partition", "=", "files")])?;
         let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
 
+        if file_slices.len() != 1 {
+            return Err(CoreError::MetadataTable(format!(
+                "Expected 1 file slice for files partition, got {}",
+                file_slices.len()
+            )));
+        }
+        let file_slice = &file_slices[0];
+
         let fg_reader = self.create_file_group_reader_with_options([(
             HudiReadConfig::FileGroupEndTimestamp,
             timestamp,
         )])?;
 
-        // Read and merge all file slices
-        let mut merged: HashMap<String, FilesPartitionRecord> = HashMap::new();
-        for file_slice in &file_slices {
-            let records = fg_reader.read_file_slice_from_mdt(file_slice).await?;
-            for (key, record) in records {
-                merged.insert(key, record);
-            }
-        }
-
-        Ok(merged)
+        fg_reader.read_file_slice_from_mdt(file_slice).await
     }
 
     /// Same as [Table::read_metadata_files], but blocking.

@@ -948,4 +948,36 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_read_file_slice_from_mdt_blocking() -> Result<()> {
+        use crate::file_group::FileGroup;
+
+        let reader = create_mdt_reader()?;
+
+        // Build FileGroup using the API
+        let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
+        let base_file_name = MDT_FILES_BASE_FILE.strip_prefix("files/").unwrap();
+        fg.add_base_file_from_name(base_file_name)?;
+        let log_file_names: Vec<_> = MDT_FILES_LOG_FILES
+            .iter()
+            .map(|s| s.strip_prefix("files/").unwrap())
+            .collect();
+        fg.add_log_files_from_names(log_file_names)?;
+
+        let file_slice = fg
+            .get_file_slice_as_of("99999999999999999")
+            .expect("Should have file slice");
+
+        let merged = reader.read_file_slice_from_mdt_blocking(file_slice)?;
+
+        // Should have 4 keys: __all_partitions__ + 3 city partitions
+        assert_eq!(merged.len(), 4);
+        assert!(merged.contains_key("__all_partitions__"));
+        assert!(merged.contains_key("city=chennai"));
+        assert!(merged.contains_key("city=san_francisco"));
+        assert!(merged.contains_key("city=sao_paulo"));
+
+        Ok(())
+    }
 }
