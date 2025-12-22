@@ -30,6 +30,7 @@ use crate::hfile::key::{compare_keys, Key, KeyValue, Utf8Key};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
 use crate::hfile::trailer::HFileTrailer;
+use crate::storage::Storage;
 use apache_avro::Schema as AvroSchema;
 use prost::Message;
 use std::cell::OnceCell;
@@ -130,6 +131,29 @@ impl HFileReader {
 
         reader.initialize_metadata()?;
         Ok(reader)
+    }
+
+    /// Open an HFile from storage.
+    ///
+    /// This is an async factory method that reads the file from storage
+    /// and creates an HFileReader.
+    ///
+    /// # Arguments
+    /// * `storage` - The storage to read from
+    /// * `relative_path` - The relative path to the HFile
+    ///
+    /// # Example
+    /// ```ignore
+    /// let reader = HFileReader::open(&storage, "files/data.hfile").await?;
+    /// for record in reader.iter()? {
+    ///     println!("{:?}", record?);
+    /// }
+    /// ```
+    pub async fn open(storage: &Storage, relative_path: &str) -> Result<Self> {
+        let bytes = storage.get_file_data(relative_path).await.map_err(|e| {
+            HFileError::InvalidFormat(format!("Failed to read HFile {}: {:?}", relative_path, e))
+        })?;
+        Self::new(bytes.to_vec())
     }
 
     /// Initialize metadata by reading index blocks and file info.
@@ -2268,5 +2292,246 @@ mod tests {
             "Total parquet files across all partitions"
         );
         assert!(total_size > 0, "Total size across partitions should be > 0");
+    }
+
+    // ================== File Info and Meta Block Tests ==================
+
+    #[test]
+    fn test_get_file_info_last_key() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // LASTKEY should be present in file info
+        let last_key = reader.get_file_info("hfile.LASTKEY");
+        assert!(last_key.is_some(), "LASTKEY should be present");
+
+        // Parse the last key - it's the structured key bytes
+        let last_key_bytes = last_key.unwrap();
+        assert!(!last_key_bytes.is_empty(), "LASTKEY should not be empty");
+    }
+
+    #[test]
+    fn test_get_file_info_not_found() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Non-existent key should return None
+        let result = reader.get_file_info("nonexistent.key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_avro_schema_from_metadata_hfile() {
+        let bytes = read_metadata_table_hfile();
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Metadata table HFiles should have embedded Avro schema
+        let schema = reader.get_avro_schema().expect("Failed to get schema");
+        assert!(schema.is_some(), "Metadata HFile should have Avro schema");
+
+        let avro_schema = schema.unwrap();
+        // Schema should be a record type for HoodieMetadataRecord
+        assert!(
+            matches!(avro_schema, AvroSchema::Record(_)),
+            "Schema should be a record type"
+        );
+    }
+
+    #[test]
+    fn test_get_avro_schema_regular_hfile() {
+        // Regular test HFiles don't have Avro schema in file info
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let schema = reader.get_avro_schema().expect("Failed to get schema");
+        // Regular HFiles typically don't have embedded Avro schema
+        assert!(
+            schema.is_none(),
+            "Regular HFile should not have Avro schema"
+        );
+    }
+
+    #[test]
+    fn test_read_min_max_record_keys_from_metadata_hfile() {
+        let bytes = read_metadata_table_hfile();
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Metadata table HFiles should have min/max record keys
+        let result = reader.read_min_max_record_keys();
+
+        // The metadata HFile may or may not have these keys depending on how it was created
+        // If present, verify the structure
+        if let Some((min_key, max_key)) = result {
+            assert!(!min_key.is_empty(), "Min key should not be empty");
+            assert!(!max_key.is_empty(), "Max key should not be empty");
+            // Min should be <= Max lexicographically
+            assert!(
+                min_key <= max_key,
+                "Min key should be <= Max key: {} vs {}",
+                min_key,
+                max_key
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_min_max_record_keys_regular_hfile() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Regular test HFiles typically don't have min/max record keys
+        let result = reader.read_min_max_record_keys();
+        assert!(
+            result.is_none(),
+            "Regular HFile should not have min/max record keys"
+        );
+    }
+
+    // ================== Error Handling Tests ==================
+
+    #[test]
+    fn test_invalid_hfile_too_small() {
+        // File too small to contain a valid trailer
+        let bytes = vec![0u8; 10];
+        let result = HFileReader::new(bytes);
+        assert!(result.is_err(), "Should fail for file too small");
+    }
+
+    #[test]
+    fn test_invalid_hfile_bad_magic() {
+        // Create a file with wrong magic bytes at the end
+        let mut bytes = vec![0u8; 100];
+        // HFile trailer magic is at the end - put garbage there
+        bytes[96..100].copy_from_slice(b"BAAD");
+        let result = HFileReader::new(bytes);
+        assert!(result.is_err(), "Should fail for invalid magic");
+    }
+
+    // ================== Multi-Block Iteration Tests ==================
+
+    #[test]
+    fn test_iterate_across_multiple_blocks() {
+        // Use GZIP file with 20000 entries - spans multiple blocks
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let mut count = 0;
+        let mut prev_key: Option<String> = None;
+
+        for result in reader.iter().expect("Failed to create iterator") {
+            let kv = result.expect("Failed to read kv");
+            let key = kv.key().content_as_str().unwrap().to_string();
+
+            // Verify keys are in ascending order
+            if let Some(ref prev) = prev_key {
+                assert!(
+                    key > *prev,
+                    "Keys should be in ascending order: {} > {}",
+                    key,
+                    prev
+                );
+            }
+            prev_key = Some(key);
+            count += 1;
+        }
+
+        assert_eq!(count, 20000, "Should iterate all 20000 entries");
+    }
+
+    #[test]
+    fn test_seek_across_block_boundaries() {
+        // Use 512KB blocks with 20000 entries
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        reader.seek_to_first().expect("Failed to seek");
+
+        // Seek to various keys that likely span different blocks
+        let test_keys = [
+            "hudi-key-000000000", // First key
+            "hudi-key-000005000", // Middle
+            "hudi-key-000010000", // Another block
+            "hudi-key-000015000", // Another block
+            "hudi-key-000019999", // Last key
+        ];
+
+        for expected_key in test_keys {
+            let lookup = Utf8Key::new(expected_key);
+            let result = reader.seek_to(&lookup).expect("Failed to seek");
+            assert_eq!(
+                result,
+                SeekResult::Found,
+                "Should find key: {}",
+                expected_key
+            );
+
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            assert_eq!(
+                kv.key().content_as_str().unwrap(),
+                expected_key,
+                "Key mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_next_at_eof() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Seek to last key
+        reader.seek_to_first().expect("Failed to seek");
+        let lookup = Utf8Key::new("hudi-key-000004999");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        // next() should return false at EOF
+        assert!(!reader.next().expect("Failed to next"));
+
+        // get_key_value should return None after EOF
+        assert!(reader.get_key_value().expect("Failed to get kv").is_none());
+    }
+
+    #[test]
+    fn test_collect_records_gzip() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let records = reader.collect_records().expect("Failed to collect records");
+        assert_eq!(records.len(), 20000);
+
+        // Verify first and last records
+        assert_eq!(records[0].key_as_str(), Some("hudi-key-000000000"));
+        assert_eq!(records[19999].key_as_str(), Some("hudi-key-000019999"));
+    }
+
+    #[test]
+    fn test_lookup_records_across_blocks() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Look up keys that span different blocks
+        let keys = vec![
+            "hudi-key-000000000",
+            "hudi-key-000005000",
+            "hudi-key-000010000",
+            "hudi-key-000015000",
+            "hudi-key-000019999",
+            "hudi-key-nonexistent",
+        ];
+
+        let results = reader.lookup_records(&keys).expect("Failed to lookup");
+        assert_eq!(results.len(), 6);
+
+        // First 5 should be found
+        for (key, value) in results.iter().take(5) {
+            assert!(value.is_some(), "Key {} should be found", key);
+        }
+
+        // Last one should not be found
+        assert!(
+            results[5].1.is_none(),
+            "Nonexistent key should not be found"
+        );
     }
 }

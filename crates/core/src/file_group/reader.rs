@@ -26,8 +26,11 @@ use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
+use crate::hfile::HFileReader;
 use crate::merge::record_merger::RecordMerger;
+use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
+use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::Storage;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
@@ -36,6 +39,7 @@ use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 use futures::TryFutureExt;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
@@ -319,6 +323,158 @@ impl FileGroupReader {
             .enable_all()
             .build()?
             .block_on(self.read_file_slice_from_paths(base_file_path, log_file_paths))
+    }
+
+    // =========================================================================
+    // Metadata Table (MDT) File Slice Reading
+    // =========================================================================
+
+    /// Check if this reader is configured for a metadata table.
+    ///
+    /// Detection is based on the base path ending with `.hoodie/metadata`.
+    pub fn is_metadata_table(&self) -> bool {
+        let base_path: String = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::BasePath)
+            .into();
+        crate::util::path::is_metadata_table_path(&base_path)
+    }
+
+    /// Reads a metadata table file slice and returns merged FilesPartitionRecords.
+    ///
+    /// This method is specifically designed for reading the metadata table's `files` partition,
+    /// which uses HFile format for base files and HFile blocks in log files.
+    ///
+    /// # Arguments
+    /// * `base_file_path` - Relative path to the HFile base file
+    /// * `log_file_paths` - Relative paths to log files
+    ///
+    /// # Returns
+    /// A HashMap mapping record keys (partition paths or "__all_partitions__") to
+    /// merged `FilesPartitionRecord`s containing file information.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let reader = FileGroupReader::new_with_options(mdt_base_uri, options)?;
+    /// let merged = reader.read_file_slice_from_mdt_paths(
+    ///     "files/files-0000-0_0-0-0_00000000000000.hfile",
+    ///     vec!["files/.files-0000-0_20240101120000000.log.1_0-100-200"],
+    /// ).await?;
+    ///
+    /// // Get file listing for a partition
+    /// if let Some(record) = merged.get("city=chennai") {
+    ///     for file_name in record.active_file_names() {
+    ///         println!("Active file: {}", file_name);
+    ///     }
+    /// }
+    /// ```
+    pub async fn read_file_slice_from_mdt_paths<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+    ) -> Result<HashMap<String, FilesPartitionRecord>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let log_file_paths: Vec<String> = log_file_paths
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+
+        // Read HFile base file using async open
+        let mut hfile_reader = HFileReader::open(&self.storage, base_file_path)
+            .await
+            .map_err(|e| {
+                ReadFileSliceError(format!(
+                    "Failed to read MDT base file {}: {:?}",
+                    base_file_path, e
+                ))
+            })?;
+
+        // Get Avro schema from HFile
+        let schema = hfile_reader
+            .get_avro_schema()
+            .map_err(|e| ReadFileSliceError(format!("Failed to get Avro schema: {:?}", e)))?
+            .ok_or_else(|| ReadFileSliceError("No Avro schema found in HFile".to_string()))?
+            .clone();
+
+        // Collect base records
+        let base_records = hfile_reader
+            .collect_records()
+            .map_err(|e| ReadFileSliceError(format!("Failed to collect HFile records: {:?}", e)))?;
+
+        // Scan log files if present
+        let log_records = if log_file_paths.is_empty() {
+            vec![]
+        } else {
+            let instant_range = self.create_instant_range_for_log_file_scan();
+            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                .scan(log_file_paths, &instant_range)
+                .await?;
+
+            match scan_result {
+                ScanResult::HFileRecords(records) => records,
+                ScanResult::Empty => vec![],
+                ScanResult::RecordBatches(_) => {
+                    return Err(CoreError::LogBlockError(
+                        "Unexpected RecordBatches in metadata table log file".to_string(),
+                    ));
+                }
+            }
+        };
+
+        // Merge base and log records
+        let merger = FilesPartitionMerger::new(schema);
+        merger.merge(&base_records, &log_records)
+    }
+
+    /// Same as [FileGroupReader::read_file_slice_from_mdt_paths], but blocking.
+    pub fn read_file_slice_from_mdt_paths_blocking<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+    ) -> Result<HashMap<String, FilesPartitionRecord>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice_from_mdt_paths(base_file_path, log_file_paths))
+    }
+
+    /// Reads a metadata table file slice using a FileSlice object.
+    ///
+    /// Convenience wrapper around [FileGroupReader::read_file_slice_from_mdt_paths].
+    pub async fn read_file_slice_from_mdt(
+        &self,
+        file_slice: &FileSlice,
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let log_file_paths = if file_slice.has_log_file() {
+            file_slice
+                .log_files
+                .iter()
+                .map(|log_file| file_slice.log_file_relative_path(log_file))
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            vec![]
+        };
+        self.read_file_slice_from_mdt_paths(&base_file_path, log_file_paths)
+            .await
+    }
+
+    /// Same as [FileGroupReader::read_file_slice_from_mdt], but blocking.
+    pub fn read_file_slice_from_mdt_blocking(
+        &self,
+        file_slice: &FileSlice,
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice_from_mdt(file_slice))
     }
 }
 
@@ -628,6 +784,199 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // MDT File Slice Reading Tests
+    // =========================================================================
+
+    fn get_metadata_table_base_uri() -> String {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let mdt_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
+        let url = Url::from_file_path(canonicalize(&mdt_path).unwrap()).unwrap();
+        url.as_ref().to_string()
+    }
+
+    /// Create a FileGroupReader for MDT without trying to resolve options from storage.
+    fn create_mdt_reader() -> Result<FileGroupReader> {
+        let mdt_uri = get_metadata_table_base_uri();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath,
+            mdt_uri.as_str(),
+        )]));
+        FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
+    }
+
+    #[test]
+    fn test_is_metadata_table_detection() -> Result<()> {
+        // Regular table should return false
+        let base_uri = get_base_uri_with_valid_props();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+        assert!(!reader.is_metadata_table());
+
+        // Metadata table should return true
+        let mdt_reader = create_mdt_reader()?;
+        assert!(mdt_reader.is_metadata_table());
+
+        Ok(())
+    }
+
+    /// Initial HFile base file for the files partition (all zeros timestamp).
+    const MDT_FILES_BASE_FILE: &str = "files/files-0000-0_0-955-2690_00000000000000000.hfile";
+
+    /// Log files for the V8Trips8I3U1D test table's files partition.
+    const MDT_FILES_LOG_FILES: &[&str] = &[
+        "files/.files-0000-0_20251220210108078.log.1_10-999-2838",
+        "files/.files-0000-0_20251220210123755.log.1_3-1032-2950",
+        "files/.files-0000-0_20251220210125441.log.1_5-1057-3024",
+        "files/.files-0000-0_20251220210127080.log.1_3-1082-3100",
+        "files/.files-0000-0_20251220210128625.log.1_5-1107-3174",
+        "files/.files-0000-0_20251220210129235.log.1_3-1118-3220",
+        "files/.files-0000-0_20251220210130911.log.1_3-1149-3338",
+    ];
+
+    #[test]
+    fn test_read_file_slice_from_mdt_paths_without_log_files() -> Result<()> {
+        use crate::metadata::table_record::MetadataRecordType;
+
+        let reader = create_mdt_reader()?;
+
+        // Read base file only (no log files)
+        let log_files: Vec<&str> = vec![];
+        let merged =
+            reader.read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, log_files)?;
+
+        // Initial base file only has __all_partitions__ record
+        // City partition records are added through log files
+        assert_eq!(merged.len(), 1, "Base file should have 1 key");
+        assert!(merged.contains_key("__all_partitions__"));
+
+        // Validate __all_partitions__ record
+        let all_parts = merged.get("__all_partitions__").unwrap();
+        assert_eq!(all_parts.record_type, MetadataRecordType::AllPartitions);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_mdt_paths_with_log_files() -> Result<()> {
+        use crate::metadata::table_record::MetadataRecordType;
+
+        let reader = create_mdt_reader()?;
+
+        // Read base file + all log files
+        let merged = reader.read_file_slice_from_mdt_paths_blocking(
+            MDT_FILES_BASE_FILE,
+            MDT_FILES_LOG_FILES.to_vec(),
+        )?;
+
+        // Should still have 4 keys after merging
+        assert_eq!(merged.len(), 4, "Should have 4 partition keys after merge");
+
+        // Validate all partition keys have correct record types
+        for (key, record) in &merged {
+            if key == "__all_partitions__" {
+                assert_eq!(record.record_type, MetadataRecordType::AllPartitions);
+            } else {
+                assert_eq!(record.record_type, MetadataRecordType::Files);
+            }
+        }
+
+        // Expected UUIDs for each partition's files
+        const CHENNAI_UUID: &str = "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc";
+        const SAN_FRANCISCO_UUID: &str = "036ded81-9ed4-479f-bcea-7145dfa0079b";
+        const SAO_PAULO_UUID: &str = "8aa68f7e-afd6-4c94-b86c-8a886552e08d";
+
+        // Validate chennai partition
+        let chennai = merged.get("city=chennai").unwrap();
+        let active_files = chennai.active_file_names();
+        assert!(
+            active_files.len() >= 2,
+            "Chennai should have at least 2 active files, got {}",
+            active_files.len()
+        );
+        assert!(chennai.total_size() > 0, "Total size should be > 0");
+        for file_name in &active_files {
+            assert!(
+                file_name.contains(CHENNAI_UUID),
+                "Chennai file should contain UUID: {}",
+                file_name
+            );
+        }
+
+        // Validate san_francisco partition
+        let sf = merged.get("city=san_francisco").unwrap();
+        for file_name in sf.active_file_names() {
+            assert!(
+                file_name.contains(SAN_FRANCISCO_UUID),
+                "San Francisco file should contain UUID: {}",
+                file_name
+            );
+        }
+
+        // Validate sao_paulo partition
+        let sp = merged.get("city=sao_paulo").unwrap();
+        for file_name in sp.active_file_names() {
+            assert!(
+                file_name.contains(SAO_PAULO_UUID),
+                "Sao Paulo file should contain UUID: {}",
+                file_name
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_mdt_error_handling() -> Result<()> {
+        let reader = create_mdt_reader()?;
+
+        // Test with non-existent base file
+        let result = reader
+            .read_file_slice_from_mdt_paths_blocking("files/nonexistent.hfile", Vec::<&str>::new());
+
+        assert!(result.is_err(), "Should error on non-existent file");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to read MDT base file"),
+            "Error should mention MDT base file: {}",
+            err
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_mdt_blocking() -> Result<()> {
+        use crate::file_group::FileGroup;
+
+        let reader = create_mdt_reader()?;
+
+        // Build FileGroup using the API
+        let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
+        let base_file_name = MDT_FILES_BASE_FILE.strip_prefix("files/").unwrap();
+        fg.add_base_file_from_name(base_file_name)?;
+        let log_file_names: Vec<_> = MDT_FILES_LOG_FILES
+            .iter()
+            .map(|s| s.strip_prefix("files/").unwrap())
+            .collect();
+        fg.add_log_files_from_names(log_file_names)?;
+
+        let file_slice = fg
+            .get_file_slice_as_of("99999999999999999")
+            .expect("Should have file slice");
+
+        let merged = reader.read_file_slice_from_mdt_blocking(file_slice)?;
+
+        // Should have 4 keys: __all_partitions__ + 3 city partitions
+        assert_eq!(merged.len(), 4);
+        assert!(merged.contains_key("__all_partitions__"));
+        assert!(merged.contains_key("city=chennai"));
+        assert!(merged.contains_key("city=san_francisco"));
+        assert!(merged.contains_key("city=sao_paulo"));
 
         Ok(())
     }

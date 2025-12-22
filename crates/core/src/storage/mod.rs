@@ -106,6 +106,7 @@ impl Storage {
     }
 
     #[cfg(test)]
+    /// Get basic file metadata (name, size) without loading the file content.
     async fn get_file_metadata_not_populated(&self, relative_path: &str) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
@@ -116,6 +117,7 @@ impl Storage {
         Ok(FileMetadata::new(name.to_string(), meta.size))
     }
 
+    /// Get full file metadata for a Parquet file, including record counts from Parquet metadata.
     pub async fn get_file_metadata(&self, relative_path: &str) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
