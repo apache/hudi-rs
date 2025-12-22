@@ -839,7 +839,7 @@ mod tests {
     ];
 
     #[test]
-    fn test_read_file_slice_from_mdt_paths_base_file_only() -> Result<()> {
+    fn test_read_file_slice_from_mdt_paths_without_log_files() -> Result<()> {
         use crate::metadata::table_record::MetadataRecordType;
 
         let reader = create_mdt_reader()?;

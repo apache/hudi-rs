@@ -101,7 +101,9 @@ use crate::error::CoreError;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::metadata::table_record::FilesPartitionRecord;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
+use crate::storage::util::join_url_segments;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -243,6 +245,12 @@ impl Table {
     /// Returns an error if the metadata table cannot be created or if there are
     /// no metadata table partitions configured.
     pub async fn new_metadata_table(&self) -> Result<Table> {
+        if self.is_metadata_table() {
+            return Err(CoreError::MetadataTable(
+                "Cannot create metadata table from another metadata table".to_string(),
+            ));
+        }
+
         let mdt_partitions = self.get_metadata_table_partitions();
         if mdt_partitions.is_empty() {
             return Err(CoreError::MetadataTable(
@@ -250,16 +258,8 @@ impl Table {
             ));
         }
 
-        let base_url = self.base_url();
-        let mdt_path = base_url
-            .join(".hoodie/metadata/")
-            .map_err(|e| CoreError::MetadataTable(format!("Invalid metadata table path: {}", e)))?;
-
-        Table::new_with_options(
-            mdt_path.as_str(),
-            [(PartitionFields.as_ref(), mdt_partitions.join(","))],
-        )
-        .await
+        let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
+        Table::new_with_options(mdt_url.as_str(), [(PartitionFields.as_ref(), "partition")]).await
     }
 
     /// Same as [Table::new_metadata_table], but blocking.
@@ -318,25 +318,25 @@ impl Table {
 
     /// Get the latest partition [arrow_schema::Schema] of the table.
     ///
-    /// For metadata tables, returns a schema with partition fields from configuration,
-    /// all typed as [arrow_schema::DataType::Utf8] since MDT partition values are
-    /// string-based identifiers.
+    /// For metadata tables, returns a schema with a single `partition` field
+    /// typed as [arrow_schema::DataType::Utf8], since MDT uses a single partition
+    /// column to identify partitions like "files", "column_stats", etc.
     ///
     /// For regular tables, returns the partition fields with their actual data types
     /// derived from the table schema.
     pub async fn get_partition_schema(&self) -> Result<Schema> {
+        if self.is_metadata_table() {
+            return Ok(Schema::new(vec![Field::new(
+                "partition",
+                arrow_schema::DataType::Utf8,
+                false,
+            )]));
+        }
+
         let partition_fields: HashSet<String> = {
             let fields: Vec<String> = self.hudi_configs.get_or_default(PartitionFields).into();
             fields.into_iter().collect()
         };
-
-        if self.is_metadata_table() {
-            let fields: Vec<Field> = partition_fields
-                .iter()
-                .map(|f| Field::new(f, arrow_schema::DataType::Utf8, false))
-                .collect();
-            return Ok(Schema::new(fields));
-        }
 
         let schema = self.get_schema().await?;
         let partition_fields: Vec<Arc<Field>> = schema
@@ -681,6 +681,52 @@ impl Table {
         )
     }
 
+    /// Read records from the "files" partition of the metadata table.
+    ///
+    /// This method can only be called on metadata tables. It reads all records
+    /// from the "files" partition and returns merged `FilesPartitionRecord`s.
+    ///
+    /// # Returns
+    /// A HashMap mapping record keys to their `FilesPartitionRecord`s.
+    pub async fn read_metadata_files(&self) -> Result<HashMap<String, FilesPartitionRecord>> {
+        if !self.is_metadata_table() {
+            return Err(CoreError::MetadataTable(
+                "read_metadata_files can only be called on metadata tables".to_string(),
+            ));
+        }
+
+        let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
+            return Ok(HashMap::new());
+        };
+
+        let filters = from_str_tuples([("partition", "=", "files")])?;
+        let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
+
+        let fg_reader = self.create_file_group_reader_with_options([(
+            HudiReadConfig::FileGroupEndTimestamp,
+            timestamp,
+        )])?;
+
+        // Read and merge all file slices
+        let mut merged: HashMap<String, FilesPartitionRecord> = HashMap::new();
+        for file_slice in &file_slices {
+            let records = fg_reader.read_file_slice_from_mdt(file_slice).await?;
+            for (key, record) in records {
+                merged.insert(key, record);
+            }
+        }
+
+        Ok(merged)
+    }
+
+    /// Same as [Table::read_metadata_files], but blocking.
+    pub fn read_metadata_files_blocking(&self) -> Result<HashMap<String, FilesPartitionRecord>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_metadata_files())
+    }
+
     /// Get all the latest records in the table.
     ///
     /// # Arguments
@@ -842,6 +888,7 @@ mod tests {
     use crate::config::HUDI_CONF_DIR;
     use crate::error::CoreError;
     use crate::metadata::meta_field::MetaField;
+    use crate::metadata::table_record::MetadataRecordType;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
     use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
@@ -1526,69 +1573,43 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "MDT snapshot read not yet implemented - gaps to fill"]
-    fn hudi_table_read_snapshot_from_metadata_table() {
-        // Create the data table and use the new_metadata_table API
+    fn hudi_table_read_metadata_files() {
         let data_table = get_data_table();
-
-        // Create MDT using the new API (uses all partitions from config)
         let metadata_table = data_table.new_metadata_table_blocking().unwrap();
 
-        // Verify this is detected as a metadata table
-        assert!(
-            metadata_table.is_metadata_table(),
-            "Should be detected as metadata table"
-        );
+        assert!(metadata_table.is_metadata_table());
 
-        // Verify partition schema returns all MDT partition fields with Utf8 type
-        // The test data table has: column_stats, files, partition_stats, record_index, secondary_index_rider_idx
-        let partition_schema = metadata_table.get_partition_schema_blocking().unwrap();
+        let records = metadata_table.read_metadata_files_blocking().unwrap();
+
+        // Should have 4 records: __all_partitions__ + 3 city partitions
+        assert_eq!(records.len(), 4);
+
+        // Validate __all_partitions__ record
+        let all_partitions = records.get("__all_partitions__").unwrap();
         assert_eq!(
-            partition_schema.fields().len(),
-            5,
-            "Should have 5 MDT partition fields"
+            all_partitions.record_type,
+            MetadataRecordType::AllPartitions
         );
-
-        // Verify "files" is one of the partition fields
-        let field_names: HashSet<&str> = partition_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert!(
-            field_names.contains("files"),
-            "Should contain 'files' partition"
-        );
-
-        // Verify all partition fields are Utf8 type (MDT-specific behavior)
-        for field in partition_schema.fields() {
-            assert_eq!(
-                field.data_type(),
-                &arrow_schema::DataType::Utf8,
-                "MDT partition field '{}' should be Utf8",
-                field.name()
-            );
-        }
-
-        // Attempt to read snapshot - this should read from the files partition
-        let batches = metadata_table
-            .read_snapshot_blocking(empty_filters())
-            .unwrap();
-
-        // The MDT files partition should have records for:
-        // - __all_partitions__ key
-        // - One record per partition (city=chennai, city=san_francisco, city=sao_paulo)
-        assert!(
-            !batches.is_empty(),
-            "Should have read records from metadata table"
-        );
-
-        // Validate total row count matches expected partitions (4 keys total)
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let partition_names: HashSet<_> = all_partitions.partition_names().into_iter().collect();
         assert_eq!(
-            total_rows, 4,
-            "Should have 4 records: __all_partitions__ + 3 city partitions"
+            partition_names,
+            HashSet::from(["city=chennai", "city=san_francisco", "city=sao_paulo"])
         );
+
+        // Validate city=chennai record with actual file names
+        let chennai = records.get("city=chennai").unwrap();
+        assert_eq!(chennai.record_type, MetadataRecordType::Files);
+        let chennai_files: HashSet<_> = chennai.active_file_names().into_iter().collect();
+        assert_eq!(
+            chennai_files,
+            HashSet::from([
+                "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_2-986-2794_20251220210108078.parquet",
+                "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_0-1112-3190_20251220210129235.parquet",
+                ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210127080.log.1_0-1072-3078",
+                ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210128625.log.1_0-1097-3150",
+            ])
+        );
+        assert!(chennai.total_size() > 0);
     }
 
     #[test]
