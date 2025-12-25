@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod builder;
+pub mod completion_time;
 pub mod instant;
 pub mod loader;
 pub mod lsm_tree;
@@ -25,13 +26,16 @@ pub(crate) mod util;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
+use crate::file_group::builder::{
+    file_groups_from_commit_metadata, replaced_file_groups_from_replace_commit, FileGroupMerger,
+};
 use crate::file_group::FileGroup;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
 use crate::storage::Storage;
 use crate::timeline::builder::TimelineBuilder;
+use crate::timeline::completion_time::CompletionTimeView;
 use crate::timeline::instant::Action;
 use crate::timeline::loader::TimelineLoader;
 use crate::timeline::selector::TimelineSelector;
@@ -245,6 +249,18 @@ impl Timeline {
             .map_or_else(|| Err(CoreError::TimelineNoCommit), |t| Ok(t.to_string()))
     }
 
+    /// Create a [CompletionTimeView] from the completed commits.
+    ///
+    /// This view maps request timestamps to completion timestamps, enabling
+    /// correct file association for v8+ tables where request and completion
+    /// timestamps differ.
+    ///
+    /// For v6 tables, the view will be empty since completed_timestamp is None
+    /// for all instants, and the caller should use the request timestamp directly.
+    pub fn create_completion_time_view(&self) -> CompletionTimeView {
+        CompletionTimeView::from_instants(&self.completed_commits)
+    }
+
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
     ///
     /// ### Note
@@ -277,7 +293,7 @@ impl Timeline {
         )?;
         for instant in selector.select(self)? {
             let commit_metadata = self.get_instant_metadata(&instant).await?;
-            file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
+            file_groups.extend(replaced_file_groups_from_replace_commit(&commit_metadata)?);
         }
 
         // TODO: return file group and instants, and handle multi-writer fg id conflicts
@@ -287,6 +303,12 @@ impl Timeline {
 
     /// Get file groups in the timeline ranging from start (exclusive) to end (inclusive).
     /// File groups are as of the [end] timestamp or the latest if not given.
+    ///
+    /// For v8+ tables, the completion timestamps from the timeline instants are used
+    /// to set the completion_timestamp on base files and log files, enabling correct
+    /// file slice association based on completion order rather than request order.
+    ///
+    /// For v6 tables, completion_timestamp is None (v6 does not track completion times).
     pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
@@ -301,12 +323,22 @@ impl Timeline {
             end_timestamp,
         )?;
         let commits = selector.select(self)?;
+
+        // Build completion time view from all commits for v8+ tables.
+        // Each file (base or log) may have a different completion timestamp,
+        // looked up from its own request timestamp.
+        let completion_time_view = CompletionTimeView::from_instants(&commits);
+
         for commit in commits {
             let commit_metadata = self.get_instant_metadata(&commit).await?;
-            file_groups.merge(build_file_groups(&commit_metadata)?)?;
+            file_groups.merge(file_groups_from_commit_metadata(
+                &commit_metadata,
+                &completion_time_view,
+            )?)?;
 
             if commit.is_replacecommit() {
-                replaced_file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
+                replaced_file_groups
+                    .extend(replaced_file_groups_from_replace_commit(&commit_metadata)?);
             }
         }
 

@@ -18,6 +18,7 @@
  */
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
+use crate::timeline::completion_time::TimelineViewByCompletionTime;
 use crate::Result;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -32,7 +33,17 @@ pub struct BaseFile {
     pub write_token: String,
 
     /// The timestamp of the commit instant in the Timeline that created the [BaseFile].
+    ///
+    /// For v6 tables: This is the commit timestamp (v6 does not track completion time separately).
+    /// For v8+ tables: This is the request instant timestamp.
     pub commit_timestamp: String,
+
+    /// The completion timestamp of the commit that created this [BaseFile].
+    ///
+    /// For v6 tables: This is always `None` (v6 does not track completion timestamps).
+    /// For v8+ tables: This is set from the timeline when the commit is completed.
+    ///   If `None`, the commit is still pending and the file should not be included in queries.
+    pub completion_timestamp: Option<String>,
 
     /// File extension that matches to [crate::config::table::HudiTableConfig::BaseFileFormat].
     ///
@@ -87,6 +98,19 @@ impl BaseFile {
             extension = self.extension,
         )
     }
+
+    /// Set the completion timestamp from a completion time view.
+    ///
+    /// Looks up the completion timestamp using this file's `commit_timestamp`
+    /// (request time) and sets `completion_timestamp` if found.
+    ///
+    /// For v6 tables, the view returns `None` and this is a no-op.
+    /// For v8+ tables, this sets the completion timestamp for completed commits.
+    pub fn set_completion_time<V: TimelineViewByCompletionTime>(&mut self, view: &V) {
+        self.completion_timestamp = view
+            .get_completion_time(&self.commit_timestamp)
+            .map(|s| s.to_string());
+    }
 }
 
 impl Display for BaseFile {
@@ -112,6 +136,7 @@ impl FromStr for BaseFile {
             file_id,
             write_token,
             commit_timestamp,
+            completion_timestamp: None,
             extension,
             file_metadata: None,
         })
@@ -128,6 +153,7 @@ impl TryFrom<FileMetadata> for BaseFile {
             file_id,
             write_token,
             commit_timestamp,
+            completion_timestamp: None,
             extension,
             file_metadata: Some(metadata),
         })

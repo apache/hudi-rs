@@ -94,7 +94,9 @@ pub mod partition;
 mod validation;
 
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig::{MetadataTablePartitions, PartitionFields};
+use crate::config::table::HudiTableConfig::{
+    MetadataTableEnabled, MetadataTablePartitions, PartitionFields, TableVersion,
+};
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -102,7 +104,7 @@ use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::metadata::table_record::FilesPartitionRecord;
-use crate::metadata::MDT_PARTITION_FIELD;
+use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::storage::util::join_url_segments;
 use crate::table::builder::TableBuilder;
@@ -237,6 +239,30 @@ impl Table {
             .into()
     }
 
+    /// Check if the metadata table "files" partition is enabled for file listing.
+    ///
+    /// Returns `true` if:
+    /// 1. `hoodie.metadata.enable` is true
+    /// 2. Table version is >= 8 (MDT support is only for v8+ tables)
+    /// 3. "files" is in the configured `hoodie.table.metadata.partitions`
+    pub fn is_metadata_table_enabled(&self) -> bool {
+        let metadata_enabled: bool = self
+            .hudi_configs
+            .get_or_default(MetadataTableEnabled)
+            .into();
+        // TODO: remove this table version check when support files for v6 tables or drop v6 support
+        let table_version: isize = self
+            .hudi_configs
+            .get(TableVersion)
+            .map(|v| v.into())
+            .unwrap_or(0);
+        metadata_enabled
+            && table_version >= 8
+            && self
+                .get_metadata_table_partitions()
+                .contains(&FilesPartitionRecord::PARTITION_NAME.to_string())
+    }
+
     /// Create a metadata table instance for this data table.
     ///
     /// Uses all partitions from `hoodie.table.metadata.partitions` configuration.
@@ -262,7 +288,7 @@ impl Table {
         let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
         Table::new_with_options(
             mdt_url.as_str(),
-            [(PartitionFields.as_ref(), MDT_PARTITION_FIELD)],
+            [(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)],
         )
         .await
     }
@@ -332,7 +358,7 @@ impl Table {
     pub async fn get_partition_schema(&self) -> Result<Schema> {
         if self.is_metadata_table() {
             return Ok(Schema::new(vec![Field::new(
-                MDT_PARTITION_FIELD,
+                METADATA_TABLE_PARTITION_FIELD,
                 arrow_schema::DataType::Utf8,
                 false,
             )]));
@@ -533,6 +559,12 @@ impl Table {
         timestamp: &str,
         filters: &[Filter],
     ) -> Result<Vec<FileSlice>> {
+        // Create completion time view for setting completion timestamps on files.
+        // For v8+ tables, this populates completion timestamps and enables filtering.
+        // For v6 tables, the view is empty and acts as a no-op.
+        let completion_time_view = self.timeline.create_completion_time_view();
+
+        // File slices are keyed by commit_timestamp (request/base instant time).
         let excludes = self
             .timeline
             .get_replaced_file_groups_as_of(timestamp)
@@ -540,9 +572,44 @@ impl Table {
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+
+        // Try metadata table accelerated listing if files partition is configured
+        let metadata_table_records = if self.is_metadata_table_enabled() {
+            match self.fetch_metadata_table_records().await {
+                Ok(records) => Some(records),
+                Err(e) => {
+                    // Fall through to storage listing if metadata table read fails
+                    log::warn!(
+                        "Failed to read file slices from metadata table, falling back to storage listing: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Use the single entrypoint that handles both metadata table and storage listing
         self.file_system_view
-            .get_file_slices_as_of(timestamp, &partition_pruner, &excludes)
+            .get_file_slices_as_of(
+                timestamp,
+                &partition_pruner,
+                &excludes,
+                metadata_table_records.as_ref(),
+                &completion_time_view,
+            )
             .await
+    }
+
+    /// Fetch file records from the metadata table.
+    ///
+    /// The metadata table returns records as-of its current state. For time travel
+    /// or incremental queries, the timestamp filtering is handled by the caller
+    /// using completion time views - the metadata table just provides the file listing.
+    async fn fetch_metadata_table_records(&self) -> Result<HashMap<String, FilesPartitionRecord>> {
+        let metadata_table = self.new_metadata_table().await?;
+        metadata_table.read_metadata_files().await
     }
 
     /// Get all the changed [FileSlice]s in the table between the given timestamps.
@@ -558,7 +625,8 @@ impl Table {
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<FileSlice>> {
-        // If the end timestamp is not provided, use the latest commit timestamp.
+        // If the end timestamp is not provided, use the latest file slice timestamp.
+        // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
         let Some(end) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
@@ -602,7 +670,8 @@ impl Table {
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<Vec<FileSlice>>> {
-        // If the end timestamp is not provided, use the latest commit timestamp.
+        // If the end timestamp is not provided, use the latest file slice timestamp.
+        // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
         let Some(end) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
@@ -700,16 +769,36 @@ impl Table {
             ));
         }
 
+        // Use completion timestamp for file slice queries (v8+ tables key by completion time)
         let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
             return Ok(HashMap::new());
         };
 
+        // For MDT, always use storage-based listing (not MDT-accelerated)
+        // to avoid recursion. MDT never uses itself for file listing.
+        let excludes = self
+            .timeline
+            .get_replaced_file_groups_as_of(timestamp)
+            .await?;
         let filters = from_str_tuples([(
-            MDT_PARTITION_FIELD,
+            METADATA_TABLE_PARTITION_FIELD,
             "=",
             FilesPartitionRecord::PARTITION_NAME,
         )])?;
-        let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
+        let partition_schema = self.get_partition_schema().await?;
+        let partition_pruner =
+            PartitionPruner::new(&filters, &partition_schema, self.hudi_configs.as_ref())?;
+        let completion_time_view = self.timeline.create_completion_time_view();
+        let file_slices = self
+            .file_system_view
+            .get_file_slices_as_of(
+                timestamp,
+                &partition_pruner,
+                &excludes,
+                None, // Never use MDT for reading MDT itself (avoid recursion)
+                &completion_time_view,
+            )
+            .await?;
 
         if file_slices.len() != 1 {
             return Err(CoreError::MetadataTable(format!(
@@ -725,7 +814,9 @@ impl Table {
             timestamp,
         )])?;
 
-        fg_reader.read_file_slice_from_mdt(file_slice).await
+        fg_reader
+            .read_file_slice_from_metadata_table(file_slice)
+            .await
     }
 
     /// Same as [Table::read_metadata_files], but blocking.
@@ -829,7 +920,8 @@ impl Table {
         start_timestamp: &str,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
-        // If the end timestamp is not provided, use the latest commit timestamp.
+        // If the end timestamp is not provided, use the latest file slice timestamp.
+        // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
         let Some(end_timestamp) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {

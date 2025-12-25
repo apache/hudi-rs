@@ -38,7 +38,7 @@ use std::cell::OnceCell;
 /// Magic bytes indicating protobuf format in file info block
 const PBUF_MAGIC: &[u8; 4] = b"PBUF";
 
-/// Seek result codes (matching Java implementation)
+/// Seek result codes for HFile reader
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeekResult {
     /// Lookup key is before the fake first key of a block but >= actual first key

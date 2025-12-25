@@ -33,4 +33,4 @@ pub const LAKE_FORMAT_METADATA_DIRS: &[&str; 3] = &[
 ];
 
 /// The virtual partition field name used in metadata tables.
-pub const MDT_PARTITION_FIELD: &str = "partition";
+pub const METADATA_TABLE_PARTITION_FIELD: &str = "partition";

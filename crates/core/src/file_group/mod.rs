@@ -41,8 +41,8 @@ use std::str::FromStr;
 /// A [FileGroup] contains multiple [FileSlice]s within a partition,
 /// and it can be uniquely identified by `file_id` across the table.
 ///
-/// The [FileSlice]s are ordered by the commit timestamps that indicate the creation of the
-/// [FileSlice].
+/// The [FileSlice]s are keyed by `commit_timestamp` (request/base instant time).
+/// This is consistent for both v6 and v8+ tables.
 #[derive(Clone, Debug)]
 pub struct FileGroup {
     pub file_id: String,
@@ -96,6 +96,9 @@ impl FileGroup {
         Ok(file_group)
     }
 
+    /// Merge another file group into this one.
+    ///
+    /// The file slices are merged by their keys (commit_timestamp / base instant time).
     pub fn merge(&mut self, other: &FileGroup) -> Result<()> {
         if self != other {
             return Err(CoreError::FileGroup(format!(
@@ -103,12 +106,12 @@ impl FileGroup {
             )));
         }
 
-        for (commit_timestamp, other_file_slice) in other.file_slices.iter() {
-            if let Some(existing_file_slice) = self.file_slices.get_mut(commit_timestamp) {
+        for (key, other_file_slice) in other.file_slices.iter() {
+            if let Some(existing_file_slice) = self.file_slices.get_mut(key) {
                 existing_file_slice.merge(other_file_slice)?;
             } else {
                 self.file_slices
-                    .insert(commit_timestamp.clone(), other_file_slice.clone());
+                    .insert(key.clone(), other_file_slice.clone());
             }
         }
 
@@ -122,18 +125,20 @@ impl FileGroup {
     }
 
     /// Add a [BaseFile] to the corresponding [FileSlice] in the [FileGroup].
+    ///
+    /// The file slice is keyed by `commit_timestamp` (request/base instant time).
+    /// This is consistent for both v6 and v8+ tables.
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
-        let commit_timestamp = base_file.commit_timestamp.as_str();
-        if self.file_slices.contains_key(commit_timestamp) {
+        let key = base_file.commit_timestamp.clone();
+
+        if self.file_slices.contains_key(&key) {
             Err(CoreError::FileGroup(format!(
-                "Instant time {commit_timestamp} is already present in File Group {}",
-                self.file_id
+                "Timestamp {} is already present in File Group {}",
+                key, self.file_id
             )))
         } else {
-            self.file_slices.insert(
-                commit_timestamp.to_owned(),
-                FileSlice::new(base_file, self.partition_path.clone()),
-            );
+            self.file_slices
+                .insert(key, FileSlice::new(base_file, self.partition_path.clone()));
             Ok(self)
         }
     }
@@ -170,28 +175,50 @@ impl FileGroup {
 
     /// Add a [LogFile] to the corresponding [FileSlice] in the [FileGroup].
     ///
-    /// For table version 6 (pre-1.0 spec):
-    ///   Log file's timestamp matches the base file's commit timestamp exactly.
+    /// File slices are keyed by `commit_timestamp` (request/base instant time).
+    /// The log file association logic:
     ///
-    /// For table version 8+ (1.0 spec):
-    ///   Log file's timestamp is its own write instant, which may differ from the base file's
-    ///   timestamp. We find the FileSlice with the closest timestamp <= log file's timestamp.
+    /// - **With completion_timestamp (v8+ tables)**: Find the file slice with the largest
+    ///   `commit_timestamp` (base instant time) that is <= log's `completion_timestamp`.
+    ///
+    /// - **Without completion_timestamp (v6 tables)**: Use exact matching or range lookup
+    ///   based on log timestamp.
     ///
     /// TODO: support adding log files to file group without base files.
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
-        let log_timestamp = log_file.timestamp.as_str();
+        // If log file has completion_timestamp, use completion-time-based association
+        // File slices are keyed by commit_timestamp (base instant time)
+        // Find the largest base instant time < log's completion time
+        if let Some(log_completion_time) = &log_file.completion_timestamp {
+            // Find file slice with largest base instant time
+            // (commit_timestamp) < log's completion time
+            if let Some((_, file_slice)) = self
+                .file_slices
+                .range_mut(..log_completion_time.clone())
+                .next_back()
+            {
+                file_slice.log_files.insert(log_file);
+                return Ok(self);
+            }
 
-        // Try exact match first (works for both v6 and v8 when timestamps happen to match)
-        if let Some(file_slice) = self.file_slices.get_mut(log_timestamp) {
-            file_slice.log_files.insert(log_file);
-            return Ok(self);
+            // No file slice with base instant time <= log's completion time found.
+            // This means the log file completed before any base file's request time.
+            // TODO: Support log files without base files in a future priority task.
+            return Err(CoreError::FileGroup(format!(
+                "No suitable FileSlice found for log file with completion_timestamp {} in File Group {}. \
+                Log file completed before any base file's request time.",
+                log_completion_time, self.file_id
+            )));
         }
 
-        // For v8 (1.0 spec): find the FileSlice with the closest timestamp <= log's timestamp
-        // This handles the case where log file's timestamp is its own write instant,
-        // not the base file's commit timestamp.
-        let log_ts = log_timestamp.to_string();
-        if let Some((_, file_slice)) = self.file_slices.range_mut(..=log_ts).next_back() {
+        // No completion_timestamp: use base instant timestamp-based association (v6 tables)
+        // Find the FileSlice with the largest base instant time <= log's timestamp
+        let log_timestamp = log_file.timestamp.as_str();
+        if let Some((_, file_slice)) = self
+            .file_slices
+            .range_mut(..=log_timestamp.to_string())
+            .next_back()
+        {
             file_slice.log_files.insert(log_file);
             return Ok(self);
         }
@@ -215,24 +242,24 @@ impl FileGroup {
 
     /// Retrieves a reference to the closest [FileSlice] that was created on or before the given
     /// `timestamp`.
+    ///
+    /// The timestamp should be a `commit_timestamp` (request/base instant time).
     pub fn get_file_slice_as_of(&self, timestamp: &str) -> Option<&FileSlice> {
-        let as_of = timestamp.to_string();
-        if let Some((_, file_slice)) = self.file_slices.range(..=as_of).next_back() {
-            Some(file_slice)
-        } else {
-            None
-        }
+        self.file_slices
+            .range(..=timestamp.to_string())
+            .next_back()
+            .map(|(_, fs)| fs)
     }
 
     /// Retrieves a mutable reference to the closest [FileSlice] that was created on or before the
     /// given `timestamp`.
+    ///
+    /// The timestamp should be a `commit_timestamp` (request/base instant time).
     pub fn get_file_slice_mut_as_of(&mut self, timestamp: &str) -> Option<&mut FileSlice> {
-        let as_of = timestamp.to_string();
-        if let Some((_, file_slice)) = self.file_slices.range_mut(..=as_of).next_back() {
-            Some(file_slice)
-        } else {
-            None
-        }
+        self.file_slices
+            .range_mut(..=timestamp.to_string())
+            .next_back()
+            .map(|(_, fs)| fs)
     }
 }
 
@@ -240,6 +267,10 @@ impl FileGroup {
 mod tests {
     use super::*;
     use crate::table::partition::EMPTY_PARTITION_PATH;
+
+    // ============================================================================
+    // FileGroup tests (v6 tables)
+    // ============================================================================
 
     #[test]
     fn load_a_valid_file_group() {
@@ -281,7 +312,7 @@ mod tests {
             "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402144910683.parquet",
         );
         assert!(res2.is_err());
-        assert_eq!(res2.unwrap_err().to_string(), "File group error: Instant time 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
+        assert_eq!(res2.unwrap_err().to_string(), "File group error: Timestamp 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
     }
 
     #[test]
@@ -311,5 +342,274 @@ mod tests {
             display_string_no_partition,
             "File Group: partition=, id=group456"
         );
+    }
+
+    // ============================================================================
+    // FileGroup tests with completion timestamps (v8+ table behavior)
+    // ============================================================================
+
+    fn create_base_file_with_completion(
+        file_id: &str,
+        commit_timestamp: &str,
+        completion_timestamp: Option<&str>,
+    ) -> BaseFile {
+        BaseFile {
+            file_id: file_id.to_string(),
+            write_token: "0-7-24".to_string(),
+            commit_timestamp: commit_timestamp.to_string(),
+            completion_timestamp: completion_timestamp.map(|s| s.to_string()),
+            extension: "parquet".to_string(),
+            file_metadata: None,
+        }
+    }
+
+    fn create_log_file_with_completion(
+        file_id: &str,
+        timestamp: &str,
+        completion_timestamp: Option<&str>,
+        version: u32,
+    ) -> LogFile {
+        LogFile {
+            file_id: file_id.to_string(),
+            timestamp: timestamp.to_string(),
+            completion_timestamp: completion_timestamp.map(|s| s.to_string()),
+            extension: "log".to_string(),
+            version,
+            write_token: "0-51-115".to_string(),
+            file_metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_file_group_add_base_file_with_completion() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+
+        // Add a base file with completion timestamp - should succeed
+        let base_file = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230302428",       // request time
+            Some("20250113230310000"), // completion time
+        );
+
+        let result = fg.add_base_file(base_file);
+        assert!(result.is_ok());
+        assert_eq!(fg.file_slices.len(), 1);
+        // File slices are keyed by commit_timestamp (request time)
+        assert!(fg.file_slices.contains_key("20250113230302428"));
+        // Verify we can get the file slice using request timestamp
+        let slice = fg.get_file_slice_as_of("20250113230302428").unwrap();
+        assert_eq!(slice.base_file.commit_timestamp, "20250113230302428");
+        assert_eq!(
+            slice.base_file.completion_timestamp,
+            Some("20250113230310000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_file_group_log_file_association_by_completion_time() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+
+        // Add two base files with different request and completion times
+        // Base file 1: request=t1, completion=t3
+        let base1 = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230100000",       // request time t1
+            Some("20250113230300000"), // completion time t3
+        );
+
+        // Base file 2: request=t2 (after t1), completion=t4 (after t3)
+        let base2 = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230200000",       // request time t2
+            Some("20250113230400000"), // completion time t4
+        );
+
+        fg.add_base_file(base1).unwrap();
+        fg.add_base_file(base2).unwrap();
+
+        // Add a log file with completion time between base1's request and base2's request
+        // Log completion time = t1.5 (between t1=request1 and t2=request2)
+        // This should go to base1 because t1 is the largest request time <= t1.5
+        let log1 = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230050000",       // request time
+            Some("20250113230150000"), // completion time t1.5 (between t1 and t2)
+            1,
+        );
+
+        fg.add_log_file(log1).unwrap();
+
+        // File slices are keyed by commit_timestamp (request time)
+        // The log file should be in base1's file slice (keyed by request t1)
+        let slice1 = fg.file_slices.get("20250113230100000").unwrap();
+        assert_eq!(slice1.log_files.len(), 1);
+
+        // Base2's file slice (keyed by request t2) should have no log files
+        let slice2 = fg.file_slices.get("20250113230200000").unwrap();
+        assert_eq!(slice2.log_files.len(), 0);
+    }
+
+    #[test]
+    fn test_file_group_log_file_association_after_latest_base() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+
+        // Add a base file
+        let base = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230100000",       // request time
+            Some("20250113230200000"), // completion time
+        );
+        fg.add_base_file(base).unwrap();
+
+        // Add a log file that completed after the base file's request time
+        // Log completion time > base request time, so it should go to this base
+        let log = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230150000",
+            Some("20250113230300000"), // completion after base's request
+            1,
+        );
+
+        fg.add_log_file(log).unwrap();
+
+        // Log should be associated with the base file (keyed by request timestamp)
+        let slice = fg.file_slices.get("20250113230100000").unwrap();
+        assert_eq!(slice.log_files.len(), 1);
+    }
+
+    #[test]
+    fn test_file_group_log_file_before_first_base_returns_error() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+
+        // Add a base file with request time t2
+        let base = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230200000",       // request at t2
+            Some("20250113230400000"), // completion at t4
+        );
+        fg.add_base_file(base).unwrap();
+
+        // Add a log file that completed before the base file's request time
+        // This is an edge case - the log completion time < base request time
+        let log = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230050000",
+            Some("20250113230100000"), // completion at t1 < t2 (base request time)
+            1,
+        );
+
+        // Since no base file has request time <= log's completion time (t1),
+        // this returns an error. TODO: Support log files without base files.
+        let result = fg.add_log_file(log);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("completed before any base file"));
+    }
+
+    #[test]
+    fn test_file_group_multiple_log_files_different_slices() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+
+        // Base1: request at t100
+        let base1 = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230000100",       // request t100
+            Some("20250113230000150"), // completion
+        );
+
+        // Base2: request at t200
+        let base2 = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230000200",       // request t200
+            Some("20250113230000250"), // completion
+        );
+
+        // Base3: request at t300
+        let base3 = create_base_file_with_completion(
+            "file-id-0",
+            "20250113230000300",       // request t300
+            Some("20250113230000350"), // completion
+        );
+
+        fg.add_base_file(base1).unwrap();
+        fg.add_base_file(base2).unwrap();
+        fg.add_base_file(base3).unwrap();
+
+        // Log with completion at t150 -> should go to base1 (request t100 <= t150 < t200)
+        let log1 = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230000010",
+            Some("20250113230000150"),
+            1,
+        );
+
+        // Log with completion at t250 -> should go to base2 (request t200 <= t250 < t300)
+        let log2 = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230000020",
+            Some("20250113230000250"),
+            1,
+        );
+
+        // Log with completion at t350 -> should go to base3 (request t300 <= t350)
+        let log3 = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230000030",
+            Some("20250113230000350"),
+            1,
+        );
+
+        fg.add_log_file(log1).unwrap();
+        fg.add_log_file(log2).unwrap();
+        fg.add_log_file(log3).unwrap();
+
+        // File slices are keyed by commit_timestamp (request time)
+        // Verify each log went to the correct slice (keyed by request timestamps t100, t200, t300)
+        assert_eq!(
+            fg.file_slices
+                .get("20250113230000100")
+                .unwrap()
+                .log_files
+                .len(),
+            1
+        );
+        assert_eq!(
+            fg.file_slices
+                .get("20250113230000200")
+                .unwrap()
+                .log_files
+                .len(),
+            1
+        );
+        assert_eq!(
+            fg.file_slices
+                .get("20250113230000300")
+                .unwrap()
+                .log_files
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_file_group_empty_slices_log_file_with_completion_error() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+
+        // Try to add a log file with completion_timestamp when there are no file slices
+        let log = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230000010",
+            Some("20250113230000150"),
+            1,
+        );
+
+        let result = fg.add_log_file(log);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No suitable FileSlice found"));
     }
 }
