@@ -260,9 +260,9 @@ impl TimelineSelector {
             )));
         }
 
-        // Handle v8+ completed instant format: {requestedTimestamp}_{completedTimestamp}.{action}
+        // Handle v8+ completed instant format: {requestedTimestamp}_{completionTimestamp}.{action}
         // Validate format based on timeline layout version and instant state
-        let (timestamp, completed_timestamp) = if let Some((requested_ts, completed_ts)) =
+        let (timestamp, completion_timestamp) = if let Some((requested_ts, completed_ts)) =
             timestamp_part.split_once('_')
         {
             // Found underscore format - this should be a v8+ (layout 2) completed instant
@@ -288,7 +288,7 @@ impl TimelineSelector {
             // No underscore format - this should be a pre-v8 instant OR a non-completed v8+ instant
             if self.timeline_layout_version == 2 && state == State::Completed {
                 return Err(CoreError::Timeline(format!(
-                    "Expected v8+ instant format (with completed timestamp) in timeline layout v2 for completed instant: {file_name}"
+                    "Expected v8+ instant format (with completion timestamp) in timeline layout v2 for completed instant: {file_name}"
                 )));
             }
             (timestamp_part, None)
@@ -315,7 +315,7 @@ impl TimelineSelector {
 
         Ok(Instant {
             timestamp: timestamp.to_string(),
-            completed_timestamp,
+            completion_timestamp,
             epoch_millis: dt.timestamp_millis(),
             action,
             state,

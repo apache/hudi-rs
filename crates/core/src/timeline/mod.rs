@@ -255,7 +255,7 @@ impl Timeline {
     /// correct file association for v8+ tables where request and completion
     /// timestamps differ.
     ///
-    /// For v6 tables, the view will be empty since completed_timestamp is None
+    /// For v6 tables, the view will be empty since completion_timestamp is None
     /// for all instants, and the caller should use the request timestamp directly.
     pub fn create_completion_time_view(&self) -> CompletionTimeView {
         CompletionTimeView::from_instants(&self.completed_commits)

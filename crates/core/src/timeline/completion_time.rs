@@ -101,7 +101,7 @@ impl CompletionTimeView {
             .into_iter()
             .filter_map(|instant| {
                 instant
-                    .completed_timestamp
+                    .completion_timestamp
                     .as_ref()
                     .map(|completion_ts| (instant.timestamp.clone(), completion_ts.clone()))
             })
@@ -151,7 +151,7 @@ mod tests {
     fn create_instant(request_ts: &str, completion_ts: Option<&str>) -> Instant {
         Instant {
             timestamp: request_ts.to_string(),
-            completed_timestamp: completion_ts.map(|s| s.to_string()),
+            completion_timestamp: completion_ts.map(|s| s.to_string()),
             action: Action::Commit,
             state: State::Completed,
             epoch_millis: 0,

@@ -100,8 +100,8 @@ impl AsRef<str> for State {
 /// An [Instant] represents a point in time when an action was performed on the table.
 ///
 /// For table version 8+, completed instants have a different filename format:
-/// `{requestedTimestamp}_{completedTimestamp}.{action}` instead of `{timestamp}.{action}`.
-/// The `timestamp` field stores the requested timestamp, and `completed_timestamp` stores
+/// `{requestedTimestamp}_{completionTimestamp}.{action}` instead of `{timestamp}.{action}`.
+/// The `timestamp` field stores the requested timestamp, and `completion_timestamp` stores
 /// the completion timestamp for v8+ completed instants.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,7 +110,7 @@ pub struct Instant {
     /// TODO rename to requested_timestamp for clarity in v8+?
     pub timestamp: String,
     /// The timestamp when the action completed (only present for v8+ completed instants).
-    pub completed_timestamp: Option<String>,
+    pub completion_timestamp: Option<String>,
     pub action: Action,
     pub state: State,
     pub epoch_millis: i64,
@@ -164,7 +164,7 @@ impl Instant {
 
             Ok(Self {
                 timestamp: requested_ts.to_string(),
-                completed_timestamp: Some(completed_ts.to_string()),
+                completion_timestamp: Some(completed_ts.to_string()),
                 state,
                 action,
                 epoch_millis: dt.timestamp_millis(),
@@ -176,7 +176,7 @@ impl Instant {
 
             Ok(Self {
                 timestamp: timestamp_part.to_string(),
-                completed_timestamp: None,
+                completion_timestamp: None,
                 state,
                 action,
                 epoch_millis: dt.timestamp_millis(),
@@ -267,12 +267,12 @@ impl Instant {
     pub fn file_name(&self) -> String {
         match (&self.action, &self.state) {
             (_, State::Completed) => {
-                // For v8+ completed instants with completed_timestamp, use the underscore format
-                if let Some(completed_ts) = &self.completed_timestamp {
+                // For v8+ completed instants with completion_timestamp, use the underscore format
+                if let Some(completion_ts) = &self.completion_timestamp {
                     format!(
                         "{}_{}.{}",
                         self.timestamp,
-                        completed_ts,
+                        completion_ts,
                         self.action.as_ref()
                     )
                 } else {
@@ -512,12 +512,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v8_instant_with_completed_timestamp() -> Result<()> {
-        // v8+ format: {requestedTimestamp}_{completedTimestamp}.{action}
+    fn test_v8_instant_with_completion_timestamp() -> Result<()> {
+        // v8+ format: {requestedTimestamp}_{completionTimestamp}.{action}
         let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
         assert_eq!(instant.timestamp, "20240101120000000");
         assert_eq!(
-            instant.completed_timestamp,
+            instant.completion_timestamp,
             Some("20240101120005000".to_string())
         );
         assert_eq!(instant.action, Action::Commit);
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_name_with_completed_timestamp() -> Result<()> {
+    fn test_file_name_with_completion_timestamp() -> Result<()> {
         let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
         let file_name = instant.file_name();
         assert_eq!(file_name, "20240101120000000_20240101120005000.commit");

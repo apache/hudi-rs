@@ -483,7 +483,7 @@ mod tests {
             use crate::timeline::instant::{Action, Instant, State};
             let instants = vec![Instant {
                 timestamp: "20240418173200000".to_string(),
-                completed_timestamp: Some("20240418173210000".to_string()),
+                completion_timestamp: Some("20240418173210000".to_string()),
                 action: Action::Commit,
                 state: State::Completed,
                 epoch_millis: 0,
