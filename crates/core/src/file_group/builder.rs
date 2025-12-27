@@ -613,10 +613,7 @@ mod tests {
         fn create_all_partitions_record(partitions: Vec<&str>) -> (String, FilesPartitionRecord) {
             let mut files_map = HashMap::new();
             for partition in partitions {
-                files_map.insert(
-                    partition.to_string(),
-                    create_file_info(partition, 0, false),
-                );
+                files_map.insert(partition.to_string(), create_file_info(partition, 0, false));
             }
             (
                 "__all_partitions__".to_string(),
@@ -826,7 +823,9 @@ mod tests {
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert!(err.to_string().contains("invalid/unsupported base file name"));
+            assert!(err
+                .to_string()
+                .contains("invalid/unsupported base file name"));
             assert!(err.to_string().contains("partition1"));
         }
 
@@ -850,7 +849,9 @@ mod tests {
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert!(err.to_string().contains("invalid/unsupported log file name"));
+            assert!(err
+                .to_string()
+                .contains("invalid/unsupported log file name"));
         }
 
         #[test]
@@ -859,11 +860,7 @@ mod tests {
             // A base file with timestamp that is NOT in the completion view (uncommitted)
             let (key, record) = create_files_record(
                 "partition1",
-                vec![(
-                    "file-id-0_0-7-24_20240418173200000.parquet",
-                    1000,
-                    false,
-                )],
+                vec![("file-id-0_0-7-24_20240418173200000.parquet", 1000, false)],
             );
             records.insert(key, record);
 
@@ -896,11 +893,7 @@ mod tests {
             let mut records = HashMap::new();
             let (key, record) = create_files_record(
                 "partition1",
-                vec![(
-                    "file-id-0_0-7-24_20240418173200000.parquet",
-                    1000,
-                    false,
-                )],
+                vec![("file-id-0_0-7-24_20240418173200000.parquet", 1000, false)],
             );
             records.insert(key, record);
 
@@ -919,11 +912,7 @@ mod tests {
             let mut records = HashMap::new();
             let (key, record) = create_files_record(
                 "partition1",
-                vec![(
-                    "file-id-0_0-7-24_20240418173200000.parquet",
-                    1000,
-                    false,
-                )],
+                vec![("file-id-0_0-7-24_20240418173200000.parquet", 1000, false)],
             );
             records.insert(key, record);
 
@@ -965,11 +954,7 @@ mod tests {
                     ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
                     // Log file with a different base_commit_time that's NOT in the view
                     // The log file's timestamp (20240418173205000) won't have a completion time
-                    (
-                        ".file-id-0_20240418173205000.log.1_0-8-25",
-                        100,
-                        false,
-                    ),
+                    (".file-id-0_20240418173205000.log.1_0-8-25", 100, false),
                 ],
             );
             records.insert(key, record);
@@ -1008,11 +993,7 @@ mod tests {
                     ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
                     // Log file with same base_commit_time that IS in the completion view
                     // Log file format: .{file_id}_{base_commit_time}.log.{version}_{write_token}
-                    (
-                        ".file-id-0_20240418173200000.log.1_0-8-25",
-                        100,
-                        false,
-                    ),
+                    (".file-id-0_20240418173200000.log.1_0-8-25", 100, false),
                 ],
             );
             records.insert(key, record);
