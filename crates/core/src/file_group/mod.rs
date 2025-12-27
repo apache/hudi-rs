@@ -129,6 +129,14 @@ impl FileGroup {
     /// The file slice is keyed by `commit_timestamp` (request/base instant time).
     /// This is consistent for both v6 and v8+ tables.
     pub fn add_base_file(&mut self, base_file: BaseFile) -> Result<&Self> {
+        // Validate file_id matches
+        if base_file.file_id != self.file_id {
+            return Err(CoreError::FileGroup(format!(
+                "Base file ID '{}' does not match File Group ID '{}'",
+                base_file.file_id, self.file_id
+            )));
+        }
+
         let key = base_file.commit_timestamp.clone();
 
         if self.file_slices.contains_key(&key) {
@@ -186,6 +194,14 @@ impl FileGroup {
     ///
     /// TODO: support adding log files to file group without base files.
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
+        // Validate file_id matches
+        if log_file.file_id != self.file_id {
+            return Err(CoreError::FileGroup(format!(
+                "Log file ID '{}' does not match File Group ID '{}'",
+                log_file.file_id, self.file_id
+            )));
+        }
+
         // If log file has completion_timestamp, use completion-time-based association
         // File slices are keyed by commit_timestamp (base instant time)
         // Find the largest base instant time <= log's completion time

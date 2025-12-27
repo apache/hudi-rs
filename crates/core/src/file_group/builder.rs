@@ -181,53 +181,46 @@ pub fn file_groups_from_files_partition_records<V: TimelineViewByCompletionTime>
         for file_name in record.active_file_names() {
             if file_name.starts_with('.') {
                 // Log file: starts with '.'
-                match LogFile::from_str(file_name) {
-                    Ok(mut log_file) => {
-                        log_file.set_completion_time(completion_time_view);
-                        // Filter uncommitted files for v8+ tables
-                        if completion_time_view.should_filter_uncommitted()
-                            && log_file.completion_timestamp.is_none()
-                        {
-                            continue;
-                        }
-                        file_id_to_log_files
-                            .entry(log_file.file_id.clone())
-                            .or_default()
-                            .push(log_file);
-                    }
-                    Err(e) => {
-                        // Skip files that can't be parsed (e.g., .cdc files not yet supported)
-                        log::warn!(
-                            "Failed to parse log file from metadata table: {}: {}",
-                            file_name,
-                            e
-                        );
-                    }
+                let mut log_file = LogFile::from_str(file_name).map_err(|e| {
+                    CoreError::FileGroup(format!(
+                        "Metadata table contains invalid/unsupported log file name '{}' in partition '{}': {}. \
+                         This may indicate data corruption.",
+                        file_name, partition_path, e
+                    ))
+                })?;
+
+                log_file.set_completion_time(completion_time_view);
+                // Filter uncommitted files for v8+ tables
+                if completion_time_view.should_filter_uncommitted()
+                    && log_file.completion_timestamp.is_none()
+                {
+                    continue;
                 }
+                file_id_to_log_files
+                    .entry(log_file.file_id.clone())
+                    .or_default()
+                    .push(log_file);
             } else if file_name.ends_with(&base_file_suffix) {
                 // Base file: ends with base file extension
-                match BaseFile::from_str(file_name) {
-                    Ok(mut base_file) => {
-                        base_file.set_completion_time(completion_time_view);
-                        // Filter uncommitted files for v8+ tables
-                        if completion_time_view.should_filter_uncommitted()
-                            && base_file.completion_timestamp.is_none()
-                        {
-                            continue;
-                        }
-                        file_id_to_base_files
-                            .entry(base_file.file_id.clone())
-                            .or_default()
-                            .push(base_file);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to parse base file from metadata table: {}: {}",
-                            file_name,
-                            e
-                        );
-                    }
+                let mut base_file = BaseFile::from_str(file_name).map_err(|e| {
+                    CoreError::FileGroup(format!(
+                        "Metadata table contains invalid/unsupported base file name '{}' in partition '{}': {}. \
+                         This may indicate data corruption.",
+                        file_name, partition_path, e
+                    ))
+                })?;
+
+                base_file.set_completion_time(completion_time_view);
+                // Filter uncommitted files for v8+ tables
+                if completion_time_view.should_filter_uncommitted()
+                    && base_file.completion_timestamp.is_none()
+                {
+                    continue;
                 }
+                file_id_to_base_files
+                    .entry(base_file.file_id.clone())
+                    .or_default()
+                    .push(base_file);
             }
             // Skip files with unrecognized extensions
         }
