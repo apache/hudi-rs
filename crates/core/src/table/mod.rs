@@ -252,6 +252,7 @@ impl Table {
     /// when partitions are configured, even without explicit `hoodie.metadata.enable=true`.
     pub fn is_metadata_table_enabled(&self) -> bool {
         // Check table version first - MDT is only supported for v8+ tables
+        // TODO: drop v6 support then no need to check table version here
         let table_version: isize = self
             .hudi_configs
             .get(TableVersion)
@@ -273,7 +274,12 @@ impl Table {
             .get_or_default(MetadataTableEnabled)
             .into();
 
-        // Enable if explicitly enabled OR if files partition is configured (implicit enablement)
+        // Enable if explicitly enabled OR if files partition is configured.
+        // Note: For v8+ tables, having files partition configured implicitly enables MDT
+        // even if hoodie.metadata.enable is not set or is false. This is because if the
+        // files partition exists, MDT must have been enabled to populate it (either by
+        // Hudi writer or during table migration). This handles tables where the explicit
+        // config was not persisted but MDT was actively used.
         metadata_explicitly_enabled || has_files_partition
     }
 
@@ -1815,4 +1821,59 @@ mod tests {
             "is_metadata_table_enabled should return false for v6 table"
         );
     }
+
+    #[test]
+    fn hudi_table_is_not_metadata_table() {
+        // A regular data table should not be a metadata table
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        assert!(
+            !hudi_table.is_metadata_table(),
+            "Regular data table should not be a metadata table"
+        );
+    }
+
+    #[test]
+    fn hudi_table_metadata_table_is_metadata_table() {
+        // Create a metadata table and verify it's recognized as such
+        let data_table = get_data_table();
+        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
+        assert!(
+            metadata_table.is_metadata_table(),
+            "Metadata table should be recognized as a metadata table"
+        );
+    }
+
+    #[test]
+    fn hudi_table_new_metadata_table_from_metadata_table_errors() {
+        // Trying to create a metadata table from a metadata table should fail
+        let data_table = get_data_table();
+        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
+
+        let result = metadata_table.new_metadata_table_blocking();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Cannot create metadata table from another metadata table"),
+            "Error message should indicate cannot create from metadata table"
+        );
+    }
+
+    #[tokio::test]
+    async fn hudi_table_read_metadata_files_on_non_metadata_table_errors() {
+        // Calling read_metadata_files on a non-metadata table should fail
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let result = hudi_table.read_metadata_files().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can only be called on metadata tables"),
+            "Error message should indicate read_metadata_files requires metadata table"
+        );
+    }
+
 }

@@ -218,11 +218,13 @@ impl FileGroup {
             }
 
             // No file slice with base instant time <= log's completion time found.
-            // This means the log file completed before any base file's request time.
+            // This means the log file's completion timestamp is earlier than all base files'
+            // commit timestamps, or the FileGroup has no base files.
             // TODO: Support log files without base files in a future priority task.
             return Err(CoreError::FileGroup(format!(
                 "No suitable FileSlice found for log file with completion_timestamp {} in File Group {}. \
-                Log file completed before any base file's request time.",
+                Either the log file's completion timestamp is earlier than all base files' commit timestamps, \
+                or the FileGroup has no base files.",
                 log_completion_time, self.file_id
             )));
         }
@@ -494,7 +496,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("completed before any base file"));
+            .contains("completion timestamp is earlier than all base files"));
 
         // Test 2: Log file with completion_timestamp when no file slices exist
         let mut fg2 = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
