@@ -272,6 +272,9 @@ mod tests {
         assert_eq!(log_file.extension, "log");
         assert_eq!(log_file.version, 1);
         assert_eq!(log_file.write_token, "0-51-115");
+        // Completion timestamp is None after parsing (set separately from timeline)
+        assert_eq!(log_file.completion_timestamp, None);
+        assert!(!log_file.is_completed());
     }
 
     #[test]
@@ -420,20 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn test_log_file_parsing_with_completion_timestamp() {
-        let filename = ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115";
-        let log_file = LogFile::from_str(filename).unwrap();
-
-        assert_eq!(log_file.file_id, "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0");
-        assert_eq!(log_file.timestamp, "20250109233025121");
-        assert_eq!(log_file.completion_timestamp, None);
-        assert_eq!(log_file.extension, "log");
-        assert_eq!(log_file.version, 1);
-        assert_eq!(log_file.write_token, "0-51-115");
-        assert!(!log_file.is_completed());
-    }
-
-    #[test]
     fn test_log_file_ordering_by_completion_time() {
         // Log file with earlier completion timestamp
         let log1 = LogFile {
@@ -486,34 +475,5 @@ mod tests {
         let mut logs = vec![log3.clone(), log1.clone(), log2.clone()];
         logs.sort();
         assert_eq!(logs, vec![log1, log2, log3]);
-    }
-
-    #[test]
-    fn test_log_file_ordering_uncommitted() {
-        // Two uncommitted log files should be ordered by request timestamp
-        let log1 = LogFile {
-            file_id: "file-0".to_string(),
-            timestamp: "20250113230300000".to_string(),
-            completion_timestamp: None,
-            extension: "log".to_string(),
-            version: 1,
-            write_token: "0-188-387".to_string(),
-            file_metadata: None,
-        };
-
-        let log2 = LogFile {
-            file_id: "file-0".to_string(),
-            timestamp: "20250113230310000".to_string(),
-            completion_timestamp: None,
-            extension: "log".to_string(),
-            version: 1,
-            write_token: "0-188-387".to_string(),
-            file_metadata: None,
-        };
-
-        assert!(
-            log1 < log2,
-            "uncommitted logs should be ordered by request timestamp"
-        );
     }
 }

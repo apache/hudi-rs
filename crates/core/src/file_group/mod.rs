@@ -188,13 +188,13 @@ impl FileGroup {
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
         // If log file has completion_timestamp, use completion-time-based association
         // File slices are keyed by commit_timestamp (base instant time)
-        // Find the largest base instant time < log's completion time
+        // Find the largest base instant time <= log's completion time
         if let Some(log_completion_time) = &log_file.completion_timestamp {
             // Find file slice with largest base instant time
-            // (commit_timestamp) < log's completion time
+            // (commit_timestamp) <= log's completion time
             if let Some((_, file_slice)) = self
                 .file_slices
-                .range_mut(..log_completion_time.clone())
+                .range_mut(..=log_completion_time.clone())
                 .next_back()
             {
                 file_slice.log_files.insert(log_file);
@@ -427,7 +427,7 @@ mod tests {
         fg.add_base_file(base1).unwrap();
         fg.add_base_file(base2).unwrap();
 
-        // Add a log file with completion time between base1's request and base2's request
+        // Test 1: Log with completion time between base1's request and base2's request
         // Log completion time = t1.5 (between t1=request1 and t2=request2)
         // This should go to base1 because t1 is the largest request time <= t1.5
         let log1 = create_log_file_with_completion(
@@ -436,76 +436,64 @@ mod tests {
             Some("20250113230150000"), // completion time t1.5 (between t1 and t2)
             1,
         );
-
         fg.add_log_file(log1).unwrap();
 
-        // File slices are keyed by commit_timestamp (request time)
-        // The log file should be in base1's file slice (keyed by request t1)
+        // Test 2: Log with completion time after base2's request
+        // This should go to base2 (latest base with request time <= log completion time)
+        let log2 = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230250000",
+            Some("20250113230500000"), // completion after base2's request
+            1,
+        );
+        fg.add_log_file(log2).unwrap();
+
+        // Verify: log1 in base1's slice, log2 in base2's slice
         let slice1 = fg.file_slices.get("20250113230100000").unwrap();
         assert_eq!(slice1.log_files.len(), 1);
 
-        // Base2's file slice (keyed by request t2) should have no log files
         let slice2 = fg.file_slices.get("20250113230200000").unwrap();
-        assert_eq!(slice2.log_files.len(), 0);
+        assert_eq!(slice2.log_files.len(), 1);
     }
 
     #[test]
-    fn test_file_group_log_file_association_after_latest_base() {
-        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
-
-        // Add a base file
-        let base = create_base_file_with_completion(
-            "file-id-0",
-            "20250113230100000",       // request time
-            Some("20250113230200000"), // completion time
-        );
-        fg.add_base_file(base).unwrap();
-
-        // Add a log file that completed after the base file's request time
-        // Log completion time > base request time, so it should go to this base
-        let log = create_log_file_with_completion(
-            "file-id-0",
-            "20250113230150000",
-            Some("20250113230300000"), // completion after base's request
-            1,
-        );
-
-        fg.add_log_file(log).unwrap();
-
-        // Log should be associated with the base file (keyed by request timestamp)
-        let slice = fg.file_slices.get("20250113230100000").unwrap();
-        assert_eq!(slice.log_files.len(), 1);
-    }
-
-    #[test]
-    fn test_file_group_log_file_before_first_base_returns_error() {
-        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
-
-        // Add a base file with request time t2
+    fn test_file_group_log_file_error_cases() {
+        // Test 1: Log file completed before any base file's request time
+        let mut fg1 = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
         let base = create_base_file_with_completion(
             "file-id-0",
             "20250113230200000",       // request at t2
             Some("20250113230400000"), // completion at t4
         );
-        fg.add_base_file(base).unwrap();
+        fg1.add_base_file(base).unwrap();
 
-        // Add a log file that completed before the base file's request time
-        // This is an edge case - the log completion time < base request time
         let log = create_log_file_with_completion(
             "file-id-0",
             "20250113230050000",
             Some("20250113230100000"), // completion at t1 < t2 (base request time)
             1,
         );
-
-        // Since no base file has request time <= log's completion time (t1),
-        // this returns an error. TODO: Support log files without base files.
-        let result = fg.add_log_file(log);
+        let result = fg1.add_log_file(log);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("completed before any base file"));
+
+        // Test 2: Log file with completion_timestamp when no file slices exist
+        let mut fg2 = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
+        let log = create_log_file_with_completion(
+            "file-id-0",
+            "20250113230000010",
+            Some("20250113230000150"),
+            1,
+        );
+        let result = fg2.add_log_file(log);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No suitable FileSlice found"));
     }
 
     #[test]
@@ -545,11 +533,12 @@ mod tests {
             1,
         );
 
-        // Log with completion at t250 -> should go to base2 (request t200 <= t250 < t300)
+        // Log with completion exactly at t200 (base2's request time) -> tests inclusive boundary
+        // This should go to base2 because request t200 <= t200 (completion)
         let log2 = create_log_file_with_completion(
             "file-id-0",
             "20250113230000020",
-            Some("20250113230000250"),
+            Some("20250113230000200"), // Exactly equals base2's request time - tests boundary
             1,
         );
 
@@ -562,11 +551,12 @@ mod tests {
         );
 
         fg.add_log_file(log1).unwrap();
-        fg.add_log_file(log2).unwrap();
+        fg.add_log_file(log2).unwrap(); // Tests inclusive boundary (completion == base request)
         fg.add_log_file(log3).unwrap();
 
         // File slices are keyed by commit_timestamp (request time)
         // Verify each log went to the correct slice (keyed by request timestamps t100, t200, t300)
+        // Note: log2 tests the inclusive boundary case (log.completion == base.request)
         assert_eq!(
             fg.file_slices
                 .get("20250113230000100")
@@ -591,25 +581,5 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn test_file_group_empty_slices_log_file_with_completion_error() {
-        let mut fg = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
-
-        // Try to add a log file with completion_timestamp when there are no file slices
-        let log = create_log_file_with_completion(
-            "file-id-0",
-            "20250113230000010",
-            Some("20250113230000150"),
-            1,
-        );
-
-        let result = fg.add_log_file(log);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No suitable FileSlice found"));
     }
 }
