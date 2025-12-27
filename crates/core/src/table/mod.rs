@@ -1875,5 +1875,4 @@ mod tests {
             "Error message should indicate read_metadata_files requires metadata table"
         );
     }
-
 }

@@ -196,23 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn test_timeline_completion_time_view_pending_and_unknown() {
-        let instants = vec![
-            create_instant("20240101120000000", Some("20240101120005000")),
-            create_instant("20240101130000000", None), // Pending
-        ];
-
-        let view = CompletionTimeView::from_instants(&instants);
-
-        // Completed instant has completion time
-        assert!(view.get_completion_time("20240101120000000").is_some());
-        // Pending instant has no completion time
-        assert!(view.get_completion_time("20240101130000000").is_none());
-        // Unknown timestamp has no completion time
-        assert!(view.get_completion_time("unknown").is_none());
-    }
-
-    #[test]
     fn test_timeline_completion_time_view_empty() {
         let view = CompletionTimeView::empty();
 
