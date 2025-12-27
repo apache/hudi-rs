@@ -600,4 +600,109 @@ mod tests {
             1
         );
     }
+
+    // ============================================================================
+    // Error case tests for coverage
+    // ============================================================================
+
+    #[test]
+    fn test_file_group_merge_different_file_groups_error() {
+        let mut fg1 = FileGroup::new("file-id-1".to_string(), "partition1".to_string());
+        let fg2 = FileGroup::new("file-id-2".to_string(), "partition1".to_string());
+
+        let result = fg1.merge(&fg2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot merge different file groups"));
+    }
+
+    #[test]
+    fn test_file_group_merge_same_file_group_inserts_new_slices() {
+        let mut fg1 = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base1 = create_base_file_with_completion("file-id-0", "20240101120000000", None);
+        fg1.add_base_file(base1).unwrap();
+
+        // Create another file group with same id but different slice
+        let mut fg2 = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base2 = create_base_file_with_completion("file-id-0", "20240101130000000", None);
+        fg2.add_base_file(base2).unwrap();
+
+        // Merge should add the new slice from fg2 into fg1
+        fg1.merge(&fg2).unwrap();
+        assert_eq!(fg1.file_slices.len(), 2);
+        assert!(fg1.file_slices.contains_key("20240101120000000"));
+        assert!(fg1.file_slices.contains_key("20240101130000000"));
+    }
+
+    #[test]
+    fn test_file_group_merge_same_slice_merges_log_files() {
+        // Create fg1 with base file and log file version 1
+        let mut fg1 = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base1 = create_base_file_with_completion("file-id-0", "20240101120000000", None);
+        fg1.add_base_file(base1).unwrap();
+        let log1 = create_log_file_with_completion("file-id-0", "20240101120000000", None, 1);
+        fg1.add_log_file(log1).unwrap();
+
+        // Create fg2 with same base file timestamp but log file version 2
+        let mut fg2 = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base2 = create_base_file_with_completion("file-id-0", "20240101120000000", None);
+        fg2.add_base_file(base2).unwrap();
+        let log2 = create_log_file_with_completion("file-id-0", "20240101120000000", None, 2);
+        fg2.add_log_file(log2).unwrap();
+
+        // Merge should merge the file slices, adding log file from fg2 to fg1's slice
+        fg1.merge(&fg2).unwrap();
+        assert_eq!(fg1.file_slices.len(), 1);
+        let slice = fg1.file_slices.get("20240101120000000").unwrap();
+        assert_eq!(slice.log_files.len(), 2);
+    }
+
+    #[test]
+    fn test_file_group_add_base_file_id_mismatch_error() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base_file = create_base_file_with_completion("different-id", "20240101120000000", None);
+
+        let result = fg.add_base_file(base_file);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not match File Group ID"));
+    }
+
+    #[test]
+    fn test_file_group_add_log_file_id_mismatch_error() {
+        let mut fg = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base = create_base_file_with_completion("file-id-0", "20240101120000000", None);
+        fg.add_base_file(base).unwrap();
+
+        let log_file =
+            create_log_file_with_completion("different-id", "20240101120000000", None, 1);
+        let result = fg.add_log_file(log_file);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not match File Group ID"));
+    }
+
+    #[test]
+    fn test_file_group_v6_log_file_no_suitable_slice_error() {
+        // V6 table: log file without completion_timestamp
+        let mut fg = FileGroup::new("file-id-0".to_string(), "partition1".to_string());
+        let base = create_base_file_with_completion("file-id-0", "20240101130000000", None);
+        fg.add_base_file(base).unwrap();
+
+        // Log file timestamp is earlier than base file's commit timestamp
+        // Without completion_timestamp, it uses timestamp-based association
+        let log_file = create_log_file_with_completion("file-id-0", "20240101120000000", None, 1);
+        let result = fg.add_log_file(log_file);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No suitable FileSlice found for log file with timestamp"));
+    }
 }
