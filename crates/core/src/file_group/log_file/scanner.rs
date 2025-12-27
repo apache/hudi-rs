@@ -304,7 +304,9 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::file_group::record_batches::RecordBatches;
     use crate::hfile::HFileReader;
-    use crate::metadata::table_record::decode_files_partition_record_with_schema;
+    use crate::metadata::table_record::{
+        decode_files_partition_record_with_schema, FilesPartitionRecord,
+    };
     use crate::storage::util::parse_uri;
     use apache_avro::Schema as AvroSchema;
     use hudi_test::QuickstartTripsTable;
@@ -511,7 +513,7 @@ mod tests {
 
         // Validate __all_partitions__ records
         let all_partitions = records_by_key
-            .get("__all_partitions__")
+            .get(FilesPartitionRecord::ALL_PARTITIONS_KEY)
             .expect("Should have __all_partitions__ records");
         assert_eq!(
             all_partitions.len(),

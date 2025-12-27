@@ -94,19 +94,14 @@ pub mod partition;
 mod validation;
 
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig::{
-    MetadataTableEnabled, MetadataTablePartitions, PartitionFields, TableVersion,
-};
+use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::config::HudiConfigs;
-use crate::error::CoreError;
 use crate::expr::filter::{from_str_tuples, Filter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
-use crate::metadata::table_record::FilesPartitionRecord;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
-use crate::storage::util::join_url_segments;
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
@@ -219,108 +214,6 @@ impl Table {
         self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
 
-    /// Check if this table is a metadata table.
-    ///
-    /// Detection is based on the base path ending with `.hoodie/metadata`.
-    pub fn is_metadata_table(&self) -> bool {
-        let base_path: String = self
-            .hudi_configs
-            .get_or_default(HudiTableConfig::BasePath)
-            .into();
-        crate::util::path::is_metadata_table_path(&base_path)
-    }
-
-    /// Get the list of available metadata table partitions for this table.
-    ///
-    /// Returns the partitions configured in `hoodie.table.metadata.partitions`.
-    pub fn get_metadata_table_partitions(&self) -> Vec<String> {
-        self.hudi_configs
-            .get_or_default(MetadataTablePartitions)
-            .into()
-    }
-
-    /// Check if the metadata table "files" partition is enabled for file listing.
-    ///
-    /// Returns `true` if:
-    /// 1. Table version is >= 8 (MDT support is only for v8+ tables), AND
-    /// 2. Either:
-    ///    - `hoodie.metadata.enable` is explicitly true, OR
-    ///    - "files" is in the configured `hoodie.table.metadata.partitions`
-    ///      (implicit enablement for v8+ tables with configured partitions)
-    ///
-    /// This matches Hudi Java behavior where metadata table is considered active
-    /// when partitions are configured, even without explicit `hoodie.metadata.enable=true`.
-    pub fn is_metadata_table_enabled(&self) -> bool {
-        // Check table version first - MDT is only supported for v8+ tables
-        // TODO: drop v6 support then no need to check table version here
-        let table_version: isize = self
-            .hudi_configs
-            .get(TableVersion)
-            .map(|v| v.into())
-            .unwrap_or(0);
-
-        if table_version < 8 {
-            return false;
-        }
-
-        // Check if "files" partition is configured
-        let has_files_partition = self
-            .get_metadata_table_partitions()
-            .contains(&FilesPartitionRecord::PARTITION_NAME.to_string());
-
-        // Explicit check for hoodie.metadata.enable
-        let metadata_explicitly_enabled: bool = self
-            .hudi_configs
-            .get_or_default(MetadataTableEnabled)
-            .into();
-
-        // Enable if explicitly enabled OR if files partition is configured.
-        // Note: For v8+ tables, having files partition configured implicitly enables MDT
-        // even if hoodie.metadata.enable is not set or is false. This is because if the
-        // files partition exists, MDT must have been enabled to populate it (either by
-        // Hudi writer or during table migration). This handles tables where the explicit
-        // config was not persisted but MDT was actively used.
-        metadata_explicitly_enabled || has_files_partition
-    }
-
-    /// Create a metadata table instance for this data table.
-    ///
-    /// Uses all partitions from `hoodie.table.metadata.partitions` configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the metadata table cannot be created or if there are
-    /// no metadata table partitions configured.
-    pub async fn new_metadata_table(&self) -> Result<Table> {
-        if self.is_metadata_table() {
-            return Err(CoreError::MetadataTable(
-                "Cannot create metadata table from another metadata table".to_string(),
-            ));
-        }
-
-        let mdt_partitions = self.get_metadata_table_partitions();
-        if mdt_partitions.is_empty() {
-            return Err(CoreError::MetadataTable(
-                "No metadata table partitions configured".to_string(),
-            ));
-        }
-
-        let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
-        Table::new_with_options(
-            mdt_url.as_str(),
-            [(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)],
-        )
-        .await
-    }
-
-    /// Same as [Table::new_metadata_table], but blocking.
-    pub fn new_metadata_table_blocking(&self) -> Result<Table> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(async { self.new_metadata_table().await })
-    }
-
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -370,7 +263,7 @@ impl Table {
     /// Get the latest partition [arrow_schema::Schema] of the table.
     ///
     /// For metadata tables, returns a schema with a single `partition` field
-    /// typed as [arrow_schema::DataType::Utf8], since MDT uses a single partition
+    /// typed as [arrow_schema::DataType::Utf8], since metadata tables use a single partition
     /// column to identify partitions like "files", "column_stats", etc.
     ///
     /// For regular tables, returns the partition fields with their actual data types
@@ -579,35 +472,20 @@ impl Table {
         timestamp: &str,
         filters: &[Filter],
     ) -> Result<Vec<FileSlice>> {
-        // Create completion time view for setting completion timestamps on files.
-        // For v8+ tables, this populates completion timestamps and enables filtering.
-        // For v6 tables, the view is empty and acts as a no-op.
-        let completion_time_view = self.timeline.create_completion_time_view();
+        let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
 
-        // File slices are keyed by commit_timestamp (request/base instant time).
-        let excludes = self
-            .timeline
-            .get_replaced_file_groups_as_of(timestamp)
-            .await?;
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
 
-        // Try metadata table accelerated listing if files partition is configured
-        let metadata_table_records = if self.is_metadata_table_enabled() {
+        // Try to create metadata table instance if enabled
+        let metadata_table = if self.is_metadata_table_enabled() {
             log::debug!("Using metadata table for file listing");
-            match self.fetch_metadata_table_records().await {
-                Ok(records) => {
-                    log::debug!(
-                        "Successfully read {} partition records from metadata table",
-                        records.len()
-                    );
-                    Some(records)
-                }
+            match self.new_metadata_table().await {
+                Ok(mdt) => Some(mdt),
                 Err(e) => {
-                    // Fall through to storage listing if metadata table read fails
                     log::warn!(
-                        "Failed to read file slices from metadata table, falling back to storage listing: {}",
+                        "Failed to create metadata table, falling back to storage listing: {}",
                         e
                     );
                     None
@@ -617,26 +495,9 @@ impl Table {
             None
         };
 
-        // Use the single entrypoint that handles both metadata table and storage listing
         self.file_system_view
-            .get_file_slices_as_of(
-                timestamp,
-                &partition_pruner,
-                &excludes,
-                metadata_table_records.as_ref(),
-                &completion_time_view,
-            )
+            .get_file_slices(&partition_pruner, &timeline_view, metadata_table.as_ref())
             .await
-    }
-
-    /// Fetch file records from the metadata table.
-    ///
-    /// The metadata table returns records as-of its current state. For time travel
-    /// or incremental queries, the timestamp filtering is handled by the caller
-    /// using completion time views - the metadata table just provides the file listing.
-    async fn fetch_metadata_table_records(&self) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let metadata_table = self.new_metadata_table().await?;
-        metadata_table.read_metadata_files().await
     }
 
     /// Get all the changed [FileSlice]s in the table between the given timestamps.
@@ -782,78 +643,6 @@ impl Table {
         )
     }
 
-    /// Read records from the "files" partition of the metadata table.
-    ///
-    /// This method can only be called on metadata tables. It reads all records
-    /// from the "files" partition and returns merged `FilesPartitionRecord`s.
-    ///
-    /// # Returns
-    /// A HashMap mapping record keys to their `FilesPartitionRecord`s.
-    pub async fn read_metadata_files(&self) -> Result<HashMap<String, FilesPartitionRecord>> {
-        if !self.is_metadata_table() {
-            return Err(CoreError::MetadataTable(
-                "read_metadata_files can only be called on metadata tables".to_string(),
-            ));
-        }
-
-        // Use completion timestamp for file slice queries (v8+ tables key by completion time)
-        let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
-            return Ok(HashMap::new());
-        };
-
-        // For MDT, always use storage-based listing (not MDT-accelerated)
-        // to avoid recursion. MDT never uses itself for file listing.
-        let excludes = self
-            .timeline
-            .get_replaced_file_groups_as_of(timestamp)
-            .await?;
-        let filters = from_str_tuples([(
-            METADATA_TABLE_PARTITION_FIELD,
-            "=",
-            FilesPartitionRecord::PARTITION_NAME,
-        )])?;
-        let partition_schema = self.get_partition_schema().await?;
-        let partition_pruner =
-            PartitionPruner::new(&filters, &partition_schema, self.hudi_configs.as_ref())?;
-        let completion_time_view = self.timeline.create_completion_time_view();
-        let file_slices = self
-            .file_system_view
-            .get_file_slices_as_of(
-                timestamp,
-                &partition_pruner,
-                &excludes,
-                None, // Never use MDT for reading MDT itself (avoid recursion)
-                &completion_time_view,
-            )
-            .await?;
-
-        if file_slices.len() != 1 {
-            return Err(CoreError::MetadataTable(format!(
-                "Expected 1 file slice for {} partition, got {}",
-                FilesPartitionRecord::PARTITION_NAME,
-                file_slices.len()
-            )));
-        }
-        let file_slice = &file_slices[0];
-
-        let fg_reader = self.create_file_group_reader_with_options([(
-            HudiReadConfig::FileGroupEndTimestamp,
-            timestamp,
-        )])?;
-
-        fg_reader
-            .read_file_slice_from_metadata_table(file_slice)
-            .await
-    }
-
-    /// Same as [Table::read_metadata_files], but blocking.
-    pub fn read_metadata_files_blocking(&self) -> Result<HashMap<String, FilesPartitionRecord>> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_metadata_files())
-    }
-
     /// Get all the latest records in the table.
     ///
     /// # Arguments
@@ -949,23 +738,24 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         // If the end timestamp is not provided, use the latest file slice timestamp.
         // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
-        let Some(end_timestamp) =
+        let Some(end_ts) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             return Ok(Vec::new());
         };
 
         let timezone = self.timezone();
-        let start_timestamp = format_timestamp(start_timestamp, &timezone)?;
-        let end_timestamp = format_timestamp(end_timestamp, &timezone)?;
+        let start_ts = format_timestamp(start_timestamp, &timezone)?;
+        let end_ts = format_timestamp(end_ts, &timezone)?;
 
+        // Use incremental API that reads from timeline commit metadata
         let file_slices = self
-            .get_file_slices_between_internal(&start_timestamp, &end_timestamp)
+            .get_file_slices_between_internal(&start_ts, &end_ts)
             .await?;
 
         let fg_reader = self.create_file_group_reader_with_options([
-            (HudiReadConfig::FileGroupStartTimestamp, start_timestamp),
-            (HudiReadConfig::FileGroupEndTimestamp, end_timestamp),
+            (HudiReadConfig::FileGroupStartTimestamp, start_ts.clone()),
+            (HudiReadConfig::FileGroupEndTimestamp, end_ts),
         ])?;
 
         let batches =
@@ -1016,9 +806,9 @@ mod tests {
     use crate::config::HUDI_CONF_DIR;
     use crate::error::CoreError;
     use crate::metadata::meta_field::MetaField;
-    use crate::metadata::table_record::MetadataRecordType;
     use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
+    use crate::timeline::EARLIEST_START_TIMESTAMP;
     use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
     use std::collections::HashSet;
     use std::fs::canonicalize;
@@ -1688,191 +1478,5 @@ mod tests {
             .collect::<HashSet<_>>();
         let expected = HashSet::new();
         assert_eq!(actual, expected);
-    }
-
-    // =========================================================================
-    // Metadata Table Tests
-    // =========================================================================
-
-    fn get_data_table() -> Table {
-        use hudi_test::QuickstartTripsTable;
-        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
-        Table::new_blocking(&table_path).unwrap()
-    }
-
-    #[test]
-    fn hudi_table_read_metadata_files() {
-        let data_table = get_data_table();
-        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
-
-        assert!(metadata_table.is_metadata_table());
-
-        let records = metadata_table.read_metadata_files_blocking().unwrap();
-
-        // Should have 4 records: __all_partitions__ + 3 city partitions
-        assert_eq!(records.len(), 4);
-
-        // Validate __all_partitions__ record
-        let all_partitions = records.get("__all_partitions__").unwrap();
-        assert_eq!(
-            all_partitions.record_type,
-            MetadataRecordType::AllPartitions
-        );
-        let partition_names: HashSet<_> = all_partitions.partition_names().into_iter().collect();
-        assert_eq!(
-            partition_names,
-            HashSet::from(["city=chennai", "city=san_francisco", "city=sao_paulo"])
-        );
-
-        // Validate city=chennai record with actual file names
-        let chennai = records.get("city=chennai").unwrap();
-        assert_eq!(chennai.record_type, MetadataRecordType::Files);
-        let chennai_files: HashSet<_> = chennai.active_file_names().into_iter().collect();
-        assert_eq!(
-            chennai_files,
-            HashSet::from([
-                "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_2-986-2794_20251220210108078.parquet",
-                "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_0-1112-3190_20251220210129235.parquet",
-                ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210127080.log.1_0-1072-3078",
-                ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210128625.log.1_0-1097-3150",
-            ])
-        );
-        assert!(chennai.total_size() > 0);
-    }
-
-    #[test]
-    fn hudi_table_get_metadata_table_partitions() {
-        let data_table = get_data_table();
-
-        // Verify we can get the MDT partitions from the data table
-        let partitions = data_table.get_metadata_table_partitions();
-
-        // The test table has 5 MDT partitions configured
-        assert_eq!(
-            partitions.len(),
-            5,
-            "Should have 5 MDT partitions, got: {:?}",
-            partitions
-        );
-
-        // Verify all expected partitions are present
-        let expected = [
-            "column_stats",
-            "files",
-            "partition_stats",
-            "record_index",
-            "secondary_index_rider_idx",
-        ];
-        for partition in &expected {
-            assert!(
-                partitions.contains(&partition.to_string()),
-                "Should contain '{}' partition, got: {:?}",
-                partition,
-                partitions
-            );
-        }
-    }
-
-    #[test]
-    fn hudi_table_is_metadata_table_enabled() {
-        // V8 table with files partition configured should enable MDT
-        // even without explicit hoodie.metadata.enable=true
-        let data_table = get_data_table();
-
-        // Verify it's a v8 table
-        let table_version: isize = data_table
-            .hudi_configs
-            .get(TableVersion)
-            .map(|v| v.into())
-            .unwrap_or(0);
-        assert_eq!(table_version, 8, "Test table should be v8");
-
-        // Verify files partition is configured
-        let partitions = data_table.get_metadata_table_partitions();
-        assert!(
-            partitions.contains(&"files".to_string()),
-            "Should have 'files' partition configured"
-        );
-
-        // Verify is_metadata_table_enabled returns true (implicit enablement)
-        assert!(
-            data_table.is_metadata_table_enabled(),
-            "is_metadata_table_enabled should return true for v8 table with files partition"
-        );
-    }
-
-    #[test]
-    fn hudi_table_v6_metadata_table_not_enabled() {
-        // V6 tables should NOT have MDT enabled, even with explicit setting
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-
-        // Verify it's a v6 table
-        let table_version: isize = hudi_table
-            .hudi_configs
-            .get(TableVersion)
-            .map(|v| v.into())
-            .unwrap_or(0);
-        assert_eq!(table_version, 6, "Test table should be v6");
-
-        // V6 tables should not have MDT enabled
-        assert!(
-            !hudi_table.is_metadata_table_enabled(),
-            "is_metadata_table_enabled should return false for v6 table"
-        );
-    }
-
-    #[test]
-    fn hudi_table_is_not_metadata_table() {
-        // A regular data table should not be a metadata table
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
-        assert!(
-            !hudi_table.is_metadata_table(),
-            "Regular data table should not be a metadata table"
-        );
-    }
-
-    #[test]
-    fn hudi_table_metadata_table_is_metadata_table() {
-        // Create a metadata table and verify it's recognized as such
-        let data_table = get_data_table();
-        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
-        assert!(
-            metadata_table.is_metadata_table(),
-            "Metadata table should be recognized as a metadata table"
-        );
-    }
-
-    #[test]
-    fn hudi_table_new_metadata_table_from_metadata_table_errors() {
-        // Trying to create a metadata table from a metadata table should fail
-        let data_table = get_data_table();
-        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
-
-        let result = metadata_table.new_metadata_table_blocking();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Cannot create metadata table from another metadata table"),
-            "Error message should indicate cannot create from metadata table"
-        );
-    }
-
-    #[tokio::test]
-    async fn hudi_table_read_metadata_files_on_non_metadata_table_errors() {
-        // Calling read_metadata_files on a non-metadata table should fail
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-
-        let result = hudi_table.read_metadata_files().await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("can only be called on metadata tables"),
-            "Error message should indicate read_metadata_files requires metadata table"
-        );
     }
 }

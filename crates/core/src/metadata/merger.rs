@@ -105,6 +105,63 @@ impl FilesPartitionMerger {
         Ok(merged)
     }
 
+    /// Merge records, optionally filtering to specific keys.
+    ///
+    /// When `keys` is empty, processes all records (same as `merge()`).
+    /// When `keys` is non-empty, only processes records matching those keys,
+    /// which is useful for efficient partition pruning.
+    ///
+    /// # Arguments
+    /// * `base_records` - Records from the base HFile
+    /// * `log_records` - Records from log files
+    /// * `keys` - Only process records with these keys. If empty, process all.
+    ///
+    /// # Returns
+    /// A HashMap containing the requested keys (or all if keys is empty).
+    pub fn merge_for_keys(
+        &self,
+        base_records: &[HFileRecord],
+        log_records: &[HFileRecord],
+        keys: &[&str],
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        // When keys is empty, process all records
+        if keys.is_empty() {
+            return self.merge(base_records, log_records);
+        }
+
+        let key_set: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        let mut merged: HashMap<String, FilesPartitionRecord> = HashMap::new();
+
+        // Process base records, filtering by key
+        for record in base_records {
+            if let Some(key_str) = record.key_as_str() {
+                if key_set.contains(key_str) {
+                    let decoded = self.decode_record(record)?;
+                    merged.insert(decoded.key.clone(), decoded);
+                }
+            }
+        }
+
+        // Process log records, filtering by key
+        for record in log_records {
+            if let Some(key_str) = record.key_as_str() {
+                if key_set.contains(key_str) {
+                    let decoded = self.decode_record(record)?;
+                    match merged.get_mut(&decoded.key) {
+                        Some(existing) => {
+                            self.merge_files_partition_records(existing, &decoded);
+                        }
+                        None => {
+                            merged.insert(decoded.key.clone(), decoded);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
     /// Decode an HFile record using the schema.
     fn decode_record(&self, record: &HFileRecord) -> Result<FilesPartitionRecord> {
         decode_files_partition_record_with_schema(record, &self.schema)
@@ -159,7 +216,7 @@ impl FilesPartitionMerger {
 mod tests {
     use super::*;
     use crate::hfile::HFileReader;
-    use crate::metadata::table_record::MetadataRecordType;
+    use crate::metadata::table_record::{FilesPartitionRecord, MetadataRecordType};
     use hudi_test::QuickstartTripsTable;
     use std::path::PathBuf;
 
@@ -422,7 +479,7 @@ mod tests {
 
         // Validate __all_partitions__ - should list all 3 city partitions
         let all_partitions = merged
-            .get("__all_partitions__")
+            .get(FilesPartitionRecord::ALL_PARTITIONS_KEY)
             .expect("Should have __all_partitions__");
         assert_eq!(
             all_partitions.record_type,
@@ -530,6 +587,47 @@ mod tests {
             .map(|r| r.active_file_names().len())
             .sum();
         assert_eq!(total_active, 11, "Total active files should be 11 (4+3+4)");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_for_keys_filters_to_requested_keys() -> crate::Result<()> {
+        // Get base records from the HFile
+        let dir = files_partition_dir();
+        let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "hfile")
+                    .unwrap_or(false)
+            })
+            .collect();
+        hfiles.sort_by_key(|e| e.file_name());
+
+        let hfile_path = hfiles.last().expect("No HFile found").path();
+        let bytes = std::fs::read(&hfile_path).expect("Failed to read HFile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create HFileReader");
+        let schema = reader
+            .get_avro_schema()
+            .expect("Failed to get schema")
+            .expect("No schema in HFile")
+            .clone();
+        let base_records = reader.collect_records().expect("Failed to collect records");
+
+        let merger = FilesPartitionMerger::new(schema);
+
+        // Request only specific keys
+        let keys = vec![FilesPartitionRecord::ALL_PARTITIONS_KEY, "city=chennai"];
+        let merged = merger.merge_for_keys(&base_records, &[], &keys)?;
+
+        // Should only contain requested keys
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains_key(FilesPartitionRecord::ALL_PARTITIONS_KEY));
+        assert!(merged.contains_key("city=chennai"));
+        assert!(!merged.contains_key("city=san_francisco"));
 
         Ok(())
     }

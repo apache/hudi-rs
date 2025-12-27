@@ -39,6 +39,40 @@ use apache_avro::types::Value as AvroValue;
 use apache_avro::Schema as AvroSchema;
 use std::collections::HashMap;
 
+/// Metadata table partition types.
+///
+/// These represent the different partitions (directories) within the metadata table,
+/// each storing a different type of index data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetadataPartitionType {
+    /// The "files" partition containing file listings per data table partition.
+    Files,
+    /// The "column_stats" partition containing column statistics.
+    ColumnStats,
+    /// The "partition_stats" partition containing partition-level statistics.
+    PartitionStats,
+    /// The "record_index" partition containing record-level index entries.
+    RecordIndex,
+}
+
+impl MetadataPartitionType {
+    /// Get the partition directory name as used in the metadata table.
+    pub fn partition_name(&self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::ColumnStats => "column_stats",
+            Self::PartitionStats => "partition_stats",
+            Self::RecordIndex => "record_index",
+        }
+    }
+}
+
+impl std::fmt::Display for MetadataPartitionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.partition_name())
+    }
+}
+
 /// File information from the metadata table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoodieMetadataFileInfo {
@@ -122,6 +156,9 @@ pub struct FilesPartitionRecord {
 impl FilesPartitionRecord {
     /// The partition name in the metadata table that stores file listings.
     pub const PARTITION_NAME: &'static str = "files";
+
+    /// The key for the record that contains all partition paths.
+    pub const ALL_PARTITIONS_KEY: &'static str = "__all_partitions__";
 
     /// Check if this is an ALL_PARTITIONS record.
     pub fn is_all_partitions(&self) -> bool {
@@ -432,6 +469,40 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_partition_type_partition_name() {
+        assert_eq!(MetadataPartitionType::Files.partition_name(), "files");
+        assert_eq!(
+            MetadataPartitionType::ColumnStats.partition_name(),
+            "column_stats"
+        );
+        assert_eq!(
+            MetadataPartitionType::PartitionStats.partition_name(),
+            "partition_stats"
+        );
+        assert_eq!(
+            MetadataPartitionType::RecordIndex.partition_name(),
+            "record_index"
+        );
+    }
+
+    #[test]
+    fn test_metadata_partition_type_display() {
+        assert_eq!(format!("{}", MetadataPartitionType::Files), "files");
+        assert_eq!(
+            format!("{}", MetadataPartitionType::ColumnStats),
+            "column_stats"
+        );
+        assert_eq!(
+            format!("{}", MetadataPartitionType::PartitionStats),
+            "partition_stats"
+        );
+        assert_eq!(
+            format!("{}", MetadataPartitionType::RecordIndex),
+            "record_index"
+        );
+    }
+
+    #[test]
     fn test_metadata_record_type_from_i32() {
         assert_eq!(
             MetadataRecordType::from(1),
@@ -502,7 +573,7 @@ mod tests {
         // Test ALL_PARTITIONS record
         let all_partitions_record = records
             .iter()
-            .find(|r| r.key_as_str() == Some("__all_partitions__"))
+            .find(|r| r.key_as_str() == Some(FilesPartitionRecord::ALL_PARTITIONS_KEY))
             .expect("__all_partitions__ record not found");
 
         let decoded = decode_files_partition_record(&reader, all_partitions_record)

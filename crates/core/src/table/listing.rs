@@ -28,7 +28,7 @@ use crate::storage::{get_leaf_dirs, Storage};
 use crate::table::partition::{
     is_table_partitioned, PartitionPruner, EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX,
 };
-use crate::timeline::completion_time::TimelineViewByCompletionTime;
+use crate::timeline::completion_time::CompletionTimeView;
 use crate::Result;
 use dashmap::DashMap;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -65,15 +65,10 @@ impl FileLister {
     /// # Arguments
     /// * `partition_path` - The partition path to list files from
     /// * `completion_time_view` - View to look up completion timestamps.
-    ///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-    ///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
     ///
     /// Files whose commit timestamps are not found in the completion time view
     /// (i.e., uncommitted files) will have `completion_timestamp = None`.
-    ///
-    /// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-    /// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
-    async fn list_file_groups_for_partition<V: TimelineViewByCompletionTime>(
+    async fn list_file_groups_for_partition<V: CompletionTimeView>(
         &self,
         partition_path: &str,
         completion_time_view: &V,
@@ -101,7 +96,7 @@ impl FileLister {
                 if completion_time_view.should_filter_uncommitted()
                     && base_file.completion_timestamp.is_none()
                 {
-                    // v8+ table: file is from an uncommitted commit, skip it
+                    // file belongs to an uncommitted commit, skip it
                     continue;
                 }
 
@@ -118,7 +113,7 @@ impl FileLister {
                         if completion_time_view.should_filter_uncommitted()
                             && log_file.completion_timestamp.is_none()
                         {
-                            // v8+ table: file is from an uncommitted commit, skip it
+                            // file belongs to an uncommitted commit, skip it
                             continue;
                         }
 
@@ -187,14 +182,7 @@ impl FileLister {
     ///
     /// # Arguments
     /// * `completion_time_view` - View to look up completion timestamps.
-    ///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-    ///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
-    ///
-    /// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-    /// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
-    pub async fn list_file_groups_for_relevant_partitions<
-        V: TimelineViewByCompletionTime + Sync,
-    >(
+    pub async fn list_file_groups_for_relevant_partitions<V: CompletionTimeView + Sync>(
         &self,
         completion_time_view: &V,
     ) -> Result<DashMap<String, Vec<FileGroup>>> {

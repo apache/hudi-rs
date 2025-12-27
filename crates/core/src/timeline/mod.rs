@@ -23,22 +23,21 @@ pub mod loader;
 pub mod lsm_tree;
 pub(crate) mod selector;
 pub(crate) mod util;
+pub mod view;
 
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::builder::{
-    file_groups_from_commit_metadata, replaced_file_groups_from_replace_commit, FileGroupMerger,
-};
+use crate::file_group::builder::replaced_file_groups_from_replace_commit;
 use crate::file_group::FileGroup;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
 use crate::storage::Storage;
 use crate::timeline::builder::TimelineBuilder;
-use crate::timeline::completion_time::CompletionTimeView;
 use crate::timeline::instant::Action;
 use crate::timeline::loader::TimelineLoader;
 use crate::timeline::selector::TimelineSelector;
+use crate::timeline::view::TimelineView;
 use crate::Result;
 use arrow_schema::Schema;
 use instant::Instant;
@@ -249,16 +248,16 @@ impl Timeline {
             .map_or_else(|| Err(CoreError::TimelineNoCommit), |t| Ok(t.to_string()))
     }
 
-    /// Create a [CompletionTimeView] from the completed commits.
-    ///
-    /// This view maps request timestamps to completion timestamps, enabling
-    /// correct file association for v8+ tables where request and completion
-    /// timestamps differ.
-    ///
-    /// For v6 tables, the view will be empty since completion_timestamp is None
-    /// for all instants, and the caller should use the request timestamp directly.
-    pub fn create_completion_time_view(&self) -> CompletionTimeView {
-        CompletionTimeView::from_instants(&self.completed_commits)
+    /// Create a [TimelineView] as of the given timestamp.
+    pub async fn create_view_as_of(&self, timestamp: &str) -> Result<TimelineView> {
+        let excludes = self.get_replaced_file_groups_as_of(timestamp).await?;
+        Ok(TimelineView::new(
+            timestamp.to_string(),
+            None,
+            &self.completed_commits,
+            excludes,
+            &self.hudi_configs,
+        ))
     }
 
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
@@ -301,21 +300,28 @@ impl Timeline {
         Ok(file_groups)
     }
 
-    /// Get file groups in the timeline ranging from start (exclusive) to end (inclusive).
-    /// File groups are as of the [end] timestamp or the latest if not given.
+    /// Get file groups from commit metadata for commits in a time range.
     ///
-    /// For v8+ tables, the completion timestamps from the timeline instants are used
-    /// to set the completion_timestamp on base files and log files, enabling correct
-    /// file slice association based on completion order rather than request order.
+    /// This is used for incremental queries where we only want file groups
+    /// that were modified in the time range (start, end].
     ///
-    /// For v6 tables, completion_timestamp is None (v6 does not track completion times).
+    /// # Arguments
+    /// * `start_timestamp` - Start of the time range (exclusive), None means no lower bound
+    /// * `end_timestamp` - End of the time range (inclusive), None means no upper bound
+    ///
+    /// # Returns
+    /// File groups that were modified in the time range, excluding replaced file groups.
     pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<HashSet<FileGroup>> {
-        let mut file_groups: HashSet<FileGroup> = HashSet::new();
-        let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
+        use crate::file_group::builder::{
+            file_groups_from_commit_metadata, replaced_file_groups_from_replace_commit,
+            FileGroupMerger,
+        };
+
+        // Get commits in the time range (start, end]
         let selector = TimelineSelector::completed_actions_in_range(
             DEFAULT_LOADING_ACTIONS,
             self.hudi_configs.clone(),
@@ -323,11 +329,21 @@ impl Timeline {
             end_timestamp,
         )?;
         let commits = selector.select(self)?;
+        if commits.is_empty() {
+            return Ok(HashSet::new());
+        }
 
-        // Build completion time view from all commits for v8+ tables.
-        // Each file (base or log) may have a different completion timestamp,
-        // looked up from its own request timestamp.
-        let completion_time_view = CompletionTimeView::from_instants(&commits);
+        // Build completion time view from selected commits only.
+        let completion_time_view = TimelineView::new(
+            commits.last().unwrap().timestamp.clone(),
+            Some(commits.first().unwrap().timestamp.clone()),
+            &commits,
+            HashSet::new(),
+            &self.hudi_configs,
+        );
+
+        let mut file_groups: HashSet<FileGroup> = HashSet::new();
+        let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
 
         for commit in commits {
             let commit_metadata = self.get_instant_metadata(&commit).await?;

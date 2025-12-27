@@ -232,7 +232,7 @@ impl Decoder {
     ///
     /// HFile blocks are used in metadata table log files. Unlike Avro/Parquet blocks,
     /// the content is NOT converted to Arrow RecordBatch because:
-    /// - MDT operations need key-based lookup/merge
+    /// - Metadata table operations need key-based lookup/merge
     /// - Values are Avro-serialized payloads decoded on demand
     ///
     /// The HFile content structure:

@@ -18,7 +18,7 @@
  */
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
-use crate::timeline::completion_time::TimelineViewByCompletionTime;
+use crate::timeline::completion_time::CompletionTimeView;
 use crate::Result;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -106,7 +106,7 @@ impl BaseFile {
     ///
     /// For v6 tables, the view returns `None` and this is a no-op.
     /// For v8+ tables, this sets the completion timestamp for completed commits.
-    pub fn set_completion_time<V: TimelineViewByCompletionTime>(&mut self, view: &V) {
+    pub fn set_completion_time<V: CompletionTimeView>(&mut self, view: &V) {
         self.completion_timestamp = view
             .get_completion_time(&self.commit_timestamp)
             .map(|s| s.to_string());
