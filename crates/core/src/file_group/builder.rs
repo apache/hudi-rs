@@ -460,6 +460,88 @@ mod tests {
         }
 
         #[test]
+        fn test_mor_table_with_base_file_and_log_files() {
+            let sample_json = r#"{
+            "partitionToWriteStats": {
+                "partition1": [{
+                    "fileId": "file-id-0",
+                    "baseFile": "file-id-0_0-7-24_20240418173200000.parquet",
+                    "logFiles": [
+                        ".file-id-0_20240418173200000.log.1_0-8-25",
+                        ".file-id-0_20240418173200000.log.2_0-9-26"
+                    ]
+                }]
+            }
+        }"#;
+
+            let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
+            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            let file_group = file_groups.iter().next().unwrap();
+            assert_eq!(file_group.file_id, "file-id-0");
+            assert_eq!(file_group.partition_path, "partition1");
+
+            // Check that we have a file slice with base file and log files
+            assert_eq!(file_group.file_slices.len(), 1);
+            let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
+            assert_eq!(
+                file_slice.base_file.file_name(),
+                "file-id-0_0-7-24_20240418173200000.parquet"
+            );
+            assert_eq!(file_slice.log_files.len(), 2);
+        }
+
+        #[test]
+        fn test_mor_table_base_file_no_log_files() {
+            // MOR table with base file but no log files (initial insert)
+            let sample_json = r#"{
+            "partitionToWriteStats": {
+                "partition1": [{
+                    "fileId": "file-id-0",
+                    "baseFile": "file-id-0_0-7-24_20240418173200000.parquet"
+                }]
+            }
+        }"#;
+
+            let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
+            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            let file_group = file_groups.iter().next().unwrap();
+            let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
+            assert!(file_slice.log_files.is_empty());
+        }
+
+        #[test]
+        fn test_mor_table_base_file_empty_log_files() {
+            // MOR table with base file and empty log files array
+            let sample_json = r#"{
+            "partitionToWriteStats": {
+                "partition1": [{
+                    "fileId": "file-id-0",
+                    "baseFile": "file-id-0_0-7-24_20240418173200000.parquet",
+                    "logFiles": []
+                }]
+            }
+        }"#;
+
+            let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
+            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            assert!(result.is_ok());
+            let file_groups = result.unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            let file_group = file_groups.iter().next().unwrap();
+            let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
+            assert!(file_slice.log_files.is_empty());
+        }
+
+        #[test]
         fn test_file_groups_from_commit_metadata_with_completion_time_view() {
             let sample_json = r#"{
             "partitionToWriteStats": {
@@ -494,6 +576,567 @@ mod tests {
                 file_slice.base_file.completion_timestamp,
                 Some("20240418173210000".to_string())
             );
+        }
+    }
+
+    mod test_file_groups_from_files_partition_records {
+        use super::super::*;
+        use crate::metadata::table_record::{
+            FilesPartitionRecord, HoodieMetadataFileInfo, MetadataRecordType,
+        };
+        use crate::timeline::completion_time::{CompletionTimeView, V6CompletionTimeView};
+        use crate::timeline::instant::{Action, Instant, State};
+        use std::collections::HashMap;
+
+        fn create_file_info(name: &str, size: i64, is_deleted: bool) -> HoodieMetadataFileInfo {
+            HoodieMetadataFileInfo::new(name.to_string(), size, is_deleted)
+        }
+
+        fn create_files_record(
+            key: &str,
+            files: Vec<(&str, i64, bool)>,
+        ) -> (String, FilesPartitionRecord) {
+            let mut files_map = HashMap::new();
+            for (name, size, is_deleted) in files {
+                files_map.insert(name.to_string(), create_file_info(name, size, is_deleted));
+            }
+            (
+                key.to_string(),
+                FilesPartitionRecord {
+                    key: key.to_string(),
+                    record_type: MetadataRecordType::Files,
+                    files: files_map,
+                },
+            )
+        }
+
+        fn create_all_partitions_record(partitions: Vec<&str>) -> (String, FilesPartitionRecord) {
+            let mut files_map = HashMap::new();
+            for partition in partitions {
+                files_map.insert(
+                    partition.to_string(),
+                    create_file_info(partition, 0, false),
+                );
+            }
+            (
+                "__all_partitions__".to_string(),
+                FilesPartitionRecord {
+                    key: "__all_partitions__".to_string(),
+                    record_type: MetadataRecordType::AllPartitions,
+                    files: files_map,
+                },
+            )
+        }
+
+        #[test]
+        fn test_empty_records() {
+            let records: HashMap<String, FilesPartitionRecord> = HashMap::new();
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+            assert!(file_groups_map.is_empty());
+        }
+
+        #[test]
+        fn test_all_partitions_record_skipped() {
+            let mut records = HashMap::new();
+            let (key, record) = create_all_partitions_record(vec!["partition1", "partition2"]);
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+            // __all_partitions__ record should be skipped
+            assert!(file_groups_map.is_empty());
+        }
+
+        #[test]
+        fn test_base_files_only() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    ("file-id-1_0-8-25_20240418173210000.parquet", 2000, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 2);
+
+            // Check file IDs are correctly parsed
+            let file_ids: HashSet<_> = file_groups.iter().map(|fg| fg.file_id.as_str()).collect();
+            assert!(file_ids.contains("file-id-0"));
+            assert!(file_ids.contains("file-id-1"));
+        }
+
+        #[test]
+        fn test_base_files_with_log_files() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    // Base file for file-id-0
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    // Log files for file-id-0
+                    (".file-id-0_20240418173200000.log.1_0-8-25", 100, false),
+                    (".file-id-0_20240418173200000.log.2_0-9-26", 150, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            let fg = &file_groups[0];
+            assert_eq!(fg.file_id, "file-id-0");
+
+            // Check that log files were added
+            let file_slice = fg.file_slices.values().next().unwrap();
+            assert_eq!(file_slice.log_files.len(), 2);
+        }
+
+        #[test]
+        fn test_multiple_partitions() {
+            let mut records = HashMap::new();
+
+            let (key1, record1) = create_files_record(
+                "city=chennai",
+                vec![("file-id-0_0-7-24_20240418173200000.parquet", 1000, false)],
+            );
+            records.insert(key1, record1);
+
+            let (key2, record2) = create_files_record(
+                "city=sao_paulo",
+                vec![("file-id-1_0-8-25_20240418173210000.parquet", 2000, false)],
+            );
+            records.insert(key2, record2);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 2);
+            assert!(file_groups_map.contains_key("city=chennai"));
+            assert!(file_groups_map.contains_key("city=sao_paulo"));
+        }
+
+        #[test]
+        fn test_deleted_files_excluded() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    // This file is marked as deleted
+                    ("file-id-1_0-8-25_20240418173210000.parquet", 2000, true),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            // Only 1 file group because deleted file is excluded
+            assert_eq!(file_groups.len(), 1);
+            assert_eq!(file_groups[0].file_id, "file-id-0");
+        }
+
+        #[test]
+        fn test_unrecognized_file_extension_skipped() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    // Unrecognized extension
+                    ("somefile.txt", 500, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            // Only 1 file group, .txt file skipped
+            assert_eq!(file_groups.len(), 1);
+        }
+
+        #[test]
+        fn test_invalid_base_file_name_returns_error() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    // Invalid base file name - missing required parts
+                    ("invalid_file.parquet", 1000, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("invalid/unsupported base file name"));
+            assert!(err.to_string().contains("partition1"));
+        }
+
+        #[test]
+        fn test_invalid_log_file_name_returns_error() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    // Invalid log file name
+                    (".invalid_log_file", 100, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("invalid/unsupported log file name"));
+        }
+
+        #[test]
+        fn test_v8_uncommitted_base_file_filtered() {
+            let mut records = HashMap::new();
+            // A base file with timestamp that is NOT in the completion view (uncommitted)
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![(
+                    "file-id-0_0-7-24_20240418173200000.parquet",
+                    1000,
+                    false,
+                )],
+            );
+            records.insert(key, record);
+
+            // Create a non-empty completion view that does NOT include the file's timestamp
+            // This simulates an uncommitted file in v8 tables
+            // The view has OTHER commits, so should_filter_uncommitted() returns true
+            let instants = vec![Instant {
+                timestamp: "20240418173199999".to_string(), // Different timestamp
+                completion_timestamp: Some("20240418173209999".to_string()),
+                action: Action::Commit,
+                state: State::Completed,
+                epoch_millis: 0,
+            }];
+            let view = CompletionTimeView::from_instants(&instants);
+
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            // File should be filtered because it has no completion timestamp
+            // (its request timestamp is not in the completion view)
+            assert!(file_groups_map.is_empty());
+        }
+
+        #[test]
+        fn test_empty_completion_view_no_filtering() {
+            // Empty completion view means no completion time data available
+            // In this case, should_filter_uncommitted() returns false
+            // and all files are included (v6 behavior)
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![(
+                    "file-id-0_0-7-24_20240418173200000.parquet",
+                    1000,
+                    false,
+                )],
+            );
+            records.insert(key, record);
+
+            let view = CompletionTimeView::from_instants(&[]);
+
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            // With empty view, no filtering happens
+            assert_eq!(file_groups_map.len(), 1);
+        }
+
+        #[test]
+        fn test_v8_committed_base_file_included() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![(
+                    "file-id-0_0-7-24_20240418173200000.parquet",
+                    1000,
+                    false,
+                )],
+            );
+            records.insert(key, record);
+
+            // Create a completion view that includes the file's timestamp
+            let instants = vec![Instant {
+                timestamp: "20240418173200000".to_string(),
+                completion_timestamp: Some("20240418173210000".to_string()),
+                action: Action::Commit,
+                state: State::Completed,
+                epoch_millis: 0,
+            }];
+            let view = CompletionTimeView::from_instants(&instants);
+
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            // Verify completion timestamp was set
+            let file_slice = file_groups[0].file_slices.values().next().unwrap();
+            assert_eq!(
+                file_slice.base_file.completion_timestamp,
+                Some("20240418173210000".to_string())
+            );
+        }
+
+        #[test]
+        fn test_v8_uncommitted_log_file_filtered() {
+            let mut records = HashMap::new();
+            // Log file has a DIFFERENT base commit timestamp (20240418173205000)
+            // that is NOT in the completion view
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    // Committed base file with timestamp in the completion view
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    // Log file with a different base_commit_time that's NOT in the view
+                    // The log file's timestamp (20240418173205000) won't have a completion time
+                    (
+                        ".file-id-0_20240418173205000.log.1_0-8-25",
+                        100,
+                        false,
+                    ),
+                ],
+            );
+            records.insert(key, record);
+
+            // Completion view only includes the base file's timestamp, not the log's
+            let instants = vec![Instant {
+                timestamp: "20240418173200000".to_string(),
+                completion_timestamp: Some("20240418173210000".to_string()),
+                action: Action::Commit,
+                state: State::Completed,
+                epoch_millis: 0,
+            }];
+            let view = CompletionTimeView::from_instants(&instants);
+
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            // Log file should be filtered - only base file remains
+            // Because the log's base_commit_time is not in the completion view
+            let file_slice = file_groups[0].file_slices.values().next().unwrap();
+            assert!(file_slice.log_files.is_empty());
+        }
+
+        #[test]
+        fn test_v8_committed_log_file_included() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    // Committed base file
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    // Log file with same base_commit_time that IS in the completion view
+                    // Log file format: .{file_id}_{base_commit_time}.log.{version}_{write_token}
+                    (
+                        ".file-id-0_20240418173200000.log.1_0-8-25",
+                        100,
+                        false,
+                    ),
+                ],
+            );
+            records.insert(key, record);
+
+            // Completion view includes the timestamp used by both base file and log file
+            let instants = vec![Instant {
+                timestamp: "20240418173200000".to_string(),
+                completion_timestamp: Some("20240418173210000".to_string()),
+                action: Action::Commit,
+                state: State::Completed,
+                epoch_millis: 0,
+            }];
+            let view = CompletionTimeView::from_instants(&instants);
+
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+
+            // Both base file and log file should be included since they share the same timestamp
+            let file_slice = file_groups[0].file_slices.values().next().unwrap();
+            assert_eq!(file_slice.log_files.len(), 1);
+        }
+
+        #[test]
+        fn test_empty_partition_not_added_to_map() {
+            let mut records = HashMap::new();
+            // Partition with only deleted files
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![(
+                    "file-id-0_0-7-24_20240418173200000.parquet",
+                    1000,
+                    true, // deleted
+                )],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            // Empty partition should not be in the map
+            assert!(file_groups_map.is_empty());
+        }
+
+        #[test]
+        fn test_multiple_base_files_same_file_id() {
+            let mut records = HashMap::new();
+            // Multiple base files with same file_id (different commit times)
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    ("file-id-0_0-8-25_20240418173210000.parquet", 1500, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            // Should have 1 file group with 2 file slices
+            assert_eq!(file_groups.len(), 1);
+            assert_eq!(file_groups[0].file_slices.len(), 2);
+        }
+
+        #[test]
+        fn test_log_files_without_base_file_not_included() {
+            let mut records = HashMap::new();
+            // Only log files, no base file
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    (".file-id-0_20240418173200000.log.1_0-8-25", 100, false),
+                    (".file-id-0_20240418173200000.log.2_0-9-26", 150, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "parquet",
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            // Log-only file groups are not yet supported (see P1 task)
+            assert!(file_groups_map.is_empty());
+        }
+
+        #[test]
+        fn test_hfile_base_file_extension() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![("file-id-0_0-7-24_20240418173200000.hfile", 1000, false)],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                "hfile", // Different base file extension
+                &V6CompletionTimeView::new(),
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
         }
     }
 

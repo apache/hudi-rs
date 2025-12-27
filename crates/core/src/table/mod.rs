@@ -242,25 +242,39 @@ impl Table {
     /// Check if the metadata table "files" partition is enabled for file listing.
     ///
     /// Returns `true` if:
-    /// 1. `hoodie.metadata.enable` is true
-    /// 2. Table version is >= 8 (MDT support is only for v8+ tables)
-    /// 3. "files" is in the configured `hoodie.table.metadata.partitions`
+    /// 1. Table version is >= 8 (MDT support is only for v8+ tables), AND
+    /// 2. Either:
+    ///    - `hoodie.metadata.enable` is explicitly true, OR
+    ///    - "files" is in the configured `hoodie.table.metadata.partitions`
+    ///      (implicit enablement for v8+ tables with configured partitions)
+    ///
+    /// This matches Hudi Java behavior where metadata table is considered active
+    /// when partitions are configured, even without explicit `hoodie.metadata.enable=true`.
     pub fn is_metadata_table_enabled(&self) -> bool {
-        let metadata_enabled: bool = self
-            .hudi_configs
-            .get_or_default(MetadataTableEnabled)
-            .into();
-        // TODO: remove this table version check when support files for v6 tables or drop v6 support
+        // Check table version first - MDT is only supported for v8+ tables
         let table_version: isize = self
             .hudi_configs
             .get(TableVersion)
             .map(|v| v.into())
             .unwrap_or(0);
-        metadata_enabled
-            && table_version >= 8
-            && self
-                .get_metadata_table_partitions()
-                .contains(&FilesPartitionRecord::PARTITION_NAME.to_string())
+
+        if table_version < 8 {
+            return false;
+        }
+
+        // Check if "files" partition is configured
+        let has_files_partition = self
+            .get_metadata_table_partitions()
+            .contains(&FilesPartitionRecord::PARTITION_NAME.to_string());
+
+        // Explicit check for hoodie.metadata.enable
+        let metadata_explicitly_enabled: bool = self
+            .hudi_configs
+            .get_or_default(MetadataTableEnabled)
+            .into();
+
+        // Enable if explicitly enabled OR if files partition is configured (implicit enablement)
+        metadata_explicitly_enabled || has_files_partition
     }
 
     /// Create a metadata table instance for this data table.
@@ -575,8 +589,15 @@ impl Table {
 
         // Try metadata table accelerated listing if files partition is configured
         let metadata_table_records = if self.is_metadata_table_enabled() {
+            log::debug!("Using metadata table for file listing");
             match self.fetch_metadata_table_records().await {
-                Ok(records) => Some(records),
+                Ok(records) => {
+                    log::debug!(
+                        "Successfully read {} partition records from metadata table",
+                        records.len()
+                    );
+                    Some(records)
+                }
                 Err(e) => {
                     // Fall through to storage listing if metadata table read fails
                     log::warn!(
@@ -1744,5 +1765,54 @@ mod tests {
                 partitions
             );
         }
+    }
+
+    #[test]
+    fn hudi_table_is_metadata_table_enabled() {
+        // V8 table with files partition configured should enable MDT
+        // even without explicit hoodie.metadata.enable=true
+        let data_table = get_data_table();
+
+        // Verify it's a v8 table
+        let table_version: isize = data_table
+            .hudi_configs
+            .get(TableVersion)
+            .map(|v| v.into())
+            .unwrap_or(0);
+        assert_eq!(table_version, 8, "Test table should be v8");
+
+        // Verify files partition is configured
+        let partitions = data_table.get_metadata_table_partitions();
+        assert!(
+            partitions.contains(&"files".to_string()),
+            "Should have 'files' partition configured"
+        );
+
+        // Verify is_metadata_table_enabled returns true (implicit enablement)
+        assert!(
+            data_table.is_metadata_table_enabled(),
+            "is_metadata_table_enabled should return true for v8 table with files partition"
+        );
+    }
+
+    #[test]
+    fn hudi_table_v6_metadata_table_not_enabled() {
+        // V6 tables should NOT have MDT enabled, even with explicit setting
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+
+        // Verify it's a v6 table
+        let table_version: isize = hudi_table
+            .hudi_configs
+            .get(TableVersion)
+            .map(|v| v.into())
+            .unwrap_or(0);
+        assert_eq!(table_version, 6, "Test table should be v6");
+
+        // V6 tables should not have MDT enabled
+        assert!(
+            !hudi_table.is_metadata_table_enabled(),
+            "is_metadata_table_enabled should return false for v6 table"
+        );
     }
 }
