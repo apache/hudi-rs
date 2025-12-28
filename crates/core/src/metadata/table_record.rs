@@ -63,7 +63,6 @@ impl HoodieMetadataFileInfo {
 
 /// Metadata record type.
 ///
-/// These values match the Java implementation in `MetadataPartitionType`.
 /// The type field in `HoodieMetadataRecord` indicates which metadata partition
 /// the record belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

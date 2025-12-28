@@ -326,7 +326,7 @@ impl FileGroupReader {
     }
 
     // =========================================================================
-    // Metadata Table (MDT) File Slice Reading
+    // Metadata Table File Slice Reading
     // =========================================================================
 
     /// Check if this reader is configured for a metadata table.
@@ -355,8 +355,8 @@ impl FileGroupReader {
     ///
     /// # Example
     /// ```ignore
-    /// let reader = FileGroupReader::new_with_options(mdt_base_uri, options)?;
-    /// let merged = reader.read_file_slice_from_mdt_paths(
+    /// let reader = FileGroupReader::new_with_options(metadata_table_base_uri, options)?;
+    /// let merged = reader.read_file_slice_from_metadata_table_paths(
     ///     "files/files-0000-0_0-0-0_00000000000000.hfile",
     ///     vec!["files/.files-0000-0_20240101120000000.log.1_0-100-200"],
     /// ).await?;
@@ -368,7 +368,7 @@ impl FileGroupReader {
     ///     }
     /// }
     /// ```
-    pub async fn read_file_slice_from_mdt_paths<I, S>(
+    pub async fn read_file_slice_from_metadata_table_paths<I, S>(
         &self,
         base_file_path: &str,
         log_file_paths: I,
@@ -387,7 +387,7 @@ impl FileGroupReader {
             .await
             .map_err(|e| {
                 ReadFileSliceError(format!(
-                    "Failed to read MDT base file {}: {:?}",
+                    "Failed to read metadata table base file {}: {:?}",
                     base_file_path, e
                 ))
             })?;
@@ -429,8 +429,8 @@ impl FileGroupReader {
         merger.merge(&base_records, &log_records)
     }
 
-    /// Same as [FileGroupReader::read_file_slice_from_mdt_paths], but blocking.
-    pub fn read_file_slice_from_mdt_paths_blocking<I, S>(
+    /// Same as [FileGroupReader::read_file_slice_from_metadata_table_paths], but blocking.
+    pub fn read_file_slice_from_metadata_table_paths_blocking<I, S>(
         &self,
         base_file_path: &str,
         log_file_paths: I,
@@ -442,13 +442,15 @@ impl FileGroupReader {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(self.read_file_slice_from_mdt_paths(base_file_path, log_file_paths))
+            .block_on(
+                self.read_file_slice_from_metadata_table_paths(base_file_path, log_file_paths),
+            )
     }
 
     /// Reads a metadata table file slice using a FileSlice object.
     ///
-    /// Convenience wrapper around [FileGroupReader::read_file_slice_from_mdt_paths].
-    pub async fn read_file_slice_from_mdt(
+    /// Convenience wrapper around [FileGroupReader::read_file_slice_from_metadata_table_paths].
+    pub async fn read_file_slice_from_metadata_table(
         &self,
         file_slice: &FileSlice,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
@@ -462,19 +464,19 @@ impl FileGroupReader {
         } else {
             vec![]
         };
-        self.read_file_slice_from_mdt_paths(&base_file_path, log_file_paths)
+        self.read_file_slice_from_metadata_table_paths(&base_file_path, log_file_paths)
             .await
     }
 
-    /// Same as [FileGroupReader::read_file_slice_from_mdt], but blocking.
-    pub fn read_file_slice_from_mdt_blocking(
+    /// Same as [FileGroupReader::read_file_slice_from_metadata_table], but blocking.
+    pub fn read_file_slice_from_metadata_table_blocking(
         &self,
         file_slice: &FileSlice,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(self.read_file_slice_from_mdt(file_slice))
+            .block_on(self.read_file_slice_from_metadata_table(file_slice))
     }
 }
 
@@ -789,23 +791,23 @@ mod tests {
     }
 
     // =========================================================================
-    // MDT File Slice Reading Tests
+    // Metadata Table File Slice Reading Tests
     // =========================================================================
 
     fn get_metadata_table_base_uri() -> String {
         use hudi_test::QuickstartTripsTable;
         let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
-        let mdt_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
-        let url = Url::from_file_path(canonicalize(&mdt_path).unwrap()).unwrap();
+        let metadata_table_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
+        let url = Url::from_file_path(canonicalize(&metadata_table_path).unwrap()).unwrap();
         url.as_ref().to_string()
     }
 
-    /// Create a FileGroupReader for MDT without trying to resolve options from storage.
-    fn create_mdt_reader() -> Result<FileGroupReader> {
-        let mdt_uri = get_metadata_table_base_uri();
+    /// Create a FileGroupReader for metadata table without trying to resolve options from storage.
+    fn create_metadata_table_reader() -> Result<FileGroupReader> {
+        let metadata_table_uri = get_metadata_table_base_uri();
         let hudi_configs = Arc::new(HudiConfigs::new([(
             HudiTableConfig::BasePath,
-            mdt_uri.as_str(),
+            metadata_table_uri.as_str(),
         )]));
         FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
     }
@@ -818,17 +820,18 @@ mod tests {
         assert!(!reader.is_metadata_table());
 
         // Metadata table should return true
-        let mdt_reader = create_mdt_reader()?;
-        assert!(mdt_reader.is_metadata_table());
+        let metadata_table_reader = create_metadata_table_reader()?;
+        assert!(metadata_table_reader.is_metadata_table());
 
         Ok(())
     }
 
     /// Initial HFile base file for the files partition (all zeros timestamp).
-    const MDT_FILES_BASE_FILE: &str = "files/files-0000-0_0-955-2690_00000000000000000.hfile";
+    const METADATA_TABLE_FILES_BASE_FILE: &str =
+        "files/files-0000-0_0-955-2690_00000000000000000.hfile";
 
     /// Log files for the V8Trips8I3U1D test table's files partition.
-    const MDT_FILES_LOG_FILES: &[&str] = &[
+    const METADATA_TABLE_FILES_LOG_FILES: &[&str] = &[
         "files/.files-0000-0_20251220210108078.log.1_10-999-2838",
         "files/.files-0000-0_20251220210123755.log.1_3-1032-2950",
         "files/.files-0000-0_20251220210125441.log.1_5-1057-3024",
@@ -839,15 +842,17 @@ mod tests {
     ];
 
     #[test]
-    fn test_read_file_slice_from_mdt_paths_without_log_files() -> Result<()> {
+    fn test_read_file_slice_from_metadata_table_paths_without_log_files() -> Result<()> {
         use crate::metadata::table_record::MetadataRecordType;
 
-        let reader = create_mdt_reader()?;
+        let reader = create_metadata_table_reader()?;
 
         // Read base file only (no log files)
         let log_files: Vec<&str> = vec![];
-        let merged =
-            reader.read_file_slice_from_mdt_paths_blocking(MDT_FILES_BASE_FILE, log_files)?;
+        let merged = reader.read_file_slice_from_metadata_table_paths_blocking(
+            METADATA_TABLE_FILES_BASE_FILE,
+            log_files,
+        )?;
 
         // Initial base file only has __all_partitions__ record
         // City partition records are added through log files
@@ -862,15 +867,15 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_slice_from_mdt_paths_with_log_files() -> Result<()> {
+    fn test_read_file_slice_from_metadata_table_paths_with_log_files() -> Result<()> {
         use crate::metadata::table_record::MetadataRecordType;
 
-        let reader = create_mdt_reader()?;
+        let reader = create_metadata_table_reader()?;
 
         // Read base file + all log files
-        let merged = reader.read_file_slice_from_mdt_paths_blocking(
-            MDT_FILES_BASE_FILE,
-            MDT_FILES_LOG_FILES.to_vec(),
+        let merged = reader.read_file_slice_from_metadata_table_paths_blocking(
+            METADATA_TABLE_FILES_BASE_FILE,
+            METADATA_TABLE_FILES_LOG_FILES.to_vec(),
         )?;
 
         // Should still have 4 keys after merging
@@ -931,18 +936,20 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_slice_from_mdt_error_handling() -> Result<()> {
-        let reader = create_mdt_reader()?;
+    fn test_read_file_slice_from_metadata_table_error_handling() -> Result<()> {
+        let reader = create_metadata_table_reader()?;
 
         // Test with non-existent base file
-        let result = reader
-            .read_file_slice_from_mdt_paths_blocking("files/nonexistent.hfile", Vec::<&str>::new());
+        let result = reader.read_file_slice_from_metadata_table_paths_blocking(
+            "files/nonexistent.hfile",
+            Vec::<&str>::new(),
+        );
 
         assert!(result.is_err(), "Should error on non-existent file");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Failed to read MDT base file"),
-            "Error should mention MDT base file: {}",
+            err.contains("Failed to read metadata table base file"),
+            "Error should mention metadata table base file: {}",
             err
         );
 
@@ -950,16 +957,18 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_slice_from_mdt_blocking() -> Result<()> {
+    fn test_read_file_slice_from_metadata_table_blocking() -> Result<()> {
         use crate::file_group::FileGroup;
 
-        let reader = create_mdt_reader()?;
+        let reader = create_metadata_table_reader()?;
 
         // Build FileGroup using the API
         let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
-        let base_file_name = MDT_FILES_BASE_FILE.strip_prefix("files/").unwrap();
+        let base_file_name = METADATA_TABLE_FILES_BASE_FILE
+            .strip_prefix("files/")
+            .unwrap();
         fg.add_base_file_from_name(base_file_name)?;
-        let log_file_names: Vec<_> = MDT_FILES_LOG_FILES
+        let log_file_names: Vec<_> = METADATA_TABLE_FILES_LOG_FILES
             .iter()
             .map(|s| s.strip_prefix("files/").unwrap())
             .collect();
@@ -969,7 +978,7 @@ mod tests {
             .get_file_slice_as_of("99999999999999999")
             .expect("Should have file slice");
 
-        let merged = reader.read_file_slice_from_mdt_blocking(file_slice)?;
+        let merged = reader.read_file_slice_from_metadata_table_blocking(file_slice)?;
 
         // Should have 4 keys: __all_partitions__ + 3 city partitions
         assert_eq!(merged.len(), 4);
