@@ -49,129 +49,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  prepare-integration-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: buildx-integration-${{ runner.os }}-${{ hashFiles('demo/infra/runner/Dockerfile', 'rust-toolchain.toml') }}
-          restore-keys: buildx-integration-${{ runner.os }}-
-
-      - name: Pre-pull base images
-        run: |
-          docker pull rust:1.87
-          docker pull quay.io/minio/minio:latest
-
-      - name: Prepare cache directories
-        run: |
-          mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
-          sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
-
-      - name: Cache integration dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-            .cargo/registry
-            .cargo/git
-            python/target
-            .uv-cache
-          key: integration-prep-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml') }}
-          restore-keys: integration-prep-${{ runner.os }}-
-
-      - name: Build runner image and pre-compile bindings
-        run: |
-          cd demo
-          export DOCKER_BUILDKIT=1
-          export HOST_UID=$(id -u)
-          export HOST_GID=$(id -g)
-
-          # Build with Docker Buildx layer caching
-          docker buildx build \
-            --cache-from type=local,src=/tmp/.buildx-cache \
-            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
-            -t demo-runner:latest \
-            --load \
-            ./infra/runner
-
-          # Rotate cache to avoid size growth
-          if [ -d /tmp/.buildx-cache ]; then
-            rm -rf /tmp/.buildx-cache-old || true
-            mv /tmp/.buildx-cache /tmp/.buildx-cache-old || true
-          fi
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
-
-          # Start the runner container (mounts host directories for build cache)
-          docker compose up -d runner
-
-          # Wait for container ready
-          max_attempts=30
-          attempt=0
-          until [ "$(docker inspect -f '{{.State.Status}}' runner)" = "running" ] || [ $attempt -eq $max_attempts ]; do
-            attempt=$(( $attempt + 1 ))
-            echo "Waiting for container... (attempt $attempt of $max_attempts)"
-            sleep 1
-          done
-
-          if [ $attempt -eq $max_attempts ]; then
-            echo "Container failed to start in time"
-            docker compose down -v
-            exit 1
-          fi
-
-          # Pre-compile bindings - artifacts will be in the mounted volume (host filesystem)
-          if ! docker compose exec -T runner /bin/bash -c "
-            export PATH=/root/.local/bin:\$PATH && \
-            source /opt/.venv/bin/activate && \
-            cd /opt/hudi-rs && \
-            make setup develop
-          "; then
-            echo "Failed to build bindings"
-            docker compose down -v
-            exit 1
-          fi
-
-          # Verify bindings were built successfully
-          docker compose exec -T runner /bin/bash -c "
-            source /opt/.venv/bin/activate && \
-            python -c 'import hudi; print(\"Python bindings OK\")'
-          "
-
-          docker compose down -v
-
-          # Save the runner image (without build artifacts - those are in cache)
-          docker save demo-runner:latest | gzip > /tmp/runner-image.tar.gz
-
-      - name: Upload runner image
-        uses: actions/upload-artifact@v4
-        with:
-          name: runner-image
-          path: /tmp/runner-image.tar.gz
-          retention-days: 1
-
-      - name: Upload build cache
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-build-cache
-          path: |
-            target
-            python/target
-            .cargo/registry
-            .cargo/git
-            .uv-cache
-          retention-days: 1
-
-      - name: Fix cache ownership
-        if: always()
-        run: sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache || true
-
   rust-tests:
     strategy:
       fail-fast: false
@@ -279,48 +156,45 @@ jobs:
           if-no-files-found: 'error'
 
   integration-tests:
-    needs: [prepare-integration-build]
     strategy:
-        fail-fast: false
-        matrix:
-          app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
+      fail-fast: false
+      matrix:
+        app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust', 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
-      - name: Download runner image
-        uses: actions/download-artifact@v4
-        with:
-          name: runner-image
-          path: /tmp
-
-      - name: Download build cache
-        uses: actions/download-artifact@v4
-        with:
-          name: integration-build-cache
-          path: .
-
-      - name: Load runner image
+      - name: Pull pre-built runner image
         run: |
-          docker load -i /tmp/runner-image.tar.gz
-          # Tag it so compose uses the pre-built image
-          docker tag demo-runner:latest demo-runner:cached
+          docker pull andreab92/hudi-demo-runner:latest
+          docker tag andreab92/hudi-demo-runner:latest demo-runner:latest
 
-      - name: Pre-pull base images
+      - name: Cache integration dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            .cargo/registry
+            .cargo/git
+            python/target
+            .uv-cache
+          key: integration-${{ runner.os }}-${{ matrix.app-path }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            integration-${{ runner.os }}-${{ matrix.app-path }}-
+            integration-${{ runner.os }}-
+
+      - name: Pre-pull minio
         run: docker pull quay.io/minio/minio:latest
 
-      - name: Fix cache ownership
+      - name: Prepare cache directories
         run: |
-          # Ensure directories exist and have correct ownership for container access
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
           sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache || true
 
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
-          ./ci_run.sh ${{ matrix.app-path }} --use-cached-build
+          ./ci_run.sh ${{ matrix.app-path }}
 
       - name: Fix cache ownership
         if: always()
