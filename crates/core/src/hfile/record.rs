@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! HFile record types for MDT (Metadata Table) operations.
+//! HFile record types for metadata table operations.
 //!
 //! This module provides simple, owned record types for HFile key-value pairs.
-//! These are designed for use in MDT operations where:
+//! These are designed for use in metadata table operations where:
 //! - Records need to be passed around and stored
 //! - Key-based lookups and merging are primary operations
 //! - Values are Avro-serialized payloads decoded on demand
@@ -31,8 +31,8 @@ use std::cmp::Ordering;
 
 /// An owned HFile record with key and value.
 ///
-/// This is a simple struct designed for MDT operations. The key is the
-/// UTF-8 record key (content only, without HFile key structure), and
+/// This is a simple struct designed for metadata table operations. The key is
+/// the UTF-8 record key (content only, without HFile key structure), and
 /// the value is the raw bytes (typically Avro-serialized payload).
 ///
 /// # Example
@@ -83,7 +83,7 @@ impl HFileRecord {
 
     /// Returns whether this record represents a deletion.
     ///
-    /// In MDT, a deleted record has an empty value.
+    /// In metadata table, a deleted record has an empty value.
     pub fn is_deleted(&self) -> bool {
         self.value.is_empty()
     }

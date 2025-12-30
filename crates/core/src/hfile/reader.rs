@@ -879,20 +879,20 @@ impl HFileReader {
         Ok(HFileIterator { reader: self })
     }
 
-    // ================== HFileRecord API for MDT ==================
+    // ================== HFileRecord API for metadata table ==================
 
     /// Convert a KeyValue to an owned HFileRecord.
     ///
     /// This extracts the key content (without length prefix) and value bytes
-    /// into an owned struct suitable for MDT operations.
+    /// into an owned struct suitable for metadata table operations.
     fn key_value_to_record(kv: &KeyValue) -> HFileRecord {
         HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
     }
 
     /// Collect all records from the HFile as owned HFileRecords.
     ///
-    /// This is useful for MDT operations where records need to be stored
-    /// and merged with log file records.
+    /// This is useful for metadata table operations where records need to be
+    /// stored and merged with log file records.
     ///
     /// # Example
     /// ```ignore
@@ -1998,7 +1998,7 @@ mod tests {
     // 3. "city=san_francisco" - 2 parquet files (UUID: 036ded81-9ed4-479f-bcea-7145dfa0079b)
     // 4. "city=sao_paulo" - 2 parquet files (UUID: 8aa68f7e-afd6-4c94-b86c-8a886552e08d)
 
-    use crate::metadata::table_record::decode_files_partition_record;
+    use crate::metadata::table_record::{decode_files_partition_record, FilesPartitionRecord};
     use hudi_test::QuickstartTripsTable;
 
     /// Get the path to the files partition directory in the test table.
@@ -2062,7 +2062,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "__all_partitions__",
+                FilesPartitionRecord::ALL_PARTITIONS_KEY,
                 "city=chennai",
                 "city=san_francisco",
                 "city=sao_paulo"
@@ -2100,7 +2100,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Failed to decode record for key {}: {}", key, e));
 
             match key {
-                "__all_partitions__" => {
+                FilesPartitionRecord::ALL_PARTITIONS_KEY => {
                     // Validate ALL_PARTITIONS record type and partitions
                     assert_eq!(
                         files_record.record_type,

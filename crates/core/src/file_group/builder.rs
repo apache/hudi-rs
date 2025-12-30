@@ -23,7 +23,7 @@ use crate::file_group::FileGroup;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::metadata::table_record::FilesPartitionRecord;
-use crate::timeline::completion_time::TimelineViewByCompletionTime;
+use crate::timeline::completion_time::CompletionTimeView;
 use crate::Result;
 use dashmap::DashMap;
 use serde_json::{Map, Value};
@@ -64,12 +64,7 @@ impl FileGroupMerger for HashSet<FileGroup> {
 ///
 /// * `commit_metadata` - The commit metadata JSON map
 /// * `completion_time_view` - View to look up completion timestamps.
-///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
-///
-/// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-/// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
-pub fn file_groups_from_commit_metadata<V: TimelineViewByCompletionTime>(
+pub fn file_groups_from_commit_metadata<V: CompletionTimeView>(
     commit_metadata: &Map<String, Value>,
     completion_time_view: &V,
 ) -> Result<HashSet<FileGroup>> {
@@ -153,15 +148,10 @@ pub fn replaced_file_groups_from_replace_commit(
 /// * `records` - Metadata table files partition records (partition_path -> FilesPartitionRecord)
 /// * `base_file_extension` - The base file format extension (e.g., "parquet", "hfile")
 /// * `completion_time_view` - View to look up completion timestamps.
-///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
-///
-/// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-/// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
 ///
 /// # Returns
 /// A map of partition paths to their FileGroups.
-pub fn file_groups_from_files_partition_records<V: TimelineViewByCompletionTime>(
+pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
     records: &HashMap<String, FilesPartitionRecord>,
     base_file_extension: &str,
     completion_time_view: &V,
@@ -190,7 +180,7 @@ pub fn file_groups_from_files_partition_records<V: TimelineViewByCompletionTime>
                 })?;
 
                 log_file.set_completion_time(completion_time_view);
-                // Filter uncommitted files for v8+ tables
+                // Filter uncommitted files for timeline layout v2
                 if completion_time_view.should_filter_uncommitted()
                     && log_file.completion_timestamp.is_none()
                 {
@@ -211,7 +201,7 @@ pub fn file_groups_from_files_partition_records<V: TimelineViewByCompletionTime>
                 })?;
 
                 base_file.set_completion_time(completion_time_view);
-                // Filter uncommitted files for v8+ tables
+                // Filter uncommitted files for timeline layout v2
                 if completion_time_view.should_filter_uncommitted()
                     && base_file.completion_timestamp.is_none()
                 {
@@ -285,8 +275,34 @@ mod tests {
 
     mod test_file_groups_from_commit_metadata {
         use super::super::*;
-        use crate::timeline::completion_time::{CompletionTimeView, V6CompletionTimeView};
+        use crate::config::HudiConfigs;
+        use crate::timeline::instant::{Action, Instant, State};
+        use crate::timeline::view::TimelineView;
         use serde_json::{json, Map, Value};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        fn create_layout_v1_view() -> TimelineView {
+            let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")]));
+            TimelineView::new(
+                "99999999999999999".to_string(),
+                None,
+                &[] as &[Instant],
+                HashSet::new(),
+                &configs,
+            )
+        }
+
+        fn create_layout_v2_view(instants: &[Instant]) -> TimelineView {
+            let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
+            TimelineView::new(
+                "99999999999999999".to_string(),
+                None,
+                instants,
+                HashSet::new(),
+                &configs,
+            )
+        }
 
         #[test]
         fn test_missing_partition_to_write_stats() {
@@ -298,8 +314,8 @@ mod tests {
             .unwrap()
             .clone();
 
-            // Use V6CompletionTimeView for v6 table behavior (no completion time tracking)
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            // Use layout v1 view (no completion time tracking)
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             // With the new implementation, this returns Ok with an empty HashSet
             // because iter_write_stats() returns an empty iterator when partition_to_write_stats is None
             assert!(result.is_ok());
@@ -317,7 +333,7 @@ mod tests {
             .unwrap()
             .clone();
 
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(matches!(
                 result,
                 Err(CoreError::CommitMetadata(msg)) if msg.contains("Failed to parse commit metadata")
@@ -337,7 +353,7 @@ mod tests {
             .unwrap()
             .clone();
 
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(matches!(
                 result,
                 Err(CoreError::CommitMetadata(msg)) if msg == "Missing fileId in write stats"
@@ -357,7 +373,7 @@ mod tests {
             .unwrap()
             .clone();
 
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(matches!(
                 result,
                 Err(CoreError::CommitMetadata(msg)) if msg == "Missing path in write stats"
@@ -378,7 +394,7 @@ mod tests {
             .unwrap()
             .clone();
 
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(matches!(
                 result,
                 Err(CoreError::CommitMetadata(msg)) if msg == "Invalid file name in path"
@@ -399,7 +415,7 @@ mod tests {
             .unwrap()
             .clone();
 
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             // Serde will fail to parse this and return a deserialization error
             assert!(matches!(
                 result,
@@ -421,7 +437,7 @@ mod tests {
             .unwrap()
             .clone();
 
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             // Serde will fail to parse this and return a deserialization error
             assert!(matches!(
                 result,
@@ -445,7 +461,7 @@ mod tests {
         }"#;
 
             let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(result.is_ok());
             let file_groups = result.unwrap();
             assert_eq!(file_groups.len(), 2);
@@ -475,7 +491,7 @@ mod tests {
         }"#;
 
             let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(result.is_ok());
             let file_groups = result.unwrap();
             assert_eq!(file_groups.len(), 1);
@@ -507,7 +523,7 @@ mod tests {
         }"#;
 
             let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(result.is_ok());
             let file_groups = result.unwrap();
             assert_eq!(file_groups.len(), 1);
@@ -531,7 +547,7 @@ mod tests {
         }"#;
 
             let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
-            let result = file_groups_from_commit_metadata(&metadata, &V6CompletionTimeView::new());
+            let result = file_groups_from_commit_metadata(&metadata, &create_layout_v1_view());
             assert!(result.is_ok());
             let file_groups = result.unwrap();
             assert_eq!(file_groups.len(), 1);
@@ -555,7 +571,6 @@ mod tests {
             let metadata: Map<String, Value> = serde_json::from_str(sample_json).unwrap();
 
             // Create a completion time view with the mapping for this file's request timestamp
-            use crate::timeline::instant::{Action, Instant, State};
             let instants = vec![Instant {
                 timestamp: "20240418173200000".to_string(),
                 completion_timestamp: Some("20240418173210000".to_string()),
@@ -563,7 +578,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = CompletionTimeView::from_instants(&instants);
+            let view = create_layout_v2_view(&instants);
 
             let result = file_groups_from_commit_metadata(&metadata, &view);
             assert!(result.is_ok());
@@ -581,12 +596,36 @@ mod tests {
 
     mod test_file_groups_from_files_partition_records {
         use super::super::*;
+        use crate::config::HudiConfigs;
         use crate::metadata::table_record::{
             FilesPartitionRecord, HoodieMetadataFileInfo, MetadataRecordType,
         };
-        use crate::timeline::completion_time::{CompletionTimeView, V6CompletionTimeView};
         use crate::timeline::instant::{Action, Instant, State};
-        use std::collections::HashMap;
+        use crate::timeline::view::TimelineView;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        fn create_layout_v1_view() -> TimelineView {
+            let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")]));
+            TimelineView::new(
+                "99999999999999999".to_string(),
+                None,
+                &[] as &[Instant],
+                HashSet::new(),
+                &configs,
+            )
+        }
+
+        fn create_layout_v2_view(instants: &[Instant]) -> TimelineView {
+            let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
+            TimelineView::new(
+                "99999999999999999".to_string(),
+                None,
+                instants,
+                HashSet::new(),
+                &configs,
+            )
+        }
 
         fn create_file_info(name: &str, size: i64, is_deleted: bool) -> HoodieMetadataFileInfo {
             HoodieMetadataFileInfo::new(name.to_string(), size, is_deleted)
@@ -616,9 +655,9 @@ mod tests {
                 files_map.insert(partition.to_string(), create_file_info(partition, 0, false));
             }
             (
-                "__all_partitions__".to_string(),
+                FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
                 FilesPartitionRecord {
-                    key: "__all_partitions__".to_string(),
+                    key: FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
                     record_type: MetadataRecordType::AllPartitions,
                     files: files_map,
                 },
@@ -631,7 +670,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -647,7 +686,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -670,7 +709,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -703,7 +742,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -739,7 +778,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -765,7 +804,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -793,7 +832,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -819,7 +858,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -845,7 +884,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -855,7 +894,7 @@ mod tests {
         }
 
         #[test]
-        fn test_v8_uncommitted_base_file_filtered() {
+        fn test_layout_v2_uncommitted_base_file_filtered() {
             let mut records = HashMap::new();
             // A base file with timestamp that is NOT in the completion view (uncommitted)
             let (key, record) = create_files_record(
@@ -865,7 +904,7 @@ mod tests {
             records.insert(key, record);
 
             // Create a non-empty completion view that does NOT include the file's timestamp
-            // This simulates an uncommitted file in v8 tables
+            // This simulates an uncommitted file in timeline layout v2
             // The view has OTHER commits, so should_filter_uncommitted() returns true
             let instants = vec![Instant {
                 timestamp: "20240418173199999".to_string(), // Different timestamp
@@ -874,7 +913,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = CompletionTimeView::from_instants(&instants);
+            let view = create_layout_v2_view(&instants);
 
             let result = file_groups_from_files_partition_records(&records, "parquet", &view);
             assert!(result.is_ok());
@@ -886,10 +925,10 @@ mod tests {
         }
 
         #[test]
-        fn test_empty_completion_view_no_filtering() {
-            // Empty completion view means no completion time data available
-            // In this case, should_filter_uncommitted() returns false
-            // and all files are included (v6 behavior)
+        fn test_empty_completion_view_filters_uncommitted() {
+            // For timeline layout v2 with no completion time data (empty instants),
+            // all files are filtered because their request timestamps don't have
+            // corresponding completion timestamps in the view.
             let mut records = HashMap::new();
             let (key, record) = create_files_record(
                 "partition1",
@@ -897,18 +936,18 @@ mod tests {
             );
             records.insert(key, record);
 
-            let view = CompletionTimeView::from_instants(&[]);
+            let view = create_layout_v2_view(&[]);
 
             let result = file_groups_from_files_partition_records(&records, "parquet", &view);
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
-            // With empty view, no filtering happens
-            assert_eq!(file_groups_map.len(), 1);
+            // Layout v2 with empty view filters all files (no completion timestamps available)
+            assert!(file_groups_map.is_empty());
         }
 
         #[test]
-        fn test_v8_committed_base_file_included() {
+        fn test_layout_v2_committed_base_file_included() {
             let mut records = HashMap::new();
             let (key, record) = create_files_record(
                 "partition1",
@@ -924,7 +963,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = CompletionTimeView::from_instants(&instants);
+            let view = create_layout_v2_view(&instants);
 
             let result = file_groups_from_files_partition_records(&records, "parquet", &view);
             assert!(result.is_ok());
@@ -943,7 +982,7 @@ mod tests {
         }
 
         #[test]
-        fn test_v8_uncommitted_log_file_filtered() {
+        fn test_layout_v2_uncommitted_log_file_filtered() {
             let mut records = HashMap::new();
             // Log file has a DIFFERENT base commit timestamp (20240418173205000)
             // that is NOT in the completion view
@@ -967,7 +1006,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = CompletionTimeView::from_instants(&instants);
+            let view = create_layout_v2_view(&instants);
 
             let result = file_groups_from_files_partition_records(&records, "parquet", &view);
             assert!(result.is_ok());
@@ -984,7 +1023,7 @@ mod tests {
         }
 
         #[test]
-        fn test_v8_committed_log_file_included() {
+        fn test_layout_v2_committed_log_file_included() {
             let mut records = HashMap::new();
             let (key, record) = create_files_record(
                 "partition1",
@@ -1006,7 +1045,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = CompletionTimeView::from_instants(&instants);
+            let view = create_layout_v2_view(&instants);
 
             let result = file_groups_from_files_partition_records(&records, "parquet", &view);
             assert!(result.is_ok());
@@ -1038,7 +1077,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -1063,7 +1102,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -1091,7 +1130,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "parquet",
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -1112,7 +1151,7 @@ mod tests {
             let result = file_groups_from_files_partition_records(
                 &records,
                 "hfile", // Different base file extension
-                &V6CompletionTimeView::new(),
+                &create_layout_v1_view(),
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();

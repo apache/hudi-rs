@@ -17,20 +17,20 @@
  * under the License.
  */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::config::HudiConfigs;
-use crate::file_group::FileGroup;
-use crate::metadata::table_record::FilesPartitionRecord;
-use crate::storage::Storage;
-use crate::timeline::completion_time::TimelineViewByCompletionTime;
-
 use crate::file_group::builder::file_groups_from_files_partition_records;
 use crate::file_group::file_slice::FileSlice;
+use crate::file_group::FileGroup;
+use crate::storage::Storage;
 use crate::table::listing::FileLister;
 use crate::table::partition::PartitionPruner;
+use crate::table::Table;
+use crate::timeline::completion_time::CompletionTimeView;
+use crate::timeline::view::TimelineView;
 use crate::Result;
 use dashmap::DashMap;
 
@@ -58,17 +58,12 @@ impl FileSystemView {
         })
     }
 
-    /// Load file groups by listing from the file system.
+    /// Load file groups by listing from the storage.
     ///
     /// # Arguments
     /// * `partition_pruner` - Filters which partitions to include
-    /// * `completion_time_view` - View to look up completion timestamps.
-    ///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-    ///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
-    ///
-    /// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-    /// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
-    async fn load_file_groups_from_file_system<V: TimelineViewByCompletionTime + Sync>(
+    /// * `completion_time_view` - View to look up completion timestamps
+    async fn load_file_groups_from_storage<V: CompletionTimeView + Sync>(
         &self,
         partition_pruner: &PartitionPruner,
         completion_time_view: &V,
@@ -90,34 +85,25 @@ impl FileSystemView {
 
     /// Load file groups from metadata table records.
     ///
-    /// This is an alternative to `load_file_groups_from_file_system` that uses pre-fetched
-    /// metadata table records instead of listing from storage. Only partitions that pass the
-    /// partition pruner will be loaded.
+    /// This is an alternative to `load_file_groups_from_file_system` that uses
+    /// file listing records fetched from the metadata table. Only partitions that
+    /// pass the partition pruner will be loaded.
     ///
-    /// This method is not async because it operates on pre-fetched records - no I/O is needed.
-    ///
-    /// TODO: Consider making this async and fetching metadata table records within this method
-    /// instead of receiving pre-fetched records. This would make the API more symmetric with
-    /// `load_file_groups_from_file_system` and encapsulate the metadata table fetching logic.
+    /// This method is not async because it operates on pre-fetched records.
     ///
     /// # Arguments
-    /// * `metadata_table_records` - Metadata table files partition records
+    /// * `records` - Metadata table files partition records
     /// * `partition_pruner` - Filters which partitions to include
-    /// * `completion_time_view` - View to look up completion timestamps.
-    ///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-    ///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
-    ///
-    /// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-    /// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
-    fn load_file_groups_from_metadata_table<V: TimelineViewByCompletionTime>(
+    /// * `completion_time_view` - View to look up completion timestamps
+    fn load_file_groups_from_metadata_table_records<V: CompletionTimeView>(
         &self,
-        metadata_table_records: &HashMap<String, FilesPartitionRecord>,
+        records: &HashMap<String, crate::metadata::table_record::FilesPartitionRecord>,
         partition_pruner: &PartitionPruner,
         completion_time_view: &V,
     ) -> Result<()> {
         let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
         let file_groups_map = file_groups_from_files_partition_records(
-            metadata_table_records,
+            records,
             &base_file_format,
             completion_time_view,
         )?;
@@ -132,15 +118,15 @@ impl FileSystemView {
         Ok(())
     }
 
-    /// Collect file slices from loaded file groups as of a given timestamp.
-    ///
-    /// This is a private method that assumes file groups have already been loaded.
-    async fn collect_file_slices_as_of(
+    /// Collect file slices from loaded file groups using the timeline view.
+    async fn collect_file_slices(
         &self,
-        timestamp: &str,
         partition_pruner: &PartitionPruner,
-        excluding_file_groups: &HashSet<FileGroup>,
+        timeline_view: &TimelineView,
     ) -> Result<Vec<FileSlice>> {
+        let timestamp = timeline_view.as_of_timestamp();
+        let excluding_file_groups = timeline_view.excluding_file_groups();
+
         let mut file_slices = Vec::new();
         for mut partition_entry in self.partition_to_file_groups.iter_mut() {
             if !partition_pruner.should_include(partition_entry.key()) {
@@ -160,44 +146,60 @@ impl FileSystemView {
         Ok(file_slices)
     }
 
-    /// Get file slices as of a given timestamp.
+    /// Get file slices using a [`TimelineView`].
     ///
-    /// This is the single entrypoint for retrieving file slices. It internally decides
-    /// whether to load file groups from metadata table records (if provided) or from storage listing.
+    /// This is the main API for retrieving file slices for snapshot or time-travel queries.
+    /// It loads file groups from metadata table (if enabled) or storage listing,
+    /// then select file slices based on the timeline view.
+    ///
+    /// The [`TimelineView`] encapsulates:
+    /// - The "as of" timestamp for the query
+    /// - File groups to exclude (from replace commits for example)
+    /// - Completion time mappings (if needed)
     ///
     /// # Arguments
-    /// * `timestamp` - The timestamp to get file slices as of
     /// * `partition_pruner` - Filters which partitions to include
-    /// * `excluding_file_groups` - File groups to exclude (e.g., replaced file groups)
-    /// * `metadata_table_records` - Optional metadata table files partition records for
-    ///   accelerated listing. If provided, file groups are loaded from these records instead
-    ///   of storage listing.
-    /// * `completion_time_view` - View to look up completion timestamps.
-    ///   - For v6 tables: Pass [`V6CompletionTimeView`] (returns `None` for all lookups)
-    ///   - For v8+ tables: Pass [`CompletionTimeView`] built from timeline instants
-    ///
-    /// [`V6CompletionTimeView`]: crate::timeline::completion_time::V6CompletionTimeView
-    /// [`CompletionTimeView`]: crate::timeline::completion_time::CompletionTimeView
-    pub async fn get_file_slices_as_of<V: TimelineViewByCompletionTime + Sync>(
+    /// * `timeline_view` - The timeline view containing query context
+    /// * `metadata_table` - Optional metadata table instance
+    pub(crate) async fn get_file_slices(
         &self,
-        timestamp: &str,
         partition_pruner: &PartitionPruner,
-        excluding_file_groups: &HashSet<FileGroup>,
-        metadata_table_records: Option<&HashMap<String, FilesPartitionRecord>>,
-        completion_time_view: &V,
+        timeline_view: &TimelineView,
+        metadata_table: Option<&Table>,
     ) -> Result<Vec<FileSlice>> {
-        // Load file groups from metadata table records if provided, otherwise from file system
-        if let Some(records) = metadata_table_records {
-            self.load_file_groups_from_metadata_table(
-                records,
+        if let Some(mdt) = metadata_table {
+            // Use metadata table for file listing
+            let records = mdt.fetch_files_partition_records(partition_pruner).await?;
+            self.load_file_groups_from_metadata_table_records(
+                &records,
                 partition_pruner,
-                completion_time_view,
+                timeline_view,
             )?;
         } else {
-            self.load_file_groups_from_file_system(partition_pruner, completion_time_view)
+            // Fall back to storage listing
+            self.load_file_groups_from_storage(partition_pruner, timeline_view)
                 .await?;
         }
-        self.collect_file_slices_as_of(timestamp, partition_pruner, excluding_file_groups)
+        self.collect_file_slices(partition_pruner, timeline_view)
+            .await
+    }
+
+    /// Get file slices using storage listing only.
+    ///
+    /// This method always lists files from storage, which is needed
+    /// for metadata table's own file listing flow to avoid async recursion.
+    ///
+    /// # Arguments
+    /// * `partition_pruner` - Filters which partitions to include
+    /// * `timeline_view` - The timeline view containing query context
+    pub(crate) async fn get_file_slices_by_storage_listing(
+        &self,
+        partition_pruner: &PartitionPruner,
+        timeline_view: &TimelineView,
+    ) -> Result<Vec<FileSlice>> {
+        self.load_file_groups_from_storage(partition_pruner, timeline_view)
+            .await?;
+        self.collect_file_slices(partition_pruner, timeline_view)
             .await
     }
 }
@@ -209,35 +211,28 @@ mod tests {
     use crate::table::Table;
 
     use hudi_test::SampleTable;
-    use std::collections::HashSet;
 
     #[tokio::test]
     async fn fs_view_get_latest_file_slices() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let latest_timestamp = hudi_table
-            .timeline
-            .completed_commits
-            .iter()
-            .next_back()
-            .map(|i| i.timestamp.clone())
-            .unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
         let fs_view = &hudi_table.file_system_view;
-        let completion_time_view = hudi_table.timeline.create_completion_time_view();
 
         assert!(fs_view.partition_to_file_groups.is_empty());
-        let partition_pruner = PartitionPruner::empty();
-        let excludes = HashSet::new();
-        let file_slices = fs_view
-            .get_file_slices_as_of(
-                &latest_timestamp,
-                &partition_pruner,
-                &excludes,
-                None, // mdt_records
-                &completion_time_view,
-            )
+
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
             .await
             .unwrap();
+        let partition_pruner = PartitionPruner::empty();
+
+        let file_slices = fs_view
+            .get_file_slices(&partition_pruner, &timeline_view, None)
+            .await
+            .unwrap();
+
         assert_eq!(fs_view.partition_to_file_groups.len(), 1);
         assert_eq!(file_slices.len(), 1);
         let file_ids = file_slices
@@ -254,33 +249,23 @@ mod tests {
     async fn fs_view_get_latest_file_slices_with_replace_commit() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let latest_timestamp = hudi_table
-            .timeline
-            .completed_commits
-            .iter()
-            .next_back()
-            .map(|i| i.timestamp.clone())
-            .unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
         let fs_view = &hudi_table.file_system_view;
-        let completion_time_view = hudi_table.timeline.create_completion_time_view();
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
-        let partition_pruner = PartitionPruner::empty();
-        let excludes = &hudi_table
+
+        let timeline_view = hudi_table
             .timeline
-            .get_replaced_file_groups_as_of(&latest_timestamp)
+            .create_view_as_of(&latest_timestamp)
             .await
             .unwrap();
+        let partition_pruner = PartitionPruner::empty();
+
         let file_slices = fs_view
-            .get_file_slices_as_of(
-                &latest_timestamp,
-                &partition_pruner,
-                excludes,
-                None, // mdt_records
-                &completion_time_view,
-            )
+            .get_file_slices(&partition_pruner, &timeline_view, None)
             .await
             .unwrap();
+
         assert_eq!(fs_view.partition_to_file_groups.len(), 3);
         assert_eq!(file_slices.len(), 1);
         let file_ids = file_slices
@@ -297,21 +282,14 @@ mod tests {
     async fn fs_view_get_latest_file_slices_with_partition_filters() {
         let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let latest_timestamp = hudi_table
-            .timeline
-            .completed_commits
-            .iter()
-            .next_back()
-            .map(|i| i.timestamp.clone())
-            .unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
         let fs_view = &hudi_table.file_system_view;
-        let completion_time_view = hudi_table.timeline.create_completion_time_view();
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
 
-        let excludes = &hudi_table
+        let timeline_view = hudi_table
             .timeline
-            .get_replaced_file_groups_as_of(&latest_timestamp)
+            .create_view_as_of(&latest_timestamp)
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
@@ -326,15 +304,10 @@ mod tests {
         .unwrap();
 
         let file_slices = fs_view
-            .get_file_slices_as_of(
-                &latest_timestamp,
-                &partition_pruner,
-                excludes,
-                None, // mdt_records
-                &completion_time_view,
-            )
+            .get_file_slices(&partition_pruner, &timeline_view, None)
             .await
             .unwrap();
+
         assert_eq!(fs_view.partition_to_file_groups.len(), 1);
         assert_eq!(file_slices.len(), 1);
 
