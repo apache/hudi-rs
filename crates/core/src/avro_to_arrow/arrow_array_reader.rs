@@ -21,6 +21,7 @@ use crate::avro_to_arrow::to_arrow_schema;
 use crate::error::{CoreError, Result};
 use apache_avro::schema::RecordSchema;
 use apache_avro::{
+    error::Details as AvroDetails,
     schema::{Schema as AvroSchema, SchemaKind},
     types::Value,
     AvroResult, Error as AvroError,
@@ -856,11 +857,11 @@ fn resolve_string(v: &Value) -> ArrowResult<Option<String>> {
     match v {
         Value::String(s) => Ok(Some(s.clone())),
         Value::Bytes(bytes) => String::from_utf8(bytes.to_vec())
-            .map_err(AvroError::ConvertToUtf8)
+            .map_err(|e| AvroError::new(AvroDetails::ConvertToUtf8(e)))
             .map(Some),
         Value::Enum(_, s) => Ok(Some(s.clone())),
         Value::Null => Ok(None),
-        other => Err(AvroError::GetString(other.into())),
+        other => Err(AvroError::new(AvroDetails::GetString(other.clone()))),
     }
     .map_err(|e| SchemaError(format!("expected resolvable string : {e:?}")))
 }
@@ -869,7 +870,7 @@ fn resolve_u8(v: &Value) -> AvroResult<u8> {
     let int = match v {
         Value::Int(n) => Ok(Value::Int(*n)),
         Value::Long(n) => Ok(Value::Int(*n as i32)),
-        other => Err(AvroError::GetU8(other.into())),
+        other => Err(AvroError::new(AvroDetails::GetU8(other.clone()))),
     }?;
     if let Value::Int(n) = int {
         if n >= 0 && n <= u8::MAX as i32 {
@@ -877,7 +878,7 @@ fn resolve_u8(v: &Value) -> AvroResult<u8> {
         }
     }
 
-    Err(AvroError::GetU8(int.into()))
+    Err(AvroError::new(AvroDetails::GetU8(int)))
 }
 
 fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
@@ -892,7 +893,7 @@ fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
                 .collect::<Result<Vec<_>, _>>()
                 .ok()?,
         )),
-        other => Err(AvroError::GetBytes(other.into())),
+        other => Err(AvroError::new(AvroDetails::GetBytes(other.clone()))),
     }
     .ok()
     .and_then(|v| match v {

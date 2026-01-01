@@ -100,7 +100,9 @@ fn schema_to_field_with_props(
                         .data_type()
                         .clone()
                 } else {
-                    return Err(CoreError::from(apache_avro::Error::GetUnionDuplicate));
+                    return Err(CoreError::from(apache_avro::Error::new(
+                        apache_avro::error::Details::GetUnionDuplicate,
+                    )));
                 }
             } else {
                 let fields = sub_schemas
