@@ -23,7 +23,7 @@ pub struct FileMetadata {
     pub name: String,
 
     /// Size in bytes on storage
-    pub size: usize,
+    pub size: u64,
 
     /// Size in bytes in memory
     pub byte_size: i64,
@@ -36,7 +36,7 @@ pub struct FileMetadata {
 }
 
 impl FileMetadata {
-    pub fn new(name: impl Into<String>, size: usize) -> Self {
+    pub fn new(name: impl Into<String>, size: u64) -> Self {
         Self {
             name: name.into(),
             size,

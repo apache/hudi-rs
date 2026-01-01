@@ -29,9 +29,10 @@ use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
-use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::physical_plan::FileScanConfigBuilder;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
@@ -143,7 +144,7 @@ impl HudiDataSource {
     fn is_supported_operand(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Column(col) => self.schema().column_with_name(&col.name).is_some(),
-            Expr::Literal(_) => true,
+            Expr::Literal(..) => true,
             _ => false,
         }
     }
@@ -211,6 +212,7 @@ impl TableProvider for HudiDataSource {
             global: state.config_options().execution.parquet.clone(),
             column_specific_options: Default::default(),
             key_value_metadata: Default::default(),
+            crypto: Default::default(),
         };
         let table_schema = self.schema();
         let mut parquet_source = ParquetSource::new(parquet_opts);
@@ -218,17 +220,21 @@ impl TableProvider for HudiDataSource {
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            parquet_source = parquet_source.with_predicate(table_schema.clone(), predicate)
+            parquet_source = parquet_source.with_predicate(predicate)
         }
 
-        let fsc = Arc::new(
-            FileScanConfig::new(url, table_schema, Arc::new(parquet_source))
-                .with_file_groups(parquet_file_groups)
-                .with_projection(projection.cloned())
-                .with_limit(limit),
-        );
+        let file_groups: Vec<FileGroup> = parquet_file_groups
+            .into_iter()
+            .map(FileGroup::from)
+            .collect();
 
-        Ok(Arc::new(DataSourceExec::new(fsc)))
+        let fsc = FileScanConfigBuilder::new(url, table_schema, Arc::new(parquet_source))
+            .with_file_groups(file_groups)
+            .with_projection_indices(projection.cloned())
+            .with_limit(limit)
+            .build();
+
+        Ok(Arc::new(DataSourceExec::new(Arc::new(fsc))))
     }
 
     fn supports_filters_pushdown(
@@ -566,13 +572,13 @@ mod tests {
         let expr0 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())))),
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())), None)),
         });
 
         let expr1 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
             op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)), None)),
         });
 
         let expr2 = Expr::BinaryExpr(BinaryExpr {
@@ -580,21 +586,21 @@ mod tests {
                 "nonexistent_column".to_string(),
             ))),
             op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)), None)),
         });
 
         let expr3 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::NotEq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())))),
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())), None)),
         });
 
-        let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)));
+        let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)), None);
 
         let expr5 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
             op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)), None)),
         })));
 
         let filters = vec![&expr0, &expr1, &expr2, &expr3, &expr4, &expr5];
