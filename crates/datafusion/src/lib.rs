@@ -29,9 +29,9 @@ use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
+use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::physical_plan::FileScanConfigBuilder;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableProvider;
@@ -199,7 +199,7 @@ impl TableProvider for HudiDataSource {
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
                 let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
-                let partitioned_file = PartitionedFile::new(url.path(), size as u64);
+                let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }
             parquet_file_groups.push(parquet_file_group_vec)
@@ -572,7 +572,10 @@ mod tests {
         let expr0 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())), None)),
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Alice".to_string())),
+                None,
+            )),
         });
 
         let expr1 = Expr::BinaryExpr(BinaryExpr {
@@ -592,7 +595,10 @@ mod tests {
         let expr3 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::NotEq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())), None)),
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Diana".to_string())),
+                None,
+            )),
         });
 
         let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)), None);

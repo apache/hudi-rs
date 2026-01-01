@@ -95,11 +95,9 @@ impl HudiFileGroupReader {
         relative_path: &str,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
+        rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
             .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+            .to_pyarrow(py)
     }
     fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<Py<PyAny>> {
         let mut file_group = FileGroup::new_with_base_file_name(
@@ -122,11 +120,9 @@ impl HudiFileGroupReader {
                 ))
             })
             .map_err(PythonError::from)?;
-        Ok(rt()
-            .block_on(self.inner.read_file_slice(file_slice))
+        rt().block_on(self.inner.read_file_slice(file_slice))
             .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+            .to_pyarrow(py)
     }
 
     fn read_file_slice_from_paths(
@@ -135,14 +131,12 @@ impl HudiFileGroupReader {
         log_file_paths: Vec<String>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(
-                self.inner
-                    .read_file_slice_from_paths(base_file_path, log_file_paths),
-            )
-            .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+        rt().block_on(
+            self.inner
+                .read_file_slice_from_paths(base_file_path, log_file_paths),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
     }
 }
 
@@ -333,19 +327,15 @@ impl HudiTable {
     }
 
     fn get_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(self.inner.get_schema())
+        rt().block_on(self.inner.get_schema())
             .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+            .to_pyarrow(py)
     }
 
     fn get_partition_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(self.inner.get_partition_schema())
+        rt().block_on(self.inner.get_partition_schema())
             .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+            .to_pyarrow(py)
     }
 
     fn get_timeline(&self, py: Python) -> HudiTimeline {
@@ -467,11 +457,9 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
+        rt().block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
             .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+            .to_pyarrow(py)
     }
 
     #[pyo3(signature = (timestamp, filters=None))]
@@ -481,14 +469,12 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(
-                self.inner
-                    .read_snapshot_as_of(timestamp, filters.unwrap_or_default()),
-            )
-            .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+        rt().block_on(
+            self.inner
+                .read_snapshot_as_of(timestamp, filters.unwrap_or_default()),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
     }
 
     #[pyo3(signature = (start_timestamp, end_timestamp=None))]
@@ -498,14 +484,12 @@ impl HudiTable {
         end_timestamp: Option<&str>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(
-                self.inner
-                    .read_incremental_records(start_timestamp, end_timestamp),
-            )
-            .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+        rt().block_on(
+            self.inner
+                .read_incremental_records(start_timestamp, end_timestamp),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
     }
 }
 
@@ -599,11 +583,9 @@ impl HudiTimeline {
     }
 
     pub fn get_latest_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
-        Ok(rt()
-            .block_on(self.inner.get_latest_schema())
+        rt().block_on(self.inner.get_latest_schema())
             .map_err(PythonError::from)?
-            .to_pyarrow(py)?
-)
+            .to_pyarrow(py)
     }
 }
 
