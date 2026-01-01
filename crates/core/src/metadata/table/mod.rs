@@ -148,6 +148,10 @@ impl Table {
     /// Fetch records from the `files` partition of metadata table
     /// with optional data table partition pruning.
     ///
+    /// Records are returned with normalized partition keys. For non-partitioned tables,
+    /// the key is "" (empty string) instead of the internal "." representation.
+    /// Normalization happens at decode time in [`decode_files_partition_record_with_schema`].
+    ///
     /// # Note
     /// Must be called on a DATA table, not a METADATA table.
     pub async fn read_metadata_table_files_partition(
@@ -173,6 +177,9 @@ impl Table {
 
     /// Fetch records from the `files` partition with optional partition pruning.
     ///
+    /// For non-partitioned tables, directly fetches the "." record.
+    /// For partitioned tables with filters, performs partition pruning via `__all_partitions__`.
+    ///
     /// # Arguments
     /// * `partition_pruner` - Data table's partition pruner to filter partitions.
     ///
@@ -182,12 +189,19 @@ impl Table {
         &self,
         partition_pruner: &PartitionPruner,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        // If no partition filters, read all records (pass empty keys)
+        // Non-partitioned table: directly fetch "." record
+        if !partition_pruner.is_table_partitioned() {
+            return self
+                .read_files_partition(&[FilesPartitionRecord::NON_PARTITIONED_NAME])
+                .await;
+        }
+
+        // Partitioned table without filters: read all records
         if partition_pruner.is_empty() {
             return self.read_files_partition(&[]).await;
         }
 
-        // Step 1: Get all partition paths
+        // Partitioned table with filters: partition pruning
         let all_partitions_records = self
             .read_files_partition(&[FilesPartitionRecord::ALL_PARTITIONS_KEY])
             .await?;
