@@ -27,7 +27,7 @@ resolver = "2"
 version = "0.5.0-dev"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.86"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 readme = "README.md"
 description = "The native Rust implementation for Apache Hudi"
@@ -36,30 +36,30 @@ repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "~54.2.0"}
-arrow-arith = { version = "~54.2.0" }
-arrow-array = { version = "~54.2.0" }
-arrow-buffer = { version = "~54.2.0" }
-arrow-cast = { version = "~54.2.0" }
-arrow-ipc = { version = "~54.2.0" }
-arrow-json = { version = "~54.2.0" }
-arrow-ord = { version = "~54.2.0" }
-arrow-row = { version = "~54.2.0" }
-arrow-schema = { version = "~54.2.0", features = ["serde"] }
-arrow-select = { version = "~54.2.0" }
-object_store = { version = "~0.11.2", features = ["aws", "azure", "gcp"] }
-parquet = { version = "~54.2.0", features = ["async", "object_store"] }
+arrow = { version = "~56.0.0"}
+arrow-arith = { version = "~56.0.0" }
+arrow-array = { version = "~56.0.0" }
+arrow-buffer = { version = "~56.0.0" }
+arrow-cast = { version = "~56.0.0" }
+arrow-ipc = { version = "~56.0.0" }
+arrow-json = { version = "~56.0.0" }
+arrow-ord = { version = "~56.0.0" }
+arrow-row = { version = "~56.0.0" }
+arrow-schema = { version = "~56.0.0", features = ["serde"] }
+arrow-select = { version = "~56.0.0" }
+object_store = { version = "~0.12.3", features = ["aws", "azure", "gcp"] }
+parquet = { version = "~56.0.0", features = ["async", "object_store"] }
 
 # avro
 apache-avro = { version = "~0.21.0", features = ["derive"] }
 apache-avro-derive = { version = "~0.21.0" }
 
 # datafusion
-datafusion = { version = "~46.0.0" }
-datafusion-expr = { version = "~46.0.0" }
-datafusion-common = { version = "~46.0.0" }
-datafusion-physical-expr = { version = "~46.0.0" }
-datafusion-ffi = { version = "~46.0.0" }
+datafusion = { version = "=50.1.0" }
+datafusion-expr = { version = "=50.1.0" }
+datafusion-common = { version = "=50.1.0" }
+datafusion-physical-expr = { version = "=50.1.0" }
+datafusion-ffi = { version = "=50.1.0" }
 
 # serde
 percent-encoding = { version = "~2.3.1" }
@@ -68,16 +68,16 @@ serde_json = { version = "~1.0" }
 
 # "stdlib"
 thiserror = { version = "~2.0.11" }
-bytes = { version = "~1.10" }
-chrono = { version = "=0.4.39" }
+bytes = { version = "~1.11" }
+chrono = { version = "~0.4.42" }
 lazy_static = { version = "~1.5.0" }
 log = { version = "~0.4" }
 num-traits = { version = "~0.2" }
 once_cell = { version = "~1.21.3" }
 paste = { version = "~1.0.15" }
-strum = { version = "~0.27.0", features = ["derive"] }
-strum_macros = "~0.27.0"
-url = { version = "~2.5.4" }
+strum = { version = "~0.27.2", features = ["derive"] }
+strum_macros = "~0.27.2"
+url = { version = "~2.5.7" }
 
 # runtime / async
 async-recursion = { version = "~1.1.1" }
@@ -87,7 +87,7 @@ futures = { version = "~0.3" }
 tokio = { version = "~1.48", features = ["rt-multi-thread"] }
 
 # protobuf
-prost = { version = "~0.13" }
+prost = { version = "~0.13.1" }
 
 # compression
 flate2 = { version = "^1.1" }
