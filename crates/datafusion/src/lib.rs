@@ -230,7 +230,7 @@ impl TableProvider for HudiDataSource {
 
         let fsc = FileScanConfigBuilder::new(url, table_schema, Arc::new(parquet_source))
             .with_file_groups(file_groups)
-            .with_projection_indices(projection.cloned())
+            .with_projection(projection.cloned())
             .with_limit(limit)
             .build();
 
