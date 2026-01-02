@@ -128,7 +128,7 @@ impl Storage {
             .filename()
             .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", &obj_meta)))?;
         let size = obj_meta.size;
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(size);
+        let reader = ParquetObjectReader::new(obj_store, obj_meta);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let parquet_meta = builder.metadata().clone();
         let num_records = parquet_meta.file_metadata().num_rows();
@@ -151,7 +151,7 @@ impl Storage {
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
+        let reader = ParquetObjectReader::new(obj_store, meta);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         Ok(builder.metadata().as_ref().clone())
     }
@@ -189,7 +189,7 @@ impl Storage {
         let meta = obj_store.head(&obj_path).await?;
 
         // read parquet
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
+        let reader = ParquetObjectReader::new(obj_store, meta);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let schema = builder.schema().clone();
         let mut stream = builder.build()?;

@@ -36,8 +36,7 @@ use hudi::table::Table;
 use hudi::timeline::instant::Instant;
 use hudi::timeline::Timeline;
 use pyo3::exceptions::PyException;
-use pyo3::prelude::*;
-use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyResult, Python};
+use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyObject, PyResult, Python};
 use std::error::Error;
 
 create_exception!(_internal, HudiCoreError, PyException);
@@ -94,12 +93,12 @@ impl HudiFileGroupReader {
         &self,
         relative_path: &str,
         py: Python,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<PyObject> {
         rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }
-    fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<Py<PyAny>> {
+    fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<PyObject> {
         let mut file_group = FileGroup::new_with_base_file_name(
             &file_slice.base_file_name,
             &file_slice.partition_path,
@@ -130,7 +129,7 @@ impl HudiFileGroupReader {
         base_file_path: &str,
         log_file_paths: Vec<String>,
         py: Python,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<PyObject> {
         rt().block_on(
             self.inner
                 .read_file_slice_from_paths(base_file_path, log_file_paths),
@@ -153,7 +152,7 @@ pub struct HudiFileSlice {
     #[pyo3(get)]
     base_file_name: String,
     #[pyo3(get)]
-    base_file_size: u64,
+    base_file_size: usize,
     #[pyo3(get)]
     base_file_byte_size: i64,
     #[pyo3(get)]
@@ -326,13 +325,13 @@ impl HudiTable {
         })
     }
 
-    fn get_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
+    fn get_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
     }
 
-    fn get_partition_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
+    fn get_partition_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_partition_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
@@ -456,7 +455,7 @@ impl HudiTable {
         &self,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<PyObject> {
         rt().block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
@@ -468,7 +467,7 @@ impl HudiTable {
         timestamp: &str,
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<PyObject> {
         rt().block_on(
             self.inner
                 .read_snapshot_as_of(timestamp, filters.unwrap_or_default()),
@@ -483,7 +482,7 @@ impl HudiTable {
         start_timestamp: &str,
         end_timestamp: Option<&str>,
         py: Python,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<PyObject> {
         rt().block_on(
             self.inner
                 .read_incremental_records(start_timestamp, end_timestamp),
@@ -582,7 +581,7 @@ impl HudiTimeline {
         })
     }
 
-    pub fn get_latest_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
+    pub fn get_latest_schema(&self, py: Python) -> PyResult<PyObject> {
         rt().block_on(self.inner.get_latest_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)

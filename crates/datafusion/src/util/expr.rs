@@ -50,8 +50,8 @@ pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<(String, String, String)> {
 fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
     // extract the column and literal from the binary expression
     let (column, literal) = match (&*binary_expr.left, &*binary_expr.right) {
-        (Expr::Column(col), Expr::Literal(lit, _)) => (col, lit),
-        (Expr::Literal(lit, _), Expr::Column(col)) => (col, lit),
+        (Expr::Column(col), Expr::Literal(lit)) => (col, lit),
+        (Expr::Literal(lit), Expr::Column(col)) => (col, lit),
         _ => return None,
     };
 
