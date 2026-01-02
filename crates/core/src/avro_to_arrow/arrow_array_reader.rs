@@ -21,25 +21,25 @@ use crate::avro_to_arrow::to_arrow_schema;
 use crate::error::{CoreError, Result};
 use apache_avro::schema::RecordSchema;
 use apache_avro::{
-    error::Details as AvroDetails,
+    AvroResult, Error as AvroError,
+    error::Details as AvroErrorDetails,
     schema::{Schema as AvroSchema, SchemaKind},
     types::Value,
-    AvroResult, Error as AvroError,
 };
 use arrow::array::{
-    make_array, Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder,
-    LargeStringArray, ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray,
-    StringBuilder, StringDictionaryBuilder,
+    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, LargeStringArray,
+    ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StringBuilder,
+    StringDictionaryBuilder, make_array,
 };
 use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
 use arrow::buffer::{Buffer, MutableBuffer};
 use arrow::datatypes::Fields;
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNumericType, ArrowPrimitiveType, DataType, Date32Type, Date64Type,
-    Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
+    Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
     Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::error::ArrowError;
 use arrow::error::ArrowError::SchemaError;
@@ -299,7 +299,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             e => {
                 return Err(SchemaError(format!(
                     "Nested list data builder type is not supported: {e:?}"
-                )))
+                )));
             }
         };
 
@@ -364,7 +364,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     e => {
                         return Err(SchemaError(format!(
                             "Nested list data builder type is not supported: {e:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -498,7 +498,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             | DataType::Time64(_) => {
                 return Err(SchemaError(
                     "Temporal types are not yet supported, see ARROW-4803".to_string(),
-                ))
+                ));
             }
             DataType::Utf8 => flatten_string_values(rows)
                 .into_iter()
@@ -657,7 +657,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             t => {
                                 return Err(SchemaError(format!(
                                     "TimeUnit {t:?} not supported with Time64"
-                                )))
+                                )));
                             }
                         }
                     }
@@ -671,7 +671,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                         t => {
                             return Err(SchemaError(format!(
                                 "TimeUnit {t:?} not supported with Time32"
-                            )))
+                            )));
                         }
                     },
                     DataType::Utf8 | DataType::LargeUtf8 => Arc::new(
@@ -693,7 +693,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             })
                             .collect::<BinaryArray>(),
                     ) as ArrayRef,
-                    DataType::FixedSizeBinary(ref size) => {
+                    DataType::FixedSizeBinary(size) => {
                         Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                             rows.iter().map(|row| {
                                 let maybe_value = self.field_lookup(&field_path, row);
@@ -702,9 +702,9 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             *size,
                         )?) as ArrayRef
                     }
-                    DataType::List(ref list_field) => {
+                    DataType::List(list_field) => {
                         match list_field.data_type() {
-                            DataType::Dictionary(ref key_ty, _) => {
+                            DataType::Dictionary(key_ty, _) => {
                                 self.build_wrapped_list_array(rows, &field_path, key_ty)?
                             }
                             _ => {
@@ -723,7 +723,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             }
                         }
                     }
-                    DataType::Dictionary(ref key_ty, ref val_ty) => {
+                    DataType::Dictionary(key_ty, val_ty) => {
                         self.build_string_dictionary_array(rows, &field_path, key_ty, val_ty)?
                     }
                     DataType::Struct(fields) => {
@@ -764,7 +764,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                         return Err(SchemaError(format!(
                             "type {:?} not supported",
                             field.data_type()
-                        )))
+                        )));
                     }
                 };
                 Ok(arr)
@@ -857,49 +857,42 @@ fn resolve_string(v: &Value) -> ArrowResult<Option<String>> {
     match v {
         Value::String(s) => Ok(Some(s.clone())),
         Value::Bytes(bytes) => String::from_utf8(bytes.to_vec())
-            .map_err(|e| AvroError::new(AvroDetails::ConvertToUtf8(e)))
+            .map_err(|e| AvroError::new(AvroErrorDetails::ConvertToUtf8(e)))
             .map(Some),
         Value::Enum(_, s) => Ok(Some(s.clone())),
         Value::Null => Ok(None),
-        other => Err(AvroError::new(AvroDetails::GetString(other.clone()))),
+        other => Err(AvroError::new(AvroErrorDetails::GetString(
+            other.clone().into(),
+        ))),
     }
     .map_err(|e| SchemaError(format!("expected resolvable string : {e:?}")))
 }
 
-fn resolve_u8(v: &Value) -> AvroResult<u8> {
-    let int = match v {
-        Value::Int(n) => Ok(Value::Int(*n)),
-        Value::Long(n) => Ok(Value::Int(*n as i32)),
-        other => Err(AvroError::new(AvroDetails::GetU8(other.clone()))),
-    }?;
-    if let Value::Int(n) = int {
-        if n >= 0 && n <= u8::MAX as i32 {
-            return Ok(n as u8);
-        }
-    }
+fn resolve_u8(v: &Value) -> Option<u8> {
+    let v = match v {
+        Value::Union(_, inner) => inner.as_ref(),
+        _ => v,
+    };
 
-    Err(AvroError::new(AvroDetails::GetU8(int)))
+    match v {
+        Value::Int(n) => u8::try_from(*n).ok(),
+        Value::Long(n) => u8::try_from(*n).ok(),
+        _ => None,
+    }
 }
 
 fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
-    let v = if let Value::Union(_, b) = v { b } else { v };
+    let v = match v {
+        Value::Union(_, inner) => inner.as_ref(),
+        _ => v,
+    };
+
     match v {
-        Value::Bytes(_) => Ok(v.clone()),
-        Value::String(s) => Ok(Value::Bytes(s.clone().into_bytes())),
-        Value::Array(items) => Ok(Value::Bytes(
-            items
-                .iter()
-                .map(resolve_u8)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?,
-        )),
-        other => Err(AvroError::new(AvroDetails::GetBytes(other.clone()))),
-    }
-    .ok()
-    .and_then(|v| match v {
-        Value::Bytes(s) => Some(s),
+        Value::Bytes(bytes) => Some(bytes.clone()),
+        Value::String(s) => Some(s.as_bytes().to_vec()),
+        Value::Array(items) => items.iter().map(resolve_u8).collect::<Option<Vec<u8>>>(),
         _ => None,
-    })
+    }
 }
 
 fn resolve_fixed(v: &Value, size: usize) -> Option<Vec<u8>> {

@@ -256,9 +256,11 @@ mod v6_tables {
                 .into_iter()
                 .map(|(_, rider, _)| rider)
                 .collect::<Vec<_>>();
-            assert!(riders
-                .iter()
-                .all(|rider| { !deleted_riders.contains(&rider.as_str()) }));
+            assert!(
+                riders
+                    .iter()
+                    .all(|rider| { !deleted_riders.contains(&rider.as_str()) })
+            );
 
             // verify deleted record as of the first commit
             let commit_timestamps = hudi_table
@@ -502,9 +504,11 @@ mod v8_tables {
                 .collect();
 
             // Deleted riders should not be present
-            assert!(riders
-                .iter()
-                .all(|rider| { !deleted_riders.contains(rider) }));
+            assert!(
+                riders
+                    .iter()
+                    .all(|rider| { !deleted_riders.contains(rider) })
+            );
 
             // Should have 6 active riders (8 - 2 deleted)
             assert_eq!(riders.len(), 6);

@@ -16,11 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::HudiTableConfig;
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::schema::delete::transform_delete_record_batch;
-use crate::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
@@ -158,7 +158,7 @@ mod tests {
         let names: Vec<Option<String>> = (0..num_rows)
             .map(|i| {
                 if i % 2 == 0 {
-                    Some(format!("name_{}", i))
+                    Some(format!("name_{i}"))
                 } else {
                     None
                 }
@@ -183,7 +183,7 @@ mod tests {
 
         let record_keys: Vec<String> = (0..num_rows).map(|i| i.to_string()).collect();
         let partition_paths: Vec<String> =
-            (0..num_rows).map(|i| format!("partition_{}", i)).collect();
+            (0..num_rows).map(|i| format!("partition_{i}")).collect();
         let ordering_vals: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.6).collect();
 
         let record_key_array = Arc::new(StringArray::from(record_keys));

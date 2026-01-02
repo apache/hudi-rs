@@ -285,7 +285,7 @@ mod tests {
             match t {
                 SampleTableMdt::V8Nonpartitioned => {
                     let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists(), "zip file should exist: {:?}", path);
+                    assert!(path.exists(), "zip file should exist: {path:?}");
                 }
             }
         }

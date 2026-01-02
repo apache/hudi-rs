@@ -93,11 +93,12 @@ mod listing;
 pub mod partition;
 mod validation;
 
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::config::HudiConfigs;
-use crate::expr::filter::{from_str_tuples, Filter};
+use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
@@ -106,9 +107,8 @@ use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
-use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
+use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
-use crate::Result;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -485,8 +485,7 @@ impl Table {
                 Ok(mdt) => Some(mdt),
                 Err(e) => {
                     log::warn!(
-                        "Failed to create metadata table, falling back to storage listing: {}",
-                        e
+                        "Failed to create metadata table, falling back to storage listing: {e}"
                     );
                     None
                 }
@@ -796,6 +795,7 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HUDI_CONF_DIR;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
         IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
@@ -803,13 +803,12 @@ mod tests {
         TimelineLayoutVersion, TimelineTimezone,
     };
     use crate::config::util::{empty_filters, empty_options};
-    use crate::config::HUDI_CONF_DIR;
     use crate::error::CoreError;
     use crate::metadata::meta_field::MetaField;
-    use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
+    use crate::storage::util::join_url_segments;
     use crate::timeline::EARLIEST_START_TIMESTAMP;
-    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
+    use hudi_test::{SampleTable, assert_arrow_field_names_eq, assert_avro_field_names_eq};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -874,13 +873,11 @@ mod tests {
                 cloud_prefixes
                     .iter()
                     .any(|prefix| key_lower.starts_with(prefix)),
-                "Storage option key '{}' should start with a cloud storage prefix",
-                key
+                "Storage option key '{key}' should start with a cloud storage prefix"
             );
             assert!(
                 !value.is_empty(),
-                "Storage option value for key '{}' should not be empty",
-                key
+                "Storage option value for key '{key}' should not be empty"
             );
         }
     }
@@ -1125,7 +1122,10 @@ mod tests {
         // Environment variable HUDI_CONF_DIR points to nothing
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("random/wrong/dir");
-        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        }
         let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
@@ -1136,7 +1136,10 @@ mod tests {
         // With global config
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
-        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        }
         let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         let actual: String = configs.get(DatabaseName).unwrap().into();
@@ -1145,7 +1148,10 @@ mod tests {
         assert_eq!(actual, "MERGE_ON_READ");
         let actual: String = configs.get(TableName).unwrap().into();
         assert_eq!(actual, "trips");
-        env::remove_var(HUDI_CONF_DIR)
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            env::remove_var(HUDI_CONF_DIR);
+        }
     }
 
     #[test]

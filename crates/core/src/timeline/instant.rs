@@ -16,11 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::error::StorageError;
-use crate::Result;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ impl FromStr for Action {
             "commit" => Ok(Action::Commit),
             "deltacommit" => Ok(Action::DeltaCommit),
             "replacecommit" => Ok(Action::ReplaceCommit),
-            _ => Err(CoreError::Timeline(format!("Invalid action: {}", s))),
+            _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
 }
@@ -80,8 +80,7 @@ impl FromStr for State {
             "inflight" => Ok(State::Inflight),
             "" => Ok(State::Completed),
             _ => Err(CoreError::Timeline(format!(
-                "Invalid state suffix: {}",
-                suffix
+                "Invalid state suffix: {suffix}"
             ))),
         }
     }
@@ -143,7 +142,7 @@ impl Instant {
     pub fn try_from_file_name_and_timezone(file_name: &str, timezone: &str) -> Result<Self> {
         let (timestamp_part, action_suffix) = file_name
             .split_once('.')
-            .ok_or_else(|| CoreError::Timeline(format!("Invalid file name: {}", file_name)))?;
+            .ok_or_else(|| CoreError::Timeline(format!("Invalid file name: {file_name}")))?;
 
         let (action, state) = Self::parse_action_and_state(action_suffix)?;
 
@@ -157,8 +156,7 @@ impl Instant {
 
             if state != State::Completed {
                 return Err(CoreError::Timeline(format!(
-                    "Underscore timestamp format is only valid for completed instants: {}",
-                    file_name
+                    "Underscore timestamp format is only valid for completed instants: {file_name}"
                 )));
             }
 
@@ -187,8 +185,7 @@ impl Instant {
     fn validate_timestamp(timestamp: &str) -> Result<()> {
         if !matches!(timestamp.len(), 14 | 17) {
             return Err(CoreError::Timeline(format!(
-                "Timestamp must be in format yyyyMMddHHmmss or yyyyMMddHHmmssSSS, but got: {}",
-                timestamp
+                "Timestamp must be in format yyyyMMddHHmmss or yyyyMMddHHmmssSSS, but got: {timestamp}"
             )));
         }
         Ok(())
@@ -214,25 +211,24 @@ impl Instant {
         if timestamp.len() == 17 && timestamp.chars().all(|c| c.is_ascii_digit()) {
             let epoch_ms: i64 = timestamp
                 .parse()
-                .map_err(|e| CoreError::Timeline(format!("Invalid epoch timestamp: {}", e)))?;
+                .map_err(|e| CoreError::Timeline(format!("Invalid epoch timestamp: {e}")))?;
             return DateTime::from_timestamp_millis(epoch_ms)
                 .ok_or_else(|| CoreError::Timeline("Invalid epoch millis".to_string()));
         }
 
         Err(CoreError::Timeline(format!(
-            "Cannot parse timestamp '{}': not a valid date format or epoch millis",
-            timestamp
+            "Cannot parse timestamp '{timestamp}': not a valid date format or epoch millis"
         )))
     }
 
     fn parse_naive_datetime(timestamp: &str) -> Result<NaiveDateTime> {
         let naive_dt = NaiveDateTime::parse_from_str(&timestamp[..14], "%Y%m%d%H%M%S")
-            .map_err(|e| CoreError::Timeline(format!("Failed to parse timestamp: {}", e)))?;
+            .map_err(|e| CoreError::Timeline(format!("Failed to parse timestamp: {e}")))?;
 
         if timestamp.len() == 17 {
             let millis: u32 = timestamp[14..]
                 .parse()
-                .map_err(|e| CoreError::Timeline(format!("Failed to parse milliseconds: {}", e)))?;
+                .map_err(|e| CoreError::Timeline(format!("Failed to parse milliseconds: {e}")))?;
             naive_dt
                 .with_nanosecond(millis * 1_000_000)
                 .ok_or_else(|| CoreError::Timeline("Invalid milliseconds".to_string()))
@@ -305,8 +301,7 @@ impl Instant {
         commit_file_path
             .to_str()
             .ok_or(StorageError::InvalidPath(format!(
-                "Failed to get file path for {:?}",
-                self
+                "Failed to get file path for {self:?}"
             )))
             .map_err(CoreError::Storage)
             .map(|s| s.to_string())
@@ -446,7 +441,10 @@ mod tests {
     fn test_create_instant_using_local_timezone() {
         // Set a fixed timezone for consistent testing
         let original_tz = std::env::var("TZ").ok();
-        std::env::set_var("TZ", "Etc/GMT+5"); // UTC-5 fixed timezone with no DST
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            std::env::set_var("TZ", "Etc/GMT+5"); // UTC-5 fixed timezone with no DST
+        }
 
         let file_name = "20240103153000.commit";
         let instant_local = Instant::try_from_file_name_and_timezone(file_name, "local").unwrap();
@@ -457,9 +455,12 @@ mod tests {
         assert_eq!(offset_seconds, 5 * 3600);
 
         // Restore original TZ
-        match original_tz {
-            Some(tz) => std::env::set_var("TZ", tz),
-            None => std::env::remove_var("TZ"),
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            match original_tz {
+                Some(tz) => std::env::set_var("TZ", tz),
+                None => std::env::remove_var("TZ"),
+            }
         }
     }
 
@@ -531,10 +532,12 @@ mod tests {
         // Underscore format with non-completed state should fail
         let result = Instant::from_str("20240101120000000_20240101120005000.commit.inflight");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("only valid for completed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for completed")
+        );
     }
 
     #[test]

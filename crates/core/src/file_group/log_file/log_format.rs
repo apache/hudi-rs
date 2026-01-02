@@ -16,8 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::error::CoreError;
 use crate::Result;
+use crate::error::CoreError;
 
 pub const MAGIC: &[u8] = b"#HUDI#";
 

@@ -134,7 +134,7 @@ impl std::hash::Hash for Key {
 impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.content_as_str() {
-            Ok(s) => write!(f, "Key{{{}}}", s),
+            Ok(s) => write!(f, "Key{{{s}}}"),
             Err(_) => write!(f, "Key{{<binary>}}"),
         }
     }
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_utf8_key_display() {
         let k = Utf8Key::new("mykey");
-        assert_eq!(format!("{}", k), "Utf8Key{mykey}");
+        assert_eq!(format!("{k}"), "Utf8Key{mykey}");
     }
 
     #[test]
@@ -401,11 +401,11 @@ mod tests {
     #[test]
     fn test_key_display() {
         let k1 = Key::from_bytes(vec![0, 4, b't', b'e', b's', b't']);
-        assert_eq!(format!("{}", k1), "Key{test}");
+        assert_eq!(format!("{k1}"), "Key{test}");
 
         // Binary key (invalid UTF-8)
         let k2 = Key::from_bytes(vec![0, 3, 0xFF, 0xFE, 0xFD]);
-        assert_eq!(format!("{}", k2), "Key{<binary>}");
+        assert_eq!(format!("{k2}"), "Key{<binary>}");
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
         bytes.push(0); // MVCC
 
         let kv = KeyValue::parse(&bytes, 0);
-        assert!(format!("{}", kv).contains("test"));
+        assert!(format!("{kv}").contains("test"));
     }
 
     #[test]

@@ -36,10 +36,10 @@ static DELETE_RECORD_AVRO_SCHEMA_IN_JSON: Lazy<Result<JsonValue>> = Lazy::new(||
         .join("HoodieDeleteRecord.avsc");
 
     let content = fs::read_to_string(schema_path)
-        .map_err(|e| CoreError::Schema(format!("Failed to read schema file: {}", e)))?;
+        .map_err(|e| CoreError::Schema(format!("Failed to read schema file: {e}")))?;
 
     serde_json::from_str(&content)
-        .map_err(|e| CoreError::Schema(format!("Failed to parse schema to JSON: {}", e)))
+        .map_err(|e| CoreError::Schema(format!("Failed to parse schema to JSON: {e}")))
 });
 
 // TODO further improve perf by using once_cell for the whole function based on table config
@@ -51,7 +51,7 @@ pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<
         _ => {
             return Err(CoreError::Schema(
                 "Expected a record for delete record schema".to_string(),
-            ))
+            ));
         }
     };
 
@@ -70,7 +70,7 @@ pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<
         _ => {
             return Err(CoreError::Schema(
                 "Expected a union for ordering value in delete record schema".to_string(),
-            ))
+            ));
         }
     };
 
@@ -116,7 +116,7 @@ static DELETE_RECORD_LIST_AVRO_SCHEMA: Lazy<Result<AvroSchema>> = Lazy::new(|| {
         .join("HoodieDeleteRecordList.avsc");
 
     let mut file = File::open(&schema_path)
-        .map_err(|e| CoreError::Schema(format!("Failed to open schema file: {}", e)))?;
+        .map_err(|e| CoreError::Schema(format!("Failed to open schema file: {e}")))?;
 
     AvroSchema::parse_reader(&mut file).map_err(CoreError::AvroError)
 });

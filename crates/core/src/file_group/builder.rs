@@ -16,15 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::file_group::FileGroup;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::metadata::table_record::FilesPartitionRecord;
 use crate::timeline::completion_time::CompletionTimeView;
-use crate::Result;
 use dashmap::DashMap;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -157,7 +157,7 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
     completion_time_view: &V,
 ) -> Result<DashMap<String, Vec<FileGroup>>> {
     let file_groups_map = DashMap::new();
-    let base_file_suffix = format!(".{}", base_file_extension);
+    let base_file_suffix = format!(".{base_file_extension}");
 
     for (partition_path, record) in records {
         // Skip __all_partitions__ record - it lists partition names, not files
@@ -173,9 +173,8 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 // Log file: starts with '.'
                 let mut log_file = LogFile::from_str(file_name).map_err(|e| {
                     CoreError::FileGroup(format!(
-                        "Metadata table contains invalid/unsupported log file name '{}' in partition '{}': {}. \
-                         This may indicate data corruption.",
-                        file_name, partition_path, e
+                        "Metadata table contains invalid/unsupported log file name '{file_name}' in partition '{partition_path}': {e}. \
+                         This may indicate data corruption."
                     ))
                 })?;
 
@@ -194,9 +193,8 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 // Base file: ends with base file extension
                 let mut base_file = BaseFile::from_str(file_name).map_err(|e| {
                     CoreError::FileGroup(format!(
-                        "Metadata table contains invalid/unsupported base file name '{}' in partition '{}': {}. \
-                         This may indicate data corruption.",
-                        file_name, partition_path, e
+                        "Metadata table contains invalid/unsupported base file name '{file_name}' in partition '{partition_path}': {e}. \
+                         This may indicate data corruption."
                     ))
                 })?;
 
@@ -278,7 +276,7 @@ mod tests {
         use crate::config::HudiConfigs;
         use crate::timeline::instant::{Action, Instant, State};
         use crate::timeline::view::TimelineView;
-        use serde_json::{json, Map, Value};
+        use serde_json::{Map, Value, json};
         use std::collections::HashSet;
         use std::sync::Arc;
 
@@ -862,9 +860,10 @@ mod tests {
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert!(err
-                .to_string()
-                .contains("invalid/unsupported base file name"));
+            assert!(
+                err.to_string()
+                    .contains("invalid/unsupported base file name")
+            );
             assert!(err.to_string().contains("partition1"));
         }
 
@@ -888,9 +887,10 @@ mod tests {
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
-            assert!(err
-                .to_string()
-                .contains("invalid/unsupported log file name"));
+            assert!(
+                err.to_string()
+                    .contains("invalid/unsupported log file name")
+            );
         }
 
         #[test]
@@ -1163,7 +1163,7 @@ mod tests {
     mod test_replaced_file_groups_from_replace_commit {
         use super::super::*;
         use crate::table::partition::EMPTY_PARTITION_PATH;
-        use serde_json::{json, Map, Value};
+        use serde_json::{Map, Value, json};
 
         #[test]
         fn test_missing_partition_to_replace() {

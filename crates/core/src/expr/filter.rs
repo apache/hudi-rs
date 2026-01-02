@@ -17,11 +17,11 @@
  * under the License.
  */
 
+use crate::Result;
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
-use crate::Result;
 use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar, StringArray};
-use arrow_cast::{cast_with_options, CastOptions};
+use arrow_cast::{CastOptions, cast_with_options};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
 use std::str::FromStr;
@@ -162,7 +162,7 @@ impl TryFrom<(Filter, &Schema)> for SchemableFilter {
     fn try_from((filter, schema): (Filter, &Schema)) -> Result<Self, Self::Error> {
         let field_name = filter.field_name.clone();
         let field: &Field = schema.field_with_name(&field_name).map_err(|e| {
-            CoreError::Schema(format!("Field {} not found in schema: {:?}", field_name, e))
+            CoreError::Schema(format!("Field {field_name} not found in schema: {e:?}"))
         })?;
 
         let operator = filter.operator;
@@ -188,9 +188,8 @@ impl SchemableFilter {
         let value = StringArray::from(Vec::from(value));
 
         Ok(Scalar::new(
-            cast_with_options(&value, data_type, &cast_options).map_err(|e| {
-                CoreError::Schema(format!("Unable to cast {:?}: {:?}", data_type, e))
-            })?,
+            cast_with_options(&value, data_type, &cast_options)
+                .map_err(|e| CoreError::Schema(format!("Unable to cast {data_type:?}: {e:?}")))?,
         ))
     }
 
@@ -334,9 +333,7 @@ mod tests {
             assert_eq!(
                 result,
                 BooleanArray::from(expected),
-                "Failed for operator {:?} with value {}",
-                operator,
-                value
+                "Failed for operator {operator:?} with value {value}"
             );
         }
 

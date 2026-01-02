@@ -16,11 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::HudiTableConfig;
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::error::CoreError::InvalidPartitionPath;
 use crate::expr::filter::{Filter, SchemableFilter};
-use crate::Result;
 
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
@@ -154,7 +154,7 @@ impl PartitionPruner {
             .map(|(field, part)| {
                 let value = if self.is_hive_style {
                     let (name, value) = part.split_once('=').ok_or(InvalidPartitionPath(
-                        format!("Partition path should be hive-style but got {}", part),
+                        format!("Partition path should be hive-style but got {part}"),
                     ))?;
                     if name != field.name() {
                         return Err(InvalidPartitionPath(format!(
@@ -337,10 +337,12 @@ mod tests {
         };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Field invalid_field not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Field invalid_field not found in schema")
+        );
     }
 
     #[test]

@@ -27,17 +27,17 @@ use tokio::runtime::Runtime;
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
 use hudi::error::CoreError;
+use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
-use hudi::file_group::FileGroup;
 use hudi::storage::error::StorageError;
-use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
-use hudi::timeline::instant::Instant;
+use hudi::table::builder::TableBuilder;
 use hudi::timeline::Timeline;
+use hudi::timeline::instant::Instant;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyResult, Python};
+use pyo3::{PyErr, PyResult, Python, create_exception, pyclass, pyfunction, pymethods};
 use std::error::Error;
 
 create_exception!(_internal, HudiCoreError, PyException);
@@ -51,6 +51,7 @@ where
 }
 
 #[derive(thiserror::Error, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum PythonError {
     #[error("Error in Hudi core: {0}")]
     HudiCore(#[from] CoreError),
@@ -98,6 +99,7 @@ impl HudiFileGroupReader {
         rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+            .map(|b| b.unbind())
     }
     fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<Py<PyAny>> {
         let mut file_group = FileGroup::new_with_base_file_name(
@@ -115,14 +117,14 @@ impl HudiFileGroupReader {
             .next()
             .ok_or_else(|| {
                 CoreError::FileGroup(format!(
-                    "Failed to get file slice from file group: {:?}",
-                    file_group
+                    "Failed to get file slice from file group: {file_group:?}"
                 ))
             })
             .map_err(PythonError::from)?;
         rt().block_on(self.inner.read_file_slice(file_slice))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+            .map(|b| b.unbind())
     }
 
     fn read_file_slice_from_paths(
@@ -137,6 +139,7 @@ impl HudiFileGroupReader {
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
+        .map(|b| b.unbind())
     }
 }
 
@@ -172,8 +175,7 @@ impl HudiFileSlice {
             .map(String::from)
             .ok_or_else(|| {
                 StorageError::InvalidPath(format!(
-                    "Failed to get base file relative path for file slice: {:?}",
-                    self
+                    "Failed to get base file relative path for file slice: {self:?}"
                 ))
             })
             .map_err(CoreError::from)
@@ -189,8 +191,7 @@ impl HudiFileSlice {
                 .map(String::from)
                 .ok_or_else(|| {
                     StorageError::InvalidPath(format!(
-                        "Failed to get log file relative path for file slice: {:?}",
-                        self
+                        "Failed to get log file relative path for file slice: {self:?}"
                     ))
                 })
                 .map_err(CoreError::from)
@@ -318,7 +319,7 @@ impl HudiTable {
     }
 
     fn get_avro_schema(&self, py: Python) -> PyResult<String> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let avro_schema = rt()
                 .block_on(self.inner.get_avro_schema())
                 .map_err(PythonError::from)?;
@@ -330,16 +331,18 @@ impl HudiTable {
         rt().block_on(self.inner.get_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+            .map(|b| b.unbind())
     }
 
     fn get_partition_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
         rt().block_on(self.inner.get_partition_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+            .map(|b| b.unbind())
     }
 
     fn get_timeline(&self, py: Python) -> HudiTimeline {
-        py.allow_threads(|| {
+        py.detach(|| {
             let timeline = self.inner.get_timeline();
             HudiTimeline::from(timeline)
         })
@@ -352,7 +355,7 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let file_slices = rt()
                 .block_on(
                     self.inner
@@ -374,7 +377,7 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let file_slices = rt()
                 .block_on(self.inner.get_file_slices_splits_as_of(
                     num_splits,
@@ -395,7 +398,7 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let file_slices = rt()
                 .block_on(self.inner.get_file_slices(filters.unwrap_or_default()))
                 .map_err(PythonError::from)?;
@@ -410,7 +413,7 @@ impl HudiTable {
         filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let file_slices = rt()
                 .block_on(
                     self.inner
@@ -428,7 +431,7 @@ impl HudiTable {
         end_timestamp: Option<&str>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let file_slices = rt()
                 .block_on(
                     self.inner
@@ -460,6 +463,7 @@ impl HudiTable {
         rt().block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+            .map(|b| b.unbind())
     }
 
     #[pyo3(signature = (timestamp, filters=None))]
@@ -475,6 +479,7 @@ impl HudiTable {
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
+        .map(|b| b.unbind())
     }
 
     #[pyo3(signature = (start_timestamp, end_timestamp=None))]
@@ -490,6 +495,7 @@ impl HudiTable {
         )
         .map_err(PythonError::from)?
         .to_pyarrow(py)
+        .map(|b| b.unbind())
     }
 }
 
@@ -504,7 +510,7 @@ pub struct HudiTimeline {
 impl HudiTimeline {
     #[pyo3(signature = (desc=false))]
     pub fn get_completed_commits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let instants = rt()
                 .block_on(self.inner.get_completed_commits(desc))
                 .map_err(PythonError::from)?;
@@ -514,7 +520,7 @@ impl HudiTimeline {
 
     #[pyo3(signature = (desc=false))]
     pub fn get_completed_deltacommits(&self, desc: bool, py: Python) -> PyResult<Vec<HudiInstant>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let instants = rt()
                 .block_on(self.inner.get_completed_deltacommits(desc))
                 .map_err(PythonError::from)?;
@@ -528,7 +534,7 @@ impl HudiTimeline {
         desc: bool,
         py: Python,
     ) -> PyResult<Vec<HudiInstant>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let instants = rt()
                 .block_on(self.inner.get_completed_replacecommits(desc))
                 .map_err(PythonError::from)?;
@@ -542,7 +548,7 @@ impl HudiTimeline {
         desc: bool,
         py: Python,
     ) -> PyResult<Vec<HudiInstant>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let instants = rt()
                 .block_on(self.inner.get_completed_clustering_commits(desc))
                 .map_err(PythonError::from)?;
@@ -555,7 +561,7 @@ impl HudiTimeline {
         instant: &HudiInstant,
         py: Python,
     ) -> PyResult<String> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let commit_metadata = rt()
                 .block_on(self.inner.get_instant_metadata_in_json(&instant.inner))
                 .map_err(PythonError::from)?;
@@ -564,7 +570,7 @@ impl HudiTimeline {
     }
 
     pub fn get_latest_commit_timestamp(&self, py: Python) -> PyResult<String> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let commit_timestamp = self
                 .inner
                 .get_latest_commit_timestamp()
@@ -574,7 +580,7 @@ impl HudiTimeline {
     }
 
     pub fn get_latest_avro_schema(&self, py: Python) -> PyResult<String> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let schema = rt()
                 .block_on(self.inner.get_latest_avro_schema())
                 .map_err(PythonError::from)?;
@@ -586,6 +592,7 @@ impl HudiTimeline {
         rt().block_on(self.inner.get_latest_schema())
             .map_err(PythonError::from)?
             .to_pyarrow(py)
+            .map(|b| b.unbind())
     }
 }
 

@@ -17,8 +17,8 @@
  * under the License.
  */
 
-use crate::error::CoreError;
 use crate::Result;
+use crate::error::CoreError;
 use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
 use arrow::array::StringArray;

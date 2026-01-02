@@ -29,8 +29,8 @@
 //! [`TimelineView`] implements [`CompletionTimeView`] trait and is the main
 //! type used for completion time lookups throughout the codebase.
 
-use crate::config::table::HudiTableConfig::TimelineLayoutVersion;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig::TimelineLayoutVersion;
 use crate::file_group::FileGroup;
 use crate::timeline::completion_time::CompletionTimeView;
 use crate::timeline::instant::Instant;

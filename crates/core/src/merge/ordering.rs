@@ -16,15 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::HudiTableConfig;
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::record::{
     extract_commit_time_ordering_values, extract_event_time_ordering_values, extract_record_keys,
 };
-use crate::Result;
 use arrow_array::{
-    Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, UInt16Array, UInt32Array,
-    UInt64Array, UInt8Array,
+    Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_row::{OwnedRow, Row, RowConverter};
 use arrow_schema::DataType;
@@ -190,8 +190,8 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_array::{
-        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use std::sync::Arc;

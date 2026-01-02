@@ -17,11 +17,11 @@
  * under the License.
  */
 
+use crate::Result;
 use crate::config::table::HudiTableConfig::{TimelineHistoryPath, TimelinePath};
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
-use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -69,7 +69,7 @@ impl LSMTree {
             .hudi_configs
             .get_or_default(TimelinePath)
             .into();
-        format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
+        format!("{HUDI_METADATA_DIR}/{timeline_path}")
     }
 
     /// Returns the history directory path, resolved from configs.
@@ -84,12 +84,12 @@ impl LSMTree {
             .hudi_configs
             .get_or_default(TimelineHistoryPath)
             .into();
-        format!("{}/{}/{}", HUDI_METADATA_DIR, timeline_path, history_path)
+        format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
     }
 
     pub async fn read_manifest(&self) -> Result<Option<TimelineManifest>> {
         let history_dir = self.history_dir();
-        let version_path = format!("{}/_version_", history_dir);
+        let version_path = format!("{history_dir}/_version_");
         if let Ok(data) = self.storage.get_file_data(&version_path).await {
             let version_str =
                 String::from_utf8(data.to_vec()).map_err(|e| CoreError::Timeline(e.to_string()))?;
@@ -97,7 +97,7 @@ impl LSMTree {
                 .trim()
                 .parse::<i64>()
                 .map_err(|e| CoreError::Timeline(e.to_string()))?;
-            let manifest_path = format!("{}/manifest_{}", history_dir, version);
+            let manifest_path = format!("{history_dir}/manifest_{version}");
             let data = self.storage.get_file_data(&manifest_path).await?;
             let manifest: TimelineManifest =
                 serde_json::from_slice(&data).map_err(|e| CoreError::Timeline(e.to_string()))?;

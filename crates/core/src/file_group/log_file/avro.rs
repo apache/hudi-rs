@@ -16,9 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use apache_avro::types::Value as AvroValue;
 use apache_avro::AvroResult;
-use apache_avro::{from_avro_datum, Schema as AvroSchema};
+use apache_avro::types::Value as AvroValue;
+use apache_avro::{Schema as AvroSchema, from_avro_datum};
 use std::io::Read;
 
 pub struct AvroDataBlockContentReader<R: Read> {
@@ -53,7 +53,7 @@ impl<R: Read> Iterator for AvroDataBlockContentReader<R> {
             Err(e) => {
                 return Some(Err(apache_avro::Error::new(
                     apache_avro::error::Details::ReadBytes(e),
-                )))
+                )));
             }
         }
 

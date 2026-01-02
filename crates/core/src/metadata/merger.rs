@@ -21,11 +21,11 @@
 //! This module provides functionality to merge HFile records from base files
 //! and log files for the metadata table's files partition.
 
+use crate::Result;
 use crate::hfile::HFileRecord;
 use crate::metadata::table_record::{
-    decode_files_partition_record_with_schema, FilesPartitionRecord, HoodieMetadataFileInfo,
+    FilesPartitionRecord, HoodieMetadataFileInfo, decode_files_partition_record_with_schema,
 };
-use crate::Result;
 use apache_avro::Schema as AvroSchema;
 use std::collections::HashMap;
 
@@ -440,8 +440,8 @@ mod tests {
     async fn test_merge_log_files_from_scanner() -> crate::Result<()> {
         use crate::config::HudiConfigs;
         use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
-        use crate::storage::util::parse_uri;
         use crate::storage::Storage;
+        use crate::storage::util::parse_uri;
         use crate::timeline::selector::InstantRange;
         use std::sync::Arc;
 
@@ -521,8 +521,7 @@ mod tests {
         for (name, info) in &chennai.files {
             assert!(
                 name.contains(CHENNAI_UUID),
-                "File should contain Chennai UUID: {}",
-                name
+                "File should contain Chennai UUID: {name}"
             );
             assert!(!info.is_deleted, "File should not be deleted");
             assert!(info.size > 0, "File size should be > 0");
@@ -549,8 +548,7 @@ mod tests {
         for (name, info) in &sf.files {
             assert!(
                 name.contains(SAN_FRANCISCO_UUID),
-                "File should contain SF UUID: {}",
-                name
+                "File should contain SF UUID: {name}"
             );
             assert!(!info.is_deleted);
         }
@@ -574,8 +572,7 @@ mod tests {
         for (name, info) in &sp.files {
             assert!(
                 name.contains(SAO_PAULO_UUID),
-                "File should contain SP UUID: {}",
-                name
+                "File should contain SP UUID: {name}"
             );
             assert!(!info.is_deleted);
         }

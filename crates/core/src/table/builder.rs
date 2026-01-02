@@ -22,16 +22,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::Result;
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
-use crate::config::{HudiConfigs, HUDI_CONF_DIR};
+use crate::config::{HUDI_CONF_DIR, HudiConfigs};
 use crate::storage::Storage;
+use crate::table::Table;
 use crate::table::fs_view::FileSystemView;
 use crate::table::validation::validate_configs;
-use crate::table::Table;
 use crate::timeline::Timeline;
 use crate::util::collection::extend_if_absent;
-use crate::Result;
 
 /// Builder for creating a [Table] instance.
 #[derive(Debug, Clone)]
@@ -386,17 +386,20 @@ mod tests {
 
     #[test]
     fn test_resolve_cloud_env_vars_with_hudi_style() {
-        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
-        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+            std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
 
-        std::env::set_var(
-            "HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key",
-            "test_access_key",
-        );
-        std::env::set_var(
-            "HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key",
-            "test_secret_key",
-        );
+            std::env::set_var(
+                "HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key",
+                "test_access_key",
+            );
+            std::env::set_var(
+                "HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key",
+                "test_secret_key",
+            );
+        }
 
         let mut resolver = OptionResolver::new("test_uri");
         resolver.resolve_env_vars();
@@ -410,18 +413,24 @@ mod tests {
             Some(&"test_secret_key".to_string())
         );
 
-        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
-        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+            std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
+        }
     }
 
     #[test]
     fn test_resolve_cloud_env_vars_precedence() {
-        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
 
-        // Test that manually set storage options take precedence over env vars
-        std::env::set_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key", "env_access_key");
-        std::env::set_var("AWS_ACCESS_KEY_ID", "standard_access_key");
+            // Test that manually set storage options take precedence over env vars
+            std::env::set_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key", "env_access_key");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "standard_access_key");
+        }
 
         let mut resolver = OptionResolver::new("test_uri");
         resolver.storage_options.insert(
@@ -435,7 +444,10 @@ mod tests {
             Some(&"manual_access_key".to_string())
         );
 
-        std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        // SAFETY: This is a test function that runs single-threaded
+        unsafe {
+            std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+        }
     }
 }

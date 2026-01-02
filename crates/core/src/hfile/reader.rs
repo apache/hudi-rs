@@ -21,12 +21,12 @@
 use std::collections::BTreeMap;
 
 use crate::hfile::block::{
-    read_var_long, var_long_size_on_disk, BlockIndexEntry, DataBlock, HFileBlock, BLOCK_HEADER_SIZE,
+    BLOCK_HEADER_SIZE, BlockIndexEntry, DataBlock, HFileBlock, read_var_long, var_long_size_on_disk,
 };
 use crate::hfile::block_type::HFileBlockType;
 use crate::hfile::compression::CompressionCodec;
 use crate::hfile::error::{HFileError, Result};
-use crate::hfile::key::{compare_keys, Key, KeyValue, Utf8Key};
+use crate::hfile::key::{Key, KeyValue, Utf8Key, compare_keys};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
 use crate::hfile::trailer::HFileTrailer;
@@ -151,7 +151,7 @@ impl HFileReader {
     /// ```
     pub async fn open(storage: &Storage, relative_path: &str) -> Result<Self> {
         let bytes = storage.get_file_data(relative_path).await.map_err(|e| {
-            HFileError::InvalidFormat(format!("Failed to read HFile {}: {:?}", relative_path, e))
+            HFileError::InvalidFormat(format!("Failed to read HFile {relative_path}: {e:?}"))
         })?;
         Self::new(bytes.to_vec())
     }
@@ -529,10 +529,10 @@ impl HFileReader {
 
         // Parse schema from JSON
         let schema_str = std::str::from_utf8(schema_bytes)
-            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {}", e)))?;
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {e}")))?;
 
         let schema = AvroSchema::parse_str(schema_str)
-            .map_err(|e| HFileError::InvalidFormat(format!("Invalid Avro schema: {}", e)))?;
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid Avro schema: {e}")))?;
 
         // Cache the schema (ignore if already set by another thread)
         let _ = self.cached_schema.set(schema);
@@ -1112,7 +1112,7 @@ mod tests {
 
     fn read_test_hfile(filename: &str) -> Vec<u8> {
         let path = test_data_dir().join(filename);
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {:?}", path))
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {path:?}"))
     }
 
     #[test]
@@ -1169,8 +1169,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1235,7 +1235,7 @@ mod tests {
         let mut count = 0;
         for result in reader.iter().expect("Failed to create iterator") {
             let kv = result.expect("Failed to read kv");
-            let expected_key = format!("hudi-key-{:09}", count);
+            let expected_key = format!("hudi-key-{count:09}");
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             count += 1;
         }
@@ -1266,8 +1266,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1310,7 +1310,7 @@ mod tests {
         let mut count = 0;
         for result in reader.record_iter().expect("Failed to create iterator") {
             let record = result.expect("Failed to read record");
-            let expected_key = format!("hudi-key-{:09}", count);
+            let expected_key = format!("hudi-key-{count:09}");
             assert_eq!(record.key_as_str(), Some(expected_key.as_str()));
             count += 1;
         }
@@ -1438,8 +1438,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1485,8 +1485,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1545,7 +1545,7 @@ mod tests {
             assert!(reader.next().expect("Failed to move next"));
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
             assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000000000");
-            let expected_value = format!("hudi-value-000000000_{}", j);
+            let expected_value = format!("hudi-value-000000000_{j}");
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
         }
 
@@ -1596,8 +1596,8 @@ mod tests {
         // Read first 10 entries - keys have "-abcdefghij" suffix
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}-abcdefghij", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}-abcdefghij");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1672,8 +1672,8 @@ mod tests {
         // Read first 5 entries
         for i in 0..5 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("{}{:09}", large_key_prefix, i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("{large_key_prefix}{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1695,7 +1695,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek to a key deep in the file
-        let lookup_key = format!("{}000005340", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000005340");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Found);
@@ -1742,8 +1742,8 @@ mod tests {
         // Read first 5 entries
         for i in 0..5 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("{}{:09}", large_key_prefix, i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("{large_key_prefix}{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1766,7 +1766,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek to a key deep in the file
-        let lookup_key = format!("{}000005340", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000005340");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Found);
@@ -1802,7 +1802,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek to last key
-        let lookup_key = format!("{}000009999", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000009999");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Found);
@@ -1830,7 +1830,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek past last key
-        let lookup_key = format!("{}000009999a", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000009999a");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Eof);
@@ -1998,7 +1998,7 @@ mod tests {
     // 3. "city=san_francisco" - 2 parquet files (UUID: 036ded81-9ed4-479f-bcea-7145dfa0079b)
     // 4. "city=sao_paulo" - 2 parquet files (UUID: 8aa68f7e-afd6-4c94-b86c-8a886552e08d)
 
-    use crate::metadata::table_record::{decode_files_partition_record, FilesPartitionRecord};
+    use crate::metadata::table_record::{FilesPartitionRecord, decode_files_partition_record};
     use hudi_test::QuickstartTripsTable;
 
     /// Get the path to the files partition directory in the test table.
@@ -2016,7 +2016,7 @@ mod tests {
     fn files_partition_hfile_path() -> PathBuf {
         let dir = files_partition_dir();
         let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("Failed to read directory {:?}: {}", dir, e))
+            .unwrap_or_else(|e| panic!("Failed to read directory {dir:?}: {e}"))
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 entry
@@ -2033,12 +2033,12 @@ mod tests {
         hfiles
             .last()
             .map(|e| e.path())
-            .unwrap_or_else(|| panic!("No HFile found in {:?}", dir))
+            .unwrap_or_else(|| panic!("No HFile found in {dir:?}"))
     }
 
     fn read_metadata_table_hfile() -> Vec<u8> {
         let path = files_partition_hfile_path();
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {:?}", path))
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {path:?}"))
     }
 
     /// Test reading and validating metadata table HFile structure.
@@ -2097,7 +2097,7 @@ mod tests {
         for record in &records {
             let key = record.key_as_str().expect("Key should be UTF-8");
             let files_record = decode_files_partition_record(&schema_reader, record)
-                .unwrap_or_else(|e| panic!("Failed to decode record for key {}: {}", key, e));
+                .unwrap_or_else(|e| panic!("Failed to decode record for key {key}: {e}"));
 
             match key {
                 FilesPartitionRecord::ALL_PARTITIONS_KEY => {
@@ -2128,8 +2128,7 @@ mod tests {
                     for file in &parquet_files {
                         assert!(
                             file.contains("6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc"),
-                            "chennai file ID mismatch: {}",
-                            file
+                            "chennai file ID mismatch: {file}"
                         );
                     }
                     // Validate file sizes are populated
@@ -2149,8 +2148,7 @@ mod tests {
                     for file in &parquet_files {
                         assert!(
                             file.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
-                            "san_francisco file ID mismatch: {}",
-                            file
+                            "san_francisco file ID mismatch: {file}"
                         );
                     }
                 }
@@ -2168,12 +2166,11 @@ mod tests {
                     for file in &parquet_files {
                         assert!(
                             file.contains("8aa68f7e-afd6-4c94-b86c-8a886552e08d"),
-                            "sao_paulo file ID mismatch: {}",
-                            file
+                            "sao_paulo file ID mismatch: {file}"
                         );
                     }
                 }
-                _ => panic!("Unexpected key: {}", key),
+                _ => panic!("Unexpected key: {key}"),
             }
         }
     }
@@ -2220,8 +2217,7 @@ mod tests {
         for (file_name, file_info) in &parquet_files {
             assert!(
                 file_name.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
-                "File should match san_francisco UUID: {}",
-                file_name
+                "File should match san_francisco UUID: {file_name}"
             );
             assert!(file_info.size > 0, "File size should be > 0");
             assert!(!file_info.is_deleted, "File should not be deleted");
@@ -2367,9 +2363,7 @@ mod tests {
             // Min should be <= Max lexicographically
             assert!(
                 min_key <= max_key,
-                "Min key should be <= Max key: {} vs {}",
-                min_key,
-                max_key
+                "Min key should be <= Max key: {min_key} vs {max_key}"
             );
         }
     }
@@ -2426,9 +2420,7 @@ mod tests {
             if let Some(ref prev) = prev_key {
                 assert!(
                     key > *prev,
-                    "Keys should be in ascending order: {} > {}",
-                    key,
-                    prev
+                    "Keys should be in ascending order: {key} > {prev}"
                 );
             }
             prev_key = Some(key);
@@ -2458,12 +2450,7 @@ mod tests {
         for expected_key in test_keys {
             let lookup = Utf8Key::new(expected_key);
             let result = reader.seek_to(&lookup).expect("Failed to seek");
-            assert_eq!(
-                result,
-                SeekResult::Found,
-                "Should find key: {}",
-                expected_key
-            );
+            assert_eq!(result, SeekResult::Found, "Should find key: {expected_key}");
 
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
             assert_eq!(
@@ -2525,7 +2512,7 @@ mod tests {
 
         // First 5 should be found
         for (key, value) in results.iter().take(5) {
-            assert!(value.is_some(), "Key {} should be found", key);
+            assert!(value.is_some(), "Key {key} should be found");
         }
 
         // Last one should not be found

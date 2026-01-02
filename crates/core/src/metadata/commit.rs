@@ -17,10 +17,10 @@
  * under the License.
  */
 
-use crate::error::CoreError;
 use crate::Result;
-use apache_avro::from_value;
+use crate::error::CoreError;
 use apache_avro::Reader as AvroReader;
+use apache_avro::from_value;
 use apache_avro_derive::AvroSchema as DeriveAvroSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -131,16 +131,14 @@ pub struct HoodieCommitMetadata {
 impl HoodieCommitMetadata {
     /// Parse commit metadata from a serde_json Map
     pub fn from_json_map(map: &Map<String, Value>) -> Result<Self> {
-        serde_json::from_value(Value::Object(map.clone())).map_err(|e| {
-            CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e))
-        })
+        serde_json::from_value(Value::Object(map.clone()))
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to parse commit metadata: {e}")))
     }
 
     /// Parse commit metadata from JSON bytes
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|e| {
-            CoreError::CommitMetadata(format!("Failed to parse commit metadata: {}", e))
-        })
+        serde_json::from_slice(bytes)
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to parse commit metadata: {e}")))
     }
 
     /// Parse commit metadata from Avro bytes (v8+ format)
@@ -149,19 +147,18 @@ impl HoodieCommitMetadata {
     /// This format is used by table version 8 and later for commit/deltacommit instants.
     pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
         let cursor = Cursor::new(bytes);
-        let reader = AvroReader::new(cursor).map_err(|e| {
-            CoreError::CommitMetadata(format!("Failed to create Avro reader: {}", e))
-        })?;
+        let reader = AvroReader::new(cursor)
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to create Avro reader: {e}")))?;
 
         // The commit metadata file should contain exactly one record
         let mut records = reader;
         let value = records
             .next()
             .ok_or_else(|| CoreError::CommitMetadata("Avro file contains no records".to_string()))?
-            .map_err(|e| CoreError::CommitMetadata(format!("Failed to read Avro record: {}", e)))?;
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to read Avro record: {e}")))?;
 
         from_value::<Self>(&value).map_err(|e| {
-            CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {}", e))
+            CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {e}"))
         })
     }
 
@@ -171,7 +168,7 @@ impl HoodieCommitMetadata {
     /// processed by code that expects a serde_json Map.
     pub fn to_json_map(&self) -> Result<Map<String, Value>> {
         let value = serde_json::to_value(self).map_err(|e| {
-            CoreError::CommitMetadata(format!("Failed to convert to JSON value: {}", e))
+            CoreError::CommitMetadata(format!("Failed to convert to JSON value: {e}"))
         })?;
         match value {
             Value::Object(map) => Ok(map),
@@ -582,8 +579,7 @@ mod tests {
                 // file_id should be present
                 assert!(
                     stat.file_id.is_some(),
-                    "file_id should be present in partition {}",
-                    partition
+                    "file_id should be present in partition {partition}"
                 );
                 // For UPSERT operation, num_inserts or num_update_writes should be present
                 if let Some(num_inserts) = stat.num_inserts {

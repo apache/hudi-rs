@@ -16,24 +16,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::error::ConfigError;
 use crate::config::error::Result as ConfigResult;
 use crate::config::table::HudiTableConfig::{
     PopulatesMetaFields, PrecombineField, RecordMergeStrategy,
 };
-use crate::config::HudiConfigs;
 use crate::file_group::record_batches::RecordBatches;
-use crate::merge::ordering::{process_batch_for_max_orderings, MaxOrderingInfo};
 use crate::merge::RecordMergeStrategyValue;
+use crate::merge::ordering::{MaxOrderingInfo, process_batch_for_max_orderings};
 use crate::metadata::meta_field::MetaField;
 use crate::record::{
     create_commit_time_ordering_converter, create_event_time_ordering_converter,
     create_record_key_converter, extract_commit_time_ordering_values,
     extract_event_time_ordering_values, extract_record_keys,
 };
-use crate::util::arrow::lexsort_to_indices;
 use crate::util::arrow::ColumnAsArray;
-use crate::Result;
+use crate::util::arrow::lexsort_to_indices;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_row::{OwnedRow, Row};
 use arrow_schema::SchemaRef;

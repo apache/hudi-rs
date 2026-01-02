@@ -16,12 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
-use crate::Result;
+use CoreError::TimestampParsingError;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use std::str::FromStr;
-use CoreError::TimestampParsingError;
 
 /// Parse various timestamp formats and convert to Hudi timeline format
 ///
@@ -59,8 +59,7 @@ pub fn format_timestamp(ts_str: &str, timezone: &str) -> Result<String> {
     }
 
     Err(TimestampParsingError(format!(
-        "Unable to parse timestamp: {} due to errors: {:?}",
-        ts_str, parse_errors
+        "Unable to parse timestamp: {ts_str} due to errors: {parse_errors:?}"
     )))
 }
 
@@ -75,13 +74,12 @@ fn parse_timeline_format(ts_str: &str) -> Result<String> {
 }
 
 fn parse_epoch_time(ts_str: &str, timezone: &TimelineTimezoneValue) -> Result<String> {
-    let ts: i64 = ts_str.parse().map_err(|e| {
-        TimestampParsingError(format!("Invalid epoch time: {} due to {:?}", ts_str, e))
-    })?;
+    let ts: i64 = ts_str
+        .parse()
+        .map_err(|e| TimestampParsingError(format!("Invalid epoch time: {ts_str} due to {e:?}")))?;
     if ts < 0 {
         return Err(TimestampParsingError(format!(
-            "Epoch time must be non-negative: {}",
-            ts_str
+            "Epoch time must be non-negative: {ts_str}"
         )));
     }
 
@@ -108,8 +106,7 @@ fn parse_epoch_time(ts_str: &str, timezone: &TimelineTimezoneValue) -> Result<St
             }
         },
         None => Err(TimestampParsingError(format!(
-            "Invalid epoch time: {}",
-            ts_str
+            "Invalid epoch time: {ts_str}"
         ))),
     }
 }
@@ -139,8 +136,7 @@ fn datetime_to_timeline_format(dt: &DateTime<impl TimeZone>) -> String {
     let second = dt.second();
     let timestamp_subsec_millis = dt.timestamp_subsec_millis();
     format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}{:03}",
-        year, month, day, hour, minute, second, timestamp_subsec_millis
+        "{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}{timestamp_subsec_millis:03}"
     )
 }
 
@@ -359,8 +355,7 @@ mod tests {
             let result = format_timestamp(input, timezone).unwrap();
             assert_eq!(
                 result, expected,
-                "Failed for input: {} with timezone: {}",
-                input, timezone
+                "Failed for input: {input} with timezone: {timezone}"
             );
         }
 
@@ -407,7 +402,7 @@ mod tests {
 
         for input in invalid_inputs {
             let result = format_timestamp(input, "UTC");
-            assert!(result.is_err(), "Should fail for input: {}", input);
+            assert!(result.is_err(), "Should fail for input: {input}");
         }
     }
 

@@ -32,11 +32,11 @@
 //! - Map keys are file names (e.g., "abc.parquet")
 //! - Map values are `HoodieMetadataFileInfo` with size and deletion status
 
+use crate::Result;
 use crate::error::CoreError;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::Result;
-use apache_avro::types::Value as AvroValue;
 use apache_avro::Schema as AvroSchema;
+use apache_avro::types::Value as AvroValue;
 use std::collections::HashMap;
 
 /// Metadata table partition types.
@@ -234,7 +234,7 @@ pub fn decode_files_partition_record(
     // Get schema from HFile reader
     let schema = reader
         .get_avro_schema()
-        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {}", e)))?
+        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {e}")))?
         .ok_or_else(|| CoreError::MetadataTable("No Avro schema in HFile".to_string()))?;
 
     decode_files_partition_record_with_schema(record, schema)
@@ -410,13 +410,13 @@ pub fn decode_avro_value(value: &[u8], schema: &AvroSchema) -> Result<AvroValue>
     }
 
     apache_avro::from_avro_datum(schema, &mut &value[..], None)
-        .map_err(|e| CoreError::MetadataTable(format!("Avro decode error: {}", e)))
+        .map_err(|e| CoreError::MetadataTable(format!("Avro decode error: {e}")))
 }
 
 /// Parse an Avro schema from JSON string.
 pub fn parse_avro_schema(schema_json: &str) -> Result<AvroSchema> {
     AvroSchema::parse_str(schema_json)
-        .map_err(|e| CoreError::MetadataTable(format!("Invalid Avro schema: {}", e)))
+        .map_err(|e| CoreError::MetadataTable(format!("Invalid Avro schema: {e}")))
 }
 
 /// Extract an i32 field from an Avro record.
@@ -467,7 +467,7 @@ mod tests {
     fn files_partition_hfile_path() -> PathBuf {
         let dir = files_partition_dir();
         let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("Failed to read directory {:?}: {}", dir, e))
+            .unwrap_or_else(|e| panic!("Failed to read directory {dir:?}: {e}"))
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 entry
@@ -484,7 +484,7 @@ mod tests {
         hfiles
             .last()
             .map(|e| e.path())
-            .unwrap_or_else(|| panic!("No HFile found in {:?}", dir))
+            .unwrap_or_else(|| panic!("No HFile found in {dir:?}"))
     }
 
     #[test]
@@ -652,14 +652,9 @@ mod tests {
         for (file_name, file_info) in &parquet_files {
             assert!(
                 file_name.contains("6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc"),
-                "File should contain chennai UUID: {}",
-                file_name
+                "File should contain chennai UUID: {file_name}"
             );
-            assert!(
-                file_info.size > 0,
-                "File size should be > 0: {:?}",
-                file_info
-            );
+            assert!(file_info.size > 0, "File size should be > 0: {file_info:?}");
             assert!(!file_info.is_deleted, "File should not be deleted");
         }
 
