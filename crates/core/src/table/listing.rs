@@ -16,22 +16,22 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig::ListingParallelism;
 use crate::config::table::HudiTableConfig::BaseFileFormat;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::file_group::FileGroup;
 use crate::metadata::LAKE_FORMAT_METADATA_DIRS;
-use crate::storage::{get_leaf_dirs, Storage};
+use crate::storage::{Storage, get_leaf_dirs};
 use crate::table::partition::{
-    is_table_partitioned, PartitionPruner, EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX,
+    EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX, PartitionPruner, is_table_partitioned,
 };
 use crate::timeline::completion_time::CompletionTimeView;
-use crate::Result;
 use dashmap::DashMap;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -85,7 +85,7 @@ impl FileLister {
                 continue;
             }
 
-            let base_file_extension = format!(".{}", base_file_format);
+            let base_file_extension = format!(".{base_file_format}");
             if file_metadata.name.ends_with(&base_file_extension) {
                 // After excluding the unintended files,
                 // we expect a file that has the base file extension to be a valid base file.
@@ -128,7 +128,7 @@ impl FileLister {
                         // fails. However, once we support all data files, we should return error
                         // here because we expect all files to be either base files or log files,
                         // after excluding the unintended files.
-                        log::warn!("Failed to create a log file: {}", e);
+                        log::warn!("Failed to create a log file: {e}");
                         continue;
                     }
                 }

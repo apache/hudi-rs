@@ -16,10 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
@@ -34,7 +35,6 @@ use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::Storage;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
-use crate::Result;
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
@@ -369,15 +369,14 @@ impl FileGroupReader {
             .await
             .map_err(|e| {
                 ReadFileSliceError(format!(
-                    "Failed to read metadata table base file {}: {:?}",
-                    base_file_path, e
+                    "Failed to read metadata table base file {base_file_path}: {e:?}"
                 ))
             })?;
 
         // Get Avro schema from HFile
         let schema = hfile_reader
             .get_avro_schema()
-            .map_err(|e| ReadFileSliceError(format!("Failed to get Avro schema: {:?}", e)))?
+            .map_err(|e| ReadFileSliceError(format!("Failed to get Avro schema: {e:?}")))?
             .ok_or_else(|| ReadFileSliceError("No Avro schema found in HFile".to_string()))?
             .clone();
 
@@ -391,14 +390,12 @@ impl FileGroupReader {
 
         let base_records: Vec<HFileRecord> = if hfile_keys.is_empty() {
             hfile_reader.collect_records().map_err(|e| {
-                ReadFileSliceError(format!("Failed to collect HFile records: {:?}", e))
+                ReadFileSliceError(format!("Failed to collect HFile records: {e:?}"))
             })?
         } else {
             hfile_reader
                 .lookup_records(&hfile_keys)
-                .map_err(|e| {
-                    ReadFileSliceError(format!("Failed to lookup HFile records: {:?}", e))
-                })?
+                .map_err(|e| ReadFileSliceError(format!("Failed to lookup HFile records: {e:?}")))?
                 .into_iter()
                 .filter_map(|(_, r)| r)
                 .collect()
@@ -431,11 +428,11 @@ impl FileGroupReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Result;
     use crate::config::util::empty_options;
     use crate::error::CoreError;
     use crate::file_group::base_file::BaseFile;
     use crate::file_group::file_slice::FileSlice;
-    use crate::Result;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -499,10 +496,12 @@ mod tests {
         let base_uri = get_base_uri_with_valid_props();
         let reader = FileGroupReader::new_with_options(&base_uri, options).unwrap();
         assert!(!reader.storage.options.is_empty());
-        assert!(reader
-            .storage
-            .hudi_configs
-            .contains(HudiTableConfig::BasePath));
+        assert!(
+            reader
+                .storage
+                .hudi_configs
+                .contains(HudiTableConfig::BasePath)
+        );
     }
 
     #[test]
@@ -642,8 +641,7 @@ mod tests {
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
+                    "Expected file not found error, got: {error_msg}"
                 );
             }
         }
@@ -671,8 +669,7 @@ mod tests {
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
+                    "Expected file not found error, got: {error_msg}"
                 );
             }
         }
@@ -696,8 +693,7 @@ mod tests {
         let error_msg = result.unwrap_err().to_string();
         assert!(
             error_msg.contains("not found") || error_msg.contains("Failed to read path"),
-            "Should contain appropriate error message, got: {}",
-            error_msg
+            "Should contain appropriate error message, got: {error_msg}"
         );
 
         Ok(())
@@ -729,8 +725,7 @@ mod tests {
                     error_msg.contains("Failed to read path")
                         || error_msg.contains("not found")
                         || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
+                    "Expected file not found error, got: {error_msg}"
                 );
             }
         }

@@ -32,11 +32,11 @@
 //! - Map keys are file names (e.g., "abc.parquet")
 //! - Map values are `HoodieMetadataFileInfo` with size and deletion status
 
+use crate::Result;
 use crate::error::CoreError;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::Result;
-use apache_avro::types::Value as AvroValue;
 use apache_avro::Schema as AvroSchema;
+use apache_avro::types::Value as AvroValue;
 use std::collections::HashMap;
 
 /// Metadata table partition types.
@@ -234,7 +234,7 @@ pub fn decode_files_partition_record(
     // Get schema from HFile reader
     let schema = reader
         .get_avro_schema()
-        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {}", e)))?
+        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {e}")))?
         .ok_or_else(|| CoreError::MetadataTable("No Avro schema in HFile".to_string()))?;
 
     decode_files_partition_record_with_schema(record, schema)
@@ -410,13 +410,13 @@ pub fn decode_avro_value(value: &[u8], schema: &AvroSchema) -> Result<AvroValue>
     }
 
     apache_avro::from_avro_datum(schema, &mut &value[..], None)
-        .map_err(|e| CoreError::MetadataTable(format!("Avro decode error: {}", e)))
+        .map_err(|e| CoreError::MetadataTable(format!("Avro decode error: {e}")))
 }
 
 /// Parse an Avro schema from JSON string.
 pub fn parse_avro_schema(schema_json: &str) -> Result<AvroSchema> {
     AvroSchema::parse_str(schema_json)
-        .map_err(|e| CoreError::MetadataTable(format!("Invalid Avro schema: {}", e)))
+        .map_err(|e| CoreError::MetadataTable(format!("Invalid Avro schema: {e}")))
 }
 
 /// Extract an i32 field from an Avro record.
@@ -467,7 +467,7 @@ mod tests {
     fn files_partition_hfile_path() -> PathBuf {
         let dir = files_partition_dir();
         let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("Failed to read directory {:?}: {}", dir, e))
+            .unwrap_or_else(|e| panic!("Failed to read directory {dir:?}: {e}"))
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 entry
@@ -484,7 +484,7 @@ mod tests {
         hfiles
             .last()
             .map(|e| e.path())
-            .unwrap_or_else(|| panic!("No HFile found in {:?}", dir))
+            .unwrap_or_else(|| panic!("No HFile found in {dir:?}"))
     }
 
     #[test]
@@ -652,14 +652,9 @@ mod tests {
         for (file_name, file_info) in &parquet_files {
             assert!(
                 file_name.contains("6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc"),
-                "File should contain chennai UUID: {}",
-                file_name
+                "File should contain chennai UUID: {file_name}"
             );
-            assert!(
-                file_info.size > 0,
-                "File size should be > 0: {:?}",
-                file_info
-            );
+            assert!(file_info.size > 0, "File size should be > 0: {file_info:?}");
             assert!(!file_info.is_deleted, "File should not be deleted");
         }
 
@@ -729,132 +724,95 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_avro_schema_success() {
+    fn test_parse_avro_schema() {
+        // Valid schema
         let schema_json =
             r#"{"type": "record", "name": "Test", "fields": [{"name": "id", "type": "int"}]}"#;
-        let result = parse_avro_schema(schema_json);
-        assert!(result.is_ok());
-    }
+        assert!(parse_avro_schema(schema_json).is_ok());
 
-    #[test]
-    fn test_parse_avro_schema_error() {
-        let invalid_json = "not valid json";
-        let result = parse_avro_schema(invalid_json);
+        // Invalid schema
+        let result = parse_avro_schema("not valid json");
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Invalid Avro schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid Avro schema")
+        );
     }
 
     #[test]
-    fn test_decode_avro_value_empty_value() {
-        let schema_json =
-            r#"{"type": "record", "name": "Test", "fields": [{"name": "id", "type": "int"}]}"#;
-        let schema = parse_avro_schema(schema_json).unwrap();
-        let result = decode_avro_value(&[], &schema);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Empty value"));
-    }
+    fn test_get_record_type() {
+        // Record without type field -> Unknown
+        let no_type = AvroValue::Record(vec![("other".to_string(), AvroValue::Int(42))]);
+        assert_eq!(get_record_type(&no_type), MetadataRecordType::Unknown);
 
-    #[test]
-    fn test_get_record_type_no_type_field() {
-        // Record without type field should return Unknown
-        let value = AvroValue::Record(vec![("other".to_string(), AvroValue::Int(42))]);
-        let result = get_record_type(&value);
-        assert_eq!(result, MetadataRecordType::Unknown);
-    }
+        // Non-record value -> Unknown
+        let non_record = AvroValue::String("test".to_string());
+        assert_eq!(get_record_type(&non_record), MetadataRecordType::Unknown);
 
-    #[test]
-    fn test_get_record_type_non_record() {
-        // Non-record value should return Unknown
-        let value = AvroValue::String("test".to_string());
-        let result = get_record_type(&value);
-        assert_eq!(result, MetadataRecordType::Unknown);
-    }
-
-    #[test]
-    fn test_get_record_type_union_int() {
-        // Union containing Int should work
-        let value = AvroValue::Record(vec![(
+        // Union containing Int -> works
+        let union_int = AvroValue::Record(vec![(
             "type".to_string(),
             AvroValue::Union(0, Box::new(AvroValue::Int(2))),
         )]);
-        let result = get_record_type(&value);
-        assert_eq!(result, MetadataRecordType::Files);
+        assert_eq!(get_record_type(&union_int), MetadataRecordType::Files);
     }
 
     #[test]
-    fn test_extract_long_int_value() {
-        let value = AvroValue::Int(42);
-        assert_eq!(extract_long(&value), Some(42));
+    fn test_extract_long() {
+        assert_eq!(extract_long(&AvroValue::Int(42)), Some(42));
+        assert_eq!(extract_long(&AvroValue::Long(123456789)), Some(123456789));
+        assert_eq!(
+            extract_long(&AvroValue::Union(0, Box::new(AvroValue::Long(999)))),
+            Some(999)
+        );
+        assert_eq!(
+            extract_long(&AvroValue::String("not a number".to_string())),
+            None
+        );
     }
 
     #[test]
-    fn test_extract_long_long_value() {
-        let value = AvroValue::Long(123456789);
-        assert_eq!(extract_long(&value), Some(123456789));
-    }
-
-    #[test]
-    fn test_extract_long_union() {
-        let value = AvroValue::Union(0, Box::new(AvroValue::Long(999)));
-        assert_eq!(extract_long(&value), Some(999));
-    }
-
-    #[test]
-    fn test_extract_long_invalid() {
-        let value = AvroValue::String("not a number".to_string());
-        assert_eq!(extract_long(&value), None);
-    }
-
-    #[test]
-    fn test_extract_bool_boolean() {
+    fn test_extract_bool() {
         assert_eq!(extract_bool(&AvroValue::Boolean(true)), Some(true));
         assert_eq!(extract_bool(&AvroValue::Boolean(false)), Some(false));
+        assert_eq!(
+            extract_bool(&AvroValue::Union(0, Box::new(AvroValue::Boolean(true)))),
+            Some(true)
+        );
+        assert_eq!(
+            extract_bool(&AvroValue::String("not a bool".to_string())),
+            None
+        );
     }
 
     #[test]
-    fn test_extract_bool_union() {
-        let value = AvroValue::Union(0, Box::new(AvroValue::Boolean(true)));
-        assert_eq!(extract_bool(&value), Some(true));
-    }
+    fn test_extract_filesystem_metadata() {
+        // Non-record -> empty
+        assert!(
+            extract_filesystem_metadata(&AvroValue::String("not a record".to_string())).is_empty()
+        );
 
-    #[test]
-    fn test_extract_bool_invalid() {
-        let value = AvroValue::String("not a bool".to_string());
-        assert_eq!(extract_bool(&value), None);
-    }
+        // Record without field -> empty
+        let no_field = AvroValue::Record(vec![("other".to_string(), AvroValue::Int(42))]);
+        assert!(extract_filesystem_metadata(&no_field).is_empty());
 
-    #[test]
-    fn test_extract_filesystem_metadata_non_record() {
-        // Non-record Avro value should return empty map
-        let value = AvroValue::String("not a record".to_string());
-        let result = extract_filesystem_metadata(&value);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_extract_filesystem_metadata_no_field() {
-        // Record without filesystemMetadata field should return empty map
-        let value = AvroValue::Record(vec![("other".to_string(), AvroValue::Int(42))]);
-        let result = extract_filesystem_metadata(&value);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_extract_filesystem_metadata_union_with_non_map() {
-        // filesystemMetadata as Union containing non-Map value should return empty
-        let value = AvroValue::Record(vec![(
+        // Union with Null -> empty
+        let union_null = AvroValue::Record(vec![(
             "filesystemMetadata".to_string(),
             AvroValue::Union(0, Box::new(AvroValue::Null)),
         )]);
-        let result = extract_filesystem_metadata(&value);
-        assert!(result.is_empty());
-    }
+        assert!(extract_filesystem_metadata(&union_null).is_empty());
 
-    #[test]
-    fn test_extract_filesystem_metadata_union_with_map() {
-        // filesystemMetadata as Union containing Map should work
+        // Invalid type (String) -> empty
+        let invalid_type = AvroValue::Record(vec![(
+            "filesystemMetadata".to_string(),
+            AvroValue::String("not a map".to_string()),
+        )]);
+        assert!(extract_filesystem_metadata(&invalid_type).is_empty());
+
+        // Union with Map -> works
         use std::collections::HashMap as StdMap;
         let mut map = StdMap::new();
         map.insert(
@@ -864,91 +822,66 @@ mod tests {
                 ("isDeleted".to_string(), AvroValue::Boolean(false)),
             ]),
         );
-        let value = AvroValue::Record(vec![(
+        let union_map = AvroValue::Record(vec![(
             "filesystemMetadata".to_string(),
             AvroValue::Union(1, Box::new(AvroValue::Map(map))),
         )]);
-        let result = extract_filesystem_metadata(&value);
+        let result = extract_filesystem_metadata(&union_map);
         assert_eq!(result.len(), 1);
-        assert!(result.contains_key("test.parquet"));
         let info = result.get("test.parquet").unwrap();
         assert_eq!(info.size, 1000);
         assert!(!info.is_deleted);
     }
 
     #[test]
-    fn test_extract_filesystem_metadata_other_value_type() {
-        // filesystemMetadata with invalid type (e.g., String) should return empty
-        let value = AvroValue::Record(vec![(
-            "filesystemMetadata".to_string(),
-            AvroValue::String("not a map".to_string()),
-        )]);
-        let result = extract_filesystem_metadata(&value);
-        assert!(result.is_empty());
-    }
+    fn test_extract_file_info() {
+        // Non-Record/Union -> None
+        assert!(
+            extract_file_info(
+                "test.parquet",
+                &AvroValue::String("not a record".to_string())
+            )
+            .is_none()
+        );
 
-    #[test]
-    fn test_extract_file_info_non_record_non_union() {
-        // extract_file_info with non-Record/Union value returns None
-        let value = AvroValue::String("not a record".to_string());
-        let result = extract_file_info("test.parquet", &value);
-        assert!(result.is_none());
-    }
+        // Union with non-Record -> None
+        let union_string =
+            AvroValue::Union(0, Box::new(AvroValue::String("not a record".to_string())));
+        assert!(extract_file_info("test.parquet", &union_string).is_none());
 
-    #[test]
-    fn test_extract_file_info_union_with_non_record() {
-        // Union containing non-Record should return None
-        let value = AvroValue::Union(0, Box::new(AvroValue::String("not a record".to_string())));
-        let result = extract_file_info("test.parquet", &value);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_file_info_union_with_record() {
-        // Union containing Record should work
-        let value = AvroValue::Union(
+        // Union with Record -> works
+        let union_record = AvroValue::Union(
             1,
             Box::new(AvroValue::Record(vec![
                 ("size".to_string(), AvroValue::Long(5000)),
                 ("isDeleted".to_string(), AvroValue::Boolean(true)),
             ])),
         );
-        let result = extract_file_info("deleted.parquet", &value);
-        assert!(result.is_some());
-        let info = result.unwrap();
+        let info = extract_file_info("deleted.parquet", &union_record).unwrap();
         assert_eq!(info.name, "deleted.parquet");
         assert_eq!(info.size, 5000);
         assert!(info.is_deleted);
     }
 
     #[test]
-    fn test_get_avro_int_union_with_non_int() {
-        // Union containing non-Int should return None
-        let value = AvroValue::Record(vec![(
+    fn test_get_avro_int() {
+        // Union with non-Int -> None
+        let union_string = AvroValue::Record(vec![(
             "type".to_string(),
             AvroValue::Union(0, Box::new(AvroValue::String("not int".to_string()))),
         )]);
-        let result = get_avro_int(&value, "type");
-        assert!(result.is_none());
-    }
+        assert!(get_avro_int(&union_string, "type").is_none());
 
-    #[test]
-    fn test_get_avro_int_non_int_non_union() {
-        // Field with non-Int and non-Union value should return None
-        let value = AvroValue::Record(vec![(
+        // Non-Int, non-Union -> None
+        let direct_string = AvroValue::Record(vec![(
             "type".to_string(),
             AvroValue::String("not int".to_string()),
         )]);
-        let result = get_avro_int(&value, "type");
-        assert!(result.is_none());
-    }
+        assert!(get_avro_int(&direct_string, "type").is_none());
 
-    #[test]
-    fn test_get_avro_int_direct_int() {
-        // Direct Int value should work
-        let value = AvroValue::Record(vec![("type".to_string(), AvroValue::Int(3))]);
-        let result = get_avro_int(&value, "type");
-        assert_eq!(result, Some(3));
+        // Direct Int -> works
+        let direct_int = AvroValue::Record(vec![("type".to_string(), AvroValue::Int(3))]);
+        assert_eq!(get_avro_int(&direct_int, "type"), Some(3));
     }
 
     #[test]
@@ -977,7 +910,40 @@ mod tests {
         .unwrap();
         let result = decode_files_partition_record_with_schema(&record, &schema);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Invalid UTF-8 key"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid UTF-8 key")
+        );
+    }
+
+    #[test]
+    fn test_decode_avro_value() {
+        let schema = parse_avro_schema(
+            r#"{"type": "record", "name": "Test", "fields": [{"name": "name", "type": "string"}, {"name": "value", "type": "long"}]}"#,
+        )
+        .unwrap();
+
+        // Empty value
+        let empty_result = decode_avro_value(&[], &schema);
+        assert!(empty_result.is_err());
+        assert!(
+            empty_result
+                .unwrap_err()
+                .to_string()
+                .contains("Empty value")
+        );
+
+        // Invalid bytes (truncated varint)
+        let invalid_bytes: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0xff];
+        let invalid_result = decode_avro_value(invalid_bytes, &schema);
+        assert!(invalid_result.is_err());
+        assert!(
+            invalid_result
+                .unwrap_err()
+                .to_string()
+                .contains("Avro decode error")
+        );
     }
 }

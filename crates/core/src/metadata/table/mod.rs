@@ -26,6 +26,7 @@ pub mod records;
 
 use std::collections::HashMap;
 
+use crate::Result;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::{
     MetadataTableEnabled, MetadataTablePartitions, PartitionFields, TableVersion,
@@ -34,9 +35,8 @@ use crate::error::CoreError;
 use crate::expr::filter::from_str_tuples;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::storage::util::join_url_segments;
-use crate::table::partition::PartitionPruner;
 use crate::table::Table;
-use crate::Result;
+use crate::table::partition::PartitionPruner;
 
 use records::FilesPartitionRecord;
 
@@ -344,8 +344,7 @@ mod tests {
         assert_eq!(
             partitions.len(),
             5,
-            "Should have 5 metadata table partitions, got: {:?}",
-            partitions
+            "Should have 5 metadata table partitions, got: {partitions:?}"
         );
 
         // Verify all expected partitions are present
@@ -359,9 +358,7 @@ mod tests {
         for partition in &expected {
             assert!(
                 partitions.contains(&partition.to_string()),
-                "Should contain '{}' partition, got: {:?}",
-                partition,
-                partitions
+                "Should contain '{partition}' partition, got: {partitions:?}"
             );
         }
     }

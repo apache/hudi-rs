@@ -27,10 +27,10 @@ pub mod log_file;
 pub mod reader;
 pub mod record_batches;
 
+use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::Result;
 use file_slice::FileSlice;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -330,7 +330,10 @@ mod tests {
             "5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402144910683.parquet",
         );
         assert!(res2.is_err());
-        assert_eq!(res2.unwrap_err().to_string(), "File group error: Timestamp 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0");
+        assert_eq!(
+            res2.unwrap_err().to_string(),
+            "File group error: Timestamp 20240402144910683 is already present in File Group 5a226868-2934-4f84-a16f-55124630c68d-0"
+        );
     }
 
     #[test]
@@ -341,7 +344,7 @@ mod tests {
             file_slices: BTreeMap::new(),
         };
 
-        let display_string = format!("{}", file_group);
+        let display_string = format!("{file_group}");
 
         assert_eq!(
             display_string,
@@ -354,7 +357,7 @@ mod tests {
             file_slices: BTreeMap::new(),
         };
 
-        let display_string_no_partition = format!("{}", file_group_no_partition);
+        let display_string_no_partition = format!("{file_group_no_partition}");
 
         assert_eq!(
             display_string_no_partition,
@@ -493,10 +496,12 @@ mod tests {
         );
         let result = fg1.add_log_file(log);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("completion timestamp is earlier than all base files"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("completion timestamp is earlier than all base files")
+        );
 
         // Test 2: Log file with completion_timestamp when no file slices exist
         let mut fg2 = FileGroup::new("file-id-0".to_string(), EMPTY_PARTITION_PATH.to_string());
@@ -508,10 +513,12 @@ mod tests {
         );
         let result = fg2.add_log_file(log);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No suitable FileSlice found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No suitable FileSlice found")
+        );
     }
 
     #[test]
@@ -612,10 +619,12 @@ mod tests {
 
         let result = fg1.merge(&fg2);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot merge different file groups"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot merge different file groups")
+        );
     }
 
     #[test]
@@ -666,10 +675,12 @@ mod tests {
 
         let result = fg.add_base_file(base_file);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("does not match File Group ID"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not match File Group ID")
+        );
     }
 
     #[test]
@@ -682,10 +693,12 @@ mod tests {
             create_log_file_with_completion("different-id", "20240101120000000", None, 1);
         let result = fg.add_log_file(log_file);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("does not match File Group ID"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not match File Group ID")
+        );
     }
 
     #[test]
@@ -700,9 +713,11 @@ mod tests {
         let log_file = create_log_file_with_completion("file-id-0", "20240101120000000", None, 1);
         let result = fg.add_log_file(log_file);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No suitable FileSlice found for log file with timestamp"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No suitable FileSlice found for log file with timestamp")
+        );
     }
 }

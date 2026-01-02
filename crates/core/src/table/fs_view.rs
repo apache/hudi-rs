@@ -20,18 +20,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::table::HudiTableConfig::BaseFileFormat;
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig::BaseFileFormat;
+use crate::file_group::FileGroup;
 use crate::file_group::builder::file_groups_from_files_partition_records;
 use crate::file_group::file_slice::FileSlice;
-use crate::file_group::FileGroup;
 use crate::storage::Storage;
+use crate::table::Table;
 use crate::table::listing::FileLister;
 use crate::table::partition::PartitionPruner;
-use crate::table::Table;
 use crate::timeline::completion_time::CompletionTimeView;
 use crate::timeline::view::TimelineView;
-use crate::Result;
 use dashmap::DashMap;
 
 /// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and

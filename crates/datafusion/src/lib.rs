@@ -28,19 +28,19 @@ use std::thread;
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
+use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
 use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
+use datafusion_common::config::TableParquetOptions;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
@@ -97,7 +97,7 @@ impl HudiDataSource {
     {
         match HudiTable::new_with_options(base_uri, options).await {
             Ok(t) => Ok(Self { table: Arc::new(t) }),
-            Err(e) => Err(Execution(format!("Failed to create Hudi table: {}", e))),
+            Err(e) => Err(Execution(format!("Failed to create Hudi table: {e}"))),
         }
     }
 
@@ -185,7 +185,7 @@ impl TableProvider for HudiDataSource {
             .table
             .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
             .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
+            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let base_url = self.table.base_url();
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {
@@ -230,7 +230,7 @@ impl TableProvider for HudiDataSource {
 
         let fsc = FileScanConfigBuilder::new(url, table_schema, Arc::new(parquet_source))
             .with_file_groups(file_groups)
-            .with_projection(projection.cloned())
+            .with_projection_indices(projection.cloned())
             .with_limit(limit)
             .build();
 
@@ -348,13 +348,13 @@ mod tests {
     use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_core::metadata::meta_field::MetaField;
-    use hudi_test::assert_arrow_field_names_eq;
     use hudi_test::SampleTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
         V6TimebasedkeygenNonhivestyle,
     };
-    use hudi_test::{util, SampleTable};
+    use hudi_test::assert_arrow_field_names_eq;
+    use hudi_test::{SampleTable, util};
     use util::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
@@ -473,13 +473,12 @@ mod tests {
         assert!(plan_lines[1].starts_with("SortExec: TopK(fetch=10)"));
         assert!(plan_lines[2].starts_with(&format!(
             "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
-            get_field(structField@3, field2) as {}.structField[field2]]",
-            table_name
+            get_field(structField@3, field2) as {table_name}.structField[field2]]"
         )));
         assert!(plan_lines[4].starts_with(
             "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND name@1 != Alice AND get_field(structField@3, field2) > 30"
         ));
-        assert!(plan_lines[5].contains(&format!("input_partitions={}", planned_input_partitioned)));
+        assert!(plan_lines[5].contains(&format!("input_partitions={planned_input_partitioned}")));
     }
 
     async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -490,7 +489,7 @@ mod tests {
         assert_eq!(get_str_column(rb, "name"), &["Bob", "Diana"]);
         assert_eq!(get_bool_column(rb, "isActive"), &[false, true]);
         assert_eq!(
-            get_i32_column(rb, &format!("{}.structField[field2]", table_name)),
+            get_i32_column(rb, &format!("{table_name}.structField[field2]")),
             &[40, 50]
         );
     }
@@ -531,7 +530,7 @@ mod tests {
         assert_eq!(get_str_column(rb, "name"), &["Diana"]);
         assert_eq!(get_bool_column(rb, "isActive"), &[false]);
         assert_eq!(
-            get_i32_column(rb, &format!("{}.structField[field2]", table_name)),
+            get_i32_column(rb, &format!("{table_name}.structField[field2]")),
             &[50]
         );
     }

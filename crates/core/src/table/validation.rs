@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::BaseFileFormatValue;
@@ -23,7 +24,6 @@ use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::{
     BaseFileFormat, BasePath, DropsPartitionFields, TableVersion, TimelineLayoutVersion,
 };
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::merge::record_merger::RecordMerger;
 use crate::util::path::is_metadata_table_path;
@@ -47,8 +47,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
     let table_version: isize = hudi_configs.get(TableVersion)?.into();
     if table_version != 6 && table_version != 8 {
         return Err(CoreError::Unsupported(format!(
-            "Only support table version 6 and 8. Found: {}",
-            table_version
+            "Only support table version 6 and 8. Found: {table_version}"
         )));
     }
 
@@ -58,8 +57,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
     let expected_layout_version = if table_version >= 8 { 2 } else { 1 };
     if timeline_layout_version != expected_layout_version {
         return Err(CoreError::Unsupported(format!(
-            "Table version {} expects timeline layout version {}. Found: {}",
-            table_version, expected_layout_version, timeline_layout_version
+            "Table version {table_version} expects timeline layout version {expected_layout_version}. Found: {timeline_layout_version}"
         )));
     }
 
@@ -78,8 +76,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
             let base_path: String = hudi_configs.get_or_default(BasePath).into();
             if !is_metadata_table_path(&base_path) {
                 return Err(CoreError::Unsupported(format!(
-                    "Base file format '{}' is only valid for metadata tables",
-                    format_str
+                    "Base file format '{format_str}' is only valid for metadata tables"
                 )));
             }
         }
@@ -93,10 +90,10 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HudiConfigs;
     use crate::config::table::HudiTableConfig::{
         TableName, TableType, TableVersion, TimelineLayoutVersion,
     };
-    use crate::config::HudiConfigs;
     use std::collections::HashMap;
 
     #[test]
@@ -114,8 +111,7 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("Only support table version 6 and 8"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for table version 5");
@@ -169,8 +165,7 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("expects timeline layout version 2"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for v8 with layout 1");
@@ -192,8 +187,7 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("expects timeline layout version 1"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for v6 with layout 2");
@@ -219,8 +213,7 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("only valid for metadata tables"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for HFile on regular table");
@@ -247,8 +240,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "HFile format should be allowed for metadata table: {:?}",
-            result
+            "HFile format should be allowed for metadata table: {result:?}"
         );
     }
 }

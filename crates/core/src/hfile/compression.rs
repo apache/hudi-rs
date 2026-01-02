@@ -73,7 +73,7 @@ impl CompressionCodec {
                 let mut decoder = GzDecoder::new(compressed_data);
                 let mut decompressed = Vec::with_capacity(uncompressed_size);
                 decoder.read_to_end(&mut decompressed).map_err(|e| {
-                    HFileError::DecompressionError(format!("GZIP decompression failed: {}", e))
+                    HFileError::DecompressionError(format!("GZIP decompression failed: {e}"))
                 })?;
                 Ok(decompressed)
             }

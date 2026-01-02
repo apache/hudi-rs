@@ -17,10 +17,10 @@
  * under the License.
  */
 
-use crate::internal::{rt, PythonError};
+use crate::internal::{PythonError, rt};
 use hudi::HudiDataSource as InternalDataFusionHudiDataSource;
-use pyo3::{pyclass, pymethods, PyErr, PyResult, Python};
-use pyo3::{types::PyCapsule, Bound};
+use pyo3::{Bound, types::PyCapsule};
+use pyo3::{PyErr, PyResult, Python, pyclass, pymethods};
 
 #[cfg(not(tarpaulin_include))]
 #[pyclass(name = "HudiDataFusionDataSource")]
@@ -53,7 +53,7 @@ impl HudiDataFusionDataSource {
         use std::ffi::CString;
         use std::sync::Arc;
         let capsule_name = CString::new("datafusion_table_provider").map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid capsule name: {}", e))
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid capsule name: {e}"))
         })?;
 
         // Clone the inner data source and wrap it in an Arc

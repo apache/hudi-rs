@@ -25,10 +25,11 @@ pub(crate) mod selector;
 pub(crate) mod util;
 pub mod view;
 
+use crate::Result;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::builder::replaced_file_groups_from_replace_commit;
 use crate::file_group::FileGroup;
+use crate::file_group::builder::replaced_file_groups_from_replace_commit;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
@@ -38,7 +39,6 @@ use crate::timeline::instant::Action;
 use crate::timeline::loader::TimelineLoader;
 use crate::timeline::selector::TimelineSelector;
 use crate::timeline::view::TimelineView;
-use crate::Result;
 use arrow_schema::Schema;
 use instant::Instant;
 
@@ -317,8 +317,8 @@ impl Timeline {
         end_timestamp: Option<&str>,
     ) -> Result<HashSet<FileGroup>> {
         use crate::file_group::builder::{
-            file_groups_from_commit_metadata, replaced_file_groups_from_replace_commit,
-            FileGroupMerger,
+            FileGroupMerger, file_groups_from_commit_metadata,
+            replaced_file_groups_from_replace_commit,
         };
 
         // Get commits in the time range (start, end]
@@ -376,7 +376,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
+    use hudi_test::{SampleTable, assert_arrow_field_names_eq, assert_avro_field_names_eq};
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
@@ -432,11 +432,13 @@ mod tests {
 
         // When TimelineArchivedReadEnabled is true, archived loader should be created
         assert!(timeline.active_loader.is_layout_two_active());
-        assert!(timeline
-            .archived_loader
-            .as_ref()
-            .map(|l| l.is_layout_two_archived())
-            .unwrap_or(false));
+        assert!(
+            timeline
+                .archived_loader
+                .as_ref()
+                .map(|l| l.is_layout_two_archived())
+                .unwrap_or(false)
+        );
     }
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
@@ -567,12 +569,18 @@ mod tests {
         // Check Arrow schema
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_err());
-        assert!(matches!(arrow_schema.unwrap_err(), CoreError::CommitMetadata(_)), "Getting Arrow schema includes base file lookup, therefore expect CommitMetadata error when write stats are missing");
+        assert!(
+            matches!(arrow_schema.unwrap_err(), CoreError::CommitMetadata(_)),
+            "Getting Arrow schema includes base file lookup, therefore expect CommitMetadata error when write stats are missing"
+        );
 
         // Check Avro schema
         let avro_schema = timeline.get_latest_avro_schema().await;
         assert!(avro_schema.is_err());
-        assert!(matches!(avro_schema.unwrap_err(), CoreError::SchemaNotFound(_)), "Getting Avro schema does not include base file lookup, therefore expect SchemaNotFound error when `extraMetadata.schema` is missing");
+        assert!(
+            matches!(avro_schema.unwrap_err(), CoreError::SchemaNotFound(_)),
+            "Getting Avro schema does not include base file lookup, therefore expect SchemaNotFound error when `extraMetadata.schema` is missing"
+        );
     }
 
     #[tokio::test]

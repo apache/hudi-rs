@@ -17,15 +17,15 @@
  * under the License.
  */
 
-use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPath, TimelinePath};
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPath, TimelinePath};
 use crate::error::CoreError;
-use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::HUDI_METADATA_DIR;
+use crate::metadata::commit::HoodieCommitMetadata;
 use crate::storage::Storage;
 use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
-use crate::Result;
 use log::debug;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -109,7 +109,7 @@ impl TimelineLoader {
             TimelineLayout::V1Active | TimelineLayout::V1Archived => HUDI_METADATA_DIR.to_string(),
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
                 let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
-                format!("{}/{}", HUDI_METADATA_DIR, timeline_path)
+                format!("{HUDI_METADATA_DIR}/{timeline_path}")
             }
         }
     }
@@ -129,7 +129,7 @@ impl TimelineLoader {
                 let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
                 let history_path: String =
                     self.hudi_configs.get_or_default(TimelineHistoryPath).into();
-                format!("{}/{}/{}", HUDI_METADATA_DIR, timeline_path, history_path)
+                format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
             }
         }
     }
@@ -161,10 +161,7 @@ impl TimelineLoader {
                     match selector.try_create_instant(file_info.name.as_str()) {
                         Ok(instant) => instants.push(instant),
                         Err(e) => {
-                            debug!(
-                                "Instant not created from file {:?} due to: {:?}",
-                                file_info, e
-                            );
+                            debug!("Instant not created from file {file_info:?} due to: {e:?}");
                         }
                     }
                 }
@@ -191,10 +188,7 @@ impl TimelineLoader {
                     match selector.try_create_instant(file_info.name.as_str()) {
                         Ok(instant) => instants.push(instant),
                         Err(e) => {
-                            debug!(
-                                "Instant not created from file {:?} due to: {:?}",
-                                file_info, e
-                            );
+                            debug!("Instant not created from file {file_info:?} due to: {e:?}");
                         }
                     }
                 }
@@ -285,7 +279,7 @@ impl TimelineLoader {
             TimelineLayout::V1Active | TimelineLayout::V1Archived => {
                 // Layout 1: JSON format
                 serde_json::from_slice(&bytes).map_err(|e| {
-                    CoreError::Timeline(format!("Failed to parse JSON commit metadata: {}", e))
+                    CoreError::Timeline(format!("Failed to parse JSON commit metadata: {e}"))
                 })
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
@@ -309,14 +303,14 @@ impl TimelineLoader {
             TimelineLayout::V1Active | TimelineLayout::V1Archived => {
                 // Layout 1: JSON format - return raw bytes as string
                 String::from_utf8(bytes.to_vec()).map_err(|e| {
-                    CoreError::Timeline(format!("Failed to convert JSON bytes to string: {}", e))
+                    CoreError::Timeline(format!("Failed to convert JSON bytes to string: {e}"))
                 })
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
                 // Layout 2: Avro format - deserialize then serialize to JSON
                 let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
                 serde_json::to_string(&metadata).map_err(|e| {
-                    CoreError::Timeline(format!("Failed to serialize metadata to JSON: {}", e))
+                    CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
                 })
             }
         }
@@ -326,8 +320,8 @@ impl TimelineLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
+    use crate::config::table::HudiTableConfig;
     use std::collections::HashMap;
 
     fn create_test_configs() -> Arc<HudiConfigs> {
@@ -372,7 +366,7 @@ mod tests {
         let loader = TimelineLoader::new_layout_two_active(configs, storage);
 
         // Default timeline path
-        let expected = format!("{}/timeline", HUDI_METADATA_DIR);
+        let expected = format!("{HUDI_METADATA_DIR}/timeline");
         assert_eq!(loader.get_active_timeline_dir(), expected);
         assert_eq!(loader.get_timeline_dir(), expected);
     }
@@ -384,7 +378,7 @@ mod tests {
         let loader = TimelineLoader::new_layout_two_archived(configs, storage);
 
         // Default timeline path and history path
-        let expected = format!("{}/timeline/history", HUDI_METADATA_DIR);
+        let expected = format!("{HUDI_METADATA_DIR}/timeline/history");
         assert_eq!(loader.get_archived_timeline_dir(), expected);
         assert_eq!(loader.get_timeline_dir(), expected);
     }
@@ -428,13 +422,13 @@ mod tests {
         let loader = TimelineLoader::new_layout_two_active(configs.clone(), storage.clone());
         assert_eq!(
             loader.get_active_timeline_dir(),
-            format!("{}/custom_timeline", HUDI_METADATA_DIR)
+            format!("{HUDI_METADATA_DIR}/custom_timeline")
         );
 
         let archived_loader = TimelineLoader::new_layout_two_archived(configs, storage);
         assert_eq!(
             archived_loader.get_archived_timeline_dir(),
-            format!("{}/custom_timeline/custom_history", HUDI_METADATA_DIR)
+            format!("{HUDI_METADATA_DIR}/custom_timeline/custom_history")
         );
     }
 

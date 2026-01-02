@@ -92,7 +92,7 @@ pub(crate) async fn resolve_schema_from_commit_metadata(
     let avro_schema_str = match resolve_avro_schema_from_commit_metadata(commit_metadata) {
         Ok(s) => s,
         Err(CoreError::SchemaNotFound(_)) => {
-            return resolve_schema_from_base_file(commit_metadata, storage).await
+            return resolve_schema_from_base_file(commit_metadata, storage).await;
         }
         Err(e) => return Err(e),
     };
@@ -142,7 +142,7 @@ async fn resolve_schema_from_base_file(
     if let Some(base_file) = &first_stat.base_file {
         let parquet_file_path_buf = PathBuf::from_str(partition)
             .map_err(|e| {
-                CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {}", e))
+                CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {e}"))
             })?
             .join(base_file);
         let path = parquet_file_path_buf.to_str().ok_or_else(|| {
@@ -165,7 +165,7 @@ fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
 fn arrow_schema_from_avro_schema_str(avro_schema_str: &str) -> Result<Schema> {
     let s = sanitize_avro_schema_str(avro_schema_str);
     let avro_schema = AvroSchema::parse_str(&s)
-        .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema: {}", e)))?;
+        .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema: {e}")))?;
 
     to_arrow_schema(&avro_schema)
 }

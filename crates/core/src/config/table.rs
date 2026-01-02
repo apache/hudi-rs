@@ -23,11 +23,11 @@ use std::fmt::Display;
 use std::str::FromStr;
 use strum_macros::{AsRefStr, EnumIter};
 
+use crate::config::Result;
 use crate::config::error::ConfigError;
 use crate::config::error::ConfigError::{
     InvalidValue, NotFound, ParseBool, ParseInt, UnsupportedValue,
 };
-use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
 use crate::merge::RecordMergeStrategyValue;
 

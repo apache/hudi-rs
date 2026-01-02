@@ -69,8 +69,7 @@ impl HFileTrailer {
         let file_size = file_bytes.len();
         if file_size < TRAILER_SIZE {
             return Err(HFileError::InvalidFormat(format!(
-                "File too small for HFile trailer: {} bytes, need at least {}",
-                file_size, TRAILER_SIZE
+                "File too small for HFile trailer: {file_size} bytes, need at least {TRAILER_SIZE}"
             )));
         }
 

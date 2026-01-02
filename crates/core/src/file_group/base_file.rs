@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::timeline::completion_time::CompletionTimeView;
-use crate::Result;
 use std::fmt::Display;
 use std::str::FromStr;
 

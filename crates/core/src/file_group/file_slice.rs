@@ -16,12 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
 use crate::storage::Storage;
-use crate::Result;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::PathBuf;

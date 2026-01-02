@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::timeline::completion_time::CompletionTimeView;
-use crate::Result;
 use std::cmp::Ordering;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -259,7 +259,7 @@ mod tests {
     fn test_log_file_name_in_formatted_str() {
         let filename = ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115";
         let log_file = LogFile::from_str(filename).unwrap();
-        assert!(format!("{}", log_file).contains(filename));
+        assert!(format!("{log_file}").contains(filename));
     }
 
     #[test]

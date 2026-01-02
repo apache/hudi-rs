@@ -24,9 +24,9 @@ use std::sync::Arc;
 use crate::config::error::{ConfigError, Result};
 use crate::storage::error::Result as StorageResult;
 use crate::storage::util::parse_uri;
+use ConfigError::NotFound;
 use serde::{Deserialize, Serialize};
 use url::Url;
-use ConfigError::NotFound;
 
 pub mod error;
 pub mod internal;

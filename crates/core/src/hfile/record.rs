@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn test_hfile_record_display() {
         let record = HFileRecord::from_str_key("test", b"value".to_vec());
-        let display = format!("{}", record);
+        let display = format!("{record}");
         assert!(display.contains("test"));
         assert!(display.contains("value_len=5"));
     }

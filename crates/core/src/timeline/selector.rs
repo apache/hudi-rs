@@ -16,12 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::HudiTableConfig;
-use crate::config::HudiConfigs;
-use crate::error::CoreError;
-use crate::timeline::instant::{Action, Instant, State};
-use crate::timeline::Timeline;
 use crate::Result;
+use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
+use crate::error::CoreError;
+use crate::timeline::Timeline;
+use crate::timeline::instant::{Action, Instant, State};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
@@ -167,11 +167,7 @@ impl TimelineSelector {
                 .try_get(HudiTableConfig::TableVersion)
                 .map(|v| v.into())
                 .unwrap_or(6); // Conservative default if table version is somehow missing
-            if table_version >= 8 {
-                2
-            } else {
-                1
-            }
+            if table_version >= 8 { 2 } else { 1 }
         }
     }
 
@@ -298,8 +294,7 @@ impl TimelineSelector {
         if let Some(start) = self.start_datetime {
             if dt < start {
                 return Err(CoreError::Timeline(format!(
-                    "Instant not created for due to timestamp before start datetime: {}",
-                    file_name
+                    "Instant not created for due to timestamp before start datetime: {file_name}"
                 )));
             }
         }
@@ -307,8 +302,7 @@ impl TimelineSelector {
         if let Some(end) = self.end_datetime {
             if dt >= end {
                 return Err(CoreError::Timeline(format!(
-                    "Instant not created for due to timestamp after or at end datetime: {}",
-                    file_name
+                    "Instant not created for due to timestamp after or at end datetime: {file_name}"
                 )));
             }
         }
@@ -369,12 +363,12 @@ impl TimelineSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::table::HudiTableConfig;
     use crate::config::HudiConfigs;
+    use crate::config::table::HudiTableConfig;
     use crate::storage::Storage;
+    use crate::timeline::Timeline;
     use crate::timeline::builder::TimelineBuilder;
     use crate::timeline::instant::{Action, Instant, State};
-    use crate::timeline::Timeline;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -671,15 +665,19 @@ mod tests {
         // v8+ format should be rejected for layout v1
         let result = selector_v1.try_create_instant("20240103153000_20240103153001.deltacommit");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unexpected v8+ instant format in timeline layout v1"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unexpected v8+ instant format in timeline layout v1")
+        );
 
         // pre-v8 format should work for layout v1
-        assert!(selector_v1
-            .try_create_instant("20240103153000.deltacommit")
-            .is_ok());
+        assert!(
+            selector_v1
+                .try_create_instant("20240103153000.deltacommit")
+                .is_ok()
+        );
 
         // Test layout v2 - should reject pre-v8 format for completed instants
         let selector_v2 = TimelineSelector {
@@ -695,15 +693,19 @@ mod tests {
         // pre-v8 format should be rejected for layout v2 completed instants
         let result = selector_v2.try_create_instant("20240103153000.deltacommit");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Expected v8+ instant format"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Expected v8+ instant format")
+        );
 
         // v8+ format should work for layout v2
-        assert!(selector_v2
-            .try_create_instant("20240103153000_20240103153001.deltacommit")
-            .is_ok());
+        assert!(
+            selector_v2
+                .try_create_instant("20240103153000_20240103153001.deltacommit")
+                .is_ok()
+        );
 
         // Non-completed instants (inflight, requested) should work with standard format in both layouts
         let selector_v2_inflight = TimelineSelector {
@@ -716,9 +718,11 @@ mod tests {
             timeline_layout_version: 2,
         };
 
-        assert!(selector_v2_inflight
-            .try_create_instant("20240103153000.deltacommit.inflight")
-            .is_ok());
+        assert!(
+            selector_v2_inflight
+                .try_create_instant("20240103153000.deltacommit.inflight")
+                .is_ok()
+        );
     }
 
     #[tokio::test]

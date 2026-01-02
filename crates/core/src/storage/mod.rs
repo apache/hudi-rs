@@ -28,14 +28,14 @@ use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as ObjPath;
-use object_store::{parse_url_opts, ObjectStore};
+use object_store::{ObjectStore, parse_url_opts};
 use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::{parquet_to_arrow_schema, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
-use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::storage::error::StorageError::{Creation, InvalidPath};
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
@@ -69,7 +69,7 @@ impl Storage {
                 return Err(Creation(format!(
                     "{} is required.",
                     HudiTableConfig::BasePath.as_ref()
-                )))
+                )));
             }
         };
 
@@ -80,7 +80,7 @@ impl Storage {
                 options,
                 hudi_configs,
             })),
-            Err(e) => Err(Creation(format!("Failed to create storage: {}", e))),
+            Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
     }
 
@@ -222,7 +222,7 @@ impl Storage {
         for dir in dir_paths {
             dirs.push(
                 dir.filename()
-                    .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", dir)))?
+                    .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {dir:?}")))?
                     .to_string(),
             )
         }
@@ -287,7 +287,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
             next_subdir.push(child_dir);
             let next_subdir = next_subdir
                 .to_str()
-                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {:?}", next_subdir)))?;
+                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {next_subdir:?}")))?;
             let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }
@@ -312,10 +312,12 @@ mod tests {
             result.is_err(),
             "Should return error when no base path is provided."
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to create storage"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to create storage")
+        );
     }
 
     #[test]
