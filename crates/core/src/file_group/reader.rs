@@ -381,22 +381,29 @@ impl FileGroupReader {
             .ok_or_else(|| ReadFileSliceError("No Avro schema found in HFile".to_string()))?
             .clone();
 
-        // Read base records: all if keys is empty, targeted lookup otherwise
-        let base_records: Vec<HFileRecord> = if keys.is_empty() {
+        let hfile_keys: Vec<&str> = if keys.is_empty() {
+            vec![]
+        } else {
+            let mut sorted = keys.to_vec();
+            sorted.sort();
+            sorted
+        };
+
+        let base_records: Vec<HFileRecord> = if hfile_keys.is_empty() {
             hfile_reader.collect_records().map_err(|e| {
                 ReadFileSliceError(format!("Failed to collect HFile records: {:?}", e))
             })?
         } else {
-            let lookup_results = hfile_reader.lookup_records(keys).map_err(|e| {
-                ReadFileSliceError(format!("Failed to lookup HFile records: {:?}", e))
-            })?;
-            lookup_results
+            hfile_reader
+                .lookup_records(&hfile_keys)
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to lookup HFile records: {:?}", e))
+                })?
                 .into_iter()
-                .filter_map(|(_, opt_record)| opt_record)
+                .filter_map(|(_, r)| r)
                 .collect()
         };
 
-        // Scan log files if present
         let log_records = if log_file_paths.is_empty() {
             vec![]
         } else {
@@ -416,9 +423,8 @@ impl FileGroupReader {
             }
         };
 
-        // Merge records (key filtering is applied internally when keys is non-empty)
         let merger = FilesPartitionMerger::new(schema);
-        merger.merge_for_keys(&base_records, &log_records, keys)
+        merger.merge_for_keys(&base_records, &log_records, &hfile_keys)
     }
 }
 

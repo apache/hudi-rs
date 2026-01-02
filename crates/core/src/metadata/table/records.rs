@@ -160,15 +160,27 @@ impl FilesPartitionRecord {
     /// The key for the record that contains all partition paths.
     pub const ALL_PARTITIONS_KEY: &'static str = "__all_partitions__";
 
+    /// The key used in metadata table for non-partitioned tables.
+    /// The metadata table stores "." for non-partitioned tables, which maps to "" externally.
+    pub const NON_PARTITIONED_NAME: &'static str = ".";
+
     /// Check if this is an ALL_PARTITIONS record.
     pub fn is_all_partitions(&self) -> bool {
         self.record_type == MetadataRecordType::AllPartitions
     }
 
     /// Get list of partition names (for ALL_PARTITIONS record).
+    ///
+    /// Returns the partition keys from the files map. When records are decoded using
+    /// [`decode_files_partition_record_with_schema`], keys are normalized at decode time,
+    /// so non-partitioned tables will have "" (empty string) as the partition key.
+    ///
+    /// The returned list is sorted in ascending order for stable, deterministic output.
     pub fn partition_names(&self) -> Vec<&str> {
         if self.is_all_partitions() {
-            self.files.keys().map(|s| s.as_str()).collect()
+            let mut names: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
+            names.sort();
+            names
         } else {
             vec![]
         }
@@ -243,14 +255,18 @@ pub fn decode_files_partition_record_with_schema(
     record: &HFileRecord,
     schema: &AvroSchema,
 ) -> Result<FilesPartitionRecord> {
-    let key = record
+    let raw_key = record
         .key_as_str()
-        .ok_or_else(|| CoreError::MetadataTable("Invalid UTF-8 key".to_string()))?
-        .to_string();
+        .ok_or_else(|| CoreError::MetadataTable("Invalid UTF-8 key".to_string()))?;
+    // Normalize "." -> "" for non-partitioned tables
+    let key = if raw_key == FilesPartitionRecord::NON_PARTITIONED_NAME {
+        String::new()
+    } else {
+        raw_key.to_string()
+    };
 
     let value = record.value();
     if value.is_empty() {
-        // Tombstone record - treat as deleted Files record
         return Ok(FilesPartitionRecord {
             key,
             record_type: MetadataRecordType::Files,
@@ -258,14 +274,17 @@ pub fn decode_files_partition_record_with_schema(
         });
     }
 
-    // Decode using Avro
     let avro_value = decode_avro_value(value, schema)?;
-
-    // Extract record type
     let record_type = get_record_type(&avro_value);
+    let mut files = extract_filesystem_metadata(&avro_value);
 
-    // Extract filesystemMetadata map
-    let files = extract_filesystem_metadata(&avro_value);
+    // Normalize "." -> "" in AllPartitions files map
+    if record_type == MetadataRecordType::AllPartitions {
+        if let Some(mut file_info) = files.remove(FilesPartitionRecord::NON_PARTITIONED_NAME) {
+            file_info.name = String::new();
+            files.insert(String::new(), file_info);
+        }
+    }
 
     Ok(FilesPartitionRecord {
         key,
