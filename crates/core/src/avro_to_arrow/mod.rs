@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(warnings, clippy::all)]
-
 //! This module contains code for reading [Avro] data into `RecordBatch`es
 //!
 //! [Avro]: https://avro.apache.org/docs/1.2.0/
+
+#![allow(warnings, clippy::all)]
 
 pub mod arrow_array_reader;
 mod schema;

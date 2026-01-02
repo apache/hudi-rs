@@ -28,4 +28,3 @@
 - Original tests are removed.
 - DataFusion errors (`datafusion_common::error::Result`) replaced with Hudi errors (`crate::error::Result`).
 - Adjusted `AvroArrowArrayReader` to work with `Iterator<Item = AvroResult<Value>>` instead of a reader-based approach.
-- Added `#![allow(warnings, clippy::all)]` to keep code close to DataFusion's original (minimize diff for future syncs).
