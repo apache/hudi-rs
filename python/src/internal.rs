@@ -26,6 +26,8 @@ use tokio::runtime::Runtime;
 
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
+use hudi::config::read::HudiReadConfig;
+use hudi::config::table::HudiTableConfig;
 use hudi::error::CoreError;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
@@ -35,6 +37,7 @@ use hudi::table::builder::TableBuilder;
 use hudi::table::Table;
 use hudi::timeline::instant::Instant;
 use hudi::timeline::Timeline;
+use hudi_macros::AutoBind;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::{create_exception, pyclass, pyfunction, pymethods, PyErr, PyResult, Python};
@@ -616,6 +619,22 @@ pub fn build_hudi_table(
         )
         .map_err(PythonError::from)?;
     Ok(HudiTable { inner })
+}
+
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug, AutoBind)]
+#[auto_bind(pyo3)]
+#[pyclass(name = "HudiTableConfig")]
+pub struct PyHudiTableConfig {
+    inner: HudiTableConfig,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug, AutoBind)]
+#[auto_bind(pyo3)]
+#[pyclass(name = "HudiReadConfig")]
+pub struct PyHudiReadConfig {
+    inner: HudiReadConfig,
 }
 
 #[cfg(not(tarpaulin_include))]

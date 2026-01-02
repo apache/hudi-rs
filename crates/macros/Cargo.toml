@@ -16,46 +16,28 @@
 # under the License.
 
 [package]
-name = "hudi-python"
+name = "hudi-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 keywords.workspace = true
-readme.workspace = true
-description = "Native Python binding for Apache Hudi, based on Hudi-rs."
+readme = "README.md"
+description = "Procedural macros for generating language bindings from Hudi Rust enums"
 homepage.workspace = true
-repository = "https://github.com/apache/hudi-rs/tree/main/python/"
+repository = "https://github.com/apache/hudi-rs/tree/main/crates/macros/"
 
 [lib]
-name = "hudi"
-crate-type = ["cdylib"]
-doc = false
+proc-macro = true
 
 [dependencies]
-hudi = { path = "../crates/hudi"}
-hudi-macros = { path = "../crates/macros", features = ["pyo3"] }
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
 strum = { workspace = true }
-# arrow
-arrow = { workspace = true, features = ["pyarrow"] }
-
-datafusion = { workspace = true, optional = true}
-datafusion-ffi = { workspace = true, optional = true}
-
-# "stdlib"
-thiserror = { workspace = true }
-
-# runtime / async
-futures = { workspace = true }
-tokio = { workspace = true }
-
-[dependencies.pyo3]
-version = "~0.25.1"
-features = ["extension-module", "abi3", "abi3-py39"]
 
 [features]
 default = []
-datafusion = ["dep:datafusion","dep:datafusion-ffi","hudi/datafusion"]
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
+pyo3 = []
+jni = []
+cpp = []

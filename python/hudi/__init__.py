@@ -21,7 +21,9 @@ from hudi._internal import (
     HudiFileGroupReader,
     HudiFileSlice,
     HudiInstant,
+    HudiReadConfig,
     HudiTable,
+    HudiTableConfig,
     HudiTimeline,
 )
 from hudi._internal import __version__ as __version__
@@ -32,7 +34,9 @@ __all__ = [
     "HudiFileGroupReader",
     "HudiFileSlice",
     "HudiInstant",
+    "HudiReadConfig",
     "HudiTable",
     "HudiTableBuilder",
+    "HudiTableConfig",
     "HudiTimeline",
 ]
