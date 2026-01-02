@@ -20,9 +20,12 @@ use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::log_file::avro::AvroDataBlockContentReader;
-use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
+use crate::file_group::log_file::log_block::{
+    BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
+};
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
+use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
 use crate::Result;
 use apache_avro::{from_avro_datum, Schema as AvroSchema};
@@ -52,7 +55,7 @@ impl Decoder {
         fallback_length: u64,
         block_type: &BlockType,
         header: &HashMap<BlockMetadataKey, String>,
-    ) -> Result<RecordBatches> {
+    ) -> Result<LogBlockContent> {
         let content_length = if log_format_version.has_content_length() {
             let mut content_length_buf = [0u8; 8];
             reader.read_exact(&mut content_length_buf)?;
@@ -63,25 +66,38 @@ impl Decoder {
 
         let reader = reader.by_ref().take(content_length);
         match block_type {
-            BlockType::AvroData => self.decode_avro_record_content(reader, header),
-            BlockType::ParquetData => self.decode_parquet_record_content(reader),
-            BlockType::Delete => self.decode_delete_record_content(reader, header),
-            BlockType::Command => Ok(RecordBatches::new()),
+            BlockType::AvroData => self
+                .decode_avro_record_content(reader, header)
+                .map(LogBlockContent::Records),
+            BlockType::ParquetData => self
+                .decode_parquet_record_content(reader)
+                .map(LogBlockContent::Records),
+            BlockType::Delete => self
+                .decode_delete_record_content(reader, header)
+                .map(LogBlockContent::Records),
+            BlockType::HfileData => self
+                .decode_hfile_record_content(reader)
+                .map(LogBlockContent::HFileRecords),
+            BlockType::Command => Ok(LogBlockContent::Empty),
             _ => Err(CoreError::LogBlockError(format!(
                 "Unsupported block type: {block_type:?}"
             ))),
         }
     }
 
-    fn validate_log_format_version(mut reader: impl Read) -> Result<()> {
-        let mut format_version_buf = [0u8; 4];
-        reader.read_exact(&mut format_version_buf)?;
-        let format_version = u32::from_be_bytes(format_version_buf);
-        let version = LogFormatVersion::try_from(format_version)?;
-        if version != LogFormatVersion::V3 {
+    /// Validate the log block version (first 4 bytes of block content).
+    ///
+    /// This is NOT the same as [`LogFormatVersion`] (read from the file header).
+    /// Modern Hudi tables use [`LogBlockVersion::V3`].
+    fn validate_log_block_version(mut reader: impl Read) -> Result<()> {
+        let mut version_buf = [0u8; 4];
+        reader.read_exact(&mut version_buf)?;
+        let version = LogBlockVersion::try_from(version_buf)?;
+        if version != LogBlockVersion::V3 {
             return Err(CoreError::LogBlockError(format!(
-                "Only support log format version {} but got: {format_version}",
-                LogFormatVersion::V3 as u32
+                "Only support log block version {} but got: {:?}",
+                LogBlockVersion::V3 as u32,
+                version
             )));
         }
         Ok(())
@@ -92,7 +108,7 @@ impl Decoder {
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<RecordBatches> {
-        Decoder::validate_log_format_version(&mut reader)?;
+        Decoder::validate_log_block_version(&mut reader)?;
 
         let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
             CoreError::LogBlockError("Schema not found in block header".to_string())
@@ -134,7 +150,7 @@ impl Decoder {
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<RecordBatches> {
-        Decoder::validate_log_format_version(&mut reader)?;
+        Decoder::validate_log_block_version(&mut reader)?;
 
         // Read delete keys byte length
         let mut delete_records_num_bytes = [0u8; 4];
@@ -210,6 +226,44 @@ impl Decoder {
         }
 
         Ok(batches)
+    }
+
+    /// Decode HFile data block content into HFile records.
+    ///
+    /// HFile blocks are used in metadata table log files. Unlike Avro/Parquet blocks,
+    /// the content is NOT converted to Arrow RecordBatch because:
+    /// - MDT operations need key-based lookup/merge
+    /// - Values are Avro-serialized payloads decoded on demand
+    ///
+    /// The HFile content structure:
+    /// - Raw HFile data (no version prefix, unlike Avro blocks)
+    fn decode_hfile_record_content(&self, mut reader: impl Read) -> Result<Vec<HFileRecord>> {
+        // Note: HFile blocks do NOT have the 4-byte log block version prefix
+        // that Avro blocks have. The content is raw HFile data.
+        let mut hfile_bytes = Vec::new();
+        reader.read_to_end(&mut hfile_bytes)?;
+
+        if hfile_bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hfile_reader =
+            HFileReader::new(hfile_bytes).map_err(|e| CoreError::HFile(e.to_string()))?;
+
+        let mut records = Vec::new();
+        let iter = hfile_reader
+            .iter()
+            .map_err(|e| CoreError::HFile(e.to_string()))?;
+
+        for kv_result in iter {
+            let kv = kv_result.map_err(|e| CoreError::HFile(e.to_string()))?;
+            records.push(HFileRecord::new(
+                kv.key().content().to_vec(),
+                kv.value().to_vec(),
+            ));
+        }
+
+        Ok(records)
     }
 }
 

@@ -73,6 +73,12 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 
+# protobuf
+prost = { workspace = true }
+
+# compression
+flate2 = { workspace = true }
+
 # datafusion
 datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
@@ -82,6 +88,7 @@ percent-encoding = { workspace = true }
 
 [dev-dependencies]
 hudi-test = { path = "../test" }
+serial_test = { workspace = true }
 
 [lints.clippy]
 result_large_err = "allow"

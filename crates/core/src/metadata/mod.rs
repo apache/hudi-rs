@@ -17,8 +17,10 @@
  * under the License.
  */
 pub mod commit;
+pub mod merger;
 pub mod meta_field;
 pub mod replace_commit;
+pub mod table_record;
 
 pub const HUDI_METADATA_DIR: &str = ".hoodie";
 pub const DELTALAKE_METADATA_DIR: &str = "_delta_log";

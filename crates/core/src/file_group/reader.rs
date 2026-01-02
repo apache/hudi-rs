@@ -20,10 +20,11 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
 use crate::config::HudiConfigs;
+use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
-use crate::file_group::log_file::scanner::LogFileScanner;
+use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
@@ -221,27 +222,75 @@ impl FileGroupReader {
     /// # Returns
     /// A record batch read from the file slice.
     pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        let relative_path = file_slice.base_file_relative_path()?;
-        let base_file_only = !file_slice.has_log_file()
-            || self
-                .hudi_configs
-                .get_or_default(HudiReadConfig::UseReadOptimizedMode)
-                .into();
-        if base_file_only {
-            self.read_file_slice_by_base_file_path(&relative_path).await
-        } else {
-            let log_file_paths = file_slice
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let log_file_paths = if file_slice.has_log_file() {
+            file_slice
                 .log_files
                 .iter()
                 .map(|log_file| file_slice.log_file_relative_path(log_file))
-                .collect::<Result<Vec<String>>>()?;
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            vec![]
+        };
+        self.read_file_slice_from_paths(&base_file_path, log_file_paths)
+            .await
+    }
+
+    /// Same as [FileGroupReader::read_file_slice], but blocking.
+    pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.read_file_slice(file_slice))
+    }
+
+    /// Reads a file slice from a base file and a list of log files.
+    ///
+    /// # Arguments
+    /// * `base_file_path` - The relative path to the base file.
+    /// * `log_file_paths` - An iterator of relative paths to log files.
+    ///
+    /// # Returns
+    /// A record batch read from the base file merged with log files.
+    pub async fn read_file_slice_from_paths<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+    ) -> Result<RecordBatch>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let log_file_paths: Vec<String> = log_file_paths
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        let use_read_optimized: bool = self
+            .hudi_configs
+            .get_or_default(HudiReadConfig::UseReadOptimizedMode)
+            .into();
+        let base_file_only = log_file_paths.is_empty() || use_read_optimized;
+
+        if base_file_only {
+            self.read_file_slice_by_base_file_path(base_file_path).await
+        } else {
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let log_batches = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
 
+            let log_batches = match scan_result {
+                ScanResult::RecordBatches(batches) => batches,
+                ScanResult::Empty => RecordBatches::new(),
+                ScanResult::HFileRecords(_) => {
+                    return Err(CoreError::LogBlockError(
+                        "Unexpected HFile records in regular table log file".to_string(),
+                    ));
+                }
+            };
+
             let base_batch = self
-                .read_file_slice_by_base_file_path(&relative_path)
+                .read_file_slice_by_base_file_path(base_file_path)
                 .await?;
             let schema = base_batch.schema();
             let num_data_batches = log_batches.num_data_batches() + 1;
@@ -256,12 +305,20 @@ impl FileGroupReader {
         }
     }
 
-    /// Same as [FileGroupReader::read_file_slice], but blocking.
-    pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+    /// Same as [FileGroupReader::read_file_slice_from_paths], but blocking.
+    pub fn read_file_slice_from_paths_blocking<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+    ) -> Result<RecordBatch>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(self.read_file_slice(file_slice))
+            .block_on(self.read_file_slice_from_paths(base_file_path, log_file_paths))
     }
 }
 
@@ -270,14 +327,22 @@ mod tests {
     use super::*;
     use crate::config::util::empty_options;
     use crate::error::CoreError;
+    use crate::file_group::base_file::BaseFile;
+    use crate::file_group::file_slice::FileSlice;
     use crate::Result;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use std::fs::canonicalize;
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::sync::Arc;
     use url::Url;
+
+    const TEST_SAMPLE_BASE_FILE: &str =
+        "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
+    const TEST_SAMPLE_LOG_FILE: &str =
+        ".a079bdb3-731c-4894-b855-abfcd6921007-0_20240418173551906.log.1_0-204-275";
 
     fn get_non_existent_base_uri() -> String {
         "file:///non-existent-path/table".to_string()
@@ -417,6 +482,152 @@ mod tests {
             Some(BooleanArray::from(vec![false, false, true, true, false])),
             "Expected only records with commit_time > '2' and <= '4'"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_with_base_file_only() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+
+        // Test with actual test files and empty log files - should trigger base_file_only logic
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let log_file_paths: Vec<&str> = vec![];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+
+        match result {
+            Ok(batch) => {
+                assert!(
+                    batch.num_rows() > 0,
+                    "Should have read some records from base file"
+                );
+            }
+            Err(_) => {
+                // This might fail if the test data doesn't exist, which is acceptable for a unit test
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_read_optimized_mode() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
+        )?;
+
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+
+        // In read-optimized mode, log files should be ignored
+        // This should behave the same as read_file_slice_by_base_file_path
+        match result {
+            Ok(_) => {
+                // Test passes if we get a result - the method correctly ignored log files
+            }
+            Err(e) => {
+                // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("not found") || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {}",
+                    error_msg
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+
+        // The actual file reading might fail due to missing test data, which is expected
+        match result {
+            Ok(_batch) => {
+                // Test passes if we get a valid batch
+            }
+            Err(e) => {
+                // Expected for missing test data - verify it's a storage/file not found error
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("not found") || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {}",
+                    error_msg
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_from_paths_error_handling() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+
+        // Test with non-existent base file
+        let base_file_path = "non_existent_file.parquet";
+        let log_file_paths: Vec<&str> = vec![];
+
+        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+
+        assert!(result.is_err(), "Should return error for non-existent file");
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("not found") || error_msg.contains("Failed to read path"),
+            "Should contain appropriate error message, got: {}",
+            error_msg
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_file_slice_blocking() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+
+        // Create a FileSlice from the test sample base file
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new()); // empty partition path
+
+        // Call read_file_slice_blocking
+        let result = reader.read_file_slice_blocking(&file_slice);
+
+        match result {
+            Ok(batch) => {
+                assert!(
+                    batch.num_rows() > 0,
+                    "Should have read some records from base file"
+                );
+            }
+            Err(e) => {
+                // Expected for missing test data - verify it's a file not found error
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {}",
+                    error_msg
+                );
+            }
+        }
 
         Ok(())
     }

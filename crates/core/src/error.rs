@@ -57,6 +57,12 @@ pub enum CoreError {
     #[error("{0}")]
     LogBlockError(String),
 
+    #[error("HFile error: {0}")]
+    HFile(String),
+
+    #[error("Metadata table error: {0}")]
+    MetadataTable(String),
+
     #[error("{0}")]
     InvalidPartitionPath(String),
 
