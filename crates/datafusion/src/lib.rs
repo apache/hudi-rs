@@ -28,18 +28,19 @@ use std::thread;
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
+use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::datasource::physical_plan::FileGroup;
+use datafusion::datasource::physical_plan::FileScanConfigBuilder;
 use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
-use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_common::config::TableParquetOptions;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
+use datafusion_common::config::TableParquetOptions;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 
@@ -96,7 +97,7 @@ impl HudiDataSource {
     {
         match HudiTable::new_with_options(base_uri, options).await {
             Ok(t) => Ok(Self { table: Arc::new(t) }),
-            Err(e) => Err(Execution(format!("Failed to create Hudi table: {}", e))),
+            Err(e) => Err(Execution(format!("Failed to create Hudi table: {e}"))),
         }
     }
 
@@ -143,7 +144,7 @@ impl HudiDataSource {
     fn is_supported_operand(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Column(col) => self.schema().column_with_name(&col.name).is_some(),
-            Expr::Literal(_) => true,
+            Expr::Literal(..) => true,
             _ => false,
         }
     }
@@ -184,7 +185,7 @@ impl TableProvider for HudiDataSource {
             .table
             .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
             .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {}", e)))?;
+            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let base_url = self.table.base_url();
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {
@@ -198,7 +199,7 @@ impl TableProvider for HudiDataSource {
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
                 let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
-                let partitioned_file = PartitionedFile::new(url.path(), size as u64);
+                let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }
             parquet_file_groups.push(parquet_file_group_vec)
@@ -211,6 +212,7 @@ impl TableProvider for HudiDataSource {
             global: state.config_options().execution.parquet.clone(),
             column_specific_options: Default::default(),
             key_value_metadata: Default::default(),
+            crypto: Default::default(),
         };
         let table_schema = self.schema();
         let mut parquet_source = ParquetSource::new(parquet_opts);
@@ -218,17 +220,21 @@ impl TableProvider for HudiDataSource {
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            parquet_source = parquet_source.with_predicate(table_schema.clone(), predicate)
+            parquet_source = parquet_source.with_predicate(predicate)
         }
 
-        let fsc = Arc::new(
-            FileScanConfig::new(url, table_schema, Arc::new(parquet_source))
-                .with_file_groups(parquet_file_groups)
-                .with_projection(projection.cloned())
-                .with_limit(limit),
-        );
+        let file_groups: Vec<FileGroup> = parquet_file_groups
+            .into_iter()
+            .map(FileGroup::from)
+            .collect();
 
-        Ok(Arc::new(DataSourceExec::new(fsc)))
+        let fsc = FileScanConfigBuilder::new(url, table_schema, Arc::new(parquet_source))
+            .with_file_groups(file_groups)
+            .with_projection_indices(projection.cloned())
+            .with_limit(limit)
+            .build();
+
+        Ok(Arc::new(DataSourceExec::new(Arc::new(fsc))))
     }
 
     fn supports_filters_pushdown(
@@ -342,13 +348,13 @@ mod tests {
     use datafusion::logical_expr::BinaryExpr;
     use hudi_core::config::read::HudiReadConfig::InputPartitions;
     use hudi_core::metadata::meta_field::MetaField;
-    use hudi_test::assert_arrow_field_names_eq;
     use hudi_test::SampleTable::{
         V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
         V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
         V6TimebasedkeygenNonhivestyle,
     };
-    use hudi_test::{util, SampleTable};
+    use hudi_test::assert_arrow_field_names_eq;
+    use hudi_test::{SampleTable, util};
     use util::{get_bool_column, get_i32_column, get_str_column};
 
     use crate::HudiDataSource;
@@ -467,13 +473,12 @@ mod tests {
         assert!(plan_lines[1].starts_with("SortExec: TopK(fetch=10)"));
         assert!(plan_lines[2].starts_with(&format!(
             "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
-            get_field(structField@3, field2) as {}.structField[field2]]",
-            table_name
+            get_field(structField@3, field2) as {table_name}.structField[field2]]"
         )));
         assert!(plan_lines[4].starts_with(
             "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND name@1 != Alice AND get_field(structField@3, field2) > 30"
         ));
-        assert!(plan_lines[5].contains(&format!("input_partitions={}", planned_input_partitioned)));
+        assert!(plan_lines[5].contains(&format!("input_partitions={planned_input_partitioned}")));
     }
 
     async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -484,7 +489,7 @@ mod tests {
         assert_eq!(get_str_column(rb, "name"), &["Bob", "Diana"]);
         assert_eq!(get_bool_column(rb, "isActive"), &[false, true]);
         assert_eq!(
-            get_i32_column(rb, &format!("{}.structField[field2]", table_name)),
+            get_i32_column(rb, &format!("{table_name}.structField[field2]")),
             &[40, 50]
         );
     }
@@ -525,7 +530,7 @@ mod tests {
         assert_eq!(get_str_column(rb, "name"), &["Diana"]);
         assert_eq!(get_bool_column(rb, "isActive"), &[false]);
         assert_eq!(
-            get_i32_column(rb, &format!("{}.structField[field2]", table_name)),
+            get_i32_column(rb, &format!("{table_name}.structField[field2]")),
             &[50]
         );
     }
@@ -566,13 +571,16 @@ mod tests {
         let expr0 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Alice".to_string())))),
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Alice".to_string())),
+                None,
+            )),
         });
 
         let expr1 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
             op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)), None)),
         });
 
         let expr2 = Expr::BinaryExpr(BinaryExpr {
@@ -580,21 +588,24 @@ mod tests {
                 "nonexistent_column".to_string(),
             ))),
             op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)), None)),
         });
 
         let expr3 = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
             op: Operator::NotEq,
-            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("Diana".to_string())))),
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Diana".to_string())),
+                None,
+            )),
         });
 
-        let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)));
+        let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)), None);
 
         let expr5 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
             op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)), None)),
         })));
 
         let filters = vec![&expr0, &expr1, &expr2, &expr3, &expr4, &expr5];

@@ -16,11 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::config::table::HudiTableConfig;
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::error::CoreError::InvalidPartitionPath;
 use crate::expr::filter::{Filter, SchemableFilter};
-use crate::Result;
 
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
@@ -55,6 +55,7 @@ pub struct PartitionPruner {
     schema: Arc<Schema>,
     is_hive_style: bool,
     is_url_encoded: bool,
+    is_partitioned: bool,
     and_filters: Vec<SchemableFilter>,
 }
 
@@ -76,10 +77,12 @@ impl PartitionPruner {
         let is_url_encoded: bool = hudi_configs
             .get_or_default(HudiTableConfig::IsPartitionPathUrlencoded)
             .into();
+        let is_partitioned = is_table_partitioned(hudi_configs);
         Ok(PartitionPruner {
             schema,
             is_hive_style,
             is_url_encoded,
+            is_partitioned,
             and_filters,
         })
     }
@@ -90,6 +93,7 @@ impl PartitionPruner {
             schema: Arc::new(Schema::empty()),
             is_hive_style: false,
             is_url_encoded: false,
+            is_partitioned: false,
             and_filters: Vec::new(),
         }
     }
@@ -97,6 +101,11 @@ impl PartitionPruner {
     /// Returns `true` if the partition pruner does not have any filters.
     pub fn is_empty(&self) -> bool {
         self.and_filters.is_empty()
+    }
+
+    /// Returns `true` if the table is partitioned.
+    pub fn is_table_partitioned(&self) -> bool {
+        self.is_partitioned
     }
 
     /// Returns `true` if the partition path should be included based on the filters.
@@ -145,7 +154,7 @@ impl PartitionPruner {
             .map(|(field, part)| {
                 let value = if self.is_hive_style {
                     let (name, value) = part.split_once('=').ok_or(InvalidPartitionPath(
-                        format!("Partition path should be hive-style but got {}", part),
+                        format!("Partition path should be hive-style but got {part}"),
                     ))?;
                     if name != field.name() {
                         return Err(InvalidPartitionPath(format!(
@@ -328,10 +337,12 @@ mod tests {
         };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Field invalid_field not found in schema"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Field invalid_field not found in schema")
+        );
     }
 
     #[test]

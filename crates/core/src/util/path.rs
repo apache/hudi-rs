@@ -16,22 +16,25 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-pub mod commit;
-pub mod merger;
-pub mod meta_field;
-pub mod replace_commit;
-pub mod table;
-pub use table::records as table_record;
 
-pub const HUDI_METADATA_DIR: &str = ".hoodie";
-pub const DELTALAKE_METADATA_DIR: &str = "_delta_log";
-pub const ICEBERG_METADATA_DIR: &str = "metadata";
+/// Check if the given path is a metadata table path.
+///
+/// Detection is based on the path ending with `.hoodie/metadata`.
+pub fn is_metadata_table_path(path: &str) -> bool {
+    path.trim_end_matches('/').ends_with(".hoodie/metadata")
+}
 
-pub const LAKE_FORMAT_METADATA_DIRS: &[&str; 3] = &[
-    HUDI_METADATA_DIR,
-    DELTALAKE_METADATA_DIR,
-    ICEBERG_METADATA_DIR,
-];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// The virtual partition field name used in metadata tables.
-pub const METADATA_TABLE_PARTITION_FIELD: &str = "partition";
+    #[test]
+    fn test_is_metadata_table_path() {
+        assert!(is_metadata_table_path("/data/my_table/.hoodie/metadata"));
+        assert!(is_metadata_table_path("/data/my_table/.hoodie/metadata/"));
+        assert!(is_metadata_table_path("s3://bucket/table/.hoodie/metadata"));
+        assert!(!is_metadata_table_path("/data/my_table"));
+        assert!(!is_metadata_table_path("/data/my_table/.hoodie"));
+        assert!(!is_metadata_table_path("/data/.hoodie/metadata/files"));
+    }
+}

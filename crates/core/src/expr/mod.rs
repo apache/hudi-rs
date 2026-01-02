@@ -87,7 +87,7 @@ impl FromStr for ExprOperator {
                     None
                 }
             })
-            .ok_or_else(|| Unsupported(format!("Unsupported operator: {}", s)))
+            .ok_or_else(|| Unsupported(format!("Unsupported operator: {s}")))
     }
 }
 

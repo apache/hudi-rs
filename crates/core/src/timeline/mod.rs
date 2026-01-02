@@ -17,16 +17,19 @@
  * under the License.
  */
 pub mod builder;
+pub mod completion_time;
 pub mod instant;
 pub mod loader;
 pub mod lsm_tree;
 pub(crate) mod selector;
 pub(crate) mod util;
+pub mod view;
 
+use crate::Result;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::builder::{build_file_groups, build_replaced_file_groups, FileGroupMerger};
 use crate::file_group::FileGroup;
+use crate::file_group::builder::replaced_file_groups_from_replace_commit;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
 };
@@ -35,7 +38,7 @@ use crate::timeline::builder::TimelineBuilder;
 use crate::timeline::instant::Action;
 use crate::timeline::loader::TimelineLoader;
 use crate::timeline::selector::TimelineSelector;
-use crate::Result;
+use crate::timeline::view::TimelineView;
 use arrow_schema::Schema;
 use instant::Instant;
 
@@ -245,6 +248,18 @@ impl Timeline {
             .map_or_else(|| Err(CoreError::TimelineNoCommit), |t| Ok(t.to_string()))
     }
 
+    /// Create a [TimelineView] as of the given timestamp.
+    pub async fn create_view_as_of(&self, timestamp: &str) -> Result<TimelineView> {
+        let excludes = self.get_replaced_file_groups_as_of(timestamp).await?;
+        Ok(TimelineView::new(
+            timestamp.to_string(),
+            None,
+            &self.completed_commits,
+            excludes,
+            &self.hudi_configs,
+        ))
+    }
+
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
     ///
     /// ### Note
@@ -277,7 +292,7 @@ impl Timeline {
         )?;
         for instant in selector.select(self)? {
             let commit_metadata = self.get_instant_metadata(&instant).await?;
-            file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
+            file_groups.extend(replaced_file_groups_from_replace_commit(&commit_metadata)?);
         }
 
         // TODO: return file group and instants, and handle multi-writer fg id conflicts
@@ -285,15 +300,28 @@ impl Timeline {
         Ok(file_groups)
     }
 
-    /// Get file groups in the timeline ranging from start (exclusive) to end (inclusive).
-    /// File groups are as of the [end] timestamp or the latest if not given.
+    /// Get file groups from commit metadata for commits in a time range.
+    ///
+    /// This is used for incremental queries where we only want file groups
+    /// that were modified in the time range (start, end].
+    ///
+    /// # Arguments
+    /// * `start_timestamp` - Start of the time range (exclusive), None means no lower bound
+    /// * `end_timestamp` - End of the time range (inclusive), None means no upper bound
+    ///
+    /// # Returns
+    /// File groups that were modified in the time range, excluding replaced file groups.
     pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<HashSet<FileGroup>> {
-        let mut file_groups: HashSet<FileGroup> = HashSet::new();
-        let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
+        use crate::file_group::builder::{
+            FileGroupMerger, file_groups_from_commit_metadata,
+            replaced_file_groups_from_replace_commit,
+        };
+
+        // Get commits in the time range (start, end]
         let selector = TimelineSelector::completed_actions_in_range(
             DEFAULT_LOADING_ACTIONS,
             self.hudi_configs.clone(),
@@ -301,12 +329,32 @@ impl Timeline {
             end_timestamp,
         )?;
         let commits = selector.select(self)?;
+        if commits.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        // Build completion time view from selected commits only.
+        let completion_time_view = TimelineView::new(
+            commits.last().unwrap().timestamp.clone(),
+            Some(commits.first().unwrap().timestamp.clone()),
+            &commits,
+            HashSet::new(),
+            &self.hudi_configs,
+        );
+
+        let mut file_groups: HashSet<FileGroup> = HashSet::new();
+        let mut replaced_file_groups: HashSet<FileGroup> = HashSet::new();
+
         for commit in commits {
             let commit_metadata = self.get_instant_metadata(&commit).await?;
-            file_groups.merge(build_file_groups(&commit_metadata)?)?;
+            file_groups.merge(file_groups_from_commit_metadata(
+                &commit_metadata,
+                &completion_time_view,
+            )?)?;
 
             if commit.is_replacecommit() {
-                replaced_file_groups.extend(build_replaced_file_groups(&commit_metadata)?);
+                replaced_file_groups
+                    .extend(replaced_file_groups_from_replace_commit(&commit_metadata)?);
             }
         }
 
@@ -328,7 +376,7 @@ mod tests {
 
     use url::Url;
 
-    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
+    use hudi_test::{SampleTable, assert_arrow_field_names_eq, assert_avro_field_names_eq};
 
     use crate::config::table::HudiTableConfig;
     use crate::metadata::meta_field::MetaField;
@@ -384,11 +432,13 @@ mod tests {
 
         // When TimelineArchivedReadEnabled is true, archived loader should be created
         assert!(timeline.active_loader.is_layout_two_active());
-        assert!(timeline
-            .archived_loader
-            .as_ref()
-            .map(|l| l.is_layout_two_archived())
-            .unwrap_or(false));
+        assert!(
+            timeline
+                .archived_loader
+                .as_ref()
+                .map(|l| l.is_layout_two_archived())
+                .unwrap_or(false)
+        );
     }
 
     async fn create_test_timeline(base_url: Url) -> Timeline {
@@ -519,12 +569,18 @@ mod tests {
         // Check Arrow schema
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_err());
-        assert!(matches!(arrow_schema.unwrap_err(), CoreError::CommitMetadata(_)), "Getting Arrow schema includes base file lookup, therefore expect CommitMetadata error when write stats are missing");
+        assert!(
+            matches!(arrow_schema.unwrap_err(), CoreError::CommitMetadata(_)),
+            "Getting Arrow schema includes base file lookup, therefore expect CommitMetadata error when write stats are missing"
+        );
 
         // Check Avro schema
         let avro_schema = timeline.get_latest_avro_schema().await;
         assert!(avro_schema.is_err());
-        assert!(matches!(avro_schema.unwrap_err(), CoreError::SchemaNotFound(_)), "Getting Avro schema does not include base file lookup, therefore expect SchemaNotFound error when `extraMetadata.schema` is missing");
+        assert!(
+            matches!(avro_schema.unwrap_err(), CoreError::SchemaNotFound(_)),
+            "Getting Avro schema does not include base file lookup, therefore expect SchemaNotFound error when `extraMetadata.schema` is missing"
+        );
     }
 
     #[tokio::test]

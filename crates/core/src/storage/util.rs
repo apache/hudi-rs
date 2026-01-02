@@ -20,8 +20,8 @@
 //! Utility functions for storage.
 use url::Url;
 
-use crate::storage::error::StorageError::{InvalidPath, UrlParseError};
 use crate::storage::Result;
+use crate::storage::error::StorageError::{InvalidPath, UrlParseError};
 
 /// Parses a URI string into a URL.
 pub fn parse_uri(uri: &str) -> Result<Url> {
@@ -31,7 +31,7 @@ pub fn parse_uri(uri: &str) -> Result<Url> {
     };
 
     if url.path().ends_with('/') {
-        let err = InvalidPath(format!("Url {:?} cannot be a base", url));
+        let err = InvalidPath(format!("Url {url:?} cannot be a base"));
         url.path_segments_mut().map_err(|_| err)?.pop();
     }
 
@@ -53,7 +53,7 @@ pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
 
     for &seg in segments {
         let segs: Vec<_> = seg.split('/').filter(|&s| !s.is_empty()).collect();
-        let err = InvalidPath(format!("Url {:?} cannot be a base", url));
+        let err = InvalidPath(format!("Url {url:?} cannot be a base"));
         url.path_segments_mut().map_err(|_| err)?.extend(segs);
     }
 

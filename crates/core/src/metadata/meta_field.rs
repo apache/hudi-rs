@@ -16,8 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::error::CoreError;
 use crate::Result;
+use crate::error::CoreError;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lazy_static::lazy_static;
 use std::fmt::Display;

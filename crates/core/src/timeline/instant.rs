@@ -16,11 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::error::StorageError;
-use crate::Result;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ impl FromStr for Action {
             "commit" => Ok(Action::Commit),
             "deltacommit" => Ok(Action::DeltaCommit),
             "replacecommit" => Ok(Action::ReplaceCommit),
-            _ => Err(CoreError::Timeline(format!("Invalid action: {}", s))),
+            _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
 }
@@ -80,8 +80,7 @@ impl FromStr for State {
             "inflight" => Ok(State::Inflight),
             "" => Ok(State::Completed),
             _ => Err(CoreError::Timeline(format!(
-                "Invalid state suffix: {}",
-                suffix
+                "Invalid state suffix: {suffix}"
             ))),
         }
     }
@@ -100,8 +99,8 @@ impl AsRef<str> for State {
 /// An [Instant] represents a point in time when an action was performed on the table.
 ///
 /// For table version 8+, completed instants have a different filename format:
-/// `{requestedTimestamp}_{completedTimestamp}.{action}` instead of `{timestamp}.{action}`.
-/// The `timestamp` field stores the requested timestamp, and `completed_timestamp` stores
+/// `{requestedTimestamp}_{completionTimestamp}.{action}` instead of `{timestamp}.{action}`.
+/// The `timestamp` field stores the requested timestamp, and `completion_timestamp` stores
 /// the completion timestamp for v8+ completed instants.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,7 +109,7 @@ pub struct Instant {
     /// TODO rename to requested_timestamp for clarity in v8+?
     pub timestamp: String,
     /// The timestamp when the action completed (only present for v8+ completed instants).
-    pub completed_timestamp: Option<String>,
+    pub completion_timestamp: Option<String>,
     pub action: Action,
     pub state: State,
     pub epoch_millis: i64,
@@ -143,7 +142,7 @@ impl Instant {
     pub fn try_from_file_name_and_timezone(file_name: &str, timezone: &str) -> Result<Self> {
         let (timestamp_part, action_suffix) = file_name
             .split_once('.')
-            .ok_or_else(|| CoreError::Timeline(format!("Invalid file name: {}", file_name)))?;
+            .ok_or_else(|| CoreError::Timeline(format!("Invalid file name: {file_name}")))?;
 
         let (action, state) = Self::parse_action_and_state(action_suffix)?;
 
@@ -157,14 +156,13 @@ impl Instant {
 
             if state != State::Completed {
                 return Err(CoreError::Timeline(format!(
-                    "Underscore timestamp format is only valid for completed instants: {}",
-                    file_name
+                    "Underscore timestamp format is only valid for completed instants: {file_name}"
                 )));
             }
 
             Ok(Self {
                 timestamp: requested_ts.to_string(),
-                completed_timestamp: Some(completed_ts.to_string()),
+                completion_timestamp: Some(completed_ts.to_string()),
                 state,
                 action,
                 epoch_millis: dt.timestamp_millis(),
@@ -176,7 +174,7 @@ impl Instant {
 
             Ok(Self {
                 timestamp: timestamp_part.to_string(),
-                completed_timestamp: None,
+                completion_timestamp: None,
                 state,
                 action,
                 epoch_millis: dt.timestamp_millis(),
@@ -187,26 +185,50 @@ impl Instant {
     fn validate_timestamp(timestamp: &str) -> Result<()> {
         if !matches!(timestamp.len(), 14 | 17) {
             return Err(CoreError::Timeline(format!(
-                "Timestamp must be in format yyyyMMddHHmmss or yyyyMMddHHmmssSSS, but got: {}",
-                timestamp
+                "Timestamp must be in format yyyyMMddHHmmss or yyyyMMddHHmmssSSS, but got: {timestamp}"
             )));
         }
         Ok(())
     }
 
+    /// Parse a timestamp string into a UTC DateTime.
+    ///
+    /// Supports two formats:
+    /// 1. Date format: `yyyyMMddHHmmss` (14 chars) or `yyyyMMddHHmmssSSS` (17 chars)
+    /// 2. Epoch milliseconds: 17-digit number representing milliseconds since Unix epoch
+    ///    (used by metadata table for timestamps like `00000000000000000`)
+    ///
+    /// The function tries date format first, then falls back to epoch milliseconds
+    /// if the date parsing fails (e.g., invalid month/day like `00`).
     pub fn parse_datetime(timestamp: &str, timezone: &str) -> Result<DateTime<Utc>> {
-        let naive_dt = Self::parse_naive_datetime(timestamp)?;
-        Self::convert_to_timezone(naive_dt, timezone)
+        // First try parsing as yyyyMMddHHmmssSSS date format
+        if let Ok(naive_dt) = Self::parse_naive_datetime(timestamp) {
+            return Self::convert_to_timezone(naive_dt, timezone);
+        }
+
+        // Fallback: treat as epoch milliseconds (zero-padded 17-digit number)
+        // This handles metadata table timestamps like 00000000000000000, 00000000000000001, etc.
+        if timestamp.len() == 17 && timestamp.chars().all(|c| c.is_ascii_digit()) {
+            let epoch_ms: i64 = timestamp
+                .parse()
+                .map_err(|e| CoreError::Timeline(format!("Invalid epoch timestamp: {e}")))?;
+            return DateTime::from_timestamp_millis(epoch_ms)
+                .ok_or_else(|| CoreError::Timeline("Invalid epoch millis".to_string()));
+        }
+
+        Err(CoreError::Timeline(format!(
+            "Cannot parse timestamp '{timestamp}': not a valid date format or epoch millis"
+        )))
     }
 
     fn parse_naive_datetime(timestamp: &str) -> Result<NaiveDateTime> {
         let naive_dt = NaiveDateTime::parse_from_str(&timestamp[..14], "%Y%m%d%H%M%S")
-            .map_err(|e| CoreError::Timeline(format!("Failed to parse timestamp: {}", e)))?;
+            .map_err(|e| CoreError::Timeline(format!("Failed to parse timestamp: {e}")))?;
 
         if timestamp.len() == 17 {
             let millis: u32 = timestamp[14..]
                 .parse()
-                .map_err(|e| CoreError::Timeline(format!("Failed to parse milliseconds: {}", e)))?;
+                .map_err(|e| CoreError::Timeline(format!("Failed to parse milliseconds: {e}")))?;
             naive_dt
                 .with_nanosecond(millis * 1_000_000)
                 .ok_or_else(|| CoreError::Timeline("Invalid milliseconds".to_string()))
@@ -241,12 +263,12 @@ impl Instant {
     pub fn file_name(&self) -> String {
         match (&self.action, &self.state) {
             (_, State::Completed) => {
-                // For v8+ completed instants with completed_timestamp, use the underscore format
-                if let Some(completed_ts) = &self.completed_timestamp {
+                // For v8+ completed instants with completion_timestamp, use the underscore format
+                if let Some(completion_ts) = &self.completion_timestamp {
                     format!(
                         "{}_{}.{}",
                         self.timestamp,
-                        completed_ts,
+                        completion_ts,
                         self.action.as_ref()
                     )
                 } else {
@@ -279,8 +301,7 @@ impl Instant {
         commit_file_path
             .to_str()
             .ok_or(StorageError::InvalidPath(format!(
-                "Failed to get file path for {:?}",
-                self
+                "Failed to get file path for {self:?}"
             )))
             .map_err(CoreError::Storage)
             .map(|s| s.to_string())
@@ -294,6 +315,7 @@ impl Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_action_methods() {
@@ -417,10 +439,13 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_create_instant_using_local_timezone() {
         // Set a fixed timezone for consistent testing
         let original_tz = std::env::var("TZ").ok();
-        std::env::set_var("TZ", "Etc/GMT+5"); // UTC-5 fixed timezone with no DST
+        unsafe {
+            std::env::set_var("TZ", "Etc/GMT+5"); // UTC-5 fixed timezone with no DST
+        }
 
         let file_name = "20240103153000.commit";
         let instant_local = Instant::try_from_file_name_and_timezone(file_name, "local").unwrap();
@@ -431,9 +456,11 @@ mod tests {
         assert_eq!(offset_seconds, 5 * 3600);
 
         // Restore original TZ
-        match original_tz {
-            Some(tz) => std::env::set_var("TZ", tz),
-            None => std::env::remove_var("TZ"),
+        unsafe {
+            match original_tz {
+                Some(tz) => std::env::set_var("TZ", tz),
+                None => std::env::remove_var("TZ"),
+            }
         }
     }
 
@@ -486,12 +513,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v8_instant_with_completed_timestamp() -> Result<()> {
-        // v8+ format: {requestedTimestamp}_{completedTimestamp}.{action}
+    fn test_v8_instant_with_completion_timestamp() -> Result<()> {
+        // v8+ format: {requestedTimestamp}_{completionTimestamp}.{action}
         let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
         assert_eq!(instant.timestamp, "20240101120000000");
         assert_eq!(
-            instant.completed_timestamp,
+            instant.completion_timestamp,
             Some("20240101120005000".to_string())
         );
         assert_eq!(instant.action, Action::Commit);
@@ -505,14 +532,16 @@ mod tests {
         // Underscore format with non-completed state should fail
         let result = Instant::from_str("20240101120000000_20240101120005000.commit.inflight");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("only valid for completed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for completed")
+        );
     }
 
     #[test]
-    fn test_file_name_with_completed_timestamp() -> Result<()> {
+    fn test_file_name_with_completion_timestamp() -> Result<()> {
         let instant = Instant::from_str("20240101120000000_20240101120005000.commit")?;
         let file_name = instant.file_name();
         assert_eq!(file_name, "20240101120000000_20240101120005000.commit");
@@ -537,5 +566,54 @@ mod tests {
         // Too long (not 14 or 17)
         let result = Instant::from_str("202403151425301.commit");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_epoch_millis() -> Result<()> {
+        // Epoch 0 (1970-01-01 00:00:00.000 UTC)
+        let dt = Instant::parse_datetime("00000000000000000", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 0);
+
+        // Epoch 1ms
+        let dt = Instant::parse_datetime("00000000000000001", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 1);
+
+        // Epoch 1000ms (1 second)
+        let dt = Instant::parse_datetime("00000000000001000", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 1000);
+
+        // A larger epoch value
+        let dt = Instant::parse_datetime("00001734567890123", "UTC")?;
+        assert_eq!(dt.timestamp_millis(), 1734567890123);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_datetime_epoch_ordering() -> Result<()> {
+        // Verify ordering: epoch 0 < epoch 1 < epoch 2 < ... < real timestamp
+        let epoch_0 = Instant::parse_datetime("00000000000000000", "UTC")?;
+        let epoch_1 = Instant::parse_datetime("00000000000000001", "UTC")?;
+        let epoch_2 = Instant::parse_datetime("00000000000000002", "UTC")?;
+        let real_ts = Instant::parse_datetime("20240315142530500", "UTC")?;
+
+        assert!(epoch_0 < epoch_1);
+        assert!(epoch_1 < epoch_2);
+        assert!(epoch_2 < real_ts);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_datetime_date_format_still_works() -> Result<()> {
+        // Valid date format should still parse correctly (not treated as epoch)
+        let dt = Instant::parse_datetime("20240101120000000", "UTC")?;
+        // This is Jan 1, 2024, 12:00:00.000 UTC - NOT epoch 20240101120000000
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-01-01 12:00:00"
+        );
+
+        Ok(())
     }
 }

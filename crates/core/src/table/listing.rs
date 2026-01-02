@@ -16,23 +16,23 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig::ListingParallelism;
 use crate::config::table::HudiTableConfig::BaseFileFormat;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
+use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::file_group::FileGroup;
 use crate::metadata::LAKE_FORMAT_METADATA_DIRS;
-use crate::storage::{get_leaf_dirs, Storage};
+use crate::storage::{Storage, get_leaf_dirs};
 use crate::table::partition::{
-    is_table_partitioned, PartitionPruner, EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX,
+    EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX, PartitionPruner, is_table_partitioned,
 };
-use crate::Result;
+use crate::timeline::completion_time::CompletionTimeView;
 use dashmap::DashMap;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use std::collections::HashMap;
-use std::string::ToString;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -60,7 +60,19 @@ impl FileLister {
         file_name.starts_with(PARTITION_METAFIELD_PREFIX)
     }
 
-    async fn list_file_groups_for_partition(&self, partition_path: &str) -> Result<Vec<FileGroup>> {
+    /// List file groups for a partition, setting completion timestamps from the view.
+    ///
+    /// # Arguments
+    /// * `partition_path` - The partition path to list files from
+    /// * `completion_time_view` - View to look up completion timestamps.
+    ///
+    /// Files whose commit timestamps are not found in the completion time view
+    /// (i.e., uncommitted files) will have `completion_timestamp = None`.
+    async fn list_file_groups_for_partition<V: CompletionTimeView>(
+        &self,
+        partition_path: &str,
+        completion_time_view: &V,
+    ) -> Result<Vec<FileGroup>> {
         let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
 
         let listed_file_metadata = self.storage.list_files(Some(partition_path)).await?;
@@ -73,11 +85,21 @@ impl FileLister {
                 continue;
             }
 
-            let base_file_extension = format!(".{}", base_file_format);
+            let base_file_extension = format!(".{base_file_format}");
             if file_metadata.name.ends_with(&base_file_extension) {
                 // After excluding the unintended files,
                 // we expect a file that has the base file extension to be a valid base file.
-                let base_file = BaseFile::try_from(file_metadata)?;
+                let mut base_file = BaseFile::try_from(file_metadata)?;
+
+                // Look up completion timestamp and filter uncommitted files if applicable
+                base_file.set_completion_time(completion_time_view);
+                if completion_time_view.should_filter_uncommitted()
+                    && base_file.completion_timestamp.is_none()
+                {
+                    // file belongs to an uncommitted commit, skip it
+                    continue;
+                }
+
                 let file_id = &base_file.file_id;
                 file_id_to_base_files
                     .entry(file_id.to_owned())
@@ -85,7 +107,16 @@ impl FileLister {
                     .push(base_file);
             } else {
                 match LogFile::try_from(file_metadata) {
-                    Ok(log_file) => {
+                    Ok(mut log_file) => {
+                        // Look up completion timestamp and filter uncommitted files if applicable
+                        log_file.set_completion_time(completion_time_view);
+                        if completion_time_view.should_filter_uncommitted()
+                            && log_file.completion_timestamp.is_none()
+                        {
+                            // file belongs to an uncommitted commit, skip it
+                            continue;
+                        }
+
                         let file_id = &log_file.file_id;
                         file_id_to_log_files
                             .entry(file_id.to_owned())
@@ -97,7 +128,7 @@ impl FileLister {
                         // fails. However, once we support all data files, we should return error
                         // here because we expect all files to be either base files or log files,
                         // after excluding the unintended files.
-                        log::warn!("Failed to create a log file: {}", e);
+                        log::warn!("Failed to create a log file: {e}");
                         continue;
                     }
                 }
@@ -147,12 +178,17 @@ impl FileLister {
             .collect())
     }
 
-    pub async fn list_file_groups_for_relevant_partitions(
+    /// List file groups for all relevant partitions.
+    ///
+    /// # Arguments
+    /// * `completion_time_view` - View to look up completion timestamps.
+    pub async fn list_file_groups_for_relevant_partitions<V: CompletionTimeView + Sync>(
         &self,
+        completion_time_view: &V,
     ) -> Result<DashMap<String, Vec<FileGroup>>> {
         if !is_table_partitioned(&self.hudi_configs) {
             let file_groups = self
-                .list_file_groups_for_partition(EMPTY_PARTITION_PATH)
+                .list_file_groups_for_partition(EMPTY_PARTITION_PATH, completion_time_view)
                 .await?;
             let file_groups_map = DashMap::with_capacity(1);
             file_groups_map.insert(EMPTY_PARTITION_PATH.to_string(), file_groups);
@@ -164,7 +200,9 @@ impl FileLister {
         let parallelism = self.hudi_configs.get_or_default(ListingParallelism).into();
         stream::iter(pruned_partition_paths)
             .map(|p| async move {
-                let file_groups = self.list_file_groups_for_partition(&p).await?;
+                let file_groups = self
+                    .list_file_groups_for_partition(&p, completion_time_view)
+                    .await?;
                 Ok::<_, CoreError>((p, file_groups))
             })
             .buffer_unordered(parallelism)

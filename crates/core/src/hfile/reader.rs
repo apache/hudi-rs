@@ -21,15 +21,16 @@
 use std::collections::BTreeMap;
 
 use crate::hfile::block::{
-    read_var_long, var_long_size_on_disk, BlockIndexEntry, DataBlock, HFileBlock, BLOCK_HEADER_SIZE,
+    BLOCK_HEADER_SIZE, BlockIndexEntry, DataBlock, HFileBlock, read_var_long, var_long_size_on_disk,
 };
 use crate::hfile::block_type::HFileBlockType;
 use crate::hfile::compression::CompressionCodec;
 use crate::hfile::error::{HFileError, Result};
-use crate::hfile::key::{compare_keys, Key, KeyValue, Utf8Key};
+use crate::hfile::key::{Key, KeyValue, Utf8Key, compare_keys};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
 use crate::hfile::trailer::HFileTrailer;
+use crate::storage::Storage;
 use apache_avro::Schema as AvroSchema;
 use prost::Message;
 use std::cell::OnceCell;
@@ -37,7 +38,7 @@ use std::cell::OnceCell;
 /// Magic bytes indicating protobuf format in file info block
 const PBUF_MAGIC: &[u8; 4] = b"PBUF";
 
-/// Seek result codes (matching Java implementation)
+/// Seek result codes for HFile reader
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeekResult {
     /// Lookup key is before the fake first key of a block but >= actual first key
@@ -130,6 +131,29 @@ impl HFileReader {
 
         reader.initialize_metadata()?;
         Ok(reader)
+    }
+
+    /// Open an HFile from storage.
+    ///
+    /// This is an async factory method that reads the file from storage
+    /// and creates an HFileReader.
+    ///
+    /// # Arguments
+    /// * `storage` - The storage to read from
+    /// * `relative_path` - The relative path to the HFile
+    ///
+    /// # Example
+    /// ```ignore
+    /// let reader = HFileReader::open(&storage, "files/data.hfile").await?;
+    /// for record in reader.iter()? {
+    ///     println!("{:?}", record?);
+    /// }
+    /// ```
+    pub async fn open(storage: &Storage, relative_path: &str) -> Result<Self> {
+        let bytes = storage.get_file_data(relative_path).await.map_err(|e| {
+            HFileError::InvalidFormat(format!("Failed to read HFile {relative_path}: {e:?}"))
+        })?;
+        Self::new(bytes.to_vec())
     }
 
     /// Initialize metadata by reading index blocks and file info.
@@ -505,10 +529,10 @@ impl HFileReader {
 
         // Parse schema from JSON
         let schema_str = std::str::from_utf8(schema_bytes)
-            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {}", e)))?;
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {e}")))?;
 
         let schema = AvroSchema::parse_str(schema_str)
-            .map_err(|e| HFileError::InvalidFormat(format!("Invalid Avro schema: {}", e)))?;
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid Avro schema: {e}")))?;
 
         // Cache the schema (ignore if already set by another thread)
         let _ = self.cached_schema.set(schema);
@@ -855,20 +879,20 @@ impl HFileReader {
         Ok(HFileIterator { reader: self })
     }
 
-    // ================== HFileRecord API for MDT ==================
+    // ================== HFileRecord API for metadata table ==================
 
     /// Convert a KeyValue to an owned HFileRecord.
     ///
     /// This extracts the key content (without length prefix) and value bytes
-    /// into an owned struct suitable for MDT operations.
+    /// into an owned struct suitable for metadata table operations.
     fn key_value_to_record(kv: &KeyValue) -> HFileRecord {
         HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
     }
 
     /// Collect all records from the HFile as owned HFileRecords.
     ///
-    /// This is useful for MDT operations where records need to be stored
-    /// and merged with log file records.
+    /// This is useful for metadata table operations where records need to be
+    /// stored and merged with log file records.
     ///
     /// # Example
     /// ```ignore
@@ -1088,7 +1112,7 @@ mod tests {
 
     fn read_test_hfile(filename: &str) -> Vec<u8> {
         let path = test_data_dir().join(filename);
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {:?}", path))
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {path:?}"))
     }
 
     #[test]
@@ -1118,6 +1142,22 @@ mod tests {
         assert_eq!(reader.num_entries(), 0);
     }
 
+    #[tokio::test]
+    async fn test_open_nonexistent_file() {
+        use crate::storage::Storage;
+        use url::Url;
+        let base_url = Url::parse("file:///nonexistent/path").unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let result = HFileReader::open(&storage, "nonexistent.hfile").await;
+        assert!(result.is_err());
+        // Use err() instead of unwrap_err() since HFileReader doesn't implement Debug
+        match result.err() {
+            Some(HFileError::InvalidFormat(_)) => {}
+            Some(err) => panic!("Expected InvalidFormat error, got: {err:?}"),
+            None => panic!("Expected error, got Ok"),
+        }
+    }
+
     #[test]
     fn test_seek_to_first_uncompressed() {
         let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
@@ -1145,8 +1185,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1211,7 +1251,7 @@ mod tests {
         let mut count = 0;
         for result in reader.iter().expect("Failed to create iterator") {
             let kv = result.expect("Failed to read kv");
-            let expected_key = format!("hudi-key-{:09}", count);
+            let expected_key = format!("hudi-key-{count:09}");
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             count += 1;
         }
@@ -1242,8 +1282,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1286,7 +1326,7 @@ mod tests {
         let mut count = 0;
         for result in reader.record_iter().expect("Failed to create iterator") {
             let record = result.expect("Failed to read record");
-            let expected_key = format!("hudi-key-{:09}", count);
+            let expected_key = format!("hudi-key-{count:09}");
             assert_eq!(record.key_as_str(), Some(expected_key.as_str()));
             count += 1;
         }
@@ -1414,8 +1454,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1461,8 +1501,8 @@ mod tests {
         // Read first 10 entries
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1521,7 +1561,7 @@ mod tests {
             assert!(reader.next().expect("Failed to move next"));
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
             assert_eq!(kv.key().content_as_str().unwrap(), "hudi-key-000000000");
-            let expected_value = format!("hudi-value-000000000_{}", j);
+            let expected_value = format!("hudi-value-000000000_{j}");
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
         }
 
@@ -1572,8 +1612,8 @@ mod tests {
         // Read first 10 entries - keys have "-abcdefghij" suffix
         for i in 0..10 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("hudi-key-{:09}-abcdefghij", i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("hudi-key-{i:09}-abcdefghij");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1648,8 +1688,8 @@ mod tests {
         // Read first 5 entries
         for i in 0..5 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("{}{:09}", large_key_prefix, i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("{large_key_prefix}{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1671,7 +1711,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek to a key deep in the file
-        let lookup_key = format!("{}000005340", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000005340");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Found);
@@ -1718,8 +1758,8 @@ mod tests {
         // Read first 5 entries
         for i in 0..5 {
             let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
-            let expected_key = format!("{}{:09}", large_key_prefix, i);
-            let expected_value = format!("hudi-value-{:09}", i);
+            let expected_key = format!("{large_key_prefix}{i:09}");
+            let expected_value = format!("hudi-value-{i:09}");
 
             assert_eq!(kv.key().content_as_str().unwrap(), expected_key);
             assert_eq!(std::str::from_utf8(kv.value()).unwrap(), expected_value);
@@ -1742,7 +1782,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek to a key deep in the file
-        let lookup_key = format!("{}000005340", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000005340");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Found);
@@ -1778,7 +1818,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek to last key
-        let lookup_key = format!("{}000009999", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000009999");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Found);
@@ -1806,7 +1846,7 @@ mod tests {
         assert!(reader.seek_to_first().expect("Failed to seek"));
 
         // Seek past last key
-        let lookup_key = format!("{}000009999a", large_key_prefix);
+        let lookup_key = format!("{large_key_prefix}000009999a");
         let lookup = Utf8Key::new(&lookup_key);
         let result = reader.seek_to(&lookup).expect("Failed to seek");
         assert_eq!(result, SeekResult::Eof);
@@ -1974,7 +2014,7 @@ mod tests {
     // 3. "city=san_francisco" - 2 parquet files (UUID: 036ded81-9ed4-479f-bcea-7145dfa0079b)
     // 4. "city=sao_paulo" - 2 parquet files (UUID: 8aa68f7e-afd6-4c94-b86c-8a886552e08d)
 
-    use crate::metadata::table_record::decode_files_partition_record;
+    use crate::metadata::table_record::{FilesPartitionRecord, decode_files_partition_record};
     use hudi_test::QuickstartTripsTable;
 
     /// Get the path to the files partition directory in the test table.
@@ -1992,7 +2032,7 @@ mod tests {
     fn files_partition_hfile_path() -> PathBuf {
         let dir = files_partition_dir();
         let mut hfiles: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("Failed to read directory {:?}: {}", dir, e))
+            .unwrap_or_else(|e| panic!("Failed to read directory {dir:?}: {e}"))
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 entry
@@ -2009,12 +2049,12 @@ mod tests {
         hfiles
             .last()
             .map(|e| e.path())
-            .unwrap_or_else(|| panic!("No HFile found in {:?}", dir))
+            .unwrap_or_else(|| panic!("No HFile found in {dir:?}"))
     }
 
     fn read_metadata_table_hfile() -> Vec<u8> {
         let path = files_partition_hfile_path();
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {:?}", path))
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {path:?}"))
     }
 
     /// Test reading and validating metadata table HFile structure.
@@ -2038,7 +2078,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "__all_partitions__",
+                FilesPartitionRecord::ALL_PARTITIONS_KEY,
                 "city=chennai",
                 "city=san_francisco",
                 "city=sao_paulo"
@@ -2073,10 +2113,10 @@ mod tests {
         for record in &records {
             let key = record.key_as_str().expect("Key should be UTF-8");
             let files_record = decode_files_partition_record(&schema_reader, record)
-                .unwrap_or_else(|e| panic!("Failed to decode record for key {}: {}", key, e));
+                .unwrap_or_else(|e| panic!("Failed to decode record for key {key}: {e}"));
 
             match key {
-                "__all_partitions__" => {
+                FilesPartitionRecord::ALL_PARTITIONS_KEY => {
                     // Validate ALL_PARTITIONS record type and partitions
                     assert_eq!(
                         files_record.record_type,
@@ -2104,8 +2144,7 @@ mod tests {
                     for file in &parquet_files {
                         assert!(
                             file.contains("6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc"),
-                            "chennai file ID mismatch: {}",
-                            file
+                            "chennai file ID mismatch: {file}"
                         );
                     }
                     // Validate file sizes are populated
@@ -2125,8 +2164,7 @@ mod tests {
                     for file in &parquet_files {
                         assert!(
                             file.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
-                            "san_francisco file ID mismatch: {}",
-                            file
+                            "san_francisco file ID mismatch: {file}"
                         );
                     }
                 }
@@ -2144,12 +2182,11 @@ mod tests {
                     for file in &parquet_files {
                         assert!(
                             file.contains("8aa68f7e-afd6-4c94-b86c-8a886552e08d"),
-                            "sao_paulo file ID mismatch: {}",
-                            file
+                            "sao_paulo file ID mismatch: {file}"
                         );
                     }
                 }
-                _ => panic!("Unexpected key: {}", key),
+                _ => panic!("Unexpected key: {key}"),
             }
         }
     }
@@ -2196,8 +2233,7 @@ mod tests {
         for (file_name, file_info) in &parquet_files {
             assert!(
                 file_name.contains("036ded81-9ed4-479f-bcea-7145dfa0079b"),
-                "File should match san_francisco UUID: {}",
-                file_name
+                "File should match san_francisco UUID: {file_name}"
             );
             assert!(file_info.size > 0, "File size should be > 0");
             assert!(!file_info.is_deleted, "File should not be deleted");
@@ -2268,5 +2304,237 @@ mod tests {
             "Total parquet files across all partitions"
         );
         assert!(total_size > 0, "Total size across partitions should be > 0");
+    }
+
+    // ================== File Info and Meta Block Tests ==================
+
+    #[test]
+    fn test_get_file_info_last_key() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // LASTKEY should be present in file info
+        let last_key = reader.get_file_info("hfile.LASTKEY");
+        assert!(last_key.is_some(), "LASTKEY should be present");
+
+        // Parse the last key - it's the structured key bytes
+        let last_key_bytes = last_key.unwrap();
+        assert!(!last_key_bytes.is_empty(), "LASTKEY should not be empty");
+    }
+
+    #[test]
+    fn test_get_file_info_not_found() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Non-existent key should return None
+        let result = reader.get_file_info("nonexistent.key");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_avro_schema_from_metadata_hfile() {
+        let bytes = read_metadata_table_hfile();
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Metadata table HFiles should have embedded Avro schema
+        let schema = reader.get_avro_schema().expect("Failed to get schema");
+        assert!(schema.is_some(), "Metadata HFile should have Avro schema");
+
+        let avro_schema = schema.unwrap();
+        // Schema should be a record type for HoodieMetadataRecord
+        assert!(
+            matches!(avro_schema, AvroSchema::Record(_)),
+            "Schema should be a record type"
+        );
+    }
+
+    #[test]
+    fn test_get_avro_schema_regular_hfile() {
+        // Regular test HFiles don't have Avro schema in file info
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let schema = reader.get_avro_schema().expect("Failed to get schema");
+        // Regular HFiles typically don't have embedded Avro schema
+        assert!(
+            schema.is_none(),
+            "Regular HFile should not have Avro schema"
+        );
+    }
+
+    #[test]
+    fn test_read_min_max_record_keys_from_metadata_hfile() {
+        let bytes = read_metadata_table_hfile();
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Metadata table HFiles should have min/max record keys
+        let result = reader.read_min_max_record_keys();
+
+        // The metadata HFile may or may not have these keys depending on how it was created
+        // If present, verify the structure
+        if let Some((min_key, max_key)) = result {
+            assert!(!min_key.is_empty(), "Min key should not be empty");
+            assert!(!max_key.is_empty(), "Max key should not be empty");
+            // Min should be <= Max lexicographically
+            assert!(
+                min_key <= max_key,
+                "Min key should be <= Max key: {min_key} vs {max_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_min_max_record_keys_regular_hfile() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Regular test HFiles typically don't have min/max record keys
+        let result = reader.read_min_max_record_keys();
+        assert!(
+            result.is_none(),
+            "Regular HFile should not have min/max record keys"
+        );
+    }
+
+    // ================== Error Handling Tests ==================
+
+    #[test]
+    fn test_invalid_hfile_too_small() {
+        // File too small to contain a valid trailer
+        let bytes = vec![0u8; 10];
+        let result = HFileReader::new(bytes);
+        assert!(result.is_err(), "Should fail for file too small");
+    }
+
+    #[test]
+    fn test_invalid_hfile_bad_magic() {
+        // Create a file with wrong magic bytes at the end
+        let mut bytes = vec![0u8; 100];
+        // HFile trailer magic is at the end - put garbage there
+        bytes[96..100].copy_from_slice(b"BAAD");
+        let result = HFileReader::new(bytes);
+        assert!(result.is_err(), "Should fail for invalid magic");
+    }
+
+    // ================== Multi-Block Iteration Tests ==================
+
+    #[test]
+    fn test_iterate_across_multiple_blocks() {
+        // Use GZIP file with 20000 entries - spans multiple blocks
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let mut count = 0;
+        let mut prev_key: Option<String> = None;
+
+        for result in reader.iter().expect("Failed to create iterator") {
+            let kv = result.expect("Failed to read kv");
+            let key = kv.key().content_as_str().unwrap().to_string();
+
+            // Verify keys are in ascending order
+            if let Some(ref prev) = prev_key {
+                assert!(
+                    key > *prev,
+                    "Keys should be in ascending order: {key} > {prev}"
+                );
+            }
+            prev_key = Some(key);
+            count += 1;
+        }
+
+        assert_eq!(count, 20000, "Should iterate all 20000 entries");
+    }
+
+    #[test]
+    fn test_seek_across_block_boundaries() {
+        // Use 512KB blocks with 20000 entries
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        reader.seek_to_first().expect("Failed to seek");
+
+        // Seek to various keys that likely span different blocks
+        let test_keys = [
+            "hudi-key-000000000", // First key
+            "hudi-key-000005000", // Middle
+            "hudi-key-000010000", // Another block
+            "hudi-key-000015000", // Another block
+            "hudi-key-000019999", // Last key
+        ];
+
+        for expected_key in test_keys {
+            let lookup = Utf8Key::new(expected_key);
+            let result = reader.seek_to(&lookup).expect("Failed to seek");
+            assert_eq!(result, SeekResult::Found, "Should find key: {expected_key}");
+
+            let kv = reader.get_key_value().expect("Failed to get kv").unwrap();
+            assert_eq!(
+                kv.key().content_as_str().unwrap(),
+                expected_key,
+                "Key mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_next_at_eof() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Seek to last key
+        reader.seek_to_first().expect("Failed to seek");
+        let lookup = Utf8Key::new("hudi-key-000004999");
+        let result = reader.seek_to(&lookup).expect("Failed to seek");
+        assert_eq!(result, SeekResult::Found);
+
+        // next() should return false at EOF
+        assert!(!reader.next().expect("Failed to next"));
+
+        // get_key_value should return None after EOF
+        assert!(reader.get_key_value().expect("Failed to get kv").is_none());
+    }
+
+    #[test]
+    fn test_collect_records_gzip() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        let records = reader.collect_records().expect("Failed to collect records");
+        assert_eq!(records.len(), 20000);
+
+        // Verify first and last records
+        assert_eq!(records[0].key_as_str(), Some("hudi-key-000000000"));
+        assert_eq!(records[19999].key_as_str(), Some("hudi-key-000019999"));
+    }
+
+    #[test]
+    fn test_lookup_records_across_blocks() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile");
+        let mut reader = HFileReader::new(bytes).expect("Failed to create reader");
+
+        // Look up keys that span different blocks
+        let keys = vec![
+            "hudi-key-000000000",
+            "hudi-key-000005000",
+            "hudi-key-000010000",
+            "hudi-key-000015000",
+            "hudi-key-000019999",
+            "hudi-key-nonexistent",
+        ];
+
+        let results = reader.lookup_records(&keys).expect("Failed to lookup");
+        assert_eq!(results.len(), 6);
+
+        // First 5 should be found
+        for (key, value) in results.iter().take(5) {
+            assert!(value.is_some(), "Key {key} should be found");
+        }
+
+        // Last one should not be found
+        assert!(
+            results[5].1.is_none(),
+            "Nonexistent key should not be found"
+        );
     }
 }

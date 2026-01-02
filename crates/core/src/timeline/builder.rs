@@ -17,14 +17,14 @@
  * under the License.
  */
 
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig::TimelineArchivedReadEnabled;
 use crate::config::table::HudiTableConfig::{TableVersion, TimelineLayoutVersion};
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::storage::Storage;
-use crate::timeline::loader::TimelineLoader;
 use crate::timeline::Timeline;
-use crate::Result;
+use crate::timeline::loader::TimelineLoader;
 use std::sync::Arc;
 
 pub struct TimelineBuilder {
@@ -89,8 +89,7 @@ impl TimelineBuilder {
             1 => {
                 if !(6..=8).contains(&table_version) {
                     return Err(CoreError::Unsupported(format!(
-                        "Unsupported table version {} with timeline layout version {}",
-                        table_version, layout_version
+                        "Unsupported table version {table_version} with timeline layout version {layout_version}"
                     )));
                 }
                 let archived_loader = if archived_enabled {
@@ -112,8 +111,7 @@ impl TimelineBuilder {
             2 => {
                 if table_version < 8 {
                     return Err(CoreError::Unsupported(format!(
-                        "Unsupported table version {} with timeline layout version {}",
-                        table_version, layout_version
+                        "Unsupported table version {table_version} with timeline layout version {layout_version}"
                     )));
                 }
                 let archived_loader = if archived_enabled {
@@ -133,8 +131,7 @@ impl TimelineBuilder {
                 ))
             }
             _ => Err(CoreError::Unsupported(format!(
-                "Unsupported timeline layout version: {}",
-                layout_version
+                "Unsupported timeline layout version: {layout_version}"
             ))),
         }
     }
@@ -241,11 +238,13 @@ mod tests {
         let timeline = builder.build().await.unwrap();
         assert!(timeline.active_loader.is_layout_two_active());
         assert!(timeline.archived_loader.is_some());
-        assert!(timeline
-            .archived_loader
-            .as_ref()
-            .unwrap()
-            .is_layout_two_archived());
+        assert!(
+            timeline
+                .archived_loader
+                .as_ref()
+                .unwrap()
+                .is_layout_two_archived()
+        );
     }
 
     #[tokio::test]
@@ -266,11 +265,13 @@ mod tests {
         let timeline = builder.build().await.unwrap();
         assert!(!timeline.active_loader.is_layout_two_active());
         assert!(timeline.archived_loader.is_some());
-        assert!(!timeline
-            .archived_loader
-            .as_ref()
-            .unwrap()
-            .is_layout_two_archived());
+        assert!(
+            !timeline
+                .archived_loader
+                .as_ref()
+                .unwrap()
+                .is_layout_two_archived()
+        );
     }
 
     #[tokio::test]
@@ -290,10 +291,12 @@ mod tests {
 
         let result = builder.build().await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported table version 5"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported table version 5")
+        );
     }
 
     #[tokio::test]
@@ -313,10 +316,12 @@ mod tests {
 
         let result = builder.build().await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported table version 7"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported table version 7")
+        );
     }
 
     #[tokio::test]
@@ -336,9 +341,11 @@ mod tests {
 
         let result = builder.build().await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unsupported timeline layout version: 3"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported timeline layout version: 3")
+        );
     }
 }

@@ -23,11 +23,11 @@ use std::fmt::Display;
 use std::str::FromStr;
 use strum_macros::{AsRefStr, EnumIter};
 
+use crate::config::Result;
 use crate::config::error::ConfigError;
 use crate::config::error::ConfigError::{
     InvalidValue, NotFound, ParseBool, ParseInt, UnsupportedValue,
 };
-use crate::config::Result;
 use crate::config::{ConfigParser, HudiConfigValue};
 use crate::merge::RecordMergeStrategyValue;
 
@@ -128,6 +128,20 @@ pub enum HudiTableConfig {
     /// Path for LSM timeline history for layout v2, relative to timeline path (default: history)
     /// The full path will be `.hoodie/{TimelinePath}/{TimelineHistoryPath}`
     TimelineHistoryPath,
+
+    /// Enable the internal metadata table which serves table metadata like file listings.
+    ///
+    /// When enabled, file listings are read from the metadata table instead of storage,
+    /// which can significantly improve performance for tables with many partitions.
+    MetadataTableEnabled,
+
+    /// List of metadata table partitions enabled for this table.
+    ///
+    /// This config is read from the data table's hoodie.properties and specifies which
+    /// partitions are available in the metadata table (e.g., "files", "column_stats").
+    /// When creating a metadata table instance, this value should be passed as the
+    /// PartitionFields option.
+    MetadataTablePartitions,
 }
 
 impl AsRef<str> for HudiTableConfig {
@@ -155,6 +169,8 @@ impl AsRef<str> for HudiTableConfig {
             Self::ArchiveLogFolder => "hoodie.archivelog.folder",
             Self::TimelinePath => "hoodie.timeline.path",
             Self::TimelineHistoryPath => "hoodie.timeline.history.path",
+            Self::MetadataTableEnabled => "hoodie.metadata.enable",
+            Self::MetadataTablePartitions => "hoodie.table.metadata.partitions",
         }
     }
 }
@@ -175,6 +191,8 @@ impl ConfigParser for HudiTableConfig {
             )),
             Self::DatabaseName => Some(HudiConfigValue::String("default".to_string())),
             Self::DropsPartitionFields => Some(HudiConfigValue::Boolean(false)),
+            Self::IsHiveStylePartitioning => Some(HudiConfigValue::Boolean(false)),
+            Self::IsPartitionPathUrlencoded => Some(HudiConfigValue::Boolean(false)),
             Self::PartitionFields => Some(HudiConfigValue::List(vec![])),
             Self::PopulatesMetaFields => Some(HudiConfigValue::Boolean(true)),
             Self::TimelineTimezone => Some(HudiConfigValue::String(
@@ -183,6 +201,8 @@ impl ConfigParser for HudiTableConfig {
             Self::ArchiveLogFolder => Some(HudiConfigValue::String(".hoodie/archived".to_string())),
             Self::TimelinePath => Some(HudiConfigValue::String("timeline".to_string())),
             Self::TimelineHistoryPath => Some(HudiConfigValue::String("history".to_string())),
+            Self::MetadataTableEnabled => Some(HudiConfigValue::Boolean(false)),
+            Self::MetadataTablePartitions => Some(HudiConfigValue::List(vec![])),
             _ => None,
         }
     }
@@ -258,6 +278,13 @@ impl ConfigParser for HudiTableConfig {
             Self::ArchiveLogFolder => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::TimelinePath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::TimelineHistoryPath => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::MetadataTableEnabled => get_result
+                .and_then(|v| {
+                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::Boolean),
+            Self::MetadataTablePartitions => get_result
+                .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
         }
     }
 
@@ -323,6 +350,9 @@ impl FromStr for TableTypeValue {
 pub enum BaseFileFormatValue {
     #[strum(serialize = "parquet")]
     Parquet,
+    /// HFile format - only valid for metadata tables.
+    #[strum(serialize = "hfile")]
+    HFile,
 }
 
 impl FromStr for BaseFileFormatValue {
@@ -331,6 +361,7 @@ impl FromStr for BaseFileFormatValue {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
+            "hfile" => Ok(Self::HFile),
             "orc" => Err(UnsupportedValue(s.to_string())),
             v => Err(InvalidValue(v.to_string())),
         }
@@ -422,6 +453,14 @@ mod tests {
         assert_eq!(
             BaseFileFormatValue::from_str("PArquet").unwrap(),
             BaseFileFormatValue::Parquet
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_str("hfile").unwrap(),
+            BaseFileFormatValue::HFile
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_str("HFILE").unwrap(),
+            BaseFileFormatValue::HFile
         );
         assert!(matches!(
             BaseFileFormatValue::from_str("").unwrap_err(),

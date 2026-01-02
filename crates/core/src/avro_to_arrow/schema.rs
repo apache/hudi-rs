@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
+use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordSchema};
 use apache_avro::types::Value;
-use apache_avro::Schema as AvroSchema;
 use arrow::datatypes::{DataType, IntervalUnit, Schema, TimeUnit, UnionMode};
 use arrow::datatypes::{Field, UnionFields};
 use std::collections::HashMap;
@@ -100,7 +100,10 @@ fn schema_to_field_with_props(
                         .data_type()
                         .clone()
                 } else {
-                    return Err(CoreError::from(apache_avro::Error::GetUnionDuplicate));
+                    return Err(apache_avro::Error::new(
+                        apache_avro::error::Details::GetUnionDuplicate,
+                    )
+                    .into());
                 }
             } else {
                 let fields = sub_schemas
@@ -221,6 +224,8 @@ fn default_field_name(dt: &DataType) -> &str {
         | DataType::LargeListView(_) => {
             unimplemented!("View support not implemented")
         }
+        DataType::Decimal32(_, _) => "decimal",
+        DataType::Decimal64(_, _) => "decimal",
         DataType::Decimal128(_, _) => "decimal",
         DataType::Decimal256(_, _) => "decimal",
     }
@@ -229,15 +234,9 @@ fn default_field_name(dt: &DataType) -> &str {
 fn external_props(schema: &AvroSchema) -> HashMap<String, String> {
     let mut props = HashMap::new();
     match &schema {
-        AvroSchema::Record(RecordSchema {
-            doc: Some(ref doc), ..
-        })
-        | AvroSchema::Enum(EnumSchema {
-            doc: Some(ref doc), ..
-        })
-        | AvroSchema::Fixed(FixedSchema {
-            doc: Some(ref doc), ..
-        }) => {
+        AvroSchema::Record(RecordSchema { doc: Some(doc), .. })
+        | AvroSchema::Enum(EnumSchema { doc: Some(doc), .. })
+        | AvroSchema::Fixed(FixedSchema { doc: Some(doc), .. }) => {
             props.insert("avro::doc".to_string(), doc.clone());
         }
         _ => {}

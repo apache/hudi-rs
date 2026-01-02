@@ -19,7 +19,7 @@
 
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{BinaryExpr, Expr};
-use hudi_core::expr::filter::{col, Filter as HudiFilter};
+use hudi_core::expr::filter::{Filter as HudiFilter, col};
 
 /// Converts DataFusion expressions into Hudi filters.
 ///
@@ -50,8 +50,8 @@ pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<(String, String, String)> {
 fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
     // extract the column and literal from the binary expression
     let (column, literal) = match (&*binary_expr.left, &*binary_expr.right) {
-        (Expr::Column(col), Expr::Literal(lit)) => (col, lit),
-        (Expr::Literal(lit), Expr::Column(col)) => (col, lit),
+        (Expr::Column(col), Expr::Literal(lit, _)) => (col, lit),
+        (Expr::Literal(lit, _), Expr::Column(col)) => (col, lit),
         _ => return None,
     };
 
@@ -74,7 +74,7 @@ fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
 /// Converts a NOT expression (`Expr::Not`) into a `PartitionFilter`.
 fn not_expr_to_filter(not_expr: &Expr) -> Option<HudiFilter> {
     match not_expr {
-        Expr::BinaryExpr(ref binary_expr) => {
+        Expr::BinaryExpr(binary_expr) => {
             binary_expr_to_filter(binary_expr).map(|filter| filter.negate())?
         }
         _ => None,

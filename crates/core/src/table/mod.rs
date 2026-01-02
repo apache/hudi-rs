@@ -93,21 +93,22 @@ mod listing;
 pub mod partition;
 mod validation;
 
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::config::HudiConfigs;
-use crate::expr::filter::{from_str_tuples, Filter};
+use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::table::builder::TableBuilder;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
-use crate::timeline::{Timeline, EARLIEST_START_TIMESTAMP};
+use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
-use crate::Result;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
@@ -260,7 +261,22 @@ impl Table {
     }
 
     /// Get the latest partition [arrow_schema::Schema] of the table.
+    ///
+    /// For metadata tables, returns a schema with a single `partition` field
+    /// typed as [arrow_schema::DataType::Utf8], since metadata tables use a single partition
+    /// column to identify partitions like "files", "column_stats", etc.
+    ///
+    /// For regular tables, returns the partition fields with their actual data types
+    /// derived from the table schema.
     pub async fn get_partition_schema(&self) -> Result<Schema> {
+        if self.is_metadata_table() {
+            return Ok(Schema::new(vec![Field::new(
+                METADATA_TABLE_PARTITION_FIELD,
+                arrow_schema::DataType::Utf8,
+                false,
+            )]));
+        }
+
         let partition_fields: HashSet<String> = {
             let fields: Vec<String> = self.hudi_configs.get_or_default(PartitionFields).into();
             fields.into_iter().collect()
@@ -456,15 +472,30 @@ impl Table {
         timestamp: &str,
         filters: &[Filter],
     ) -> Result<Vec<FileSlice>> {
-        let excludes = self
-            .timeline
-            .get_replaced_file_groups_as_of(timestamp)
-            .await?;
+        let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
+
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+
+        // Try to create metadata table instance if enabled
+        let metadata_table = if self.is_metadata_table_enabled() {
+            log::debug!("Using metadata table for file listing");
+            match self.new_metadata_table().await {
+                Ok(mdt) => Some(mdt),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create metadata table, falling back to storage listing: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         self.file_system_view
-            .get_file_slices_as_of(timestamp, &partition_pruner, &excludes)
+            .get_file_slices(&partition_pruner, &timeline_view, metadata_table.as_ref())
             .await
     }
 
@@ -481,7 +512,8 @@ impl Table {
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<FileSlice>> {
-        // If the end timestamp is not provided, use the latest commit timestamp.
+        // If the end timestamp is not provided, use the latest file slice timestamp.
+        // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
         let Some(end) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
@@ -525,7 +557,8 @@ impl Table {
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<Vec<FileSlice>>> {
-        // If the end timestamp is not provided, use the latest commit timestamp.
+        // If the end timestamp is not provided, use the latest file slice timestamp.
+        // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
         let Some(end) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
@@ -702,24 +735,26 @@ impl Table {
         start_timestamp: &str,
         end_timestamp: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
-        // If the end timestamp is not provided, use the latest commit timestamp.
-        let Some(end_timestamp) =
+        // If the end timestamp is not provided, use the latest file slice timestamp.
+        // This is the request timestamp (commit_timestamp) for both v6 and v8+ tables.
+        let Some(end_ts) =
             end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             return Ok(Vec::new());
         };
 
         let timezone = self.timezone();
-        let start_timestamp = format_timestamp(start_timestamp, &timezone)?;
-        let end_timestamp = format_timestamp(end_timestamp, &timezone)?;
+        let start_ts = format_timestamp(start_timestamp, &timezone)?;
+        let end_ts = format_timestamp(end_ts, &timezone)?;
 
+        // Use incremental API that reads from timeline commit metadata
         let file_slices = self
-            .get_file_slices_between_internal(&start_timestamp, &end_timestamp)
+            .get_file_slices_between_internal(&start_ts, &end_ts)
             .await?;
 
         let fg_reader = self.create_file_group_reader_with_options([
-            (HudiReadConfig::FileGroupStartTimestamp, start_timestamp),
-            (HudiReadConfig::FileGroupEndTimestamp, end_timestamp),
+            (HudiReadConfig::FileGroupStartTimestamp, start_ts.clone()),
+            (HudiReadConfig::FileGroupEndTimestamp, end_ts),
         ])?;
 
         let batches =
@@ -760,6 +795,7 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HUDI_CONF_DIR;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
         IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
@@ -767,12 +803,13 @@ mod tests {
         TimelineLayoutVersion, TimelineTimezone,
     };
     use crate::config::util::{empty_filters, empty_options};
-    use crate::config::HUDI_CONF_DIR;
     use crate::error::CoreError;
     use crate::metadata::meta_field::MetaField;
-    use crate::storage::util::join_url_segments;
     use crate::storage::Storage;
-    use hudi_test::{assert_arrow_field_names_eq, assert_avro_field_names_eq, SampleTable};
+    use crate::storage::util::join_url_segments;
+    use crate::timeline::EARLIEST_START_TIMESTAMP;
+    use hudi_test::{SampleTable, assert_arrow_field_names_eq, assert_avro_field_names_eq};
+    use serial_test::serial;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -837,13 +874,11 @@ mod tests {
                 cloud_prefixes
                     .iter()
                     .any(|prefix| key_lower.starts_with(prefix)),
-                "Storage option key '{}' should start with a cloud storage prefix",
-                key
+                "Storage option key '{key}' should start with a cloud storage prefix"
             );
             assert!(
                 !value.is_empty(),
-                "Storage option value for key '{}' should not be empty",
-                key
+                "Storage option value for key '{key}' should not be empty"
             );
         }
     }
@@ -1017,8 +1052,10 @@ mod tests {
         assert_eq!(actual, "default");
         let actual: bool = configs.get_or_default(DropsPartitionFields).into();
         assert!(!actual);
-        assert!(panic::catch_unwind(|| configs.get_or_default(IsHiveStylePartitioning)).is_err());
-        assert!(panic::catch_unwind(|| configs.get_or_default(IsPartitionPathUrlencoded)).is_err());
+        let actual: bool = configs.get_or_default(IsHiveStylePartitioning).into();
+        assert!(!actual);
+        let actual: bool = configs.get_or_default(IsPartitionPathUrlencoded).into();
+        assert!(!actual);
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
         let actual: Vec<String> = configs.get_or_default(PartitionFields).into();
         assert!(actual.is_empty());
@@ -1074,6 +1111,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn get_global_table_props() {
         // Without the environment variable HUDI_CONF_DIR
         let table = get_test_table_without_validation("table_props_partial");
@@ -1086,7 +1124,9 @@ mod tests {
         // Environment variable HUDI_CONF_DIR points to nothing
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("random/wrong/dir");
-        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        unsafe {
+            env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        }
         let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         assert!(configs.get(DatabaseName).is_err());
@@ -1097,7 +1137,9 @@ mod tests {
         // With global config
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
-        env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        unsafe {
+            env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
+        }
         let table = get_test_table_without_validation("table_props_partial");
         let configs = table.hudi_configs;
         let actual: String = configs.get(DatabaseName).unwrap().into();
@@ -1106,7 +1148,9 @@ mod tests {
         assert_eq!(actual, "MERGE_ON_READ");
         let actual: String = configs.get(TableName).unwrap().into();
         assert_eq!(actual, "trips");
-        env::remove_var(HUDI_CONF_DIR)
+        unsafe {
+            env::remove_var(HUDI_CONF_DIR);
+        }
     }
 
     #[test]

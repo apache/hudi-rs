@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::error::CoreError;
 use crate::metadata::meta_field::MetaField;
 use crate::util::arrow::{create_row_converter, get_column_arrays};
-use crate::Result;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, Rows};
 use arrow_schema::SchemaRef;

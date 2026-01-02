@@ -17,11 +17,11 @@
  * under the License.
  */
 
+use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
-use crate::Result;
 use std::collections::HashMap;
 use std::str::FromStr;
 

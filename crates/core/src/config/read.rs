@@ -24,8 +24,8 @@ use std::str::FromStr;
 
 use strum_macros::EnumIter;
 
-use crate::config::error::ConfigError::{NotFound, ParseBool, ParseInt};
 use crate::config::Result;
+use crate::config::error::ConfigError::{NotFound, ParseBool, ParseInt};
 use crate::config::{ConfigParser, HudiConfigValue};
 
 /// Configurations for reading Hudi tables.

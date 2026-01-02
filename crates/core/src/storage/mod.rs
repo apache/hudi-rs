@@ -28,14 +28,14 @@ use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as ObjPath;
-use object_store::{parse_url_opts, ObjectStore};
+use object_store::{ObjectStore, parse_url_opts};
 use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::{parquet_to_arrow_schema, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
-use crate::config::table::HudiTableConfig;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::storage::error::StorageError::{Creation, InvalidPath};
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
@@ -69,7 +69,7 @@ impl Storage {
                 return Err(Creation(format!(
                     "{} is required.",
                     HudiTableConfig::BasePath.as_ref()
-                )))
+                )));
             }
         };
 
@@ -80,7 +80,7 @@ impl Storage {
                 options,
                 hudi_configs,
             })),
-            Err(e) => Err(Creation(format!("Failed to create storage: {}", e))),
+            Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
     }
 
@@ -106,6 +106,7 @@ impl Storage {
     }
 
     #[cfg(test)]
+    /// Get basic file metadata (name, size) without loading the file content.
     async fn get_file_metadata_not_populated(&self, relative_path: &str) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
@@ -116,6 +117,7 @@ impl Storage {
         Ok(FileMetadata::new(name.to_string(), meta.size))
     }
 
+    /// Get full file metadata for a Parquet file, including record counts from Parquet metadata.
     pub async fn get_file_metadata(&self, relative_path: &str) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
@@ -126,7 +128,7 @@ impl Storage {
             .filename()
             .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", &obj_meta)))?;
         let size = obj_meta.size;
-        let reader = ParquetObjectReader::new(obj_store, obj_meta);
+        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let parquet_meta = builder.metadata().clone();
         let num_records = parquet_meta.file_metadata().num_rows();
@@ -149,7 +151,7 @@ impl Storage {
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
-        let reader = ParquetObjectReader::new(obj_store, meta);
+        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         Ok(builder.metadata().as_ref().clone())
     }
@@ -187,7 +189,7 @@ impl Storage {
         let meta = obj_store.head(&obj_path).await?;
 
         // read parquet
-        let reader = ParquetObjectReader::new(obj_store, meta);
+        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let schema = builder.schema().clone();
         let mut stream = builder.build()?;
@@ -220,7 +222,7 @@ impl Storage {
         for dir in dir_paths {
             dirs.push(
                 dir.filename()
-                    .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", dir)))?
+                    .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {dir:?}")))?
                     .to_string(),
             )
         }
@@ -285,7 +287,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
             next_subdir.push(child_dir);
             let next_subdir = next_subdir
                 .to_str()
-                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {:?}", next_subdir)))?;
+                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {next_subdir:?}")))?;
             let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }
@@ -310,10 +312,12 @@ mod tests {
             result.is_err(),
             "Should return error when no base path is provided."
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to create storage"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to create storage")
+        );
     }
 
     #[test]

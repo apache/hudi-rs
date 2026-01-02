@@ -27,6 +27,7 @@
 venv
 **/.python-version
 __pycache__
+uv.lock
 
 # macOS
 **/.DS_Store
@@ -34,3 +35,4 @@ __pycache__
 # coverage files
 *.profraw
 cobertura.xml
+/cov-reports/

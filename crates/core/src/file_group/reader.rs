@@ -16,26 +16,30 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
+use crate::hfile::{HFileReader, HFileRecord};
 use crate::merge::record_merger::RecordMerger;
+use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
+use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::Storage;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
-use crate::Result;
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 use futures::TryFutureExt;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
@@ -320,16 +324,115 @@ impl FileGroupReader {
             .build()?
             .block_on(self.read_file_slice_from_paths(base_file_path, log_file_paths))
     }
+
+    // =========================================================================
+    // Metadata Table File Slice Reading
+    // =========================================================================
+
+    /// Check if this reader is configured for a metadata table.
+    ///
+    /// Detection is based on the base path ending with `.hoodie/metadata`.
+    pub fn is_metadata_table(&self) -> bool {
+        let base_path: String = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::BasePath)
+            .into();
+        crate::util::path::is_metadata_table_path(&base_path)
+    }
+
+    /// Read records from metadata table files partition.
+    ///
+    /// # Arguments
+    /// * `file_slice` - The file slice to read from
+    /// * `keys` - Only read records with these keys. If empty, reads all records.
+    ///
+    /// # Returns
+    /// HashMap containing the requested keys (or all keys if `keys` is empty).
+    pub(crate) async fn read_metadata_table_files_partition(
+        &self,
+        file_slice: &FileSlice,
+        keys: &[&str],
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let log_file_paths: Vec<String> = if file_slice.has_log_file() {
+            file_slice
+                .log_files
+                .iter()
+                .map(|log_file| file_slice.log_file_relative_path(log_file))
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            vec![]
+        };
+
+        // Open HFile
+        let mut hfile_reader = HFileReader::open(&self.storage, &base_file_path)
+            .await
+            .map_err(|e| {
+                ReadFileSliceError(format!(
+                    "Failed to read metadata table base file {base_file_path}: {e:?}"
+                ))
+            })?;
+
+        // Get Avro schema from HFile
+        let schema = hfile_reader
+            .get_avro_schema()
+            .map_err(|e| ReadFileSliceError(format!("Failed to get Avro schema: {e:?}")))?
+            .ok_or_else(|| ReadFileSliceError("No Avro schema found in HFile".to_string()))?
+            .clone();
+
+        let hfile_keys: Vec<&str> = if keys.is_empty() {
+            vec![]
+        } else {
+            let mut sorted = keys.to_vec();
+            sorted.sort();
+            sorted
+        };
+
+        let base_records: Vec<HFileRecord> = if hfile_keys.is_empty() {
+            hfile_reader.collect_records().map_err(|e| {
+                ReadFileSliceError(format!("Failed to collect HFile records: {e:?}"))
+            })?
+        } else {
+            hfile_reader
+                .lookup_records(&hfile_keys)
+                .map_err(|e| ReadFileSliceError(format!("Failed to lookup HFile records: {e:?}")))?
+                .into_iter()
+                .filter_map(|(_, r)| r)
+                .collect()
+        };
+
+        let log_records = if log_file_paths.is_empty() {
+            vec![]
+        } else {
+            let instant_range = self.create_instant_range_for_log_file_scan();
+            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                .scan(log_file_paths, &instant_range)
+                .await?;
+
+            match scan_result {
+                ScanResult::HFileRecords(records) => records,
+                ScanResult::Empty => vec![],
+                ScanResult::RecordBatches(_) => {
+                    return Err(CoreError::LogBlockError(
+                        "Unexpected RecordBatches in metadata table log file".to_string(),
+                    ));
+                }
+            }
+        };
+
+        let merger = FilesPartitionMerger::new(schema);
+        merger.merge_for_keys(&base_records, &log_records, &hfile_keys)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Result;
     use crate::config::util::empty_options;
     use crate::error::CoreError;
     use crate::file_group::base_file::BaseFile;
     use crate::file_group::file_slice::FileSlice;
-    use crate::Result;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -393,10 +496,12 @@ mod tests {
         let base_uri = get_base_uri_with_valid_props();
         let reader = FileGroupReader::new_with_options(&base_uri, options).unwrap();
         assert!(!reader.storage.options.is_empty());
-        assert!(reader
-            .storage
-            .hudi_configs
-            .contains(HudiTableConfig::BasePath));
+        assert!(
+            reader
+                .storage
+                .hudi_configs
+                .contains(HudiTableConfig::BasePath)
+        );
     }
 
     #[test]
@@ -536,8 +641,7 @@ mod tests {
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
+                    "Expected file not found error, got: {error_msg}"
                 );
             }
         }
@@ -565,8 +669,7 @@ mod tests {
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
+                    "Expected file not found error, got: {error_msg}"
                 );
             }
         }
@@ -590,8 +693,7 @@ mod tests {
         let error_msg = result.unwrap_err().to_string();
         assert!(
             error_msg.contains("not found") || error_msg.contains("Failed to read path"),
-            "Should contain appropriate error message, got: {}",
-            error_msg
+            "Should contain appropriate error message, got: {error_msg}"
         );
 
         Ok(())
@@ -623,11 +725,133 @@ mod tests {
                     error_msg.contains("Failed to read path")
                         || error_msg.contains("not found")
                         || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {}",
-                    error_msg
+                    "Expected file not found error, got: {error_msg}"
                 );
             }
         }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Metadata Table File Slice Reading Tests
+    // =========================================================================
+
+    fn get_metadata_table_base_uri() -> String {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let metadata_table_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
+        let url = Url::from_file_path(canonicalize(&metadata_table_path).unwrap()).unwrap();
+        url.as_ref().to_string()
+    }
+
+    /// Create a FileGroupReader for metadata table without trying to resolve options from storage.
+    fn create_metadata_table_reader() -> Result<FileGroupReader> {
+        let metadata_table_uri = get_metadata_table_base_uri();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath,
+            metadata_table_uri.as_str(),
+        )]));
+        FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
+    }
+
+    #[test]
+    fn test_is_metadata_table_detection() -> Result<()> {
+        // Regular table should return false
+        let base_uri = get_base_uri_with_valid_props();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+        assert!(!reader.is_metadata_table());
+
+        // Metadata table should return true
+        let metadata_table_reader = create_metadata_table_reader()?;
+        assert!(metadata_table_reader.is_metadata_table());
+
+        Ok(())
+    }
+
+    /// Initial HFile base file for the files partition (all zeros timestamp).
+    const METADATA_TABLE_FILES_BASE_FILE: &str =
+        "files/files-0000-0_0-955-2690_00000000000000000.hfile";
+
+    /// Log files for the V8Trips8I3U1D test table's files partition.
+    const METADATA_TABLE_FILES_LOG_FILES: &[&str] = &[
+        "files/.files-0000-0_20251220210108078.log.1_10-999-2838",
+        "files/.files-0000-0_20251220210123755.log.1_3-1032-2950",
+        "files/.files-0000-0_20251220210125441.log.1_5-1057-3024",
+        "files/.files-0000-0_20251220210127080.log.1_3-1082-3100",
+        "files/.files-0000-0_20251220210128625.log.1_5-1107-3174",
+        "files/.files-0000-0_20251220210129235.log.1_3-1118-3220",
+        "files/.files-0000-0_20251220210130911.log.1_3-1149-3338",
+    ];
+
+    fn create_test_file_slice() -> Result<FileSlice> {
+        use crate::file_group::FileGroup;
+
+        let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
+        let base_file_name = METADATA_TABLE_FILES_BASE_FILE
+            .strip_prefix("files/")
+            .unwrap();
+        fg.add_base_file_from_name(base_file_name)?;
+        let log_file_names: Vec<_> = METADATA_TABLE_FILES_LOG_FILES
+            .iter()
+            .map(|s| s.strip_prefix("files/").unwrap())
+            .collect();
+        fg.add_log_files_from_names(log_file_names)?;
+
+        Ok(fg
+            .get_file_slice_as_of("99999999999999999")
+            .expect("Should have file slice")
+            .clone())
+    }
+
+    #[tokio::test]
+    async fn test_read_metadata_table_files_partition() -> Result<()> {
+        use crate::metadata::table_record::{FilesPartitionRecord, MetadataRecordType};
+
+        let reader = create_metadata_table_reader()?;
+        let file_slice = create_test_file_slice()?;
+
+        // Test 1: Read all records (empty keys)
+        let all_records = reader
+            .read_metadata_table_files_partition(&file_slice, &[])
+            .await?;
+
+        // Should have 4 keys after merging
+        assert_eq!(
+            all_records.len(),
+            4,
+            "Should have 4 partition keys after merge"
+        );
+
+        // Validate all partition keys have correct record types
+        for (key, record) in &all_records {
+            if key == FilesPartitionRecord::ALL_PARTITIONS_KEY {
+                assert_eq!(record.record_type, MetadataRecordType::AllPartitions);
+            } else {
+                assert_eq!(record.record_type, MetadataRecordType::Files);
+            }
+        }
+
+        // Validate chennai partition has files
+        let chennai = all_records.get("city=chennai").unwrap();
+        assert!(
+            chennai.active_file_names().len() >= 2,
+            "Chennai should have at least 2 active files"
+        );
+        assert!(chennai.total_size() > 0, "Total size should be > 0");
+
+        // Test 2: Read specific keys
+        let keys = vec![FilesPartitionRecord::ALL_PARTITIONS_KEY, "city=chennai"];
+        let filtered_records = reader
+            .read_metadata_table_files_partition(&file_slice, &keys)
+            .await?;
+
+        // Should only contain the requested keys
+        assert_eq!(filtered_records.len(), 2);
+        assert!(filtered_records.contains_key(FilesPartitionRecord::ALL_PARTITIONS_KEY));
+        assert!(filtered_records.contains_key("city=chennai"));
+        assert!(!filtered_records.contains_key("city=san_francisco"));
+        assert!(!filtered_records.contains_key("city=sao_paulo"));
 
         Ok(())
     }

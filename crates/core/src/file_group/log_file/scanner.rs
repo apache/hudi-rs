@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::config::HudiConfigs;
 use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
 use crate::file_group::log_file::reader::LogFileReader;
@@ -23,7 +24,6 @@ use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
-use crate::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -304,7 +304,9 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::file_group::record_batches::RecordBatches;
     use crate::hfile::HFileReader;
-    use crate::metadata::table_record::decode_files_partition_record_with_schema;
+    use crate::metadata::table_record::{
+        FilesPartitionRecord, decode_files_partition_record_with_schema,
+    };
     use crate::storage::util::parse_uri;
     use apache_avro::Schema as AvroSchema;
     use hudi_test::QuickstartTripsTable;
@@ -478,7 +480,7 @@ mod tests {
                     panic!("Expected HFileRecords, got RecordBatches");
                 }
                 ScanResult::Empty => {
-                    panic!("Expected HFileRecords, got Empty for {}", log_file);
+                    panic!("Expected HFileRecords, got Empty for {log_file}");
                 }
             }
         }
@@ -511,7 +513,7 @@ mod tests {
 
         // Validate __all_partitions__ records
         let all_partitions = records_by_key
-            .get("__all_partitions__")
+            .get(FilesPartitionRecord::ALL_PARTITIONS_KEY)
             .expect("Should have __all_partitions__ records");
         assert_eq!(
             all_partitions.len(),
@@ -532,8 +534,7 @@ mod tests {
             for (name, info) in &record.files {
                 assert!(
                     name.contains(CHENNAI_UUID),
-                    "Chennai file should contain UUID: {}",
-                    name
+                    "Chennai file should contain UUID: {name}"
                 );
                 assert!(!info.is_deleted, "Files should not be deleted");
                 assert!(info.size > 0, "File size should be > 0");
@@ -550,8 +551,7 @@ mod tests {
             for (name, info) in &record.files {
                 assert!(
                     name.contains(SAN_FRANCISCO_UUID),
-                    "San Francisco file should contain UUID: {}",
-                    name
+                    "San Francisco file should contain UUID: {name}"
                 );
                 assert!(!info.is_deleted);
             }
@@ -567,8 +567,7 @@ mod tests {
             for (name, info) in &record.files {
                 assert!(
                     name.contains(SAO_PAULO_UUID),
-                    "Sao Paulo file should contain UUID: {}",
-                    name
+                    "Sao Paulo file should contain UUID: {name}"
                 );
                 assert!(!info.is_deleted);
             }

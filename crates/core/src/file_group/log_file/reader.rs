@@ -17,18 +17,18 @@
  * under the License.
  */
 
-use crate::config::table::HudiTableConfig;
+use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
-use crate::storage::reader::StorageReader;
 use crate::storage::Storage;
+use crate::storage::reader::StorageReader;
 use crate::timeline::selector::InstantRange;
-use crate::Result;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::io::{self, Read, Seek};

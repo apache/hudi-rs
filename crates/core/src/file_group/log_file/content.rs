@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
 use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -27,8 +28,7 @@ use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
-use crate::Result;
-use apache_avro::{from_avro_datum, Schema as AvroSchema};
+use apache_avro::{Schema as AvroSchema, from_avro_datum};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use std::collections::HashMap;
@@ -122,7 +122,7 @@ impl Decoder {
         let record_content_reader =
             AvroDataBlockContentReader::new(reader, writer_schema.as_ref(), record_count);
         let mut avro_arrow_array_reader =
-            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref(), None)?;
+            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref())?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
         while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
@@ -171,7 +171,7 @@ impl Decoder {
                 _ => {
                     return Err(CoreError::LogBlockError(
                         "Expected record type for delete record list".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -185,8 +185,7 @@ impl Decoder {
             let (field_name, field_value) = &fields[0];
             if field_name != "deleteRecordList" {
                 return Err(CoreError::LogBlockError(format!(
-                    "Expected field name 'deleteRecordList', got '{}'",
-                    field_name
+                    "Expected field name 'deleteRecordList', got '{field_name}'"
                 )));
             }
 
@@ -196,7 +195,7 @@ impl Decoder {
                 _ => {
                     return Err(CoreError::LogBlockError(
                         "Expected 'deleteRecordList' to be an array type".to_string(),
-                    ))
+                    ));
                 }
             }
         };
@@ -214,7 +213,6 @@ impl Decoder {
         let mut reader = AvroArrowArrayReader::try_new(
             delete_records.into_iter().map(Ok),
             &delete_record_schema,
-            None,
         )?;
 
         let instant_time = header.get(&BlockMetadataKey::InstantTime).ok_or_else(|| {
@@ -232,7 +230,7 @@ impl Decoder {
     ///
     /// HFile blocks are used in metadata table log files. Unlike Avro/Parquet blocks,
     /// the content is NOT converted to Arrow RecordBatch because:
-    /// - MDT operations need key-based lookup/merge
+    /// - Metadata table operations need key-based lookup/merge
     /// - Values are Avro-serialized payloads decoded on demand
     ///
     /// The HFile content structure:

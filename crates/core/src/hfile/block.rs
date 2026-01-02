@@ -21,7 +21,7 @@
 use crate::hfile::block_type::{HFileBlockType, MAGIC_LENGTH};
 use crate::hfile::compression::CompressionCodec;
 use crate::hfile::error::{HFileError, Result};
-use crate::hfile::key::{Key, KeyValue, KEY_VALUE_HEADER_SIZE};
+use crate::hfile::key::{KEY_VALUE_HEADER_SIZE, Key, KeyValue};
 
 /// Size constants for block header
 const SIZEOF_INT32: usize = 4;

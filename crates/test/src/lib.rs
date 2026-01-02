@@ -122,6 +122,15 @@ pub enum SampleTable {
     V8TimebasedkeygenNonhivestyle,
 }
 
+/// Sample tables with metadata table (MDT) enabled and basic schema.
+#[allow(dead_code)]
+#[derive(Debug, EnumString, AsRefStr, EnumIter)]
+#[strum(serialize_all = "snake_case")]
+pub enum SampleTableMdt {
+    /// V8 MOR non-partitioned table with MDT enabled.
+    V8Nonpartitioned,
+}
+
 impl SampleTable {
     /// Return rows of columns (id, name, isActive) for the given [RecordBatch] order by id.
     pub fn sample_data_order_by_id(record_batch: &RecordBatch) -> Vec<(i32, &str, bool)> {
@@ -191,11 +200,39 @@ impl SampleTable {
     }
 }
 
+impl SampleTableMdt {
+    /// Return rows of columns (id, name, isActive) for the given [RecordBatch] order by id.
+    pub fn sample_data_order_by_id(record_batch: &RecordBatch) -> Vec<(i32, &str, bool)> {
+        SampleTable::sample_data_order_by_id(record_batch)
+    }
+
+    fn zip_path(&self, table_type: &str, log_format: Option<&str>) -> Box<Path> {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let data_path = Path::new(dir)
+            .join("data/sample_table_use_mdt_basic_schema")
+            .join(table_type.to_lowercase())
+            .join(log_format.unwrap_or_default())
+            .join(format!("{}.zip", self.as_ref()));
+        data_path.into_boxed_path()
+    }
+
+    pub fn path_to_mor_avro(&self) -> String {
+        let zip_path = self.zip_path("mor", Some("avro"));
+        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+        path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn url_to_mor_avro(&self) -> Url {
+        let path = self.path_to_mor_avro();
+        Url::from_file_path(path).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use strum::IntoEnumIterator;
 
-    use crate::{QuickstartTripsTable, SampleTable};
+    use crate::{QuickstartTripsTable, SampleTable, SampleTableMdt};
 
     #[test]
     fn quickstart_trips_table_zip_file_should_exist() {
@@ -237,6 +274,18 @@ mod tests {
                     assert!(path.exists());
                     let path = t.zip_path("mor", Some("parquet"));
                     assert!(path.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sample_table_mdt_zip_file_should_exist() {
+        for t in SampleTableMdt::iter() {
+            match t {
+                SampleTableMdt::V8Nonpartitioned => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists(), "zip file should exist: {path:?}");
                 }
             }
         }

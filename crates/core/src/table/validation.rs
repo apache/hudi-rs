@@ -16,15 +16,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
 use crate::config::read::HudiReadConfig;
+use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::{
-    DropsPartitionFields, TableVersion, TimelineLayoutVersion,
+    BaseFileFormat, BasePath, DropsPartitionFields, TableVersion, TimelineLayoutVersion,
 };
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::merge::record_merger::RecordMerger;
+use crate::util::path::is_metadata_table_path;
+use std::str::FromStr;
 use strum::IntoEnumIterator;
 
 pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> {
@@ -44,8 +47,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
     let table_version: isize = hudi_configs.get(TableVersion)?.into();
     if table_version != 6 && table_version != 8 {
         return Err(CoreError::Unsupported(format!(
-            "Only support table version 6 and 8. Found: {}",
-            table_version
+            "Only support table version 6 and 8. Found: {table_version}"
         )));
     }
 
@@ -55,8 +57,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
     let expected_layout_version = if table_version >= 8 { 2 } else { 1 };
     if timeline_layout_version != expected_layout_version {
         return Err(CoreError::Unsupported(format!(
-            "Table version {} expects timeline layout version {}. Found: {}",
-            table_version, expected_layout_version, timeline_layout_version
+            "Table version {table_version} expects timeline layout version {expected_layout_version}. Found: {timeline_layout_version}"
         )));
     }
 
@@ -68,6 +69,19 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
         )));
     }
 
+    // Validate HFile format is only used for metadata tables
+    if let Ok(base_file_format_str) = hudi_configs.get(BaseFileFormat) {
+        let format_str: String = base_file_format_str.into();
+        if let Ok(BaseFileFormatValue::HFile) = BaseFileFormatValue::from_str(&format_str) {
+            let base_path: String = hudi_configs.get_or_default(BasePath).into();
+            if !is_metadata_table_path(&base_path) {
+                return Err(CoreError::Unsupported(format!(
+                    "Base file format '{format_str}' is only valid for metadata tables"
+                )));
+            }
+        }
+    }
+
     RecordMerger::validate_configs(hudi_configs)?;
 
     Ok(())
@@ -76,10 +90,10 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HudiConfigs;
     use crate::config::table::HudiTableConfig::{
         TableName, TableType, TableVersion, TimelineLayoutVersion,
     };
-    use crate::config::HudiConfigs;
     use std::collections::HashMap;
 
     #[test]
@@ -97,8 +111,7 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("Only support table version 6 and 8"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for table version 5");
@@ -152,8 +165,7 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("expects timeline layout version 2"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for v8 with layout 1");
@@ -175,11 +187,60 @@ mod tests {
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
                 msg.contains("expects timeline layout version 1"),
-                "Unexpected message: {}",
-                msg
+                "Unexpected message: {msg}"
             );
         } else {
             panic!("Expected CoreError::Unsupported for v6 with layout 2");
         }
+    }
+
+    #[test]
+    fn test_hfile_format_rejected_for_regular_table() {
+        use crate::config::table::HudiTableConfig::BaseFileFormat;
+
+        let mut options = HashMap::new();
+        options.insert(TableName.as_ref().to_string(), "test_table".to_string());
+        options.insert(TableType.as_ref().to_string(), "MERGE_ON_READ".to_string());
+        options.insert(TableVersion.as_ref().to_string(), "8".to_string());
+        options.insert(TimelineLayoutVersion.as_ref().to_string(), "2".to_string());
+        options.insert(BaseFileFormat.as_ref().to_string(), "hfile".to_string());
+        options.insert("hoodie.base.path".to_string(), "/data/my_table".to_string());
+
+        let configs = HudiConfigs::new(options);
+        let result = validate_configs(&configs);
+
+        assert!(result.is_err());
+        if let Err(CoreError::Unsupported(msg)) = result {
+            assert!(
+                msg.contains("only valid for metadata tables"),
+                "Unexpected message: {msg}"
+            );
+        } else {
+            panic!("Expected CoreError::Unsupported for HFile on regular table");
+        }
+    }
+
+    #[test]
+    fn test_hfile_format_allowed_for_metadata_table() {
+        use crate::config::table::HudiTableConfig::BaseFileFormat;
+
+        let mut options = HashMap::new();
+        options.insert(TableName.as_ref().to_string(), "metadata".to_string());
+        options.insert(TableType.as_ref().to_string(), "MERGE_ON_READ".to_string());
+        options.insert(TableVersion.as_ref().to_string(), "8".to_string());
+        options.insert(TimelineLayoutVersion.as_ref().to_string(), "2".to_string());
+        options.insert(BaseFileFormat.as_ref().to_string(), "hfile".to_string());
+        options.insert(
+            "hoodie.base.path".to_string(),
+            "/data/my_table/.hoodie/metadata".to_string(),
+        );
+
+        let configs = HudiConfigs::new(options);
+        let result = validate_configs(&configs);
+
+        assert!(
+            result.is_ok(),
+            "HFile format should be allowed for metadata table: {result:?}"
+        );
     }
 }

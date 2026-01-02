@@ -58,12 +58,14 @@ pub fn get_bool_column(record_batch: &RecordBatch, name: &str) -> Vec<bool> {
 
 /// Sets a fixed timezone by setting the TZ environment variable.
 pub fn set_fixed_timezone(tz: &str) {
-    env::set_var("TZ", tz);
+    // SAFETY: Only used in serial tests
+    unsafe { env::set_var("TZ", tz) };
 }
 
 /// Resets the timezone to the system default by removing the TZ environment variable.
 pub fn reset_timezone() {
-    env::remove_var("TZ");
+    // SAFETY: Only used in serial tests
+    unsafe { env::remove_var("TZ") };
 }
 
 #[macro_export]

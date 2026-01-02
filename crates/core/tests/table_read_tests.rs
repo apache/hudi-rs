@@ -26,7 +26,7 @@ use hudi_core::config::read::HudiReadConfig;
 use hudi_core::config::util::empty_filters;
 use hudi_core::error::Result;
 use hudi_core::table::Table;
-use hudi_test::{QuickstartTripsTable, SampleTable};
+use hudi_test::{QuickstartTripsTable, SampleTable, SampleTableMdt};
 
 /// Test helper module for v6 tables (pre-1.0 spec)
 mod v6_tables {
@@ -256,9 +256,11 @@ mod v6_tables {
                 .into_iter()
                 .map(|(_, rider, _)| rider)
                 .collect::<Vec<_>>();
-            assert!(riders
-                .iter()
-                .all(|rider| { !deleted_riders.contains(&rider.as_str()) }));
+            assert!(
+                riders
+                    .iter()
+                    .all(|rider| { !deleted_riders.contains(&rider.as_str()) })
+            );
 
             // verify deleted record as of the first commit
             let commit_timestamps = hudi_table
@@ -502,9 +504,11 @@ mod v8_tables {
                 .collect();
 
             // Deleted riders should not be present
-            assert!(riders
-                .iter()
-                .all(|rider| { !deleted_riders.contains(rider) }));
+            assert!(
+                riders
+                    .iter()
+                    .all(|rider| { !deleted_riders.contains(rider) })
+            );
 
             // Should have 6 active riders (8 - 2 deleted)
             assert_eq!(riders.len(), 6);
@@ -545,6 +549,96 @@ mod v8_tables {
             assert_eq!(uuid_rider_and_fare[0].2, 34.15);
             assert_eq!(uuid_rider_and_fare[1].1, "rider-J");
             assert_eq!(uuid_rider_and_fare[1].2, 17.85);
+
+            Ok(())
+        }
+    }
+}
+
+/// Test module for tables with metadata table (MDT) enabled.
+/// These tests verify MDT-accelerated file listing and partition normalization.
+mod mdt_enabled_tables {
+    use super::*;
+    use hudi_core::table::partition::PartitionPruner;
+
+    mod snapshot_queries {
+        use super::*;
+
+        /// Test reading a V8 MOR non-partitioned table with MDT enabled.
+        /// Verifies:
+        /// 1. Table can be read correctly via MDT file listing
+        /// 2. MDT partition key normalization ("." -> "") works correctly
+        /// 3. File slices are retrieved correctly from MDT
+        #[test]
+        fn test_v8_nonpartitioned_with_mdt() -> Result<()> {
+            let base_url = SampleTableMdt::V8Nonpartitioned.url_to_mor_avro();
+            let hudi_table = Table::new_blocking(base_url.path())?;
+
+            // Verify MDT is enabled
+            assert!(
+                hudi_table.is_metadata_table_enabled(),
+                "Metadata table should be enabled"
+            );
+
+            // Get file slices - this uses MDT file listing
+            let file_slices = hudi_table.get_file_slices_blocking(empty_filters())?;
+
+            // Should have file slices for the non-partitioned table
+            assert!(
+                !file_slices.is_empty(),
+                "Should have file slices from MDT listing"
+            );
+
+            // All file slices should be in the root partition (empty string)
+            for fs in &file_slices {
+                assert_eq!(
+                    &fs.partition_path, "",
+                    "Non-partitioned table should have files in root partition"
+                );
+            }
+
+            Ok(())
+        }
+
+        /// Test MDT partition key normalization for non-partitioned tables.
+        /// The metadata table stores "." as partition key, but external API should see "".
+        /// For non-partitioned tables, we use a fast path that directly fetches "." without
+        /// going through __all_partitions__ lookup.
+        #[test]
+        fn test_v8_nonpartitioned_mdt_partition_normalization() -> Result<()> {
+            let base_url = SampleTableMdt::V8Nonpartitioned.url_to_mor_avro();
+            let hudi_table = Table::new_blocking(base_url.path())?;
+
+            // Read MDT files partition records
+            let partition_pruner = PartitionPruner::empty();
+            let records =
+                hudi_table.read_metadata_table_files_partition_blocking(&partition_pruner)?;
+
+            // For non-partitioned tables, the fast path only fetches the files record.
+            // __all_partitions__ is not fetched to avoid redundant HFile lookup.
+            assert_eq!(
+                records.len(),
+                1,
+                "Non-partitioned table fast path should only fetch files record"
+            );
+
+            // The files record should be keyed by "" (empty string)
+            // not "." (which is the internal MDT representation)
+            assert!(
+                records.contains_key(""),
+                "Non-partitioned table should have files record with empty string key"
+            );
+            assert!(
+                !records.contains_key("."),
+                "Non-partitioned table should NOT have files record with '.' key after normalization"
+            );
+
+            // Verify the files record has actual file entries
+            let files_record = records.get("").unwrap();
+            assert!(
+                !files_record.files.is_empty(),
+                "Files record should contain file entries"
+            );
 
             Ok(())
         }

@@ -16,11 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::Result;
+use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
 use crate::storage::Storage;
-use crate::Result;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::PathBuf;
@@ -112,12 +113,22 @@ impl FileSlice {
 
     /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
     /// or if `file_metadata` is not fully populated.
+    ///
+    /// This only loads metadata for Parquet files. For non-Parquet files (e.g., HFile),
+    /// this is a no-op since Parquet-specific metadata reading would fail.
+    /// TODO: see if mdt read would benefit from loading hfile metadata as well.
     pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
+        // Skip non-Parquet files - metadata loading uses Parquet-specific APIs
+        if self.base_file.extension != BaseFileFormatValue::Parquet.as_ref() {
+            return Ok(());
+        }
+
         if let Some(metadata) = &self.base_file.file_metadata {
             if metadata.fully_populated {
                 return Ok(());
             }
         }
+
         let relative_path = self.base_file_relative_path()?;
         let fetched_metadata = storage.get_file_metadata(&relative_path).await?;
         self.base_file.file_metadata = Some(fetched_metadata);
