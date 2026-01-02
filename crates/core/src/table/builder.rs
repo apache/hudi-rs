@@ -287,6 +287,7 @@ impl OptionResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn create_table_builder() -> TableBuilder {
         let option_resolver = OptionResolver::new("test_uri");
@@ -385,8 +386,8 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_resolve_cloud_env_vars_with_hudi_style() {
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
@@ -413,7 +414,6 @@ mod tests {
             Some(&"test_secret_key".to_string())
         );
 
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_secret_DOT_key");
@@ -421,8 +421,8 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_resolve_cloud_env_vars_precedence() {
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
             std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -444,7 +444,6 @@ mod tests {
             Some(&"manual_access_key".to_string())
         );
 
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
             std::env::remove_var("AWS_ACCESS_KEY_ID");

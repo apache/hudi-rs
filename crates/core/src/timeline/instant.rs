@@ -315,6 +315,7 @@ impl Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_action_methods() {
@@ -438,10 +439,10 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_create_instant_using_local_timezone() {
         // Set a fixed timezone for consistent testing
         let original_tz = std::env::var("TZ").ok();
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             std::env::set_var("TZ", "Etc/GMT+5"); // UTC-5 fixed timezone with no DST
         }
@@ -455,7 +456,6 @@ mod tests {
         assert_eq!(offset_seconds, 5 * 3600);
 
         // Restore original TZ
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             match original_tz {
                 Some(tz) => std::env::set_var("TZ", tz),

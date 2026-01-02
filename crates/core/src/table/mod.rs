@@ -809,6 +809,7 @@ mod tests {
     use crate::storage::util::join_url_segments;
     use crate::timeline::EARLIEST_START_TIMESTAMP;
     use hudi_test::{SampleTable, assert_arrow_field_names_eq, assert_avro_field_names_eq};
+    use serial_test::serial;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::PathBuf;
@@ -1110,6 +1111,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn get_global_table_props() {
         // Without the environment variable HUDI_CONF_DIR
         let table = get_test_table_without_validation("table_props_partial");
@@ -1122,7 +1124,6 @@ mod tests {
         // Environment variable HUDI_CONF_DIR points to nothing
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("random/wrong/dir");
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
         }
@@ -1136,7 +1137,6 @@ mod tests {
         // With global config
         let base_path = env::current_dir().unwrap();
         let hudi_conf_dir = base_path.join("tests/data/hudi_conf_dir");
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             env::set_var(HUDI_CONF_DIR, hudi_conf_dir.as_os_str());
         }
@@ -1148,7 +1148,6 @@ mod tests {
         assert_eq!(actual, "MERGE_ON_READ");
         let actual: String = configs.get(TableName).unwrap().into();
         assert_eq!(actual, "trips");
-        // SAFETY: This is a test function that runs single-threaded
         unsafe {
             env::remove_var(HUDI_CONF_DIR);
         }
