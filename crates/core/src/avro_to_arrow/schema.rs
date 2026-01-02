@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordSchema};
 use apache_avro::types::Value;
@@ -100,9 +100,10 @@ fn schema_to_field_with_props(
                         .data_type()
                         .clone()
                 } else {
-                    return Err(CoreError::from(apache_avro::Error::new(
+                    return Err(apache_avro::Error::new(
                         apache_avro::error::Details::GetUnionDuplicate,
-                    )));
+                    )
+                    .into());
                 }
             } else {
                 let fields = sub_schemas

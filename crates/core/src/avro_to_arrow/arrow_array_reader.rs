@@ -18,7 +18,7 @@
 //! Avro to Arrow array readers
 
 use crate::avro_to_arrow::to_arrow_schema;
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use apache_avro::schema::RecordSchema;
 use apache_avro::{
     AvroResult, Error as AvroError,
@@ -33,14 +33,14 @@ use arrow::array::{
 };
 use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
 use arrow::buffer::{Buffer, MutableBuffer};
-use arrow::datatypes::Fields;
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNumericType, ArrowPrimitiveType, DataType, Date32Type, Date64Type,
-    Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
+    Field, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
     Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
+use arrow::datatypes::{Fields, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::error::ArrowError::SchemaError;
 use arrow::error::Result as ArrowResult;
@@ -54,30 +54,17 @@ type RecordSlice<'a> = &'a [&'a Vec<(String, Value)>];
 
 pub struct AvroArrowArrayReader<I: Iterator<Item = AvroResult<Value>>> {
     values: I,
-    schema: Schema,
-    projection: Option<Vec<String>>,
+    schema: SchemaRef,
     schema_lookup: BTreeMap<String, usize>,
 }
 
 impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
-    /// Create a new Avro to Arrow array reader.
-    ///
-    /// # Arguments
-    ///
-    /// * `values_iter` - Iterator that returns Avro values
-    /// * `writer_schema` - The writer schema for each Avro value (record)
-    /// * `projection` - The fields to project
-    pub fn try_new(
-        values: I,
-        writer_schema: &AvroSchema,
-        projection: Option<Vec<String>>,
-    ) -> Result<Self> {
-        let schema = to_arrow_schema(writer_schema)?;
+    pub fn try_new(values: I, writer_schema: &AvroSchema) -> Result<Self> {
+        let schema = Arc::new(to_arrow_schema(writer_schema)?);
         let schema_lookup = Self::schema_lookup(writer_schema.clone())?;
         Ok(Self {
             values,
             schema,
-            projection,
             schema_lookup,
         })
     }
@@ -92,9 +79,9 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                 }
                 Ok(lookup)
             }
-            _ => Err(CoreError::from(SchemaError(
-                "expected avro schema to be a record".to_string(),
-            ))),
+            _ => Err(
+                ArrowError::SchemaError("expected avro schema to be a record".to_string()).into(),
+            ),
         }
     }
 
@@ -123,7 +110,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             }
             AvroSchema::Record(RecordSchema { fields, lookup, .. }) => {
                 lookup.iter().for_each(|(field_name, pos)| {
-                    schema_lookup.insert(format!("{}.{}", parent_field_name, field_name), *pos);
+                    schema_lookup.insert(format!("{parent_field_name}.{field_name}"), *pos);
                 });
 
                 for field in fields {
@@ -136,7 +123,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                 }
             }
             AvroSchema::Array(schema) => {
-                let sub_parent_field_name = format!("{}.element", parent_field_name);
+                let sub_parent_field_name = format!("{parent_field_name}.element");
                 Self::child_schema_lookup(&sub_parent_field_name, &schema.items, schema_lookup)?;
             }
             _ => (),
@@ -153,7 +140,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             .map(|value| match value {
                 Ok(Value::Record(v)) => Ok(v),
                 Err(e) => Err(ArrowError::ParseError(format!(
-                    "Failed to parse avro value: {e:?}"
+                    "Failed to parse avro value: {e}"
                 ))),
                 other => Err(ArrowError::ParseError(format!(
                     "Row needs to be of type object, got: {other:?}"
@@ -170,19 +157,9 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
         };
 
         let rows = rows.iter().collect::<Vec<&Vec<(String, Value)>>>();
-        let projection = self.projection.clone().unwrap_or_default();
-        let arrays = self.build_struct_array(&rows, "", self.schema.fields(), &projection);
-        let projected_fields = if projection.is_empty() {
-            self.schema.fields().clone()
-        } else {
-            projection
-                .iter()
-                .filter_map(|name| self.schema.column_with_name(name))
-                .map(|(_, field)| field.clone())
-                .collect()
-        };
-        let projected_schema = Arc::new(Schema::new(projected_fields));
-        Some(arrays.and_then(|arr| RecordBatch::try_new(projected_schema, arr)))
+        let arrays = self.build_struct_array(&rows, "", self.schema.fields());
+
+        Some(arrays.and_then(|arr| RecordBatch::try_new(Arc::clone(&self.schema), arr)))
     }
 
     fn build_boolean_array(&self, rows: RecordSlice, col_name: &str) -> ArrayRef {
@@ -272,7 +249,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                 self.list_array_string_array_builder::<UInt64Type>(&dtype, col_name, rows)
             }
             ref e => Err(SchemaError(format!(
-                "Data type is currently not supported for dictionaries in list : {e:?}"
+                "Data type is currently not supported for dictionaries in list : {e}"
             ))),
         }
     }
@@ -298,7 +275,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             }
             e => {
                 return Err(SchemaError(format!(
-                    "Nested list data builder type is not supported: {e:?}"
+                    "Nested list data builder type is not supported: {e}"
                 )));
             }
         };
@@ -363,7 +340,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     }
                     e => {
                         return Err(SchemaError(format!(
-                            "Nested list data builder type is not supported: {e:?}"
+                            "Nested list data builder type is not supported: {e}"
                         )));
                     }
                 }
@@ -566,7 +543,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     .collect();
 
                 let sub_parent_field_name = format!("{}.{}", parent_field_name, list_field.name());
-                let arrays = self.build_struct_array(&rows, &sub_parent_field_name, fields, &[])?;
+                let arrays = self.build_struct_array(&rows, &sub_parent_field_name, fields)?;
                 let data_type = DataType::Struct(fields.clone());
                 ArrayDataBuilder::new(data_type)
                     .len(rows.len())
@@ -577,7 +554,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             }
             datatype => {
                 return Err(SchemaError(format!(
-                    "Nested list of {datatype:?} not supported"
+                    "Nested list of {datatype} not supported"
                 )));
             }
         };
@@ -596,20 +573,14 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
     /// The function does not construct the StructArray as some callers would want the child arrays.
     ///
     /// *Note*: The function is recursive, and will read nested structs.
-    ///
-    /// If `projection` is not empty, then all values are returned. The first level of projection
-    /// occurs at the `RecordBatch` level. No further projection currently occurs, but would be
-    /// useful if plucking values from a struct, e.g. getting `a.b.c.e` from `a.b.c.{d, e}`.
     fn build_struct_array(
         &self,
         rows: RecordSlice,
         parent_field_name: &str,
         struct_fields: &Fields,
-        projection: &[String],
     ) -> ArrowResult<Vec<ArrayRef>> {
         let arrays: ArrowResult<Vec<ArrayRef>> = struct_fields
             .iter()
-            .filter(|field| projection.is_empty() || projection.contains(field.name()))
             .map(|field| {
                 let field_path = if parent_field_name.is_empty() {
                     field.name().to_string()
@@ -749,8 +720,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                                 }
                             })
                             .collect::<Vec<&Vec<(String, Value)>>>();
-                        let arrays =
-                            self.build_struct_array(&struct_rows, &field_path, fields, &[])?;
+                        let arrays = self.build_struct_array(&struct_rows, &field_path, fields)?;
                         // construct a struct array's data in order to set null buffer
                         let data_type = DataType::Struct(fields.clone());
                         let data = ArrayDataBuilder::new(data_type)
@@ -762,7 +732,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     }
                     _ => {
                         return Err(SchemaError(format!(
-                            "type {:?} not supported",
+                            "type {} not supported",
                             field.data_type()
                         )));
                     }
@@ -861,11 +831,9 @@ fn resolve_string(v: &Value) -> ArrowResult<Option<String>> {
             .map(Some),
         Value::Enum(_, s) => Ok(Some(s.clone())),
         Value::Null => Ok(None),
-        other => Err(AvroError::new(AvroErrorDetails::GetString(
-            other.clone().into(),
-        ))),
+        other => Err(AvroError::new(AvroErrorDetails::GetString(other.clone()))),
     }
-    .map_err(|e| SchemaError(format!("expected resolvable string : {e:?}")))
+    .map_err(|e| SchemaError(format!("expected resolvable string : {e}")))
 }
 
 fn resolve_u8(v: &Value) -> Option<u8> {

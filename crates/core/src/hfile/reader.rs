@@ -1142,6 +1142,22 @@ mod tests {
         assert_eq!(reader.num_entries(), 0);
     }
 
+    #[tokio::test]
+    async fn test_open_nonexistent_file() {
+        use crate::storage::Storage;
+        use url::Url;
+        let base_url = Url::parse("file:///nonexistent/path").unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let result = HFileReader::open(&storage, "nonexistent.hfile").await;
+        assert!(result.is_err());
+        // Use err() instead of unwrap_err() since HFileReader doesn't implement Debug
+        match result.err() {
+            Some(HFileError::InvalidFormat(_)) => {}
+            Some(err) => panic!("Expected InvalidFormat error, got: {err:?}"),
+            None => panic!("Expected error, got Ok"),
+        }
+    }
+
     #[test]
     fn test_seek_to_first_uncompressed() {
         let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");

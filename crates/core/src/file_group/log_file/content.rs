@@ -122,7 +122,7 @@ impl Decoder {
         let record_content_reader =
             AvroDataBlockContentReader::new(reader, writer_schema.as_ref(), record_count);
         let mut avro_arrow_array_reader =
-            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref(), None)?;
+            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref())?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
         while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
@@ -213,7 +213,6 @@ impl Decoder {
         let mut reader = AvroArrowArrayReader::try_new(
             delete_records.into_iter().map(Ok),
             &delete_record_schema,
-            None,
         )?;
 
         let instant_time = header.get(&BlockMetadataKey::InstantTime).ok_or_else(|| {

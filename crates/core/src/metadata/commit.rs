@@ -385,6 +385,15 @@ mod tests {
     }
 
     #[test]
+    fn test_from_avro_bytes_invalid() {
+        // Invalid Avro data that cannot be parsed
+        let invalid_avro = b"not valid avro data";
+        let result = HoodieCommitMetadata::from_avro_bytes(invalid_avro);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CoreError::CommitMetadata(_))));
+    }
+
+    #[test]
     fn test_get_partition_write_stats() {
         let json = json!({
             "partitionToWriteStats": {

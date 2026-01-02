@@ -19,8 +19,6 @@
 //!
 //! [Avro]: https://avro.apache.org/docs/1.2.0/
 
-#![allow(warnings, clippy::all)]
-
 pub mod arrow_array_reader;
 mod schema;
 
@@ -30,6 +28,7 @@ pub use schema::to_arrow_schema;
 use std::io::Read;
 
 /// Read Avro schema given a reader
+#[allow(dead_code)]
 pub fn read_avro_schema_from_reader<R: Read>(reader: &mut R) -> Result<Schema> {
     let avro_reader = apache_avro::Reader::new(reader)?;
     let schema = avro_reader.writer_schema();
