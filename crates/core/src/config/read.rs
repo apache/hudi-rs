@@ -93,7 +93,7 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
-            HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(8192usize)),
+            HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             _ => None,
         }
     }

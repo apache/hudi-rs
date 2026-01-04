@@ -110,6 +110,7 @@ impl FileGroupReader {
             })
     }
 
+    #[cfg(test)]
     fn create_filtering_mask_for_base_file_records(
         &self,
         records: &RecordBatch,
@@ -185,12 +186,7 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
             .await?;
 
-        if let Some(mask) = self.create_filtering_mask_for_base_file_records(&records)? {
-            filter_record_batch(&records, &mask)
-                .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
-        } else {
-            Ok(records)
-        }
+        apply_commit_time_filter(&self.hudi_configs, records)
     }
 
     /// Same as [FileGroupReader::read_file_slice_by_base_file_path], but blocking.
@@ -403,19 +399,21 @@ impl FileGroupReader {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let use_read_optimized: bool = self
+            .hudi_configs
+            .get_or_default(HudiReadConfig::UseReadOptimizedMode)
+            .into();
+
+        if use_read_optimized {
+            return self.read_base_file_stream(base_file_path, options).await;
+        }
+
         let log_file_paths: Vec<String> = log_file_paths
             .into_iter()
             .map(|s| s.as_ref().to_string())
             .collect();
 
-        let use_read_optimized: bool = self
-            .hudi_configs
-            .get_or_default(HudiReadConfig::UseReadOptimizedMode)
-            .into();
-        let base_file_only = log_file_paths.is_empty() || use_read_optimized;
-
-        if base_file_only {
-            // True streaming: return a stream from the parquet file
+        if log_file_paths.is_empty() {
             self.read_base_file_stream(base_file_path, options).await
         } else {
             // Fallback: collect + merge, then yield as single-item stream
@@ -427,39 +425,41 @@ impl FileGroupReader {
     }
 
     /// Reads a base file as a stream of record batches.
-    ///
-    /// This method streams record batches directly from the parquet file without
-    /// loading all data into memory at once.
     async fn read_base_file_stream(
         &self,
         relative_path: &str,
         options: &ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        // Get default batch size from config
+        use crate::config::table::BaseFileFormatValue;
+
+        // Validate base file format is parquet
+        let base_file_format: String = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::BaseFileFormat)
+            .into();
+        if !base_file_format.eq_ignore_ascii_case(BaseFileFormatValue::Parquet.as_ref()) {
+            return Err(ReadFileSliceError(format!(
+                "Streaming read only supports parquet format, got: {base_file_format}"
+            )));
+        }
+
         let default_batch_size: usize = self
             .hudi_configs
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
-
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
-
         let parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
 
-        // Get the parquet stream
         let parquet_stream = self
             .storage
             .get_parquet_file_stream(&path, parquet_options)
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
-        let populates_meta_fields: bool = hudi_configs
-            .get_or_default(HudiTableConfig::PopulatesMetaFields)
-            .into();
-
-        // Create a stream that applies commit time filtering
+        // Apply the same filtering logic as read_file_slice_by_base_file_path
         let stream = parquet_stream
             .into_stream()
             .filter_map(move |result| {
@@ -470,31 +470,10 @@ impl FileGroupReader {
                             "Failed to read batch: {e:?}"
                         )))),
                         Ok(batch) => {
-                            // Apply commit time filtering if meta fields are populated
-                            let filtered = if populates_meta_fields {
-                                match create_commit_time_filter(&hudi_configs, &batch) {
-                                    Err(e) => return Some(Err(e)),
-                                    Ok(Some(mask)) => {
-                                        match filter_record_batch(&batch, &mask) {
-                                            Ok(b) => b,
-                                            Err(e) => {
-                                                return Some(Err(ReadFileSliceError(format!(
-                                                    "Failed to filter records: {e:?}"
-                                                ))))
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => batch,
-                                }
-                            } else {
-                                batch
-                            };
-
-                            // Only yield non-empty batches
-                            if filtered.num_rows() > 0 {
-                                Some(Ok(filtered))
-                            } else {
-                                None
+                            match apply_commit_time_filter(&hudi_configs, batch) {
+                                Err(e) => Some(Err(e)),
+                                Ok(filtered) if filtered.num_rows() > 0 => Some(Ok(filtered)),
+                                Ok(_) => None,
                             }
                         }
                     }
@@ -604,26 +583,32 @@ impl FileGroupReader {
     }
 }
 
-/// Helper function to create a commit time filter mask for a record batch.
-/// This is used by the streaming read APIs.
-fn create_commit_time_filter(
-    hudi_configs: &HudiConfigs,
-    records: &RecordBatch,
-) -> Result<Option<BooleanArray>> {
+/// Apply commit time filtering to a record batch.
+///
+/// This function mirrors the filtering logic in `FileGroupReader::create_filtering_mask_for_base_file_records`
+/// but takes `HudiConfigs` directly so it can be used in streaming contexts where `&self` is not available.
+fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> Result<RecordBatch> {
+    let populates_meta_fields: bool = hudi_configs
+        .get_or_default(HudiTableConfig::PopulatesMetaFields)
+        .into();
+    if !populates_meta_fields {
+        return Ok(batch);
+    }
+
+    let start_ts = hudi_configs
+        .try_get(HudiReadConfig::FileGroupStartTimestamp)
+        .map(|v| -> String { v.into() });
+    if start_ts.is_none() {
+        // If start timestamp is not provided, the query is snapshot or time-travel
+        return Ok(batch);
+    }
+
     let mut and_filters: Vec<SchemableFilter> = Vec::new();
     let schema = MetaField::schema();
 
-    if let Some(start) = hudi_configs
-        .try_get(HudiReadConfig::FileGroupStartTimestamp)
-        .map(|v| -> String { v.into() })
-    {
-        let filter: Filter =
-            Filter::try_from((MetaField::CommitTime.as_ref(), ">", start.as_str()))?;
-        let filter = SchemableFilter::try_from((filter, schema.as_ref()))?;
-        and_filters.push(filter);
-    } else {
-        // If start timestamp is not provided, no filtering needed
-        return Ok(None);
+    if let Some(start) = start_ts {
+        let filter = Filter::try_from((MetaField::CommitTime.as_ref(), ">", start.as_str()))?;
+        and_filters.push(SchemableFilter::try_from((filter, schema.as_ref()))?);
     }
 
     if let Some(end) = hudi_configs
@@ -631,25 +616,25 @@ fn create_commit_time_filter(
         .map(|v| -> String { v.into() })
     {
         let filter = Filter::try_from((MetaField::CommitTime.as_ref(), "<=", end.as_str()))?;
-        let filter = SchemableFilter::try_from((filter, schema.as_ref()))?;
-        and_filters.push(filter);
+        and_filters.push(SchemableFilter::try_from((filter, schema.as_ref()))?);
     }
 
     if and_filters.is_empty() {
-        return Ok(None);
+        return Ok(batch);
     }
 
-    let mut mask = BooleanArray::from(vec![true; records.num_rows()]);
+    let mut mask = BooleanArray::from(vec![true; batch.num_rows()]);
     for filter in &and_filters {
         let col_name = filter.field.name().as_str();
-        let col_values = records
+        let col_values = batch
             .column_by_name(col_name)
             .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} not found")))?;
-
         let comparison = filter.apply_comparsion(col_values)?;
         mask = and(&mask, &comparison)?;
     }
-    Ok(Some(mask))
+
+    filter_record_batch(&batch, &mask)
+        .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
 }
 
 #[cfg(test)]
