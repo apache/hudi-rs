@@ -142,7 +142,8 @@ int main() {
         auto file_group_reader = new_file_group_reader_with_options(base_uri, opts);
 
         auto base_file_path = "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
-        ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_by_base_file_path(base_file_path);
+        std::vector<std::string> log_file_paths{};  // No log files for this example
+        ArrowArrayStream* stream_ptr = file_group_reader->read_file_slice_from_paths(base_file_path, log_file_paths);
 
         if (!stream_ptr) {
             std::cerr << "Error: Received null stream pointer" << std::endl;

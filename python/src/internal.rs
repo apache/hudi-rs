@@ -106,25 +106,6 @@ impl HudiFileGroupReader {
         batches.to_pyarrow(py).map(|b| b.unbind())
     }
 
-    fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &str,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        let options = ReadOptions::new();
-        let stream = rt()
-            .block_on(self.inner.read_file_slice_by_paths(
-                relative_path,
-                Vec::<String>::new(),
-                &options,
-            ))
-            .map_err(PythonError::from)?;
-        let batches: Vec<_> = rt()
-            .block_on(stream.try_collect())
-            .map_err(PythonError::from)?;
-        batches.to_pyarrow(py).map(|b| b.unbind())
-    }
-
     fn read_file_slice_from_paths(
         &self,
         base_file_path: &str,
@@ -135,7 +116,7 @@ impl HudiFileGroupReader {
         let stream = rt()
             .block_on(
                 self.inner
-                    .read_file_slice_by_paths(base_file_path, log_file_paths, &options),
+                    .read_file_slice_from_paths(base_file_path, log_file_paths, &options),
             )
             .map_err(PythonError::from)?;
         let batches: Vec<_> = rt()

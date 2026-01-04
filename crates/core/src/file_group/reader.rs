@@ -201,7 +201,10 @@ impl FileGroupReader {
     }
 
     /// Reads the data from the base file at the given relative path.
-    async fn read_file_slice_by_base_file_path(&self, relative_path: &str) -> Result<RecordBatch> {
+    ///
+    /// This is an internal method that reads just the base file portion of a file slice.
+    /// Currently only parquet format is supported for base files.
+    async fn read_base_file_records(&self, relative_path: &str) -> Result<RecordBatch> {
         let records = self
             .read_parquet_file_to_single_batch(relative_path)
             .await?;
@@ -304,9 +307,7 @@ impl FileGroupReader {
                 }
             };
 
-            let base_batch = self
-                .read_file_slice_by_base_file_path(base_file_path)
-                .await?;
+            let base_batch = self.read_base_file_records(base_file_path).await?;
             let schema = base_batch.schema();
             let num_data_batches = log_batches.num_data_batches() + 1;
             let num_delete_batches = log_batches.num_delete_batches();
@@ -423,7 +424,7 @@ impl FileGroupReader {
     /// use futures::StreamExt;
     ///
     /// let options = ReadOptions::new();
-    /// let mut stream = reader.read_file_slice_by_paths(
+    /// let mut stream = reader.read_file_slice_from_paths(
     ///     "city=chennai/file-id-0_0-7-24_20240101120000.parquet",
     ///     [".file-id-0_20240101120000.log.1_0-51-115"],
     ///     &options,
@@ -434,7 +435,7 @@ impl FileGroupReader {
     ///     // Process batch...
     /// }
     /// ```
-    pub async fn read_file_slice_by_paths<I, S>(
+    pub async fn read_file_slice_from_paths<I, S>(
         &self,
         base_file_path: &str,
         log_file_paths: I,
@@ -1009,7 +1010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_slice_by_paths() -> Result<()> {
+    async fn test_read_file_slice_from_paths() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
@@ -1017,7 +1018,7 @@ mod tests {
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let options = ReadOptions::new();
         let result = reader
-            .read_file_slice_by_paths(base_file_path, Vec::<String>::new(), &options)
+            .read_file_slice_from_paths(base_file_path, Vec::<String>::new(), &options)
             .await;
 
         match result {
@@ -1038,7 +1039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_slice_by_paths_with_partition() -> Result<()> {
+    async fn test_read_file_slice_from_paths_with_partition() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
@@ -1046,7 +1047,7 @@ mod tests {
         let base_file_path = format!("city=chennai/{TEST_SAMPLE_BASE_FILE}");
         let options = ReadOptions::new();
         let result = reader
-            .read_file_slice_by_paths(&base_file_path, Vec::<String>::new(), &options)
+            .read_file_slice_from_paths(&base_file_path, Vec::<String>::new(), &options)
             .await;
 
         // Should fail because the file doesn't exist at that path
@@ -1067,14 +1068,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_slice_by_paths_error_invalid_base_path() -> Result<()> {
+    async fn test_read_file_slice_from_paths_error_invalid_base_path() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
         // Test with invalid base file name (not a valid parquet file name)
         let options = ReadOptions::new();
         let result = reader
-            .read_file_slice_by_paths("some/invalid_file_name", Vec::<String>::new(), &options)
+            .read_file_slice_from_paths("some/invalid_file_name", Vec::<String>::new(), &options)
             .await;
 
         match result {

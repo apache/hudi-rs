@@ -47,7 +47,7 @@ mod ffi {
             options: &CxxVector<CxxString>,
         ) -> Box<HudiFileGroupReader>;
 
-        fn read_file_slice_by_paths(
+        fn read_file_slice_from_paths(
             self: &HudiFileGroupReader,
             base_file_path: &CxxString,
             log_file_paths: &CxxVector<CxxString>,
@@ -84,7 +84,7 @@ pub fn new_file_group_reader_with_options(
 }
 
 impl HudiFileGroupReader {
-    pub fn read_file_slice_by_paths(
+    pub fn read_file_slice_from_paths(
         &self,
         base_file_path: &CxxString,
         log_file_paths: &CxxVector<CxxString>,
@@ -106,7 +106,7 @@ impl HudiFileGroupReader {
         let stream = rt()
             .block_on(
                 self.inner
-                    .read_file_slice_by_paths(base_file_path, log_file_paths, &options),
+                    .read_file_slice_from_paths(base_file_path, log_file_paths, &options),
             )
             .expect("Failed to read file slice by paths");
 

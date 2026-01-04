@@ -200,20 +200,34 @@ from hudi import HudiFileGroupReader
 reader = HudiFileGroupReader(
     "/table/base/path", {"hoodie.read.file_group.start_timestamp": "0"})
 
-# Returns a PyArrow RecordBatch
-record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet")
+# Read records from base file and log files
+record_batch = reader.read_file_slice_from_paths(
+    "partition/base_file.parquet",
+    ["partition/.log_file_1", "partition/.log_file_2"])
+
+# Read records from base file only (pass empty list for log files)
+record_batch = reader.read_file_slice_from_paths(
+    "partition/base_file.parquet", [])
 ```
 
 #### Rust
 
 ```rust
 use hudi::file_group::reader::FileGroupReader;
+use hudi::table::ReadOptions;
+use futures::TryStreamExt;
 
 let reader = FileGroupReader::new_with_options(
     "/table/base/path", [("hoodie.read.file_group.start_timestamp", "0")])?;
 
-// Returns an Arrow RecordBatch
-let record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet").await?;
+// Read records from base file and log files (complete file slice)
+let options = ReadOptions::new();
+let stream = reader.read_file_slice_from_paths(
+    "partition/base_file.parquet",
+    ["partition/.log_file_1", "partition/.log_file_2"],
+    &options,
+).await?;
+let batches: Vec<_> = stream.try_collect().await?;
 ```
 
 #### C++
@@ -226,8 +240,10 @@ let record_batch = reader.read_file_slice_by_base_file_path("relative/path.parqu
 auto reader = new_file_group_reader_with_options(
     "/table/base/path", {"hoodie.read.file_group.start_timestamp=0"});
 
-// Returns an ArrowArrayStream pointer
-ArrowArrayStream* stream_ptr = reader->read_file_slice_by_base_file_path("relative/path.parquet");
+// Read records from base file and log files
+std::vector<std::string> log_files = {"partition/.log_file_1"};
+ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths(
+    "partition/base_file.parquet", log_files);
 ```
 
 ## Query Engine Integration
@@ -251,10 +267,10 @@ Create a Hudi table instance using its constructor or the `TableBuilder` API.
 
 Create a Hudi file group reader instance using its constructor or the Hudi table API `create_file_group_reader_with_options()`.
 
-| Stage           | API                                   | Description                                                                                                                                                                        |
-|-----------------|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Query execution | `read_file_slice()`                   | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
-|                 | `read_file_slice_by_base_file_path()` | Read records from a given base file path; log files will be ignored                                                                                                                |
+| Stage           | API                           | Description                                                                                                                                                                        |
+|-----------------|-------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Query execution | `read_file_slice()`           | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
+|                 | `read_file_slice_from_paths()`  | Read records from paths specifying the base file and log files. Pass empty list for log files to read base file only.                                                             |
 
 
 ### Apache DataFusion
