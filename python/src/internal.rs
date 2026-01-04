@@ -175,15 +175,11 @@ impl HudiFileSlice {
         let mut file_group =
             FileGroup::new_with_base_file_name(&self.base_file_name, &self.partition_path)?;
         file_group.add_log_files_from_names(&self.log_file_names)?;
-        let (_, file_slice) = file_group
-            .file_slices
-            .iter()
-            .next()
-            .ok_or_else(|| {
-                CoreError::FileGroup(format!(
-                    "Failed to get file slice from file group: {file_group:?}"
-                ))
-            })?;
+        let (_, file_slice) = file_group.file_slices.iter().next().ok_or_else(|| {
+            CoreError::FileGroup(format!(
+                "Failed to get file slice from file group: {file_group:?}"
+            ))
+        })?;
         Ok(file_slice.clone())
     }
 }
@@ -264,8 +260,10 @@ fn build_read_options(
     }
 
     if let Some(f) = filters {
-        let filter_tuples: Vec<(&str, &str, &str)> =
-            f.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect();
+        let filter_tuples: Vec<(&str, &str, &str)> = f
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
         let core_filters = from_str_tuples(filter_tuples)?;
         options = options.with_partition_filters(core_filters);
     }

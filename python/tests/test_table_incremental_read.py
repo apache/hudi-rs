@@ -24,7 +24,7 @@ def test_table_incremental_read_returns_correct_data(get_sample_table):
     table_path = get_sample_table
     table = HudiTable(table_path)
 
-    batches = table.read_incremental_records("20240402123035233", "20240402144910683")
+    batches = table.read_incremental("20240402123035233", "20240402144910683")
     t = pa.Table.from_batches(batches).select([0, 3, 4, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {

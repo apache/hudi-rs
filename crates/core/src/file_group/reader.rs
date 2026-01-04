@@ -34,8 +34,8 @@ use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::{ParquetReadOptions, Storage};
-use crate::table::builder::OptionResolver;
 use crate::table::ReadOptions;
+use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
 use arrow::compute::{and, concat_batches, filter_record_batch};
 use arrow_array::{BooleanArray, RecordBatch};
@@ -108,8 +108,7 @@ impl FileGroupReader {
             let mut resolver = OptionResolver::new_with_options(&base_uri, options_vec);
             resolver.resolve_options().await?;
             let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
-            let storage =
-                Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+            let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
 
             Ok(FileGroupReader {
                 hudi_configs,
@@ -202,10 +201,7 @@ impl FileGroupReader {
     }
 
     /// Reads the data from the base file at the given relative path.
-    async fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &str,
-    ) -> Result<RecordBatch> {
+    async fn read_file_slice_by_base_file_path(&self, relative_path: &str) -> Result<RecordBatch> {
         let records = self
             .read_parquet_file_to_single_batch(relative_path)
             .await?;
@@ -398,7 +394,8 @@ impl FileGroupReader {
 
         if base_file_only {
             // True streaming: return the parquet stream directly
-            self.read_parquet_file_stream(&base_file_path, options).await
+            self.read_parquet_file_stream(&base_file_path, options)
+                .await
         } else {
             // Fallback: collect + merge, then yield as single-item stream
             let batch = self
@@ -511,7 +508,9 @@ impl FileGroupReader {
             .storage
             .get_parquet_file_stream(relative_path, parquet_options)
             .await
-            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))?;
+            .map_err(|e| {
+                ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+            })?;
 
         // Clone data for the closure so the stream is 'static
         let reader = self.clone();
@@ -519,11 +518,13 @@ impl FileGroupReader {
         let row_predicate = options.row_predicate.clone();
 
         let mapped_stream = stream.map(move |result| {
-            let batch = result
-                .map_err(|e| ReadFileSliceError(format!("Failed to read batch: {e:?}")))?;
+            let batch =
+                result.map_err(|e| ReadFileSliceError(format!("Failed to read batch: {e:?}")))?;
 
             // Apply Hudi commit time filtering
-            let batch = if let Some(mask) = reader.create_filtering_mask_for_base_file_records(&batch)? {
+            let batch = if let Some(mask) =
+                reader.create_filtering_mask_for_base_file_records(&batch)?
+            {
                 filter_record_batch(&batch, &mask)
                     .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))?
             } else {
@@ -551,7 +552,10 @@ impl FileGroupReader {
     }
 
     /// Creates an instant range for log file scanning using ReadOptions.
-    fn create_instant_range_for_log_file_scan_with_opts(&self, options: &ReadOptions) -> InstantRange {
+    fn create_instant_range_for_log_file_scan_with_opts(
+        &self,
+        options: &ReadOptions,
+    ) -> InstantRange {
         let timezone = self
             .hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -563,14 +567,11 @@ impl FileGroupReader {
             .try_get(HudiReadConfig::FileGroupStartTimestamp)
             .map(|v| -> String { v.into() });
 
-        let end_timestamp = options
-            .as_of_timestamp
-            .clone()
-            .or_else(|| {
-                self.hudi_configs
-                    .try_get(HudiReadConfig::FileGroupEndTimestamp)
-                    .map(|v| -> String { v.into() })
-            });
+        let end_timestamp = options.as_of_timestamp.clone().or_else(|| {
+            self.hudi_configs
+                .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                .map(|v| -> String { v.into() })
+        });
 
         InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
     }
@@ -601,7 +602,10 @@ impl FileGroupReader {
 
         // Get the column to filter on
         let column = batch.column_by_name(&predicate.field_name).ok_or_else(|| {
-            ReadFileSliceError(format!("Column '{}' not found for predicate", predicate.field_name))
+            ReadFileSliceError(format!(
+                "Column '{}' not found for predicate",
+                predicate.field_name
+            ))
         })?;
 
         // Apply the comparison to get a boolean mask
@@ -625,12 +629,13 @@ impl FileGroupReader {
             .await?;
 
         // Apply base file filtering mask (for Hudi record filtering)
-        let records = if let Some(mask) = self.create_filtering_mask_for_base_file_records(&records)? {
-            filter_record_batch(&records, &mask)
-                .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))?
-        } else {
-            records
-        };
+        let records =
+            if let Some(mask) = self.create_filtering_mask_for_base_file_records(&records)? {
+                filter_record_batch(&records, &mask)
+                    .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))?
+            } else {
+                records
+            };
 
         // Apply column projection if specified
         let records = if let Some(cols) = projection {
@@ -929,13 +934,11 @@ mod tests {
 
         match result {
             Ok(mut stream) => {
-                if let Some(batch_result) = stream.next().await {
-                    if let Ok(batch) = batch_result {
-                        assert!(
-                            batch.num_rows() > 0,
-                            "Should have read some records from base file"
-                        );
-                    }
+                if let Some(Ok(batch)) = stream.next().await {
+                    assert!(
+                        batch.num_rows() > 0,
+                        "Should have read some records from base file"
+                    );
                 }
             }
             Err(_) => {
@@ -1019,13 +1022,11 @@ mod tests {
 
         match result {
             Ok(mut stream) => {
-                if let Some(batch_result) = stream.next().await {
-                    if let Ok(batch) = batch_result {
-                        assert!(
-                            batch.num_rows() > 0,
-                            "Should have read some records from base file"
-                        );
-                    }
+                if let Some(Ok(batch)) = stream.next().await {
+                    assert!(
+                        batch.num_rows() > 0,
+                        "Should have read some records from base file"
+                    );
                 }
             }
             Err(_) => {

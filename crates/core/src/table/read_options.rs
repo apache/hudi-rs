@@ -239,10 +239,7 @@ mod tests {
             options.start_timestamp,
             Some("20240101120000000".to_string())
         );
-        assert_eq!(
-            options.end_timestamp,
-            Some("20240102120000000".to_string())
-        );
+        assert_eq!(options.end_timestamp, Some("20240102120000000".to_string()));
     }
 
     #[test]

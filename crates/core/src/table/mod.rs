@@ -524,9 +524,7 @@ impl Table {
             .then(move |file_slice| {
                 let fg_reader = fg_reader.clone();
                 let options = options.clone();
-                async move {
-                    fg_reader.read_file_slice(&file_slice, &options).await
-                }
+                async move { fg_reader.read_file_slice(&file_slice, &options).await }
             })
             .try_flatten();
 
@@ -571,7 +569,11 @@ impl Table {
             .as_ref()
             .map(|ts| format_timestamp(ts, &timezone))
             .transpose()?
-            .or_else(|| self.timeline.get_latest_commit_timestamp_as_option().map(String::from))
+            .or_else(|| {
+                self.timeline
+                    .get_latest_commit_timestamp_as_option()
+                    .map(String::from)
+            })
         else {
             return Ok(Box::pin(futures::stream::empty()));
         };
@@ -599,9 +601,7 @@ impl Table {
             .then(move |file_slice| {
                 let fg_reader = fg_reader.clone();
                 let options = options.clone();
-                async move {
-                    fg_reader.read_file_slice(&file_slice, &options).await
-                }
+                async move { fg_reader.read_file_slice(&file_slice, &options).await }
             })
             .try_flatten();
 
@@ -619,8 +619,8 @@ mod tests {
         PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion, TimelineTimezone,
     };
-    use crate::expr::filter::from_str_tuples;
     use crate::error::CoreError;
+    use crate::expr::filter::from_str_tuples;
     use crate::metadata::meta_field::MetaField;
     use crate::storage::Storage;
     use crate::storage::util::join_url_segments;
@@ -975,8 +975,13 @@ mod tests {
         let options = ReadOptions::new();
         let file_slices = hudi_table.get_file_slices(options).await.unwrap();
         let file_slice = file_slices.first().unwrap();
-        let fg_reader = hudi_table.create_file_group_reader(&ReadOptions::new()).unwrap();
-        let mut stream = fg_reader.read_file_slice(file_slice, &ReadOptions::new()).await.unwrap();
+        let fg_reader = hudi_table
+            .create_file_group_reader(&ReadOptions::new())
+            .unwrap();
+        let mut stream = fg_reader
+            .read_file_slice(file_slice, &ReadOptions::new())
+            .await
+            .unwrap();
         let batch = stream.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 4);
         assert_eq!(batch.num_columns(), 21);
@@ -1014,10 +1019,7 @@ mod tests {
         // before replacecommit (insert overwrite table)
         let second_latest_timestamp = "20250121000656060";
         let options = ReadOptions::new().as_of(second_latest_timestamp);
-        let file_slices = hudi_table
-            .get_file_slices(options)
-            .await
-            .unwrap();
+        let file_slices = hudi_table.get_file_slices(options).await.unwrap();
         assert_eq!(file_slices.len(), 3);
         let file_slices_10 = file_slices
             .iter()
@@ -1046,10 +1048,7 @@ mod tests {
         // as of replacecommit (insert overwrite table)
         let latest_timestamp = "20250121000702475";
         let options = ReadOptions::new().as_of(latest_timestamp);
-        let file_slices = hudi_table
-            .get_file_slices(options)
-            .await
-            .unwrap();
+        let file_slices = hudi_table.get_file_slices(options).await.unwrap();
         assert_eq!(file_slices.len(), 1);
     }
 
@@ -1072,10 +1071,7 @@ mod tests {
 
         // as of the latest timestamp
         let options = ReadOptions::new().as_of("20240418173551906");
-        let file_slices = hudi_table
-            .get_file_slices(options)
-            .await
-            .unwrap();
+        let file_slices = hudi_table.get_file_slices(options).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -1086,10 +1082,7 @@ mod tests {
 
         // as of just smaller than the latest timestamp
         let options = ReadOptions::new().as_of("20240418173551905");
-        let file_slices = hudi_table
-            .get_file_slices(options)
-            .await
-            .unwrap();
+        let file_slices = hudi_table.get_file_slices(options).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -1100,10 +1093,7 @@ mod tests {
 
         // as of non-exist old timestamp
         let options = ReadOptions::new().as_of("19700101000000");
-        let file_slices = hudi_table
-            .get_file_slices(options)
-            .await
-            .unwrap();
+        let file_slices = hudi_table.get_file_slices(options).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()

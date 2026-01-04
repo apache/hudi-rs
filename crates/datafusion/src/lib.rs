@@ -187,11 +187,10 @@ impl TableProvider for HudiDataSource {
         let pushdown_filters = from_str_tuples(pushdown_filter_tuples)
             .map_err(|e| Execution(format!("Failed to convert filters: {e}")))?;
         let options = ReadOptions::new().with_partition_filters(pushdown_filters);
-        let file_slices_flat = self
-            .table
-            .get_file_slices(options)
-            .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
+        let file_slices_flat =
+            self.table.get_file_slices(options).await.map_err(|e| {
+                Execution(format!("Failed to get file slices from Hudi table: {e}"))
+            })?;
 
         // Split into chunks for parallel processing
         let num_partitions = self.get_input_partitions();
