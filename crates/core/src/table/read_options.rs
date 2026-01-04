@@ -158,3 +158,54 @@ impl std::fmt::Debug for ReadOptions {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_projection() {
+        let options = ReadOptions::new().with_projection(["col1", "col2", "col3"]);
+
+        assert_eq!(
+            options.projection,
+            Some(vec![
+                "col1".to_string(),
+                "col2".to_string(),
+                "col3".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_with_row_predicate() {
+        let options = ReadOptions::new()
+            .with_row_predicate(|batch| Ok(BooleanArray::from(vec![true; batch.num_rows()])));
+
+        assert!(options.row_predicate.is_some());
+    }
+
+    #[test]
+    fn test_with_as_of_timestamp() {
+        let options = ReadOptions::new().with_as_of_timestamp("20240101120000000");
+
+        assert_eq!(
+            options.as_of_timestamp,
+            Some("20240101120000000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let options = ReadOptions::new()
+            .with_filters([("city", "=", "sf")])
+            .with_projection(["id"])
+            .with_batch_size(1000);
+
+        let debug_str = format!("{options:?}");
+        assert!(debug_str.contains("ReadOptions"));
+        assert!(debug_str.contains("filters"));
+        assert!(debug_str.contains("projection"));
+        assert!(debug_str.contains("batch_size"));
+    }
+}

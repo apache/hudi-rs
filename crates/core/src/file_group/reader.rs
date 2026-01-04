@@ -1062,8 +1062,12 @@ mod tests {
                 while let Some(batch_result) = stream.next().await {
                     batches.push(batch_result?);
                 }
-                // Should have exactly one batch (the merged result)
-                assert!(!batches.is_empty(), "Should produce batches");
+                // Should have exactly one batch (the merged result from fallback path)
+                assert_eq!(
+                    batches.len(),
+                    1,
+                    "Should produce exactly one batch in fallback mode"
+                );
             }
             Err(e) => {
                 // Expected for missing test data
@@ -1144,6 +1148,67 @@ mod tests {
         match result {
             Ok(_) => panic!("Should return error for non-existent file"),
             Err(e) => {
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file")
+                        || error_msg.contains("Object at location"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper to create a FileGroupReader with commit time filtering options.
+    fn create_test_reader_with_commit_time_filter(base_uri: &str) -> Result<FileGroupReader> {
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
+        FileGroupReader::new_with_configs_and_overwriting_options(
+            hudi_configs,
+            [
+                (HudiReadConfig::FileGroupStartTimestamp.as_ref(), "2"),
+                (HudiReadConfig::FileGroupEndTimestamp.as_ref(), "4"),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_with_commit_time_filtering() -> Result<()> {
+        use futures::StreamExt;
+
+        let base_uri = get_base_uri_with_valid_props_minimum();
+
+        // Create reader with commit time filtering options
+        let reader = create_test_reader_with_commit_time_filter(&base_uri)?;
+
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new());
+        let options = ReadOptions::default();
+
+        let result = reader.read_file_slice_stream(&file_slice, &options).await;
+
+        match result {
+            Ok(mut stream) => {
+                // Collect all batches and verify commit time filtering was applied
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    batches.push(batch_result?);
+                }
+
+                // Verify streaming with commit time filtering completed successfully.
+                // The commit time filtering is applied via apply_commit_time_filter
+                // in read_base_file_stream for each batch.
+                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                // Just verify we can process all batches - exact count depends on test data
+                assert!(
+                    batches.is_empty() || total_rows > 0,
+                    "Non-empty batches should have rows"
+                );
+            }
+            Err(e) => {
+                // Expected for missing test data - verify error is file-related
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("Failed to read path")
