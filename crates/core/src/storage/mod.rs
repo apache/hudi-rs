@@ -75,6 +75,14 @@ impl ParquetReadOptions {
 }
 
 /// A stream of record batches from a Parquet file with its schema.
+///
+/// # Implementation Note
+///
+/// This struct uses a `BoxStream` internally, which requires a heap allocation per file.
+/// For high-performance scenarios with many small files, this adds minimal overhead since:
+/// - Batch processing amortizes the allocation cost (each batch may contain thousands of rows)
+/// - The streaming benefit (lazy evaluation, reduced memory) outweighs the Box allocation cost
+/// - For typical parquet files (>10MB), the Box overhead (~40-80 bytes) is negligible
 pub struct ParquetFileStream {
     schema: SchemaRef,
     stream: BoxStream<'static, std::result::Result<RecordBatch, parquet::errors::ParquetError>>,
