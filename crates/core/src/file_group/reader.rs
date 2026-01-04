@@ -110,65 +110,6 @@ impl FileGroupReader {
             })
     }
 
-    #[cfg(test)]
-    fn create_filtering_mask_for_base_file_records(
-        &self,
-        records: &RecordBatch,
-    ) -> Result<Option<BooleanArray>> {
-        let populates_meta_fields: bool = self
-            .hudi_configs
-            .get_or_default(HudiTableConfig::PopulatesMetaFields)
-            .into();
-        if !populates_meta_fields {
-            // If meta fields are not populated, commit time filtering is not applicable.
-            return Ok(None);
-        }
-
-        let mut and_filters: Vec<SchemableFilter> = Vec::new();
-        let schema = MetaField::schema();
-        if let Some(start) = self
-            .hudi_configs
-            .try_get(HudiReadConfig::FileGroupStartTimestamp)
-            .map(|v| -> String { v.into() })
-        {
-            let filter: Filter =
-                Filter::try_from((MetaField::CommitTime.as_ref(), ">", start.as_str()))?;
-            let filter = SchemableFilter::try_from((filter, schema.as_ref()))?;
-            and_filters.push(filter);
-        } else {
-            // If start timestamp is not provided, the query is snapshot or time-travel, so
-            // commit time filtering is not needed as the base file being read is already
-            // filtered and selected by the timeline.
-            return Ok(None);
-        }
-
-        if let Some(end) = self
-            .hudi_configs
-            .try_get(HudiReadConfig::FileGroupEndTimestamp)
-            .map(|v| -> String { v.into() })
-        {
-            let filter = Filter::try_from((MetaField::CommitTime.as_ref(), "<=", end.as_str()))?;
-            let filter = SchemableFilter::try_from((filter, schema.as_ref()))?;
-            and_filters.push(filter);
-        }
-
-        if and_filters.is_empty() {
-            return Ok(None);
-        }
-
-        let mut mask = BooleanArray::from(vec![true; records.num_rows()]);
-        for filter in &and_filters {
-            let col_name = filter.field.name().as_str();
-            let col_values = records
-                .column_by_name(col_name)
-                .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} not found")))?;
-
-            let comparison = filter.apply_comparison(col_values)?;
-            mask = and(&mask, &comparison)?;
-        }
-        Ok(Some(mask))
-    }
-
     /// Reads the data from the base file at the given relative path.
     ///
     /// # Arguments
@@ -590,16 +531,18 @@ impl FileGroupReader {
     }
 }
 
-/// Apply commit time filtering to a record batch.
+/// Creates a commit time filtering mask based on the provided configs.
 ///
-/// This function mirrors the filtering logic in `FileGroupReader::create_filtering_mask_for_base_file_records`
-/// but takes `HudiConfigs` directly so it can be used in streaming contexts where `&self` is not available.
-fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> Result<RecordBatch> {
+/// Returns `None` if no filtering is needed (meta fields disabled or no start timestamp).
+fn create_commit_time_filter_mask(
+    hudi_configs: &HudiConfigs,
+    batch: &RecordBatch,
+) -> Result<Option<BooleanArray>> {
     let populates_meta_fields: bool = hudi_configs
         .get_or_default(HudiTableConfig::PopulatesMetaFields)
         .into();
     if !populates_meta_fields {
-        return Ok(batch);
+        return Ok(None);
     }
 
     let start_ts = hudi_configs
@@ -607,7 +550,7 @@ fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> R
         .map(|v| -> String { v.into() });
     if start_ts.is_none() {
         // If start timestamp is not provided, the query is snapshot or time-travel
-        return Ok(batch);
+        return Ok(None);
     }
 
     let mut and_filters: Vec<SchemableFilter> = Vec::new();
@@ -627,7 +570,7 @@ fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> R
     }
 
     if and_filters.is_empty() {
-        return Ok(batch);
+        return Ok(None);
     }
 
     let mut mask = BooleanArray::from(vec![true; batch.num_rows()]);
@@ -640,8 +583,16 @@ fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> R
         mask = and(&mask, &comparison)?;
     }
 
-    filter_record_batch(&batch, &mask)
-        .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))
+    Ok(Some(mask))
+}
+
+/// Apply commit time filtering to a record batch.
+fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> Result<RecordBatch> {
+    match create_commit_time_filter_mask(hudi_configs, &batch)? {
+        Some(mask) => filter_record_batch(&batch, &mask)
+            .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}"))),
+        None => Ok(batch),
+    }
 }
 
 #[cfg(test)]
@@ -752,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_filtering_mask_for_base_file_records() -> Result<()> {
+    fn test_create_commit_time_filter_mask() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let records = create_test_record_batch()?;
 
@@ -764,12 +715,12 @@ mod tests {
                 (HudiReadConfig::FileGroupStartTimestamp.as_ref(), "2"),
             ],
         )?;
-        let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
+        let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(mask, None, "Commit time filtering should not be needed");
 
         // Test case 2: No commit time filtering options
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
-        let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
+        let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(mask, None);
 
         // Test case 3: Filtering commit time > '2'
@@ -777,7 +728,7 @@ mod tests {
             &base_uri,
             [(HudiReadConfig::FileGroupStartTimestamp, "2")],
         )?;
-        let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
+        let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(
             mask,
             Some(BooleanArray::from(vec![false, false, true, true, true])),
@@ -789,7 +740,7 @@ mod tests {
             &base_uri,
             [(HudiReadConfig::FileGroupEndTimestamp, "4")],
         )?;
-        let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
+        let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(mask, None, "Commit time filtering should not be needed");
 
         // Test case 5: Filtering commit time > '2' and <= '4'
@@ -800,7 +751,7 @@ mod tests {
                 (HudiReadConfig::FileGroupEndTimestamp, "4"),
             ],
         )?;
-        let mask = reader.create_filtering_mask_for_base_file_records(&records)?;
+        let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(
             mask,
             Some(BooleanArray::from(vec![false, false, true, true, false])),
