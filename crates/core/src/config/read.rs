@@ -60,6 +60,10 @@ pub enum HudiReadConfig {
     /// When set to true, only [BaseFile]s will be read for optimized reads.
     /// This is only applicable to Merge-On-Read (MOR) tables.
     UseReadOptimizedMode,
+
+    /// Target number of rows per batch for streaming reads.
+    /// This controls the batch size when using streaming APIs.
+    StreamBatchSize,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -70,6 +74,7 @@ impl AsRef<str> for HudiReadConfig {
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
+            Self::StreamBatchSize => "hoodie.read.stream.batch_size",
         }
     }
 }
@@ -88,6 +93,7 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
+            HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(8192usize)),
             _ => None,
         }
     }
@@ -120,6 +126,11 @@ impl ConfigParser for HudiReadConfig {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Boolean),
+            Self::StreamBatchSize => get_result
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::UInteger),
         }
     }
 }
