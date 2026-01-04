@@ -17,18 +17,34 @@
 
 import pyarrow as pa
 
-from hudi import HudiFileGroupReader
-
-TEST_SAMPLE_BASE_FILE = "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet"
+from hudi import HudiFileGroupReader, HudiTable
 
 
 def test_file_group_api_read_file_slice(get_sample_table):
     table_path = get_sample_table
-    file_group_reader = HudiFileGroupReader(table_path)
+    table = HudiTable(table_path)
+    file_group_reader = table.create_file_group_reader()
 
-    batch = file_group_reader.read_file_slice_by_base_file_path(TEST_SAMPLE_BASE_FILE)
+    # Get file slices from table and find the one for san_francisco
+    file_slices = table.get_file_slices()
+    sf_slices = [
+        f
+        for f in file_slices
+        if f.partition_path == "san_francisco"
+        and f.creation_instant_time == "20240402123035233"
+    ]
+    assert len(sf_slices) >= 1
 
-    t = pa.Table.from_batches([batch]).select([0, 5, 6, 9]).sort_by("ts")
+    # Pick the file slice with the expected file id
+    file_slice = [
+        f
+        for f in sf_slices
+        if "780b8586-3ad0-48ef-a6a1-d2217845ce4a" in f.base_file_name
+    ][0]
+
+    batch = file_group_reader.read_file_slice(file_slice)
+
+    t = pa.Table.from_batches(batch).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {
             "_hoodie_commit_time": "20240402123035233",
@@ -39,20 +55,39 @@ def test_file_group_api_read_file_slice(get_sample_table):
     ]
 
 
-def test_file_group_api_read_file_slice_from_paths(get_sample_table):
-    """Test read_file_slice_from_paths produces identical results to read_file_slice_by_base_file_path."""
+def test_file_group_api_read_file_slice_with_file_group_reader(get_sample_table):
+    """Test read_file_slice using HudiFileGroupReader created from table path."""
     table_path = get_sample_table
+    table = HudiTable(table_path)
     file_group_reader = HudiFileGroupReader(table_path)
 
-    # Read using read_file_slice_from_paths with empty log files
-    batch = file_group_reader.read_file_slice_from_paths(TEST_SAMPLE_BASE_FILE, [])
+    # Get file slices from table and find the one for san_francisco
+    file_slices = table.get_file_slices()
+    sf_slices = [
+        f
+        for f in file_slices
+        if f.partition_path == "san_francisco"
+        and f.creation_instant_time == "20240402123035233"
+    ]
+    assert len(sf_slices) >= 1
+
+    # Pick the file slice with the expected file id
+    file_slice = [
+        f
+        for f in sf_slices
+        if "780b8586-3ad0-48ef-a6a1-d2217845ce4a" in f.base_file_name
+    ][0]
+
+    # Read using read_file_slice
+    batch = file_group_reader.read_file_slice(file_slice)
 
     # Verify it returns data
-    assert batch.num_rows == 1
-    assert batch.num_columns > 0
+    t = pa.Table.from_batches(batch)
+    assert t.num_rows == 1
+    assert t.num_columns > 0
 
     # Verify the data matches expected values
-    t = pa.Table.from_batches([batch]).select([0, 5, 6, 9]).sort_by("ts")
+    t = t.select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {
             "_hoodie_commit_time": "20240402123035233",
@@ -61,10 +96,3 @@ def test_file_group_api_read_file_slice_from_paths(get_sample_table):
             "fare": 19.1,
         },
     ]
-
-    # Verify results are identical to read_file_slice_by_base_file_path
-    batch_original = file_group_reader.read_file_slice_by_base_file_path(
-        TEST_SAMPLE_BASE_FILE
-    )
-    assert batch.num_rows == batch_original.num_rows
-    assert batch.num_columns == batch_original.num_columns

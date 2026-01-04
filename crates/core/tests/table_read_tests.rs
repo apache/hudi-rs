@@ -22,9 +22,11 @@
 //! organized by table version (v6, v8+) and query type.
 
 use arrow::compute::concat_batches;
+use futures::TryStreamExt;
 use hudi_core::config::read::HudiReadConfig;
-use hudi_core::config::util::empty_filters;
 use hudi_core::error::Result;
+use hudi_core::expr::filter::col;
+use hudi_core::table::ReadOptions;
 use hudi_core::table::Table;
 use hudi_test::{QuickstartTripsTable, SampleTable, SampleTableMdt};
 
@@ -35,21 +37,23 @@ mod v6_tables {
     mod snapshot_queries {
         use super::*;
 
-        #[test]
-        fn test_empty_table() -> Result<()> {
+        #[tokio::test]
+        async fn test_empty_table() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
-                let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+                let hudi_table = Table::new(base_url.path()).await?;
+                let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 assert!(records.is_empty());
             }
             Ok(())
         }
 
-        #[test]
-        fn test_non_partitioned() -> Result<()> {
+        #[tokio::test]
+        async fn test_non_partitioned() -> Result<()> {
             for base_url in SampleTable::V6Nonpartitioned.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
-                let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+                let hudi_table = Table::new(base_url.path()).await?;
+                let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -67,13 +71,14 @@ mod v6_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_non_partitioned_read_optimized() -> Result<()> {
+        #[tokio::test]
+        async fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
-            let hudi_table = Table::new_with_options_blocking(
+            let hudi_table = Table::new_with_options(
                 base_url.path(),
                 [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-            )?;
+            )
+            .await?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -81,8 +86,9 @@ mod v6_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
-            let records =
-                hudi_table.read_snapshot_as_of_blocking(latest_commit, empty_filters())?;
+            let options = ReadOptions::new().as_of(*latest_commit);
+            let stream = hudi_table.read_snapshot(options).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -99,11 +105,12 @@ mod v6_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_non_partitioned_rollback() -> Result<()> {
+        #[tokio::test]
+        async fn test_non_partitioned_rollback() -> Result<()> {
             let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor_parquet();
-            let hudi_table = Table::new_blocking(base_url.path())?;
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let hudi_table = Table::new(base_url.path()).await?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -119,17 +126,17 @@ mod v6_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
+        #[tokio::test]
+        async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
             for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
+                let hudi_table = Table::new(base_url.path()).await?;
 
-                let filters = vec![
-                    ("byteField", ">=", "10"),
-                    ("byteField", "<", "20"),
-                    ("shortField", "!=", "100"),
-                ];
-                let records = hudi_table.read_snapshot_blocking(filters)?;
+                let options = ReadOptions::new()
+                    .with_partition_filter(col("byteField").gte("10"))
+                    .with_partition_filter(col("byteField").lt("20"))
+                    .with_partition_filter(col("shortField").ne("100"));
+                let stream = hudi_table.read_snapshot(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -139,11 +146,12 @@ mod v6_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
+        #[tokio::test]
+        async fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenHivestyleNoMetafields.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
-                let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+                let hudi_table = Table::new(base_url.path()).await?;
+                let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -165,10 +173,10 @@ mod v6_tables {
     mod time_travel_queries {
         use super::*;
 
-        #[test]
-        fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
+        #[tokio::test]
+        async fn test_simple_keygen_nonhivestyle_time_travel() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenNonhivestyle.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
+                let hudi_table = Table::new(base_url.path()).await?;
                 let commit_timestamps = hudi_table
                     .timeline
                     .completed_commits
@@ -176,8 +184,9 @@ mod v6_tables {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records =
-                    hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
+                let options = ReadOptions::new().as_of(first_commit);
+                let stream = hudi_table.read_snapshot(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -194,15 +203,16 @@ mod v6_tables {
     mod mor_log_file_queries {
         use super::*;
 
-        #[test]
-        fn test_quickstart_trips_inserts_updates() -> Result<()> {
+        #[tokio::test]
+        async fn test_quickstart_trips_inserts_updates() -> Result<()> {
             let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
             let updated_rider = "rider-D";
 
             // verify updated record as of the latest commit
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -224,7 +234,9 @@ mod v6_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
+            let options = ReadOptions::new().as_of(first_commit);
+            let stream = hudi_table.read_snapshot(options).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -241,15 +253,16 @@ mod v6_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_quickstart_trips_inserts_deletes() -> Result<()> {
+        #[tokio::test]
+        async fn test_quickstart_trips_inserts_deletes() -> Result<()> {
             let base_url = QuickstartTripsTable::V6Trips8I3D.url_to_mor_avro();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
             let deleted_riders = ["rider-A", "rider-C", "rider-D"];
 
             // verify deleted record as of the latest commit
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let riders = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -270,7 +283,9 @@ mod v6_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
+            let options = ReadOptions::new().as_of(first_commit);
+            let stream = hudi_table.read_snapshot(options).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -293,20 +308,22 @@ mod v6_tables {
     mod incremental_queries {
         use super::*;
 
-        #[test]
-        fn test_empty_table() -> Result<()> {
+        #[tokio::test]
+        async fn test_empty_table() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
-                let records = hudi_table.read_incremental_records_blocking("0", None)?;
+                let hudi_table = Table::new(base_url.path()).await?;
+                let options = ReadOptions::new().from_timestamp("0");
+                let stream = hudi_table.read_incremental(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 assert!(records.is_empty())
             }
             Ok(())
         }
 
-        #[test]
-        fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
+        #[tokio::test]
+        async fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenNonhivestyleOverwritetable.urls() {
-                let hudi_table = Table::new_blocking(base_url.path())?;
+                let hudi_table = Table::new(base_url.path()).await?;
                 let commit_timestamps = hudi_table
                     .timeline
                     .completed_commits
@@ -319,8 +336,11 @@ mod v6_tables {
                 let third_commit = commit_timestamps[2];
 
                 // read records changed from the beginning to the 1st commit
-                let records = hudi_table
-                    .read_incremental_records_blocking("19700101000000", Some(first_commit))?;
+                let options = ReadOptions::new()
+                    .from_timestamp("19700101000000")
+                    .to_timestamp(first_commit);
+                let stream = hudi_table.read_incremental(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -331,8 +351,11 @@ mod v6_tables {
                 );
 
                 // read records changed from the 1st to the 2nd commit
-                let records = hudi_table
-                    .read_incremental_records_blocking(first_commit, Some(second_commit))?;
+                let options = ReadOptions::new()
+                    .from_timestamp(first_commit)
+                    .to_timestamp(second_commit);
+                let stream = hudi_table.read_incremental(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -343,8 +366,11 @@ mod v6_tables {
                 );
 
                 // read records changed from the 2nd to the 3rd commit
-                let records = hudi_table
-                    .read_incremental_records_blocking(second_commit, Some(third_commit))?;
+                let options = ReadOptions::new()
+                    .from_timestamp(second_commit)
+                    .to_timestamp(third_commit);
+                let stream = hudi_table.read_incremental(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -354,8 +380,10 @@ mod v6_tables {
                     "Should return 1 record insert-overwritten in the 3rd commit"
                 );
 
-                // read records changed from the 1st commit
-                let records = hudi_table.read_incremental_records_blocking(first_commit, None)?;
+                // read records changed from the 1st commit (to latest)
+                let options = ReadOptions::new().from_timestamp(first_commit);
+                let stream = hudi_table.read_incremental(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -365,8 +393,10 @@ mod v6_tables {
                     "Should return 1 record insert-overwritten in the 3rd commit"
                 );
 
-                // read records changed from the 3rd commit
-                let records = hudi_table.read_incremental_records_blocking(third_commit, None)?;
+                // read records changed from the 3rd commit (should be empty)
+                let options = ReadOptions::new().from_timestamp(third_commit);
+                let stream = hudi_table.read_incremental(options).await?;
+                let records: Vec<_> = stream.try_collect().await?;
                 assert!(
                     records.is_empty(),
                     "Should return 0 record as it's the latest commit"
@@ -384,20 +414,22 @@ mod v8_tables {
     mod snapshot_queries {
         use super::*;
 
-        #[test]
-        fn test_empty_table() -> Result<()> {
+        #[tokio::test]
+        async fn test_empty_table() -> Result<()> {
             let base_url = SampleTable::V8Empty.url_to_cow();
-            let hudi_table = Table::new_blocking(base_url.path())?;
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let hudi_table = Table::new(base_url.path()).await?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             assert!(records.is_empty());
             Ok(())
         }
 
-        #[test]
-        fn test_non_partitioned() -> Result<()> {
+        #[tokio::test]
+        async fn test_non_partitioned() -> Result<()> {
             let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
-            let hudi_table = Table::new_blocking(base_url.path())?;
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let hudi_table = Table::new(base_url.path()).await?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -414,12 +446,13 @@ mod v8_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_complex_keygen_hive_style() -> Result<()> {
+        #[tokio::test]
+        async fn test_complex_keygen_hive_style() -> Result<()> {
             let base_url = SampleTable::V8ComplexkeygenHivestyle.url_to_cow();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -436,12 +469,13 @@ mod v8_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_simple_keygen_nonhivestyle() -> Result<()> {
+        #[tokio::test]
+        async fn test_simple_keygen_nonhivestyle() -> Result<()> {
             let base_url = SampleTable::V8SimplekeygenNonhivestyle.url_to_cow();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -458,12 +492,13 @@ mod v8_tables {
             Ok(())
         }
 
-        #[test]
-        fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
+        #[tokio::test]
+        async fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
             let base_url = SampleTable::V8SimplekeygenHivestyleNoMetafields.url_to_cow();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -485,16 +520,17 @@ mod v8_tables {
     mod mor_log_file_queries {
         use super::*;
 
-        #[test]
-        fn test_quickstart_trips_inserts_updates_deletes() -> Result<()> {
+        #[tokio::test]
+        async fn test_quickstart_trips_inserts_updates_deletes() -> Result<()> {
             // V8Trips8I3U1D: 8 inserts, 3 updates (A, J, G fare=0), 2 deletes (F, J)
             let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
             let deleted_riders = ["rider-F", "rider-J"];
 
             // verify deleted records are not present in latest snapshot
-            let records = hudi_table.read_snapshot_blocking(empty_filters())?;
+            let stream = hudi_table.read_snapshot(ReadOptions::new()).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records);
@@ -534,7 +570,9 @@ mod v8_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of_blocking(first_commit, empty_filters())?;
+            let options = ReadOptions::new().as_of(first_commit);
+            let stream = hudi_table.read_snapshot(options).await?;
+            let records: Vec<_> = stream.try_collect().await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -569,10 +607,10 @@ mod mdt_enabled_tables {
         /// 1. Table can be read correctly via MDT file listing
         /// 2. MDT partition key normalization ("." -> "") works correctly
         /// 3. File slices are retrieved correctly from MDT
-        #[test]
-        fn test_v8_nonpartitioned_with_mdt() -> Result<()> {
+        #[tokio::test]
+        async fn test_v8_nonpartitioned_with_mdt() -> Result<()> {
             let base_url = SampleTableMdt::V8Nonpartitioned.url_to_mor_avro();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
             // Verify MDT is enabled
             assert!(
@@ -581,7 +619,7 @@ mod mdt_enabled_tables {
             );
 
             // Get file slices - this uses MDT file listing
-            let file_slices = hudi_table.get_file_slices_blocking(empty_filters())?;
+            let file_slices = hudi_table.get_file_slices(ReadOptions::new()).await?;
 
             // Should have file slices for the non-partitioned table
             assert!(
@@ -604,15 +642,16 @@ mod mdt_enabled_tables {
         /// The metadata table stores "." as partition key, but external API should see "".
         /// For non-partitioned tables, we use a fast path that directly fetches "." without
         /// going through __all_partitions__ lookup.
-        #[test]
-        fn test_v8_nonpartitioned_mdt_partition_normalization() -> Result<()> {
+        #[tokio::test]
+        async fn test_v8_nonpartitioned_mdt_partition_normalization() -> Result<()> {
             let base_url = SampleTableMdt::V8Nonpartitioned.url_to_mor_avro();
-            let hudi_table = Table::new_blocking(base_url.path())?;
+            let hudi_table = Table::new(base_url.path()).await?;
 
             // Read MDT files partition records
             let partition_pruner = PartitionPruner::empty();
-            let records =
-                hudi_table.read_metadata_table_files_partition_blocking(&partition_pruner)?;
+            let records = hudi_table
+                .read_metadata_table_files_partition(&partition_pruner)
+                .await?;
 
             // For non-partitioned tables, the fast path only fetches the files record.
             // __all_partitions__ is not fetched to avoid redundant HFile lookup.

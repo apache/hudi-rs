@@ -18,6 +18,7 @@
  */
 
 use arrow::pyarrow::ToPyArrow;
+use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::convert::From;
 use std::path::PathBuf;
@@ -27,10 +28,11 @@ use tokio::runtime::Runtime;
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
 use hudi::error::CoreError;
-use hudi::file_group::FileGroup;
+use hudi::expr::filter::from_str_tuples;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
+use hudi::table::ReadOptions;
 use hudi::table::Table;
 use hudi::table::builder::TableBuilder;
 use hudi::timeline::Timeline;
@@ -91,40 +93,17 @@ impl HudiFileGroupReader {
         Ok(HudiFileGroupReader { inner })
     }
 
-    fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &str,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
-            .map_err(PythonError::from)?
-            .to_pyarrow(py)
-            .map(|b| b.unbind())
-    }
     fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<Py<PyAny>> {
-        let mut file_group = FileGroup::new_with_base_file_name(
-            &file_slice.base_file_name,
-            &file_slice.partition_path,
-        )
-        .map_err(PythonError::from)?;
-        let log_file_names = &file_slice.log_file_names;
-        file_group
-            .add_log_files_from_names(log_file_names)
+        // Create a FileSlice from the HudiFileSlice wrapper
+        let fs = file_slice.to_file_slice().map_err(PythonError::from)?;
+        let options = ReadOptions::new();
+        let stream = rt()
+            .block_on(self.inner.read_file_slice(&fs, &options))
             .map_err(PythonError::from)?;
-        let (_, file_slice) = file_group
-            .file_slices
-            .iter()
-            .next()
-            .ok_or_else(|| {
-                CoreError::FileGroup(format!(
-                    "Failed to get file slice from file group: {file_group:?}"
-                ))
-            })
+        let batches: Vec<_> = rt()
+            .block_on(stream.try_collect())
             .map_err(PythonError::from)?;
-        rt().block_on(self.inner.read_file_slice(file_slice))
-            .map_err(PythonError::from)?
-            .to_pyarrow(py)
-            .map(|b| b.unbind())
+        batches.to_pyarrow(py).map(|b| b.unbind())
     }
 
     fn read_file_slice_from_paths(
@@ -133,13 +112,17 @@ impl HudiFileGroupReader {
         log_file_paths: Vec<String>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        rt().block_on(
-            self.inner
-                .read_file_slice_from_paths(base_file_path, log_file_paths),
-        )
-        .map_err(PythonError::from)?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
+        let options = ReadOptions::new();
+        let stream = rt()
+            .block_on(
+                self.inner
+                    .read_file_slice_from_paths(base_file_path, log_file_paths, &options),
+            )
+            .map_err(PythonError::from)?;
+        let batches: Vec<_> = rt()
+            .block_on(stream.try_collect())
+            .map_err(PythonError::from)?;
+        batches.to_pyarrow(py).map(|b| b.unbind())
     }
 }
 
@@ -199,6 +182,24 @@ impl HudiFileSlice {
             paths.push(p)
         }
         Ok(paths)
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl HudiFileSlice {
+    /// Convert HudiFileSlice to internal FileSlice for use with FileGroupReader
+    fn to_file_slice(&self) -> Result<FileSlice, CoreError> {
+        use hudi::file_group::FileGroup;
+
+        let mut file_group =
+            FileGroup::new_with_base_file_name(&self.base_file_name, &self.partition_path)?;
+        file_group.add_log_files_from_names(&self.log_file_names)?;
+        let (_, file_slice) = file_group.file_slices.iter().next().ok_or_else(|| {
+            CoreError::FileGroup(format!(
+                "Failed to get file slice from file group: {file_group:?}"
+            ))
+        })?;
+        Ok(file_slice.clone())
     }
 }
 
@@ -264,6 +265,29 @@ impl From<&Instant> for HudiInstant {
             inner: i.to_owned(),
         }
     }
+}
+
+/// Helper function to convert Python tuple filters to ReadOptions
+fn build_read_options(
+    filters: Option<Vec<(String, String, String)>>,
+    timestamp: Option<&str>,
+) -> Result<ReadOptions, CoreError> {
+    let mut options = ReadOptions::new();
+
+    if let Some(ts) = timestamp {
+        options = options.as_of(ts);
+    }
+
+    if let Some(f) = filters {
+        let filter_tuples: Vec<(&str, &str, &str)> = f
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        let core_filters = from_str_tuples(filter_tuples)?;
+        options = options.with_partition_filters(core_filters);
+    }
+
+    Ok(options)
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -348,6 +372,28 @@ impl HudiTable {
         })
     }
 
+    /// Get file slices with optional partition filters and time-travel timestamp.
+    ///
+    /// Args:
+    ///     filters: Optional partition filter tuples in (field, op, value) format
+    ///     timestamp: Optional timestamp for time-travel queries
+    #[pyo3(signature = (filters=None, timestamp=None))]
+    fn get_file_slices(
+        &self,
+        filters: Option<Vec<(String, String, String)>>,
+        timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        py.detach(|| {
+            let options = build_read_options(filters, timestamp).map_err(PythonError::from)?;
+            let file_slices = rt()
+                .block_on(self.inner.get_file_slices(options))
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
+    /// Get file slices in splits (legacy API).
     #[pyo3(signature = (num_splits, filters=None))]
     fn get_file_slices_splits(
         &self,
@@ -369,6 +415,7 @@ impl HudiTable {
         })
     }
 
+    /// Get file slices in splits as of a timestamp (legacy API).
     #[pyo3(signature = (num_splits, timestamp, filters=None))]
     fn get_file_slices_splits_as_of(
         &self,
@@ -392,20 +439,7 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (filters=None))]
-    fn get_file_slices(
-        &self,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Vec<HudiFileSlice>> {
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(self.inner.get_file_slices(filters.unwrap_or_default()))
-                .map_err(PythonError::from)?;
-            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
-        })
-    }
-
+    /// Get file slices as of a timestamp (legacy API).
     #[pyo3(signature = (timestamp, filters=None))]
     fn get_file_slices_as_of(
         &self,
@@ -424,6 +458,7 @@ impl HudiTable {
         })
     }
 
+    /// Get file slices between timestamps (legacy API).
     #[pyo3(signature = (start_timestamp=None, end_timestamp=None))]
     fn get_file_slices_between(
         &self,
@@ -442,6 +477,41 @@ impl HudiTable {
         })
     }
 
+    /// Get file slices for incremental reads between timestamps.
+    ///
+    /// Args:
+    ///     start_timestamp: Start timestamp (exclusive)
+    ///     end_timestamp: Optional end timestamp (inclusive), defaults to latest
+    #[pyo3(signature = (start_timestamp, end_timestamp=None))]
+    fn get_file_slices_incremental(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        py.detach(|| {
+            let mut options = ReadOptions::new().from_timestamp(start_timestamp);
+            if let Some(end_ts) = end_timestamp {
+                options = options.to_timestamp(end_ts);
+            }
+            let file_slices = rt()
+                .block_on(self.inner.get_file_slices_incremental(options))
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
+    /// Create a file group reader for this table.
+    fn create_file_group_reader(&self) -> PyResult<HudiFileGroupReader> {
+        let options = ReadOptions::new();
+        let fg_reader = self
+            .inner
+            .create_file_group_reader(&options)
+            .map_err(PythonError::from)?;
+        Ok(HudiFileGroupReader { inner: fg_reader })
+    }
+
+    /// Create a file group reader with options (legacy API).
     #[pyo3(signature = (options=None))]
     fn create_file_group_reader_with_options(
         &self,
@@ -454,18 +524,54 @@ impl HudiTable {
         Ok(HudiFileGroupReader { inner: fg_reader })
     }
 
-    #[pyo3(signature = (filters=None))]
+    /// Read a snapshot of the table with optional partition filters and time-travel timestamp.
+    ///
+    /// Args:
+    ///     filters: Optional partition filter tuples in (field, op, value) format
+    ///     timestamp: Optional timestamp for time-travel queries
+    #[pyo3(signature = (filters=None, timestamp=None))]
     fn read_snapshot(
         &self,
         filters: Option<Vec<(String, String, String)>>,
+        timestamp: Option<&str>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
-        rt().block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
-            .map_err(PythonError::from)?
-            .to_pyarrow(py)
-            .map(|b| b.unbind())
+        let options = build_read_options(filters, timestamp).map_err(PythonError::from)?;
+        let stream = rt()
+            .block_on(self.inner.read_snapshot(options))
+            .map_err(PythonError::from)?;
+        let batches: Vec<_> = rt()
+            .block_on(stream.try_collect())
+            .map_err(PythonError::from)?;
+        batches.to_pyarrow(py).map(|b| b.unbind())
     }
 
+    /// Read incremental changes between timestamps.
+    ///
+    /// Args:
+    ///     start_timestamp: Start timestamp (exclusive)
+    ///     end_timestamp: Optional end timestamp (inclusive), defaults to latest
+    #[pyo3(signature = (start_timestamp, end_timestamp=None))]
+    fn read_incremental(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Py<PyAny>> {
+        let mut options = ReadOptions::new().from_timestamp(start_timestamp);
+        if let Some(end_ts) = end_timestamp {
+            options = options.to_timestamp(end_ts);
+        }
+        let stream = rt()
+            .block_on(self.inner.read_incremental(options))
+            .map_err(PythonError::from)?;
+        let batches: Vec<_> = rt()
+            .block_on(stream.try_collect())
+            .map_err(PythonError::from)?;
+        batches.to_pyarrow(py).map(|b| b.unbind())
+    }
+
+    /// Read snapshot as of a timestamp (legacy API).
     #[pyo3(signature = (timestamp, filters=None))]
     fn read_snapshot_as_of(
         &self,
@@ -482,6 +588,7 @@ impl HudiTable {
         .map(|b| b.unbind())
     }
 
+    /// Read incremental records (legacy API).
     #[pyo3(signature = (start_timestamp, end_timestamp=None))]
     fn read_incremental_records(
         &self,

@@ -15,8 +15,6 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from itertools import chain
-
 import pyarrow as pa
 
 from hudi import HudiTable
@@ -74,19 +72,14 @@ def test_read_table_can_read_from_batches(get_sample_table):
     table = HudiTable(table_path)
 
     file_slices = table.get_file_slices()
-    file_slice_paths = [f.base_file_relative_path() for f in file_slices]
-    batch = (
-        table.create_file_group_reader_with_options().read_file_slice_by_base_file_path(
-            file_slice_paths[0]
-        )
-    )
-    t = pa.Table.from_batches([batch])
+    assert len(file_slices) == 5
+
+    # Read using file group reader
+    file_group_reader = table.create_file_group_reader()
+    batch = file_group_reader.read_file_slice(file_slices[0])
+    t = pa.Table.from_batches(batch)
     assert t.num_rows == 1
     assert t.num_columns == 11
-
-    file_slices_gen = iter(table.get_file_slices_splits(2))
-    assert len(next(file_slices_gen)) == 3
-    assert len(next(file_slices_gen)) == 2
 
 
 def test_read_table_returns_correct_data(get_sample_table):
@@ -162,10 +155,8 @@ def test_table_apis_as_of_timestamp(get_sample_table):
     table = HudiTable(table_path)
     timestamp = "20240402123035233"
 
-    file_slices_gen = table.get_file_slices_splits_as_of(2, timestamp)
-    file_slices_base_paths = set(
-        f.base_file_relative_path() for f in chain.from_iterable(file_slices_gen)
-    )
+    file_slices = table.get_file_slices(timestamp=timestamp)
+    file_slices_base_paths = set(f.base_file_relative_path() for f in file_slices)
     assert file_slices_base_paths == {
         "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet",
         "san_francisco/d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0_1-9-0_20240402123035233.parquet",
@@ -174,7 +165,7 @@ def test_table_apis_as_of_timestamp(get_sample_table):
         "chennai/68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0_4-12-0_20240402123035233.parquet",
     }
 
-    batches = table.read_snapshot_as_of(timestamp)
+    batches = table.read_snapshot(timestamp=timestamp)
     t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
     assert t.to_pylist() == [
         {

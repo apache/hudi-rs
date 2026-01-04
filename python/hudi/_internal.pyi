@@ -39,19 +39,6 @@ class HudiFileGroupReader:
             options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
-    def read_file_slice_by_base_file_path(
-        self, relative_path: str
-    ) -> "pyarrow.RecordBatch":
-        """
-        Reads the data from the base file at the given relative path.
-
-        Parameters:
-            relative_path (str): The relative path to the base file.
-
-        Returns:
-            pyarrow.RecordBatch: A record batch read from the base file.
-        """
-        ...
     def read_file_slice(self, file_slice: HudiFileSlice) -> "pyarrow.RecordBatch":
         """
         Reads the data from the given file slice.
@@ -73,6 +60,7 @@ class HudiFileGroupReader:
         Args:
             base_file_path (str): The relative path to the base file.
             log_file_paths (List[str]): A list of relative paths to log files.
+                Pass an empty list to read only the base file.
 
         Returns:
             pyarrow.RecordBatch: The merged record batch from base file and log files.
