@@ -553,6 +553,432 @@ mod v8_tables {
             Ok(())
         }
     }
+
+    /// Streaming query tests for v8 tables
+    mod streaming_queries {
+        use super::*;
+        use futures::StreamExt;
+        use hudi_core::table::ReadOptions;
+
+        #[tokio::test]
+        async fn test_read_snapshot_stream_empty_table() -> Result<()> {
+            let base_url = SampleTable::V8Empty.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let options = ReadOptions::new();
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+            assert!(batches.is_empty(), "Empty table should produce no batches");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_snapshot_stream_basic() -> Result<()> {
+            let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let options = ReadOptions::new();
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            assert!(!batches.is_empty(), "Should produce at least one batch");
+
+            // Concatenate batches and verify data
+            let schema = &batches[0].schema();
+            let records = concat_batches(schema, &batches)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(
+                sample_data,
+                vec![
+                    (1, "Alice", false),
+                    (2, "Bob", false),
+                    (3, "Carol", true),
+                    (4, "Diana", true),
+                ]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_snapshot_stream_with_batch_size() -> Result<()> {
+            let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            // Request small batch size
+            let options = ReadOptions::new().with_batch_size(1);
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            // With batch_size=1 and 4 rows, we expect multiple batches, but the
+            // exact number depends on both the batch_size setting and the Parquet
+            // file's internal row group structure.
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 4, "Total rows should match expected count");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_snapshot_stream_with_partition_filters() -> Result<()> {
+            let base_url = SampleTable::V8ComplexkeygenHivestyle.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            let options = ReadOptions::new().with_filters([
+                ("byteField", ">=", "10"),
+                ("byteField", "<", "20"),
+                ("shortField", "!=", "100"),
+            ]);
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            assert!(
+                !batches.is_empty(),
+                "Should produce at least one batch for the given partition filters"
+            );
+            let schema = &batches[0].schema();
+            let records = concat_batches(schema, &batches)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true),]);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_file_slice_stream_basic() -> Result<()> {
+            let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            // Get file slices first
+            let file_slices = hudi_table.get_file_slices(empty_filters()).await?;
+            assert!(
+                !file_slices.is_empty(),
+                "Should have at least one file slice"
+            );
+
+            let options = ReadOptions::new();
+            let file_slice = &file_slices[0];
+            let mut stream = hudi_table
+                .read_file_slice_stream(file_slice, &options)
+                .await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            assert!(!batches.is_empty(), "Should produce at least one batch");
+
+            // Verify we got records
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(total_rows > 0, "Should read at least one row");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_file_slice_stream_with_batch_size() -> Result<()> {
+            let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            let file_slices = hudi_table.get_file_slices(empty_filters()).await?;
+            let file_slice = &file_slices[0];
+
+            // Test with small batch size
+            let options = ReadOptions::new().with_batch_size(1);
+            let mut stream = hudi_table
+                .read_file_slice_stream(file_slice, &options)
+                .await?;
+
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 4, "Should read all 4 rows");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_snapshot_stream_mor_with_log_files() -> Result<()> {
+            // Test MOR table with log files - should still work (falls back to collect+merge)
+            // V8Trips8I3U1D: 8 inserts, 3 updates (A, J, G fare=0), 2 deletes (F, J)
+            let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            let options = ReadOptions::new();
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            assert!(!batches.is_empty(), "Should produce batches from MOR table");
+
+            // Verify total row count - should have 6 rows (8 inserts - 2 deletes)
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 6, "Should have 6 rows (8 inserts - 2 deleted)");
+
+            // Verify deleted riders are not present
+            let schema = &batches[0].schema();
+            let records = concat_batches(schema, &batches)?;
+            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records);
+            let riders: Vec<_> = uuid_rider_and_fare
+                .iter()
+                .map(|(_, rider, _)| rider.as_str())
+                .collect();
+
+            let deleted_riders = ["rider-F", "rider-J"];
+            assert!(
+                riders.iter().all(|rider| !deleted_riders.contains(rider)),
+                "Deleted riders should not be present in streaming results"
+            );
+
+            Ok(())
+        }
+    }
+}
+
+/// Test module for streaming read APIs.
+/// These tests verify the streaming versions of snapshot and file slice reads.
+mod streaming_queries {
+    use super::*;
+    use futures::StreamExt;
+    use hudi_core::table::ReadOptions;
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_empty_table() -> Result<()> {
+        for base_url in SampleTable::V6Empty.urls() {
+            let hudi_table = Table::new(base_url.path()).await?;
+            let options = ReadOptions::new();
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+            assert!(batches.is_empty(), "Empty table should produce no batches");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_basic() -> Result<()> {
+        for base_url in SampleTable::V6Nonpartitioned.urls() {
+            let hudi_table = Table::new(base_url.path()).await?;
+            let options = ReadOptions::new();
+            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+            // Collect all batches from stream
+            let mut batches = Vec::new();
+            while let Some(result) = stream.next().await {
+                batches.push(result?);
+            }
+
+            assert!(!batches.is_empty(), "Should produce at least one batch");
+
+            // Concatenate batches and verify data
+            let schema = &batches[0].schema();
+            let records = concat_batches(schema, &batches)?;
+
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(
+                sample_data,
+                vec![
+                    (1, "Alice", false),
+                    (2, "Bob", false),
+                    (3, "Carol", true),
+                    (4, "Diana", true),
+                ]
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_with_batch_size() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Request small batch size
+        let options = ReadOptions::new().with_batch_size(1);
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        // Collect all batches from stream
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        // With batch_size=1 and 4 rows, we expect multiple batches, but the
+        // exact number depends on both the batch_size setting and the Parquet
+        // file's internal row group structure.
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "Total rows should match expected count");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_with_partition_filters() -> Result<()> {
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let options = ReadOptions::new().with_filters([
+            ("byteField", ">=", "10"),
+            ("byteField", "<", "20"),
+            ("shortField", "!=", "100"),
+        ]);
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        // Collect all batches from stream
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        assert!(
+            !batches.is_empty(),
+            "Should produce at least one batch for the given partition filters"
+        );
+        let schema = &batches[0].schema();
+        let records = concat_batches(schema, &batches)?;
+
+        let sample_data = SampleTable::sample_data_order_by_id(&records);
+        assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true),]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_basic() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Get file slices first
+        let file_slices = hudi_table.get_file_slices(empty_filters()).await?;
+        assert!(
+            !file_slices.is_empty(),
+            "Should have at least one file slice"
+        );
+
+        let options = ReadOptions::new();
+        let file_slice = &file_slices[0];
+        let mut stream = hudi_table
+            .read_file_slice_stream(file_slice, &options)
+            .await?;
+
+        // Collect all batches from stream
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        assert!(!batches.is_empty(), "Should produce at least one batch");
+
+        // Verify we got records
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "Should read at least one row");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_with_batch_size() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let file_slices = hudi_table.get_file_slices(empty_filters()).await?;
+        let file_slice = &file_slices[0];
+
+        // Test with small batch size
+        let options = ReadOptions::new().with_batch_size(1);
+        let mut stream = hudi_table
+            .read_file_slice_stream(file_slice, &options)
+            .await?;
+
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "Should read all 4 rows");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_mor_with_log_files() -> Result<()> {
+        // Test MOR table with log files - should still work (falls back to collect+merge)
+        let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let options = ReadOptions::new();
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        assert!(!batches.is_empty(), "Should produce batches from MOR table");
+
+        // Verify total row count
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 8, "Should have 8 rows (8 inserts)");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_successful_read() -> Result<()> {
+        // This test verifies that reading from a valid table succeeds without errors.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let options = ReadOptions::new();
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        // All reads should succeed without error
+        while let Some(result) = stream.next().await {
+            assert!(result.is_ok(), "Reading should not produce errors");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_empty_table_no_timestamp() -> Result<()> {
+        // For an empty table with no commit timestamp, streaming reads should return
+        // an empty stream (consistent with read_snapshot behavior).
+        let base_url = SampleTable::V6Empty.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let options = ReadOptions::new();
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        let mut count = 0;
+        while (stream.next().await).is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 0, "Empty table should produce no batches");
+        Ok(())
+    }
 }
 
 /// Test module for tables with metadata table (MDT) enabled.

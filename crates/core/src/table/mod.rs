@@ -91,7 +91,10 @@ pub mod builder;
 mod fs_view;
 mod listing;
 pub mod partition;
+mod read_options;
 mod validation;
+
+pub use read_options::ReadOptions;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -789,6 +792,155 @@ impl Table {
         _end_timestamp: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
         todo!("read_incremental_changes")
+    }
+
+    // =========================================================================
+    // Streaming Read APIs
+    // =========================================================================
+
+    /// Reads a file slice as a stream of record batches.
+    ///
+    /// This is the streaming version of reading a single file slice. It returns a stream
+    /// that yields record batches as they are read, without loading all data into memory.
+    ///
+    /// # Arguments
+    /// * `file_slice` - The file slice to read.
+    /// * `options` - Read options for configuring the read operation.
+    ///
+    /// # Returns
+    /// A stream of record batches.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::StreamExt;
+    /// use hudi::table::ReadOptions;
+    ///
+    /// let file_slices = table.get_file_slices(empty_filters()).await?;
+    /// let options = ReadOptions::new().with_batch_size(4096);
+    ///
+    /// for file_slice in &file_slices {
+    ///     let mut stream = table.read_file_slice_stream(file_slice, &options).await?;
+    ///     while let Some(result) = stream.next().await {
+    ///         let batch = result?;
+    ///         // Process batch...
+    ///     }
+    /// }
+    /// ```
+    pub async fn read_file_slice_stream(
+        &self,
+        file_slice: &FileSlice,
+        options: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use futures::stream;
+
+        let timestamp = options
+            .as_of_timestamp
+            .as_deref()
+            .or_else(|| self.timeline.get_latest_commit_timestamp_as_option());
+
+        let Some(timestamp) = timestamp else {
+            // No commit timestamp means empty table - return empty stream (consistent with read_snapshot)
+            return Ok(Box::pin(stream::empty()));
+        };
+
+        let fg_reader = self.create_file_group_reader_with_options([(
+            HudiReadConfig::FileGroupEndTimestamp,
+            timestamp,
+        )])?;
+
+        fg_reader.read_file_slice_stream(file_slice, options).await
+    }
+
+    /// Reads the table snapshot as a stream of record batches.
+    ///
+    /// This is the streaming version of [Table::read_snapshot]. Instead of returning
+    /// all batches at once, it returns a stream that yields record batches as they
+    /// are read from the underlying file slices.
+    ///
+    /// # Arguments
+    /// * `options` - Read options including partition filters, batch size, and projection.
+    ///
+    /// # Returns
+    /// A stream of record batches from all file slices. Errors from individual file
+    /// slices are propagated through the stream.
+    ///
+    /// # Limitations
+    ///
+    /// - The `row_predicate` field in [ReadOptions] is not yet implemented for streaming reads.
+    /// - For MOR tables with log files, streaming falls back to the collect-and-merge approach.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::StreamExt;
+    /// use hudi::table::ReadOptions;
+    ///
+    /// let options = ReadOptions::new()
+    ///     .with_filters([("city", "=", "san_francisco")])
+    ///     .with_batch_size(4096);
+    /// let mut stream = table.read_snapshot_stream(&options).await?;
+    ///
+    /// while let Some(result) = stream.next().await {
+    ///     let batch = result?;
+    ///     println!("Read {} rows", batch.num_rows());
+    /// }
+    /// ```
+    pub async fn read_snapshot_stream(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use futures::stream::{self, StreamExt};
+
+        let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
+            return Ok(Box::pin(stream::empty()));
+        };
+
+        let filters: Vec<Filter> = options
+            .partition_filters
+            .iter()
+            .map(|(f, o, v)| Filter::try_from((f.as_str(), o.as_str(), v.as_str())))
+            .collect::<Result<Vec<_>>>()?;
+        let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
+
+        if file_slices.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        let fg_reader = self.create_file_group_reader_with_options([(
+            HudiReadConfig::FileGroupEndTimestamp,
+            timestamp,
+        )])?;
+
+        // Extract options to pass to each file slice read.
+        // Note: row_predicate is not yet supported in streaming base file reads.
+        let batch_size = options.batch_size;
+        let projection = options.projection.clone();
+
+        let streams_iter = file_slices.into_iter().map(move |file_slice| {
+            let fg_reader = fg_reader.clone();
+            let projection = projection.clone();
+            let options = ReadOptions {
+                partition_filters: vec![],
+                projection,
+                row_predicate: None, // Not yet implemented in streaming reads
+                batch_size,
+                as_of_timestamp: None,
+            };
+            async move {
+                fg_reader
+                    .read_file_slice_stream(&file_slice, &options)
+                    .await
+            }
+        });
+
+        // Chain all file slice streams together, propagating errors to the caller.
+        let combined_stream = stream::iter(streams_iter)
+            .then(|fut| fut)
+            .flat_map(|result| match result {
+                Ok(file_stream) => file_stream.left_stream(),
+                Err(e) => stream::once(async move { Err(e) }).right_stream(),
+            });
+
+        Ok(Box::pin(combined_stream))
     }
 }
 

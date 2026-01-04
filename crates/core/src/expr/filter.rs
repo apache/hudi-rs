@@ -193,7 +193,7 @@ impl SchemableFilter {
         ))
     }
 
-    pub fn apply_comparsion(&self, value: &dyn Datum) -> Result<BooleanArray> {
+    pub fn apply_comparison(&self, value: &dyn Datum) -> Result<BooleanArray> {
         match self.operator {
             ExprOperator::Eq => eq(value, &self.value),
             ExprOperator::Ne => neq(value, &self.value),
@@ -289,7 +289,7 @@ mod tests {
         let schemable = SchemableFilter::try_from((eq_filter, &schema))?;
 
         let test_array = StringArray::from(vec!["test", "other", "test"]);
-        let result = schemable.apply_comparsion(&test_array)?;
+        let result = schemable.apply_comparison(&test_array)?;
         assert_eq!(result, BooleanArray::from(vec![true, false, true]));
 
         // Test integer greater than comparison
@@ -301,7 +301,7 @@ mod tests {
         let schemable = SchemableFilter::try_from((gt_filter, &schema))?;
 
         let test_array = Int64Array::from(vec![40, 50, 60]);
-        let result = schemable.apply_comparsion(&test_array)?;
+        let result = schemable.apply_comparison(&test_array)?;
         assert_eq!(result, BooleanArray::from(vec![false, false, true]));
 
         Ok(())
@@ -329,7 +329,7 @@ mod tests {
             };
 
             let schemable = SchemableFilter::try_from((filter, &schema))?;
-            let result = schemable.apply_comparsion(&test_array)?;
+            let result = schemable.apply_comparison(&test_array)?;
             assert_eq!(
                 result,
                 BooleanArray::from(expected),

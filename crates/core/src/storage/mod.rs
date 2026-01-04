@@ -24,9 +24,11 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
+use arrow_schema::SchemaRef;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, parse_url_opts};
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -46,6 +48,70 @@ pub mod error;
 pub mod file_metadata;
 pub mod reader;
 pub mod util;
+
+/// Options for reading Parquet files with streaming.
+#[derive(Clone, Debug, Default)]
+pub struct ParquetReadOptions {
+    /// Target batch size (number of rows per batch).
+    pub batch_size: Option<usize>,
+    /// Column projection (indices of columns to read).
+    pub projection: Option<Vec<usize>>,
+}
+
+impl ParquetReadOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
+    pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+}
+
+/// A stream of record batches from a Parquet file with its schema.
+///
+/// # Implementation Note
+///
+/// This struct uses a `BoxStream` internally, which requires a heap allocation per file.
+/// For high-performance scenarios with many small files, this adds minimal overhead since:
+/// - Batch processing amortizes the allocation cost (each batch may contain thousands of rows)
+/// - The streaming benefit (lazy evaluation, reduced memory) outweighs the Box allocation cost
+/// - For typical parquet files (>10MB), the Box overhead (~40-80 bytes) is negligible
+pub struct ParquetFileStream {
+    schema: SchemaRef,
+    stream: BoxStream<'static, std::result::Result<RecordBatch, parquet::errors::ParquetError>>,
+}
+
+impl ParquetFileStream {
+    /// Returns the Arrow schema of the Parquet file.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Consumes self and returns the inner stream.
+    pub fn into_stream(
+        self,
+    ) -> BoxStream<'static, std::result::Result<RecordBatch, parquet::errors::ParquetError>> {
+        self.stream
+    }
+}
+
+impl futures::Stream for ParquetFileStream {
+    type Item = std::result::Result<RecordBatch, parquet::errors::ParquetError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -204,6 +270,48 @@ impl Storage {
         }
 
         Ok(concat_batches(&schema, &batches)?)
+    }
+
+    /// Get a streaming reader for a Parquet file.
+    ///
+    /// Returns a [ParquetFileStream] that yields record batches as they are read,
+    /// without loading all data into memory at once.
+    ///
+    /// # Arguments
+    /// * `relative_path` - The relative path to the Parquet file.
+    /// * `options` - Options for reading the Parquet file (batch size, projection).
+    pub async fn get_parquet_file_stream(
+        &self,
+        relative_path: &str,
+        options: ParquetReadOptions,
+    ) -> Result<ParquetFileStream> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let meta = obj_store.head(&obj_path).await?;
+
+        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
+        let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+
+        if let Some(batch_size) = options.batch_size {
+            builder = builder.with_batch_size(batch_size);
+        }
+
+        if let Some(projection) = options.projection {
+            let projection_mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                projection.iter().copied(),
+            );
+            builder = builder.with_projection(projection_mask);
+        }
+
+        let schema = builder.schema().clone();
+        let stream = builder.build()?;
+
+        Ok(ParquetFileStream {
+            schema,
+            stream: Box::pin(stream),
+        })
     }
 
     pub async fn get_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
