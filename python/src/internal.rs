@@ -105,6 +105,44 @@ impl HudiFileGroupReader {
             .map_err(PythonError::from)?;
         batches.to_pyarrow(py).map(|b| b.unbind())
     }
+
+    fn read_file_slice_by_base_file_path(
+        &self,
+        relative_path: &str,
+        py: Python,
+    ) -> PyResult<Py<PyAny>> {
+        let options = ReadOptions::new();
+        let stream = rt()
+            .block_on(self.inner.read_file_slice_by_paths(
+                relative_path,
+                Vec::<String>::new(),
+                &options,
+            ))
+            .map_err(PythonError::from)?;
+        let batches: Vec<_> = rt()
+            .block_on(stream.try_collect())
+            .map_err(PythonError::from)?;
+        batches.to_pyarrow(py).map(|b| b.unbind())
+    }
+
+    fn read_file_slice_from_paths(
+        &self,
+        base_file_path: &str,
+        log_file_paths: Vec<String>,
+        py: Python,
+    ) -> PyResult<Py<PyAny>> {
+        let options = ReadOptions::new();
+        let stream = rt()
+            .block_on(
+                self.inner
+                    .read_file_slice_by_paths(base_file_path, log_file_paths, &options),
+            )
+            .map_err(PythonError::from)?;
+        let batches: Vec<_> = rt()
+            .block_on(stream.try_collect())
+            .map_err(PythonError::from)?;
+        batches.to_pyarrow(py).map(|b| b.unbind())
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -374,6 +412,90 @@ impl HudiTable {
         })
     }
 
+    /// Get file slices in splits (legacy API).
+    #[pyo3(signature = (num_splits, filters=None))]
+    fn get_file_slices_splits(
+        &self,
+        num_splits: usize,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_splits(num_splits, filters.unwrap_or_default()),
+                )
+                .map_err(PythonError::from)?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
+                .collect())
+        })
+    }
+
+    /// Get file slices in splits as of a timestamp (legacy API).
+    #[pyo3(signature = (num_splits, timestamp, filters=None))]
+    fn get_file_slices_splits_as_of(
+        &self,
+        num_splits: usize,
+        timestamp: &str,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(self.inner.get_file_slices_splits_as_of(
+                    num_splits,
+                    timestamp,
+                    filters.unwrap_or_default(),
+                ))
+                .map_err(PythonError::from)?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
+                .collect())
+        })
+    }
+
+    /// Get file slices as of a timestamp (legacy API).
+    #[pyo3(signature = (timestamp, filters=None))]
+    fn get_file_slices_as_of(
+        &self,
+        timestamp: &str,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_as_of(timestamp, filters.unwrap_or_default()),
+                )
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
+    /// Get file slices between timestamps (legacy API).
+    #[pyo3(signature = (start_timestamp=None, end_timestamp=None))]
+    fn get_file_slices_between(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_between(start_timestamp, end_timestamp),
+                )
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
     /// Get file slices for incremental reads between timestamps.
     ///
     /// Args:
@@ -404,6 +526,19 @@ impl HudiTable {
         let fg_reader = self
             .inner
             .create_file_group_reader(&options)
+            .map_err(PythonError::from)?;
+        Ok(HudiFileGroupReader { inner: fg_reader })
+    }
+
+    /// Create a file group reader with options (legacy API).
+    #[pyo3(signature = (options=None))]
+    fn create_file_group_reader_with_options(
+        &self,
+        options: Option<HashMap<String, String>>,
+    ) -> PyResult<HudiFileGroupReader> {
+        let fg_reader = self
+            .inner
+            .create_file_group_reader_with_options(options.unwrap_or_default())
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner: fg_reader })
     }
@@ -453,6 +588,40 @@ impl HudiTable {
             .block_on(stream.try_collect())
             .map_err(PythonError::from)?;
         batches.to_pyarrow(py).map(|b| b.unbind())
+    }
+
+    /// Read snapshot as of a timestamp (legacy API).
+    #[pyo3(signature = (timestamp, filters=None))]
+    fn read_snapshot_as_of(
+        &self,
+        timestamp: &str,
+        filters: Option<Vec<(String, String, String)>>,
+        py: Python,
+    ) -> PyResult<Py<PyAny>> {
+        rt().block_on(
+            self.inner
+                .read_snapshot_as_of(timestamp, filters.unwrap_or_default()),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
+        .map(|b| b.unbind())
+    }
+
+    /// Read incremental records (legacy API).
+    #[pyo3(signature = (start_timestamp, end_timestamp=None))]
+    fn read_incremental_records(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Py<PyAny>> {
+        rt().block_on(
+            self.inner
+                .read_incremental_records(start_timestamp, end_timestamp),
+        )
+        .map_err(PythonError::from)?
+        .to_pyarrow(py)
+        .map(|b| b.unbind())
     }
 }
 

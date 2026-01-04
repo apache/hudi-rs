@@ -101,7 +101,7 @@ use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::expr::filter::Filter;
+use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
@@ -111,6 +111,7 @@ use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
+use crate::util::collection::split_into_chunks;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use futures::stream::BoxStream;
@@ -134,6 +135,14 @@ impl Table {
         TableBuilder::from_base_uri(base_uri).build().await
     }
 
+    /// Same as [Table::new], but blocking.
+    pub fn new_blocking(base_uri: &str) -> Result<Self> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { Table::new(base_uri).await })
+    }
+
     /// Create hudi table with options
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
@@ -145,6 +154,19 @@ impl Table {
             .with_options(options)
             .build()
             .await
+    }
+
+    /// Same as [Table::new_with_options], but blocking.
+    pub fn new_with_options_blocking<I, K, V>(base_uri: &str, options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { Table::new_with_options(base_uri, options).await })
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -217,6 +239,14 @@ impl Table {
         resolve_avro_schema(self).await
     }
 
+    /// Same as [Table::get_avro_schema], but blocking.
+    pub fn get_avro_schema_blocking(&self) -> Result<String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_avro_schema().await })
+    }
+
     /// Get the latest [arrow_schema::Schema] of the table.
     ///
     /// The implementation looks for the schema in the following order:
@@ -225,6 +255,14 @@ impl Table {
     /// 3. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
     pub async fn get_schema(&self) -> Result<Schema> {
         resolve_schema(self).await
+    }
+
+    /// Same as [Table::get_schema], but blocking.
+    pub fn get_schema_blocking(&self) -> Result<Schema> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_schema().await })
     }
 
     /// Get the latest partition [arrow_schema::Schema] of the table.
@@ -260,10 +298,264 @@ impl Table {
         Ok(Schema::new(partition_fields))
     }
 
+    /// Same as [Table::get_partition_schema], but blocking.
+    pub fn get_partition_schema_blocking(&self) -> Result<Schema> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_partition_schema().await })
+    }
+
     /// Get the [Timeline] of the table.
     pub fn get_timeline(&self) -> &Timeline {
         &self.timeline
     }
+
+    // =========================================================================
+    // Legacy File Slice APIs (with filter tuples)
+    // =========================================================================
+
+    /// Get all the [FileSlice]s in splits from the table.
+    ///
+    /// # Arguments
+    ///     * `num_splits` - The number of chunks to split the file slices into.
+    ///     * `filters` - Partition filters to apply.
+    pub async fn get_file_slices_splits<I, S>(
+        &self,
+        num_splits: usize,
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
+            let filters = from_str_tuples(filters)?;
+            self.get_file_slices_splits_internal(num_splits, timestamp, &filters)
+                .await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Same as [Table::get_file_slices_splits], but blocking.
+    pub fn get_file_slices_splits_blocking<I, S>(
+        &self,
+        num_splits: usize,
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_file_slices_splits(num_splits, filters).await })
+    }
+
+    /// Get all the [FileSlice]s in splits from the table at a given timestamp.
+    ///
+    /// # Arguments
+    ///     * `num_splits` - The number of chunks to split the file slices into.
+    ///     * `timestamp` - The timestamp which file slices associated with.
+    ///     * `filters` - Partition filters to apply.
+    pub async fn get_file_slices_splits_as_of<I, S>(
+        &self,
+        num_splits: usize,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
+        let filters = from_str_tuples(filters)?;
+        self.get_file_slices_splits_internal(num_splits, &timestamp, &filters)
+            .await
+    }
+
+    /// Same as [Table::get_file_slices_splits_as_of], but blocking.
+    pub fn get_file_slices_splits_as_of_blocking<I, S>(
+        &self,
+        num_splits: usize,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<Vec<FileSlice>>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.get_file_slices_splits_as_of(num_splits, timestamp, filters)
+                    .await
+            })
+    }
+
+    async fn get_file_slices_splits_internal(
+        &self,
+        num_splits: usize,
+        timestamp: &str,
+        filters: &[Filter],
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
+        Ok(split_into_chunks(file_slices, num_splits))
+    }
+
+    /// Get all the [FileSlice]s in the table (legacy API with filter tuples).
+    ///
+    /// # Arguments
+    ///     * `filters` - Partition filters to apply.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing snapshot query.
+    pub async fn get_file_slices_legacy<I, S>(&self, filters: I) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
+            let filters = from_str_tuples(filters)?;
+            self.get_file_slices_internal(timestamp, &filters).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Same as [Table::get_file_slices_legacy], but blocking.
+    pub fn get_file_slices_blocking<I, S>(&self, filters: I) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_file_slices_legacy(filters).await })
+    }
+
+    /// Get all the [FileSlice]s in the table at a given timestamp (legacy API).
+    ///
+    /// # Arguments
+    ///     * `timestamp` - The timestamp which file slices associated with.
+    ///     * `filters` - Partition filters to apply.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing time travel query.
+    pub async fn get_file_slices_as_of<I, S>(
+        &self,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
+        let filters = from_str_tuples(filters)?;
+        self.get_file_slices_internal(&timestamp, &filters).await
+    }
+
+    /// Same as [Table::get_file_slices_as_of], but blocking.
+    pub fn get_file_slices_as_of_blocking<I, S>(
+        &self,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<FileSlice>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.get_file_slices_as_of(timestamp, filters).await })
+    }
+
+    /// Get all the changed [FileSlice]s in the table between the given timestamps (legacy API).
+    ///
+    /// # Arguments
+    ///     * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
+    ///     * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
+    ///
+    /// # Notes
+    ///     * This API is useful for implementing incremental query.
+    pub async fn get_file_slices_between(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<FileSlice>> {
+        let Some(end) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
+        else {
+            return Ok(Vec::new());
+        };
+        let start = start_timestamp.unwrap_or(EARLIEST_START_TIMESTAMP);
+        self.get_file_slices_incremental_internal(start, end).await
+    }
+
+    /// Same as [Table::get_file_slices_between], but blocking.
+    pub fn get_file_slices_between_blocking(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<FileSlice>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.get_file_slices_between(start_timestamp, end_timestamp)
+                    .await
+            })
+    }
+
+    /// Get all the changed [FileSlice]s in splits from the table between the given timestamps (legacy API).
+    ///
+    /// # Arguments
+    ///     * `num_splits` - The number of chunks to split the file slices into.
+    ///     * `start_timestamp` - If provided, only file slices that were changed after this timestamp will be returned.
+    ///     * `end_timestamp` - If provided, only file slices that were changed before or at this timestamp will be returned.
+    pub async fn get_file_slices_splits_between(
+        &self,
+        num_splits: usize,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        let Some(end) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
+        else {
+            return Ok(Vec::new());
+        };
+        let start = start_timestamp.unwrap_or(EARLIEST_START_TIMESTAMP);
+        let file_slices = self
+            .get_file_slices_incremental_internal(start, end)
+            .await?;
+        Ok(split_into_chunks(file_slices, num_splits))
+    }
+
+    /// Same as [Table::get_file_slices_splits_between], but blocking.
+    pub fn get_file_slices_splits_between_blocking(
+        &self,
+        num_splits: usize,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<Vec<FileSlice>>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.get_file_slices_splits_between(num_splits, start_timestamp, end_timestamp)
+                    .await
+            })
+    }
+
+    // =========================================================================
+    // New File Slice APIs (with ReadOptions)
+    // =========================================================================
 
     /// Get all the [FileSlice]s in the table using [ReadOptions].
     ///
@@ -391,8 +683,8 @@ impl Table {
         Ok(file_slices)
     }
 
-    /// Create a [FileGroupReader] using the [Table]'s Hudi configs.
-    pub(crate) fn create_file_group_reader_with_options<I, K, V>(
+    /// Create a [FileGroupReader] using the [Table]'s Hudi configs, and overwriting options.
+    pub fn create_file_group_reader_with_options<I, K, V>(
         &self,
         options: I,
     ) -> Result<FileGroupReader>
@@ -413,6 +705,155 @@ impl Table {
             overwriting_options,
         )
     }
+
+    // =========================================================================
+    // Legacy Read APIs (with filter tuples, returning Vec<RecordBatch>)
+    // =========================================================================
+
+    /// Get all the latest records in the table (legacy API).
+    ///
+    /// # Arguments
+    ///     * `filters` - Partition filters to apply.
+    pub async fn read_snapshot_legacy<I, S>(&self, filters: I) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        if let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() {
+            let filters = from_str_tuples(filters)?;
+            self.read_snapshot_legacy_internal(timestamp, &filters)
+                .await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Same as [Table::read_snapshot_legacy], but blocking.
+    pub fn read_snapshot_blocking<I, S>(&self, filters: I) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.read_snapshot_legacy(filters).await })
+    }
+
+    /// Get all the records in the table at a given timestamp (legacy API).
+    ///
+    /// # Arguments
+    ///     * `timestamp` - The timestamp which records associated with.
+    ///     * `filters` - Partition filters to apply.
+    pub async fn read_snapshot_as_of<I, S>(
+        &self,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
+        let filters = from_str_tuples(filters)?;
+        self.read_snapshot_legacy_internal(&timestamp, &filters)
+            .await
+    }
+
+    /// Same as [Table::read_snapshot_as_of], but blocking.
+    pub fn read_snapshot_as_of_blocking<I, S>(
+        &self,
+        timestamp: &str,
+        filters: I,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        I: IntoIterator<Item = (S, S, S)>,
+        S: AsRef<str>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async { self.read_snapshot_as_of(timestamp, filters).await })
+    }
+
+    async fn read_snapshot_legacy_internal(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+    ) -> Result<Vec<RecordBatch>> {
+        let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
+        let fg_reader = self.create_file_group_reader_with_options([(
+            HudiReadConfig::FileGroupEndTimestamp,
+            timestamp,
+        )])?;
+        let options = ReadOptions::new();
+        let batches = futures::future::try_join_all(file_slices.iter().map(|f| async {
+            let stream = fg_reader.read_file_slice(f, &options).await?;
+            stream.try_collect::<Vec<_>>().await
+        }))
+        .await?;
+        Ok(batches.into_iter().flatten().collect())
+    }
+
+    /// Get records that were inserted or updated between the given timestamps (legacy API).
+    ///
+    /// Records that were updated multiple times should have their latest states within
+    /// the time span being returned.
+    ///
+    /// # Arguments
+    ///     * `start_timestamp` - Only records that were inserted or updated after this timestamp will be returned.
+    ///     * `end_timestamp` - If provided, only records that were inserted or updated before or at this timestamp will be returned.
+    pub async fn read_incremental_records(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        let Some(end_ts) =
+            end_timestamp.or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let timezone = self.timezone();
+        let start_ts = format_timestamp(start_timestamp, &timezone)?;
+        let end_ts = format_timestamp(end_ts, &timezone)?;
+
+        let file_slices = self
+            .get_file_slices_incremental_internal(&start_ts, &end_ts)
+            .await?;
+
+        let fg_reader = self.create_file_group_reader_with_options([
+            (HudiReadConfig::FileGroupStartTimestamp, start_ts.clone()),
+            (HudiReadConfig::FileGroupEndTimestamp, end_ts),
+        ])?;
+
+        let options = ReadOptions::new();
+        let batches = futures::future::try_join_all(file_slices.iter().map(|f| async {
+            let stream = fg_reader.read_file_slice(f, &options).await?;
+            stream.try_collect::<Vec<_>>().await
+        }))
+        .await?;
+        Ok(batches.into_iter().flatten().collect())
+    }
+
+    /// Same as [Table::read_incremental_records], but blocking.
+    pub fn read_incremental_records_blocking(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.read_incremental_records(start_timestamp, end_timestamp)
+                    .await
+            })
+    }
+
+    // =========================================================================
+    // New Read APIs (with ReadOptions, returning Stream)
+    // =========================================================================
 
     /// Create a [FileGroupReader] for this table.
     ///

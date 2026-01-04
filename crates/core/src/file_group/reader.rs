@@ -284,7 +284,7 @@ impl FileGroupReader {
         // For now, only projection is supported for base file only reads
         // Log file merging with projection/predicate is more complex and deferred
         if base_file_only {
-            self.read_parquet_file_with_opts(base_file_path, projection, row_predicate)
+            self.read_base_file_with_opts(base_file_path, projection, row_predicate)
                 .await
         } else {
             // For MOR tables with log files, use as_of_timestamp from options if provided
@@ -616,8 +616,8 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to apply row predicate: {e:?}")))
     }
 
-    /// Reads a parquet file with optional projection and row predicate.
-    async fn read_parquet_file_with_opts(
+    /// Reads a base file with optional projection and row predicate.
+    async fn read_base_file_with_opts(
         &self,
         relative_path: &str,
         projection: Option<&[String]>,
