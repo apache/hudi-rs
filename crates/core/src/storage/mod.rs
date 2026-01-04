@@ -22,15 +22,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
-use arrow::record_batch::RecordBatch;
 use async_recursion::async_recursion;
 use bytes::Bytes;
-use futures::StreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, parse_url_opts};
-use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
+use parquet::arrow::arrow_reader::{RowFilter, RowSelection};
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream};
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
@@ -46,6 +44,66 @@ pub mod error;
 pub mod file_metadata;
 pub mod reader;
 pub mod util;
+
+/// Options for streaming parquet file reads.
+///
+/// This struct provides configuration for reading parquet files as a stream,
+/// supporting column projection, row filtering, row selection, and batch size control.
+pub struct ParquetReadOptions {
+    /// Column indices to read (projection pushdown).
+    /// If `None`, all columns are read.
+    pub projection: Option<ProjectionMask>,
+
+    /// Arrow predicate for row filtering (filter pushdown).
+    /// The filter is applied during parquet decode, skipping rows that don't match.
+    pub row_filter: Option<RowFilter>,
+
+    /// Pre-computed row selection for row-group/page level pruning.
+    /// This is typically derived from parquet statistics or other metadata.
+    pub row_selection: Option<RowSelection>,
+
+    /// Target number of rows per batch.
+    pub batch_size: usize,
+}
+
+impl Default for ParquetReadOptions {
+    fn default() -> Self {
+        Self {
+            projection: None,
+            row_filter: None,
+            row_selection: None,
+            batch_size: 8192,
+        }
+    }
+}
+
+impl ParquetReadOptions {
+    /// Creates new options with the specified batch size.
+    pub fn with_batch_size(batch_size: usize) -> Self {
+        Self {
+            batch_size,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the projection mask for column selection.
+    pub fn projection(mut self, projection: ProjectionMask) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+
+    /// Sets the row filter for predicate pushdown.
+    pub fn row_filter(mut self, filter: RowFilter) -> Self {
+        self.row_filter = Some(filter);
+        self
+    }
+
+    /// Sets the row selection for row-group/page level pruning.
+    pub fn row_selection(mut self, selection: RowSelection) -> Self {
+        self.row_selection = Some(selection);
+        self
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -182,28 +240,66 @@ impl Storage {
         Ok(bytes)
     }
 
-    pub async fn get_parquet_file_data(&self, relative_path: &str) -> Result<RecordBatch> {
+    /// Reads a parquet file as a streaming iterator of record batches.
+    ///
+    /// This method returns a stream that yields record batches one at a time,
+    /// enabling memory-efficient processing of large files without loading
+    /// all data into memory at once.
+    ///
+    /// # Arguments
+    /// * `relative_path` - The relative path to the parquet file within the storage base.
+    /// * `options` - Configuration options for the read operation, including:
+    ///   - `projection`: Column indices to read (projection pushdown)
+    ///   - `row_filter`: Arrow predicate for row filtering (filter pushdown)
+    ///   - `row_selection`: Pre-computed row selection for row-group/page pruning
+    ///   - `batch_size`: Target number of rows per batch
+    ///
+    /// # Returns
+    /// A `ParquetRecordBatchStream` that yields `Result<RecordBatch>` items.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::StreamExt;
+    ///
+    /// let options = ParquetReadOptions::with_batch_size(4096);
+    /// let mut stream = storage.get_parquet_file_stream("data.parquet", options).await?;
+    ///
+    /// while let Some(result) = stream.next().await {
+    ///     let batch = result?;
+    ///     // Process batch...
+    /// }
+    /// ```
+    pub async fn get_parquet_file_stream(
+        &self,
+        relative_path: &str,
+        options: ParquetReadOptions,
+    ) -> Result<ParquetRecordBatchStream<ParquetObjectReader>> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
 
-        // read parquet
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-        let schema = builder.schema().clone();
-        let mut stream = builder.build()?;
-        let mut batches = Vec::new();
+        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await?
+            .with_batch_size(options.batch_size);
 
-        while let Some(r) = stream.next().await {
-            batches.push(r?)
+        // Apply projection if specified
+        if let Some(projection) = options.projection {
+            builder = builder.with_projection(projection);
         }
 
-        if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(schema.clone()));
+        // Apply row filter if specified
+        if let Some(row_filter) = options.row_filter {
+            builder = builder.with_row_filter(row_filter);
         }
 
-        Ok(concat_batches(&schema, &batches)?)
+        // Apply row selection if specified
+        if let Some(row_selection) = options.row_selection {
+            builder = builder.with_row_selection(row_selection);
+        }
+
+        Ok(builder.build()?)
     }
 
     pub async fn get_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
@@ -298,6 +394,7 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
@@ -467,11 +564,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_get_parquet_file_data() {
+    async fn storage_get_parquet_file_stream() {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let file_data = storage.get_parquet_file_data("a.parquet").await.unwrap();
-        assert_eq!(file_data.num_rows(), 5);
+
+        let options = ParquetReadOptions::default();
+        let mut stream = storage
+            .get_parquet_file_stream("a.parquet", options)
+            .await
+            .unwrap();
+
+        let mut total_rows = 0;
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5);
     }
 }

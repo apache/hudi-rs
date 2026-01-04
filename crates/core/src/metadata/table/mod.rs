@@ -284,20 +284,21 @@ mod tests {
     use records::{FilesPartitionRecord, MetadataRecordType};
     use std::collections::HashSet;
 
-    fn get_data_table() -> Table {
+    async fn get_data_table() -> Table {
         let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
-        Table::new_blocking(&table_path).unwrap()
+        Table::new(&table_path).await.unwrap()
     }
 
-    #[test]
-    fn hudi_table_read_metadata_table_files_partition() {
-        let data_table = get_data_table();
-        let partition_schema = data_table.get_partition_schema_blocking().unwrap();
+    #[tokio::test]
+    async fn hudi_table_read_metadata_table_files_partition() {
+        let data_table = get_data_table().await;
+        let partition_schema = data_table.get_partition_schema().await.unwrap();
         let partition_pruner =
             PartitionPruner::new(&[], &partition_schema, data_table.hudi_configs.as_ref()).unwrap();
 
         let records = data_table
-            .read_metadata_table_files_partition_blocking(&partition_pruner)
+            .read_metadata_table_files_partition(&partition_pruner)
+            .await
             .unwrap();
 
         // Should have 4 records: __all_partitions__ + 3 city partitions
@@ -333,9 +334,9 @@ mod tests {
         assert!(chennai.total_size() > 0);
     }
 
-    #[test]
-    fn hudi_table_get_metadata_table_partitions() {
-        let data_table = get_data_table();
+    #[tokio::test]
+    async fn hudi_table_get_metadata_table_partitions() {
+        let data_table = get_data_table().await;
 
         // Verify we can get the metadata table partitions from the data table
         let partitions = data_table.get_metadata_table_partitions();
@@ -363,11 +364,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hudi_table_is_metadata_table_enabled() {
+    #[tokio::test]
+    async fn hudi_table_is_metadata_table_enabled() {
         // V8 table with files partition configured should enable metadata table
         // even without explicit hoodie.metadata.enable=true
-        let data_table = get_data_table();
+        let data_table = get_data_table().await;
 
         // Verify it's a v8 table
         let table_version: isize = data_table
@@ -391,11 +392,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hudi_table_v6_metadata_table_not_enabled() {
+    #[tokio::test]
+    async fn hudi_table_v6_metadata_table_not_enabled() {
         // V6 tables should NOT have metadata table enabled, even with explicit setting
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
 
         // Verify it's a v6 table
         let table_version: isize = hudi_table
@@ -412,35 +413,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hudi_table_is_not_metadata_table() {
+    #[tokio::test]
+    async fn hudi_table_is_not_metadata_table() {
         // A regular data table should not be a metadata table
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new_blocking(base_url.path()).unwrap();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
         assert!(
             !hudi_table.is_metadata_table(),
             "Regular data table should not be a metadata table"
         );
     }
 
-    #[test]
-    fn hudi_table_metadata_table_is_metadata_table() {
+    #[tokio::test]
+    async fn hudi_table_metadata_table_is_metadata_table() {
         // Create a metadata table and verify it's recognized as such
-        let data_table = get_data_table();
-        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
+        let data_table = get_data_table().await;
+        let metadata_table = data_table.new_metadata_table().await.unwrap();
         assert!(
             metadata_table.is_metadata_table(),
             "Metadata table should be recognized as a metadata table"
         );
     }
 
-    #[test]
-    fn hudi_table_new_metadata_table_from_metadata_table_errors() {
+    #[tokio::test]
+    async fn hudi_table_new_metadata_table_from_metadata_table_errors() {
         // Trying to create a metadata table from a metadata table should fail
-        let data_table = get_data_table();
-        let metadata_table = data_table.new_metadata_table_blocking().unwrap();
+        let data_table = get_data_table().await;
+        let metadata_table = data_table.new_metadata_table().await.unwrap();
 
-        let result = metadata_table.new_metadata_table_blocking();
+        let result = metadata_table.new_metadata_table().await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(

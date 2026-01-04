@@ -60,6 +60,10 @@ pub enum HudiReadConfig {
     /// When set to true, only [BaseFile]s will be read for optimized reads.
     /// This is only applicable to Merge-On-Read (MOR) tables.
     UseReadOptimizedMode,
+
+    /// Target number of rows per batch for streaming reads.
+    /// This controls the batch size when using streaming APIs.
+    StreamBatchSize,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -70,6 +74,7 @@ impl AsRef<str> for HudiReadConfig {
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
+            Self::StreamBatchSize => "hoodie.read.stream.batch_size",
         }
     }
 }
@@ -88,6 +93,7 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
+            HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(8192usize)),
             _ => None,
         }
     }
@@ -120,6 +126,11 @@ impl ConfigParser for HudiReadConfig {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Boolean),
+            Self::StreamBatchSize => get_result
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::UInteger),
         }
     }
 }
@@ -128,7 +139,7 @@ impl ConfigParser for HudiReadConfig {
 mod tests {
     use super::*;
     use crate::config::read::HudiReadConfig::{
-        InputPartitions, ListingParallelism, UseReadOptimizedMode,
+        InputPartitions, ListingParallelism, StreamBatchSize, UseReadOptimizedMode,
     };
 
     #[test]
@@ -140,6 +151,7 @@ mod tests {
                 UseReadOptimizedMode.as_ref().to_string(),
                 "true".to_string(),
             ),
+            (StreamBatchSize.as_ref().to_string(), "4096".to_string()),
         ]);
         let actual: usize = InputPartitions.parse_value(&options).unwrap().into();
         assert_eq!(actual, 100);
@@ -147,6 +159,8 @@ mod tests {
         assert_eq!(actual, 100);
         let actual: bool = UseReadOptimizedMode.parse_value(&options).unwrap().into();
         assert!(actual);
+        let actual: usize = StreamBatchSize.parse_value(&options).unwrap().into();
+        assert_eq!(actual, 4096);
     }
 
     #[test]
@@ -155,6 +169,7 @@ mod tests {
             (InputPartitions.as_ref().to_string(), "foo".to_string()),
             (ListingParallelism.as_ref().to_string(), "_100".to_string()),
             (UseReadOptimizedMode.as_ref().to_string(), "1".to_string()),
+            (StreamBatchSize.as_ref().to_string(), "abc".to_string()),
         ]);
         assert!(matches!(
             InputPartitions.parse_value(&options).unwrap_err(),
@@ -173,6 +188,12 @@ mod tests {
             ParseBool(_, _, _)
         ));
         let actual: bool = UseReadOptimizedMode.parse_value_or_default(&options).into();
-        assert!(!actual)
+        assert!(!actual);
+        assert!(matches!(
+            StreamBatchSize.parse_value(&options).unwrap_err(),
+            ParseInt(_, _, _)
+        ));
+        let actual: usize = StreamBatchSize.parse_value_or_default(&options).into();
+        assert_eq!(actual, 8192);
     }
 }

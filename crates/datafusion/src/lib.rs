@@ -47,8 +47,11 @@ use datafusion_physical_expr::create_physical_expr;
 use crate::util::expr::exprs_to_filters;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
+use hudi_core::expr::filter::from_str_tuples;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
+use hudi_core::table::ReadOptions;
 use hudi_core::table::Table as HudiTable;
+use hudi_core::util::collection::split_into_chunks;
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -180,12 +183,23 @@ impl TableProvider for HudiDataSource {
         self.table.register_storage(state.runtime_env().clone());
 
         // Convert Datafusion `Expr` to `Filter`
-        let pushdown_filters = exprs_to_filters(filters);
-        let file_slices = self
+        let pushdown_filter_tuples = exprs_to_filters(filters);
+        let pushdown_filters = from_str_tuples(pushdown_filter_tuples)
+            .map_err(|e| Execution(format!("Failed to convert filters: {e}")))?;
+        let options = ReadOptions::new().with_partition_filters(pushdown_filters);
+        let file_slices_flat = self
             .table
-            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
+            .get_file_slices(options)
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
+
+        // Split into chunks for parallel processing
+        let num_partitions = self.get_input_partitions();
+        let file_slices: Vec<Vec<_>> = if num_partitions > 0 {
+            split_into_chunks(file_slices_flat, num_partitions)
+        } else {
+            vec![file_slices_flat]
+        };
         let base_url = self.table.base_url();
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {

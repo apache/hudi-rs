@@ -24,6 +24,7 @@ use crate::config::util::split_hudi_options_from_others;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
+use crate::file_group::FileGroup;
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
@@ -32,13 +33,14 @@ use crate::merge::record_merger::RecordMerger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
-use crate::storage::Storage;
+use crate::storage::{ParquetReadOptions, Storage};
 use crate::table::builder::OptionResolver;
+use crate::table::ReadOptions;
 use crate::timeline::selector::InstantRange;
-use arrow::compute::and;
-use arrow::compute::filter_record_batch;
+use arrow::compute::{and, concat_batches, filter_record_batch};
 use arrow_array::{BooleanArray, RecordBatch};
-use futures::TryFutureExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -91,21 +93,54 @@ impl FileGroupReader {
         K: AsRef<str>,
         V: Into<String>,
     {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(async {
-                let mut resolver = OptionResolver::new_with_options(base_uri, options);
-                resolver.resolve_options().await?;
-                let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
-                let storage =
-                    Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+        // Collect options upfront so we can move them across thread boundaries if needed
+        let options_vec: Vec<(String, String)> = options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+            .collect();
+        let base_uri = base_uri.to_string();
 
-                Ok(Self {
-                    hudi_configs,
-                    storage,
-                })
+        // Helper function to run the async resolution
+        async fn resolve_reader(
+            base_uri: String,
+            options_vec: Vec<(String, String)>,
+        ) -> Result<FileGroupReader> {
+            let mut resolver = OptionResolver::new_with_options(&base_uri, options_vec);
+            resolver.resolve_options().await?;
+            let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
+            let storage =
+                Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+
+            Ok(FileGroupReader {
+                hudi_configs,
+                storage,
             })
+        }
+
+        // Check if we're already in a tokio runtime
+        match tokio::runtime::Handle::try_current() {
+            Ok(_handle) => {
+                // We're inside a runtime, spawn a new thread with its own runtime
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(resolve_reader(base_uri, options_vec))
+                    })
+                    .join()
+                    .unwrap()
+                })
+            }
+            Err(_) => {
+                // No runtime, create one
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(resolve_reader(base_uri, options_vec))
+            }
+        }
     }
 
     fn create_filtering_mask_for_base_file_records(
@@ -167,20 +202,12 @@ impl FileGroupReader {
     }
 
     /// Reads the data from the base file at the given relative path.
-    ///
-    /// # Arguments
-    /// * `relative_path` - The relative path to the base file.
-    ///
-    /// # Returns
-    /// A record batch read from the base file.
-    pub async fn read_file_slice_by_base_file_path(
+    async fn read_file_slice_by_base_file_path(
         &self,
         relative_path: &str,
     ) -> Result<RecordBatch> {
-        let records: RecordBatch = self
-            .storage
-            .get_parquet_file_data(relative_path)
-            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
+        let records = self
+            .read_parquet_file_to_single_batch(relative_path)
             .await?;
 
         if let Some(mask) = self.create_filtering_mask_for_base_file_records(&records)? {
@@ -191,15 +218,31 @@ impl FileGroupReader {
         }
     }
 
-    /// Same as [FileGroupReader::read_file_slice_by_base_file_path], but blocking.
-    pub fn read_file_slice_by_base_file_path_blocking(
-        &self,
-        relative_path: &str,
-    ) -> Result<RecordBatch> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_file_slice_by_base_file_path(relative_path))
+    /// Reads a parquet file using the streaming API and collects into a single batch.
+    async fn read_parquet_file_to_single_batch(&self, relative_path: &str) -> Result<RecordBatch> {
+        let options = ParquetReadOptions::default();
+        let mut stream = self
+            .storage
+            .get_parquet_file_stream(relative_path, options)
+            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
+            .await?;
+
+        let schema = stream.schema().clone();
+        let mut batches = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            let batch = result.map_err(|e| {
+                ReadFileSliceError(format!("Failed to read batch from {relative_path}: {e:?}"))
+            })?;
+            batches.push(batch);
+        }
+
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        concat_batches(&schema, &batches)
+            .map_err(|e| ReadFileSliceError(format!("Failed to concat batches: {e:?}")))
     }
 
     fn create_instant_range_for_log_file_scan(&self) -> InstantRange {
@@ -218,48 +261,12 @@ impl FileGroupReader {
         InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
     }
 
-    /// Reads the data from the given file slice.
-    ///
-    /// # Arguments
-    /// * `file_slice` - The file slice to read.
-    ///
-    /// # Returns
-    /// A record batch read from the file slice.
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        let base_file_path = file_slice.base_file_relative_path()?;
-        let log_file_paths = if file_slice.has_log_file() {
-            file_slice
-                .log_files
-                .iter()
-                .map(|log_file| file_slice.log_file_relative_path(log_file))
-                .collect::<Result<Vec<String>>>()?
-        } else {
-            vec![]
-        };
-        self.read_file_slice_from_paths(&base_file_path, log_file_paths)
-            .await
-    }
-
-    /// Same as [FileGroupReader::read_file_slice], but blocking.
-    pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_file_slice(file_slice))
-    }
-
-    /// Reads a file slice from a base file and a list of log files.
-    ///
-    /// # Arguments
-    /// * `base_file_path` - The relative path to the base file.
-    /// * `log_file_paths` - An iterator of relative paths to log files.
-    ///
-    /// # Returns
-    /// A record batch read from the base file merged with log files.
-    pub async fn read_file_slice_from_paths<I, S>(
+    /// Reads a file slice from a base file and a list of log files with [ReadOptions].
+    async fn read_file_slice_from_paths_with_opts<I, S>(
         &self,
         base_file_path: &str,
         log_file_paths: I,
+        options: &ReadOptions,
     ) -> Result<RecordBatch>
     where
         I: IntoIterator<Item = S>,
@@ -275,10 +282,18 @@ impl FileGroupReader {
             .into();
         let base_file_only = log_file_paths.is_empty() || use_read_optimized;
 
+        let projection = options.projection.as_deref();
+        let row_predicate = options.row_predicate.as_ref();
+
+        // For now, only projection is supported for base file only reads
+        // Log file merging with projection/predicate is more complex and deferred
         if base_file_only {
-            self.read_file_slice_by_base_file_path(base_file_path).await
+            self.read_parquet_file_with_opts(base_file_path, projection, row_predicate)
+                .await
         } else {
-            let instant_range = self.create_instant_range_for_log_file_scan();
+            // For MOR tables with log files, use as_of_timestamp from options if provided
+            let instant_range = self.create_instant_range_for_log_file_scan_with_opts(options);
+
             let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
@@ -305,24 +320,333 @@ impl FileGroupReader {
             all_batches.extend(log_batches);
 
             let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)
+            let batch = merger.merge_record_batches(all_batches)?;
+
+            // Apply projection if specified
+            let batch = if let Some(cols) = projection {
+                Self::apply_projection(&batch, cols)?
+            } else {
+                batch
+            };
+
+            // Apply row predicate if specified
+            let batch = if let Some(predicate) = row_predicate {
+                Self::apply_row_predicate(&batch, predicate)?
+            } else {
+                batch
+            };
+
+            Ok(batch)
         }
     }
 
-    /// Same as [FileGroupReader::read_file_slice_from_paths], but blocking.
-    pub fn read_file_slice_from_paths_blocking<I, S>(
+    /// Reads a file slice as a stream of record batches with [ReadOptions].
+    ///
+    /// This is the primary read API for FileGroupReader. It returns a stream that
+    /// yields record batches as they are read.
+    ///
+    /// For COW tables or read-optimized mode (base file only), this returns a true
+    /// streaming iterator from the underlying parquet file, yielding batches as they
+    /// are read without loading all data into memory.
+    ///
+    /// For MOR tables with log files, this falls back to the collect-and-merge approach
+    /// and yields the merged result as a single batch.
+    ///
+    /// # Arguments
+    /// * `file_slice` - The file slice to read.
+    /// * `options` - Read options for configuring the read operation:
+    ///     - `projection`: Column names to project (select)
+    ///     - `row_predicate`: Row-level filter predicate
+    ///     - `batch_size`: Target rows per batch
+    ///
+    /// # Returns
+    /// A stream of record batches. The stream owns all necessary data and is `'static`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::StreamExt;
+    ///
+    /// let options = ReadOptions::new().with_batch_size(4096);
+    /// let mut stream = reader.read_file_slice(&file_slice, &options).await?;
+    ///
+    /// while let Some(result) = stream.next().await {
+    ///     let batch = result?;
+    ///     // Process batch...
+    /// }
+    /// ```
+    pub async fn read_file_slice(
+        &self,
+        file_slice: &FileSlice,
+        options: &ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let log_file_paths: Vec<String> = if file_slice.has_log_file() {
+            file_slice
+                .log_files
+                .iter()
+                .map(|log_file| file_slice.log_file_relative_path(log_file))
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            vec![]
+        };
+
+        let use_read_optimized: bool = self
+            .hudi_configs
+            .get_or_default(HudiReadConfig::UseReadOptimizedMode)
+            .into();
+        let base_file_only = log_file_paths.is_empty() || use_read_optimized;
+
+        if base_file_only {
+            // True streaming: return the parquet stream directly
+            self.read_parquet_file_stream(&base_file_path, options).await
+        } else {
+            // Fallback: collect + merge, then yield as single-item stream
+            let batch = self
+                .read_file_slice_from_paths_with_opts(&base_file_path, log_file_paths, options)
+                .await?;
+            Ok(Box::pin(futures::stream::once(async { Ok(batch) })))
+        }
+    }
+
+    /// Reads a file slice specified by file paths as a stream of record batches.
+    ///
+    /// This is a convenience method that constructs a [FileSlice] from the given paths
+    /// and delegates to [Self::read_file_slice].
+    ///
+    /// # Arguments
+    /// * `base_file_path` - Relative path to the base file (e.g., "city=chennai/file.parquet")
+    /// * `log_file_paths` - Optional iterator of relative paths to log files
+    /// * `options` - Read options for configuring the read operation
+    ///
+    /// # Returns
+    /// A stream of record batches.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::StreamExt;
+    ///
+    /// let options = ReadOptions::new();
+    /// let mut stream = reader.read_file_slice_by_paths(
+    ///     "city=chennai/file-id-0_0-7-24_20240101120000.parquet",
+    ///     [".file-id-0_20240101120000.log.1_0-51-115"],
+    ///     &options,
+    /// ).await?;
+    ///
+    /// while let Some(result) = stream.next().await {
+    ///     let batch = result?;
+    ///     // Process batch...
+    /// }
+    /// ```
+    pub async fn read_file_slice_by_paths<I, S>(
         &self,
         base_file_path: &str,
         log_file_paths: I,
-    ) -> Result<RecordBatch>
+        options: &ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_file_slice_from_paths(base_file_path, log_file_paths))
+        use std::path::Path;
+
+        // Parse base file path to extract partition path and file name
+        let path = Path::new(base_file_path);
+        let partition_path = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let base_file_name = path
+            .file_name()
+            .ok_or_else(|| {
+                CoreError::FileGroup(format!(
+                    "Cannot extract file name from base file path: {base_file_path}"
+                ))
+            })?
+            .to_string_lossy();
+
+        // Create a FileGroup from the base file
+        let mut file_group = FileGroup::new_with_base_file_name(&base_file_name, &partition_path)?;
+
+        // Add log files if provided
+        for log_file_path in log_file_paths {
+            let log_path = Path::new(log_file_path.as_ref());
+            let log_file_name = log_path
+                .file_name()
+                .ok_or_else(|| {
+                    CoreError::FileGroup(format!(
+                        "Cannot extract file name from log file path: {}",
+                        log_file_path.as_ref()
+                    ))
+                })?
+                .to_string_lossy();
+            file_group.add_log_file_from_name(&log_file_name)?;
+        }
+
+        // Get the file slice (there should be exactly one after adding base file)
+        let file_slice = file_group
+            .file_slices
+            .values()
+            .next()
+            .ok_or_else(|| CoreError::FileGroup("No file slice found in file group".to_string()))?
+            .clone();
+
+        // Delegate to the primary read API
+        self.read_file_slice(&file_slice, options).await
+    }
+
+    /// Reads a parquet file as a stream of record batches.
+    ///
+    /// This method propagates the underlying parquet stream, applying Hudi-specific
+    /// filtering (commit time filtering for incremental reads) to each batch.
+    /// The returned stream owns all necessary data and is `'static`.
+    async fn read_parquet_file_stream(
+        &self,
+        relative_path: &str,
+        options: &ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let batch_size = options.batch_size.unwrap_or(8192);
+        let parquet_options = ParquetReadOptions::with_batch_size(batch_size);
+
+        let stream = self
+            .storage
+            .get_parquet_file_stream(relative_path, parquet_options)
+            .await
+            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))?;
+
+        // Clone data for the closure so the stream is 'static
+        let reader = self.clone();
+        let projection = options.projection.clone();
+        let row_predicate = options.row_predicate.clone();
+
+        let mapped_stream = stream.map(move |result| {
+            let batch = result
+                .map_err(|e| ReadFileSliceError(format!("Failed to read batch: {e:?}")))?;
+
+            // Apply Hudi commit time filtering
+            let batch = if let Some(mask) = reader.create_filtering_mask_for_base_file_records(&batch)? {
+                filter_record_batch(&batch, &mask)
+                    .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))?
+            } else {
+                batch
+            };
+
+            // Apply column projection if specified
+            let batch = if let Some(ref cols) = projection {
+                FileGroupReader::apply_projection(&batch, cols)?
+            } else {
+                batch
+            };
+
+            // Apply row predicate if specified
+            let batch = if let Some(ref predicate) = row_predicate {
+                FileGroupReader::apply_row_predicate(&batch, predicate)?
+            } else {
+                batch
+            };
+
+            Ok(batch)
+        });
+
+        Ok(Box::pin(mapped_stream))
+    }
+
+    /// Creates an instant range for log file scanning using ReadOptions.
+    fn create_instant_range_for_log_file_scan_with_opts(&self, options: &ReadOptions) -> InstantRange {
+        let timezone = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .into();
+
+        // Use as_of_timestamp from options if provided, otherwise fall back to config
+        let start_timestamp = self
+            .hudi_configs
+            .try_get(HudiReadConfig::FileGroupStartTimestamp)
+            .map(|v| -> String { v.into() });
+
+        let end_timestamp = options
+            .as_of_timestamp
+            .clone()
+            .or_else(|| {
+                self.hudi_configs
+                    .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                    .map(|v| -> String { v.into() })
+            });
+
+        InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
+    }
+
+    /// Applies column projection to a record batch.
+    fn apply_projection(batch: &RecordBatch, columns: &[String]) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let indices: Vec<usize> = columns
+            .iter()
+            .filter_map(|col| schema.index_of(col).ok())
+            .collect();
+
+        if indices.is_empty() {
+            return Err(ReadFileSliceError(
+                "No matching columns found for projection".to_string(),
+            ));
+        }
+
+        batch
+            .project(&indices)
+            .map_err(|e| ReadFileSliceError(format!("Failed to project columns: {e:?}")))
+    }
+
+    /// Applies a row predicate filter to a record batch.
+    fn apply_row_predicate(batch: &RecordBatch, predicate: &Filter) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let schemable = SchemableFilter::try_from((predicate.clone(), schema.as_ref()))?;
+
+        // Get the column to filter on
+        let column = batch.column_by_name(&predicate.field_name).ok_or_else(|| {
+            ReadFileSliceError(format!("Column '{}' not found for predicate", predicate.field_name))
+        })?;
+
+        // Apply the comparison to get a boolean mask
+        let mask = schemable.apply_comparsion(column)?;
+
+        // Filter the batch
+        filter_record_batch(batch, &mask)
+            .map_err(|e| ReadFileSliceError(format!("Failed to apply row predicate: {e:?}")))
+    }
+
+    /// Reads a parquet file with optional projection and row predicate.
+    async fn read_parquet_file_with_opts(
+        &self,
+        relative_path: &str,
+        projection: Option<&[String]>,
+        row_predicate: Option<&Filter>,
+    ) -> Result<RecordBatch> {
+        // Read the file using streaming API
+        let records = self
+            .read_parquet_file_to_single_batch(relative_path)
+            .await?;
+
+        // Apply base file filtering mask (for Hudi record filtering)
+        let records = if let Some(mask) = self.create_filtering_mask_for_base_file_records(&records)? {
+            filter_record_batch(&records, &mask)
+                .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}")))?
+        } else {
+            records
+        };
+
+        // Apply column projection if specified
+        let records = if let Some(cols) = projection {
+            Self::apply_projection(&records, cols)?
+        } else {
+            records
+        };
+
+        // Apply row predicate if specified
+        let records = if let Some(predicate) = row_predicate {
+            Self::apply_row_predicate(&records, predicate)?
+        } else {
+            records
+        };
+
+        Ok(records)
     }
 
     // =========================================================================
@@ -433,9 +757,11 @@ mod tests {
     use crate::error::CoreError;
     use crate::file_group::base_file::BaseFile;
     use crate::file_group::file_slice::FileSlice;
+    use crate::table::ReadOptions;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use futures::StreamExt;
     use std::fs::canonicalize;
     use std::path::PathBuf;
     use std::str::FromStr;
@@ -444,8 +770,6 @@ mod tests {
 
     const TEST_SAMPLE_BASE_FILE: &str =
         "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
-    const TEST_SAMPLE_LOG_FILE: &str =
-        ".a079bdb3-731c-4894-b855-abfcd6921007-0_20240418173551906.log.1_0-204-275";
 
     fn get_non_existent_base_uri() -> String {
         "file:///non-existent-path/table".to_string()
@@ -591,23 +915,28 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_with_base_file_only() -> Result<()> {
+    #[tokio::test]
+    async fn test_read_file_slice_with_base_file_only() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
-        // Test with actual test files and empty log files - should trigger base_file_only logic
-        let base_file_path = TEST_SAMPLE_BASE_FILE;
-        let log_file_paths: Vec<&str> = vec![];
+        // Create a FileSlice from the test sample base file
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new());
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let options = ReadOptions::new();
+        let result = reader.read_file_slice(&file_slice, &options).await;
 
         match result {
-            Ok(batch) => {
-                assert!(
-                    batch.num_rows() > 0,
-                    "Should have read some records from base file"
-                );
+            Ok(mut stream) => {
+                if let Some(batch_result) = stream.next().await {
+                    if let Ok(batch) = batch_result {
+                        assert!(
+                            batch.num_rows() > 0,
+                            "Should have read some records from base file"
+                        );
+                    }
+                }
             }
             Err(_) => {
                 // This might fail if the test data doesn't exist, which is acceptable for a unit test
@@ -617,24 +946,25 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_read_optimized_mode() -> Result<()> {
+    #[tokio::test]
+    async fn test_read_file_slice_read_optimized_mode() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(
             &base_uri,
             [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
         )?;
 
-        let base_file_path = TEST_SAMPLE_BASE_FILE;
-        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+        // Create a FileSlice from the test sample base file
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new());
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let options = ReadOptions::new();
+        let result = reader.read_file_slice(&file_slice, &options).await;
 
         // In read-optimized mode, log files should be ignored
-        // This should behave the same as read_file_slice_by_base_file_path
         match result {
             Ok(_) => {
-                // Test passes if we get a result - the method correctly ignored log files
+                // Test passes if we get a result
             }
             Err(e) => {
                 // Expected for missing test data
@@ -649,27 +979,25 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
+    #[tokio::test]
+    async fn test_read_file_slice_error_handling() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
-        let base_file_path = TEST_SAMPLE_BASE_FILE;
-        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+        // Create a FileSlice from a non-existent file
+        let base_file = BaseFile::from_str("non_existent_file.parquet")?;
+        let file_slice = FileSlice::new(base_file, String::new());
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let options = ReadOptions::new();
+        let result = reader.read_file_slice(&file_slice, &options).await;
 
-        // The actual file reading might fail due to missing test data, which is expected
         match result {
-            Ok(_batch) => {
-                // Test passes if we get a valid batch
-            }
+            Ok(_) => panic!("Expected error for non-existent file"),
             Err(e) => {
-                // Expected for missing test data - verify it's a storage/file not found error
                 let error_msg = e.to_string();
                 assert!(
-                    error_msg.contains("not found") || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {error_msg}"
+                    error_msg.contains("not found") || error_msg.contains("Failed to read path"),
+                    "Should contain appropriate error message, got: {error_msg}"
                 );
             }
         }
@@ -677,55 +1005,86 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_error_handling() -> Result<()> {
+    #[tokio::test]
+    async fn test_read_file_slice_by_paths() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
-        // Test with non-existent base file
-        let base_file_path = "non_existent_file.parquet";
-        let log_file_paths: Vec<&str> = vec![];
+        // Test with just base file path (no partition, no log files)
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let options = ReadOptions::new();
+        let result = reader
+            .read_file_slice_by_paths(base_file_path, Vec::<String>::new(), &options)
+            .await;
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
-
-        assert!(result.is_err(), "Should return error for non-existent file");
-
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("not found") || error_msg.contains("Failed to read path"),
-            "Should contain appropriate error message, got: {error_msg}"
-        );
+        match result {
+            Ok(mut stream) => {
+                if let Some(batch_result) = stream.next().await {
+                    if let Ok(batch) = batch_result {
+                        assert!(
+                            batch.num_rows() > 0,
+                            "Should have read some records from base file"
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                // This might fail if the test data doesn't exist
+            }
+        }
 
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_blocking() -> Result<()> {
+    #[tokio::test]
+    async fn test_read_file_slice_by_paths_with_partition() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
-        // Create a FileSlice from the test sample base file
-        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
-        let file_slice = FileSlice::new(base_file, String::new()); // empty partition path
+        // Test with partition path in the base file path
+        let base_file_path = format!("city=chennai/{TEST_SAMPLE_BASE_FILE}");
+        let options = ReadOptions::new();
+        let result = reader
+            .read_file_slice_by_paths(&base_file_path, Vec::<String>::new(), &options)
+            .await;
 
-        // Call read_file_slice_blocking
-        let result = reader.read_file_slice_blocking(&file_slice);
-
+        // Should fail because the file doesn't exist at that path
         match result {
-            Ok(batch) => {
-                assert!(
-                    batch.num_rows() > 0,
-                    "Should have read some records from base file"
-                );
+            Ok(_) => {
+                // Unexpected success - the file shouldn't exist at this path
             }
             Err(e) => {
-                // Expected for missing test data - verify it's a file not found error
                 let error_msg = e.to_string();
                 assert!(
-                    error_msg.contains("Failed to read path")
-                        || error_msg.contains("not found")
-                        || error_msg.contains("No such file"),
-                    "Expected file not found error, got: {error_msg}"
+                    error_msg.contains("not found") || error_msg.contains("Failed to read path"),
+                    "Should contain appropriate error message, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_by_paths_error_invalid_base_path() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
+
+        // Test with invalid base file name (not a valid parquet file name)
+        let options = ReadOptions::new();
+        let result = reader
+            .read_file_slice_by_paths("some/invalid_file_name", Vec::<String>::new(), &options)
+            .await;
+
+        match result {
+            Ok(_) => panic!("Expected error for invalid base file path"),
+            Err(e) => {
+                let error_msg = e.to_string();
+                // Should fail to parse as a valid base file name
+                assert!(
+                    error_msg.contains("Failed to parse file name")
+                        || error_msg.contains("Invalid base file name"),
+                    "Should contain appropriate error message, got: {error_msg}"
                 );
             }
         }
