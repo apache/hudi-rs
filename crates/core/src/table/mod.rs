@@ -838,7 +838,11 @@ impl Table {
 
         let timestamp = match timestamp {
             Some(ts) => ts.to_string(),
-            None => return Err(crate::error::CoreError::Timeline("No commit timestamp available".to_string())),
+            None => {
+                return Err(crate::error::CoreError::Timeline(
+                    "No commit timestamp available".to_string(),
+                ));
+            }
         };
 
         let fg_reader = self.create_file_group_reader_with_options([(
@@ -856,10 +860,16 @@ impl Table {
     /// are read from the underlying file slices.
     ///
     /// # Arguments
-    /// * `options` - Read options including partition filters, batch size, etc.
+    /// * `options` - Read options including partition filters, batch size, and projection.
     ///
     /// # Returns
-    /// A stream of record batches from all file slices.
+    /// A stream of record batches from all file slices. Errors from individual file
+    /// slices are propagated through the stream.
+    ///
+    /// # Limitations
+    ///
+    /// - The `row_predicate` field in [ReadOptions] is not yet implemented for streaming reads.
+    /// - For MOR tables with log files, streaming falls back to the collect-and-merge approach.
     ///
     /// # Example
     /// ```ignore
@@ -902,33 +912,35 @@ impl Table {
             timestamp,
         )])?;
 
+        // Extract options to pass to each file slice read.
+        // Note: row_predicate is not yet supported in streaming base file reads.
         let batch_size = options.batch_size;
+        let projection = options.projection.clone();
+
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();
+            let projection = projection.clone();
             let options = ReadOptions {
                 partition_filters: vec![],
-                projection: None,
-                row_predicate: None,
+                projection,
+                row_predicate: None, // Not yet implemented in streaming reads
                 batch_size,
                 as_of_timestamp: None,
             };
             async move {
-                fg_reader.read_file_slice_stream(&file_slice, &options).await
+                fg_reader
+                    .read_file_slice_stream(&file_slice, &options)
+                    .await
             }
         });
 
+        // Chain all file slice streams together, propagating errors to the caller.
         let combined_stream = stream::iter(streams_iter)
             .then(|fut| fut)
-            .filter_map(|result| async move {
-                match result {
-                    Ok(stream) => Some(stream),
-                    Err(e) => {
-                        log::warn!("Failed to read file slice: {:?}", e);
-                        None
-                    }
-                }
-            })
-            .flatten();
+            .flat_map(|result| match result {
+                Ok(file_stream) => file_stream.left_stream(),
+                Err(e) => stream::once(async move { Err(e) }).right_stream(),
+            });
 
         Ok(Box::pin(combined_stream))
     }

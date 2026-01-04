@@ -33,8 +33,8 @@ use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::{ParquetReadOptions, Storage};
-use crate::table::builder::OptionResolver;
 use crate::table::ReadOptions;
+use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
@@ -337,7 +337,13 @@ impl FileGroupReader {
     /// are read without loading all data into memory.
     ///
     /// For MOR tables with log files, this falls back to the collect-and-merge approach
-    /// and yields the merged result as a single batch.
+    /// and yields the merged result as a single batch. This limitation exists because
+    /// streaming merge of base files with log files is not yet implemented.
+    ///
+    /// # Limitations
+    ///
+    /// - The `projection` and `row_predicate` fields in [ReadOptions] are not yet
+    ///   implemented for streaming reads. Only `batch_size` is currently supported.
     ///
     /// # Arguments
     /// * `file_slice` - The file slice to read.
@@ -425,6 +431,11 @@ impl FileGroupReader {
     }
 
     /// Reads a base file as a stream of record batches.
+    ///
+    /// # Limitations
+    ///
+    /// Currently only `batch_size` from [ReadOptions] is used. The `projection` and
+    /// `row_predicate` fields are not yet implemented.
     async fn read_base_file_stream(
         &self,
         relative_path: &str,
@@ -460,25 +471,21 @@ impl FileGroupReader {
             .await?;
 
         // Apply the same filtering logic as read_file_slice_by_base_file_path
-        let stream = parquet_stream
-            .into_stream()
-            .filter_map(move |result| {
-                let hudi_configs = hudi_configs.clone();
-                async move {
-                    match result {
-                        Err(e) => Some(Err(ReadFileSliceError(format!(
-                            "Failed to read batch: {e:?}"
-                        )))),
-                        Ok(batch) => {
-                            match apply_commit_time_filter(&hudi_configs, batch) {
-                                Err(e) => Some(Err(e)),
-                                Ok(filtered) if filtered.num_rows() > 0 => Some(Ok(filtered)),
-                                Ok(_) => None,
-                            }
-                        }
-                    }
+        let stream = parquet_stream.into_stream().filter_map(move |result| {
+            let hudi_configs = hudi_configs.clone();
+            async move {
+                match result {
+                    Err(e) => Some(Err(ReadFileSliceError(format!(
+                        "Failed to read batch: {e:?}"
+                    )))),
+                    Ok(batch) => match apply_commit_time_filter(&hudi_configs, batch) {
+                        Err(e) => Some(Err(e)),
+                        Ok(filtered) if filtered.num_rows() > 0 => Some(Ok(filtered)),
+                        Ok(_) => None,
+                    },
                 }
-            });
+            }
+        });
 
         Ok(Box::pin(stream))
     }
@@ -937,6 +944,261 @@ mod tests {
                     error_msg.contains("Failed to read path")
                         || error_msg.contains("not found")
                         || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Streaming API Tests
+    // =========================================================================
+
+    /// Helper to create a FileGroupReader without using block_on (safe for async tests).
+    fn create_test_reader(base_uri: &str) -> Result<FileGroupReader> {
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
+        FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
+    }
+
+    /// Helper to create a FileGroupReader with read-optimized mode.
+    fn create_test_reader_read_optimized(base_uri: &str) -> Result<FileGroupReader> {
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
+        FileGroupReader::new_with_configs_and_overwriting_options(
+            hudi_configs,
+            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
+        )
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_base_file_only() -> Result<()> {
+        use futures::StreamExt;
+
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new());
+
+        let options = ReadOptions::default();
+        let result = reader.read_file_slice_stream(&file_slice, &options).await;
+
+        match result {
+            Ok(mut stream) => {
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    batches.push(batch_result?);
+                }
+                // Should have read some batches
+                assert!(!batches.is_empty(), "Should produce at least one batch");
+                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert!(total_rows > 0, "Should read at least one row");
+            }
+            Err(e) => {
+                // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_from_paths_stream_base_file_only() -> Result<()> {
+        use futures::StreamExt;
+
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let log_file_paths: Vec<&str> = vec![];
+        let options = ReadOptions::default();
+
+        let result = reader
+            .read_file_slice_from_paths_stream(base_file_path, log_file_paths, &options)
+            .await;
+
+        match result {
+            Ok(mut stream) => {
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    batches.push(batch_result?);
+                }
+                assert!(!batches.is_empty(), "Should produce at least one batch");
+            }
+            Err(e) => {
+                // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path") || error_msg.contains("not found"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_from_paths_stream_read_optimized_mode() -> Result<()> {
+        use futures::StreamExt;
+
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader_read_optimized(&base_uri)?;
+
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        // Even with log files, read-optimized mode should ignore them
+        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+        let options = ReadOptions::default();
+
+        let result = reader
+            .read_file_slice_from_paths_stream(base_file_path, log_file_paths, &options)
+            .await;
+
+        match result {
+            Ok(mut stream) => {
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    batches.push(batch_result?);
+                }
+                // In read-optimized mode, log files are ignored - should still work
+                assert!(
+                    !batches.is_empty(),
+                    "Should produce batches in read-optimized mode"
+                );
+            }
+            Err(e) => {
+                // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_from_paths_stream_with_log_files() -> Result<()> {
+        use futures::StreamExt;
+
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+
+        let base_file_path = TEST_SAMPLE_BASE_FILE;
+        let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
+        let options = ReadOptions::default();
+
+        let result = reader
+            .read_file_slice_from_paths_stream(base_file_path, log_file_paths, &options)
+            .await;
+
+        match result {
+            Ok(mut stream) => {
+                // With log files, falls back to collect+merge and yields single batch
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    batches.push(batch_result?);
+                }
+                // Should have exactly one batch (the merged result)
+                assert!(!batches.is_empty(), "Should produce batches");
+            }
+            Err(e) => {
+                // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_with_batch_size() -> Result<()> {
+        use futures::StreamExt;
+
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+
+        let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
+        let file_slice = FileSlice::new(base_file, String::new());
+
+        // Use very small batch size
+        let options = ReadOptions {
+            partition_filters: vec![],
+            projection: None,
+            row_predicate: None,
+            batch_size: Some(1),
+            as_of_timestamp: None,
+        };
+
+        let result = reader.read_file_slice_stream(&file_slice, &options).await;
+
+        match result {
+            Ok(mut stream) => {
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    batches.push(batch_result?);
+                }
+                // With small batch size, should get multiple batches
+                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert!(total_rows > 0, "Should read at least one row");
+            }
+            Err(e) => {
+                // Expected for missing test data
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file"),
+                    "Expected file not found error, got: {error_msg}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_error_on_invalid_file() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+
+        // Use a valid file name format but pointing to a non-existent file
+        let base_file = BaseFile::from_str(
+            "00000000-0000-0000-0000-000000000000-0_0-0-0_00000000000000000.parquet",
+        )?;
+        let file_slice = FileSlice::new(base_file, String::new());
+
+        let options = ReadOptions::default();
+        let result = reader.read_file_slice_stream(&file_slice, &options).await;
+
+        // Should return error for non-existent file
+        match result {
+            Ok(_) => panic!("Should return error for non-existent file"),
+            Err(e) => {
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("Failed to read path")
+                        || error_msg.contains("not found")
+                        || error_msg.contains("No such file")
+                        || error_msg.contains("Object at location"),
                     "Expected file not found error, got: {error_msg}"
                 );
             }

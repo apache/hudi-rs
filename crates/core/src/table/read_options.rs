@@ -36,6 +36,13 @@ pub type PartitionFilter = (String, String, String);
 /// - Batch size control (rows per batch)
 /// - Time travel (as-of timestamp)
 ///
+/// # Current Limitations
+///
+/// Not all options are supported in all streaming APIs:
+/// - `batch_size` and `partition_filters` are fully supported.
+/// - `projection` is passed through but not yet applied at the parquet read level.
+/// - `row_predicate` is not yet implemented in streaming reads.
+///
 /// # Example
 ///
 /// ```ignore
