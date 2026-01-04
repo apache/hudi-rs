@@ -163,7 +163,7 @@ impl FileGroupReader {
                 .column_by_name(col_name)
                 .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} not found")))?;
 
-            let comparison = filter.apply_comparsion(col_values)?;
+            let comparison = filter.apply_comparison(col_values)?;
             mask = and(&mask, &comparison)?;
         }
         Ok(Some(mask))
@@ -636,7 +636,7 @@ fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> R
         let col_values = batch
             .column_by_name(col_name)
             .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} not found")))?;
-        let comparison = filter.apply_comparsion(col_values)?;
+        let comparison = filter.apply_comparison(col_values)?;
         mask = and(&mask, &comparison)?;
     }
 

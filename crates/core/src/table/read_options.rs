@@ -38,10 +38,13 @@ pub type PartitionFilter = (String, String, String);
 ///
 /// # Current Limitations
 ///
-/// Not all options are supported in all streaming APIs:
+/// Not all options are fully supported in streaming APIs:
 /// - `batch_size` and `partition_filters` are fully supported.
-/// - `projection` is passed through but not yet applied at the parquet read level.
-/// - `row_predicate` is not yet implemented in streaming reads.
+/// - `projection` is passed through to the streaming implementation but is not yet
+///   applied at the parquet read level. This is because projection requires mapping
+///   column names to column indices via schema lookup, which is not yet implemented.
+/// - `row_predicate` is not yet implemented in streaming reads. The predicate function
+///   is accepted but will be ignored.
 ///
 /// # Example
 ///
@@ -108,6 +111,9 @@ impl ReadOptions {
     }
 
     /// Sets the row-level predicate for filtering records.
+    ///
+    /// **Note:** Row predicates are not yet implemented in streaming reads.
+    /// The predicate will be accepted but ignored during streaming operations.
     ///
     /// # Arguments
     /// * `predicate` - A function that takes a RecordBatch and returns a BooleanArray mask

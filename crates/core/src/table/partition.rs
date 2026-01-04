@@ -118,7 +118,7 @@ impl PartitionPruner {
         self.and_filters.iter().all(|filter| {
             match segments.get(filter.field.name()) {
                 Some(segment_value) => {
-                    match filter.apply_comparsion(segment_value) {
+                    match filter.apply_comparison(segment_value) {
                         Ok(scalar) => scalar.value(0),
                         Err(_) => true, // Include the partition when comparison error occurs
                     }

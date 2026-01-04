@@ -831,23 +831,21 @@ impl Table {
         file_slice: &FileSlice,
         options: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use futures::stream;
+
         let timestamp = options
             .as_of_timestamp
             .as_deref()
             .or_else(|| self.timeline.get_latest_commit_timestamp_as_option());
 
-        let timestamp = match timestamp {
-            Some(ts) => ts.to_string(),
-            None => {
-                return Err(crate::error::CoreError::Timeline(
-                    "No commit timestamp available".to_string(),
-                ));
-            }
+        let Some(timestamp) = timestamp else {
+            // No commit timestamp means empty table - return empty stream (consistent with read_snapshot)
+            return Ok(Box::pin(stream::empty()));
         };
 
         let fg_reader = self.create_file_group_reader_with_options([(
             HudiReadConfig::FileGroupEndTimestamp,
-            timestamp.as_str(),
+            timestamp,
         )])?;
 
         fg_reader.read_file_slice_stream(file_slice, options).await

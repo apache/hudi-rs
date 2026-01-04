@@ -627,8 +627,9 @@ mod streaming_queries {
             batches.push(result?);
         }
 
-        // With batch_size=1 and 4 rows, we should get multiple batches
-        // (exact number depends on parquet row groups)
+        // With batch_size=1 and 4 rows, we expect multiple batches, but the
+        // exact number depends on both the batch_size setting and the Parquet
+        // file's internal row group structure.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 4, "Total rows should match expected count");
         Ok(())
@@ -652,6 +653,10 @@ mod streaming_queries {
             batches.push(result?);
         }
 
+        assert!(
+            !batches.is_empty(),
+            "Should produce at least one batch for the given partition filters"
+        );
         let schema = &batches[0].schema();
         let records = concat_batches(schema, &batches)?;
 
@@ -739,9 +744,8 @@ mod streaming_queries {
     }
 
     #[tokio::test]
-    async fn test_read_snapshot_stream_error_propagation() -> Result<()> {
-        // This test verifies that if we read from a valid table, no errors are propagated
-        // (We can't easily trigger file read errors in a unit test without mocking)
+    async fn test_read_snapshot_stream_successful_read() -> Result<()> {
+        // This test verifies that reading from a valid table succeeds without errors.
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
 
@@ -756,15 +760,12 @@ mod streaming_queries {
     }
 
     #[tokio::test]
-    async fn test_read_file_slice_stream_no_timestamp_error() -> Result<()> {
-        // For an empty table, read_file_slice_stream should error if called with
-        // a file slice that doesn't have a valid timestamp context
+    async fn test_read_snapshot_stream_empty_table_no_timestamp() -> Result<()> {
+        // For an empty table with no commit timestamp, streaming reads should return
+        // an empty stream (consistent with read_snapshot behavior).
         let base_url = SampleTable::V6Empty.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
 
-        // Create a dummy file slice - this should fail because there's no commit timestamp
-        // Note: We can't easily test this without creating an invalid file slice
-        // So we verify the empty table returns empty stream from read_snapshot_stream
         let options = ReadOptions::new();
         let mut stream = hudi_table.read_snapshot_stream(&options).await?;
 
