@@ -23,9 +23,14 @@ use arrow_array::{BooleanArray, RecordBatch};
 /// A row-level predicate function for filtering records.
 pub type RowPredicate = Box<dyn Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync>;
 
+/// A partition filter tuple: (field_name, operator, value).
+/// Example: ("city", "=", "san_francisco")
+pub type PartitionFilter = (String, String, String);
+
 /// Options for reading file slices with streaming APIs.
 ///
 /// This struct provides configuration for:
+/// - Partition filters (filtering partitions)
 /// - Column projection (which columns to read)
 /// - Row-level predicates (filtering rows)
 /// - Batch size control (rows per batch)
@@ -37,11 +42,14 @@ pub type RowPredicate = Box<dyn Fn(&RecordBatch) -> crate::Result<BooleanArray> 
 /// use hudi::table::ReadOptions;
 ///
 /// let options = ReadOptions::new()
-///     .with_projection(&["id", "name"])
+///     .with_filters([("city", "=", "san_francisco")])
 ///     .with_batch_size(4096);
 /// ```
 #[derive(Default)]
 pub struct ReadOptions {
+    /// Partition filters. Each filter is a tuple of (field, operator, value).
+    pub partition_filters: Vec<PartitionFilter>,
+
     /// Column names to project (select). If None, all columns are read.
     pub projection: Option<Vec<String>>,
 
@@ -59,6 +67,24 @@ impl ReadOptions {
     /// Creates a new ReadOptions with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets partition filters.
+    ///
+    /// # Arguments
+    /// * `filters` - Partition filters as tuples of (field, operator, value)
+    pub fn with_filters<I, S1, S2, S3>(mut self, filters: I) -> Self
+    where
+        I: IntoIterator<Item = (S1, S2, S3)>,
+        S1: Into<String>,
+        S2: Into<String>,
+        S3: Into<String>,
+    {
+        self.partition_filters = filters
+            .into_iter()
+            .map(|(f, o, v)| (f.into(), o.into(), v.into()))
+            .collect();
+        self
     }
 
     /// Sets the column projection (which columns to read).
@@ -108,6 +134,7 @@ impl ReadOptions {
 impl std::fmt::Debug for ReadOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadOptions")
+            .field("filters", &self.partition_filters)
             .field("projection", &self.projection)
             .field(
                 "row_predicate",

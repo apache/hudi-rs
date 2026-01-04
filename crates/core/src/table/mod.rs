@@ -856,8 +856,7 @@ impl Table {
     /// are read from the underlying file slices.
     ///
     /// # Arguments
-    /// * `filters` - Partition filters to apply.
-    /// * `options` - Read options for configuring the read operation.
+    /// * `options` - Read options including partition filters, batch size, etc.
     ///
     /// # Returns
     /// A stream of record batches from all file slices.
@@ -867,31 +866,31 @@ impl Table {
     /// use futures::StreamExt;
     /// use hudi::table::ReadOptions;
     ///
-    /// let options = ReadOptions::new().with_batch_size(4096);
-    /// let mut stream = table.read_snapshot_stream(empty_filters(), &options).await?;
+    /// let options = ReadOptions::new()
+    ///     .with_filters([("city", "=", "san_francisco")])
+    ///     .with_batch_size(4096);
+    /// let mut stream = table.read_snapshot_stream(&options).await?;
     ///
     /// while let Some(result) = stream.next().await {
     ///     let batch = result?;
     ///     println!("Read {} rows", batch.num_rows());
     /// }
     /// ```
-    pub async fn read_snapshot_stream<I, S>(
+    pub async fn read_snapshot_stream(
         &self,
-        filters: I,
         options: &ReadOptions,
-    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>>
-    where
-        I: IntoIterator<Item = (S, S, S)>,
-        S: AsRef<str>,
-    {
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use futures::stream::{self, StreamExt};
 
         let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
-            // Return empty stream if no commits
             return Ok(Box::pin(stream::empty()));
         };
 
-        let filters = from_str_tuples(filters)?;
+        let filters: Vec<Filter> = options
+            .partition_filters
+            .iter()
+            .map(|(f, o, v)| Filter::try_from((f.as_str(), o.as_str(), v.as_str())))
+            .collect::<Result<Vec<_>>>()?;
         let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
 
         if file_slices.is_empty() {
@@ -903,11 +902,11 @@ impl Table {
             timestamp,
         )])?;
 
-        // Create a stream that iterates through file slices and yields batches
         let batch_size = options.batch_size;
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();
             let options = ReadOptions {
+                partition_filters: vec![],
                 projection: None,
                 row_predicate: None,
                 batch_size,
@@ -918,14 +917,12 @@ impl Table {
             }
         });
 
-        // Chain all the streams together
         let combined_stream = stream::iter(streams_iter)
             .then(|fut| fut)
             .filter_map(|result| async move {
                 match result {
                     Ok(stream) => Some(stream),
                     Err(e) => {
-                        // Log error and skip this file slice
                         log::warn!("Failed to read file slice: {:?}", e);
                         None
                     }
