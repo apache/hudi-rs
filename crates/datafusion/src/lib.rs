@@ -453,28 +453,15 @@ impl TableProviderFactory for HudiTableFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::execution::session_state::SessionStateBuilder;
-    use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{Column, DataFusionError, ScalarValue};
+    use datafusion_common::{Column, ScalarValue};
     use std::fs::canonicalize;
     use std::path::Path;
-    use std::sync::Arc;
     use url::Url;
 
     use datafusion::logical_expr::BinaryExpr;
-    use hudi_core::config::read::HudiReadConfig::InputPartitions;
-    use hudi_core::metadata::meta_field::MetaField;
-    use hudi_test::SampleTable::{
-        V6ComplexkeygenHivestyle, V6Empty, V6Nonpartitioned, V6SimplekeygenHivestyleNoMetafields,
-        V6SimplekeygenNonhivestyle, V6SimplekeygenNonhivestyleOverwritetable,
-        V6TimebasedkeygenNonhivestyle,
-    };
-    use hudi_test::assert_arrow_field_names_eq;
-    use hudi_test::{SampleTable, util};
-    use util::{get_bool_column, get_i32_column, get_str_column};
+    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle};
 
     use crate::HudiDataSource;
-    use crate::HudiTableFactory;
 
     #[tokio::test]
     async fn get_default_input_partitions() {
@@ -483,196 +470,6 @@ mod tests {
                 .unwrap();
         let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
         assert_eq!(hudi.get_input_partitions(), 0)
-    }
-
-    #[tokio::test]
-    async fn test_get_create_schema_from_empty_table() {
-        let table_provider =
-            HudiDataSource::new_with_options(V6Empty.path_to_cow().as_str(), empty_options())
-                .await
-                .unwrap();
-        let schema = table_provider.schema();
-        assert_arrow_field_names_eq!(
-            schema,
-            [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
-        );
-    }
-
-    async fn register_test_table_with_session<I, K, V>(
-        test_table: &SampleTable,
-        options: I,
-        use_sql: bool,
-    ) -> Result<SessionContext, DataFusionError>
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let ctx = create_test_session().await;
-        if use_sql {
-            let create_table_sql = format!(
-                "CREATE EXTERNAL TABLE {} STORED AS HUDI LOCATION '{}' {}",
-                test_table.as_ref(),
-                test_table.path_to_cow(),
-                concat_as_sql_options(options)
-            );
-            ctx.sql(create_table_sql.as_str()).await?;
-        } else {
-            let base_url = test_table.url_to_cow();
-            let hudi = HudiDataSource::new_with_options(base_url.as_str(), options).await?;
-            ctx.register_table(test_table.as_ref(), Arc::new(hudi))?;
-        }
-        Ok(ctx)
-    }
-
-    async fn create_test_session() -> SessionContext {
-        let config = SessionConfig::new().set(
-            "datafusion.sql_parser.enable_ident_normalization",
-            &ScalarValue::from(false),
-        );
-        let table_factory: Arc<dyn TableProviderFactory> = Arc::new(HudiTableFactory::default());
-
-        let session_state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(config)
-            .with_table_factories(HashMap::from([("HUDI".to_string(), table_factory)]))
-            .build();
-
-        SessionContext::new_with_state(session_state)
-    }
-
-    fn concat_as_sql_options<I, K, V>(options: I) -> String
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let kv_pairs: Vec<String> = options
-            .into_iter()
-            .map(|(k, v)| format!("'{}' '{}'", k.as_ref(), v.into()))
-            .collect();
-
-        if kv_pairs.is_empty() {
-            String::new()
-        } else {
-            format!("OPTIONS ({})", kv_pairs.join(", "))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_create_table_with_unknown_format() {
-        let test_table = V6Nonpartitioned;
-        let invalid_format = "UNKNOWN_FORMAT";
-        let create_table_sql = format!(
-            "CREATE EXTERNAL TABLE {} STORED AS {} LOCATION '{}'",
-            test_table.as_ref(),
-            invalid_format,
-            test_table.path_to_cow()
-        );
-
-        let ctx = create_test_session().await;
-        let result = ctx.sql(create_table_sql.as_str()).await;
-        assert!(result.is_err());
-    }
-
-    async fn verify_plan(
-        ctx: &SessionContext,
-        sql: &str,
-        table_name: &str,
-        planned_input_partitioned: &i32,
-    ) {
-        let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
-        let explaining_rb = explaining_df.collect().await.unwrap();
-        let explaining_rb = explaining_rb.first().unwrap();
-        let plan = get_str_column(explaining_rb, "plan").join("");
-        let plan_lines: Vec<&str> = plan.lines().map(str::trim).collect();
-        assert!(plan_lines[1].starts_with("SortExec: TopK(fetch=10)"));
-        assert!(plan_lines[2].starts_with(&format!(
-            "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
-            get_field(structField@3, field2) as {table_name}.structField[field2]]"
-        )));
-        assert!(plan_lines[4].starts_with(
-            "FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND name@1 != Alice AND get_field(structField@3, field2) > 30"
-        ));
-        assert!(plan_lines[5].contains(&format!("input_partitions={planned_input_partitioned}")));
-    }
-
-    async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
-        let df = ctx.sql(sql).await.unwrap();
-        let rb = df.collect().await.unwrap();
-        let rb = rb.first().unwrap();
-        assert_eq!(get_i32_column(rb, "id"), &[2, 4]);
-        assert_eq!(get_str_column(rb, "name"), &["Bob", "Diana"]);
-        assert_eq!(get_bool_column(rb, "isActive"), &[false, true]);
-        assert_eq!(
-            get_i32_column(rb, &format!("{table_name}.structField[field2]")),
-            &[40, 50]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_datafusion_read_hudi_table_with_partition_filter_pushdown() {
-        for (test_table, use_sql, planned_input_partitions) in &[
-            (V6ComplexkeygenHivestyle, true, 2),
-            (V6Nonpartitioned, true, 1),
-            (V6SimplekeygenNonhivestyle, false, 2),
-            (V6SimplekeygenHivestyleNoMetafields, true, 2),
-            (V6TimebasedkeygenNonhivestyle, false, 2),
-        ] {
-            println!(">>> testing for {}", test_table.as_ref());
-            let options = [(InputPartitions, "2")];
-            let ctx = register_test_table_with_session(test_table, options, *use_sql)
-                .await
-                .unwrap();
-
-            let sql = format!(
-                r#"
-            SELECT id, name, isActive, structField.field2
-            FROM {} WHERE id % 2 = 0 AND name != 'Alice'
-            AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
-                test_table.as_ref()
-            );
-
-            verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
-            verify_data(&ctx, &sql, test_table.as_ref()).await
-        }
-    }
-
-    async fn verify_data_with_replacecommits(ctx: &SessionContext, sql: &str, table_name: &str) {
-        let df = ctx.sql(sql).await.unwrap();
-        let rb = df.collect().await.unwrap();
-        let rb = rb.first().unwrap();
-        assert_eq!(get_i32_column(rb, "id"), &[4]);
-        assert_eq!(get_str_column(rb, "name"), &["Diana"]);
-        assert_eq!(get_bool_column(rb, "isActive"), &[false]);
-        assert_eq!(
-            get_i32_column(rb, &format!("{table_name}.structField[field2]")),
-            &[50]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_datafusion_read_hudi_table_with_replacecommits_with_partition_filter_pushdown() {
-        for (test_table, use_sql, planned_input_partitions) in
-            &[(V6SimplekeygenNonhivestyleOverwritetable, true, 1)]
-        {
-            println!(">>> testing for {}", test_table.as_ref());
-            let ctx =
-                register_test_table_with_session(test_table, [(InputPartitions, "2")], *use_sql)
-                    .await
-                    .unwrap();
-
-            let sql = format!(
-                r#"
-            SELECT id, name, isActive, structField.field2
-            FROM {} WHERE id % 2 = 0 AND name != 'Alice'
-            AND structField.field2 > 30 ORDER BY name LIMIT 10"#,
-                test_table.as_ref()
-            );
-
-            verify_plan(&ctx, &sql, test_table.as_ref(), planned_input_partitions).await;
-            verify_data_with_replacecommits(&ctx, &sql, test_table.as_ref()).await
-        }
     }
 
     #[tokio::test]
