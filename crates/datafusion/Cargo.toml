@@ -53,5 +53,8 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 
+# logging
+log = { workspace = true }
+
 [dev-dependencies]
 hudi-test = { path = "../test" }

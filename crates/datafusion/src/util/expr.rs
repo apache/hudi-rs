@@ -19,7 +19,8 @@
 
 use datafusion::logical_expr::Operator;
 use datafusion_expr::{Between, BinaryExpr, Expr};
-use hudi_core::expr::filter::{col, Filter as HudiFilter};
+use hudi_core::expr::filter::{Filter as HudiFilter, col};
+use log::{debug, warn};
 
 /// Converts DataFusion expressions into Hudi filters.
 ///
@@ -105,25 +106,38 @@ fn not_expr_to_filter(not_expr: &Expr) -> Option<HudiFilter> {
 /// If `negated` is true, returns empty (NOT BETWEEN is complex to represent).
 fn between_to_filters(between: &Between) -> Vec<HudiFilter> {
     if between.negated {
-        // NOT BETWEEN would require OR semantics which we can't represent
+        debug!("NOT BETWEEN expressions cannot be pushed down");
         return vec![];
     }
 
     // Extract column name from the expression
     let column_name = match &*between.expr {
         Expr::Column(col) => col.name.clone(),
-        _ => return vec![],
+        _ => {
+            debug!("BETWEEN with non-column expression cannot be pushed down");
+            return vec![];
+        }
     };
 
     // Extract literal values from low and high bounds
     let low_str = match &*between.low {
         Expr::Literal(lit, _) => lit.to_string(),
-        _ => return vec![],
+        _ => {
+            warn!(
+                "BETWEEN low bound is not a literal for column '{column_name}', skipping pushdown"
+            );
+            return vec![];
+        }
     };
 
     let high_str = match &*between.high {
         Expr::Literal(lit, _) => lit.to_string(),
-        _ => return vec![],
+        _ => {
+            warn!(
+                "BETWEEN high bound is not a literal for column '{column_name}', skipping pushdown"
+            );
+            return vec![];
+        }
     };
 
     // Create two filters: >= low AND <= high

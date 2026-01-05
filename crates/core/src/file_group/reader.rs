@@ -405,7 +405,7 @@ impl FileGroupReader {
         // Add projection pushdown using column names (converted to indices internally
         // by get_parquet_file_stream using the same schema the projection is applied to)
         if let Some(ref projection_names) = options.projection {
-            parquet_options = parquet_options.with_projection_columns(projection_names.clone());
+            parquet_options = parquet_options.with_projection(projection_names.clone());
         }
 
         let hudi_configs = self.hudi_configs.clone();
