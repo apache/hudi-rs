@@ -911,17 +911,18 @@ impl Table {
         )])?;
 
         // Extract options to pass to each file slice read.
-        // Note: row_predicate is not yet supported in streaming base file reads.
         let batch_size = options.batch_size;
         let projection = options.projection.clone();
+        let row_predicate = options.row_predicate.clone();
 
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();
             let projection = projection.clone();
+            let row_predicate = row_predicate.clone();
             let options = ReadOptions {
                 partition_filters: vec![],
                 projection,
-                row_predicate: None, // Not yet implemented in streaming reads
+                row_predicate,
                 batch_size,
                 as_of_timestamp: None,
             };

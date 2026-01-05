@@ -54,8 +54,14 @@ pub mod util;
 pub struct ParquetReadOptions {
     /// Target batch size (number of rows per batch).
     pub batch_size: Option<usize>,
-    /// Column projection (indices of columns to read).
+    /// Column projection by indices (legacy, prefer projection_columns).
     pub projection: Option<Vec<usize>>,
+    /// Column projection by names (preferred - converted to indices internally).
+    ///
+    /// This is more reliable than `projection` because the name-to-index
+    /// conversion happens using the exact schema from the parquet reader,
+    /// avoiding potential mismatches from reading the schema separately.
+    pub projection_columns: Option<Vec<String>>,
 }
 
 impl ParquetReadOptions {
@@ -70,6 +76,20 @@ impl ParquetReadOptions {
 
     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
         self.projection = Some(projection);
+        self
+    }
+
+    /// Sets column projection by column names.
+    ///
+    /// This is the preferred way to specify projection as it converts names
+    /// to indices using the exact schema from the parquet file being read,
+    /// ensuring consistency and avoiding potential schema mismatches.
+    pub fn with_projection_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.projection_columns = Some(columns.into_iter().map(|s| s.into()).collect());
         self
     }
 }
@@ -280,6 +300,17 @@ impl Storage {
     /// # Arguments
     /// * `relative_path` - The relative path to the Parquet file.
     /// * `options` - Options for reading the Parquet file (batch size, projection).
+    ///
+    /// # Projection Options
+    ///
+    /// Two projection modes are supported:
+    /// - `projection_columns` (preferred): Column names, converted to indices using the
+    ///   builder's schema. This ensures consistency since the same schema is used for
+    ///   both name lookup and projection mask creation.
+    /// - `projection` (legacy): Column indices. Use with caution as the caller must
+    ///   ensure indices match the parquet file's schema.
+    ///
+    /// If both are set, `projection_columns` takes precedence.
     pub async fn get_parquet_file_stream(
         &self,
         relative_path: &str,
@@ -297,7 +328,29 @@ impl Storage {
             builder = builder.with_batch_size(batch_size);
         }
 
-        if let Some(projection) = options.projection {
+        // Handle projection: prefer column names over indices for reliability
+        if let Some(ref column_names) = options.projection_columns {
+            // Convert column names to indices using builder's schema
+            let arrow_schema = builder.schema();
+            let projection: Vec<usize> = column_names
+                .iter()
+                .map(|name| {
+                    arrow_schema.index_of(name).map_err(|_| {
+                        StorageError::InvalidPath(format!(
+                            "Column '{}' not found in parquet file schema",
+                            name
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let projection_mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                projection.iter().copied(),
+            );
+            builder = builder.with_projection(projection_mask);
+        } else if let Some(projection) = options.projection {
+            // Legacy path: use indices directly (caller is responsible for correctness)
             let projection_mask = parquet::arrow::ProjectionMask::roots(
                 builder.parquet_schema(),
                 projection.iter().copied(),

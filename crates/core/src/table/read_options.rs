@@ -18,10 +18,14 @@
  */
 //! Read options for streaming reads.
 
+use std::sync::Arc;
+
 use arrow_array::{BooleanArray, RecordBatch};
 
 /// A row-level predicate function for filtering records.
-pub type RowPredicate = Box<dyn Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync>;
+///
+/// Uses `Arc` instead of `Box` to allow cloning for async streaming contexts.
+pub type RowPredicate = Arc<dyn Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync>;
 
 /// A partition filter tuple: (field_name, operator, value).
 /// Example: ("city", "=", "san_francisco")
@@ -36,15 +40,14 @@ pub type PartitionFilter = (String, String, String);
 /// - Batch size control (rows per batch)
 /// - Time travel (as-of timestamp)
 ///
-/// # Current Limitations
+/// # Streaming Support
 ///
-/// Not all options are fully supported in streaming APIs:
-/// - `batch_size` and `partition_filters` are fully supported.
-/// - `projection` is passed through to the streaming implementation but is not yet
-///   applied at the parquet read level. This is because projection requires mapping
-///   column names to column indices via schema lookup, which is not yet implemented.
-/// - `row_predicate` is not yet implemented in streaming reads. The predicate function
-///   is accepted but will be ignored.
+/// All options are supported in streaming APIs:
+/// - `batch_size` controls the number of rows per batch
+/// - `partition_filters` prunes partitions before reading
+/// - `projection` pushes column selection to the parquet reader level
+/// - `row_predicate` filters rows after reading each batch
+/// - `as_of_timestamp` enables time travel queries
 ///
 /// # Example
 ///
@@ -53,6 +56,7 @@ pub type PartitionFilter = (String, String, String);
 ///
 /// let options = ReadOptions::new()
 ///     .with_filters([("city", "=", "san_francisco")])
+///     .with_projection(["id", "name", "city"])
 ///     .with_batch_size(4096);
 /// ```
 #[derive(Default)]
@@ -112,8 +116,8 @@ impl ReadOptions {
 
     /// Sets the row-level predicate for filtering records.
     ///
-    /// **Note:** Row predicates are not yet implemented in streaming reads.
-    /// The predicate will be accepted but ignored during streaming operations.
+    /// The predicate function receives each `RecordBatch` and returns a `BooleanArray`
+    /// mask indicating which rows to keep. Rows where the mask is `true` are retained.
     ///
     /// # Arguments
     /// * `predicate` - A function that takes a RecordBatch and returns a BooleanArray mask
@@ -121,7 +125,7 @@ impl ReadOptions {
     where
         F: Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync + 'static,
     {
-        self.row_predicate = Some(Box::new(predicate));
+        self.row_predicate = Some(Arc::new(predicate));
         self
     }
 

@@ -23,7 +23,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::thread;
 
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -79,9 +78,31 @@ use hudi_core::table::Table as HudiTable;
 ///     Ok(())
 /// }
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
+    /// Cached table schema fetched at construction time.
+    cached_schema: SchemaRef,
+    /// Cached partition schema for determining partition columns.
+    cached_partition_schema: Schema,
+}
+
+impl std::fmt::Debug for HudiDataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HudiDataSource")
+            .field("table", &self.table)
+            .field("cached_schema", &self.cached_schema)
+            .field(
+                "cached_partition_schema",
+                &self
+                    .cached_partition_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl HudiDataSource {
@@ -95,10 +116,27 @@ impl HudiDataSource {
         K: AsRef<str>,
         V: Into<String>,
     {
-        match HudiTable::new_with_options(base_uri, options).await {
-            Ok(t) => Ok(Self { table: Arc::new(t) }),
-            Err(e) => Err(Execution(format!("Failed to create Hudi table: {e}"))),
-        }
+        let table = HudiTable::new_with_options(base_uri, options)
+            .await
+            .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
+
+        // Cache schema at construction to avoid async workarounds later
+        let cached_schema = table
+            .get_schema()
+            .await
+            .map(|s| Arc::new(s) as SchemaRef)
+            .unwrap_or_else(|_| Arc::new(Schema::empty()));
+
+        let cached_partition_schema = table
+            .get_partition_schema()
+            .await
+            .unwrap_or_else(|_| Schema::empty());
+
+        Ok(Self {
+            table: Arc::new(table),
+            cached_schema,
+            cached_partition_schema,
+        })
     }
 
     fn get_input_partitions(&self) -> usize {
@@ -110,20 +148,44 @@ impl HudiDataSource {
 
     /// Check if the given expression can be pushed down to the Hudi table.
     ///
-    /// The expression can be pushed down if it is a binary expression with a supported operator and operands.
+    /// The expression can be pushed down if it is:
+    /// - A binary expression with a supported operator and operands
+    /// - A NOT expression wrapping a pushable expression
+    /// - An AND compound expression where at least one side can be pushed down
+    /// - A BETWEEN expression with column and literals
     fn can_push_down(&self, expr: &Expr) -> bool {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
                 let left = &binary_expr.left;
                 let op = &binary_expr.op;
                 let right = &binary_expr.right;
-                self.is_supported_operator(op)
-                    && self.is_supported_operand(left)
-                    && self.is_supported_operand(right)
+
+                match op {
+                    Operator::And => {
+                        // AND is pushable if at least one side is pushable
+                        self.can_push_down(left) || self.can_push_down(right)
+                    }
+                    Operator::Or => {
+                        // OR cannot be pushed down with current filter model
+                        false
+                    }
+                    _ => {
+                        self.is_supported_operator(op)
+                            && self.is_supported_operand(left)
+                            && self.is_supported_operand(right)
+                    }
+                }
             }
             Expr::Not(inner_expr) => {
                 // Recursively check if the inner expression can be pushed down
                 self.can_push_down(inner_expr)
+            }
+            Expr::Between(between) => {
+                // BETWEEN can be pushed if expr is a column and bounds are literals
+                !between.negated
+                    && matches!(&*between.expr, Expr::Column(_))
+                    && matches!(&*between.low, Expr::Literal(..))
+                    && matches!(&*between.high, Expr::Literal(..))
             }
             _ => false,
         }
@@ -148,6 +210,43 @@ impl HudiDataSource {
             _ => false,
         }
     }
+
+    /// Returns partition column names from cached partition schema.
+    fn get_partition_columns(&self) -> Vec<String> {
+        self.cached_partition_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    /// Checks if expression filters on a partition column.
+    ///
+    /// Partition column filters can be marked as `Exact` because they are
+    /// fully handled by partition pruning and don't need post-filtering.
+    fn is_partition_column_filter(expr: &Expr, partition_cols: &[String]) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary_expr) => {
+                match binary_expr.op {
+                    Operator::And => {
+                        // For AND, check if both sides are partition filters
+                        Self::is_partition_column_filter(&binary_expr.left, partition_cols)
+                            && Self::is_partition_column_filter(&binary_expr.right, partition_cols)
+                    }
+                    _ => {
+                        // Check if either side is a Column that matches a partition column
+                        matches!(&*binary_expr.left, Expr::Column(col) if partition_cols.contains(&col.name))
+                            || matches!(&*binary_expr.right, Expr::Column(col) if partition_cols.contains(&col.name))
+                    }
+                }
+            }
+            Expr::Not(inner) => Self::is_partition_column_filter(inner, partition_cols),
+            Expr::Between(between) => {
+                matches!(&*between.expr, Expr::Column(col) if partition_cols.contains(&col.name))
+            }
+            _ => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -157,13 +256,7 @@ impl TableProvider for HudiDataSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        let table = self.table.clone();
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { table.get_schema().await })
-        });
-        let result = handle.join().unwrap().unwrap_or_else(|_| Schema::empty());
-        SchemaRef::from(result)
+        self.cached_schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -241,13 +334,20 @@ impl TableProvider for HudiDataSource {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
+        let partition_cols = self.get_partition_columns();
+
         filters
             .iter()
             .map(|expr| {
-                if self.can_push_down(expr) {
-                    Ok(TableProviderFilterPushDown::Inexact)
+                if !self.can_push_down(expr) {
+                    return Ok(TableProviderFilterPushDown::Unsupported);
+                }
+
+                // Partition column filters are fully handled by partition pruning
+                if Self::is_partition_column_filter(expr, &partition_cols) {
+                    Ok(TableProviderFilterPushDown::Exact)
                 } else {
-                    Ok(TableProviderFilterPushDown::Unsupported)
+                    Ok(TableProviderFilterPushDown::Inexact)
                 }
             })
             .collect()
@@ -612,11 +712,121 @@ mod tests {
         let result = table_provider.supports_filters_pushdown(&filters).unwrap();
 
         assert_eq!(result.len(), 6);
+        // Non-partitioned table - all filters are Inexact (no partition columns)
         assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[3], TableProviderFilterPushDown::Inexact);
         assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
         assert_eq!(result[5], TableProviderFilterPushDown::Inexact);
+    }
+
+    #[tokio::test]
+    async fn test_supports_filters_pushdown_exact_for_partition_columns() {
+        // Use a partitioned table - byteField is the partition column
+        let table_provider = HudiDataSource::new_with_options(
+            V6SimplekeygenNonhivestyle.path_to_cow().as_str(),
+            empty_options(),
+        )
+        .await
+        .unwrap();
+
+        // Filter on partition column (byteField) - should be Exact
+        let partition_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("byteField".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Int8(Some(1)), None)),
+        });
+
+        // Filter on non-partition column (name) - should be Inexact
+        let non_partition_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Alice".to_string())),
+                None,
+            )),
+        });
+
+        let filters = vec![&partition_filter, &non_partition_filter];
+        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
+
+        assert_eq!(result.len(), 2);
+        // Partition column filter is Exact
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+        // Non-partition column filter is Inexact
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
+    }
+
+    #[tokio::test]
+    async fn test_supports_filters_pushdown_and_between() {
+        let table_provider = HudiDataSource::new_with_options(
+            V6Nonpartitioned.path_to_cow().as_str(),
+            empty_options(),
+        )
+        .await
+        .unwrap();
+
+        // AND expression: name = 'Alice' AND intField > 100
+        let left = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Alice".to_string())),
+                None,
+            )),
+        });
+        let right = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(100)), None)),
+        });
+        let and_expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::And,
+            right: Box::new(right),
+        });
+
+        // BETWEEN expression: intField BETWEEN 10 AND 100
+        let between_expr = Expr::Between(datafusion_expr::Between::new(
+            Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+            false,
+            Box::new(Expr::Literal(ScalarValue::Int32(Some(10)), None)),
+            Box::new(Expr::Literal(ScalarValue::Int32(Some(100)), None)),
+        ));
+
+        // OR expression - should be unsupported
+        let or_left = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Alice".to_string())),
+                None,
+            )),
+        });
+        let or_right = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("Bob".to_string())),
+                None,
+            )),
+        });
+        let or_expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(or_left),
+            op: Operator::Or,
+            right: Box::new(or_right),
+        });
+
+        let filters = vec![&and_expr, &between_expr, &or_expr];
+        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
+
+        assert_eq!(result.len(), 3);
+        // AND expression is supported
+        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
+        // BETWEEN expression is supported
+        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
+        // OR expression is not supported
+        assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
     }
 }

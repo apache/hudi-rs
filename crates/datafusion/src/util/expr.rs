@@ -18,32 +18,51 @@
  */
 
 use datafusion::logical_expr::Operator;
-use datafusion_expr::{BinaryExpr, Expr};
-use hudi_core::expr::filter::{Filter as HudiFilter, col};
+use datafusion_expr::{Between, BinaryExpr, Expr};
+use hudi_core::expr::filter::{col, Filter as HudiFilter};
 
 /// Converts DataFusion expressions into Hudi filters.
 ///
 /// Takes a slice of DataFusion [`Expr`] and attempts to convert each expression
-/// into a [`HudiFilter`]. Only binary expressions and NOT expressions are currently supported.
+/// into Hudi filters. Supports:
+/// - Binary expressions (=, !=, <, >, <=, >=)
+/// - NOT expressions (negates inner binary expression)
+/// - AND compound expressions (recursively flattens both sides)
+/// - BETWEEN expressions (converts to two filters: >= low AND <= high)
 ///
 /// # Arguments
 /// * `exprs` - A slice of DataFusion expressions to convert
 ///
 /// # Returns
-/// Returns `Some(Vec<HudiFilter>)` if at least one filter is successfully converted,
-/// otherwise returns `None`.
-///
-/// TODO: Handle other DataFusion [`Expr`]
+/// A vector of filter tuples (field_name, operator, value).
 pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<(String, String, String)> {
     exprs
         .iter()
-        .filter_map(|expr| match expr {
-            Expr::BinaryExpr(binary_expr) => binary_expr_to_filter(binary_expr),
-            Expr::Not(not_expr) => not_expr_to_filter(not_expr),
-            _ => None,
-        })
+        .flat_map(expr_to_filters)
         .map(|filter| filter.into())
         .collect()
+}
+
+/// Recursively converts a single expression into zero or more Hudi filters.
+fn expr_to_filters(expr: &Expr) -> Vec<HudiFilter> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+            Operator::And => {
+                // Recursively flatten AND expressions
+                let mut filters = expr_to_filters(&binary_expr.left);
+                filters.extend(expr_to_filters(&binary_expr.right));
+                filters
+            }
+            Operator::Or => {
+                // Cannot represent OR in current filter model - skip
+                vec![]
+            }
+            _ => binary_expr_to_filter(binary_expr).into_iter().collect(),
+        },
+        Expr::Not(not_expr) => not_expr_to_filter(not_expr).into_iter().collect(),
+        Expr::Between(between) => between_to_filters(between),
+        _ => vec![],
+    }
 }
 
 /// Converts a binary expression [`Expr::BinaryExpr`] into a [`HudiFilter`].
@@ -79,6 +98,39 @@ fn not_expr_to_filter(not_expr: &Expr) -> Option<HudiFilter> {
         }
         _ => None,
     }
+}
+
+/// Converts a BETWEEN expression into two filters: >= low AND <= high.
+///
+/// If `negated` is true, returns empty (NOT BETWEEN is complex to represent).
+fn between_to_filters(between: &Between) -> Vec<HudiFilter> {
+    if between.negated {
+        // NOT BETWEEN would require OR semantics which we can't represent
+        return vec![];
+    }
+
+    // Extract column name from the expression
+    let column_name = match &*between.expr {
+        Expr::Column(col) => col.name.clone(),
+        _ => return vec![],
+    };
+
+    // Extract literal values from low and high bounds
+    let low_str = match &*between.low {
+        Expr::Literal(lit, _) => lit.to_string(),
+        _ => return vec![],
+    };
+
+    let high_str = match &*between.high {
+        Expr::Literal(lit, _) => lit.to_string(),
+        _ => return vec![],
+    };
+
+    // Create two filters: >= low AND <= high
+    vec![
+        col(&column_name).gte(low_str),
+        col(&column_name).lte(high_str),
+    ]
 }
 
 #[cfg(test)]
@@ -256,14 +308,103 @@ mod tests {
 
     #[test]
     fn test_convert_expr_with_unsupported_operator() {
+        // Modulo operator is not supported
         let expr = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("col")),
-            Operator::And,
-            Box::new(lit("value")),
+            Operator::Modulo,
+            Box::new(lit(2i32)),
         ));
 
         let filters = vec![expr];
         let result = exprs_to_filters(&filters);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_convert_and_compound_expr() {
+        // Test: col1 = 'a' AND col2 = 'b' should produce two filters
+        let left = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("col1")),
+            Operator::Eq,
+            Box::new(lit("a")),
+        ));
+        let right = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("col2")),
+            Operator::Eq,
+            Box::new(lit("b")),
+        ));
+        let and_expr = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::And,
+            Box::new(right),
+        ));
+
+        let result = exprs_to_filters(&[and_expr]);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "col1");
+        assert_eq!(result[0].1, "=");
+        assert_eq!(result[0].2, "a");
+        assert_eq!(result[1].0, "col2");
+        assert_eq!(result[1].1, "=");
+        assert_eq!(result[1].2, "b");
+    }
+
+    #[test]
+    fn test_convert_or_expr_returns_empty() {
+        // OR expressions cannot be pushed down
+        let left = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("col1")),
+            Operator::Eq,
+            Box::new(lit("a")),
+        ));
+        let right = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("col2")),
+            Operator::Eq,
+            Box::new(lit("b")),
+        ));
+        let or_expr = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::Or,
+            Box::new(right),
+        ));
+
+        let result = exprs_to_filters(&[or_expr]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_convert_between_expr() {
+        // Test: col BETWEEN 10 AND 20 should produce >= 10 AND <= 20
+        let between = Expr::Between(Between::new(
+            Box::new(col("count")),
+            false,
+            Box::new(lit(10i32)),
+            Box::new(lit(20i32)),
+        ));
+
+        let result = exprs_to_filters(&[between]);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "count");
+        assert_eq!(result[0].1, ">=");
+        assert_eq!(result[0].2, "10");
+        assert_eq!(result[1].0, "count");
+        assert_eq!(result[1].1, "<=");
+        assert_eq!(result[1].2, "20");
+    }
+
+    #[test]
+    fn test_convert_not_between_returns_empty() {
+        // NOT BETWEEN cannot be represented in current filter model
+        let not_between = Expr::Between(Between::new(
+            Box::new(col("count")),
+            true, // negated
+            Box::new(lit(10i32)),
+            Box::new(lit(20i32)),
+        ));
+
+        let result = exprs_to_filters(&[not_between]);
         assert!(result.is_empty());
     }
 
