@@ -373,10 +373,10 @@ impl FileGroupReader {
 
     /// Reads a base file as a stream of record batches.
     ///
-    /// # Limitations
-    ///
-    /// Currently only `batch_size` from [ReadOptions] is used. The `projection` and
-    /// `row_predicate` fields are not yet implemented.
+    /// Supports the following [ReadOptions]:
+    /// - `batch_size`: Controls the number of rows per batch
+    /// - `projection`: Pushes column selection to the parquet reader level
+    /// - `row_predicate`: Filters rows after reading each batch
     async fn read_base_file_stream(
         &self,
         relative_path: &str,
@@ -400,10 +400,17 @@ impl FileGroupReader {
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
-        let parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
+        let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
+
+        // Add projection pushdown using column names (converted to indices internally
+        // by get_parquet_file_stream using the same schema the projection is applied to)
+        if let Some(ref projection_names) = options.projection {
+            parquet_options = parquet_options.with_projection(projection_names.clone());
+        }
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
+        let row_predicate = options.row_predicate.clone();
 
         let parquet_stream = self
             .storage
@@ -411,19 +418,36 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
-        // Apply the same filtering logic as read_file_slice_by_base_file_path
+        // Apply filtering: commit time filter first, then row predicate
         let stream = parquet_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
+            let row_predicate = row_predicate.clone();
             async move {
                 match result {
                     Err(e) => Some(Err(ReadFileSliceError(format!(
                         "Failed to read batch: {e:?}"
                     )))),
-                    Ok(batch) => match apply_commit_time_filter(&hudi_configs, batch) {
-                        Err(e) => Some(Err(e)),
-                        Ok(filtered) if filtered.num_rows() > 0 => Some(Ok(filtered)),
-                        Ok(_) => None,
-                    },
+                    Ok(batch) => {
+                        // Apply commit time filter
+                        let filtered = match apply_commit_time_filter(&hudi_configs, batch) {
+                            Err(e) => return Some(Err(e)),
+                            Ok(b) if b.num_rows() == 0 => return None,
+                            Ok(b) => b,
+                        };
+
+                        // Apply row predicate if present
+                        let final_batch = if let Some(ref predicate) = row_predicate {
+                            match apply_row_predicate(predicate.as_ref(), filtered) {
+                                Err(e) => return Some(Err(e)),
+                                Ok(b) if b.num_rows() == 0 => return None,
+                                Ok(b) => b,
+                            }
+                        } else {
+                            filtered
+                        };
+
+                        Some(Ok(final_batch))
+                    }
                 }
             }
         });
@@ -593,6 +617,16 @@ fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> R
             .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}"))),
         None => Ok(batch),
     }
+}
+
+/// Apply a row predicate to filter records in a batch.
+fn apply_row_predicate(
+    predicate: &(dyn Fn(&RecordBatch) -> Result<BooleanArray> + Send + Sync),
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    let mask = predicate(&batch)?;
+    filter_record_batch(&batch, &mask)
+        .map_err(|e| ReadFileSliceError(format!("Failed to apply row predicate: {e:?}")))
 }
 
 #[cfg(test)]

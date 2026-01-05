@@ -762,6 +762,7 @@ mod v8_tables {
 /// These tests verify the streaming versions of snapshot and file slice reads.
 mod streaming_queries {
     use super::*;
+    use arrow::record_batch::RecordBatch;
     use futures::StreamExt;
     use hudi_core::table::ReadOptions;
 
@@ -977,6 +978,164 @@ mod streaming_queries {
             count += 1;
         }
         assert_eq!(count, 0, "Empty table should produce no batches");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_with_projection() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Only request id and name columns (not isActive)
+        let options = ReadOptions::new().with_projection(["id", "name"]);
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        assert!(!batches.is_empty(), "Should produce at least one batch");
+
+        // Verify only projected columns are returned
+        let schema = &batches[0].schema();
+        assert_eq!(schema.fields().len(), 2, "Should only have 2 columns");
+        assert!(
+            schema.field_with_name("id").is_ok(),
+            "Should have id column"
+        );
+        assert!(
+            schema.field_with_name("name").is_ok(),
+            "Should have name column"
+        );
+        assert!(
+            schema.field_with_name("isActive").is_err(),
+            "Should NOT have isActive column"
+        );
+
+        // Verify row count is still correct
+        let records = concat_batches(schema, &batches)?;
+        assert_eq!(records.num_rows(), 4, "Should have all 4 rows");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_with_row_predicate() -> Result<()> {
+        use arrow::array::BooleanArray;
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Filter rows where isActive = true (Carol and Diana)
+        let options = ReadOptions::new().with_row_predicate(|batch: &RecordBatch| {
+            let col = batch
+                .column_by_name("isActive")
+                .ok_or_else(|| hudi_core::error::CoreError::Schema("isActive not found".into()))?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| hudi_core::error::CoreError::Schema("Not boolean".into()))?;
+            Ok(arr.clone())
+        });
+
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        assert!(!batches.is_empty(), "Should produce at least one batch");
+
+        let schema = &batches[0].schema();
+        let records = concat_batches(schema, &batches)?;
+
+        // Should only have Carol and Diana (isActive = true)
+        let sample_data = SampleTable::sample_data_order_by_id(&records);
+        assert_eq!(sample_data, vec![(3, "Carol", true), (4, "Diana", true)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_with_projection_and_row_predicate() -> Result<()> {
+        use arrow::array::{BooleanArray, Int32Array};
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Project only id and isActive, filter where isActive = true
+        let options = ReadOptions::new()
+            .with_projection(["id", "isActive"])
+            .with_row_predicate(|batch: &RecordBatch| {
+                let col = batch.column_by_name("isActive").ok_or_else(|| {
+                    hudi_core::error::CoreError::Schema("isActive not found".into())
+                })?;
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| hudi_core::error::CoreError::Schema("Not boolean".into()))?;
+                Ok(arr.clone())
+            });
+
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result?);
+        }
+
+        assert!(!batches.is_empty(), "Should produce at least one batch");
+
+        // Verify only projected columns
+        let schema = &batches[0].schema();
+        assert_eq!(schema.fields().len(), 2, "Should only have 2 columns");
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("isActive").is_ok());
+        assert!(schema.field_with_name("name").is_err());
+
+        // Verify filtered rows (only active users: Carol=3, Diana=4)
+        let records = concat_batches(schema, &batches)?;
+        assert_eq!(records.num_rows(), 2, "Should have 2 rows");
+
+        let ids = records
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let id_values: Vec<i32> = ids.iter().flatten().collect();
+        assert!(id_values.contains(&3) && id_values.contains(&4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_projection_invalid_column() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Request a non-existent column
+        let options = ReadOptions::new().with_projection(["id", "nonexistent_column"]);
+        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+
+        // Error occurs when polling the stream (lazy evaluation)
+        let mut found_error = false;
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(_) => {}
+                Err(err) => {
+                    assert!(
+                        err.to_string().contains("nonexistent_column"),
+                        "Error should mention the invalid column name, got: {err}"
+                    );
+                    found_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_error,
+            "Should have encountered an error for non-existent column"
+        );
         Ok(())
     }
 }

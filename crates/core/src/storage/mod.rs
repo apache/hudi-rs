@@ -54,8 +54,8 @@ pub mod util;
 pub struct ParquetReadOptions {
     /// Target batch size (number of rows per batch).
     pub batch_size: Option<usize>,
-    /// Column projection (indices of columns to read).
-    pub projection: Option<Vec<usize>>,
+    /// Column projection by names.
+    pub projection: Option<Vec<String>>,
 }
 
 impl ParquetReadOptions {
@@ -68,8 +68,13 @@ impl ParquetReadOptions {
         self
     }
 
-    pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
-        self.projection = Some(projection);
+    /// Sets column projection by column names.
+    pub fn with_projection<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.projection = Some(columns.into_iter().map(|s| s.into()).collect());
         self
     }
 }
@@ -297,7 +302,26 @@ impl Storage {
             builder = builder.with_batch_size(batch_size);
         }
 
-        if let Some(projection) = options.projection {
+        // Handle projection: convert column names to indices using builder's schema
+        if let Some(ref column_names) = options.projection {
+            let arrow_schema = builder.schema();
+            let projection: Vec<usize> = column_names
+                .iter()
+                .map(|name| {
+                    arrow_schema.index_of(name).map_err(|_| {
+                        let available = arrow_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        StorageError::InvalidColumn(format!(
+                            "Column '{name}' not found in parquet file schema. Available columns: [{available}]"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
             let projection_mask = parquet::arrow::ProjectionMask::roots(
                 builder.parquet_schema(),
                 projection.iter().copied(),

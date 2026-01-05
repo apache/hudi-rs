@@ -31,6 +31,9 @@ pub enum StorageError {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    #[error("Invalid column: {0}")]
+    InvalidColumn(String),
+
     #[error(transparent)]
     ObjectStoreError(#[from] object_store::Error),
 
