@@ -309,8 +309,14 @@ impl Storage {
                 .iter()
                 .map(|name| {
                     arrow_schema.index_of(name).map_err(|_| {
+                        let available = arrow_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         StorageError::InvalidColumn(format!(
-                            "Column '{name}' not found in parquet file schema"
+                            "Column '{name}' not found in parquet file schema. Available columns: [{available}]"
                         ))
                     })
                 })

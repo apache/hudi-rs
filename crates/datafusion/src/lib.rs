@@ -100,7 +100,7 @@ impl std::fmt::Debug for HudiDataSource {
                     .partition_schema
                     .fields()
                     .iter()
-                    .map(|f| f.name())
+                    .map(|field| field.name())
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -232,9 +232,21 @@ impl HudiDataSource {
                             && Self::is_partition_column_filter(&binary_expr.right, partition_cols)
                     }
                     _ => {
-                        // Check if either side is a Column that matches a partition column
-                        matches!(&*binary_expr.left, Expr::Column(col) if partition_cols.contains(&col.name))
-                            || matches!(&*binary_expr.right, Expr::Column(col) if partition_cols.contains(&col.name))
+                        // For partition filters, one side must be a partition column
+                        // and the other side must be a literal value
+                        match (&*binary_expr.left, &*binary_expr.right) {
+                            (Expr::Column(col), Expr::Literal(..))
+                                if partition_cols.contains(&col.name) =>
+                            {
+                                true
+                            }
+                            (Expr::Literal(..), Expr::Column(col))
+                                if partition_cols.contains(&col.name) =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        }
                     }
                 }
             }
