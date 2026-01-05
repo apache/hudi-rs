@@ -55,10 +55,6 @@ pub struct ParquetReadOptions {
     /// Target batch size (number of rows per batch).
     pub batch_size: Option<usize>,
     /// Column projection by names.
-    ///
-    /// Column names are converted to indices internally using the exact schema
-    /// from the parquet reader, ensuring consistency and avoiding potential
-    /// schema mismatches.
     pub projection: Option<Vec<String>>,
 }
 
@@ -73,9 +69,6 @@ impl ParquetReadOptions {
     }
 
     /// Sets column projection by column names.
-    ///
-    /// Column names are converted to indices using the exact schema from the
-    /// parquet file being read, ensuring consistency.
     pub fn with_projection<I, S>(mut self, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,

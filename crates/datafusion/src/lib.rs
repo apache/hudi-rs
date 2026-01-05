@@ -22,7 +22,8 @@ pub(crate) mod util;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::thread;
 
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -80,41 +81,28 @@ use hudi_core::table::Table as HudiTable;
 /// }
 /// ```
 /// A DataFusion table provider for Apache Hudi tables.
-///
-/// # Schema Freshness
-///
-/// The schema is cached at construction and automatically refreshed when the
-/// underlying Hudi timeline advances. This ensures queries always use the
-/// correct schema even after schema evolution operations.
 #[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
-    /// Cached table schema, refreshed when timeline changes.
-    cached_schema: Arc<RwLock<SchemaRef>>,
     /// Cached partition schema for determining partition columns.
-    cached_partition_schema: Arc<RwLock<Schema>>,
-    /// Last known commit timestamp for cache invalidation.
-    last_known_instant: Arc<RwLock<Option<String>>>,
+    /// This is cached at construction since partition schema rarely changes
+    /// and is needed synchronously in `supports_filters_pushdown`.
+    partition_schema: Schema,
 }
 
 impl std::fmt::Debug for HudiDataSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let schema = self.cached_schema.read().unwrap();
-        let partition_schema = self.cached_partition_schema.read().unwrap();
-        let last_instant = self.last_known_instant.read().unwrap();
-
         f.debug_struct("HudiDataSource")
             .field("table", &self.table)
-            .field("cached_schema", &*schema)
             .field(
-                "cached_partition_schema",
-                &partition_schema
+                "partition_columns",
+                &self
+                    .partition_schema
                     .fields()
                     .iter()
                     .map(|f| f.name())
                     .collect::<Vec<_>>(),
             )
-            .field("last_known_instant", &*last_instant)
             .finish()
     }
 }
@@ -134,16 +122,8 @@ impl HudiDataSource {
             .await
             .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
 
-        // Cache schema at construction
-        let cached_schema = match table.get_schema().await {
-            Ok(s) => Arc::new(s) as SchemaRef,
-            Err(e) => {
-                warn!("Failed to get table schema, using empty schema: {e}");
-                Arc::new(Schema::empty())
-            }
-        };
-
-        let cached_partition_schema = match table.get_partition_schema().await {
+        // Cache partition schema at construction for use in supports_filters_pushdown
+        let partition_schema = match table.get_partition_schema().await {
             Ok(s) => s,
             Err(e) => {
                 warn!("Failed to get partition schema, using empty schema: {e}");
@@ -151,14 +131,9 @@ impl HudiDataSource {
             }
         };
 
-        // Record the current timeline instant for cache invalidation
-        let last_known_instant = table.get_timeline().get_latest_commit_timestamp().ok();
-
         Ok(Self {
             table: Arc::new(table),
-            cached_schema: Arc::new(RwLock::new(cached_schema)),
-            cached_partition_schema: Arc::new(RwLock::new(cached_partition_schema)),
-            last_known_instant: Arc::new(RwLock::new(last_known_instant)),
+            partition_schema,
         })
     }
 
@@ -167,46 +142,6 @@ impl HudiDataSource {
             .hudi_configs
             .get_or_default(InputPartitions)
             .into()
-    }
-
-    /// Refreshes cached schemas if the timeline has advanced.
-    ///
-    /// This method checks if new commits have been made to the table since the
-    /// schemas were last cached. If so, it refreshes the cached table schema
-    /// and partition schema to reflect any schema evolution.
-    ///
-    /// This is called automatically before each scan to ensure query correctness.
-    async fn ensure_schema_fresh(&self) -> Result<()> {
-        let current_instant = self.table.get_timeline().get_latest_commit_timestamp().ok();
-
-        // Check if refresh is needed
-        let needs_refresh = {
-            let last = self.last_known_instant.read().unwrap();
-            *last != current_instant
-        };
-
-        if needs_refresh {
-            // Refresh table schema
-            let new_schema = self
-                .table
-                .get_schema()
-                .await
-                .map(|s| Arc::new(s) as SchemaRef)
-                .map_err(|e| Execution(format!("Failed to refresh table schema: {e}")))?;
-
-            let new_partition_schema = self
-                .table
-                .get_partition_schema()
-                .await
-                .map_err(|e| Execution(format!("Failed to refresh partition schema: {e}")))?;
-
-            // Update cached values
-            *self.cached_schema.write().unwrap() = new_schema;
-            *self.cached_partition_schema.write().unwrap() = new_partition_schema;
-            *self.last_known_instant.write().unwrap() = current_instant;
-        }
-
-        Ok(())
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -274,11 +209,9 @@ impl HudiDataSource {
         }
     }
 
-    /// Returns partition column names from cached partition schema.
+    /// Returns partition column names from partition schema.
     fn get_partition_columns(&self) -> Vec<String> {
-        self.cached_partition_schema
-            .read()
-            .unwrap()
+        self.partition_schema
             .fields()
             .iter()
             .map(|f| f.name().clone())
@@ -321,7 +254,13 @@ impl TableProvider for HudiDataSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.cached_schema.read().unwrap().clone()
+        let table = self.table.clone();
+        let handle = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async { table.get_schema().await })
+        });
+        let result = handle.join().unwrap().unwrap_or_else(|_| Schema::empty());
+        SchemaRef::from(result)
     }
 
     fn table_type(&self) -> TableType {
@@ -335,9 +274,6 @@ impl TableProvider for HudiDataSource {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Ensure schema is fresh before scanning (handles schema evolution)
-        self.ensure_schema_fresh().await?;
-
         self.table.register_storage(state.runtime_env().clone());
 
         // Convert Datafusion `Expr` to `Filter`
