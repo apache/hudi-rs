@@ -26,7 +26,7 @@ use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
 use std::str::FromStr;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
     pub field_name: String,
     pub operator: ExprOperator,
