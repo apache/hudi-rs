@@ -26,6 +26,8 @@ pub mod records;
 
 use std::collections::HashMap;
 
+use arrow_schema::Schema;
+
 use crate::Result;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::{
@@ -36,6 +38,7 @@ use crate::expr::filter::from_str_tuples;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::storage::util::join_url_segments;
 use crate::table::Table;
+use crate::table::file_pruner::FilePruner;
 use crate::table::partition::PartitionPruner;
 
 use records::FilesPartitionRecord;
@@ -250,9 +253,19 @@ impl Table {
         let partition_pruner =
             PartitionPruner::new(&filters, &partition_schema, self.hudi_configs.as_ref())?;
 
+        // Use empty file pruner for metadata table - no column stats pruning needed
+        // Use empty schema since the pruner is empty and won't use the schema
+        let file_pruner = FilePruner::empty();
+        let table_schema = Schema::empty();
+
         let file_slices = self
             .file_system_view
-            .get_file_slices_by_storage_listing(&partition_pruner, &timeline_view)
+            .get_file_slices_by_storage_listing(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+            )
             .await?;
 
         if file_slices.len() != 1 {
