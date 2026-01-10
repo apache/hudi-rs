@@ -46,7 +46,7 @@ use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::read::HudiReadConfig::InputPartitions;
+use hudi_core::config::read::HudiReadConfig::{ColumnStatsPruningLevel, InputPartitions};
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::Table as HudiTable;
@@ -279,6 +279,18 @@ impl TableProvider for HudiDataSource {
         TableType::Base
     }
 
+    fn statistics(&self) -> Option<datafusion_common::Statistics> {
+        // Statistics are not available without footer caching.
+        // This will be implemented in Phase 4-5 when footer caching is added.
+        // For now, return None to indicate statistics are not available.
+        //
+        // When footer caching is implemented, this method will:
+        // 1. Read cached footers for all files
+        // 2. Aggregate column statistics (min/max/null_count)
+        // 3. Return DataFusion Statistics with Precision::Exact values
+        None
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -324,12 +336,29 @@ impl TableProvider for HudiDataSource {
             crypto: Default::default(),
         };
         let table_schema = self.schema();
+
+        // Read column stats pruning level configuration
+        let stats_level: String = self
+            .table
+            .hudi_configs
+            .get_or_default(ColumnStatsPruningLevel)
+            .into();
+
         let mut parquet_source = ParquetSource::new(parquet_opts);
+
+        // Enable page index for page-level pruning
+        if stats_level == "page" {
+            parquet_source = parquet_source.with_enable_page_index(true);
+        }
+
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            parquet_source = parquet_source.with_predicate(predicate)
+            parquet_source = parquet_source
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .with_reorder_filters(true);
         }
 
         let file_groups: Vec<FileGroup> = parquet_file_groups

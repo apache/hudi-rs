@@ -64,6 +64,21 @@ pub enum HudiReadConfig {
     /// Target number of rows per batch for streaming reads.
     /// This controls the batch size when using streaming APIs.
     StreamBatchSize,
+
+    /// Column statistics pruning granularity level.
+    /// Options: "file" (default), "row_group", "page"
+    /// - file: Aggregate stats from row groups, can skip entire files
+    /// - row_group: Per-row-group stats, can skip 64-128MB chunks
+    /// - page: Per-page stats (Parquet 1.11+), can skip ~1MB chunks
+    ColumnStatsPruningLevel,
+
+    /// Maximum number of Parquet footers to cache.
+    /// Default: 1000
+    FooterCacheSize,
+
+    /// TTL for cached footers in seconds.
+    /// Default: 300 (5 minutes)
+    FooterCacheTtlSeconds,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -75,6 +90,9 @@ impl AsRef<str> for HudiReadConfig {
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
+            Self::ColumnStatsPruningLevel => "hoodie.read.column_stats.pruning.level",
+            Self::FooterCacheSize => "hoodie.read.footer_cache.size",
+            Self::FooterCacheTtlSeconds => "hoodie.read.footer_cache.ttl_seconds",
         }
     }
 }
@@ -94,6 +112,11 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
+            HudiReadConfig::ColumnStatsPruningLevel => {
+                Some(HudiConfigValue::String("file".to_string()))
+            }
+            HudiReadConfig::FooterCacheSize => Some(HudiConfigValue::UInteger(1000usize)),
+            HudiReadConfig::FooterCacheTtlSeconds => Some(HudiConfigValue::UInteger(300usize)),
             _ => None,
         }
     }
@@ -127,6 +150,19 @@ impl ConfigParser for HudiReadConfig {
                 })
                 .map(HudiConfigValue::Boolean),
             Self::StreamBatchSize => get_result
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::UInteger),
+            Self::ColumnStatsPruningLevel => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
+            Self::FooterCacheSize => get_result
+                .and_then(|v| {
+                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                })
+                .map(HudiConfigValue::UInteger),
+            Self::FooterCacheTtlSeconds => get_result
                 .and_then(|v| {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
