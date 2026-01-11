@@ -89,6 +89,7 @@ percent-encoding = { workspace = true }
 [dev-dependencies]
 hudi-test = { path = "../test" }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
 
 [lints.clippy]
 result_large_err = "allow"

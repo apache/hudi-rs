@@ -64,6 +64,10 @@ pub enum HudiReadConfig {
     /// Target number of rows per batch for streaming reads.
     /// This controls the batch size when using streaming APIs.
     StreamBatchSize,
+
+    /// Column statistics pruning granularity level.
+    /// Options: "file" (default), "row_group", "page"
+    ColumnStatsPruningLevel,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -75,6 +79,7 @@ impl AsRef<str> for HudiReadConfig {
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
+            Self::ColumnStatsPruningLevel => "hoodie.read.column_stats.pruning.level",
         }
     }
 }
@@ -94,6 +99,9 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
+            HudiReadConfig::ColumnStatsPruningLevel => {
+                Some(HudiConfigValue::String("file".to_string()))
+            }
             _ => None,
         }
     }
@@ -131,6 +139,9 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::ColumnStatsPruningLevel => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
         }
     }
 }

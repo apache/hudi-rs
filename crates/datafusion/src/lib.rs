@@ -22,6 +22,7 @@ pub(crate) mod util;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
 
@@ -46,8 +47,9 @@ use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::read::HudiReadConfig::InputPartitions;
+use hudi_core::config::read::HudiReadConfig::{ColumnStatsPruningLevel, InputPartitions};
 use hudi_core::config::util::empty_options;
+use hudi_core::statistics::StatsGranularity;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::Table as HudiTable;
 
@@ -279,6 +281,12 @@ impl TableProvider for HudiDataSource {
         TableType::Base
     }
 
+    fn statistics(&self) -> Option<datafusion_common::Statistics> {
+        // Statistics are not available without footer caching.
+        // Footer caching is not yet implemented, so return None.
+        None
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -324,12 +332,46 @@ impl TableProvider for HudiDataSource {
             crypto: Default::default(),
         };
         let table_schema = self.schema();
+
+        // Read column stats pruning level configuration and parse to enum
+        let stats_level: String = self
+            .table
+            .hudi_configs
+            .get_or_default(ColumnStatsPruningLevel)
+            .into();
+        let stats_granularity = StatsGranularity::from_str(&stats_level).unwrap_or_else(|e| {
+            warn!(
+                "Invalid column stats pruning level '{stats_level}': {e}. Using default 'file' level."
+            );
+            StatsGranularity::File
+        });
+
         let mut parquet_source = ParquetSource::new(parquet_opts);
+
+        // Configure ParquetSource based on statistics granularity level:
+        // - File: Aggregated stats from row groups (default, no special flags needed)
+        // - RowGroup: Per-row-group stats from Parquet footer (no special flags needed)
+        // - Page: Per-page stats via ColumnIndex (requires page index enabled)
+        match stats_granularity {
+            StatsGranularity::Page => {
+                // Enable page index for page-level pruning (Parquet 1.11+)
+                // This allows skipping individual pages (~1MB chunks) based on column statistics
+                parquet_source = parquet_source.with_enable_page_index(true);
+            }
+            StatsGranularity::RowGroup | StatsGranularity::File => {
+                // Row group and file level pruning use default Parquet reader behavior
+                // Stats are read from footer's ColumnChunkMetaData
+            }
+        }
+
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
             let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            parquet_source = parquet_source.with_predicate(predicate)
+            parquet_source = parquet_source
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .with_reorder_filters(true);
         }
 
         let file_groups: Vec<FileGroup> = parquet_file_groups
