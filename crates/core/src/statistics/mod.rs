@@ -246,9 +246,16 @@ impl StatisticsContainer {
 
         // Extract stats for each column in the row group
         for col_chunk in row_group.columns() {
-            // Get column name from the column descriptor
+            // Get column name from the column descriptor.
+            // We use `.last()` to get the leaf column name for nested columns.
+            // NOTE: This means nested columns like "struct.field" will be matched by their
+            // leaf name "field" only. Full path matching for nested columns would require
+            // additional schema traversal logic.
             let col_path = col_chunk.column_descr().path();
-            let col_name = col_path.parts().last().map(|s| s.as_str()).unwrap_or("");
+            let Some(col_name) = col_path.parts().last().map(|s| s.as_str()) else {
+                // Skip columns without a valid name (shouldn't happen in practice)
+                continue;
+            };
 
             // Skip if we don't have type info for this column
             let Some(&data_type) = column_types.get(col_name) else {
@@ -272,7 +279,23 @@ impl StatisticsContainer {
         container
     }
 
-    /// Convert to DataFusion Statistics for query planning.
+    /// Converts this statistics container to DataFusion's `Statistics` struct for query planning.
+    ///
+    /// This method transforms the collected Hudi column statistics into the format expected
+    /// by DataFusion's query optimizer. The optimizer uses these statistics for:
+    /// - Cardinality estimation (predicting row counts after filters)
+    /// - Join ordering (choosing optimal join strategies)
+    /// - Predicate pushdown decisions
+    ///
+    /// # Arguments
+    /// * `schema` - The Arrow schema to use for mapping column statistics. Statistics are
+    ///   returned in schema field order.
+    ///
+    /// # Returns
+    /// A `datafusion_common::Statistics` struct with:
+    /// - `num_rows`: Total row count with `Precision::Exact` if known
+    /// - `column_statistics`: Per-column min/max/null_count with appropriate precision
+    /// - `total_byte_size`: Always `Precision::Absent` (not tracked)
     pub fn to_datafusion_statistics(&self, schema: &Schema) -> datafusion_common::Statistics {
         use datafusion_common::ColumnStatistics as DFColStats;
         use datafusion_common::Statistics;
@@ -338,28 +361,59 @@ fn parquet_stats_to_scalar(
                     (min, max)
                 }
                 DataType::Int16 => {
-                    let min = s.min_opt().map(|v| ScalarValue::Int16(Some(*v as i16)));
-                    let max = s.max_opt().map(|v| ScalarValue::Int16(Some(*v as i16)));
+                    // Use try_from to safely convert, returning None on overflow
+                    let min = s
+                        .min_opt()
+                        .and_then(|v| i16::try_from(*v).ok())
+                        .map(|v| ScalarValue::Int16(Some(v)));
+                    let max = s
+                        .max_opt()
+                        .and_then(|v| i16::try_from(*v).ok())
+                        .map(|v| ScalarValue::Int16(Some(v)));
                     (min, max)
                 }
                 DataType::Int8 => {
-                    let min = s.min_opt().map(|v| ScalarValue::Int8(Some(*v as i8)));
-                    let max = s.max_opt().map(|v| ScalarValue::Int8(Some(*v as i8)));
+                    let min = s
+                        .min_opt()
+                        .and_then(|v| i8::try_from(*v).ok())
+                        .map(|v| ScalarValue::Int8(Some(v)));
+                    let max = s
+                        .max_opt()
+                        .and_then(|v| i8::try_from(*v).ok())
+                        .map(|v| ScalarValue::Int8(Some(v)));
                     (min, max)
                 }
                 DataType::UInt32 => {
-                    let min = s.min_opt().map(|v| ScalarValue::UInt32(Some(*v as u32)));
-                    let max = s.max_opt().map(|v| ScalarValue::UInt32(Some(*v as u32)));
+                    let min = s
+                        .min_opt()
+                        .and_then(|v| u32::try_from(*v).ok())
+                        .map(|v| ScalarValue::UInt32(Some(v)));
+                    let max = s
+                        .max_opt()
+                        .and_then(|v| u32::try_from(*v).ok())
+                        .map(|v| ScalarValue::UInt32(Some(v)));
                     (min, max)
                 }
                 DataType::UInt16 => {
-                    let min = s.min_opt().map(|v| ScalarValue::UInt16(Some(*v as u16)));
-                    let max = s.max_opt().map(|v| ScalarValue::UInt16(Some(*v as u16)));
+                    let min = s
+                        .min_opt()
+                        .and_then(|v| u16::try_from(*v).ok())
+                        .map(|v| ScalarValue::UInt16(Some(v)));
+                    let max = s
+                        .max_opt()
+                        .and_then(|v| u16::try_from(*v).ok())
+                        .map(|v| ScalarValue::UInt16(Some(v)));
                     (min, max)
                 }
                 DataType::UInt8 => {
-                    let min = s.min_opt().map(|v| ScalarValue::UInt8(Some(*v as u8)));
-                    let max = s.max_opt().map(|v| ScalarValue::UInt8(Some(*v as u8)));
+                    let min = s
+                        .min_opt()
+                        .and_then(|v| u8::try_from(*v).ok())
+                        .map(|v| ScalarValue::UInt8(Some(v)));
+                    let max = s
+                        .max_opt()
+                        .and_then(|v| u8::try_from(*v).ok())
+                        .map(|v| ScalarValue::UInt8(Some(v)));
                     (min, max)
                 }
                 DataType::Date32 => {
@@ -382,8 +436,15 @@ fn parquet_stats_to_scalar(
                 (min, max)
             }
             DataType::UInt64 => {
-                let min = s.min_opt().map(|v| ScalarValue::UInt64(Some(*v as u64)));
-                let max = s.max_opt().map(|v| ScalarValue::UInt64(Some(*v as u64)));
+                // Safely convert i64 to u64, returning None for negative values
+                let min = s
+                    .min_opt()
+                    .and_then(|v| u64::try_from(*v).ok())
+                    .map(|v| ScalarValue::UInt64(Some(v)));
+                let max = s
+                    .max_opt()
+                    .and_then(|v| u64::try_from(*v).ok())
+                    .map(|v| ScalarValue::UInt64(Some(v)));
                 (min, max)
             }
             DataType::Date64 => {
