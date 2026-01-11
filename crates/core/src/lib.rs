@@ -53,7 +53,6 @@ pub mod merge;
 pub mod metadata;
 mod record;
 pub mod schema;
-#[cfg(feature = "datafusion")]
 pub mod statistics;
 pub mod storage;
 pub mod table;

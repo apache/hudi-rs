@@ -20,12 +20,19 @@
 //!
 //! This module provides abstractions for extracting, aggregating, and using
 //! column statistics from Parquet files for query pruning at different granularity levels.
+//!
+//! The core types (`StatScalar`, `ColumnStatistics`, `StatisticsContainer`) use only
+//! Parquet physical types, keeping hudi-core independent of query engine implementations.
+//! Conversions to query engine types (e.g., DataFusion) are feature-gated and use the
+//! Arrow DataType stored alongside statistics for proper logical type interpretation.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use arrow_schema::{DataType, Schema};
-use datafusion_common::ScalarValue;
+#[cfg(feature = "datafusion")]
+use arrow_schema::TimeUnit;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics as ParquetStatistics;
 
@@ -33,6 +40,8 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 ///
 /// Controls how fine-grained the statistics-based pruning is.
 /// Each level offers different trade-offs between memory overhead and pruning effectiveness.
+///
+/// String parsing is case-insensitive and accepts "row_group" or "rowgroup" for RowGroup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum StatsGranularity {
     /// File-level stats (aggregated from all row groups).
@@ -49,14 +58,14 @@ pub enum StatsGranularity {
     /// Row group level stats (directly from Parquet footer).
     ///
     /// Balanced granularity, moderate memory.
-    /// Can skip row groups within files (typically 64-128MB chunks).
+    /// Can skip row groups within files.
     /// Stats are read directly from Parquet footer's ColumnChunkMetaData.
     RowGroup,
 
     /// Page level stats (from ColumnIndex, requires Parquet 1.11+).
     ///
     /// Finest granularity, highest memory.
-    /// Can skip individual pages (typically ~1MB chunks).
+    /// Can skip individual pages.
     /// Most effective when data is sorted by filter columns.
     /// Requires Parquet files to be written with page index enabled.
     Page,
@@ -87,17 +96,117 @@ impl std::fmt::Display for StatsGranularity {
     }
 }
 
+/// A minimal scalar value representation matching Parquet physical types.
+///
+/// This enum provides a query-engine-agnostic way to store scalar values
+/// extracted from Parquet statistics. It uses Parquet's physical types rather
+/// than Arrow's logical types, minimizing maintenance burden while preserving
+/// correct comparison semantics.
+///
+/// Logical type interpretation (e.g., Int32 → Date32) is deferred to query
+/// engine conversion using the Arrow DataType stored in [`ColumnStatistics`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatScalar {
+    /// Null value
+    Null,
+    /// Boolean value (Parquet BOOLEAN)
+    Boolean(bool),
+    /// 32-bit signed integer (Parquet INT32)
+    /// Covers: Int8, Int16, Int32, UInt8, UInt16, Date32
+    Int32(i32),
+    /// 64-bit signed integer (Parquet INT64)
+    /// Covers: Int64, UInt32, UInt64, Date64, Timestamp, Time
+    Int64(i64),
+    /// 32-bit floating point (Parquet FLOAT)
+    Float32(f32),
+    /// 64-bit floating point (Parquet DOUBLE)
+    Float64(f64),
+    /// Binary data (Parquet BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY)
+    /// Covers: Utf8, LargeUtf8, Binary, LargeBinary, FixedSizeBinary
+    Binary(Vec<u8>),
+}
+
+impl PartialOrd for StatScalar {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        use StatScalar::*;
+        match (self, other) {
+            (Null, Null) => Some(Ordering::Equal),
+            (Null, _) => Some(Ordering::Less),
+            (_, Null) => Some(Ordering::Greater),
+            (Boolean(a), Boolean(b)) => a.partial_cmp(b),
+            (Int32(a), Int32(b)) => a.partial_cmp(b),
+            (Int64(a), Int64(b)) => a.partial_cmp(b),
+            (Float32(a), Float32(b)) => a.partial_cmp(b),
+            (Float64(a), Float64(b)) => a.partial_cmp(b),
+            (Binary(a), Binary(b)) => a.partial_cmp(b),
+            _ => None, // Different types are not comparable
+        }
+    }
+}
+
+/// Convert StatScalar to DataFusion ScalarValue using Arrow DataType for interpretation.
+#[cfg(feature = "datafusion")]
+pub fn to_scalar_value(scalar: &StatScalar, data_type: &DataType) -> datafusion_common::ScalarValue {
+    use datafusion_common::ScalarValue;
+
+    match (scalar, data_type) {
+        (StatScalar::Null, _) => ScalarValue::Null,
+        (StatScalar::Boolean(v), _) => ScalarValue::Boolean(Some(*v)),
+
+        // Int32 physical type → various logical types
+        (StatScalar::Int32(v), DataType::Int32) => ScalarValue::Int32(Some(*v)),
+        (StatScalar::Int32(v), DataType::Int16) => ScalarValue::Int16(Some(*v as i16)),
+        (StatScalar::Int32(v), DataType::Int8) => ScalarValue::Int8(Some(*v as i8)),
+        (StatScalar::Int32(v), DataType::UInt32) => ScalarValue::UInt32(Some(*v as u32)),
+        (StatScalar::Int32(v), DataType::UInt16) => ScalarValue::UInt16(Some(*v as u16)),
+        (StatScalar::Int32(v), DataType::UInt8) => ScalarValue::UInt8(Some(*v as u8)),
+        (StatScalar::Int32(v), DataType::Date32) => ScalarValue::Date32(Some(*v)),
+        (StatScalar::Int32(v), _) => ScalarValue::Int32(Some(*v)), // fallback
+
+        // Int64 physical type → various logical types
+        (StatScalar::Int64(v), DataType::Int64) => ScalarValue::Int64(Some(*v)),
+        (StatScalar::Int64(v), DataType::UInt64) => ScalarValue::UInt64(Some(*v as u64)),
+        (StatScalar::Int64(v), DataType::Date64) => ScalarValue::Date64(Some(*v)),
+        (StatScalar::Int64(v), DataType::Timestamp(TimeUnit::Second, tz)) => {
+            ScalarValue::TimestampSecond(Some(*v), tz.clone())
+        }
+        (StatScalar::Int64(v), DataType::Timestamp(TimeUnit::Millisecond, tz)) => {
+            ScalarValue::TimestampMillisecond(Some(*v), tz.clone())
+        }
+        (StatScalar::Int64(v), DataType::Timestamp(TimeUnit::Microsecond, tz)) => {
+            ScalarValue::TimestampMicrosecond(Some(*v), tz.clone())
+        }
+        (StatScalar::Int64(v), DataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
+            ScalarValue::TimestampNanosecond(Some(*v), tz.clone())
+        }
+        (StatScalar::Int64(v), _) => ScalarValue::Int64(Some(*v)), // fallback
+
+        // Float types
+        (StatScalar::Float32(v), _) => ScalarValue::Float32(Some(*v)),
+        (StatScalar::Float64(v), _) => ScalarValue::Float64(Some(*v)),
+
+        // Binary physical type → string or binary logical types
+        (StatScalar::Binary(v), DataType::Utf8 | DataType::LargeUtf8) => {
+            ScalarValue::Utf8(Some(String::from_utf8_lossy(v).into_owned()))
+        }
+        (StatScalar::Binary(v), DataType::FixedSizeBinary(size)) => {
+            ScalarValue::FixedSizeBinary(*size, Some(v.clone()))
+        }
+        (StatScalar::Binary(v), _) => ScalarValue::Binary(Some(v.clone())),
+    }
+}
+
 /// Statistics for a single column at a given granularity.
 #[derive(Clone, Debug)]
 pub struct ColumnStatistics {
     /// Column name
     pub column_name: String,
-    /// Arrow data type
+    /// Arrow data type (used for logical type interpretation during query engine conversion)
     pub data_type: DataType,
-    /// Minimum value (as ScalarValue for compatibility with DataFusion)
-    pub min_value: Option<ScalarValue>,
-    /// Maximum value (as ScalarValue for compatibility with DataFusion)
-    pub max_value: Option<ScalarValue>,
+    /// Minimum value (stored as Parquet physical type)
+    pub min_value: Option<StatScalar>,
+    /// Maximum value (stored as Parquet physical type)
+    pub max_value: Option<StatScalar>,
     /// Number of null values
     pub null_count: Option<i64>,
     /// Number of distinct values (if available)
@@ -119,13 +228,14 @@ impl ColumnStatistics {
 
     /// Create from Parquet row group statistics.
     ///
-    /// Converts Parquet's `Statistics` to `ScalarValue` based on the Arrow data type.
+    /// Extracts min/max as physical types; the Arrow data_type is stored for
+    /// later conversion to query engine types.
     pub fn from_parquet_statistics(
         column_name: &str,
         data_type: &DataType,
         stats: &ParquetStatistics,
     ) -> Self {
-        let (min_value, max_value) = parquet_stats_to_scalar(stats, data_type);
+        let (min_value, max_value) = parquet_stats_to_scalar(stats);
         let null_count = stats.null_count_opt().map(|n| n as i64);
 
         Self {
@@ -142,19 +252,23 @@ impl ColumnStatistics {
     ///
     /// Takes min of mins, max of maxs, sums null counts.
     /// Used when aggregating row group stats to file-level stats.
+    ///
+    /// Uses the stored Arrow DataType for correct comparison of unsigned integers,
+    /// which are stored as signed values in Parquet but need unsigned comparison semantics.
     pub fn merge(&mut self, other: &ColumnStatistics) {
         // Merge min values (take the smaller one)
-        self.min_value = match (&self.min_value, &other.min_value) {
-            (Some(a), Some(b)) => scalar_min(a, b),
-            (Some(a), None) => Some(a.clone()),
+        // Use take() to avoid cloning self's value when other is None
+        self.min_value = match (self.min_value.take(), &other.min_value) {
+            (Some(a), Some(b)) => scalar_min(a, b.clone(), &self.data_type),
+            (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b.clone()),
             (None, None) => None,
         };
 
         // Merge max values (take the larger one)
-        self.max_value = match (&self.max_value, &other.max_value) {
-            (Some(a), Some(b)) => scalar_max(a, b),
-            (Some(a), None) => Some(a.clone()),
+        self.max_value = match (self.max_value.take(), &other.max_value) {
+            (Some(a), Some(b)) => scalar_max(a, b.clone(), &self.data_type),
+            (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b.clone()),
             (None, None) => None,
         };
@@ -212,7 +326,7 @@ impl StatisticsContainer {
             for (col_name, col_stats) in rg_stats.columns {
                 container
                     .columns
-                    .entry(col_name.clone())
+                    .entry(col_name)
                     .and_modify(|existing| existing.merge(&col_stats))
                     .or_insert(col_stats);
             }
@@ -296,6 +410,7 @@ impl StatisticsContainer {
     /// - `num_rows`: Total row count with `Precision::Exact` if known
     /// - `column_statistics`: Per-column min/max/null_count with appropriate precision
     /// - `total_byte_size`: Always `Precision::Absent` (not tracked)
+    #[cfg(feature = "datafusion")]
     pub fn to_datafusion_statistics(&self, schema: &Schema) -> datafusion_common::Statistics {
         use datafusion_common::ColumnStatistics as DFColStats;
         use datafusion_common::Statistics;
@@ -320,13 +435,17 @@ impl StatisticsContainer {
                                 .unwrap_or(Precision::Absent),
                             min_value: col_stats
                                 .min_value
-                                .clone()
-                                .map(Precision::Exact)
+                                .as_ref()
+                                .map(|v| {
+                                    Precision::Exact(to_scalar_value(v, &col_stats.data_type))
+                                })
                                 .unwrap_or(Precision::Absent),
                             max_value: col_stats
                                 .max_value
-                                .clone()
-                                .map(Precision::Exact)
+                                .as_ref()
+                                .map(|v| {
+                                    Precision::Exact(to_scalar_value(v, &col_stats.data_type))
+                                })
                                 .unwrap_or(Precision::Absent),
                             sum_value: Precision::Absent,
                             distinct_count: col_stats
@@ -341,215 +460,108 @@ impl StatisticsContainer {
     }
 }
 
-/// Convert Parquet statistics to ScalarValue min/max pair.
-fn parquet_stats_to_scalar(
-    stats: &ParquetStatistics,
-    data_type: &DataType,
-) -> (Option<ScalarValue>, Option<ScalarValue>) {
+/// Convert Parquet statistics to StatScalar min/max pair (physical types only).
+///
+/// This extracts statistics as Parquet physical types without any logical type
+/// interpretation. The Arrow DataType stored in ColumnStatistics is used later
+/// for proper conversion to query engine types.
+fn parquet_stats_to_scalar(stats: &ParquetStatistics) -> (Option<StatScalar>, Option<StatScalar>) {
     match stats {
         ParquetStatistics::Boolean(s) => {
-            let min = s.min_opt().map(|v| ScalarValue::Boolean(Some(*v)));
-            let max = s.max_opt().map(|v| ScalarValue::Boolean(Some(*v)));
+            let min = s.min_opt().map(|v| StatScalar::Boolean(*v));
+            let max = s.max_opt().map(|v| StatScalar::Boolean(*v));
             (min, max)
         }
         ParquetStatistics::Int32(s) => {
-            // Int32 in Parquet can map to various Arrow types
-            match data_type {
-                DataType::Int32 => {
-                    let min = s.min_opt().map(|v| ScalarValue::Int32(Some(*v)));
-                    let max = s.max_opt().map(|v| ScalarValue::Int32(Some(*v)));
-                    (min, max)
-                }
-                DataType::Int16 => {
-                    // Use try_from to safely convert, returning None on overflow
-                    let min = s
-                        .min_opt()
-                        .and_then(|v| i16::try_from(*v).ok())
-                        .map(|v| ScalarValue::Int16(Some(v)));
-                    let max = s
-                        .max_opt()
-                        .and_then(|v| i16::try_from(*v).ok())
-                        .map(|v| ScalarValue::Int16(Some(v)));
-                    (min, max)
-                }
-                DataType::Int8 => {
-                    let min = s
-                        .min_opt()
-                        .and_then(|v| i8::try_from(*v).ok())
-                        .map(|v| ScalarValue::Int8(Some(v)));
-                    let max = s
-                        .max_opt()
-                        .and_then(|v| i8::try_from(*v).ok())
-                        .map(|v| ScalarValue::Int8(Some(v)));
-                    (min, max)
-                }
-                DataType::UInt32 => {
-                    let min = s
-                        .min_opt()
-                        .and_then(|v| u32::try_from(*v).ok())
-                        .map(|v| ScalarValue::UInt32(Some(v)));
-                    let max = s
-                        .max_opt()
-                        .and_then(|v| u32::try_from(*v).ok())
-                        .map(|v| ScalarValue::UInt32(Some(v)));
-                    (min, max)
-                }
-                DataType::UInt16 => {
-                    let min = s
-                        .min_opt()
-                        .and_then(|v| u16::try_from(*v).ok())
-                        .map(|v| ScalarValue::UInt16(Some(v)));
-                    let max = s
-                        .max_opt()
-                        .and_then(|v| u16::try_from(*v).ok())
-                        .map(|v| ScalarValue::UInt16(Some(v)));
-                    (min, max)
-                }
-                DataType::UInt8 => {
-                    let min = s
-                        .min_opt()
-                        .and_then(|v| u8::try_from(*v).ok())
-                        .map(|v| ScalarValue::UInt8(Some(v)));
-                    let max = s
-                        .max_opt()
-                        .and_then(|v| u8::try_from(*v).ok())
-                        .map(|v| ScalarValue::UInt8(Some(v)));
-                    (min, max)
-                }
-                DataType::Date32 => {
-                    let min = s.min_opt().map(|v| ScalarValue::Date32(Some(*v)));
-                    let max = s.max_opt().map(|v| ScalarValue::Date32(Some(*v)));
-                    (min, max)
-                }
-                _ => {
-                    // Default to Int32
-                    let min = s.min_opt().map(|v| ScalarValue::Int32(Some(*v)));
-                    let max = s.max_opt().map(|v| ScalarValue::Int32(Some(*v)));
-                    (min, max)
-                }
-            }
+            let min = s.min_opt().map(|v| StatScalar::Int32(*v));
+            let max = s.max_opt().map(|v| StatScalar::Int32(*v));
+            (min, max)
         }
-        ParquetStatistics::Int64(s) => match data_type {
-            DataType::Int64 => {
-                let min = s.min_opt().map(|v| ScalarValue::Int64(Some(*v)));
-                let max = s.max_opt().map(|v| ScalarValue::Int64(Some(*v)));
-                (min, max)
-            }
-            DataType::UInt64 => {
-                // Safely convert i64 to u64, returning None for negative values
-                let min = s
-                    .min_opt()
-                    .and_then(|v| u64::try_from(*v).ok())
-                    .map(|v| ScalarValue::UInt64(Some(v)));
-                let max = s
-                    .max_opt()
-                    .and_then(|v| u64::try_from(*v).ok())
-                    .map(|v| ScalarValue::UInt64(Some(v)));
-                (min, max)
-            }
-            DataType::Date64 => {
-                let min = s.min_opt().map(|v| ScalarValue::Date64(Some(*v)));
-                let max = s.max_opt().map(|v| ScalarValue::Date64(Some(*v)));
-                (min, max)
-            }
-            DataType::Timestamp(unit, tz) => {
-                use arrow_schema::TimeUnit;
-                let min = s.min_opt().map(|v| match unit {
-                    TimeUnit::Second => ScalarValue::TimestampSecond(Some(*v), tz.clone()),
-                    TimeUnit::Millisecond => {
-                        ScalarValue::TimestampMillisecond(Some(*v), tz.clone())
-                    }
-                    TimeUnit::Microsecond => {
-                        ScalarValue::TimestampMicrosecond(Some(*v), tz.clone())
-                    }
-                    TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(*v), tz.clone()),
-                });
-                let max = s.max_opt().map(|v| match unit {
-                    TimeUnit::Second => ScalarValue::TimestampSecond(Some(*v), tz.clone()),
-                    TimeUnit::Millisecond => {
-                        ScalarValue::TimestampMillisecond(Some(*v), tz.clone())
-                    }
-                    TimeUnit::Microsecond => {
-                        ScalarValue::TimestampMicrosecond(Some(*v), tz.clone())
-                    }
-                    TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(*v), tz.clone()),
-                });
-                (min, max)
-            }
-            _ => {
-                let min = s.min_opt().map(|v| ScalarValue::Int64(Some(*v)));
-                let max = s.max_opt().map(|v| ScalarValue::Int64(Some(*v)));
-                (min, max)
-            }
-        },
+        ParquetStatistics::Int64(s) => {
+            let min = s.min_opt().map(|v| StatScalar::Int64(*v));
+            let max = s.max_opt().map(|v| StatScalar::Int64(*v));
+            (min, max)
+        }
         ParquetStatistics::Int96(_) => {
             // Int96 is deprecated, typically used for timestamps in legacy Parquet
-            // We don't support it for statistics
             (None, None)
         }
         ParquetStatistics::Float(s) => {
-            let min = s.min_opt().map(|v| ScalarValue::Float32(Some(*v)));
-            let max = s.max_opt().map(|v| ScalarValue::Float32(Some(*v)));
+            let min = s.min_opt().map(|v| StatScalar::Float32(*v));
+            let max = s.max_opt().map(|v| StatScalar::Float32(*v));
             (min, max)
         }
         ParquetStatistics::Double(s) => {
-            let min = s.min_opt().map(|v| ScalarValue::Float64(Some(*v)));
-            let max = s.max_opt().map(|v| ScalarValue::Float64(Some(*v)));
+            let min = s.min_opt().map(|v| StatScalar::Float64(*v));
+            let max = s.max_opt().map(|v| StatScalar::Float64(*v));
             (min, max)
         }
-        ParquetStatistics::ByteArray(s) => match data_type {
-            DataType::Utf8 | DataType::LargeUtf8 => {
-                let min = s
-                    .min_opt()
-                    .and_then(|b| std::str::from_utf8(b.data()).ok())
-                    .map(|s| ScalarValue::Utf8(Some(s.to_string())));
-                let max = s
-                    .max_opt()
-                    .and_then(|b| std::str::from_utf8(b.data()).ok())
-                    .map(|s| ScalarValue::Utf8(Some(s.to_string())));
-                (min, max)
-            }
-            DataType::Binary | DataType::LargeBinary => {
-                let min = s
-                    .min_opt()
-                    .map(|b| ScalarValue::Binary(Some(b.data().to_vec())));
-                let max = s
-                    .max_opt()
-                    .map(|b| ScalarValue::Binary(Some(b.data().to_vec())));
-                (min, max)
-            }
-            _ => (None, None),
-        },
-        ParquetStatistics::FixedLenByteArray(s) => match data_type {
-            DataType::FixedSizeBinary(size) => {
-                let min = s
-                    .min_opt()
-                    .map(|b| ScalarValue::FixedSizeBinary(*size, Some(b.data().to_vec())));
-                let max = s
-                    .max_opt()
-                    .map(|b| ScalarValue::FixedSizeBinary(*size, Some(b.data().to_vec())));
-                (min, max)
-            }
-            _ => (None, None),
-        },
+        ParquetStatistics::ByteArray(s) => {
+            let min = s.min_opt().map(|b| StatScalar::Binary(b.data().to_vec()));
+            let max = s.max_opt().map(|b| StatScalar::Binary(b.data().to_vec()));
+            (min, max)
+        }
+        ParquetStatistics::FixedLenByteArray(s) => {
+            let min = s.min_opt().map(|b| StatScalar::Binary(b.data().to_vec()));
+            let max = s.max_opt().map(|b| StatScalar::Binary(b.data().to_vec()));
+            (min, max)
+        }
     }
 }
 
-/// Compare two ScalarValues and return the smaller one.
-fn scalar_min(a: &ScalarValue, b: &ScalarValue) -> Option<ScalarValue> {
-    match a.partial_cmp(b) {
-        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => Some(a.clone()),
-        Some(std::cmp::Ordering::Greater) => Some(b.clone()),
-        None => None,
+/// Compare two StatScalar values and return the smaller one.
+///
+/// Uses the Arrow DataType for correct comparison of unsigned integers,
+/// which are stored as signed in Parquet but need unsigned comparison semantics.
+fn scalar_min(a: StatScalar, b: StatScalar, data_type: &DataType) -> Option<StatScalar> {
+    let ordering = compare_scalars(&a, &b, data_type)?;
+    match ordering {
+        Ordering::Less | Ordering::Equal => Some(a),
+        Ordering::Greater => Some(b),
     }
 }
 
-/// Compare two ScalarValues and return the larger one.
-fn scalar_max(a: &ScalarValue, b: &ScalarValue) -> Option<ScalarValue> {
-    match a.partial_cmp(b) {
-        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => Some(a.clone()),
-        Some(std::cmp::Ordering::Less) => Some(b.clone()),
-        None => None,
+/// Compare two StatScalar values and return the larger one.
+///
+/// Uses the Arrow DataType for correct comparison of unsigned integers,
+/// which are stored as signed in Parquet but need unsigned comparison semantics.
+fn scalar_max(a: StatScalar, b: StatScalar, data_type: &DataType) -> Option<StatScalar> {
+    let ordering = compare_scalars(&a, &b, data_type)?;
+    match ordering {
+        Ordering::Greater | Ordering::Equal => Some(a),
+        Ordering::Less => Some(b),
+    }
+}
+
+/// Compare two StatScalar values using the logical DataType for correct semantics.
+///
+/// This handles the case where unsigned integers are stored as signed in Parquet
+/// but need to be compared as unsigned values.
+fn compare_scalars(a: &StatScalar, b: &StatScalar, data_type: &DataType) -> Option<Ordering> {
+    match (a, b, data_type) {
+        // Null handling
+        (StatScalar::Null, StatScalar::Null, _) => Some(Ordering::Equal),
+        (StatScalar::Null, _, _) => Some(Ordering::Less),
+        (_, StatScalar::Null, _) => Some(Ordering::Greater),
+
+        // Unsigned integers stored as Int32 - reinterpret bits as unsigned for comparison
+        (StatScalar::Int32(av), StatScalar::Int32(bv), DataType::UInt32) => {
+            (*av as u32).partial_cmp(&(*bv as u32))
+        }
+        (StatScalar::Int32(av), StatScalar::Int32(bv), DataType::UInt16) => {
+            (*av as u16).partial_cmp(&(*bv as u16))
+        }
+        (StatScalar::Int32(av), StatScalar::Int32(bv), DataType::UInt8) => {
+            (*av as u8).partial_cmp(&(*bv as u8))
+        }
+
+        // Unsigned integers stored as Int64 - reinterpret bits as unsigned for comparison
+        (StatScalar::Int64(av), StatScalar::Int64(bv), DataType::UInt64) => {
+            (*av as u64).partial_cmp(&(*bv as u64))
+        }
+
+        // For all other types, use physical comparison (which is correct)
+        _ => a.partial_cmp(b),
     }
 }
 
@@ -595,75 +607,131 @@ mod tests {
     }
 
     #[test]
-    fn test_column_statistics_merge() {
-        let mut stats1 = ColumnStatistics {
-            column_name: "test".to_string(),
-            data_type: DataType::Int32,
-            min_value: Some(ScalarValue::Int32(Some(10))),
-            max_value: Some(ScalarValue::Int32(Some(50))),
-            null_count: Some(5),
-            distinct_count: Some(10),
-        };
+    fn test_stat_scalar_comparison() {
+        // Test integer comparison
+        let a = StatScalar::Int32(10);
+        let b = StatScalar::Int32(20);
+        assert!(a < b);
+        assert!(b > a);
 
-        let stats2 = ColumnStatistics {
-            column_name: "test".to_string(),
-            data_type: DataType::Int32,
-            min_value: Some(ScalarValue::Int32(Some(5))),
-            max_value: Some(ScalarValue::Int32(Some(100))),
-            null_count: Some(3),
-            distinct_count: Some(20),
-        };
+        // Test binary comparison (covers string data)
+        let s1 = StatScalar::Binary(b"apple".to_vec());
+        let s2 = StatScalar::Binary(b"banana".to_vec());
+        assert!(s1 < s2);
 
-        stats1.merge(&stats2);
+        // Test null comparison
+        let null = StatScalar::Null;
+        assert!(null < a);
 
-        assert_eq!(stats1.min_value, Some(ScalarValue::Int32(Some(5))));
-        assert_eq!(stats1.max_value, Some(ScalarValue::Int32(Some(100))));
-        assert_eq!(stats1.null_count, Some(8));
-        // Distinct count cannot be accurately merged
-        assert_eq!(stats1.distinct_count, None);
+        // Test incompatible types
+        assert_eq!(a.partial_cmp(&s1), None);
     }
 
     #[test]
-    fn test_column_statistics_merge_with_none() {
+    fn test_column_statistics_merge() {
+        // Test 1: Both stats have values - takes min of mins, max of maxs
         let mut stats1 = ColumnStatistics {
             column_name: "test".to_string(),
             data_type: DataType::Int32,
-            min_value: Some(ScalarValue::Int32(Some(10))),
+            min_value: Some(StatScalar::Int32(10)),
+            max_value: Some(StatScalar::Int32(50)),
+            null_count: Some(5),
+            distinct_count: Some(10),
+        };
+        let stats2 = ColumnStatistics {
+            column_name: "test".to_string(),
+            data_type: DataType::Int32,
+            min_value: Some(StatScalar::Int32(5)),
+            max_value: Some(StatScalar::Int32(100)),
+            null_count: Some(3),
+            distinct_count: Some(20),
+        };
+        stats1.merge(&stats2);
+        assert_eq!(stats1.min_value, Some(StatScalar::Int32(5)));
+        assert_eq!(stats1.max_value, Some(StatScalar::Int32(100)));
+        assert_eq!(stats1.null_count, Some(8));
+        assert_eq!(stats1.distinct_count, None); // Cannot merge distinct counts
+
+        // Test 2: One side has None values - preserves the Some value
+        let mut stats3 = ColumnStatistics {
+            column_name: "test".to_string(),
+            data_type: DataType::Int32,
+            min_value: Some(StatScalar::Int32(10)),
             max_value: None,
             null_count: Some(5),
             distinct_count: None,
         };
-
-        let stats2 = ColumnStatistics {
+        let stats4 = ColumnStatistics {
             column_name: "test".to_string(),
             data_type: DataType::Int32,
             min_value: None,
-            max_value: Some(ScalarValue::Int32(Some(100))),
+            max_value: Some(StatScalar::Int32(100)),
             null_count: None,
             distinct_count: None,
         };
+        stats3.merge(&stats4);
+        assert_eq!(stats3.min_value, Some(StatScalar::Int32(10)));
+        assert_eq!(stats3.max_value, Some(StatScalar::Int32(100)));
+    }
 
-        stats1.merge(&stats2);
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_stat_scalar_to_datafusion() {
+        use datafusion_common::ScalarValue;
 
-        assert_eq!(stats1.min_value, Some(ScalarValue::Int32(Some(10))));
-        assert_eq!(stats1.max_value, Some(ScalarValue::Int32(Some(100))));
-        assert_eq!(stats1.null_count, Some(5));
+        // Physical Int32 → logical Int32
+        assert_eq!(
+            to_scalar_value(&StatScalar::Int32(42), &DataType::Int32),
+            ScalarValue::Int32(Some(42))
+        );
+        // Physical Int32 → logical Date32
+        assert_eq!(
+            to_scalar_value(&StatScalar::Int32(19000), &DataType::Date32),
+            ScalarValue::Date32(Some(19000))
+        );
+        // Physical Binary → logical Utf8
+        assert_eq!(
+            to_scalar_value(&StatScalar::Binary(b"hello".to_vec()), &DataType::Utf8),
+            ScalarValue::Utf8(Some("hello".to_string()))
+        );
     }
 
     #[test]
-    fn test_statistics_container_new() {
-        let container = StatisticsContainer::new(StatsGranularity::File);
-        assert_eq!(container.granularity, StatsGranularity::File);
-        assert_eq!(container.num_rows, None);
-        assert!(container.columns.is_empty());
-    }
+    fn test_unsigned_integer_overflow_merge() {
+        // UInt32: values > i32::MAX are stored as negative i32, need unsigned comparison
+        let mut uint32_stats = ColumnStatistics {
+            column_name: "test".to_string(),
+            data_type: DataType::UInt32,
+            min_value: Some(StatScalar::Int32(100)),
+            max_value: Some(StatScalar::Int32(200)),
+            null_count: None,
+            distinct_count: None,
+        };
+        let uint32_overflow = ColumnStatistics {
+            column_name: "test".to_string(),
+            data_type: DataType::UInt32,
+            min_value: Some(StatScalar::Int32(3_000_000_000u32 as i32)), // stored as negative
+            max_value: Some(StatScalar::Int32(4_000_000_000u32 as i32)),
+            null_count: None,
+            distinct_count: None,
+        };
+        uint32_stats.merge(&uint32_overflow);
+        assert_eq!(uint32_stats.min_value, Some(StatScalar::Int32(100))); // 100 < 3B
+        assert_eq!(
+            uint32_stats.max_value,
+            Some(StatScalar::Int32(4_000_000_000u32 as i32))
+        ); // 4B > 200
 
-    #[test]
-    fn test_scalar_min_max() {
-        let a = ScalarValue::Int32(Some(10));
-        let b = ScalarValue::Int32(Some(20));
-
-        assert_eq!(scalar_min(&a, &b), Some(a.clone()));
-        assert_eq!(scalar_max(&a, &b), Some(b.clone()));
+        // UInt64: same pattern for 64-bit overflow
+        let large = StatScalar::Int64(10_000_000_000_000_000_000u64 as i64);
+        let small = StatScalar::Int64(100);
+        assert_eq!(
+            scalar_min(large.clone(), small.clone(), &DataType::UInt64),
+            Some(StatScalar::Int64(100))
+        );
+        assert_eq!(
+            scalar_max(large.clone(), small.clone(), &DataType::UInt64),
+            Some(large)
+        );
     }
 }
