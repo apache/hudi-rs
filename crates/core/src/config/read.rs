@@ -75,15 +75,13 @@ pub enum HudiReadConfig {
     /// Maximum number of Parquet footers to cache.
     /// Default: 1000
     ///
-    /// TODO(Phase 4-5): This config will be used when footer caching is implemented.
-    /// See the implementation plan in the PR for details on the FooterCache design.
+    /// Note: Footer caching is not yet implemented. This config is reserved for future use.
     FooterCacheSize,
 
     /// TTL for cached footers in seconds.
     /// Default: 300 (5 minutes)
     ///
-    /// TODO(Phase 4-5): This config will be used when footer caching is implemented.
-    /// Cached footers older than this TTL will be evicted on next access.
+    /// Note: Footer caching is not yet implemented. This config is reserved for future use.
     FooterCacheTtlSeconds,
 }
 

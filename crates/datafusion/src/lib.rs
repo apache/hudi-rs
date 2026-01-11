@@ -283,13 +283,7 @@ impl TableProvider for HudiDataSource {
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
         // Statistics are not available without footer caching.
-        // This will be implemented in Phase 4-5 when footer caching is added.
-        // For now, return None to indicate statistics are not available.
-        //
-        // When footer caching is implemented, this method will:
-        // 1. Read cached footers for all files
-        // 2. Aggregate column statistics (min/max/null_count)
-        // 3. Return DataFusion Statistics with Precision::Exact values
+        // Footer caching is not yet implemented, so return None.
         None
     }
 
