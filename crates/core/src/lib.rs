@@ -53,6 +53,7 @@ pub mod merge;
 pub mod metadata;
 mod record;
 pub mod schema;
+pub mod statistics;
 pub mod storage;
 pub mod table;
 pub mod timeline;

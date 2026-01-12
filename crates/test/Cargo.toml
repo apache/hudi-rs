@@ -38,5 +38,5 @@ strum_macros = { workspace = true }
 url = { workspace = true }
 
 # testing
-tempfile = "3.20.0"
-zip-extract = "0.3.0"
+tempfile = { workspace = true }
+zip-extract = { workspace = true }

@@ -88,6 +88,7 @@
 //! ```
 
 pub mod builder;
+pub mod file_pruner;
 mod fs_view;
 mod listing;
 pub mod partition;
@@ -107,6 +108,7 @@ use crate::file_group::reader::FileGroupReader;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::table::builder::TableBuilder;
+use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
@@ -481,6 +483,12 @@ impl Table {
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
 
+        // Get table schema for file pruning
+        let table_schema = self.get_schema().await?;
+
+        // Create file pruner with filters on non-partition columns
+        let file_pruner = FilePruner::new(filters, &table_schema, &partition_schema)?;
+
         // Try to create metadata table instance if enabled
         let metadata_table = if self.is_metadata_table_enabled() {
             log::debug!("Using metadata table for file listing");
@@ -498,7 +506,13 @@ impl Table {
         };
 
         self.file_system_view
-            .get_file_slices(&partition_pruner, &timeline_view, metadata_table.as_ref())
+            .get_file_slices(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                metadata_table.as_ref(),
+            )
             .await
     }
 

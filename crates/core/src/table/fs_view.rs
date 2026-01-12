@@ -20,17 +20,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_schema::Schema;
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::file_group::FileGroup;
 use crate::file_group::builder::file_groups_from_files_partition_records;
 use crate::file_group::file_slice::FileSlice;
+use crate::metadata::table::records::FilesPartitionRecord;
 use crate::storage::Storage;
 use crate::table::Table;
+use crate::table::file_pruner::FilePruner;
 use crate::table::listing::FileLister;
 use crate::table::partition::PartitionPruner;
-use crate::timeline::completion_time::CompletionTimeView;
 use crate::timeline::view::TimelineView;
 use dashmap::DashMap;
 
@@ -58,64 +61,152 @@ impl FileSystemView {
         })
     }
 
-    /// Load file groups by listing from the storage.
+    /// Load file groups from the appropriate source (storage or metadata table records)
+    /// and apply stats-based pruning.
+    ///
+    /// # File Listing Source
+    /// - If `files_partition_records` is Some: Uses pre-fetched metadata table records
+    /// - If `files_partition_records` is None: Uses storage listing via FileLister
+    ///
+    /// # Stats Pruning Source (for non-empty file_pruner)
+    /// - Currently: Always extracts stats from Parquet file footers
+    /// - TODO: Use metadata table partitions when available:
+    ///   - partition_stats: Enhance PartitionPruner to prune partitions before file listing
+    ///   - column_stats: Prune files without reading Parquet footers
     ///
     /// # Arguments
     /// * `partition_pruner` - Filters which partitions to include
-    /// * `completion_time_view` - View to look up completion timestamps
-    async fn load_file_groups_from_storage<V: CompletionTimeView + Sync>(
+    /// * `file_pruner` - Filters files based on column statistics
+    /// * `table_schema` - Table schema for statistics extraction
+    /// * `timeline_view` - The timeline view providing query timestamp and completion time lookups
+    /// * `files_partition_records` - Optional pre-fetched metadata table records
+    async fn load_file_groups(
         &self,
         partition_pruner: &PartitionPruner,
-        completion_time_view: &V,
+        file_pruner: &FilePruner,
+        table_schema: &Schema,
+        timeline_view: &TimelineView,
+        files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
     ) -> Result<()> {
-        let lister = FileLister::new(
-            self.hudi_configs.clone(),
-            self.storage.clone(),
-            partition_pruner.to_owned(),
-        );
-        let file_groups_map = lister
-            .list_file_groups_for_relevant_partitions(completion_time_view)
-            .await?;
+        // TODO: Enhance PartitionPruner with partition_stats support
+        // - Load partition_stats from metadata table into PartitionPruner
+        // - PartitionPruner.should_include() will use both partition column values AND partition_stats
+        // - For non-partitioned tables: check partition_pruner.can_any_partition_match() for early return
+
+        // Step 1: Get file groups from appropriate source
+        let file_groups_map = if let Some(records) = files_partition_records {
+            // Use pre-fetched metadata table records
+            let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
+            file_groups_from_files_partition_records(records, &base_file_format, timeline_view)?
+        } else {
+            // Use storage listing
+            let lister = FileLister::new(
+                self.hudi_configs.clone(),
+                self.storage.clone(),
+                partition_pruner.to_owned(),
+            );
+            lister
+                .list_file_groups_for_relevant_partitions(timeline_view)
+                .await?
+        };
+
+        // Step 2: Apply partition pruning (for metadata table path) and stats pruning
+        // Note: Storage listing path already applies partition pruning via FileLister
+        // TODO: Check if metadata table column_stats partition is available
+        // and use that instead of Parquet footers for better performance
         for (partition_path, file_groups) in file_groups_map {
+            // Skip partitions that don't match the pruner (for metadata table path)
+            if files_partition_records.is_some()
+                && !partition_pruner.is_empty()
+                && !partition_pruner.should_include(&partition_path)
+            {
+                continue;
+            }
+
+            let retained = self
+                .apply_stats_pruning_from_footers(
+                    file_groups,
+                    file_pruner,
+                    table_schema,
+                    timeline_view.as_of_timestamp(),
+                )
+                .await;
             self.partition_to_file_groups
-                .insert(partition_path, file_groups);
+                .insert(partition_path, retained);
         }
+
         Ok(())
     }
 
-    /// Load file groups from metadata table records.
+    /// Apply file-level stats pruning using Parquet file footers.
     ///
-    /// This is an alternative to `load_file_groups_from_file_system` that uses
-    /// file listing records fetched from the metadata table. Only partitions that
-    /// pass the partition pruner will be loaded.
-    ///
-    /// This method is not async because it operates on pre-fetched records.
-    ///
-    /// # Arguments
-    /// * `records` - Metadata table files partition records
-    /// * `partition_pruner` - Filters which partitions to include
-    /// * `completion_time_view` - View to look up completion timestamps
-    fn load_file_groups_from_metadata_table_records<V: CompletionTimeView>(
+    /// Returns the filtered list of file groups that pass the pruning check.
+    /// Files are included (not pruned) if:
+    /// - The pruner has no filters
+    /// - The file is not a Parquet file
+    /// - Column stats cannot be loaded (conservative behavior)
+    /// - The file's stats indicate it might contain matching rows
+    async fn apply_stats_pruning_from_footers(
         &self,
-        records: &HashMap<String, crate::metadata::table_record::FilesPartitionRecord>,
-        partition_pruner: &PartitionPruner,
-        completion_time_view: &V,
-    ) -> Result<()> {
-        let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
-        let file_groups_map = file_groups_from_files_partition_records(
-            records,
-            &base_file_format,
-            completion_time_view,
-        )?;
+        file_groups: Vec<FileGroup>,
+        file_pruner: &FilePruner,
+        table_schema: &Schema,
+        as_of_timestamp: &str,
+    ) -> Vec<FileGroup> {
+        if file_pruner.is_empty() {
+            return file_groups;
+        }
 
-        for entry in file_groups_map.iter() {
-            let partition_path = entry.key();
-            if partition_pruner.is_empty() || partition_pruner.should_include(partition_path) {
-                self.partition_to_file_groups
-                    .insert(partition_path.clone(), entry.value().clone());
+        let mut retained = Vec::with_capacity(file_groups.len());
+
+        for mut fg in file_groups {
+            if let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) {
+                let relative_path = match fsl.base_file_relative_path() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        log::warn!(
+                            "Cannot get base file path for pruning: {e}. Including file group."
+                        );
+                        retained.push(fg);
+                        continue;
+                    }
+                };
+
+                // Case-insensitive check for .parquet extension
+                if !relative_path.to_lowercase().ends_with(".parquet") {
+                    retained.push(fg);
+                    continue;
+                }
+
+                // Load column stats from Parquet footer
+                let stats = match self
+                    .storage
+                    .get_parquet_column_stats(&relative_path, table_schema)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to load column stats for {relative_path}: {e}. Including file."
+                        );
+                        retained.push(fg);
+                        continue;
+                    }
+                };
+
+                if file_pruner.should_include(&stats) {
+                    retained.push(fg);
+                } else {
+                    log::debug!("Pruned file {relative_path} based on column stats");
+                }
+            } else {
+                // No file slice as of timestamp, include the file group
+                // (it will be filtered out later in collect_file_slices)
+                retained.push(fg);
             }
         }
-        Ok(())
+
+        retained
     }
 
     /// Collect file slices from loaded file groups using the timeline view.
@@ -159,27 +250,34 @@ impl FileSystemView {
     ///
     /// # Arguments
     /// * `partition_pruner` - Filters which partitions to include
+    /// * `file_pruner` - Filters files based on column statistics
+    /// * `table_schema` - Table schema for statistics extraction
     /// * `timeline_view` - The timeline view containing query context
     /// * `metadata_table` - Optional metadata table instance
     pub(crate) async fn get_file_slices(
         &self,
         partition_pruner: &PartitionPruner,
+        file_pruner: &FilePruner,
+        table_schema: &Schema,
         timeline_view: &TimelineView,
         metadata_table: Option<&Table>,
     ) -> Result<Vec<FileSlice>> {
-        if let Some(mdt) = metadata_table {
-            // Use metadata table for file listing
-            let records = mdt.fetch_files_partition_records(partition_pruner).await?;
-            self.load_file_groups_from_metadata_table_records(
-                &records,
-                partition_pruner,
-                timeline_view,
-            )?;
+        // Fetch records from metadata table if available
+        let files_partition_records = if let Some(mdt) = metadata_table {
+            Some(mdt.fetch_files_partition_records(partition_pruner).await?)
         } else {
-            // Fall back to storage listing
-            self.load_file_groups_from_storage(partition_pruner, timeline_view)
-                .await?;
-        }
+            None
+        };
+
+        self.load_file_groups(
+            partition_pruner,
+            file_pruner,
+            table_schema,
+            timeline_view,
+            files_partition_records.as_ref(),
+        )
+        .await?;
+
         self.collect_file_slices(partition_pruner, timeline_view)
             .await
     }
@@ -191,14 +289,26 @@ impl FileSystemView {
     ///
     /// # Arguments
     /// * `partition_pruner` - Filters which partitions to include
+    /// * `file_pruner` - Filters files based on column statistics
+    /// * `table_schema` - Table schema for statistics extraction
     /// * `timeline_view` - The timeline view containing query context
     pub(crate) async fn get_file_slices_by_storage_listing(
         &self,
         partition_pruner: &PartitionPruner,
+        file_pruner: &FilePruner,
+        table_schema: &Schema,
         timeline_view: &TimelineView,
     ) -> Result<Vec<FileSlice>> {
-        self.load_file_groups_from_storage(partition_pruner, timeline_view)
-            .await?;
+        // Pass None to force storage listing (avoids recursion for metadata table)
+        self.load_file_groups(
+            partition_pruner,
+            file_pruner,
+            table_schema,
+            timeline_view,
+            None,
+        )
+        .await?;
+
         self.collect_file_slices(partition_pruner, timeline_view)
             .await
     }
@@ -227,9 +337,17 @@ mod tests {
             .await
             .unwrap();
         let partition_pruner = PartitionPruner::empty();
+        let file_pruner = FilePruner::empty();
+        let table_schema = hudi_table.get_schema().await.unwrap();
 
         let file_slices = fs_view
-            .get_file_slices(&partition_pruner, &timeline_view, None)
+            .get_file_slices(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                None,
+            )
             .await
             .unwrap();
 
@@ -260,9 +378,17 @@ mod tests {
             .await
             .unwrap();
         let partition_pruner = PartitionPruner::empty();
+        let file_pruner = FilePruner::empty();
+        let table_schema = hudi_table.get_schema().await.unwrap();
 
         let file_slices = fs_view
-            .get_file_slices(&partition_pruner, &timeline_view, None)
+            .get_file_slices(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                None,
+            )
             .await
             .unwrap();
 
@@ -293,6 +419,7 @@ mod tests {
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema().await.unwrap();
 
         let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
         let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();
@@ -303,8 +430,16 @@ mod tests {
         )
         .unwrap();
 
+        let file_pruner = FilePruner::empty();
+
         let file_slices = fs_view
-            .get_file_slices(&partition_pruner, &timeline_view, None)
+            .get_file_slices(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                None,
+            )
             .await
             .unwrap();
 
