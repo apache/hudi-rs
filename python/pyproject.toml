@@ -43,7 +43,7 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 devel = [
-    "pytest==8.4.2",
+    "pytest==9.0.2",
     "coverage==7.10.7",
     "ruff==0.14.1",
     "mypy==1.19.1",
