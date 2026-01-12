@@ -163,8 +163,10 @@ impl FileSystemView {
             if let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) {
                 let relative_path = match fsl.base_file_relative_path() {
                     Ok(path) => path,
-                    Err(_) => {
-                        // Cannot get path, include the file group
+                    Err(e) => {
+                        log::warn!(
+                            "Cannot get base file path for pruning: {e}. Including file group."
+                        );
                         retained.push(fg);
                         continue;
                     }

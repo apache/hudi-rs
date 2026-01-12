@@ -321,6 +321,7 @@ fn parquet_stats_to_min_max_arrays(
         }
         ParquetStatistics::Int96(_) => {
             // Int96 is deprecated, typically used for timestamps in legacy Parquet
+            log::debug!("Int96 statistics not supported - legacy Parquet timestamp format");
             (None, None)
         }
         ParquetStatistics::Float(s) => {
