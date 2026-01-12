@@ -87,7 +87,7 @@ futures = { version = "0.3" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # protobuf
-prost = { version = "0.13" }
+prost = { version = "0.14" }
 
 # compression
 flate2 = { version = "1" }
