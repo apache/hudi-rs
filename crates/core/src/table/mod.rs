@@ -88,14 +88,40 @@
 //! ```
 
 pub mod builder;
-pub mod file_pruner;
 mod fs_view;
 mod listing;
-pub mod partition;
+pub mod pruning;
 mod read_options;
 mod validation;
 
+pub use pruning::{FilePruner, PartitionPruner};
 pub use read_options::ReadOptions;
+
+use crate::config::table::HudiTableConfig::{
+    KeyGeneratorClass, PartitionFields as PartitionFieldsConfig,
+};
+
+pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
+pub const EMPTY_PARTITION_PATH: &str = "";
+
+/// Check if the table is partitioned based on configuration.
+pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
+    let has_partition_fields = {
+        let partition_fields: Vec<String> =
+            hudi_configs.get_or_default(PartitionFieldsConfig).into();
+        !partition_fields.is_empty()
+    };
+
+    let uses_non_partitioned_key_gen = hudi_configs
+        .try_get(KeyGeneratorClass)
+        .map(|key_gen| {
+            let key_gen_str: String = key_gen.into();
+            key_gen_str == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
+        })
+        .unwrap_or(false);
+
+    has_partition_fields && !uses_non_partitioned_key_gen
+}
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -108,9 +134,7 @@ use crate::file_group::reader::FileGroupReader;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::schema::resolver::{resolve_avro_schema, resolve_schema};
 use crate::table::builder::TableBuilder;
-use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
-use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
@@ -489,14 +513,16 @@ impl Table {
         // Create file pruner with filters on non-partition columns
         let file_pruner = FilePruner::new(filters, &table_schema, &partition_schema)?;
 
-        // Try to create metadata table instance if enabled
+        // Create metadata table if enabled (for files listing and stats pruning)
         let metadata_table = if self.is_metadata_table_enabled() {
-            log::debug!("Using metadata table for file listing");
             match self.new_metadata_table().await {
-                Ok(mdt) => Some(mdt),
+                Ok(mdt) => {
+                    log::debug!("Using metadata table for file listing and stats pruning");
+                    Some(mdt)
+                }
                 Err(e) => {
                     log::warn!(
-                        "Failed to create metadata table, falling back to storage listing: {e}"
+                        "Failed to create metadata table: {e}. Falling back to storage listing."
                     );
                     None
                 }

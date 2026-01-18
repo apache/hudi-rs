@@ -35,3 +35,6 @@ pub const LAKE_FORMAT_METADATA_DIRS: &[&str; 3] = &[
 
 /// The virtual partition field name used in metadata tables.
 pub const METADATA_TABLE_PARTITION_FIELD: &str = "partition";
+
+/// The partition identifier used for non-partitioned tables in the metadata table.
+pub const NON_PARTITIONED_NAME: &str = ".";

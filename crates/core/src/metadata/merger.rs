@@ -19,12 +19,14 @@
 //! Merger for metadata table records.
 //!
 //! This module provides functionality to merge HFile records from base files
-//! and log files for the metadata table's files partition.
+//! and log files for the metadata table's partitions.
 
 use crate::Result;
 use crate::hfile::HFileRecord;
 use crate::metadata::table_record::{
-    FilesPartitionRecord, HoodieMetadataFileInfo, decode_files_partition_record_with_schema,
+    ColumnStatsRecord, FilesPartitionRecord, HoodieMetadataFileInfo, PartitionStatsRecord,
+    decode_column_stats_record_with_schema, decode_files_partition_record_with_schema,
+    decode_partition_stats_record_with_schema,
 };
 use apache_avro::Schema as AvroSchema;
 use std::collections::HashMap;
@@ -209,6 +211,166 @@ impl FilesPartitionMerger {
                 }
             }
         }
+    }
+}
+
+/// Merger for column stats records from the metadata table.
+///
+/// Column stats records have composite keys (column + partition + file hash).
+/// Each HFile record decodes to one or more ColumnStatsRecord entries.
+/// The merge semantics are simpler than files partition:
+/// - For the same key, newer records replace older ones
+/// - Deleted records (is_deleted=true) are kept in the result
+pub struct ColumnStatsMerger {
+    schema: AvroSchema,
+}
+
+impl ColumnStatsMerger {
+    /// Create a new merger with the given Avro schema.
+    pub fn new(schema: AvroSchema) -> Self {
+        Self { schema }
+    }
+
+    /// Merge base HFile records with log file records for column stats.
+    ///
+    /// # Arguments
+    /// * `base_records` - Records from the base HFile (may be empty)
+    /// * `log_records` - Records from log files, in chronological order
+    /// * `keys` - Only return records matching these keys. If empty, return all.
+    ///
+    /// # Returns
+    /// A vector of merged ColumnStatsRecord entries.
+    pub fn merge_for_keys(
+        &self,
+        base_records: &[HFileRecord],
+        log_records: &[HFileRecord],
+        keys: &[&str],
+    ) -> Result<Vec<ColumnStatsRecord>> {
+        let key_set: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        let filter_by_keys = !keys.is_empty();
+
+        // Use a map to track records by (column_name, file_name) for deduplication
+        let mut merged: HashMap<(String, String), ColumnStatsRecord> = HashMap::new();
+
+        // Process base records first
+        for record in base_records {
+            if filter_by_keys {
+                if let Some(key) = record.key_as_str() {
+                    if !key_set.contains(key) {
+                        continue;
+                    }
+                }
+            }
+            if let Ok(stats) = self.decode_record(record) {
+                for stat in stats {
+                    let key = (stat.column_name.clone(), stat.file_name.clone());
+                    merged.insert(key, stat);
+                }
+            }
+        }
+
+        // Process log records (newer records override older ones)
+        for record in log_records {
+            if filter_by_keys {
+                if let Some(key) = record.key_as_str() {
+                    if !key_set.contains(key) {
+                        continue;
+                    }
+                }
+            }
+            if let Ok(stats) = self.decode_record(record) {
+                for stat in stats {
+                    let key = (stat.column_name.clone(), stat.file_name.clone());
+                    merged.insert(key, stat);
+                }
+            }
+        }
+
+        Ok(merged.into_values().collect())
+    }
+
+    fn decode_record(&self, record: &HFileRecord) -> Result<Vec<ColumnStatsRecord>> {
+        decode_column_stats_record_with_schema(record, &self.schema)
+    }
+}
+
+/// Merger for partition stats records from the metadata table.
+///
+/// Partition stats records have composite keys (column + partition hash).
+/// Each HFile record decodes to one or more PartitionStatsRecord entries.
+/// The merge semantics are the same as column stats:
+/// - For the same key, newer records replace older ones
+/// - Deleted records (is_deleted=true) are kept in the result
+pub struct PartitionStatsMerger {
+    schema: AvroSchema,
+}
+
+impl PartitionStatsMerger {
+    /// Create a new merger with the given Avro schema.
+    pub fn new(schema: AvroSchema) -> Self {
+        Self { schema }
+    }
+
+    /// Merge base HFile records with log file records for partition stats.
+    ///
+    /// # Arguments
+    /// * `base_records` - Records from the base HFile (may be empty)
+    /// * `log_records` - Records from log files, in chronological order
+    /// * `keys` - Only return records matching these keys. If empty, return all.
+    ///
+    /// # Returns
+    /// A vector of merged PartitionStatsRecord entries.
+    pub fn merge_for_keys(
+        &self,
+        base_records: &[HFileRecord],
+        log_records: &[HFileRecord],
+        keys: &[&str],
+    ) -> Result<Vec<PartitionStatsRecord>> {
+        let key_set: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        let filter_by_keys = !keys.is_empty();
+
+        // Use a map to track records by (column_name, partition_path) for deduplication
+        let mut merged: HashMap<(String, String), PartitionStatsRecord> = HashMap::new();
+
+        // Process base records first
+        for record in base_records {
+            if filter_by_keys {
+                if let Some(key) = record.key_as_str() {
+                    if !key_set.contains(key) {
+                        continue;
+                    }
+                }
+            }
+            if let Ok(stats) = self.decode_record(record) {
+                for stat in stats {
+                    let key = (stat.column_name.clone(), stat.partition_path.clone());
+                    merged.insert(key, stat);
+                }
+            }
+        }
+
+        // Process log records (newer records override older ones)
+        for record in log_records {
+            if filter_by_keys {
+                if let Some(key) = record.key_as_str() {
+                    if !key_set.contains(key) {
+                        continue;
+                    }
+                }
+            }
+            if let Ok(stats) = self.decode_record(record) {
+                for stat in stats {
+                    let key = (stat.column_name.clone(), stat.partition_path.clone());
+                    merged.insert(key, stat);
+                }
+            }
+        }
+
+        Ok(merged.into_values().collect())
+    }
+
+    fn decode_record(&self, record: &HFileRecord) -> Result<Vec<PartitionStatsRecord>> {
+        decode_partition_stats_record_with_schema(record, &self.schema)
     }
 }
 

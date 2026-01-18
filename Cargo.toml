@@ -92,6 +92,13 @@ prost = { version = "0.13" }
 # compression
 flate2 = { version = "1" }
 
+# hashing
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+md-5 = { version = "0.10" }
+
+# encoding
+base64 = { version = "0.22" }
+
 # testing
 serial_test = { version = "3" }
 tempfile = { version = "3" }
