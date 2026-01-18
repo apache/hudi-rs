@@ -16,47 +16,44 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+//! Partition-level pruner for filtering partitions based on partition values and statistics.
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
 use crate::error::CoreError::InvalidPartitionPath;
 use crate::expr::filter::{Filter, SchemableFilter};
+use crate::statistics::StatisticsContainer;
+use crate::table::is_table_partitioned;
 
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
 
-use crate::config::table::HudiTableConfig::{KeyGeneratorClass, PartitionFields};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
-pub const EMPTY_PARTITION_PATH: &str = "";
-
-pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
-    let has_partition_fields = {
-        let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
-        !partition_fields.is_empty()
-    };
-
-    let uses_non_partitioned_key_gen = hudi_configs
-        .try_get(KeyGeneratorClass)
-        .map(|key_gen| {
-            let key_gen_str: String = key_gen.into();
-            key_gen_str == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
-        })
-        .unwrap_or(false);
-
-    has_partition_fields && !uses_non_partitioned_key_gen
-}
+use super::StatsPruner;
 
 /// A partition pruner that filters partitions based on the partition path and its filters.
+///
+/// The pruner supports two levels of filtering:
+/// 1. **Partition column values**: Filters based on the actual partition column values
+///    parsed from the partition path (e.g., `city=chennai` → `city = "chennai"`)
+/// 2. **Partition statistics** (optional): Filters based on aggregated column statistics
+///    at the partition level, loaded from the metadata table's `partition_stats` partition
 #[derive(Debug, Clone)]
 pub struct PartitionPruner {
     schema: Arc<Schema>,
     is_hive_style: bool,
     is_url_encoded: bool,
     is_partitioned: bool,
+    /// Filters on partition columns (for partition path value filtering).
     and_filters: Vec<SchemableFilter>,
+    /// Filters on data columns (for partition stats filtering).
+    data_filters: Vec<SchemableFilter>,
+    /// Optional partition-level statistics for enhanced pruning.
+    partition_stats: Option<HashMap<String, StatisticsContainer>>,
 }
 
 impl PartitionPruner {
@@ -84,6 +81,8 @@ impl PartitionPruner {
             is_url_encoded,
             is_partitioned,
             and_filters,
+            data_filters: Vec::new(),
+            partition_stats: None,
         })
     }
 
@@ -95,12 +94,31 @@ impl PartitionPruner {
             is_url_encoded: false,
             is_partitioned: false,
             and_filters: Vec::new(),
+            data_filters: Vec::new(),
+            partition_stats: None,
         }
+    }
+
+    /// Set partition statistics for enhanced pruning.
+    pub fn with_partition_stats(mut self, stats: HashMap<String, StatisticsContainer>) -> Self {
+        self.partition_stats = Some(stats);
+        self
+    }
+
+    /// Set data column filters for stats-based pruning.
+    pub fn with_data_filters(mut self, filters: Vec<SchemableFilter>) -> Self {
+        self.data_filters = filters;
+        self
+    }
+
+    /// Check if partition stats are available.
+    pub fn has_partition_stats(&self) -> bool {
+        self.partition_stats.is_some()
     }
 
     /// Returns `true` if the partition pruner does not have any filters.
     pub fn is_empty(&self) -> bool {
-        self.and_filters.is_empty()
+        self.and_filters.is_empty() && self.data_filters.is_empty()
     }
 
     /// Returns `true` if the table is partitioned.
@@ -109,23 +127,48 @@ impl PartitionPruner {
     }
 
     /// Returns `true` if the partition path should be included based on the filters.
+    ///
+    /// This method performs two levels of filtering:
+    /// 1. Partition column value filtering - checks if partition path values match filters
+    /// 2. Partition stats filtering - if partition_stats are available, uses aggregated
+    ///    column statistics to prune partitions based on data column filters
     pub fn should_include(&self, partition_path: &str) -> bool {
+        // Level 1: Partition column value filtering
         let segments = match self.parse_segments(partition_path) {
             Ok(s) => s,
-            Err(_) => return true, // Include the partition regardless of parsing error
+            Err(_) => return true,
         };
 
-        self.and_filters.iter().all(|filter| {
-            match segments.get(filter.field.name()) {
-                Some(segment_value) => {
-                    match filter.apply_comparison(segment_value) {
+        let partition_filter_pass =
+            self.and_filters
+                .iter()
+                .all(|filter| match segments.get(filter.field.name()) {
+                    Some(segment_value) => match filter.apply_comparison(segment_value) {
                         Ok(scalar) => scalar.value(0),
-                        Err(_) => true, // Include the partition when comparison error occurs
+                        Err(_) => true,
+                    },
+                    None => true,
+                });
+
+        if !partition_filter_pass {
+            return false;
+        }
+
+        // Level 2: Partition stats filtering (if available)
+        if let Some(ref stats_map) = self.partition_stats {
+            if let Some(stats) = stats_map.get(partition_path) {
+                for filter in &self.data_filters {
+                    let col_name = filter.field.name();
+                    if let Some(col_stats) = stats.columns.get(col_name) {
+                        if StatsPruner::can_prune_by_filter(filter, col_stats) {
+                            return false;
+                        }
                     }
                 }
-                None => true, // Include the partition when filtering field does not match any field in the partition
             }
-        })
+        }
+
+        true
     }
 
     fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
@@ -181,9 +224,9 @@ mod tests {
         IsHiveStylePartitioning, IsPartitionPathUrlencoded,
     };
     use crate::expr::ExprOperator;
-
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::Date32Array;
+    use crate::statistics::{ColumnStatistics, StatsGranularity};
+    use arrow::datatypes::{DataType, Field};
+    use arrow_array::{Date32Array, Int64Array};
     use std::str::FromStr;
 
     fn create_test_schema() -> Schema {
@@ -200,6 +243,7 @@ mod tests {
             (IsPartitionPathUrlencoded, is_url_encoded.to_string()),
         ])
     }
+
     #[test]
     fn test_partition_pruner_new() {
         let schema = create_test_schema();
@@ -371,5 +415,42 @@ mod tests {
             assert_eq!(filter.field.name(), "count");
             assert_eq!(filter.operator, ExprOperator::from_str(op).unwrap());
         }
+    }
+
+    #[test]
+    fn test_partition_pruner_with_partition_stats() {
+        let partition_schema = Schema::new(vec![Field::new("city", DataType::Utf8, false)]);
+        let data_schema = Schema::new(vec![Field::new("amount", DataType::Int64, false)]);
+        let configs = create_hudi_configs(true, false);
+
+        let make_stats = |min: i64, max: i64| {
+            let mut stats = StatisticsContainer::new(StatsGranularity::File);
+            stats.columns.insert(
+                "amount".to_string(),
+                ColumnStatistics {
+                    column_name: "amount".to_string(),
+                    data_type: DataType::Int64,
+                    min_value: Some(Arc::new(Int64Array::from(vec![min])) as ArrayRef),
+                    max_value: Some(Arc::new(Int64Array::from(vec![max])) as ArrayRef),
+                },
+            );
+            stats
+        };
+
+        let mut stats_map = HashMap::new();
+        stats_map.insert("city=A".to_string(), make_stats(100, 300));
+        stats_map.insert("city=B".to_string(), make_stats(400, 800));
+
+        let data_filter = Filter::try_from(("amount", ">", "500")).unwrap();
+        let data_schemable = SchemableFilter::try_from((data_filter, &data_schema)).unwrap();
+
+        let pruner = PartitionPruner::new(&[], &partition_schema, &configs)
+            .unwrap()
+            .with_partition_stats(stats_map)
+            .with_data_filters(vec![data_schemable]);
+
+        assert!(pruner.has_partition_stats());
+        assert!(!pruner.should_include("city=A")); // max=300 <= 500, pruned
+        assert!(pruner.should_include("city=B")); // max=800 > 500, included
     }
 }

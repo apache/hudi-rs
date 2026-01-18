@@ -18,4 +18,5 @@
  */
 pub mod arrow;
 pub mod collection;
+pub mod hash;
 pub mod path;
