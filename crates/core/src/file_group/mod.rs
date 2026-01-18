@@ -284,7 +284,7 @@ impl FileGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::partition::EMPTY_PARTITION_PATH;
+    use crate::table::EMPTY_PARTITION_PATH;
 
     // ============================================================================
     // FileGroup tests (v6 tables)

@@ -139,7 +139,7 @@ impl FileSlice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::partition::EMPTY_PARTITION_PATH;
+    use crate::table::EMPTY_PARTITION_PATH;
     use std::str::FromStr;
 
     #[test]
