@@ -17,6 +17,7 @@
  * under the License.
  */
 
+pub(crate) mod statistics;
 pub(crate) mod util;
 
 use std::any::Any;
@@ -34,6 +35,7 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::physical_plan::FileScanConfigBuilder;
 use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
+use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
@@ -45,11 +47,14 @@ use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, Ta
 use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
+use crate::statistics::file_metadata_to_datafusion_stats;
 use crate::util::expr::exprs_to_filters;
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
+use hudi_core::expr::filter::Filter;
 use hudi_core::table::Table as HudiTable;
+use hudi_core::table::file_pruner::FilePruner;
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -257,6 +262,7 @@ impl HudiDataSource {
             _ => false,
         }
     }
+
 }
 
 #[async_trait]
@@ -292,10 +298,30 @@ impl TableProvider for HudiDataSource {
         let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
-            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
+            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters.clone())
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let base_url = self.table.base_url();
+        let table_schema = self.schema();
+
+        // Create FilePruner for row-group level access plan computation
+        let partition_schema = self
+            .table
+            .get_partition_schema()
+            .await
+            .map_err(|e| Execution(format!("Failed to get partition schema: {e}")))?;
+
+        // Convert filter tuples to Filter objects
+        let hudi_filters: Vec<Filter> = pushdown_filters
+            .iter()
+            .filter_map(|(field, op, value)| {
+                Filter::try_from((field.as_str(), op.as_str(), value.as_str())).ok()
+            })
+            .collect();
+
+        let file_pruner = FilePruner::new(&hudi_filters, &table_schema, &partition_schema)
+            .map_err(|e| Execution(format!("Failed to create file pruner: {e}")))?;
+
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {
             let mut parquet_file_group_vec = Vec::new();
@@ -308,7 +334,34 @@ impl TableProvider for HudiDataSource {
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
                 let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
-                let partitioned_file = PartitionedFile::new(url.path(), size);
+                let mut partitioned_file = PartitionedFile::new(url.path(), size);
+
+                // Attach file-level statistics if available from file metadata
+                if let Some(ref metadata) = f.base_file.file_metadata {
+                    if metadata.column_statistics.is_some() {
+                        let df_stats = file_metadata_to_datafusion_stats(metadata, &table_schema);
+                        partitioned_file.statistics = Some(Arc::new(df_stats));
+                    }
+
+                    // Compute and attach row-group access plan if row-group stats are available
+                    if let Some(ref rg_stats) = metadata.row_group_statistics {
+                        // Create access plan that scans all row groups by default
+                        let mut access_plan = ParquetAccessPlan::new_all(metadata.num_row_groups);
+
+                        // Mark row groups to skip based on statistics
+                        for (idx, rg_stat) in rg_stats.iter().enumerate() {
+                            if !file_pruner.should_include(Some(&rg_stat.columns)) {
+                                access_plan.skip(idx);
+                            }
+                        }
+
+                        // Only attach if we're actually pruning some row groups
+                        if access_plan.row_group_indexes().len() < metadata.num_row_groups {
+                            partitioned_file.extensions = Some(Arc::new(access_plan));
+                        }
+                    }
+                }
+
                 parquet_file_group_vec.push(partitioned_file);
             }
             parquet_file_groups.push(parquet_file_group_vec)
@@ -323,7 +376,6 @@ impl TableProvider for HudiDataSource {
             key_value_metadata: Default::default(),
             crypto: Default::default(),
         };
-        let table_schema = self.schema();
         let mut parquet_source = ParquetSource::new(parquet_opts);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
@@ -351,6 +403,7 @@ impl TableProvider for HudiDataSource {
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         let partition_cols = self.get_partition_columns();
+        let stats_columns = self.get_stats_available_columns();
 
         filters
             .iter()
@@ -361,12 +414,96 @@ impl TableProvider for HudiDataSource {
 
                 // Partition column filters are fully handled by partition pruning
                 if Self::is_partition_column_filter(expr, &partition_cols) {
-                    Ok(TableProviderFilterPushDown::Exact)
-                } else {
-                    Ok(TableProviderFilterPushDown::Inexact)
+                    return Ok(TableProviderFilterPushDown::Exact);
                 }
+
+                // Non-partition filters with column stats can potentially be marked Exact
+                // if Hudi's file pruning can fully evaluate them.
+                // Currently conservative: return Exact only when we have high confidence
+                // that all files have complete statistics for the filter columns.
+                if Self::can_fully_evaluate_with_stats(expr, &stats_columns) {
+                    // When stats-based pruning is enabled and complete, the filter is
+                    // fully handled by Hudi - no post-filtering needed by DataFusion.
+                    return Ok(TableProviderFilterPushDown::Exact);
+                }
+
+                Ok(TableProviderFilterPushDown::Inexact)
             })
             .collect()
+    }
+}
+
+impl HudiDataSource {
+    /// Get columns that have statistics available for pruning.
+    ///
+    /// This currently returns an empty list as the feature requires integration
+    /// with Hudi's metadata table column_stats partition to know which columns
+    /// have complete statistics across all files.
+    fn get_stats_available_columns(&self) -> Vec<String> {
+        // TODO: When metadata table column_stats partition is available:
+        // 1. Check if column_stats partition exists
+        // 2. Query which columns have complete stats coverage
+        // 3. Return those column names
+        //
+        // For now, return empty list to keep conservative Inexact behavior.
+        // This ensures correctness while the metadata table integration is
+        // not yet complete.
+        Vec::new()
+    }
+
+    /// Check if a filter can be fully evaluated using column statistics.
+    ///
+    /// Returns true for simple comparison filters on columns that have
+    /// complete statistics available. The filter must be:
+    /// - A binary comparison (=, !=, <, <=, >, >=) with column and literal
+    /// - A BETWEEN expression on a stats column
+    /// - An AND of filters that can all be fully evaluated
+    fn can_fully_evaluate_with_stats(expr: &Expr, stats_columns: &[String]) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary_expr) => {
+                let op = &binary_expr.op;
+                let left = &binary_expr.left;
+                let right = &binary_expr.right;
+
+                match op {
+                    // AND expressions: fully evaluable if BOTH sides are
+                    Operator::And => {
+                        Self::can_fully_evaluate_with_stats(left, stats_columns)
+                            && Self::can_fully_evaluate_with_stats(right, stats_columns)
+                    }
+                    // OR expressions cannot be fully evaluated with stats
+                    Operator::Or => false,
+                    // Comparison operators: check if column has stats
+                    Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq => {
+                        Self::filter_column_has_stats(left, right, stats_columns)
+                    }
+                    _ => false,
+                }
+            }
+            Expr::Between(between) => {
+                // BETWEEN can be fully evaluated if the column has stats
+                matches!(&*between.expr, Expr::Column(col) if stats_columns.contains(&col.name))
+            }
+            Expr::Not(inner) => Self::can_fully_evaluate_with_stats(inner, stats_columns),
+            _ => false,
+        }
+    }
+
+    /// Check if a binary comparison filter references a column with stats.
+    fn filter_column_has_stats(left: &Expr, right: &Expr, stats_columns: &[String]) -> bool {
+        // Check for pattern: Column op Literal or Literal op Column
+        let col_name = match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(col), Expr::Literal(..)) => Some(&col.name),
+            (Expr::Literal(..), Expr::Column(col)) => Some(&col.name),
+            _ => None,
+        };
+
+        col_name.is_some_and(|name| stats_columns.contains(name))
     }
 }
 

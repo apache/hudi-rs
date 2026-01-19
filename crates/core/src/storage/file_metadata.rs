@@ -17,7 +17,15 @@
  * under the License.
  */
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+use std::collections::HashMap;
+
+use crate::statistics::{ColumnStatistics, StatisticsContainer};
+
+/// Metadata for a data file (base file or log file).
+///
+/// Contains file-level information extracted from the file footer,
+/// including size, record count, and optional column statistics.
+#[derive(Clone, Debug, Default)]
 pub struct FileMetadata {
     /// File name
     pub name: String,
@@ -33,6 +41,18 @@ pub struct FileMetadata {
 
     /// Whether all the properties are populated or not
     pub fully_populated: bool,
+
+    /// Column statistics (min/max) for pruning and query optimization.
+    /// Populated from Parquet footer when column stats are loaded.
+    pub column_statistics: Option<HashMap<String, ColumnStatistics>>,
+
+    /// Row-group level statistics for each row group in the file.
+    /// Each element is a StatisticsContainer for one row group.
+    /// Used for row-group pruning (access plan) decisions.
+    pub row_group_statistics: Option<Vec<StatisticsContainer>>,
+
+    /// Total number of row groups in the file.
+    pub num_row_groups: usize,
 }
 
 impl FileMetadata {
@@ -43,6 +63,9 @@ impl FileMetadata {
             byte_size: 0,
             num_records: 0,
             fully_populated: false,
+            column_statistics: None,
+            row_group_statistics: None,
+            num_row_groups: 0,
         }
     }
 }

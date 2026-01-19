@@ -22,7 +22,7 @@
 use crate::Result;
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, SchemableFilter};
-use crate::statistics::{ColumnStatistics, StatisticsContainer};
+use crate::statistics::ColumnStatistics;
 
 use arrow_array::{ArrayRef, Datum};
 use arrow_ord::cmp;
@@ -83,17 +83,25 @@ impl FilePruner {
         self.and_filters.is_empty()
     }
 
-    /// Returns `true` if the file should be included based on its statistics.
+    /// Returns `true` if the file should be included based on column statistics.
     ///
     /// A file is included if ANY of its rows MIGHT match all the filters.
     /// A file is excluded (pruned) only if we can prove that NO rows can match.
     ///
     /// If statistics are missing or incomplete, the file is included (safe default).
-    pub fn should_include(&self, stats: &StatisticsContainer) -> bool {
+    pub fn should_include(
+        &self,
+        column_stats: Option<&std::collections::HashMap<String, ColumnStatistics>>,
+    ) -> bool {
         // If no filters, include everything
         if self.and_filters.is_empty() {
             return true;
         }
+
+        // If no column stats available, include the file (safe default)
+        let Some(columns) = column_stats else {
+            return true;
+        };
 
         // All filters must pass (AND semantics)
         // If any filter definitively excludes the file, return false
@@ -103,7 +111,7 @@ impl FilePruner {
             // Get column statistics. When using StatisticsContainer::from_parquet_metadata(),
             // all schema columns will have an entry. However, stats may come from other sources
             // (e.g., manually constructed), so we handle missing columns defensively.
-            let Some(col_stats) = stats.columns.get(col_name) else {
+            let Some(col_stats) = columns.get(col_name) else {
                 // No stats for this column, cannot prune - include the file
                 continue;
             };
@@ -267,6 +275,7 @@ impl FilePruner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::statistics::StatisticsContainer;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
@@ -318,7 +327,7 @@ mod tests {
         assert!(pruner.is_empty());
 
         let stats = create_stats_with_int_range("id", 1, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -355,7 +364,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id = 5. Should prune (5 < 10).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -368,7 +377,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id = 200. Should prune (200 > 100).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -381,7 +390,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id = 50. Should include (10 <= 50 <= 100).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -394,7 +403,7 @@ mod tests {
 
         // Stats: min=50, max=50. Filter: id != 50. Should prune (all values are 50).
         let stats = create_stats_with_int_range("id", 50, 50);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -407,7 +416,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id != 50. Should include (has other values).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -420,7 +429,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id < 10. Should prune (min >= 10).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -433,7 +442,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id < 50. Should include (some values < 50).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -446,7 +455,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id <= 5. Should prune (min > 5).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -459,7 +468,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id > 100. Should prune (max <= 100).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -472,7 +481,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id > 50. Should include (some values > 50).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -485,7 +494,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id >= 150. Should prune (max < 150).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -498,7 +507,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id <= 50. Should include (some values <= 50).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -511,7 +520,7 @@ mod tests {
 
         // Stats: min=10, max=100. Filter: id >= 50. Should include (some values >= 50).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -524,11 +533,11 @@ mod tests {
 
         // Stats: min="apple", max="banana". Filter: name = "zebra". Should prune.
         let stats = create_stats_with_string_range("name", "apple", "banana");
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
 
         // Stats: min="apple", max="zebra". Filter: name = "banana". Should include.
         let stats2 = create_stats_with_string_range("name", "apple", "zebra");
-        assert!(pruner.should_include(&stats2));
+        assert!(pruner.should_include(Some(&stats2.columns)));
     }
 
     #[test]
@@ -541,7 +550,7 @@ mod tests {
 
         // Stats for different column - should include (cannot prune without stats)
         let stats = create_stats_with_int_range("other_column", 1, 10);
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -565,7 +574,7 @@ mod tests {
         );
 
         // Should include file (cannot prune without min/max values)
-        assert!(pruner.should_include(&stats));
+        assert!(pruner.should_include(Some(&stats.columns)));
     }
 
     #[test]
@@ -582,6 +591,6 @@ mod tests {
         // Stats: min=10, max=100. Filter: id > 0 AND id < 5.
         // First filter passes (max > 0), second filter prunes (min >= 5).
         let stats = create_stats_with_int_range("id", 10, 100);
-        assert!(!pruner.should_include(&stats));
+        assert!(!pruner.should_include(Some(&stats.columns)));
     }
 }

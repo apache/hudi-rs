@@ -116,8 +116,11 @@ impl FileSlice {
     ///
     /// This only loads metadata for Parquet files. For non-Parquet files (e.g., HFile),
     /// this is a no-op since Parquet-specific metadata reading would fail.
-    /// TODO: see if mdt read would benefit from loading hfile metadata as well.
-    pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
+    pub async fn load_metadata_if_needed(
+        &mut self,
+        storage: &Storage,
+        schema: &arrow_schema::Schema,
+    ) -> Result<()> {
         // Skip non-Parquet files - metadata loading uses Parquet-specific APIs
         if self.base_file.extension != BaseFileFormatValue::Parquet.as_ref() {
             return Ok(());
@@ -130,7 +133,9 @@ impl FileSlice {
         }
 
         let relative_path = self.base_file_relative_path()?;
-        let fetched_metadata = storage.get_file_metadata(&relative_path).await?;
+        let fetched_metadata = storage
+            .get_file_metadata_with_stats(&relative_path, schema)
+            .await?;
         self.base_file.file_metadata = Some(fetched_metadata);
         Ok(())
     }
