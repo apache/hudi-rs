@@ -26,7 +26,7 @@ use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
 use crate::metadata::LAKE_FORMAT_METADATA_DIRS;
 use crate::storage::{Storage, get_leaf_dirs};
-use crate::table::partition::{
+use crate::table::{
     EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX, PartitionPruner, is_table_partitioned,
 };
 use crate::timeline::completion_time::CompletionTimeView;

@@ -35,6 +35,7 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::hfile::{HFileReader, HFileRecord};
+use crate::metadata::NON_PARTITIONED_NAME;
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value as AvroValue;
 use std::collections::HashMap;
@@ -162,7 +163,8 @@ impl FilesPartitionRecord {
 
     /// The key used in metadata table for non-partitioned tables.
     /// The metadata table stores "." for non-partitioned tables, which maps to "" externally.
-    pub const NON_PARTITIONED_NAME: &'static str = ".";
+    /// Uses the shared constant from `crate::metadata::NON_PARTITIONED_NAME`.
+    pub const NON_PARTITIONED_NAME: &'static str = NON_PARTITIONED_NAME;
 
     /// Check if this is an ALL_PARTITIONS record.
     pub fn is_all_partitions(&self) -> bool {
@@ -214,6 +216,146 @@ impl FilesPartitionRecord {
             .sum()
     }
 }
+
+// ============================================================================
+// Column Stats Types
+// ============================================================================
+
+/// Wrapper for values in the column stats Avro union type.
+///
+/// The `minValue` and `maxValue` fields in `HoodieMetadataColumnStats` are union types
+/// that can contain various primitive and logical types. This enum represents all
+/// possible variants for runtime handling.
+///
+/// Maps to the wrapper types in HoodieMetadata.avsc:
+/// - BooleanWrapper, IntWrapper, LongWrapper, FloatWrapper, DoubleWrapper
+/// - BytesWrapper, StringWrapper, DateWrapper, DecimalWrapper
+/// - TimeMicrosWrapper, TimestampMicrosWrapper, LocalDateWrapper, ArrayWrapper
+#[derive(Debug, Clone, PartialEq)]
+pub enum WrappedStatValue {
+    /// Null value (no statistics available)
+    Null,
+    /// Boolean value (from BooleanWrapper)
+    Boolean(bool),
+    /// 32-bit integer (from IntWrapper)
+    Int(i32),
+    /// 64-bit integer (from LongWrapper)
+    Long(i64),
+    /// 32-bit float (from FloatWrapper)
+    Float(f32),
+    /// 64-bit double (from DoubleWrapper)
+    Double(f64),
+    /// UTF-8 string (from StringWrapper)
+    String(String),
+    /// Raw bytes (from BytesWrapper)
+    Bytes(Vec<u8>),
+    /// Date as days since Unix epoch (from DateWrapper)
+    Date(i32),
+    /// Decimal with precision and scale (from DecimalWrapper)
+    /// Note: Schema defines precision=30, scale=15 but actual values may vary
+    Decimal {
+        value: Vec<u8>,
+        precision: u8,
+        scale: i8,
+    },
+    /// Time in microseconds since midnight (from TimeMicrosWrapper)
+    TimeMicros(i64),
+    /// Timestamp in microseconds since Unix epoch (from TimestampMicrosWrapper)
+    TimestampMicros(i64),
+    /// Local date as days since Unix epoch (from LocalDateWrapper)
+    /// Note: Semantically same as Date but from a different wrapper type
+    LocalDate(i32),
+    /// Array of wrapped values (from ArrayWrapper)
+    /// Used for array column statistics
+    Array(Vec<WrappedStatValue>),
+}
+
+/// Value type information from HoodieMetadataColumnStats.
+///
+/// Contains type metadata that helps with proper interpretation of min/max values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueTypeInfo {
+    /// Enum ordinal representing the value type
+    pub type_ordinal: i32,
+    /// Optional additional information about the value type (e.g., timezone for timestamps)
+    pub additional_info: Option<String>,
+}
+
+/// Column statistics record from the metadata table.
+///
+/// Represents a single column's statistics for a specific file.
+/// Maps to `HoodieMetadataColumnStats` in HoodieMetadata.avsc.
+///
+/// The key format in the column_stats partition is:
+/// `COLUMN_HASH + PARTITION_HASH + FILE_HASH` (see `util::hash` module)
+#[derive(Debug, Clone)]
+pub struct ColumnStatsRecord {
+    /// File name this stats entry belongs to
+    pub file_name: String,
+    /// Column name
+    pub column_name: String,
+    /// Minimum value (wrapped in union type)
+    pub min_value: Option<WrappedStatValue>,
+    /// Maximum value (wrapped in union type)
+    pub max_value: Option<WrappedStatValue>,
+    /// Number of values (non-null count + null count)
+    pub value_count: i64,
+    /// Number of null values
+    pub null_count: i64,
+    /// Total size in bytes
+    pub total_size: i64,
+    /// Total uncompressed size in bytes
+    pub total_uncompressed_size: i64,
+    /// Whether this record marks a deletion
+    pub is_deleted: bool,
+    /// Whether the bounds are tight (exact) vs loose (may not be precise)
+    pub is_tight_bound: bool,
+    /// Value type information for proper interpretation of min/max values
+    pub value_type: Option<ValueTypeInfo>,
+}
+
+impl ColumnStatsRecord {
+    /// The partition name in the metadata table for column stats.
+    pub const PARTITION_NAME: &'static str = "column_stats";
+}
+
+/// Partition-level statistics record from the metadata table.
+///
+/// Represents aggregated column statistics for a specific partition.
+/// Uses the same structure as `ColumnStatsRecord` but at partition granularity.
+///
+/// The key format in the partition_stats partition is:
+/// `COLUMN_HASH + PARTITION_HASH` (see `util::hash` module)
+#[derive(Debug, Clone)]
+pub struct PartitionStatsRecord {
+    /// Partition path (e.g., "city=chennai" or "" for non-partitioned)
+    pub partition_path: String,
+    /// Column name
+    pub column_name: String,
+    /// Minimum value across all files in the partition
+    pub min_value: Option<WrappedStatValue>,
+    /// Maximum value across all files in the partition
+    pub max_value: Option<WrappedStatValue>,
+    /// Total value count across all files
+    pub value_count: i64,
+    /// Total null count across all files
+    pub null_count: i64,
+    /// Total size across all files
+    pub total_size: i64,
+    /// Whether this record marks a deletion
+    pub is_deleted: bool,
+    /// Whether the bounds are tight
+    pub is_tight_bound: bool,
+}
+
+impl PartitionStatsRecord {
+    /// The partition name in the metadata table for partition stats.
+    pub const PARTITION_NAME: &'static str = "partition_stats";
+}
+
+// ============================================================================
+// Files Partition Decoding
+// ============================================================================
 
 /// Decode an HFile record value from the files partition using Avro.
 ///
@@ -446,6 +588,470 @@ pub fn get_record_type(avro_value: &AvroValue) -> MetadataRecordType {
     get_avro_int(avro_value, "type")
         .map(MetadataRecordType::from)
         .unwrap_or(MetadataRecordType::Unknown)
+}
+
+// ============================================================================
+// Column Stats Decoding
+// ============================================================================
+
+/// Extract a string from an Avro value (handles union types).
+fn extract_string(value: &AvroValue) -> Option<String> {
+    match value {
+        AvroValue::String(s) => Some(s.clone()),
+        AvroValue::Union(_, inner) => extract_string(inner),
+        _ => None,
+    }
+}
+
+/// Extract an i32 from an Avro value (handles union types).
+fn extract_int(value: &AvroValue) -> Option<i32> {
+    match value {
+        AvroValue::Int(n) => Some(*n),
+        AvroValue::Union(_, inner) => extract_int(inner),
+        _ => None,
+    }
+}
+
+/// Extract a f32 from an Avro value (handles union types).
+#[allow(dead_code)]
+fn extract_float(value: &AvroValue) -> Option<f32> {
+    match value {
+        AvroValue::Float(f) => Some(*f),
+        AvroValue::Union(_, inner) => extract_float(inner),
+        _ => None,
+    }
+}
+
+/// Extract a f64 from an Avro value (handles union types).
+#[allow(dead_code)]
+fn extract_double(value: &AvroValue) -> Option<f64> {
+    match value {
+        AvroValue::Double(d) => Some(*d),
+        AvroValue::Union(_, inner) => extract_double(inner),
+        _ => None,
+    }
+}
+
+/// Extract bytes from an Avro value (handles union types).
+fn extract_bytes(value: &AvroValue) -> Option<Vec<u8>> {
+    match value {
+        AvroValue::Bytes(b) => Some(b.clone()),
+        AvroValue::Union(_, inner) => extract_bytes(inner),
+        _ => None,
+    }
+}
+
+/// Extract a WrappedStatValue from an Avro union type.
+///
+/// The `minValue` and `maxValue` fields in column stats are Avro union types
+/// that can contain various primitive and logical types.
+fn extract_wrapped_value(value: &AvroValue) -> Option<WrappedStatValue> {
+    match value {
+        AvroValue::Null => Some(WrappedStatValue::Null),
+        AvroValue::Boolean(b) => Some(WrappedStatValue::Boolean(*b)),
+        AvroValue::Int(n) => Some(WrappedStatValue::Int(*n)),
+        AvroValue::Long(n) => Some(WrappedStatValue::Long(*n)),
+        AvroValue::Float(f) => Some(WrappedStatValue::Float(*f)),
+        AvroValue::Double(d) => Some(WrappedStatValue::Double(*d)),
+        AvroValue::String(s) => Some(WrappedStatValue::String(s.clone())),
+        AvroValue::Bytes(b) => Some(WrappedStatValue::Bytes(b.clone())),
+        AvroValue::Date(d) => Some(WrappedStatValue::Date(*d)),
+        AvroValue::TimeMicros(t) => Some(WrappedStatValue::TimeMicros(*t)),
+        AvroValue::TimestampMicros(t) => Some(WrappedStatValue::TimestampMicros(*t)),
+        AvroValue::Union(_, inner) => extract_wrapped_value(inner),
+        AvroValue::Array(items) => {
+            // ArrayWrapper contains an array of wrapped values
+            let values: Vec<WrappedStatValue> =
+                items.iter().filter_map(extract_wrapped_value).collect();
+            Some(WrappedStatValue::Array(values))
+        }
+        AvroValue::Record(fields) => {
+            // Handle wrapper records like IntWrapper, BooleanWrapper, etc.
+            // These have a "value" field containing the actual primitive value.
+            // Also handles DecimalWrapper which has value + precision + scale fields.
+            // Also handles ArrayWrapper which has a "wrappedValues" field.
+            extract_value_from_wrapper_record(fields)
+        }
+        _ => None,
+    }
+}
+
+/// Extract a value from an Avro wrapper record structure.
+///
+/// Hudi uses wrapper records like IntWrapper, BooleanWrapper, etc. with a "value" field.
+/// DecimalWrapper is a special case with value, precision, and scale fields.
+/// ArrayWrapper has a "wrappedValues" field containing an array of wrapped values.
+///
+/// Wrapper records in HoodieMetadata.avsc:
+/// - BooleanWrapper { value: boolean }
+/// - IntWrapper { value: int }
+/// - LongWrapper { value: long }
+/// - FloatWrapper { value: float }
+/// - DoubleWrapper { value: double }
+/// - BytesWrapper { value: bytes }
+/// - StringWrapper { value: string }
+/// - DateWrapper { value: int } (date logical type)
+/// - DecimalWrapper { value: bytes, precision: int, scale: int }
+/// - TimeMicrosWrapper { value: long } (time-micros logical type)
+/// - TimestampMicrosWrapper { value: long }
+/// - LocalDateWrapper { value: int }
+/// - ArrayWrapper { wrappedValues: array }
+fn extract_value_from_wrapper_record(fields: &[(String, AvroValue)]) -> Option<WrappedStatValue> {
+    // Check if this is a DecimalWrapper (has precision and scale fields)
+    let has_precision = fields.iter().any(|(n, _)| n == "precision");
+    let has_scale = fields.iter().any(|(n, _)| n == "scale");
+
+    // Check if this is an ArrayWrapper (has wrappedValues field)
+    let has_wrapped_values = fields.iter().any(|(n, _)| n == "wrappedValues");
+
+    if has_precision && has_scale {
+        // DecimalWrapper case
+        let mut value_bytes = None;
+        let mut precision = None;
+        let mut scale = None;
+
+        for (name, val) in fields {
+            match name.as_str() {
+                "value" => value_bytes = extract_bytes(val),
+                "precision" => precision = extract_int(val),
+                "scale" => scale = extract_int(val),
+                _ => {}
+            }
+        }
+
+        match (value_bytes, precision, scale) {
+            (Some(v), Some(p), Some(s)) => Some(WrappedStatValue::Decimal {
+                value: v,
+                precision: p as u8,
+                scale: s as i8,
+            }),
+            _ => None,
+        }
+    } else if has_wrapped_values {
+        // ArrayWrapper case
+        for (name, val) in fields {
+            if name == "wrappedValues" {
+                return extract_array_wrapper(val);
+            }
+        }
+        None
+    } else {
+        // Simple wrapper case - extract the "value" field
+        for (name, val) in fields {
+            if name == "value" {
+                return extract_wrapped_value(val);
+            }
+        }
+        None
+    }
+}
+
+/// Extract an array of wrapped values from an ArrayWrapper's wrappedValues field.
+fn extract_array_wrapper(value: &AvroValue) -> Option<WrappedStatValue> {
+    let items = match value {
+        AvroValue::Array(items) => items,
+        AvroValue::Union(_, inner) => {
+            if let AvroValue::Array(items) = inner.as_ref() {
+                items
+            } else {
+                return None;
+            }
+        }
+        AvroValue::Null => return Some(WrappedStatValue::Array(vec![])),
+        _ => return None,
+    };
+
+    let values: Vec<WrappedStatValue> = items.iter().filter_map(extract_wrapped_value).collect();
+    Some(WrappedStatValue::Array(values))
+}
+
+/// Decode column stats records from an HFile record.
+///
+/// # Arguments
+/// * `reader` - The HFile reader (provides the Avro schema)
+/// * `record` - The HFile record containing the Avro-serialized value
+///
+/// # Returns
+/// A vector of `ColumnStatsRecord` entries (one per file in the record).
+pub fn decode_column_stats_record(
+    reader: &HFileReader,
+    record: &HFileRecord,
+) -> Result<Vec<ColumnStatsRecord>> {
+    let schema = reader
+        .get_avro_schema()
+        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {e}")))?
+        .ok_or_else(|| CoreError::MetadataTable("No Avro schema in HFile".to_string()))?;
+
+    decode_column_stats_record_with_schema(record, schema)
+}
+
+/// Decode column stats records using a provided Avro schema.
+///
+/// The HoodieMetadataRecord has a `columnStatMetadata` field containing
+/// a map of `file_name -> HoodieMetadataColumnStats`.
+pub fn decode_column_stats_record_with_schema(
+    record: &HFileRecord,
+    schema: &AvroSchema,
+) -> Result<Vec<ColumnStatsRecord>> {
+    let value = record.value();
+    if value.is_empty() {
+        return Ok(vec![]); // Tombstone record
+    }
+
+    let avro_value = decode_avro_value(value, schema)?;
+
+    // Verify record type is ColumnStats (type = 3)
+    let record_type = get_record_type(&avro_value);
+    if record_type != MetadataRecordType::ColumnStats {
+        return Err(CoreError::MetadataTable(format!(
+            "Expected ColumnStats record type (3), got {record_type:?}"
+        )));
+    }
+
+    extract_column_stats_metadata(&avro_value)
+}
+
+/// Extract column stats from the columnStatMetadata field.
+fn extract_column_stats_metadata(avro_value: &AvroValue) -> Result<Vec<ColumnStatsRecord>> {
+    let mut records = Vec::new();
+
+    // Find the columnStatMetadata field in the record
+    let stat_metadata = match avro_value {
+        AvroValue::Record(fields) => fields.iter().find_map(|(name, val)| {
+            if name == "columnStatMetadata" {
+                extract_map_from_union(val)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    };
+
+    if let Some(map) = stat_metadata {
+        for (file_name, stats_value) in map {
+            if let Some(stats) = extract_single_column_stats(file_name, stats_value) {
+                records.push(stats);
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+/// Extract a Map from an Avro value that may be wrapped in a Union.
+fn extract_map_from_union(
+    value: &AvroValue,
+) -> Option<&std::collections::HashMap<String, AvroValue>> {
+    match value {
+        AvroValue::Map(map) => Some(map),
+        AvroValue::Union(_, inner) => extract_map_from_union(inner),
+        _ => None,
+    }
+}
+
+/// Extract a single ColumnStatsRecord from an Avro value.
+fn extract_single_column_stats(file_name: &str, value: &AvroValue) -> Option<ColumnStatsRecord> {
+    let fields = match value {
+        AvroValue::Record(f) => f,
+        AvroValue::Union(_, inner) => {
+            if let AvroValue::Record(f) = inner.as_ref() {
+                f
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let mut stats = ColumnStatsRecord {
+        file_name: file_name.to_string(),
+        column_name: String::new(),
+        min_value: None,
+        max_value: None,
+        value_count: 0,
+        null_count: 0,
+        total_size: 0,
+        total_uncompressed_size: 0,
+        is_deleted: false,
+        is_tight_bound: true,
+        value_type: None,
+    };
+
+    for (field_name, field_value) in fields {
+        match field_name.as_str() {
+            "fileName" => {
+                stats.file_name = extract_string(field_value).unwrap_or(file_name.to_string())
+            }
+            "columnName" => stats.column_name = extract_string(field_value).unwrap_or_default(),
+            "minValue" => stats.min_value = extract_wrapped_value(field_value),
+            "maxValue" => stats.max_value = extract_wrapped_value(field_value),
+            "valueCount" => stats.value_count = extract_long(field_value).unwrap_or(0),
+            "nullCount" => stats.null_count = extract_long(field_value).unwrap_or(0),
+            "totalSize" => stats.total_size = extract_long(field_value).unwrap_or(0),
+            "totalUncompressedSize" => {
+                stats.total_uncompressed_size = extract_long(field_value).unwrap_or(0)
+            }
+            "isDeleted" => stats.is_deleted = extract_bool(field_value).unwrap_or(false),
+            "isTightBound" => stats.is_tight_bound = extract_bool(field_value).unwrap_or(true),
+            "valueType" => stats.value_type = extract_value_type_info(field_value),
+            _ => {}
+        }
+    }
+
+    Some(stats)
+}
+
+/// Extract ValueTypeInfo from an Avro value (HoodieValueTypeInfo record).
+fn extract_value_type_info(value: &AvroValue) -> Option<ValueTypeInfo> {
+    let fields = match value {
+        AvroValue::Record(f) => f,
+        AvroValue::Union(_, inner) => {
+            if let AvroValue::Record(f) = inner.as_ref() {
+                f
+            } else {
+                return None;
+            }
+        }
+        AvroValue::Null => return None,
+        _ => return None,
+    };
+
+    let mut type_ordinal = None;
+    let mut additional_info = None;
+
+    for (name, val) in fields {
+        match name.as_str() {
+            "typeOrdinal" => type_ordinal = extract_int(val),
+            "additionalInfo" => additional_info = extract_string(val),
+            _ => {}
+        }
+    }
+
+    type_ordinal.map(|ordinal| ValueTypeInfo {
+        type_ordinal: ordinal,
+        additional_info,
+    })
+}
+
+/// Decode partition stats records from an HFile record.
+///
+/// # Arguments
+/// * `reader` - The HFile reader (provides the Avro schema)
+/// * `record` - The HFile record containing the Avro-serialized value
+///
+/// # Returns
+/// A vector of `PartitionStatsRecord` entries.
+pub fn decode_partition_stats_record(
+    reader: &HFileReader,
+    record: &HFileRecord,
+) -> Result<Vec<PartitionStatsRecord>> {
+    let schema = reader
+        .get_avro_schema()
+        .map_err(|e| CoreError::MetadataTable(format!("Failed to get schema: {e}")))?
+        .ok_or_else(|| CoreError::MetadataTable("No Avro schema in HFile".to_string()))?;
+
+    decode_partition_stats_record_with_schema(record, schema)
+}
+
+/// Decode partition stats records using a provided Avro schema.
+///
+/// Partition stats use the same columnStatMetadata structure as column stats,
+/// but the key format is different (no file hash).
+pub fn decode_partition_stats_record_with_schema(
+    record: &HFileRecord,
+    schema: &AvroSchema,
+) -> Result<Vec<PartitionStatsRecord>> {
+    let value = record.value();
+    if value.is_empty() {
+        return Ok(vec![]); // Tombstone record
+    }
+
+    let avro_value = decode_avro_value(value, schema)?;
+
+    // Verify record type is PartitionStats (type = 6)
+    let record_type = get_record_type(&avro_value);
+    if record_type != MetadataRecordType::PartitionStats {
+        return Err(CoreError::MetadataTable(format!(
+            "Expected PartitionStats record type (6), got {record_type:?}"
+        )));
+    }
+
+    extract_partition_stats_metadata(&avro_value)
+}
+
+/// Extract partition stats from the columnStatMetadata field.
+///
+/// Partition stats use the same Avro schema field as column stats.
+fn extract_partition_stats_metadata(avro_value: &AvroValue) -> Result<Vec<PartitionStatsRecord>> {
+    let mut records = Vec::new();
+
+    // Partition stats also use columnStatMetadata field
+    let stat_metadata = match avro_value {
+        AvroValue::Record(fields) => fields.iter().find_map(|(name, val)| {
+            if name == "columnStatMetadata" {
+                extract_map_from_union(val)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    };
+
+    if let Some(map) = stat_metadata {
+        for (partition_key, stats_value) in map {
+            if let Some(stats) = extract_single_partition_stats(partition_key, stats_value) {
+                records.push(stats);
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+/// Extract a single PartitionStatsRecord from an Avro value.
+fn extract_single_partition_stats(
+    partition_key: &str,
+    value: &AvroValue,
+) -> Option<PartitionStatsRecord> {
+    let fields = match value {
+        AvroValue::Record(f) => f,
+        AvroValue::Union(_, inner) => {
+            if let AvroValue::Record(f) = inner.as_ref() {
+                f
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let mut stats = PartitionStatsRecord {
+        partition_path: partition_key.to_string(),
+        column_name: String::new(),
+        min_value: None,
+        max_value: None,
+        value_count: 0,
+        null_count: 0,
+        total_size: 0,
+        is_deleted: false,
+        is_tight_bound: true,
+    };
+
+    for (field_name, field_value) in fields {
+        match field_name.as_str() {
+            "columnName" => stats.column_name = extract_string(field_value).unwrap_or_default(),
+            "minValue" => stats.min_value = extract_wrapped_value(field_value),
+            "maxValue" => stats.max_value = extract_wrapped_value(field_value),
+            "valueCount" => stats.value_count = extract_long(field_value).unwrap_or(0),
+            "nullCount" => stats.null_count = extract_long(field_value).unwrap_or(0),
+            "totalSize" => stats.total_size = extract_long(field_value).unwrap_or(0),
+            "isDeleted" => stats.is_deleted = extract_bool(field_value).unwrap_or(false),
+            "isTightBound" => stats.is_tight_bound = extract_bool(field_value).unwrap_or(true),
+            _ => {}
+        }
+    }
+
+    Some(stats)
 }
 
 #[cfg(test)]

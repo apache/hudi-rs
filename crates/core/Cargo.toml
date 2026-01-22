@@ -79,6 +79,13 @@ prost = { workspace = true }
 # compression
 flate2 = { workspace = true }
 
+# hashing
+xxhash-rust = { workspace = true }
+md-5 = { workspace = true }
+
+# encoding
+base64 = { workspace = true }
+
 # datafusion
 datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }

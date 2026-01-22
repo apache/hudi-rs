@@ -1162,7 +1162,7 @@ mod tests {
 
     mod test_replaced_file_groups_from_replace_commit {
         use super::super::*;
-        use crate::table::partition::EMPTY_PARTITION_PATH;
+        use crate::table::EMPTY_PARTITION_PATH;
         use serde_json::{Map, Value, json};
 
         #[test]
