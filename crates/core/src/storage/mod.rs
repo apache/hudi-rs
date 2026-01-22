@@ -189,8 +189,20 @@ impl Storage {
         Ok(FileMetadata::new(name.to_string(), meta.size))
     }
 
-    /// Get full file metadata for a Parquet file, including record counts from Parquet metadata.
-    pub async fn get_file_metadata(&self, relative_path: &str) -> Result<FileMetadata> {
+    /// Get file metadata with column statistics from Parquet footer.
+    ///
+    /// This reads the Parquet footer once and extracts both file-level metadata
+    /// (size, record count) and column statistics (min/max per column).
+    /// Used during file pruning when stats are needed.
+    ///
+    /// # Arguments
+    /// * `relative_path` - Relative path to the Parquet file
+    /// * `schema` - Arrow schema to use for extracting statistics
+    pub async fn get_file_metadata_with_stats(
+        &self,
+        relative_path: &str,
+        schema: &arrow_schema::Schema,
+    ) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
@@ -200,21 +212,40 @@ impl Storage {
             .filename()
             .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", &obj_meta)))?;
         let size = obj_meta.size;
+
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-        let parquet_meta = builder.metadata().clone();
+        let parquet_meta = builder.metadata();
+
+        // Extract file-level metadata
         let num_records = parquet_meta.file_metadata().num_rows();
-        let size_bytes = parquet_meta
+        let byte_size = parquet_meta
             .row_groups()
             .iter()
             .map(|rg| rg.total_byte_size())
             .sum::<i64>();
+
+        // Extract file-level column statistics (aggregated from row groups)
+        let file_stats = StatisticsContainer::from_parquet_metadata(parquet_meta, schema);
+
+        // Extract row-group level statistics
+        let row_group_stats: Vec<StatisticsContainer> = parquet_meta
+            .row_groups()
+            .iter()
+            .map(|rg| StatisticsContainer::from_row_group(rg, schema))
+            .collect();
+
+        let num_row_groups = parquet_meta.num_row_groups();
+
         Ok(FileMetadata {
             name: file_name.to_string(),
             size,
-            byte_size: size_bytes,
+            byte_size,
             num_records,
             fully_populated: true,
+            column_statistics: Some(file_stats.columns),
+            row_group_statistics: Some(row_group_stats),
+            num_row_groups,
         })
     }
 
@@ -237,23 +268,6 @@ impl Storage {
             parquet_meta.file_metadata().schema_descr(),
             None,
         )?)
-    }
-
-    /// Get column statistics for a Parquet file.
-    ///
-    /// # Arguments
-    /// * `relative_path` - Relative path to the Parquet file
-    /// * `schema` - Arrow schema to use for extracting statistics
-    pub async fn get_parquet_column_stats(
-        &self,
-        relative_path: &str,
-        schema: &arrow_schema::Schema,
-    ) -> Result<StatisticsContainer> {
-        let parquet_meta = self.get_parquet_file_metadata(relative_path).await?;
-        Ok(StatisticsContainer::from_parquet_metadata(
-            &parquet_meta,
-            schema,
-        ))
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
@@ -544,21 +558,29 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect();
-        assert_eq!(file_info_1, vec![FileMetadata::new("a.parquet", 0)]);
+        assert_eq!(file_info_1.len(), 1);
+        assert_eq!(file_info_1[0].name, "a.parquet");
+        assert_eq!(file_info_1[0].size, 0);
+
         let file_info_2: Vec<FileMetadata> = storage
             .list_files(Some("part1"))
             .await
             .unwrap()
             .into_iter()
             .collect();
-        assert_eq!(file_info_2, vec![FileMetadata::new("b.parquet", 0)],);
+        assert_eq!(file_info_2.len(), 1);
+        assert_eq!(file_info_2[0].name, "b.parquet");
+        assert_eq!(file_info_2[0].size, 0);
+
         let file_info_3: Vec<FileMetadata> = storage
             .list_files(Some("part2/part22"))
             .await
             .unwrap()
             .into_iter()
             .collect();
-        assert_eq!(file_info_3, vec![FileMetadata::new("c.parquet", 0)],);
+        assert_eq!(file_info_3.len(), 1);
+        assert_eq!(file_info_3[0].name, "c.parquet");
+        assert_eq!(file_info_3[0].size, 0);
     }
 
     #[tokio::test]
@@ -569,10 +591,12 @@ mod tests {
         .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
 
-        let files = storage.list_files(None).await.unwrap();
+        let files: Vec<FileMetadata> = storage.list_files(None).await.unwrap().into_iter().collect();
 
         assert!(!files.iter().any(|f| f.name.ends_with(".crc")));
-        assert_eq!(files, vec![FileMetadata::new("a.parquet", 0)]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "a.parquet");
+        assert_eq!(files[0].size, 0);
     }
 
     #[tokio::test]

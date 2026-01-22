@@ -178,23 +178,25 @@ impl FileSystemView {
                     continue;
                 }
 
-                // Load column stats from Parquet footer
-                let stats = match self
+                // Load file metadata with column stats from Parquet footer
+                let metadata = match self
                     .storage
-                    .get_parquet_column_stats(&relative_path, table_schema)
+                    .get_file_metadata_with_stats(&relative_path, table_schema)
                     .await
                 {
-                    Ok(s) => s,
+                    Ok(m) => m,
                     Err(e) => {
                         log::warn!(
-                            "Failed to load column stats for {relative_path}: {e}. Including file."
+                            "Failed to load file metadata for {relative_path}: {e}. Including file."
                         );
                         retained.push(fg);
                         continue;
                     }
                 };
 
-                if file_pruner.should_include(&stats) {
+                if file_pruner.should_include(metadata.column_statistics.as_ref()) {
+                    // Store the loaded metadata in the BaseFile for later use by DataFusion
+                    fsl.base_file.file_metadata = Some(metadata);
                     retained.push(fg);
                 } else {
                     log::debug!("Pruned file {relative_path} based on column stats");
@@ -214,6 +216,7 @@ impl FileSystemView {
         &self,
         partition_pruner: &PartitionPruner,
         timeline_view: &TimelineView,
+        table_schema: &Schema,
     ) -> Result<Vec<FileSlice>> {
         let timestamp = timeline_view.as_of_timestamp();
         let excluding_file_groups = timeline_view.excluding_file_groups();
@@ -229,7 +232,8 @@ impl FileSystemView {
                     continue;
                 }
                 if let Some(fsl) = fg.get_file_slice_mut_as_of(timestamp) {
-                    fsl.load_metadata_if_needed(&self.storage).await?;
+                    fsl.load_metadata_if_needed(&self.storage, table_schema)
+                        .await?;
                     file_slices.push(fsl.clone());
                 }
             }
@@ -278,7 +282,7 @@ impl FileSystemView {
         )
         .await?;
 
-        self.collect_file_slices(partition_pruner, timeline_view)
+        self.collect_file_slices(partition_pruner, timeline_view, table_schema)
             .await
     }
 
@@ -309,7 +313,7 @@ impl FileSystemView {
         )
         .await?;
 
-        self.collect_file_slices(partition_pruner, timeline_view)
+        self.collect_file_slices(partition_pruner, timeline_view, table_schema)
             .await
     }
 }
