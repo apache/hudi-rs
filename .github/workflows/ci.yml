@@ -152,21 +152,29 @@ jobs:
 
   integration-tests:
     strategy:
-        fail-fast: false
-        matrix:
-          app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
+      fail-fast: false
+      matrix:
+        app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust', 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Pull pre-built runner image
+        run: |
+          docker pull andreab92/hudi-demo-runner:latest
+          docker tag andreab92/hudi-demo-runner:latest demo-runner:latest
+
       - name: Pre-pull base images
         run: |
           docker pull quay.io/minio/minio:latest
+
       - name: Prepare cache directories with correct permissions
         run: |
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
           sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
+
       - name: Cache integration build artifacts (cargo/target/uv)
         uses: actions/cache@v5
         with:
@@ -176,13 +184,16 @@ jobs:
             .cargo/git
             python/target
             .uv-cache
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
+          key: integration-${{ runner.os }}-${{ matrix.app-path }}-${{ hashFiles('**/Cargo.lock', 'python/Cargo.toml', 'demo/infra/runner/Dockerfile') }}
           restore-keys: |
+            integration-${{ runner.os }}-${{ matrix.app-path }}-
             integration-${{ runner.os }}-
+
       - name: Integration test - ${{ matrix.app-path }}
         run: |
           cd demo
           ./ci_run.sh ${{ matrix.app-path }}
+
       - name: Fix cache ownership before save
         if: always()
         run: |

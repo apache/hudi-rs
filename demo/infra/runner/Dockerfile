@@ -19,12 +19,13 @@ FROM rust:1.87
 
 RUN apt-get update && apt-get install -y cmake curl ca-certificates
 
+# Install uv to a globally accessible location (not /root/.local/bin)
+# This allows the container to run as any user (HOST_UID:HOST_GID)
 ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN UV_INSTALL_DIR=/usr/local/bin sh /uv-installer.sh && rm /uv-installer.sh
 
-RUN sh /uv-installer.sh && rm /uv-installer.sh
-
-ENV PATH="/root/.local/bin/:$PATH"
-
+# Install Python to a shared location accessible by any user
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
 RUN uv python install 3.13
 
 RUN uv python list
@@ -35,6 +36,10 @@ ENV VIRTUAL_ENV=/opt/.venv
 ENV PATH="/opt/.venv/bin:$PATH"
 
 RUN uv pip install --only-binary=all 'pyarrow==20.0.0'
+
+# Make Python installation and venv accessible to any user (needed for HOST_UID:HOST_GID mapping)
+# Python needs read+execute, venv needs read+write+execute for pip install
+RUN chmod -R a+rX /opt/python && chmod -R a+rwX /opt/.venv
 
 WORKDIR /opt
 
