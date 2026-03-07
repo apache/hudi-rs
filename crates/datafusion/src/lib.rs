@@ -324,7 +324,8 @@ impl TableProvider for HudiDataSource {
             crypto: Default::default(),
         };
         let table_schema = self.schema();
-        let mut parquet_source = ParquetSource::new(parquet_opts);
+        let mut parquet_source =
+            ParquetSource::new(table_schema.clone()).with_table_parquet_options(parquet_opts);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
@@ -337,9 +338,9 @@ impl TableProvider for HudiDataSource {
             .map(FileGroup::from)
             .collect();
 
-        let fsc = FileScanConfigBuilder::new(url, table_schema, Arc::new(parquet_source))
+        let fsc = FileScanConfigBuilder::new(url, Arc::new(parquet_source))
             .with_file_groups(file_groups)
-            .with_projection_indices(projection.cloned())
+            .with_projection_indices(projection.cloned())?
             .with_limit(limit)
             .build();
 

@@ -49,7 +49,10 @@ impl HudiDataFusionDataSource {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
+        use datafusion::prelude::SessionContext;
+        use datafusion_ffi::execution::FFI_TaskContextProvider;
         use datafusion_ffi::table_provider::FFI_TableProvider;
+        use datafusion::execution::TaskContextProvider;
         use std::ffi::CString;
         use std::sync::Arc;
         let capsule_name = CString::new("datafusion_table_provider").map_err(|e| {
@@ -59,8 +62,13 @@ impl HudiDataFusionDataSource {
         // Clone the inner data source and wrap it in an Arc
         let provider = Arc::new(self.table.clone());
 
+        // Create a session context to provide TaskContextProvider
+        let ctx = Arc::new(SessionContext::new());
+        let task_ctx_provider: Arc<dyn TaskContextProvider> = ctx;
+        let ffi_task_ctx = FFI_TaskContextProvider::from(&task_ctx_provider);
+
         // Create the FFI wrapper
-        let ffi_provider = FFI_TableProvider::new(provider, false, None);
+        let ffi_provider = FFI_TableProvider::new(provider, false, None, ffi_task_ctx, None);
 
         // Create and return the PyCapsule
         PyCapsule::new(py, ffi_provider, Some(capsule_name))
