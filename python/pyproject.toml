@@ -23,12 +23,11 @@ build-backend = "maturin"
 name = "hudi"
 description = "Native Python binding for Apache Hudi, based on hudi-rs."
 urls = { repository = "https://github.com/apache/hudi-rs/tree/main/python/" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 license = "Apache-2.0"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -53,14 +52,14 @@ lint = [
     "mypy==1.19.1",   
 ]
 datafusion = [
-    "datafusion==50.1.0",
+    "datafusion==52.0.0",
 ]
 
 [tool.maturin]
 module-name = "hudi._internal"
 
 [tool.ruff]
-target-version = 'py39'
+target-version = 'py310'
 # Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
 lint.select = [
     "E4",

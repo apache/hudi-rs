@@ -55,11 +55,11 @@ apache-avro = { version = "0.21", features = ["derive"] }
 apache-avro-derive = { version = "0.21" }
 
 # datafusion
-datafusion = { version = "51" }
-datafusion-expr = { version = "51" }
-datafusion-common = { version = "51" }
-datafusion-physical-expr = { version = "51" }
-datafusion-ffi = { version = "51" }
+datafusion = { version = "52" }
+datafusion-expr = { version = "52" }
+datafusion-common = { version = "52" }
+datafusion-physical-expr = { version = "52" }
+datafusion-ffi = { version = "52" }
 
 # serde
 percent-encoding = { version = "2" }
@@ -87,7 +87,7 @@ futures = { version = "0.3" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # protobuf
-prost = { version = "0.13" }
+prost = { version = "0.14" }
 
 # compression
 flate2 = { version = "1" }
@@ -95,4 +95,4 @@ flate2 = { version = "1" }
 # testing
 serial_test = { version = "3" }
 tempfile = { version = "3" }
-zip-extract = { version = "0.3" }
+zip = { version = "4", default-features = false, features = ["deflate"] }

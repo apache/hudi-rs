@@ -24,13 +24,17 @@ use std::path::{Path, PathBuf};
 use strum_macros::{AsRefStr, EnumIter, EnumString};
 use tempfile::tempdir;
 use url::Url;
+use zip::ZipArchive;
 
 pub mod util;
 
 pub fn extract_test_table(zip_path: &Path) -> PathBuf {
     let target_dir = tempdir().unwrap().path().to_path_buf();
     let archive = fs::read(zip_path).unwrap();
-    zip_extract::extract(Cursor::new(archive), &target_dir, false).unwrap();
+    ZipArchive::new(Cursor::new(archive))
+        .unwrap()
+        .extract(&target_dir)
+        .unwrap();
     target_dir
 }
 

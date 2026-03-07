@@ -46,7 +46,7 @@ use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::read::HudiReadConfig::InputPartitions;
+use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::Table as HudiTable;
@@ -288,11 +288,34 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
+        // Only support COW tables, or MOR tables with read-optimized mode enabled.
+        if self.table.is_mor() {
+            let use_read_optimized: bool = self
+                .table
+                .hudi_configs
+                .get_or_default(UseReadOptimizedMode)
+                .into();
+            if !use_read_optimized {
+                return Err(Execution(
+                    "MOR table is not supported without read-optimized mode. \
+                     Set hoodie.read.use.read_optimized.mode=true to read only base files."
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Resolve input partitions: use Hudi config if set, otherwise fall back
+        // to DataFusion's target_partitions (defaults to number of CPU cores).
+        let input_partitions = match self.get_input_partitions() {
+            0 => state.config_options().execution.target_partitions,
+            n => n,
+        };
+
         // Convert Datafusion `Expr` to `Filter`
         let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
-            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
+            .get_file_slices_splits(input_partitions, pushdown_filters)
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let base_url = self.table.base_url();
@@ -324,7 +347,11 @@ impl TableProvider for HudiDataSource {
             crypto: Default::default(),
         };
         let table_schema = self.schema();
-        let mut parquet_source = ParquetSource::new(parquet_opts);
+        let mut parquet_source = ParquetSource::new(table_schema.clone())
+            .with_table_parquet_options(parquet_opts)
+            .with_pushdown_filters(true)
+            .with_reorder_filters(true)
+            .with_enable_page_index(true);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
@@ -337,9 +364,9 @@ impl TableProvider for HudiDataSource {
             .map(FileGroup::from)
             .collect();
 
-        let fsc = FileScanConfigBuilder::new(url, table_schema, Arc::new(parquet_source))
+        let fsc = FileScanConfigBuilder::new(url, Arc::new(parquet_source))
             .with_file_groups(file_groups)
-            .with_projection_indices(projection.cloned())
+            .with_projection_indices(projection.cloned())?
             .with_limit(limit)
             .build();
 

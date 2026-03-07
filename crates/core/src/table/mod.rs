@@ -1051,6 +1051,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn hudi_table_get_schema_from_empty_table_without_create_schema() {
         let table = get_test_table_without_validation("table_props_no_create_schema");
 
@@ -1135,6 +1136,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn validate_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
@@ -1187,6 +1189,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn get_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
@@ -1209,6 +1212,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn get_default_for_invalid_table_props() {
         let table = get_test_table_without_validation("table_props_invalid");
         let configs = table.hudi_configs;
@@ -1240,6 +1244,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn get_valid_table_props() {
         let table = get_test_table_without_validation("table_props_valid");
         let configs = table.hudi_configs;
