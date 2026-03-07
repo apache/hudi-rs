@@ -288,11 +288,18 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
+        // Resolve input partitions: use Hudi config if set, otherwise fall back
+        // to DataFusion's target_partitions (defaults to number of CPU cores).
+        let input_partitions = match self.get_input_partitions() {
+            0 => state.config_options().execution.target_partitions,
+            n => n,
+        };
+
         // Convert Datafusion `Expr` to `Filter`
         let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
-            .get_file_slices_splits(self.get_input_partitions(), pushdown_filters)
+            .get_file_slices_splits(input_partitions, pushdown_filters)
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let base_url = self.table.base_url();
@@ -324,8 +331,11 @@ impl TableProvider for HudiDataSource {
             crypto: Default::default(),
         };
         let table_schema = self.schema();
-        let mut parquet_source =
-            ParquetSource::new(table_schema.clone()).with_table_parquet_options(parquet_opts);
+        let mut parquet_source = ParquetSource::new(table_schema.clone())
+            .with_table_parquet_options(parquet_opts)
+            .with_pushdown_filters(true)
+            .with_reorder_filters(true)
+            .with_enable_page_index(true);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;

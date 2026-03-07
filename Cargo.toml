@@ -95,4 +95,4 @@ flate2 = { version = "1" }
 # testing
 serial_test = { version = "3" }
 tempfile = { version = "3" }
-zip-extract = { version = "0.4" }
+zip = { version = "4", default-features = false, features = ["deflate"] }

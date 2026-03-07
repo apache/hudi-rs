@@ -49,10 +49,10 @@ impl HudiDataFusionDataSource {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
+        use datafusion::execution::TaskContextProvider;
         use datafusion::prelude::SessionContext;
         use datafusion_ffi::execution::FFI_TaskContextProvider;
         use datafusion_ffi::table_provider::FFI_TableProvider;
-        use datafusion::execution::TaskContextProvider;
         use std::ffi::CString;
         use std::sync::Arc;
         let capsule_name = CString::new("datafusion_table_provider").map_err(|e| {

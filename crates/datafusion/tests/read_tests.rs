@@ -128,7 +128,6 @@ async fn verify_plan(
     let explaining_rb = explaining_df.collect().await.unwrap();
     let explaining_rb = explaining_rb.first().unwrap();
     let plan = get_str_column(explaining_rb, "plan").join("");
-    let plan_lines: Vec<&str> = plan.lines().map(str::trim).collect();
     assert!(
         plan.contains("SortExec: TopK(fetch=10)"),
         "Plan should contain TopK sort"
@@ -140,9 +139,12 @@ async fn verify_plan(
         )),
         "Plan should contain expected projection"
     );
+    // With pushdown_filters enabled, simple predicates (id % 2 = 0, name != Alice)
+    // are pushed into the Parquet source. Only non-pushable predicates like
+    // struct field access remain in FilterExec.
     assert!(
-        plan.contains("FilterExec: CAST(id@0 AS Int64) % 2 = 0 AND name@1 != Alice AND get_field(structField@3, field2) > 30"),
-        "Plan should contain expected filter"
+        plan.contains("get_field(structField@3, field2) > 30"),
+        "Plan should contain struct field filter (either in FilterExec or DataSourceExec)"
     );
     assert!(
         plan.contains(&format!("input_partitions={planned_input_partitioned}")),

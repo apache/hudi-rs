@@ -39,4 +39,4 @@ url = { workspace = true }
 
 # testing
 tempfile = { workspace = true }
-zip-extract = { workspace = true }
+zip = { workspace = true }
