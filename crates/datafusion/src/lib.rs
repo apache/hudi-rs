@@ -46,7 +46,7 @@ use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::read::HudiReadConfig::InputPartitions;
+use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::config::util::empty_options;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::Table as HudiTable;
@@ -287,6 +287,22 @@ impl TableProvider for HudiDataSource {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
+
+        // Only support COW tables, or MOR tables with read-optimized mode enabled.
+        if self.table.is_mor() {
+            let use_read_optimized: bool = self
+                .table
+                .hudi_configs
+                .get_or_default(UseReadOptimizedMode)
+                .into();
+            if !use_read_optimized {
+                return Err(Execution(
+                    "MOR table is not supported without read-optimized mode. \
+                     Set hoodie.read.use.read_optimized.mode=true to read only base files."
+                        .to_string(),
+                ));
+            }
+        }
 
         // Resolve input partitions: use Hudi config if set, otherwise fall back
         // to DataFusion's target_partitions (defaults to number of CPU cores).
