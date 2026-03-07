@@ -59,7 +59,7 @@ datafusion = { version = "52" }
 datafusion-expr = { version = "52" }
 datafusion-common = { version = "52" }
 datafusion-physical-expr = { version = "52" }
-datafusion-ffi = { version = "=52.0.0" }
+datafusion-ffi = { version = "52" }
 
 # serde
 percent-encoding = { version = "2" }
