@@ -17,10 +17,43 @@
  * under the License.
  */
 
+use std::sync::Arc;
+
+use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
+use datafusion_ffi::table_provider::FFI_TableProvider;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyCapsule, PyCapsuleMethods};
+
 use crate::internal::{PythonError, rt};
 use hudi::HudiDataSource as InternalDataFusionHudiDataSource;
-use pyo3::{Bound, types::PyCapsule};
-use pyo3::{PyErr, PyResult, Python, pyclass, pymethods};
+
+/// Extract the `FFI_LogicalExtensionCodec` from a DataFusion session object.
+///
+/// The session object is expected to have a `__datafusion_logical_extension_codec__`
+/// method that returns a PyCapsule containing the codec.
+fn extract_codec(session: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
+    let capsule_obj = if session.hasattr("__datafusion_logical_extension_codec__")? {
+        session
+            .getattr("__datafusion_logical_extension_codec__")?
+            .call0()?
+    } else {
+        session
+    };
+    let capsule = capsule_obj.downcast::<PyCapsule>()?;
+    if let Some(name) = capsule.name()? {
+        let name = name
+            .to_str()
+            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        if name != "datafusion_logical_extension_codec" {
+            return Err(PyValueError::new_err(format!(
+                "Expected PyCapsule name 'datafusion_logical_extension_codec', got '{name}'"
+            )));
+        }
+    }
+    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+    Ok(codec.clone())
+}
 
 #[cfg(not(tarpaulin_include))]
 #[pyclass(name = "HudiDataFusionDataSource")]
@@ -44,33 +77,14 @@ impl HudiDataFusionDataSource {
         Ok(HudiDataFusionDataSource { table: inner })
     }
 
-    #[pyo3(signature = ())]
     fn __datafusion_table_provider__<'py>(
         &self,
         py: Python<'py>,
+        session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        use datafusion::execution::TaskContextProvider;
-        use datafusion::prelude::SessionContext;
-        use datafusion_ffi::execution::FFI_TaskContextProvider;
-        use datafusion_ffi::table_provider::FFI_TableProvider;
-        use std::ffi::CString;
-        use std::sync::Arc;
-        let capsule_name = CString::new("datafusion_table_provider").map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid capsule name: {e}"))
-        })?;
-
-        // Clone the inner data source and wrap it in an Arc
         let provider = Arc::new(self.table.clone());
-
-        // Create a session context to provide TaskContextProvider
-        let ctx = Arc::new(SessionContext::new());
-        let task_ctx_provider: Arc<dyn TaskContextProvider> = ctx;
-        let ffi_task_ctx = FFI_TaskContextProvider::from(&task_ctx_provider);
-
-        // Create the FFI wrapper
-        let ffi_provider = FFI_TableProvider::new(provider, false, None, ffi_task_ctx, None);
-
-        // Create and return the PyCapsule
-        PyCapsule::new(py, ffi_provider, Some(capsule_name))
+        let codec = extract_codec(session)?;
+        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(provider, false, None, codec);
+        PyCapsule::new(py, ffi_provider, Some(cr"datafusion_table_provider".into()))
     }
 }
