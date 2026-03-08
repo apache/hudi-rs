@@ -30,23 +30,22 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// Resolves the [`arrow_schema::Schema`] for a given Hudi table.
+/// Resolves the data [`arrow_schema::Schema`] for a given Hudi table, without Hudi meta fields.
 ///
 /// The resolution process follows these steps:
 /// - If the timeline has commit metadata, read the schema field from it.
 ///   - If the commit metadata has no schema, read the schema from the base file pointed by the first entry in the write-status of the commit metadata.
 /// - If the timeline has no commit metadata, read [`HudiTableConfig::CreateSchema`] from `hoodie.properties`.
-pub async fn resolve_schema(table: &Table) -> Result<Schema> {
+pub async fn resolve_data_schema(table: &Table) -> Result<Schema> {
     let timeline = table.get_timeline();
     match timeline.get_latest_commit_metadata().await {
         Ok(metadata) => {
-            resolve_schema_from_commit_metadata(&metadata, timeline.storage.clone()).await
+            resolve_data_schema_from_commit_metadata(&metadata, timeline.storage.clone()).await
         }
         Err(CoreError::TimelineNoCommit) => {
             if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
                 let avro_schema_str: String = create_schema.into();
-                let arrow_schema = arrow_schema_from_avro_schema_str(&avro_schema_str)?;
-                prepend_meta_fields(SchemaRef::new(arrow_schema))
+                arrow_schema_from_avro_schema_str(&avro_schema_str)
             } else {
                 Err(CoreError::SchemaNotFound(
                     "No completed commit, and no create schema for the table.".to_string(),
@@ -55,6 +54,12 @@ pub async fn resolve_schema(table: &Table) -> Result<Schema> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Resolves the [`arrow_schema::Schema`] for a given Hudi table, with Hudi meta fields prepended.
+pub async fn resolve_schema(table: &Table) -> Result<Schema> {
+    let data_schema = resolve_data_schema(table).await?;
+    prepend_meta_fields(SchemaRef::new(data_schema))
 }
 
 /// Resolves the [`apache_avro::schema::Schema`] as a [`String`] for a given Hudi table.
@@ -85,7 +90,7 @@ pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
     }
 }
 
-pub(crate) async fn resolve_schema_from_commit_metadata(
+pub(crate) async fn resolve_data_schema_from_commit_metadata(
     commit_metadata: &Map<String, Value>,
     storage: Arc<Storage>,
 ) -> Result<Schema> {
@@ -97,8 +102,7 @@ pub(crate) async fn resolve_schema_from_commit_metadata(
         Err(e) => return Err(e),
     };
 
-    let arrow_schema = arrow_schema_from_avro_schema_str(&avro_schema_str)?;
-    prepend_meta_fields(SchemaRef::new(arrow_schema))
+    arrow_schema_from_avro_schema_str(&avro_schema_str)
 }
 
 pub(crate) fn resolve_avro_schema_from_commit_metadata(

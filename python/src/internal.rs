@@ -318,10 +318,10 @@ impl HudiTable {
         self.inner.timezone()
     }
 
-    fn get_avro_schema(&self, py: Python) -> PyResult<String> {
+    fn get_schema_in_avro_str(&self, py: Python) -> PyResult<String> {
         py.detach(|| {
             let avro_schema = rt()
-                .block_on(self.inner.get_avro_schema())
+                .block_on(self.inner.get_schema_in_avro_str())
                 .map_err(PythonError::from)?;
             Ok(avro_schema)
         })
