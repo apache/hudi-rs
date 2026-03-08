@@ -346,7 +346,7 @@ mod tests {
             .unwrap();
         let partition_pruner = PartitionPruner::empty();
         let file_pruner = FilePruner::empty();
-        let table_schema = hudi_table.get_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema(false).await.unwrap();
 
         let file_slices = fs_view
             .get_file_slices(
@@ -387,7 +387,7 @@ mod tests {
             .unwrap();
         let partition_pruner = PartitionPruner::empty();
         let file_pruner = FilePruner::empty();
-        let table_schema = hudi_table.get_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema(false).await.unwrap();
 
         let file_slices = fs_view
             .get_file_slices(
@@ -427,7 +427,7 @@ mod tests {
             .await
             .unwrap();
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
-        let table_schema = hudi_table.get_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema(false).await.unwrap();
 
         let filter_lt_20 = Filter::try_from(("byteField", "<", "20")).unwrap();
         let filter_eq_300 = Filter::try_from(("shortField", "=", "300")).unwrap();

@@ -318,17 +318,19 @@ impl HudiTable {
         self.inner.timezone()
     }
 
-    fn get_avro_schema(&self, py: Python) -> PyResult<String> {
+    #[pyo3(signature = (includes_meta_fields=false))]
+    fn get_schema_in_avro_str(&self, py: Python, includes_meta_fields: bool) -> PyResult<String> {
         py.detach(|| {
             let avro_schema = rt()
-                .block_on(self.inner.get_avro_schema())
+                .block_on(self.inner.get_schema_in_avro_str(includes_meta_fields))
                 .map_err(PythonError::from)?;
             Ok(avro_schema)
         })
     }
 
-    fn get_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
-        rt().block_on(self.inner.get_schema())
+    #[pyo3(signature = (includes_meta_fields=false))]
+    fn get_schema(&self, py: Python, includes_meta_fields: bool) -> PyResult<Py<PyAny>> {
+        rt().block_on(self.inner.get_schema(includes_meta_fields))
             .map_err(PythonError::from)?
             .to_pyarrow(py)
             .map(|b| b.unbind())

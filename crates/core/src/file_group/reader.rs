@@ -93,21 +93,25 @@ impl FileGroupReader {
         K: AsRef<str>,
         V: Into<String>,
     {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(async {
-                let mut resolver = OptionResolver::new_with_options(base_uri, options);
-                resolver.resolve_options().await?;
-                let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
-                let storage =
-                    Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+        let init = async {
+            let mut resolver = OptionResolver::new_with_options(base_uri, options);
+            resolver.resolve_options().await?;
+            let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
+            let storage =
+                Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
 
-                Ok(Self {
-                    hudi_configs,
-                    storage,
-                })
+            Ok(Self {
+                hudi_configs,
+                storage,
             })
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(init)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(init),
+        }
     }
 
     /// Reads the data from the base file at the given relative path.
@@ -128,17 +132,6 @@ impl FileGroupReader {
             .await?;
 
         apply_commit_time_filter(&self.hudi_configs, records)
-    }
-
-    /// Same as [FileGroupReader::read_file_slice_by_base_file_path], but blocking.
-    pub fn read_file_slice_by_base_file_path_blocking(
-        &self,
-        relative_path: &str,
-    ) -> Result<RecordBatch> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_file_slice_by_base_file_path(relative_path))
     }
 
     fn create_instant_range_for_log_file_scan(&self) -> InstantRange {
@@ -177,14 +170,6 @@ impl FileGroupReader {
         };
         self.read_file_slice_from_paths(&base_file_path, log_file_paths)
             .await
-    }
-
-    /// Same as [FileGroupReader::read_file_slice], but blocking.
-    pub fn read_file_slice_blocking(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_file_slice(file_slice))
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -246,22 +231,6 @@ impl FileGroupReader {
             let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
             merger.merge_record_batches(all_batches)
         }
-    }
-
-    /// Same as [FileGroupReader::read_file_slice_from_paths], but blocking.
-    pub fn read_file_slice_from_paths_blocking<I, S>(
-        &self,
-        base_file_path: &str,
-        log_file_paths: I,
-    ) -> Result<RecordBatch>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.read_file_slice_from_paths(base_file_path, log_file_paths))
     }
 
     // =========================================================================
@@ -795,8 +764,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_with_base_file_only() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_read_file_slice_from_paths_with_base_file_only() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
@@ -804,7 +773,7 @@ mod tests {
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths: Vec<&str> = vec![];
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
 
         match result {
             Ok(batch) => {
@@ -821,8 +790,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_read_optimized_mode() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_read_file_slice_from_paths_read_optimized_mode() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(
             &base_uri,
@@ -832,7 +801,7 @@ mod tests {
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
 
         // In read-optimized mode, log files should be ignored
         // This should behave the same as read_file_slice_by_base_file_path
@@ -853,15 +822,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
 
         // The actual file reading might fail due to missing test data, which is expected
         match result {
@@ -881,8 +850,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_from_paths_error_handling() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_read_file_slice_from_paths_error_handling() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
@@ -890,7 +859,7 @@ mod tests {
         let base_file_path = "non_existent_file.parquet";
         let log_file_paths: Vec<&str> = vec![];
 
-        let result = reader.read_file_slice_from_paths_blocking(base_file_path, log_file_paths);
+        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
 
         assert!(result.is_err(), "Should return error for non-existent file");
 
@@ -903,8 +872,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_file_slice_blocking() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_read_file_slice() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options())?;
 
@@ -912,8 +881,8 @@ mod tests {
         let base_file = BaseFile::from_str(TEST_SAMPLE_BASE_FILE)?;
         let file_slice = FileSlice::new(base_file, String::new()); // empty partition path
 
-        // Call read_file_slice_blocking
-        let result = reader.read_file_slice_blocking(&file_slice);
+        // Call read_file_slice
+        let result = reader.read_file_slice(&file_slice).await;
 
         match result {
             Ok(batch) => {

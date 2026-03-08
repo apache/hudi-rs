@@ -196,11 +196,9 @@ mod v6_tests {
             HudiDataSource::new_with_options(V6Empty.path_to_cow().as_str(), empty_options())
                 .await
                 .unwrap();
+        // schema() returns data schema without meta fields
         let schema = table_provider.schema();
-        assert_arrow_field_names_eq!(
-            schema,
-            [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
-        );
+        assert_arrow_field_names_eq!(schema, vec!["id", "name", "isActive"]);
     }
 
     #[tokio::test]

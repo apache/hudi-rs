@@ -36,8 +36,11 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// use hudi_core::config::internal::HudiInternalConfig::SkipConfigValidation;
 /// use hudi_core::table::Table as HudiTable;
 ///
+/// # #[tokio::main]
+/// # async fn main() {
 /// let options = [(SkipConfigValidation, "true")];
-/// HudiTable::new_with_options_blocking("/tmp/hudi_data", options);
+/// HudiTable::new_with_options("/tmp/hudi_data", options).await;
+/// # }
 /// ```
 ///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]

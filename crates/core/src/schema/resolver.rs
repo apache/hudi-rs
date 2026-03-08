@@ -30,23 +30,22 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// Resolves the [`arrow_schema::Schema`] for a given Hudi table.
+/// Resolves the data [`arrow_schema::Schema`] for a given Hudi table, without Hudi meta fields.
 ///
 /// The resolution process follows these steps:
 /// - If the timeline has commit metadata, read the schema field from it.
 ///   - If the commit metadata has no schema, read the schema from the base file pointed by the first entry in the write-status of the commit metadata.
 /// - If the timeline has no commit metadata, read [`HudiTableConfig::CreateSchema`] from `hoodie.properties`.
-pub async fn resolve_schema(table: &Table) -> Result<Schema> {
+pub async fn resolve_data_schema(table: &Table) -> Result<Schema> {
     let timeline = table.get_timeline();
     match timeline.get_latest_commit_metadata().await {
         Ok(metadata) => {
-            resolve_schema_from_commit_metadata(&metadata, timeline.storage.clone()).await
+            resolve_data_schema_from_commit_metadata(&metadata, timeline.storage.clone()).await
         }
         Err(CoreError::TimelineNoCommit) => {
             if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
                 let avro_schema_str: String = create_schema.into();
-                let arrow_schema = arrow_schema_from_avro_schema_str(&avro_schema_str)?;
-                prepend_meta_fields(SchemaRef::new(arrow_schema))
+                arrow_schema_from_avro_schema_str(&avro_schema_str)
             } else {
                 Err(CoreError::SchemaNotFound(
                     "No completed commit, and no create schema for the table.".to_string(),
@@ -55,6 +54,12 @@ pub async fn resolve_schema(table: &Table) -> Result<Schema> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Resolves the [`arrow_schema::Schema`] for a given Hudi table, with Hudi meta fields prepended.
+pub async fn resolve_schema(table: &Table) -> Result<Schema> {
+    let data_schema = resolve_data_schema(table).await?;
+    prepend_meta_fields(SchemaRef::new(data_schema))
 }
 
 /// Resolves the [`apache_avro::schema::Schema`] as a [`String`] for a given Hudi table.
@@ -85,7 +90,57 @@ pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
     }
 }
 
-pub(crate) async fn resolve_schema_from_commit_metadata(
+/// Same as [`resolve_avro_schema`] but with Hudi meta fields prepended to the schema.
+pub async fn resolve_avro_schema_with_meta_fields(table: &Table) -> Result<String> {
+    let avro_schema_str = resolve_avro_schema(table).await?;
+    prepend_meta_fields_to_avro_schema_str(&avro_schema_str)
+}
+
+fn prepend_meta_fields_to_avro_schema_str(avro_schema_str: &str) -> Result<String> {
+    use crate::metadata::meta_field::MetaField;
+
+    let mut schema: Value = serde_json::from_str(&sanitize_avro_schema_str(avro_schema_str))
+        .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema JSON: {e}")))?;
+
+    let fields = schema
+        .get_mut("fields")
+        .and_then(|f| f.as_array_mut())
+        .ok_or_else(|| CoreError::Schema("Avro schema has no 'fields' array".to_string()))?;
+
+    let meta_field_defs: Vec<Value> = MetaField::field_names()
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "type": ["null", "string"],
+                "default": null
+            })
+        })
+        .collect();
+
+    let existing_names: std::collections::HashSet<&str> = fields
+        .iter()
+        .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+        .collect();
+
+    let new_meta_fields: Vec<Value> = meta_field_defs
+        .into_iter()
+        .filter(|f| {
+            f.get("name")
+                .and_then(|n| n.as_str())
+                .map_or(true, |name| !existing_names.contains(name))
+        })
+        .collect();
+
+    let mut all_fields = new_meta_fields;
+    all_fields.extend(fields.drain(..));
+    *schema.get_mut("fields").unwrap() = Value::Array(all_fields);
+
+    serde_json::to_string(&schema)
+        .map_err(|e| CoreError::Schema(format!("Failed to serialize Avro schema: {e}")))
+}
+
+pub(crate) async fn resolve_data_schema_from_commit_metadata(
     commit_metadata: &Map<String, Value>,
     storage: Arc<Storage>,
 ) -> Result<Schema> {
@@ -97,8 +152,7 @@ pub(crate) async fn resolve_schema_from_commit_metadata(
         Err(e) => return Err(e),
     };
 
-    let arrow_schema = arrow_schema_from_avro_schema_str(&avro_schema_str)?;
-    prepend_meta_fields(SchemaRef::new(arrow_schema))
+    arrow_schema_from_avro_schema_str(&avro_schema_str)
 }
 
 pub(crate) fn resolve_avro_schema_from_commit_metadata(
@@ -266,5 +320,35 @@ mod tests {
 
         let schema = extract_avro_schema_from_commit_metadata(&metadata);
         assert_eq!(schema, None);
+    }
+
+    #[test]
+    fn test_prepend_meta_fields_to_avro_schema_str() {
+        let avro_schema = r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#;
+        let result = prepend_meta_fields_to_avro_schema_str(avro_schema).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let fields = parsed["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 6, "Expected 5 meta fields + 1 data field");
+        assert_eq!(fields[0]["name"], "_hoodie_commit_time");
+        assert_eq!(fields[5]["name"], "id");
+    }
+
+    #[test]
+    fn test_prepend_meta_fields_to_avro_schema_str_dedup() {
+        let avro_schema = r#"{"type":"record","name":"TestRecord","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"default":null},{"name":"id","type":"int"}]}"#;
+        let result = prepend_meta_fields_to_avro_schema_str(avro_schema).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let fields = parsed["fields"].as_array().unwrap();
+        assert_eq!(
+            fields.len(),
+            6,
+            "Expected 5 meta fields + 1 data field (deduped existing meta field)"
+        );
+        // The existing _hoodie_commit_time should not be duplicated
+        let commit_time_count = fields
+            .iter()
+            .filter(|f| f["name"] == "_hoodie_commit_time")
+            .count();
+        assert_eq!(commit_time_count, 1);
     }
 }

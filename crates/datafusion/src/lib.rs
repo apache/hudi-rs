@@ -269,7 +269,7 @@ impl TableProvider for HudiDataSource {
         let table = self.table.clone();
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { table.get_schema().await })
+            rt.block_on(async { table.get_schema(false).await })
         });
         let result = handle.join().unwrap().unwrap_or_else(|_| Schema::empty());
         SchemaRef::from(result)

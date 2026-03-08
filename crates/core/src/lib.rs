@@ -26,8 +26,11 @@
 //! use hudi_core::config::read::HudiReadConfig::InputPartitions;
 //! use hudi_core::table::Table as HudiTable;
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! let options = [(InputPartitions, "2")];
-//! HudiTable::new_with_options_blocking("/tmp/hudi_data", options);
+//! HudiTable::new_with_options("/tmp/hudi_data", options).await;
+//! # }
 //! ```
 //!
 //! # The [table] module is responsible for managing Hudi tables.
