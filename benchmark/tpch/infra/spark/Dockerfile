@@ -15,25 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
-**/data
+FROM apache/spark:3.5.8
 
-/.idea
-.vscode
+USER root
 
-# python
-.venv
-venv
-**/.python-version
-__pycache__
-uv.lock
+# Download Hudi Spark bundle jar
+RUN cd /opt/spark/jars && \
+  wget -q \
+    https://repo1.maven.org/maven2/org/apache/hudi/hudi-spark3.5-bundle_2.12/1.1.1/hudi-spark3.5-bundle_2.12-1.1.1.jar
 
-# macOS
-**/.DS_Store
+# Bake in Spark and Hudi defaults, and logging config
+COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
+COPY log4j2.properties /opt/spark/conf/log4j2.properties
+COPY hudi-defaults.conf /etc/hudi/conf/hudi-defaults.conf
 
-# coverage files
-*.profraw
-cobertura.xml
-/cov-reports/
+USER spark
+
+WORKDIR /opt/spark/work-dir

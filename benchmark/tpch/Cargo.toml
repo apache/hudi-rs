@@ -15,25 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/Cargo.lock
-/target
-**/target
-**/data
+[package]
+name = "tpch"
+version.workspace = true
+edition.workspace = true
 
-/.idea
-.vscode
+[[bin]]
+name = "tpch"
+path = "src/main.rs"
 
-# python
-.venv
-venv
-**/.python-version
-__pycache__
-uv.lock
-
-# macOS
-**/.DS_Store
-
-# coverage files
-*.profraw
-cobertura.xml
-/cov-reports/
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+datafusion = { workspace = true }
+hudi = { path = "../../crates/hudi", features = ["datafusion"] }
+object_store = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tpchgen = "2"
+tpchgen-arrow = "2"
+serde_yaml = "0.9"
+url = { workspace = true }

@@ -158,3 +158,47 @@ coverage-check: ## Fail if coverage is below threshold (COV_THRESHOLD=60)
 .PHONY: clean-coverage
 clean-coverage: ## Remove coverage reports
 	rm -rf $(COV_OUTPUT_DIR)
+
+# =============================================================================
+# TPC-H Benchmark
+# =============================================================================
+SF ?= 0.001
+TPCH_DIR := benchmark/tpch
+TPCH_DATA_DIR := $(TPCH_DIR)/data
+
+.PHONY: tpch-generate
+tpch-generate: ## Generate TPC-H parquet tables (SF=0.001)
+	$(info --- Generate TPC-H parquet tables at SF=$(SF) ---)
+	$(TPCH_DIR)/run.sh generate --scale-factor $(SF)
+
+.PHONY: tpch-create-tables
+tpch-create-tables: ## Create Hudi COW tables from parquet (SF=0.001, requires Docker)
+	$(info --- Create Hudi tables at SF=$(SF) ---)
+	$(TPCH_DIR)/run.sh create-tables --scale-factor $(SF)
+
+.PHONY: tpch-bench-parquet
+tpch-bench-parquet: ## Run TPC-H benchmark against parquet tables (SF=0.001)
+	$(info --- Benchmark parquet at SF=$(SF) ---)
+	cargo run -p tpch --release -- bench --parquet-dir $(TPCH_DATA_DIR)/sf$(SF)-parquet
+
+.PHONY: tpch-bench-hudi
+tpch-bench-hudi: ## Run TPC-H benchmark against Hudi tables (SF=0.001)
+	$(info --- Benchmark Hudi at SF=$(SF) ---)
+	cargo run -p tpch --release -- bench --hudi-dir $(TPCH_DATA_DIR)/sf$(SF)-hudi
+
+.PHONY: tpch-bench
+tpch-bench: ## Run TPC-H benchmark comparing Hudi vs Parquet (SF=0.001)
+	$(info --- Benchmark Hudi vs Parquet at SF=$(SF) ---)
+	cargo run -p tpch --release -- bench \
+		--hudi-dir $(TPCH_DATA_DIR)/sf$(SF)-hudi \
+		--parquet-dir $(TPCH_DATA_DIR)/sf$(SF)-parquet
+
+.PHONY: tpch-bench-spark
+tpch-bench-spark: ## Run TPC-H benchmark against Hudi tables using Spark SQL (SF=0.001)
+	$(info --- Benchmark Spark+Hudi at SF=$(SF) ---)
+	$(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF)
+
+.PHONY: tpch-clean
+tpch-clean: ## Remove generated TPC-H data
+	$(info --- Clean TPC-H data ---)
+	$(TPCH_DIR)/run.sh clean

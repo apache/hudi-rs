@@ -1,0 +1,186 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+use std::collections::BTreeMap;
+use std::fmt::Write;
+use std::path::Path;
+
+use serde::Deserialize;
+
+/// Canonical table ordering for SQL output (matches TPC-H dependency order).
+const TABLE_ORDER: &[&str] = &[
+    "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
+];
+
+#[derive(Deserialize)]
+pub struct ScaleFactorConfig {
+    pub tables: BTreeMap<String, TableConfig>,
+    pub create_tables: SparkCommandConfig,
+    pub bench: SparkCommandConfig,
+}
+
+#[derive(Deserialize)]
+pub struct TableConfig {
+    pub primary_key: String,
+    pub pre_combine_field: String,
+    pub record_size_estimate: u32,
+    pub shuffle_parallelism: u32,
+}
+
+#[derive(Deserialize)]
+pub struct SparkCommandConfig {
+    pub driver_memory: String,
+    #[serde(default)]
+    pub spark_conf: BTreeMap<String, String>,
+}
+
+impl ScaleFactorConfig {
+    /// Supported scale factors that have config files.
+    const SUPPORTED: &[u64] = &[1, 10, 100];
+
+    /// Load a config file from `config/sf{N}.yaml` relative to the crate root.
+    /// Scale factors below 1 fall back to sf1. Unsupported scale factors return an error.
+    pub fn load(scale_factor: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        let effective_sf = if scale_factor < 1.0 {
+            1u64
+        } else {
+            let sf = scale_factor as u64;
+            if !Self::SUPPORTED.contains(&sf) {
+                return Err(format!(
+                    "Unsupported scale factor {scale_factor}. Supported: {:?}",
+                    Self::SUPPORTED
+                )
+                .into());
+            }
+            sf
+        };
+        let filename = format!("sf{effective_sf}.yaml");
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+        let config_path = config_dir.join(&filename);
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config {}: {e}", config_path.display()))?;
+        let config: Self = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse config {filename}: {e}"))?;
+        Ok(config)
+    }
+
+    /// Generate CTAS SQL for creating Hudi tables from parquet sources.
+    pub fn render_ctas_sql(&self, parquet_base: &str, hudi_base: &str) -> String {
+        let mut sql = String::new();
+        for &name in TABLE_ORDER {
+            let Some(table) = self.tables.get(name) else {
+                continue;
+            };
+            writeln!(sql, "CREATE TABLE {name} USING hudi").unwrap();
+            writeln!(sql, "LOCATION '{hudi_base}/{name}'").unwrap();
+            writeln!(sql, "TBLPROPERTIES (").unwrap();
+            writeln!(sql, "  type = 'cow',").unwrap();
+            writeln!(sql, "  primaryKey = '{}',", table.primary_key).unwrap();
+            writeln!(sql, "  preCombineField = '{}',", table.pre_combine_field).unwrap();
+            writeln!(sql, "  'hoodie.table.name' = '{name}',").unwrap();
+            writeln!(
+                sql,
+                "  'hoodie.bulkinsert.shuffle.parallelism' = '{}',",
+                table.shuffle_parallelism
+            )
+            .unwrap();
+            writeln!(
+                sql,
+                "  'hoodie.copyonwrite.record.size.estimate' = '{}'",
+                table.record_size_estimate
+            )
+            .unwrap();
+            writeln!(
+                sql,
+                ") AS SELECT * FROM parquet.`{parquet_base}/{name}/`;"
+            )
+            .unwrap();
+            writeln!(sql).unwrap();
+        }
+        sql
+    }
+
+    /// Generate benchmark SQL: table registrations followed by query iterations.
+    pub fn render_bench_sql(
+        &self,
+        hudi_base: &str,
+        query_nums: &[usize],
+        iterations: usize,
+        scale_factor: f64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut sql = String::new();
+
+        // Register Hudi tables
+        for &name in TABLE_ORDER {
+            if self.tables.contains_key(name) {
+                writeln!(
+                    sql,
+                    "CREATE TABLE {name} USING hudi LOCATION '{hudi_base}/{name}';"
+                )
+                .unwrap();
+            }
+        }
+        writeln!(sql).unwrap();
+
+        // Per-SF substitution values (TPC-H spec Section 2.4.11.3: FRACTION = 0.0001 / SF)
+        let q11_fraction = format!("{:.10}", 0.0001 / scale_factor);
+
+        // Add queries with bench markers
+        let queries_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("queries");
+        for &qn in query_nums {
+            let qfile = queries_dir.join(format!("q{qn}.sql"));
+            let query_sql = std::fs::read_to_string(&qfile)
+                .map_err(|e| format!("Failed to read q{qn}.sql: {e}"))?;
+            let query_sql = query_sql.replace("${Q11_FRACTION}", &q11_fraction);
+            for i in 1..=iterations {
+                writeln!(sql).unwrap();
+                writeln!(sql, "SELECT 'BENCH_MARKER q{qn} iter{i}' as marker;").unwrap();
+                write!(sql, "{query_sql}").unwrap();
+                if !query_sql.ends_with('\n') {
+                    writeln!(sql).unwrap();
+                }
+            }
+        }
+
+        Ok(sql)
+    }
+
+    /// Generate spark-submit arguments for a given command, one per line.
+    pub fn render_spark_args(&self, command: &str) -> Result<Vec<String>, String> {
+        let cmd_config = match command {
+            "create-tables" => &self.create_tables,
+            "bench" => &self.bench,
+            _ => return Err(format!("Unknown command: {command}")),
+        };
+
+        let mut args = vec![
+            "--master".to_string(),
+            "local[*]".to_string(),
+            "--driver-memory".to_string(),
+            cmd_config.driver_memory.clone(),
+        ];
+
+        for (key, value) in &cmd_config.spark_conf {
+            args.push("--conf".to_string());
+            args.push(format!("{key}={value}"));
+        }
+
+        Ok(args)
+    }
+}
