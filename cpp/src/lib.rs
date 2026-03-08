@@ -95,9 +95,12 @@ impl HudiFileGroupReader {
             .to_str()
             .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
 
-        let record_batch = self
-            .inner
-            .read_file_slice_by_base_file_path_blocking(relative_path)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        let record_batch = rt
+            .block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
             .expect("Failed to read file batch");
         let schema = record_batch.schema();
 
@@ -105,9 +108,12 @@ impl HudiFileGroupReader {
     }
 
     pub fn read_file_slice(&self, file_slice: &HudiFileSlice) -> *mut ffi::ArrowArrayStream {
-        let record_batch = self
-            .inner
-            .read_file_slice_blocking(&file_slice.inner)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        let record_batch = rt
+            .block_on(self.inner.read_file_slice(&file_slice.inner))
             .expect("Failed to read file slice");
         let schema = record_batch.schema();
 
