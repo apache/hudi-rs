@@ -26,7 +26,7 @@ use hudi_core::config::read::HudiReadConfig;
 use hudi_core::config::util::empty_filters;
 use hudi_core::error::Result;
 use hudi_core::table::Table;
-use hudi_test::{QuickstartTripsTable, SampleTable, SampleTableMdt};
+use hudi_test::{QuickstartTripsTable, SampleTable};
 
 /// Test helper module for v6 tables (pre-1.0 spec)
 mod v6_tables {
@@ -1149,14 +1149,14 @@ mod mdt_enabled_tables {
     mod snapshot_queries {
         use super::*;
 
-        /// Test reading a V8 MOR non-partitioned table with MDT enabled.
+        /// Test reading a V9 MOR non-partitioned table with MDT enabled.
         /// Verifies:
         /// 1. Table can be read correctly via MDT file listing
         /// 2. MDT partition key normalization ("." -> "") works correctly
         /// 3. File slices are retrieved correctly from MDT
         #[test]
-        fn test_v8_nonpartitioned_with_mdt() -> Result<()> {
-            let base_url = SampleTableMdt::V8Nonpartitioned.url_to_mor_avro();
+        fn test_v9_nonpartitioned_with_mdt() -> Result<()> {
+            let base_url = SampleTable::V9TxnsNonpartMeta.url_to_mor_avro();
             let hudi_table = Table::new_blocking(base_url.path())?;
 
             // Verify MDT is enabled
@@ -1190,8 +1190,8 @@ mod mdt_enabled_tables {
         /// For non-partitioned tables, we use a fast path that directly fetches "." without
         /// going through __all_partitions__ lookup.
         #[test]
-        fn test_v8_nonpartitioned_mdt_partition_normalization() -> Result<()> {
-            let base_url = SampleTableMdt::V8Nonpartitioned.url_to_mor_avro();
+        fn test_v9_nonpartitioned_mdt_partition_normalization() -> Result<()> {
+            let base_url = SampleTable::V9TxnsNonpartMeta.url_to_mor_avro();
             let hudi_table = Table::new_blocking(base_url.path())?;
 
             // Read MDT files partition records

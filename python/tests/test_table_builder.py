@@ -70,44 +70,24 @@ def test_with_multiple_options(builder, method, attr):
     assert getattr(builder, attr) == options
 
 
-def test_read_table_returns_correct_data(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTableBuilder.from_base_uri(table_path).build()
+def test_read_table_returns_correct_data(v8_trips_table):
+    table = HudiTableBuilder.from_base_uri(v8_trips_table).build()
 
     batches = table.read_snapshot()
-    t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
-    assert t.to_pylist() == [
-        {
-            "_hoodie_commit_time": "20240402144910683",
-            "ts": 1695046462179,
-            "uuid": "9909a8b1-2d15-4d3d-8ec9-efc48c536a00",
-            "fare": 339.0,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695091554788,
-            "uuid": "e96c4396-3fad-413a-a942-4cb36106d721",
-            "fare": 27.7,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695115999911,
-            "uuid": "c8abbe79-8d89-47ea-b4ce-4d224bae5bfa",
-            "fare": 17.85,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695159649087,
-            "uuid": "334e26e9-8355-45cc-97c6-c31daf0df330",
-            "fare": 19.1,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695516137016,
-            "uuid": "e3cf430c-889d-4015-bc98-59bdce1e530c",
-            "fare": 34.15,
-        },
-    ]
+    t = pa.Table.from_batches(batches).select(["rider", "fare"]).sort_by("rider")
+    rows = t.to_pylist()
+
+    # 6 surviving rows from SQL: 8 inserts - 2 deletes (rider-F, rider-J)
+    assert len(rows) == 6
+    rider_fares = {r["rider"]: r["fare"] for r in rows}
+    assert rider_fares == {
+        "rider-A": 0.0,
+        "rider-C": 27.7,
+        "rider-D": 33.9,
+        "rider-E": 93.5,
+        "rider-G": 0.0,
+        "rider-I": 41.06,
+    }
 
 
 @pytest.mark.parametrize(
@@ -125,12 +105,9 @@ def test_read_table_returns_correct_data(get_sample_table):
         ),
     ],
 )
-def test_setting_table_options(
-    get_sample_table, hudi_options, storage_options, options
-):
-    table_path = get_sample_table
+def test_setting_table_options(v8_trips_table, hudi_options, storage_options, options):
     table = (
-        HudiTableBuilder.from_base_uri(table_path)
+        HudiTableBuilder.from_base_uri(v8_trips_table)
         .with_hudi_options(hudi_options)
         .with_storage_options(storage_options)
         .with_options(options)

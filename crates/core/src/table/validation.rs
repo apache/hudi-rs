@@ -45,9 +45,9 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
 
     // additional validation
     let table_version: isize = hudi_configs.get(TableVersion)?.into();
-    if table_version != 6 && table_version != 8 {
+    if !matches!(table_version, 6 | 8 | 9) {
         return Err(CoreError::Unsupported(format!(
-            "Only support table version 6 and 8. Found: {table_version}"
+            "Only support table version 6, 8, and 9. Found: {table_version}"
         )));
     }
 
@@ -110,7 +110,7 @@ mod tests {
         assert!(result.is_err());
         if let Err(CoreError::Unsupported(msg)) = result {
             assert!(
-                msg.contains("Only support table version 6 and 8"),
+                msg.contains("Only support table version 6, 8, and 9"),
                 "Unexpected message: {msg}"
             );
         } else {
@@ -147,6 +147,22 @@ mod tests {
         assert!(
             result.is_ok(),
             "Table version 8 with layout 2 should be supported"
+        );
+    }
+
+    #[test]
+    fn test_table_version_9_with_layout_2_supported() {
+        let mut options = HashMap::new();
+        options.insert(TableName.as_ref().to_string(), "test_table".to_string());
+        options.insert(TableType.as_ref().to_string(), "COPY_ON_WRITE".to_string());
+        options.insert(TableVersion.as_ref().to_string(), "9".to_string());
+        options.insert(TimelineLayoutVersion.as_ref().to_string(), "2".to_string());
+
+        let configs = HudiConfigs::new(options);
+        let result = validate_configs(&configs);
+        assert!(
+            result.is_ok(),
+            "Table version 9 with layout 2 should be supported"
         );
     }
 

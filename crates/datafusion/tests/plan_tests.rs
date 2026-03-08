@@ -17,7 +17,8 @@
  * under the License.
  */
 
-//! E2E tests for DataFusion integration with Hudi tables.
+//! Plan verification tests for DataFusion integration with Hudi tables.
+//! Tests execution plan structure (filter pushdown, partitioning, projections).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,7 +84,6 @@ where
     Ok(ctx)
 }
 
-/// Register a table with the given session using direct registration (not SQL).
 async fn register_table_direct<I, K, V>(
     test_table: &SampleTable,
     options: I,
@@ -179,7 +179,7 @@ async fn verify_data_with_replacecommits(ctx: &SessionContext, sql: &str, table_
 }
 
 // ============================================================================
-// V6 Table Tests (moved from lib.rs)
+// V6 Table Tests
 // ============================================================================
 
 mod v6_tests {
@@ -273,7 +273,7 @@ mod v6_tests {
 }
 
 // ============================================================================
-// V8 Table Tests (new)
+// V8 Table Tests
 // ============================================================================
 
 mod v8_tests {
@@ -297,7 +297,6 @@ mod v8_tests {
             .await
             .unwrap();
         let schema = df.schema();
-        // V8 tables should have the expected columns
         assert!(schema.field_with_name(None, "id").is_ok());
         assert!(schema.field_with_name(None, "name").is_ok());
         assert!(schema.field_with_name(None, "isActive").is_ok());

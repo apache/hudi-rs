@@ -23,6 +23,9 @@ mod internal;
 #[cfg(feature = "datafusion")]
 mod datafusion_internal;
 
+#[cfg(feature = "testing")]
+mod testing_internal;
+
 #[cfg(not(tarpaulin_include))]
 #[pymodule]
 fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -39,6 +42,13 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         use datafusion_internal::HudiDataFusionDataSource;
         m.add_class::<HudiDataFusionDataSource>()?;
+    }
+
+    #[cfg(feature = "testing")]
+    {
+        use testing_internal::{get_test_table_path, verify_v9_txns_table};
+        m.add_function(wrap_pyfunction!(get_test_table_path, m)?)?;
+        m.add_function(wrap_pyfunction!(verify_v9_txns_table, m)?)?;
     }
 
     use internal::build_hudi_table;

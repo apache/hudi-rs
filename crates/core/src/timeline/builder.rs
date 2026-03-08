@@ -83,7 +83,7 @@ impl TimelineBuilder {
             .hudi_configs
             .try_get(TimelineLayoutVersion)
             .map(|v| v.into())
-            .unwrap_or_else(|| if table_version == 8 { 2isize } else { 1isize });
+            .unwrap_or_else(|| if table_version >= 8 { 2isize } else { 1isize });
 
         match layout_version {
             1 => {
@@ -196,6 +196,23 @@ mod tests {
 
         let timeline = builder.build().await.unwrap();
         // v8 without explicit layout version defaults to layout 2
+        assert!(timeline.active_loader.is_layout_two_active());
+        assert!(timeline.archived_loader.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_with_table_version_9_defaults_to_layout_2() {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "9".to_string(),
+        );
+        let configs = create_test_configs(options);
+        let storage = create_test_storage(configs.clone());
+        let builder = TimelineBuilder::new(configs, storage);
+
+        let timeline = builder.build().await.unwrap();
+        // v9 without explicit layout version defaults to layout 2
         assert!(timeline.active_loader.is_layout_two_active());
         assert!(timeline.archived_loader.is_none());
     }

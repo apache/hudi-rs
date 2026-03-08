@@ -34,6 +34,7 @@ doc = false
 
 [dependencies]
 hudi = { path = "../crates/hudi"}
+hudi-test = { path = "../crates/test", optional = true }
 # arrow
 arrow = { workspace = true, features = ["pyarrow"] }
 
@@ -54,6 +55,7 @@ features = ["extension-module", "abi3", "abi3-py310"]
 [features]
 default = []
 datafusion = ["dep:datafusion","dep:datafusion-ffi","hudi/datafusion"]
+testing = ["dep:hudi-test", "hudi-test/datafusion"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

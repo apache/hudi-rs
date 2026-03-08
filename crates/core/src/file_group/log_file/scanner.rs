@@ -174,25 +174,27 @@ impl LogFileScanner {
     fn detect_content_type(&self, collected: &CollectedBlocks) -> Result<ContentType> {
         let mut has_record_blocks = false;
         let mut has_hfile_blocks = false;
+        let mut has_delete_blocks = false;
 
         for blocks in &collected.all_blocks {
             for block in blocks {
                 match block.block_type {
-                    BlockType::AvroData
-                    | BlockType::ParquetData
-                    | BlockType::Delete
-                    | BlockType::CdcData => {
+                    BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData => {
                         has_record_blocks = true;
                     }
                     BlockType::HfileData => {
                         has_hfile_blocks = true;
+                    }
+                    BlockType::Delete => {
+                        has_delete_blocks = true;
                     }
                     BlockType::Command | BlockType::Corrupted => {
                         // Command and corrupted blocks don't affect content type
                     }
                 }
 
-                // Check for mixed types as early as possible
+                // Only error on actual data format conflict (Arrow vs HFile data blocks).
+                // Delete blocks are compatible with both formats.
                 if has_record_blocks && has_hfile_blocks {
                     return Err(crate::error::CoreError::LogBlockError(
                         "Log files contain mixed block types (both Arrow-based and HFile blocks), which is invalid".into(),
@@ -203,7 +205,7 @@ impl LogFileScanner {
 
         if has_hfile_blocks {
             Ok(ContentType::HFile)
-        } else if has_record_blocks {
+        } else if has_record_blocks || has_delete_blocks {
             Ok(ContentType::Records)
         } else {
             Ok(ContentType::Empty)

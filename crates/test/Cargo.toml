@@ -32,11 +32,22 @@ repository.workspace = true
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 
+# datafusion (optional, for verification helpers)
+datafusion = { workspace = true, optional = true }
+hudi-datafusion = { path = "../datafusion", optional = true }
+
 # "stdlib"
 strum = { workspace = true }
 strum_macros = { workspace = true }
 url = { workspace = true }
 
+# runtime / async
+tokio = { workspace = true, optional = true }
+
 # testing
 tempfile = { workspace = true }
 zip = { workspace = true }
+
+[features]
+default = []
+datafusion = ["dep:datafusion", "dep:hudi-datafusion", "dep:tokio"]
