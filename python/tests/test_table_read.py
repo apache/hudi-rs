@@ -56,7 +56,6 @@ def test_read_table_returns_correct_file_slices(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
     file_slices = table.get_file_slices()
-    # 3 partitions after compaction: san_francisco, sao_paulo, chennai
     assert len(file_slices) == 3
     assert all(f.base_file_byte_size > 0 for f in file_slices)
     partition_prefixes = sorted(
@@ -102,7 +101,6 @@ def test_read_table_returns_correct_data(v8_trips_table):
     # 6 surviving rows (8 inserts - 2 deletes: rider-F, rider-J)
     assert len(rows) == 6
 
-    # Verify riders and fares derived from SQL operations
     rider_fares = {r["rider"]: r["fare"] for r in rows}
     assert rider_fares == {
         "rider-D": 33.9,
@@ -113,11 +111,9 @@ def test_read_table_returns_correct_data(v8_trips_table):
         "rider-G": 0.0,  # updated fare=0
     }
 
-    # Deleted riders should not be present
     assert "rider-F" not in rider_fares
     assert "rider-J" not in rider_fares
 
-    # Verify UUIDs match the original inserts
     uuid_riders = {r["uuid"]: r["rider"] for r in rows}
     assert uuid_riders["334e26e9-8355-45cc-97c6-c31daf0df330"] == "rider-A"
     assert uuid_riders["9909a8b1-2d15-4d3d-8ec9-efc48c536a00"] == "rider-D"
@@ -135,7 +131,6 @@ def test_read_table_for_partition(v8_trips_table):
     )
     rows = t.to_pylist()
 
-    # san_francisco has 4 surviving rows: rider-D, C, A, E
     assert len(rows) == 4
     rider_fares = {r["rider"]: r["fare"] for r in rows}
     assert rider_fares == {
@@ -149,14 +144,12 @@ def test_read_table_for_partition(v8_trips_table):
 def test_table_apis_as_of_timestamp(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    # Get the first commit timestamp from the timeline
     timeline = table.get_timeline()
     all_commits = timeline.get_completed_commits()
     first_commit = all_commits[0].timestamp
 
     file_slices_gen = table.get_file_slices_splits_as_of(2, first_commit)
     all_slices = list(chain.from_iterable(file_slices_gen))
-    # 3 partitions at first commit too
     assert len(all_slices) == 3
     partition_prefixes = sorted(
         f.base_file_relative_path().split("/")[0] for f in all_slices
@@ -167,8 +160,8 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
         "city=sao_paulo",
     ]
 
-    # As-of the compacted commit, snapshot should still have 6 rows
-    # (compaction merges updates/deletes into base files)
+    # get_completed_commits() returns compaction commits for MOR tables.
+    # The sole compaction commit predates the final deltacommit (rider-G update).
     batches = table.read_snapshot_as_of(first_commit)
     t = (
         pa.Table.from_batches(batches)
@@ -179,17 +172,15 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
     assert len(rows) == 6
 
     rider_fares = {r["rider"]: r["fare"] for r in rows}
-    # After compaction, fares reflect updates (A=0, G=0) except rider-G
-    # whose update happened after compaction
-    assert rider_fares["rider-A"] == 0.0
+    assert rider_fares["rider-A"] == 0.0  # updated before compaction
     assert rider_fares["rider-D"] == 33.9
     assert rider_fares["rider-C"] == 27.7
+    assert rider_fares["rider-G"] == 43.40  # not yet updated at compaction time
 
 
 def test_convert_filters_valid(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    # 3 partitions: chennai, san_francisco, sao_paulo
     filters = [
         ("city", "=", "san_francisco"),
         ("city", ">", "san_francisco"),

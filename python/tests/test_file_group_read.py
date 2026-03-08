@@ -30,7 +30,6 @@ def test_file_group_api_read_file_slice(v8_trips_table):
     table = HudiTable(v8_trips_table)
     file_group_reader = HudiFileGroupReader(v8_trips_table)
 
-    # Get the san_francisco file slice (has 4 rows: rider-A, C, D, E)
     file_slices = table.get_file_slices()
     sf_slice = [
         f for f in file_slices if "san_francisco" in f.base_file_relative_path()
@@ -56,20 +55,17 @@ def test_file_group_api_read_file_slice_from_paths(v8_trips_table):
     table = HudiTable(v8_trips_table)
     file_group_reader = HudiFileGroupReader(v8_trips_table)
 
-    # Get the san_francisco file slice
     file_slices = table.get_file_slices()
     sf_slice = [
         f for f in file_slices if "san_francisco" in f.base_file_relative_path()
     ][0]
     sf_path = sf_slice.base_file_relative_path()
 
-    # Read using read_file_slice_from_paths with empty log files
     batch = file_group_reader.read_file_slice_from_paths(sf_path, [])
 
     assert batch.num_rows == 4
     assert batch.num_columns > 0
 
-    # Verify results are identical to read_file_slice_by_base_file_path
     batch_original = file_group_reader.read_file_slice_by_base_file_path(sf_path)
     assert batch.num_rows == batch_original.num_rows
     assert batch.num_columns == batch_original.num_columns

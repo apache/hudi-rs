@@ -17,11 +17,8 @@
  * under the License.
  */
 
-//! Verification helpers for v9 txns sample tables.
-//!
-//! These functions encapsulate the expected record state after the standard
-//! v9 txns table generation sequence (inserts, updates, deletes, INSERT OVERWRITE,
-//! compaction, clustering).
+//! Expected record state for v9 txns sample tables after inserts, updates,
+//! deletes, INSERT OVERWRITE, compaction, and clustering.
 
 use std::sync::Arc;
 
@@ -97,7 +94,6 @@ pub async fn verify_partitioned_records(ctx: &SessionContext) {
     .await;
     assert_eq!(eu_ids, ["TXN-011", "TXN-012", "TXN-018"]);
 
-    // us partition: original survivors + later inserts
     let us_ids = query_str_col(
         ctx,
         "SELECT txn_id FROM txns WHERE region = 'us' ORDER BY txn_id",
@@ -108,7 +104,6 @@ pub async fn verify_partitioned_records(ctx: &SessionContext) {
         ["TXN-001", "TXN-003", "TXN-013", "TXN-014", "TXN-017"]
     );
 
-    // apac partition: original survivors + later inserts
     let apac_ids = query_str_col(
         ctx,
         "SELECT txn_id FROM txns WHERE region = 'apac' ORDER BY txn_id",
@@ -140,7 +135,6 @@ pub async fn verify_nonpart_records(ctx: &SessionContext) {
         1
     );
 
-    // Verify merchant names for key records
     let merchants = query_str_col(
         ctx,
         "SELECT merchant_name FROM txns WHERE txn_id IN ('TXN-001', 'TXN-008', 'TXN-015') ORDER BY txn_id",
@@ -171,9 +165,7 @@ async fn register_v9_table(ctx: &SessionContext, table: &SampleTable, cow: bool)
     ctx.register_table("txns", Arc::new(hudi)).unwrap();
 }
 
-/// Verify a v9 txns table end-to-end: extract, register, and check all records.
-///
-/// This is the single entry point for both Rust and Python tests.
+/// Entry point for v9 txns table verification, used by both Rust and Python tests.
 pub async fn verify_v9_txns_table(table: &SampleTable, cow: bool, partitioned: bool) {
     let ctx = SessionContext::new();
     register_v9_table(&ctx, table, cow).await;

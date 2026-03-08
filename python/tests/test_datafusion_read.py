@@ -15,10 +15,7 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-"""Query result verification tests for DataFusion integration with v9 Hudi tables.
-
-Tests actual record contents after INSERT, UPDATE, DELETE, INSERT OVERWRITE,
-compaction (MOR), and clustering operations.
+"""DataFusion read tests for v9 txns tables.
 
 Verification logic is shared with Rust tests via hudi_test::v9_verification.
 """

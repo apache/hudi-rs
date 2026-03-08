@@ -17,9 +17,7 @@
  * under the License.
  */
 
-//! Query result verification tests for DataFusion integration with Hudi tables.
-//! Tests actual record contents after INSERT, UPDATE, DELETE, INSERT OVERWRITE,
-//! compaction, and clustering operations.
+//! DataFusion read tests for v9 txns tables.
 
 use hudi_test::SampleTable;
 use hudi_test::v9_verification::verify_v9_txns_table;

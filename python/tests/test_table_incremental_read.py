@@ -32,7 +32,6 @@ def test_table_incremental_read_returns_correct_data():
     table_path = get_test_table_path("v9_txns_simple_nometa", "cow")
     table = HudiTable(table_path)
 
-    # Get the first two commit timestamps
     timeline = table.get_timeline()
     commits = timeline.get_completed_commits()
     assert len(commits) >= 2
@@ -40,11 +39,9 @@ def test_table_incremental_read_returns_correct_data():
     insert_ts = commits[0].timestamp
     update_ts = commits[1].timestamp
 
-    # Incremental read: changes between insert and first update
     batches = table.read_incremental_records(insert_ts, update_ts)
     t = pa.Table.from_batches(batches)
 
-    # First update: UPDATE SET txn_type='reversal' WHERE txn_id='TXN-001'
     assert t.num_rows == 1
     assert t.column("txn_id").to_pylist() == ["TXN-001"]
     assert t.column("txn_type").to_pylist() == ["reversal"]
