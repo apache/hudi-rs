@@ -72,12 +72,12 @@ setup: ## Setup the requirements
 .PHONY: build
 build: setup ## Build Python binding of hudi-rs
 	$(info --- Build Python binding ---)
-	./build-wrapper.sh maturin build --features datafusion $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
+	./build-wrapper.sh maturin build --features datafusion,testing $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
 
 .PHONY: develop
 develop: setup ## Install Python binding of hudi-rs
 	$(info --- Develop with Python binding ---)
-	./build-wrapper.sh maturin develop --extras=devel,datafusion --features datafusion $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
+	./build-wrapper.sh maturin develop --extras=devel,datafusion --features datafusion,testing $(MATURIN_EXTRA_ARGS) -m $(PYTHON_DIR)/Cargo.toml
 
 .PHONY: format
 format: format-rust format-python ## Format Rust and Python code

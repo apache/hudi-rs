@@ -15,6 +15,13 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
+"""Table read tests using v8_trips_8i3u1d (MOR, partitioned by city).
+
+SQL: 8 inserts, UPDATE rider-A fare=0, DELETE rider-F,
+UPDATE rider-J fare=0, DELETE rider-J, UPDATE rider-G fare=0.
+Final state: 6 rows (riders A, C, D, E, G, I).
+"""
+
 from itertools import chain
 
 import pyarrow as pa
@@ -22,9 +29,8 @@ import pyarrow as pa
 from hudi import HudiTable
 
 
-def test_read_table_has_correct_schema(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
+def test_read_table_has_correct_schema(v8_trips_table):
+    table = HudiTable(v8_trips_table)
 
     assert table.get_schema().names == [
         "_hoodie_commit_time",
@@ -41,37 +47,29 @@ def test_read_table_has_correct_schema(get_sample_table):
     ]
 
 
-def test_read_table_has_correct_partition_schema(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
+def test_read_table_has_correct_partition_schema(v8_trips_table):
+    table = HudiTable(v8_trips_table)
     assert table.get_partition_schema().names == ["city"]
 
 
-def test_read_table_returns_correct_file_slices(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
+def test_read_table_returns_correct_file_slices(v8_trips_table):
+    table = HudiTable(v8_trips_table)
 
     file_slices = table.get_file_slices()
-    assert len(file_slices) == 5
-    assert set(f.creation_instant_time for f in file_slices) == {
-        "20240402123035233",
-        "20240402144910683",
-    }
-    assert all(f.num_records == 1 for f in file_slices)
+    assert len(file_slices) == 3
     assert all(f.base_file_byte_size > 0 for f in file_slices)
-    file_slice_paths = [f.base_file_relative_path() for f in file_slices]
-    assert set(file_slice_paths) == {
-        "chennai/68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0_4-12-0_20240402123035233.parquet",
-        "san_francisco/d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0_1-9-0_20240402123035233.parquet",
-        "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet",
-        "san_francisco/5a226868-2934-4f84-a16f-55124630c68d-0_0-7-24_20240402144910683.parquet",
-        "sao_paulo/ee915c68-d7f8-44f6-9759-e691add290d8-0_3-11-0_20240402123035233.parquet",
-    }
+    partition_prefixes = sorted(
+        f.base_file_relative_path().split("/")[0] for f in file_slices
+    )
+    assert partition_prefixes == [
+        "city=chennai",
+        "city=san_francisco",
+        "city=sao_paulo",
+    ]
 
 
-def test_read_table_can_read_from_batches(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
+def test_read_table_can_read_from_batches(v8_trips_table):
+    table = HudiTable(v8_trips_table)
 
     file_slices = table.get_file_slices()
     file_slice_paths = [f.base_file_relative_path() for f in file_slices]
@@ -81,138 +79,107 @@ def test_read_table_can_read_from_batches(get_sample_table):
         )
     )
     t = pa.Table.from_batches([batch])
-    assert t.num_rows == 1
+    assert t.num_rows > 0
     assert t.num_columns == 11
 
     file_slices_gen = iter(table.get_file_slices_splits(2))
-    assert len(next(file_slices_gen)) == 3
     assert len(next(file_slices_gen)) == 2
+    assert len(next(file_slices_gen)) == 1
 
 
-def test_read_table_returns_correct_data(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
+def test_read_table_returns_correct_data(v8_trips_table):
+    table = HudiTable(v8_trips_table)
 
     batches = table.read_snapshot()
-    t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
-    assert t.to_pylist() == [
-        {
-            "_hoodie_commit_time": "20240402144910683",
-            "ts": 1695046462179,
-            "uuid": "9909a8b1-2d15-4d3d-8ec9-efc48c536a00",
-            "fare": 339.0,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695091554788,
-            "uuid": "e96c4396-3fad-413a-a942-4cb36106d721",
-            "fare": 27.7,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695115999911,
-            "uuid": "c8abbe79-8d89-47ea-b4ce-4d224bae5bfa",
-            "fare": 17.85,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695159649087,
-            "uuid": "334e26e9-8355-45cc-97c6-c31daf0df330",
-            "fare": 19.1,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695516137016,
-            "uuid": "e3cf430c-889d-4015-bc98-59bdce1e530c",
-            "fare": 34.15,
-        },
-    ]
-
-
-def test_read_table_for_partition(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
-
-    batches = table.read_snapshot([("city", "=", "san_francisco")])
-    t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
-    assert t.to_pylist() == [
-        {
-            "_hoodie_commit_time": "20240402144910683",
-            "ts": 1695046462179,
-            "uuid": "9909a8b1-2d15-4d3d-8ec9-efc48c536a00",
-            "fare": 339.0,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695091554788,
-            "uuid": "e96c4396-3fad-413a-a942-4cb36106d721",
-            "fare": 27.7,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695159649087,
-            "uuid": "334e26e9-8355-45cc-97c6-c31daf0df330",
-            "fare": 19.1,
-        },
-    ]
-
-
-def test_table_apis_as_of_timestamp(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
-    timestamp = "20240402123035233"
-
-    file_slices_gen = table.get_file_slices_splits_as_of(2, timestamp)
-    file_slices_base_paths = set(
-        f.base_file_relative_path() for f in chain.from_iterable(file_slices_gen)
+    t = (
+        pa.Table.from_batches(batches)
+        .select(["ts", "uuid", "rider", "fare"])
+        .sort_by("ts")
     )
-    assert file_slices_base_paths == {
-        "san_francisco/780b8586-3ad0-48ef-a6a1-d2217845ce4a-0_0-8-0_20240402123035233.parquet",
-        "san_francisco/d9082ffd-2eb1-4394-aefc-deb4a61ecc57-0_1-9-0_20240402123035233.parquet",
-        "san_francisco/5a226868-2934-4f84-a16f-55124630c68d-0_2-10-0_20240402123035233.parquet",
-        "sao_paulo/ee915c68-d7f8-44f6-9759-e691add290d8-0_3-11-0_20240402123035233.parquet",
-        "chennai/68d3c349-f621-4cd8-9e8b-c6dd8eb20d08-0_4-12-0_20240402123035233.parquet",
+    rows = t.to_pylist()
+
+    # 6 surviving rows (8 inserts - 2 deletes: rider-F, rider-J)
+    assert len(rows) == 6
+
+    rider_fares = {r["rider"]: r["fare"] for r in rows}
+    assert rider_fares == {
+        "rider-D": 33.9,
+        "rider-C": 27.7,
+        "rider-A": 0.0,  # updated fare=0
+        "rider-I": 41.06,
+        "rider-E": 93.5,
+        "rider-G": 0.0,  # updated fare=0
     }
 
-    batches = table.read_snapshot_as_of(timestamp)
-    t = pa.Table.from_batches(batches).select([0, 5, 6, 9]).sort_by("ts")
-    assert t.to_pylist() == [
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695046462179,
-            "uuid": "9909a8b1-2d15-4d3d-8ec9-efc48c536a00",
-            "fare": 33.9,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695091554788,
-            "uuid": "e96c4396-3fad-413a-a942-4cb36106d721",
-            "fare": 27.7,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695115999911,
-            "uuid": "c8abbe79-8d89-47ea-b4ce-4d224bae5bfa",
-            "fare": 17.85,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695159649087,
-            "uuid": "334e26e9-8355-45cc-97c6-c31daf0df330",
-            "fare": 19.1,
-        },
-        {
-            "_hoodie_commit_time": "20240402123035233",
-            "ts": 1695516137016,
-            "uuid": "e3cf430c-889d-4015-bc98-59bdce1e530c",
-            "fare": 34.15,
-        },
+    assert "rider-F" not in rider_fares
+    assert "rider-J" not in rider_fares
+
+    uuid_riders = {r["uuid"]: r["rider"] for r in rows}
+    assert uuid_riders["334e26e9-8355-45cc-97c6-c31daf0df330"] == "rider-A"
+    assert uuid_riders["9909a8b1-2d15-4d3d-8ec9-efc48c536a00"] == "rider-D"
+    assert uuid_riders["7a84095f-737f-40bc-b62f-6b69664712d2"] == "rider-G"
+
+
+def test_read_table_for_partition(v8_trips_table):
+    table = HudiTable(v8_trips_table)
+
+    batches = table.read_snapshot([("city", "=", "san_francisco")])
+    t = (
+        pa.Table.from_batches(batches)
+        .select(["ts", "uuid", "rider", "fare"])
+        .sort_by("ts")
+    )
+    rows = t.to_pylist()
+
+    assert len(rows) == 4
+    rider_fares = {r["rider"]: r["fare"] for r in rows}
+    assert rider_fares == {
+        "rider-D": 33.9,
+        "rider-C": 27.7,
+        "rider-A": 0.0,
+        "rider-E": 93.5,
+    }
+
+
+def test_table_apis_as_of_timestamp(v8_trips_table):
+    table = HudiTable(v8_trips_table)
+
+    timeline = table.get_timeline()
+    all_commits = timeline.get_completed_commits()
+    first_commit = all_commits[0].timestamp
+
+    file_slices_gen = table.get_file_slices_splits_as_of(2, first_commit)
+    all_slices = list(chain.from_iterable(file_slices_gen))
+    assert len(all_slices) == 3
+    partition_prefixes = sorted(
+        f.base_file_relative_path().split("/")[0] for f in all_slices
+    )
+    assert partition_prefixes == [
+        "city=chennai",
+        "city=san_francisco",
+        "city=sao_paulo",
     ]
 
+    # get_completed_commits() returns compaction commits for MOR tables.
+    # The sole compaction commit predates the final deltacommit (rider-G update).
+    batches = table.read_snapshot_as_of(first_commit)
+    t = (
+        pa.Table.from_batches(batches)
+        .select(["ts", "uuid", "rider", "fare"])
+        .sort_by("ts")
+    )
+    rows = t.to_pylist()
+    assert len(rows) == 6
 
-def test_convert_filters_valid(get_sample_table):
-    table_path = get_sample_table
-    table = HudiTable(table_path)
+    rider_fares = {r["rider"]: r["fare"] for r in rows}
+    assert rider_fares["rider-A"] == 0.0  # updated before compaction
+    assert rider_fares["rider-D"] == 33.9
+    assert rider_fares["rider-C"] == 27.7
+    assert rider_fares["rider-G"] == 43.40  # not yet updated at compaction time
+
+
+def test_convert_filters_valid(v8_trips_table):
+    table = HudiTable(v8_trips_table)
 
     filters = [
         ("city", "=", "san_francisco"),
@@ -222,9 +189,10 @@ def test_convert_filters_valid(get_sample_table):
         ("city", ">=", "san_francisco"),
     ]
 
-    result = [3, 1, 1, 4, 4]
+    expected = [1, 1, 1, 2, 2]
 
-    for i in range(len(filters)):
-        filter_list = [filters[i]]
-        file_slices = table.get_file_slices(filters=filter_list)
-        assert len(file_slices) == result[i]
+    for f, exp in zip(filters, expected):
+        file_slices = table.get_file_slices(filters=[f])
+        assert len(file_slices) == exp, (
+            f"Filter {f} expected {exp} slices, got {len(file_slices)}"
+        )

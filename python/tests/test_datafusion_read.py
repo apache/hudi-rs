@@ -15,18 +15,68 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-from datafusion import SessionContext
+"""DataFusion read tests for v9 txns tables.
 
-from hudi import HudiDataFusionDataSource
+Verification logic is shared with Rust tests via hudi_test::v9_verification.
+"""
+
+import pytest
+
+from hudi._internal import verify_v9_txns_table
+
+# ============================================================================
+# COW tests
+# ============================================================================
 
 
-def test_datafusion_table_registry(get_sample_table):
-    table_path = get_sample_table
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "v9_txns_simple_nometa",
+        "v9_txns_simple_meta",
+        "v9_txns_complex_nometa",
+        "v9_txns_complex_meta",
+    ],
+)
+def test_v9_cow_partitioned(table_name):
+    verify_v9_txns_table(table_name, cow=True, partitioned=True)
 
-    table = HudiDataFusionDataSource(
-        table_path, [("hoodie.read.use.read_optimized.mode", "true")]
-    )
-    ctx = SessionContext()
-    ctx.register_table("trips", table)
-    df = ctx.sql("SELECT  city from trips order by city desc limit 1").to_arrow_table()
-    assert df.to_pylist() == [{"city": "sao_paulo"}]
+
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "v9_txns_nonpart_nometa",
+        "v9_txns_nonpart_meta",
+    ],
+)
+def test_v9_cow_nonpart(table_name):
+    verify_v9_txns_table(table_name, cow=True, partitioned=False)
+
+
+# ============================================================================
+# MOR tests (read-optimized mode, after compaction + clustering)
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "v9_txns_simple_nometa",
+        "v9_txns_simple_meta",
+        "v9_txns_complex_nometa",
+        "v9_txns_complex_meta",
+    ],
+)
+def test_v9_mor_partitioned(table_name):
+    verify_v9_txns_table(table_name, cow=False, partitioned=True)
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "v9_txns_nonpart_nometa",
+        "v9_txns_nonpart_meta",
+    ],
+)
+def test_v9_mor_nonpart(table_name):
+    verify_v9_txns_table(table_name, cow=False, partitioned=False)

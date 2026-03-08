@@ -15,26 +15,11 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
-import os
-import pathlib
-import zipfile
-
 import pytest
 
-
-def _extract_testing_table(zip_file_path, target_path) -> str:
-    with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-        zip_ref.extractall(target_path)
-    return os.path.join(target_path, "trips_table")
+from hudi._internal import get_test_table_path
 
 
-@pytest.fixture(
-    params=[
-        "0.x_cow_partitioned",
-    ]
-)
-def get_sample_table(request, tmp_path) -> str:
-    fixture_path = pathlib.Path(__file__).parent.joinpath("table")
-    table_name = request.param
-    zip_file_path = pathlib.Path(fixture_path).joinpath(f"{table_name}.zip")
-    return _extract_testing_table(zip_file_path, tmp_path)
+@pytest.fixture
+def v8_trips_table() -> str:
+    return get_test_table_path("v8_trips_8i3u1d", "mor_avro")

@@ -57,4 +57,4 @@ url = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
-hudi-test = { path = "../test" }
+hudi-test = { path = "../test", features = ["datafusion"] }
