@@ -67,8 +67,6 @@ pub struct ScaleFactorConfig {
 #[derive(Deserialize)]
 pub struct SparkCommandConfig {
     #[serde(default)]
-    pub driver_memory: String,
-    #[serde(default)]
     pub spark_conf: BTreeMap<String, String>,
 }
 
@@ -78,8 +76,6 @@ pub struct BenchConfig {
     pub warmup: usize,
     #[serde(default = "default_iterations")]
     pub iterations: usize,
-    #[serde(default)]
-    pub driver_memory: String,
     #[serde(default)]
     pub memory_limit: Option<String>,
     #[serde(default)]
@@ -234,21 +230,13 @@ impl ScaleFactorConfig {
 
     /// Generate spark-submit arguments for a given command, one per line.
     pub fn render_spark_args(&self, command: &str) -> Result<Vec<String>, String> {
-        let (driver_memory, spark_conf) = match command {
-            "create-tables" => (
-                &self.create_tables.driver_memory,
-                &self.create_tables.spark_conf,
-            ),
-            "bench" => (&self.bench.driver_memory, &self.bench.spark_conf),
+        let spark_conf = match command {
+            "create-tables" => &self.create_tables.spark_conf,
+            "bench" => &self.bench.spark_conf,
             _ => return Err(format!("Unknown command: {command}")),
         };
 
-        let mut args = vec![
-            "--master".to_string(),
-            "local[*]".to_string(),
-            "--driver-memory".to_string(),
-            driver_memory.clone(),
-        ];
+        let mut args = vec!["--master".to_string(), "local[*]".to_string()];
 
         for (key, value) in spark_conf {
             args.push("--conf".to_string());

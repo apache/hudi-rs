@@ -30,11 +30,15 @@ shuffle_parallelism:
 
 # Spark configs for 'create-tables' command
 create_tables:
-  driver_memory: 96g
+  spark_conf:
+    spark.driver.memory: 120g
 
 # Benchmark settings (shared across DataFusion and Spark)
 bench:
   warmup: 2
   iterations: 3
-  driver_memory: 96g
-  memory_limit: 96g
+  memory_limit: 120g
+  spark_conf:
+    spark.driver.memory: 120g
+    spark.sql.shuffle.partitions: "1600"
+    spark.sql.autoBroadcastJoinThreshold: "536870912"
