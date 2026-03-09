@@ -26,7 +26,6 @@ mirroring how DataFusion benchmarks are measured.
 import argparse
 import json
 import os
-import sys
 import time
 
 from pyspark.sql import SparkSession
@@ -47,13 +46,18 @@ def load_query(query_dir, query_num, scale_factor):
 
 def main():
     parser = argparse.ArgumentParser(description="TPC-H Spark SQL benchmark")
-    parser.add_argument("--hudi-base", required=True)
+    parser.add_argument("--hudi-base", default=None)
+    parser.add_argument("--parquet-base", default=None)
     parser.add_argument("--query-dir", required=True)
     parser.add_argument("--scale-factor", type=float, default=1.0)
     parser.add_argument("--queries", default=None, help="Comma-separated query numbers")
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--warmup", type=int, required=True)
+    parser.add_argument("--iterations", type=int, required=True)
+    parser.add_argument("--output", required=True, help="Output file for JSON results")
     args = parser.parse_args()
+
+    if not args.hudi_base and not args.parquet_base:
+        parser.error("at least one of --hudi-base or --parquet-base is required")
 
     query_nums = list(range(1, 23))
     if args.queries:
@@ -61,18 +65,27 @@ def main():
 
     total_runs = args.warmup + args.iterations
 
+    print("Initializing Spark session...", flush=True)
     spark = SparkSession.builder.getOrCreate()
 
-    # Register Hudi tables
-    for table in TPCH_TABLES:
-        spark.sql(
-            f"CREATE TABLE {table} USING hudi LOCATION '{args.hudi_base}/{table}'"
-        )
+    # Register tables
+    if args.hudi_base:
+        for table in TPCH_TABLES:
+            print(f"  Registering Hudi table: {table}", flush=True)
+            spark.sql(
+                f"CREATE TABLE {table} USING hudi LOCATION '{args.hudi_base}/{table}'"
+            )
+    elif args.parquet_base:
+        for table in TPCH_TABLES:
+            print(f"  Registering Parquet table: {table}", flush=True)
+            spark.read.parquet(f"{args.parquet_base}/{table}").createOrReplaceTempView(table)
 
     print(
         f"Warmup: {args.warmup} iteration(s), Measured: {args.iterations} iteration(s)",
-        file=sys.stderr, flush=True,
+        flush=True,
     )
+
+    result_file = open(args.output, "w")
 
     for qn in query_nums:
         sql = load_query(args.query_dir, qn, args.scale_factor)
@@ -84,18 +97,20 @@ def main():
                 label = f"warmup {i + 1}/{args.warmup}"
             else:
                 label = f"iter {i - args.warmup + 1}/{args.iterations}"
-            print(f"  Q{qn:02d} {label}...", end="", file=sys.stderr, flush=True)
+            print(f"  Q{qn:02d} {label}...", end="", flush=True)
 
             start = time.time()
             for stmt in statements:
                 spark.sql(stmt).collect()
             elapsed_ms = (time.time() - start) * 1000.0
 
-            print(f" {elapsed_ms:.1f}ms", file=sys.stderr, flush=True)
+            print(f" {elapsed_ms:.1f}ms", flush=True)
 
             if not is_warmup:
-                print(json.dumps({"query": qn, "elapsed_ms": elapsed_ms}), flush=True)
+                result_file.write(json.dumps({"query": qn, "elapsed_ms": elapsed_ms}) + "\n")
+                result_file.flush()
 
+    result_file.close()
     spark.stop()
 
 

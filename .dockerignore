@@ -1,0 +1,5 @@
+target
+.git
+benchmark/tpch/data
+benchmark/tpch/results
+python/.venv

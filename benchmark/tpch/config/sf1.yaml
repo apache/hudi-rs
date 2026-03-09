@@ -16,54 +16,24 @@
 # under the License.
 
 # TPC-H scale factor 1 configuration.
-# Table definitions and per-scale-factor Spark/Hudi tuning parameters.
+# Per-scale-factor shuffle parallelism and Spark/Hudi tuning parameters.
 
-tables:
-  customer:
-    primary_key: c_custkey
-    pre_combine_field: c_custkey
-    record_size_estimate: 87
-    shuffle_parallelism: 1
-  lineitem:
-    primary_key: l_orderkey,l_linenumber
-    pre_combine_field: l_shipdate
-    record_size_estimate: 36
-    shuffle_parallelism: 1
-  nation:
-    primary_key: n_nationkey
-    pre_combine_field: n_nationkey
-    record_size_estimate: 160
-    shuffle_parallelism: 1
-  orders:
-    primary_key: o_orderkey
-    pre_combine_field: o_orderdate
-    record_size_estimate: 35
-    shuffle_parallelism: 1
-  part:
-    primary_key: p_partkey
-    pre_combine_field: p_partkey
-    record_size_estimate: 32
-    shuffle_parallelism: 1
-  partsupp:
-    primary_key: ps_partkey,ps_suppkey
-    pre_combine_field: ps_partkey
-    record_size_estimate: 48
-    shuffle_parallelism: 1
-  region:
-    primary_key: r_regionkey
-    pre_combine_field: r_regionkey
-    record_size_estimate: 800
-    shuffle_parallelism: 1
-  supplier:
-    primary_key: s_suppkey
-    pre_combine_field: s_suppkey
-    record_size_estimate: 88
-    shuffle_parallelism: 1
+shuffle_parallelism:
+  customer: 1
+  lineitem: 1
+  nation: 1
+  orders: 1
+  part: 1
+  partsupp: 1
+  region: 1
+  supplier: 1
 
 # Spark configs for 'create-tables' command
 create_tables:
   driver_memory: 3g
 
-# Spark configs for 'bench-spark' command
+# Benchmark settings (shared across DataFusion and Spark)
 bench:
+  warmup: 0
+  iterations: 1
   driver_memory: 3g

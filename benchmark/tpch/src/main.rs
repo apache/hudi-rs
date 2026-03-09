@@ -20,18 +20,19 @@
 mod config;
 mod datagen;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::DataType;
 use arrow_array::RecordBatch;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Table};
+use serde::{Deserialize, Serialize};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
@@ -98,9 +99,9 @@ enum Commands {
         #[arg(long)]
         queries: Option<String>,
 
-        /// Number of iterations per query
-        #[arg(long, default_value_t = 3)]
-        iterations: usize,
+        /// Number of iterations per query (overrides config)
+        #[arg(long)]
+        iterations: Option<usize>,
     },
     /// Output spark-submit arguments from scale-factor config (one per line)
     SparkArgs {
@@ -112,6 +113,12 @@ enum Commands {
         #[arg(long)]
         command: String,
     },
+    /// Print bench defaults from config (warmup and iterations)
+    BenchDefaults {
+        /// TPC-H scale factor (loads config/sf{N}.yaml)
+        #[arg(long, default_value_t = 1.0)]
+        scale_factor: f64,
+    },
     /// Run TPC-H benchmark queries via DataFusion (Hudi, Parquet, or both)
     Bench {
         /// Hudi tables location (local path or cloud URL)
@@ -122,7 +129,7 @@ enum Commands {
         #[arg(long)]
         parquet_dir: Option<String>,
 
-        /// TPC-H scale factor (used for query parameter substitution)
+        /// TPC-H scale factor (used for query parameter substitution and config loading)
         #[arg(long, default_value_t = 1.0)]
         scale_factor: f64,
 
@@ -130,17 +137,33 @@ enum Commands {
         #[arg(long)]
         queries: Option<String>,
 
-        /// Number of measured iterations per query
-        #[arg(long, default_value_t = 3)]
-        iterations: usize,
+        /// Number of measured iterations per query (overrides config)
+        #[arg(long)]
+        iterations: Option<usize>,
 
-        /// Number of unmeasured warmup iterations per query
-        #[arg(long, default_value_t = 2)]
-        warmup: usize,
+        /// Number of unmeasured warmup iterations per query (overrides config)
+        #[arg(long)]
+        warmup: Option<usize>,
 
         /// DataFusion memory limit (e.g., "3g", "512m"); unlimited if not set
         #[arg(long)]
         memory_limit: Option<String>,
+
+        /// Directory to persist results as JSON (enables result saving)
+        #[arg(long)]
+        output_dir: Option<String>,
+
+        /// Engine label for persisted results (e.g., "datafusion")
+        #[arg(long)]
+        engine_label: Option<String>,
+
+        /// Format label for persisted results (e.g., "hudi"); auto-detected if omitted
+        #[arg(long)]
+        format_label: Option<String>,
+
+        /// Display name for charts (e.g., "datafusion+hudi-rs"); defaults to engine_label
+        #[arg(long)]
+        display_name: Option<String>,
     },
     /// Validate Hudi query results against Parquet (runs each query once, compares output)
     Validate {
@@ -169,6 +192,36 @@ enum Commands {
         /// Input file (reads from stdin if omitted)
         #[arg(long)]
         input: Option<String>,
+
+        /// Directory to persist results as JSON
+        #[arg(long)]
+        output_dir: Option<String>,
+
+        /// Engine label for persisted results (default: "spark")
+        #[arg(long)]
+        engine_label: Option<String>,
+
+        /// Format label for persisted results (e.g., "hudi")
+        #[arg(long)]
+        format_label: Option<String>,
+
+        /// Display name for charts (e.g., "spark+hudi"); defaults to engine_label
+        #[arg(long)]
+        display_name: Option<String>,
+
+        /// TPC-H scale factor (used for result file naming)
+        #[arg(long, default_value_t = 1.0)]
+        scale_factor: f64,
+    },
+    /// Compare persisted benchmark results with terminal bar charts
+    Compare {
+        /// Directory containing result JSON files
+        #[arg(long)]
+        results_dir: String,
+
+        /// Comma-separated result file stems (e.g., "datafusion_hudi_sf1,spark_hudi_sf1")
+        #[arg(long)]
+        runs: String,
     },
 }
 
@@ -255,6 +308,7 @@ fn register_cloud_store(ctx: &SessionContext, base_url: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -306,6 +360,7 @@ async fn main() -> Result<()> {
             let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
                 datafusion::error::DataFusionError::Plan(format!("{e}"))
             })?;
+            let iterations = iterations.unwrap_or(cfg.bench.iterations);
             let query_nums = parse_query_numbers(queries);
             let sql = cfg
                 .render_bench_sql(&hudi_base, &query_nums, iterations, scale_factor)
@@ -328,6 +383,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::BenchDefaults { scale_factor } => {
+            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
+                datafusion::error::DataFusionError::Plan(format!("{e}"))
+            })?;
+            println!("{} {}", cfg.bench.warmup, cfg.bench.iterations);
+            Ok(())
+        }
         Commands::Bench {
             hudi_dir,
             parquet_dir,
@@ -336,7 +398,30 @@ async fn main() -> Result<()> {
             iterations,
             warmup,
             memory_limit,
-        } => run_bench(hudi_dir.as_deref(), parquet_dir.as_deref(), scale_factor, queries, warmup, iterations, memory_limit.as_deref()).await,
+            output_dir,
+            engine_label,
+            format_label,
+            display_name,
+        } => {
+            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
+                datafusion::error::DataFusionError::Plan(format!("{e}"))
+            })?;
+            let warmup = warmup.unwrap_or(cfg.bench.warmup);
+            let iterations = iterations.unwrap_or(cfg.bench.iterations);
+            run_bench(
+                hudi_dir.as_deref(),
+                parquet_dir.as_deref(),
+                scale_factor,
+                queries,
+                warmup,
+                iterations,
+                memory_limit.as_deref(),
+                output_dir.as_deref(),
+                engine_label.as_deref(),
+                format_label.as_deref(),
+                display_name.as_deref(),
+            ).await
+        }
         Commands::Validate {
             hudi_dir,
             parquet_dir,
@@ -344,7 +429,22 @@ async fn main() -> Result<()> {
             queries,
             memory_limit,
         } => run_validate(&hudi_dir, &parquet_dir, scale_factor, queries, memory_limit.as_deref()).await,
-        Commands::ParseSparkOutput { input } => run_parse_spark_output(input.as_deref()),
+        Commands::ParseSparkOutput {
+            input,
+            output_dir,
+            engine_label,
+            format_label,
+            display_name,
+            scale_factor,
+        } => run_parse_spark_output(
+            input.as_deref(),
+            output_dir.as_deref(),
+            engine_label.as_deref(),
+            format_label.as_deref(),
+            display_name.as_deref(),
+            scale_factor,
+        ),
+        Commands::Compare { results_dir, runs } => run_compare(&results_dir, &runs),
     }
 }
 
@@ -362,7 +462,9 @@ fn parse_query_numbers(queries: Option<String>) -> Vec<usize> {
 
 /// Load a SQL query file, applying scale-factor-dependent substitutions.
 fn load_query(query_num: usize, scale_factor: f64) -> std::result::Result<String, String> {
-    let cache_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("queries");
+    let cache_dir = std::env::var("TPCH_QUERY_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("queries"));
     let file_name = format!("q{query_num}.sql");
     let path = cache_dir.join(&file_name);
     let sql = fs::read_to_string(&path).map_err(|e| format!("Failed to read {file_name}: {e}"))?;
@@ -562,6 +664,101 @@ fn compute_stats(timings: &[f64]) -> Option<TimingStats> {
     })
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedQueryStats {
+    avg_ms: f64,
+    min_ms: f64,
+    median_ms: f64,
+    max_ms: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedResults {
+    engine: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    format: String,
+    scale_factor: f64,
+    timestamp: u64,
+    queries: BTreeMap<String, PersistedQueryStats>,
+}
+
+impl PersistedResults {
+    fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.engine)
+    }
+}
+
+fn format_sf_label(sf: f64) -> String {
+    if sf == sf.floor() && sf >= 1.0 {
+        format!("sf{}", sf as u64)
+    } else {
+        format!("sf{sf}")
+    }
+}
+
+fn save_results(
+    results: &[QueryResult],
+    engine: &str,
+    display_name: Option<&str>,
+    format_name: &str,
+    scale_factor: f64,
+    output_dir: &str,
+) -> std::result::Result<(), String> {
+    let mut queries = BTreeMap::new();
+    for r in results {
+        if r.error.is_some() {
+            continue;
+        }
+        if let Some(stats) = compute_stats(&r.timings_ms) {
+            queries.insert(
+                r.query_num.to_string(),
+                PersistedQueryStats {
+                    avg_ms: stats.mean,
+                    min_ms: stats.min,
+                    median_ms: stats.median,
+                    max_ms: stats.max,
+                },
+            );
+        }
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let persisted = PersistedResults {
+        engine: engine.to_string(),
+        display_name: display_name.map(|s| s.to_string()),
+        format: format_name.to_string(),
+        scale_factor,
+        timestamp,
+        queries,
+    };
+
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Failed to create output dir {output_dir}: {e}"))?;
+
+    let sf_label = format_sf_label(scale_factor);
+    let filename = format!("{engine}_{format_name}_{sf_label}.json");
+    let path = Path::new(output_dir).join(&filename);
+
+    let json = serde_json::to_string_pretty(&persisted)
+        .map_err(|e| format!("Failed to serialize results: {e}"))?;
+    fs::write(&path, json)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+
+    println!("Results saved to {}", path.display());
+    Ok(())
+}
+
+fn load_results(path: &str) -> std::result::Result<PersistedResults, String> {
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {path}: {e}"))
+}
+
 /// Run the benchmark against Hudi, Parquet, or both.
 async fn run_bench(
     hudi_dir: Option<&str>,
@@ -571,6 +768,10 @@ async fn run_bench(
     warmup: usize,
     iterations: usize,
     memory_limit: Option<&str>,
+    output_dir: Option<&str>,
+    engine_label: Option<&str>,
+    format_label: Option<&str>,
+    display_name: Option<&str>,
 ) -> Result<()> {
     if hudi_dir.is_none() && parquet_dir.is_none() {
         return Err(datafusion::error::DataFusionError::Plan(
@@ -595,6 +796,12 @@ async fn run_bench(
         println!("Benchmarking Hudi...");
         let results = bench_source(&ctx, &query_nums, warmup, iterations, scale_factor).await;
         print_single_table("Hudi", &results);
+        if let Some(dir) = output_dir {
+            let engine = engine_label.unwrap_or("datafusion");
+            let fmt = format_label.unwrap_or("hudi");
+            save_results(&results, engine, display_name, fmt, scale_factor, dir)
+                .map_err(datafusion::error::DataFusionError::Plan)?;
+        }
     }
 
     if let Some(parquet_dir) = parquet_dir {
@@ -605,6 +812,12 @@ async fn run_bench(
         println!("Benchmarking Parquet...");
         let results = bench_source(&ctx, &query_nums, warmup, iterations, scale_factor).await;
         print_single_table("Parquet", &results);
+        if let Some(dir) = output_dir {
+            let engine = engine_label.unwrap_or("datafusion");
+            let fmt = format_label.unwrap_or("parquet");
+            save_results(&results, engine, display_name, fmt, scale_factor, dir)
+                .map_err(datafusion::error::DataFusionError::Plan)?;
+        }
     }
 
     Ok(())
@@ -646,7 +859,14 @@ async fn run_validate(
 }
 
 /// Parse Spark benchmark JSON output into a timing table.
-fn run_parse_spark_output(input: Option<&str>) -> Result<()> {
+fn run_parse_spark_output(
+    input: Option<&str>,
+    output_dir: Option<&str>,
+    engine_label: Option<&str>,
+    format_label: Option<&str>,
+    display_name: Option<&str>,
+    scale_factor: f64,
+) -> Result<()> {
     let reader: Box<dyn BufRead> = match input {
         Some(path) => {
             let file = fs::File::open(path).map_err(|e| {
@@ -662,6 +882,12 @@ fn run_parse_spark_output(input: Option<&str>) -> Result<()> {
         println!("No benchmark data found in input.");
     } else {
         print_single_table("Spark", &results);
+        if let Some(dir) = output_dir {
+            let engine = engine_label.unwrap_or("spark");
+            let fmt = format_label.unwrap_or("hudi");
+            save_results(&results, engine, display_name, fmt, scale_factor, dir)
+                .map_err(datafusion::error::DataFusionError::Plan)?;
+        }
     }
     Ok(())
 }
@@ -690,6 +916,156 @@ fn parse_spark_timings(reader: Box<dyn BufRead>) -> Vec<QueryResult> {
             error: None,
         })
         .collect()
+}
+
+/// Compare persisted benchmark results and render terminal bar charts.
+fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
+    let stems: Vec<&str> = runs.split(',').map(|s| s.trim()).collect();
+    if stems.is_empty() {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "No runs specified".to_string(),
+        ));
+    }
+
+    let mut loaded: Vec<PersistedResults> = Vec::new();
+    for stem in &stems {
+        let path = format!("{results_dir}/{stem}.json");
+        let r = load_results(&path).map_err(datafusion::error::DataFusionError::Plan)?;
+        loaded.push(r);
+    }
+
+    // Collect all query numbers across all runs
+    let mut all_queries = BTreeSet::new();
+    for r in &loaded {
+        for q in r.queries.keys() {
+            if let Ok(n) = q.parse::<usize>() {
+                all_queries.insert(n);
+            }
+        }
+    }
+
+    if all_queries.is_empty() {
+        println!("No query data found in the provided result files.");
+        return Ok(());
+    }
+
+    // Find global max avg_ms for bar scaling
+    let global_max = loaded
+        .iter()
+        .flat_map(|r| r.queries.values().map(|s| s.avg_ms))
+        .fold(0.0_f64, f64::max);
+
+    if global_max == 0.0 {
+        println!("All query timings are zero.");
+        return Ok(());
+    }
+
+    let bar_width: usize = 40;
+    let engine_names: Vec<&str> = loaded.iter().map(|r| r.label()).collect();
+    let max_name_len = engine_names.iter().map(|n| n.len()).max().unwrap_or(0);
+
+    println!();
+    println!("TPC-H Query Runtime Comparison");
+    println!("{}", "=".repeat(max_name_len + 6 + bar_width + 16));
+    println!();
+
+    for q in &all_queries {
+        let q_str = q.to_string();
+        for (i, r) in loaded.iter().enumerate() {
+            let label = if i == 0 {
+                format!("Q{q:02}  {:<width$}", r.label(), width = max_name_len)
+            } else {
+                format!("     {:<width$}", r.label(), width = max_name_len)
+            };
+
+            if let Some(stats) = r.queries.get(&q_str) {
+                let filled =
+                    ((stats.avg_ms / global_max) * bar_width as f64).round() as usize;
+                let filled = filled.min(bar_width);
+                let empty = bar_width - filled;
+                println!(
+                    "{label} |{}{} | {:>9.1} ms",
+                    "\u{2588}".repeat(filled),
+                    " ".repeat(empty),
+                    stats.avg_ms,
+                );
+            } else {
+                println!(
+                    "{label} |{} |       N/A",
+                    " ".repeat(bar_width),
+                );
+            }
+        }
+        println!();
+    }
+
+    // Summary: Total and Geometric Mean as bar charts
+    let mut totals: Vec<(String, f64)> = Vec::new();
+    let mut geomeans: Vec<(String, f64)> = Vec::new();
+    for r in &loaded {
+        let total: f64 = r.queries.values().map(|s| s.avg_ms).sum();
+        totals.push((r.label().to_string(), total));
+
+        let values: Vec<f64> = r.queries.values().map(|s| s.avg_ms).collect();
+        if !values.is_empty() && values.iter().all(|v| *v > 0.0) {
+            let log_sum: f64 = values.iter().map(|v| v.ln()).sum::<f64>();
+            let geomean = (log_sum / values.len() as f64).exp();
+            geomeans.push((r.label().to_string(), geomean));
+        }
+    }
+
+    println!("Summary");
+    println!("{}", "-".repeat(max_name_len + 6 + bar_width + 16));
+    println!();
+
+    // Total runtime bars
+    let total_max = totals.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+    if total_max > 0.0 {
+        for (i, (engine, total)) in totals.iter().enumerate() {
+            let label = if i == 0 {
+                format!("Tot  {:<width$}", engine, width = max_name_len)
+            } else {
+                format!("     {:<width$}", engine, width = max_name_len)
+            };
+            let filled = ((total / total_max) * bar_width as f64).round() as usize;
+            let filled = filled.min(bar_width);
+            let empty = bar_width - filled;
+            println!(
+                "{label} |{}{} | {:>9.1} ms",
+                "\u{2588}".repeat(filled),
+                " ".repeat(empty),
+                total,
+            );
+        }
+        println!();
+    }
+
+    // Geometric mean bars
+    if !geomeans.is_empty() {
+        let geomean_max = geomeans.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+        if geomean_max > 0.0 {
+            for (i, (engine, geomean)) in geomeans.iter().enumerate() {
+                let label = if i == 0 {
+                    format!("Geo  {:<width$}", engine, width = max_name_len)
+                } else {
+                    format!("     {:<width$}", engine, width = max_name_len)
+                };
+                let filled =
+                    ((geomean / geomean_max) * bar_width as f64).round() as usize;
+                let filled = filled.min(bar_width);
+                let empty = bar_width - filled;
+                println!(
+                    "{label} |{}{} | {:>9.1} ms",
+                    "\u{2588}".repeat(filled),
+                    " ".repeat(empty),
+                    geomean,
+                );
+            }
+            println!();
+        }
+    }
+
+    Ok(())
 }
 
 fn print_single_table(label: &str, results: &[QueryResult]) {

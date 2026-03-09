@@ -163,8 +163,15 @@ clean-coverage: ## Remove coverage reports
 # TPC-H Benchmark
 # =============================================================================
 SF ?= 0.001
+ENGINE ?= datafusion
+FORMAT ?= hudi
+MODE ?= docker
+QUERIES ?=
+COMPARE ?=
 TPCH_DIR := benchmark/tpch
 TPCH_DATA_DIR := $(TPCH_DIR)/data
+TPCH_RESULTS_DIR := $(TPCH_DIR)/results
+comma := ,
 
 .PHONY: tpch-generate
 tpch-generate: ## Generate TPC-H parquet tables (SF=0.001)
@@ -176,29 +183,16 @@ tpch-create-tables: ## Create Hudi COW tables from parquet (SF=0.001, requires D
 	$(info --- Create Hudi tables at SF=$(SF) ---)
 	$(TPCH_DIR)/run.sh create-tables --scale-factor $(SF)
 
-.PHONY: tpch-bench-parquet
-tpch-bench-parquet: ## Run TPC-H benchmark against parquet tables (SF=0.001)
-	$(info --- Benchmark parquet at SF=$(SF) ---)
-	cargo run -p tpch --release -- bench --parquet-dir $(TPCH_DATA_DIR)/sf$(SF)-parquet
-
-.PHONY: tpch-bench-hudi
-tpch-bench-hudi: ## Run TPC-H benchmark against Hudi tables (SF=0.001)
-	$(info --- Benchmark Hudi at SF=$(SF) ---)
-	cargo run -p tpch --release -- bench --hudi-dir $(TPCH_DATA_DIR)/sf$(SF)-hudi
-
-.PHONY: tpch-bench
-tpch-bench: ## Run TPC-H benchmark comparing Hudi vs Parquet (SF=0.001)
-	$(info --- Benchmark Hudi vs Parquet at SF=$(SF) ---)
-	cargo run -p tpch --release -- bench \
-		--hudi-dir $(TPCH_DATA_DIR)/sf$(SF)-hudi \
-		--parquet-dir $(TPCH_DATA_DIR)/sf$(SF)-parquet
-
-.PHONY: tpch-bench-spark
-tpch-bench-spark: ## Run TPC-H benchmark against Hudi tables using Spark SQL (SF=0.001)
-	$(info --- Benchmark Spark+Hudi at SF=$(SF) ---)
-	$(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF)
-
-.PHONY: tpch-clean
-tpch-clean: ## Remove generated TPC-H data
-	$(info --- Clean TPC-H data ---)
-	$(TPCH_DIR)/run.sh clean
+.PHONY: bench-tpch
+bench-tpch: ## Run TPC-H benchmark (ENGINE=datafusion|spark FORMAT=hudi|parquet SF=0.001 MODE=docker|native QUERIES=1,3,6)
+	$(info --- Benchmark at SF=$(SF) MODE=$(MODE) ---)
+ifneq (,$(findstring $(comma),$(COMPARE)))
+	@# Compare mode: COMPARE=engine1,engine2
+	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(COMPARE) --format $(FORMAT)
+else ifeq ($(ENGINE),spark)
+	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(filter 1,$(COMPARE)),--output-dir $(TPCH_RESULTS_DIR))
+else ifeq ($(ENGINE),datafusion)
+	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-datafusion --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(filter 1,$(COMPARE)),--output-dir $(TPCH_RESULTS_DIR))
+else
+	$(error Unknown ENGINE=$(ENGINE). Use datafusion or spark)
+endif

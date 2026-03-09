@@ -15,20 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM apache/spark:3.5.8
+# TPC-H scale factor 1000 configuration.
+# Per-scale-factor shuffle parallelism and Spark/Hudi tuning parameters.
 
-USER root
+shuffle_parallelism:
+  customer: 12
+  lineitem: 292
+  nation: 1
+  orders: 68
+  part: 12
+  partsupp: 48
+  region: 1
+  supplier: 4
 
-# Download Hudi Spark bundle jar
-RUN cd /opt/spark/jars && \
-  wget -q \
-    https://repo1.maven.org/maven2/org/apache/hudi/hudi-spark3.5-bundle_2.12/1.1.1/hudi-spark3.5-bundle_2.12-1.1.1.jar
+# Spark configs for 'create-tables' command
+create_tables:
+  driver_memory: 96g
 
-# Bake in Spark and Hudi defaults, and logging config
-COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
-COPY log4j2.properties /opt/spark/conf/log4j2.properties
-COPY hudi-defaults.conf /etc/hudi/conf/hudi-defaults.conf
-
-USER spark
-
-WORKDIR /opt/spark/work-dir
+# Benchmark settings (shared across DataFusion and Spark)
+bench:
+  warmup: 1
+  iterations: 3
+  driver_memory: 96g

@@ -1,118 +1,88 @@
 # TPC-H Benchmark
 
-Generate TPC-H data, create Hudi COW tables, and run benchmarks.
+Benchmark hudi-rs (DataFusion) against Spark+Hudi using TPC-H queries.
 
 ## Prerequisites
 
 - Rust toolchain
-- Docker (for local Hudi table creation via Spark 3.5.8 + Hudi 1.1.1)
+- Docker (for Hudi table creation and fair engine comparison)
 
-## Quick Start (Local)
-
-From the repository root:
+## Quick Start
 
 ```bash
-# Generate parquet tables at scale factor 0.001
-make tpch-generate SF=0.001
+# 1. Generate parquet data
+make tpch-generate SF=1
 
-# Create Hudi COW tables from the parquet data (requires Docker)
-make tpch-create-tables SF=0.001
+# 2. Create Hudi COW tables from parquet (requires Docker)
+make tpch-create-tables SF=1
 
-# Run benchmark against parquet tables
-make tpch-bench-parquet SF=0.001
-
-# Run benchmark against Hudi tables
-make tpch-bench-hudi SF=0.001
-
-# Run benchmark comparing Hudi vs Parquet (DataFusion)
-make tpch-bench SF=0.001
-
-# Run benchmark against Hudi tables using Spark SQL (requires Docker)
-make tpch-bench-spark SF=0.001
-
-# Clean up generated data
-make tpch-clean
+# 3. Benchmark
+make bench-tpch ENGINE=datafusion FORMAT=hudi SF=1
+make bench-tpch ENGINE=spark FORMAT=hudi SF=1
+make bench-tpch ENGINE=datafusion FORMAT=parquet SF=1
+make bench-tpch ENGINE=spark FORMAT=parquet SF=1
 ```
 
-The `create-tables` command auto-detects host memory and allocates 75% to Spark.
-For large scale factors (e.g., SF100), ensure the machine has sufficient memory
-and disk.
+Both engines run inside Docker (same `apache/spark:3.5.8` base image) for a fair
+comparison. Set `MODE=native` to skip Docker.
 
-## Using the Binary Directly
+### Options
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `ENGINE` | `datafusion`, `spark` | `datafusion` |
+| `FORMAT` | `hudi`, `parquet` | `hudi` |
+| `SF` | TPC-H scale factor | `0.001` |
+| `QUERIES` | Comma-separated query numbers | all 22 |
+| `MODE` | `docker`, `native` | `docker` |
+| `COMPARE` | `1` to persist results, or `engine1,engine2` to compare | |
+
+### Examples
 
 ```bash
-# Generate parquet tables
-cargo run -p tpch --release -- generate --scale-factor 0.001 --output-dir benchmark/tpch/data/sf0.001-parquet
+# Run only Q1, Q6, Q17
+make bench-tpch QUERIES=1,6,17 SF=10
 
-# Benchmark parquet
-cargo run -p tpch --release -- bench --parquet-dir benchmark/tpch/data/sf0.001-parquet
+# Run natively (no Docker overhead)
+make bench-tpch MODE=native SF=1
 
-# Benchmark specific queries with more iterations
-cargo run -p tpch --release -- bench --parquet-dir benchmark/tpch/data/sf0.001-parquet --queries 1,3,6 --iterations 5
+# Persist results then compare
+make bench-tpch ENGINE=datafusion COMPARE=1 SF=10
+make bench-tpch ENGINE=spark COMPARE=1 SF=10
+make bench-tpch COMPARE=datafusion,spark SF=10
 ```
 
 ## Cloud Storage
 
-Both `generate` and `bench` support cloud URLs directly. Cloud credentials are
-picked up from environment variables (`AWS_*`, `GOOGLE_*`, `AZURE_*`).
+`generate` and `bench` support cloud URLs (`s3://`, `gs://`, `az://`).
+Credentials are read from environment variables (`AWS_*`, `GOOGLE_*`, `AZURE_*`).
 
 ```bash
-# Generate parquet directly to cloud storage (streams, no local disk needed)
-cargo run -p tpch --release -- generate --scale-factor 1000 --output-dir gs://my-bucket/tpch/sf1000-parquet
+cargo run -p tpch --release -- generate --scale-factor 1000 \
+  --output-dir gs://my-bucket/tpch/sf1000-parquet
 
-# Benchmark from cloud
-cargo run -p tpch --release -- bench --parquet-dir gs://my-bucket/tpch/sf1000-parquet
+cargo run -p tpch --release -- bench \
+  --hudi-dir gs://my-bucket/tpch/sf1000-hudi \
+  --parquet-dir gs://my-bucket/tpch/sf1000-parquet
 ```
 
 ## Creating Hudi Tables on a Spark Cluster
 
-For large scale factors where a single Docker container is impractical, or when
-data lives in cloud storage, use `render-sql` to generate the CTAS SQL and submit
-it to any Spark 3.5 environment.
-
-### Step 1: Generate parquet data
+For large scale factors or cloud data, use `render-ctas` to generate CTAS SQL
+and submit it to any Spark 3.5 environment:
 
 ```bash
-cargo run -p tpch --release -- generate \
-  --scale-factor 1000 \
-  --output-dir gs://my-bucket/tpch/sf1000-parquet
-```
-
-### Step 2: Render the CTAS SQL
-
-```bash
-benchmark/tpch/run.sh render-sql \
+# Render SQL
+cargo run -p tpch --release -- render-ctas \
   --parquet-base gs://my-bucket/tpch/sf1000-parquet \
   --hudi-base gs://my-bucket/tpch/sf1000-hudi \
   > create_hudi_tables.sql
-```
 
-### Step 3: Submit to Spark
-
-Run `spark-sql` with the following configuration:
-
-```bash
+# Submit to Spark
 spark-sql \
-  --jars /path/to/hudi-spark3.5-bundle_2.12-1.1.1.jar \
+  --jars hudi-spark3.5-bundle_2.12-1.1.1.jar \
   --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
   --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.hudi.catalog.HoodieCatalog \
   --conf spark.sql.extensions=org.apache.spark.sql.hudi.HoodieSparkSessionExtension \
   -f create_hudi_tables.sql
-```
-
-The Hudi bundle jar is available from Maven Central:
-
-```text
-https://repo1.maven.org/maven2/org/apache/hudi/hudi-spark3.5-bundle_2.12/1.1.1/hudi-spark3.5-bundle_2.12-1.1.1.jar
-```
-
-This works with any Spark deployment: managed services (Dataproc, EMR, HDInsight),
-Kubernetes, or standalone clusters.
-
-### Step 4: Benchmark
-
-```bash
-cargo run -p tpch --release -- bench \
-  --hudi-dir gs://my-bucket/tpch/sf1000-hudi \
-  --parquet-dir gs://my-bucket/tpch/sf1000-parquet
 ```
