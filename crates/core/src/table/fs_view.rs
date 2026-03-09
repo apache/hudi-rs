@@ -210,6 +210,10 @@ impl FileSystemView {
     }
 
     /// Collect file slices from loaded file groups using the timeline view.
+    ///
+    /// File slices are first collected from the DashMap using read locks (released
+    /// promptly), then metadata is loaded on the owned clones without holding any
+    /// locks.
     async fn collect_file_slices(
         &self,
         partition_pruner: &PartitionPruner,
@@ -219,21 +223,25 @@ impl FileSystemView {
         let excluding_file_groups = timeline_view.excluding_file_groups();
 
         let mut file_slices = Vec::new();
-        for mut partition_entry in self.partition_to_file_groups.iter_mut() {
+        for partition_entry in self.partition_to_file_groups.iter() {
             if !partition_pruner.should_include(partition_entry.key()) {
                 continue;
             }
-            let file_groups = partition_entry.value_mut();
-            for fg in file_groups.iter_mut() {
+            let file_groups = partition_entry.value();
+            for fg in file_groups.iter() {
                 if excluding_file_groups.contains(fg) {
                     continue;
                 }
-                if let Some(fsl) = fg.get_file_slice_mut_as_of(timestamp) {
-                    fsl.load_metadata_if_needed(&self.storage).await?;
+                if let Some(fsl) = fg.get_file_slice_as_of(timestamp) {
                     file_slices.push(fsl.clone());
                 }
             }
         }
+
+        for fsl in &mut file_slices {
+            fsl.load_metadata_if_needed(&self.storage).await?;
+        }
+
         Ok(file_slices)
     }
 
