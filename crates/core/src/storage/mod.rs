@@ -189,35 +189,6 @@ impl Storage {
         Ok(FileMetadata::new(name.to_string(), meta.size))
     }
 
-    /// Get full file metadata for a Parquet file, including record counts from Parquet metadata.
-    pub async fn get_file_metadata(&self, relative_path: &str) -> Result<FileMetadata> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        let obj_store = self.object_store.clone();
-        let obj_meta = obj_store.head(&obj_path).await?;
-        let location = obj_meta.location.clone();
-        let file_name = location
-            .filename()
-            .ok_or_else(|| InvalidPath(format!("Failed to get file name from: {:?}", &obj_meta)))?;
-        let size = obj_meta.size;
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-        let parquet_meta = builder.metadata().clone();
-        let num_records = parquet_meta.file_metadata().num_rows();
-        let size_bytes = parquet_meta
-            .row_groups()
-            .iter()
-            .map(|rg| rg.total_byte_size())
-            .sum::<i64>();
-        Ok(FileMetadata {
-            name: file_name.to_string(),
-            size,
-            byte_size: size_bytes,
-            num_records,
-            fully_populated: true,
-        })
-    }
-
     pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;

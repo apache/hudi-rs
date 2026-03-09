@@ -39,7 +39,9 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
+use datafusion_common::Statistics;
 use datafusion_common::config::TableParquetOptions;
+use datafusion_common::stats::Precision;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 use log::warn;
@@ -89,6 +91,8 @@ pub struct HudiDataSource {
     /// This is cached at construction since partition schema rarely changes
     /// and is needed synchronously in `supports_filters_pushdown`.
     partition_schema: Schema,
+    /// Cached table-level statistics for join ordering and broadcast decisions.
+    cached_stats: Option<Statistics>,
 }
 
 impl std::fmt::Debug for HudiDataSource {
@@ -142,10 +146,31 @@ impl HudiDataSource {
             }
         };
 
+        // Compute table-level statistics for join ordering and broadcast decisions.
+        // Uses MDT files partition + latest commit stats + 1 Parquet footer to infer
+        // row counts and byte sizes without loading all file groups.
+        // Falls back to None if metadata table is not enabled.
+        let cached_stats = match table.compute_table_stats().await {
+            Some((num_rows, total_byte_size)) => {
+                let schema = table.get_schema().await.unwrap_or_else(|_| Schema::empty());
+                let num_fields = schema.fields().len();
+                Some(Statistics {
+                    num_rows: Precision::Inexact(num_rows),
+                    total_byte_size: Precision::Inexact(total_byte_size),
+                    column_statistics: vec![
+                        datafusion_common::ColumnStatistics::new_unknown();
+                        num_fields
+                    ],
+                })
+            }
+            None => None,
+        };
+
         Ok(Self {
             table: Arc::new(table),
             schema,
             partition_schema,
+            cached_stats,
         })
     }
 
@@ -285,6 +310,10 @@ impl TableProvider for HudiDataSource {
         TableType::Base
     }
 
+    fn statistics(&self) -> Option<Statistics> {
+        self.cached_stats.clone()
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -317,7 +346,6 @@ impl TableProvider for HudiDataSource {
             n => n,
         };
 
-        // Convert Datafusion `Expr` to `Filter`
         let pushdown_filters = exprs_to_filters(filters);
         let file_slices = self
             .table
@@ -370,11 +398,18 @@ impl TableProvider for HudiDataSource {
             .map(FileGroup::from)
             .collect();
 
-        let fsc = FileScanConfigBuilder::new(url, Arc::new(parquet_source))
+        let mut fsc_builder = FileScanConfigBuilder::new(url, Arc::new(parquet_source))
             .with_file_groups(file_groups)
             .with_projection_indices(projection.cloned())?
-            .with_limit(limit)
-            .build();
+            .with_limit(limit);
+
+        // Pass table statistics to the physical plan so DataFusion's join_selection
+        // optimizer can swap build/probe sides and choose broadcast joins.
+        if let Some(stats) = &self.cached_stats {
+            fsc_builder = fsc_builder.with_statistics(stats.clone());
+        }
+
+        let fsc = fsc_builder.build();
 
         Ok(Arc::new(DataSourceExec::new(Arc::new(fsc))))
     }

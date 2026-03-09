@@ -89,7 +89,7 @@
 
 pub mod builder;
 pub mod file_pruner;
-mod fs_view;
+pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
 mod read_options;
@@ -122,18 +122,48 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use url::Url;
 
 /// The main struct that provides table APIs for interacting with a Hudi table.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Table {
     pub hudi_configs: Arc<HudiConfigs>,
     pub storage_options: Arc<HashMap<String, String>>,
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
+    /// Cached metadata table instance, lazily initialized on first use.
+    /// Only populated when metadata table is enabled (v8+ with files partition).
+    /// Shared across clones via `Arc` so all scan() calls reuse the same instance.
+    cached_metadata_table: Arc<OnceCell<Table>>,
+}
+
+impl Clone for Table {
+    fn clone(&self) -> Self {
+        Self {
+            hudi_configs: self.hudi_configs.clone(),
+            storage_options: self.storage_options.clone(),
+            timeline: self.timeline.clone(),
+            file_system_view: self.file_system_view.clone(),
+            cached_metadata_table: self.cached_metadata_table.clone(),
+        }
+    }
 }
 
 impl Table {
+    /// Get or initialize the cached metadata table instance.
+    ///
+    /// Returns `Ok(&Table)` if metadata table is successfully created or was already cached.
+    /// The instance is created once and reused across all subsequent calls.
+    pub(crate) async fn get_or_init_metadata_table(&self) -> Result<&Table> {
+        self.cached_metadata_table
+            .get_or_try_init(|| async {
+                log::debug!("Initializing cached metadata table instance");
+                self.new_metadata_table().await
+            })
+            .await
+    }
+
     /// Create hudi table by base_uri
     pub async fn new(base_uri: &str) -> Result<Self> {
         TableBuilder::from_base_uri(base_uri).build().await
@@ -418,10 +448,9 @@ impl Table {
         // Create file pruner with filters on non-partition columns
         let file_pruner = FilePruner::new(filters, &table_schema, &partition_schema)?;
 
-        // Try to create metadata table instance if enabled
+        // Use cached metadata table instance if enabled
         let metadata_table = if self.is_metadata_table_enabled() {
-            log::debug!("Using metadata table for file listing");
-            match self.new_metadata_table().await {
+            match self.get_or_init_metadata_table().await {
                 Ok(mdt) => Some(mdt),
                 Err(e) => {
                     log::warn!(
@@ -440,7 +469,7 @@ impl Table {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                metadata_table.as_ref(),
+                metadata_table,
             )
             .await
     }
@@ -811,6 +840,64 @@ impl Table {
             });
 
         Ok(Box::pin(combined_stream))
+    }
+
+    /// Compute estimated table-level statistics using metadata table and commit metadata.
+    ///
+    /// Returns `(estimated_num_rows, estimated_total_byte_size)` where byte size is the
+    /// estimated uncompressed in-memory size.
+    ///
+    /// The approach:
+    /// 1. Read MDT files partition to get all active files with on-disk sizes (no footer reads)
+    /// 2. Read the latest commit's write stats to compute average row size on disk
+    /// 3. Read ONE Parquet footer from a sampled file to derive compression ratio
+    /// 4. Infer total rows and uncompressed byte size for all files
+    ///
+    /// Returns `None` if metadata table is not enabled or if statistics cannot be computed.
+    pub async fn compute_table_stats(&self) -> Option<(usize, usize)> {
+        if !self.is_metadata_table_enabled() {
+            return None;
+        }
+
+        // Step 1: Get MDT files partition records (cached on the MDT instance).
+        let partition_schema = self.get_partition_schema().await.ok()?;
+        let partition_pruner =
+            PartitionPruner::new(&[], &partition_schema, self.hudi_configs.as_ref()).ok()?;
+        let mdt = self.get_or_init_metadata_table().await.ok()?;
+        let records = mdt
+            .fetch_files_partition_records(&partition_pruner)
+            .await
+            .ok()?;
+
+        let total_on_disk_size: u64 = records
+            .values()
+            .filter(|r| !r.is_all_partitions())
+            .flat_map(|r| r.active_files_with_sizes())
+            .map(|(_, size)| size)
+            .sum();
+        let sample_file_path = FileSystemView::find_sample_parquet_path_from_records(&records);
+
+        if total_on_disk_size == 0 {
+            return Some((0, 0));
+        }
+
+        // Step 2: Use the cached estimator (or init it now).
+        // For non-Parquet tables (no sample file found), fall back to on-disk size.
+        match self
+            .file_system_view
+            .get_or_init_estimator(sample_file_path.as_deref())
+            .await
+        {
+            Some(estimator) => {
+                let (estimated_total_byte_size, estimated_total_rows) =
+                    estimator.estimate(total_on_disk_size);
+                Some((
+                    estimated_total_rows as usize,
+                    estimated_total_byte_size as usize,
+                ))
+            }
+            None => Some((0, total_on_disk_size as usize)),
+        }
     }
 }
 
@@ -1557,4 +1644,36 @@ mod tests {
         let expected = HashSet::new();
         assert_eq!(actual, expected);
     }
+
+    #[tokio::test]
+    async fn test_compute_table_stats_with_mdt() {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        assert!(table.is_metadata_table_enabled());
+
+        let stats = table.compute_table_stats().await;
+        assert!(
+            stats.is_some(),
+            "Stats should be Some for MDT-enabled table"
+        );
+        let (rows, bytes) = stats.unwrap();
+        assert!(rows > 0, "Should have estimated rows > 0, got {rows}");
+        assert!(bytes > 0, "Should have estimated bytes > 0, got {bytes}");
+    }
+
+    #[test]
+    fn test_compute_table_stats_without_mdt() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new_blocking(base_url.path()).unwrap();
+        assert!(!table.is_metadata_table_enabled());
+
+        let stats = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(table.compute_table_stats());
+        assert!(stats.is_none(), "Stats should be None for non-MDT table");
+    }
+
 }
