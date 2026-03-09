@@ -49,7 +49,8 @@ COV_OUTPUT_DIR := ./cov-reports
 COV_THRESHOLD ?= 60
 COV_EXCLUDE := \
 	--exclude-files 'cpp/src/*' \
-	--exclude-files 'crates/core/src/avro_to_arrow/*'
+	--exclude-files 'crates/core/src/avro_to_arrow/*' \
+	--exclude-files 'benchmark/*'
 TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
 	--all-features --workspace $(COV_EXCLUDE) --skip-clean
 
