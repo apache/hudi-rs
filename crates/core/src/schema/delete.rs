@@ -25,15 +25,20 @@ use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
+use std::fs;
+use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-static DELETE_RECORD_AVRO_SCHEMA_STR: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/schemas/HoodieDeleteRecord.avsc"
-));
-
 static DELETE_RECORD_AVRO_SCHEMA_IN_JSON: Lazy<Result<JsonValue>> = Lazy::new(|| {
-    serde_json::from_str(DELETE_RECORD_AVRO_SCHEMA_STR)
+    let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("schemas")
+        .join("HoodieDeleteRecord.avsc");
+
+    let content = fs::read_to_string(schema_path)
+        .map_err(|e| CoreError::Schema(format!("Failed to read schema file: {e}")))?;
+
+    serde_json::from_str(&content)
         .map_err(|e| CoreError::Schema(format!("Failed to parse schema to JSON: {e}")))
 });
 
@@ -105,13 +110,15 @@ pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<
     AvroSchema::parse(&json).map_err(CoreError::AvroError)
 }
 
-static DELETE_RECORD_LIST_AVRO_SCHEMA_STR: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/schemas/HoodieDeleteRecordList.avsc"
-));
-
 static DELETE_RECORD_LIST_AVRO_SCHEMA: Lazy<Result<AvroSchema>> = Lazy::new(|| {
-    AvroSchema::parse_str(DELETE_RECORD_LIST_AVRO_SCHEMA_STR).map_err(CoreError::AvroError)
+    let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("schemas")
+        .join("HoodieDeleteRecordList.avsc");
+
+    let mut file = File::open(&schema_path)
+        .map_err(|e| CoreError::Schema(format!("Failed to open schema file: {e}")))?;
+
+    AvroSchema::parse_reader(&mut file).map_err(CoreError::AvroError)
 });
 
 pub fn avro_schema_for_delete_record_list() -> Result<&'static AvroSchema> {
