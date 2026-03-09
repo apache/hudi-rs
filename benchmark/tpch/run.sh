@@ -26,7 +26,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DEFAULT_SCALE_FACTOR=1
 DOCKER_IMAGE="tpch-bench"
 TPCH_BIN="$REPO_ROOT/target/release/tpch"
-MODE="${MODE:-docker}"
+MODE="${MODE:-native}"
 
 build_tpch() {
   echo "Building TPC-H tool..."

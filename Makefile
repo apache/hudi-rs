@@ -165,13 +165,11 @@ clean-coverage: ## Remove coverage reports
 SF ?= 0.001
 ENGINE ?= datafusion
 FORMAT ?= hudi
-MODE ?= docker
+MODE ?= native
 QUERIES ?=
-COMPARE ?=
 TPCH_DIR := benchmark/tpch
 TPCH_DATA_DIR := $(TPCH_DIR)/data
 TPCH_RESULTS_DIR := $(TPCH_DIR)/results
-comma := ,
 
 .PHONY: tpch-generate
 tpch-generate: ## Generate TPC-H parquet tables (SF=0.001)
@@ -184,15 +182,16 @@ tpch-create-tables: ## Create Hudi COW tables from parquet (SF=0.001, requires D
 	$(TPCH_DIR)/run.sh create-tables --scale-factor $(SF)
 
 .PHONY: bench-tpch
-bench-tpch: ## Run TPC-H benchmark (ENGINE=datafusion|spark FORMAT=hudi|parquet SF=0.001 MODE=docker|native QUERIES=1,3,6)
+bench-tpch: ## Run TPC-H benchmark (ENGINE=datafusion|spark SF=0.001 MODE=native|docker QUERIES=1,3,6)
 	$(info --- Benchmark at SF=$(SF) MODE=$(MODE) ---)
-ifneq (,$(findstring $(comma),$(COMPARE)))
-	@# Compare mode: COMPARE=engine1,engine2
-	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(COMPARE) --format $(FORMAT)
-else ifeq ($(ENGINE),spark)
-	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(filter 1,$(COMPARE)),--output-dir $(TPCH_RESULTS_DIR))
+ifeq ($(ENGINE),spark)
+	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) --output-dir $(TPCH_RESULTS_DIR)
 else ifeq ($(ENGINE),datafusion)
-	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-datafusion --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(filter 1,$(COMPARE)),--output-dir $(TPCH_RESULTS_DIR))
+	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-datafusion --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) --output-dir $(TPCH_RESULTS_DIR)
 else
 	$(error Unknown ENGINE=$(ENGINE). Use datafusion or spark)
 endif
+
+.PHONY: tpch-compare
+tpch-compare: ## Compare persisted TPC-H benchmark results (ENGINES=datafusion,spark SF=0.001)
+	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(ENGINES) --format $(FORMAT)

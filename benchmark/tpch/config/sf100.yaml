@@ -34,7 +34,7 @@ create_tables:
 
 # Benchmark settings (shared across DataFusion and Spark)
 bench:
-  warmup: 1
+  warmup: 2
   iterations: 3
   driver_memory: 48g
   memory_limit: 48g
