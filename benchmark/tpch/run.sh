@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+DEFAULT_SCALE_FACTOR=1
+DOCKER_IMAGE="tpch-bench"
+TPCH_BIN="$REPO_ROOT/target/release/tpch"
+MODE="${MODE:-native}"
+
+build_tpch() {
+  echo "Building TPC-H tool..."
+  cargo build -p tpch --release --manifest-path "$REPO_ROOT/Cargo.toml"
+}
+
+build_docker() {
+  echo "Building TPC-H Docker image..."
+  docker build -t "$DOCKER_IMAGE" -f "$SCRIPT_DIR/infra/Dockerfile" "$REPO_ROOT"
+}
+
+# Read spark-submit args from tpch binary (one token per line) into SPARK_ARGS array.
+read_spark_args() {
+  SPARK_ARGS=()
+  while IFS= read -r line; do
+    SPARK_ARGS+=("$line")
+  done < <("$TPCH_BIN" spark-args "$@")
+}
+
+# Setup Spark config files for native mode.
+setup_spark_native() {
+  if [ -z "${SPARK_HOME:-}" ]; then
+    echo "Error: SPARK_HOME is not set. Set it to your Spark installation directory." >&2
+    exit 1
+  fi
+  if [ ! -x "$SPARK_HOME/bin/spark-submit" ]; then
+    echo "Error: $SPARK_HOME/bin/spark-submit not found or not executable." >&2
+    exit 1
+  fi
+
+  echo "Configuring Spark at $SPARK_HOME..."
+  cp "$SCRIPT_DIR/infra/spark/spark-defaults.conf" "$SPARK_HOME/conf/spark-defaults.conf"
+  cp "$SCRIPT_DIR/infra/spark/log4j2.properties" "$SPARK_HOME/conf/log4j2.properties"
+}
+
+usage() {
+  cat <<EOF
+Usage: $0 <command> [options]
+
+Commands:
+  generate          Generate TPC-H parquet data
+  create-tables     Create Hudi COW tables from parquet via Spark (Docker)
+  bench-spark       Run TPC-H queries against Hudi tables via Spark SQL
+  bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
+  compare           Compare persisted benchmark results with bar charts
+
+Environment:
+  MODE              Execution mode: docker (default) or native
+
+Options:
+  --scale-factor N  TPC-H scale factor (default: $DEFAULT_SCALE_FACTOR)
+  --format F        Table format: hudi or parquet (default: auto)
+  --queries Q       Comma-separated query numbers (default: all 22)
+  --iterations N    Number of measured iterations per query (from config)
+  --warmup N        Number of unmeasured warmup iterations per query (from config)
+  --output-dir D    Directory to persist results as JSON (bench commands only)
+  --engines E       Comma-separated engine names to compare (compare command only)
+
+Examples:
+  $0 generate --scale-factor 1
+  $0 create-tables --scale-factor 1
+  MODE=native $0 bench-spark --scale-factor 1 --queries 1,3,6
+  MODE=native $0 bench-datafusion --scale-factor 1 --queries 1,3,6
+  $0 bench-datafusion --scale-factor 1 --output-dir results
+  $0 compare --scale-factor 1 --engines datafusion,spark --format hudi
+EOF
+}
+
+# --- Commands ---
+
+cmd_generate() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
+  if [ -d "$parquet_dir" ]; then
+    echo "Removing existing parquet data at $parquet_dir..."
+    rm -rf "$parquet_dir"
+  fi
+
+  build_tpch
+  "$TPCH_BIN" generate --scale-factor "$sf"
+}
+
+cmd_create_tables() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
+  if [ ! -d "$parquet_dir" ]; then
+    echo "Error: parquet data not found at $parquet_dir. Run 'generate' first." >&2
+    exit 1
+  fi
+
+  local hudi_dir="$SCRIPT_DIR/data/sf$sf-hudi"
+  if [ -d "$hudi_dir" ]; then
+    echo "Removing existing Hudi data at $hudi_dir..."
+    rm -rf "$hudi_dir"
+  fi
+
+  build_tpch
+  build_docker
+  mkdir -p "$hudi_dir"
+
+  local sql_file
+  sql_file="$(mktemp)"
+  "$TPCH_BIN" render-ctas --scale-factor "$sf" \
+    --parquet-base /opt/parquet --hudi-base /opt/hudi > "$sql_file"
+
+  read_spark_args --scale-factor "$sf" --command create-tables
+
+  echo "Creating Hudi COW tables from parquet (sf$sf)..."
+  local docker_exit=0
+  docker run --rm \
+    -v "$parquet_dir:/opt/parquet:ro" \
+    -v "$hudi_dir:/opt/hudi" \
+    -v "$sql_file:/opt/spark/work-dir/create_hudi_tables.sql:ro" \
+    "$DOCKER_IMAGE" \
+    /opt/spark/bin/spark-sql "${SPARK_ARGS[@]}" \
+    -f /opt/spark/work-dir/create_hudi_tables.sql \
+    || docker_exit=$?
+
+  rm -f "$sql_file"
+  if [ $docker_exit -ne 0 ]; then
+    echo "Error: Spark SQL failed with exit code $docker_exit" >&2
+    return $docker_exit
+  fi
+  echo "Hudi COW tables created at: $hudi_dir"
+}
+
+cmd_bench_spark() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local queries=""
+  local iterations=""
+  local warmup=""
+  local output_dir=""
+  local format="hudi"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --iterations) iterations="$2"; shift 2 ;;
+      --warmup) warmup="$2"; shift 2 ;;
+      --output-dir) output_dir="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  build_tpch
+
+  # Read defaults from config via the tpch binary
+  if [ -z "$warmup" ] || [ -z "$iterations" ]; then
+    local defaults
+    defaults=$("$TPCH_BIN" bench-defaults --scale-factor "$sf")
+    local cfg_warmup cfg_iterations
+    cfg_warmup=$(echo "$defaults" | awk '{print $1}')
+    cfg_iterations=$(echo "$defaults" | awk '{print $2}')
+    warmup="${warmup:-$cfg_warmup}"
+    iterations="${iterations:-$cfg_iterations}"
+  fi
+
+  local hudi_dir="$SCRIPT_DIR/data/sf$sf-hudi"
+  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
+
+  local data_dir=""
+  local bench_data_arg=""
+  case "$format" in
+    hudi)
+      data_dir="$hudi_dir"
+      bench_data_arg="--hudi-base"
+      ;;
+    parquet)
+      data_dir="$parquet_dir"
+      bench_data_arg="--parquet-base"
+      ;;
+    *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
+  esac
+
+  if [ ! -d "$data_dir" ]; then
+    echo "Error: $format data not found at $data_dir." >&2
+    exit 1
+  fi
+
+  read_spark_args --scale-factor "$sf" --command bench
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local output_file="$tmp_dir/results.jsonl"
+
+  if [ "$MODE" = "native" ]; then
+    setup_spark_native
+
+    local bench_args=(
+      $bench_data_arg "$data_dir"
+      --query-dir "$SCRIPT_DIR/queries"
+      --scale-factor "$sf"
+      --warmup "$warmup"
+      --iterations "$iterations"
+      --output "$output_file"
+    )
+    if [ -n "$queries" ]; then
+      bench_args+=(--queries "$queries")
+    fi
+
+    echo "Running Spark SQL benchmark ($format, native)..."
+    "$SPARK_HOME/bin/spark-submit" \
+      --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:1.1.1 \
+      "${SPARK_ARGS[@]}" \
+      "$SCRIPT_DIR/infra/spark/bench.py" \
+      "${bench_args[@]}"
+  else
+    build_docker
+
+    local bench_args=(
+      $bench_data_arg /opt/data
+      --query-dir /opt/queries
+      --scale-factor "$sf"
+      --warmup "$warmup"
+      --iterations "$iterations"
+      --output /opt/output/results.jsonl
+    )
+    if [ -n "$queries" ]; then
+      bench_args+=(--queries "$queries")
+    fi
+
+    echo "Running Spark SQL benchmark ($format, docker)..."
+    local docker_exit=0
+    docker run --rm \
+      -e PYTHONUNBUFFERED=1 \
+      -v "$data_dir:/opt/data:ro" \
+      -v "$SCRIPT_DIR/queries:/opt/queries:ro" \
+      -v "$SCRIPT_DIR/infra/spark/bench.py:/opt/spark/work-dir/bench.py:ro" \
+      -v "$tmp_dir:/opt/output" \
+      "$DOCKER_IMAGE" \
+      /opt/spark/bin/spark-submit "${SPARK_ARGS[@]}" \
+      /opt/spark/work-dir/bench.py \
+      "${bench_args[@]}" \
+      || docker_exit=$?
+
+    if [ $docker_exit -ne 0 ]; then
+      echo "Error: Spark SQL benchmark failed with exit code $docker_exit" >&2
+      rm -rf "$tmp_dir"
+      return $docker_exit
+    fi
+  fi
+
+  echo ""
+  local parse_args=(parse-spark-output --input "$output_file")
+  if [ -n "$output_dir" ]; then
+    mkdir -p "$output_dir"
+    parse_args+=(--output-dir "$output_dir" --engine-label spark --format-label "$format" --display-name "spark+hudi" --scale-factor "$sf")
+  fi
+  "$TPCH_BIN" "${parse_args[@]}"
+  rm -rf "$tmp_dir"
+}
+
+cmd_bench_datafusion() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local format=""
+  local queries=""
+  local iterations=""
+  local warmup=""
+  local output_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --iterations) iterations="$2"; shift 2 ;;
+      --warmup) warmup="$2"; shift 2 ;;
+      --output-dir) output_dir="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local hudi_dir="$SCRIPT_DIR/data/sf$sf-hudi"
+  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
+
+  # Determine which formats to bench
+  local use_hudi=false
+  local use_parquet=false
+  case "$format" in
+    hudi)    use_hudi=true ;;
+    parquet) use_parquet=true ;;
+    "")
+      # Default: use whichever data dirs exist
+      [ -d "$hudi_dir" ] && use_hudi=true
+      [ -d "$parquet_dir" ] && use_parquet=true
+      ;;
+    *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
+  esac
+
+  if [ "$use_hudi" = false ] && [ "$use_parquet" = false ]; then
+    echo "Error: no data found for sf$sf. Run 'generate' and/or 'create-tables' first." >&2
+    exit 1
+  fi
+  if [ "$use_hudi" = true ] && [ ! -d "$hudi_dir" ]; then
+    echo "Error: Hudi data not found at $hudi_dir. Run 'create-tables' first." >&2
+    exit 1
+  fi
+  if [ "$use_parquet" = true ] && [ ! -d "$parquet_dir" ]; then
+    echo "Error: Parquet data not found at $parquet_dir. Run 'generate' first." >&2
+    exit 1
+  fi
+
+  if [ "$MODE" = "native" ]; then
+    build_tpch
+
+    local bench_args=(bench --scale-factor "$sf")
+    [ "$use_hudi" = true ] && bench_args+=(--hudi-dir "$hudi_dir")
+    [ "$use_parquet" = true ] && bench_args+=(--parquet-dir "$parquet_dir")
+    [ -n "$queries" ] && bench_args+=(--queries "$queries")
+    [ -n "$iterations" ] && bench_args+=(--iterations "$iterations")
+    [ -n "$warmup" ] && bench_args+=(--warmup "$warmup")
+
+    if [ -n "$output_dir" ]; then
+      mkdir -p "$output_dir"
+      output_dir="$(cd "$output_dir" && pwd)"
+      bench_args+=(--output-dir "$output_dir" --engine-label datafusion --format-label "${format:-hudi}" --display-name "datafusion+hudi-rs")
+    fi
+
+    echo "Running DataFusion benchmark (native)..."
+    TPCH_CONFIG_DIR="$SCRIPT_DIR/config" \
+    TPCH_QUERY_DIR="$SCRIPT_DIR/queries" \
+    RUST_LOG="${RUST_LOG:-warn}" \
+    "$TPCH_BIN" "${bench_args[@]}"
+  else
+    build_docker
+
+    # Resolve output_dir to absolute path (Docker requires it)
+    if [ -n "$output_dir" ]; then
+      mkdir -p "$output_dir"
+      output_dir="$(cd "$output_dir" && pwd)"
+    fi
+
+    local bench_args=(bench --scale-factor "$sf")
+    [ "$use_hudi" = true ] && bench_args+=(--hudi-dir /opt/hudi)
+    [ "$use_parquet" = true ] && bench_args+=(--parquet-dir /opt/parquet)
+    [ -n "$queries" ] && bench_args+=(--queries "$queries")
+    [ -n "$iterations" ] && bench_args+=(--iterations "$iterations")
+    [ -n "$warmup" ] && bench_args+=(--warmup "$warmup")
+
+    if [ -n "$output_dir" ]; then
+      bench_args+=(--output-dir /opt/results --engine-label datafusion --format-label "${format:-hudi}" --display-name "datafusion+hudi-rs")
+    fi
+
+    echo "Running DataFusion benchmark (docker)..."
+    local volumes=()
+    [ "$use_hudi" = true ] && volumes+=(-v "$hudi_dir:/opt/hudi:ro")
+    [ "$use_parquet" = true ] && volumes+=(-v "$parquet_dir:/opt/parquet:ro")
+    volumes+=(-v "$SCRIPT_DIR/queries:/opt/queries:ro")
+    volumes+=(-v "$SCRIPT_DIR/config:/opt/config:ro")
+    [ -n "$output_dir" ] && volumes+=(-v "$output_dir:/opt/results")
+
+    docker run --rm \
+      "${volumes[@]}" \
+      -e TPCH_CONFIG_DIR=/opt/config \
+      -e TPCH_QUERY_DIR=/opt/queries \
+      -e RUST_LOG="${RUST_LOG:-warn}" \
+      "$DOCKER_IMAGE" \
+      tpch "${bench_args[@]}"
+  fi
+}
+
+cmd_compare() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local engines=""
+  local format="hudi"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --engines) engines="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$engines" ]; then
+    echo "Error: --engines is required (e.g., --engines datafusion,spark)" >&2
+    exit 1
+  fi
+
+  # Convert "datafusion,spark" → "datafusion_hudi_sf1,spark_hudi_sf1"
+  local runs=""
+  IFS=',' read -ra engine_arr <<< "$engines"
+  for e in "${engine_arr[@]}"; do
+    [ -n "$runs" ] && runs+=","
+    runs+="${e}_${format}_sf${sf}"
+  done
+
+  build_tpch
+  "$TPCH_BIN" compare \
+    --results-dir "$SCRIPT_DIR/results" \
+    --runs "$runs"
+}
+
+# --- Main ---
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  generate)         cmd_generate "$@" ;;
+  create-tables)    cmd_create_tables "$@" ;;
+  bench-spark)      cmd_bench_spark "$@" ;;
+  bench-datafusion) cmd_bench_datafusion "$@" ;;
+  compare)          cmd_compare "$@" ;;
+  *)
+    echo "Unknown command: $COMMAND" >&2
+    usage
+    exit 1
+    ;;
+esac

@@ -15,21 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
-header:
-  license:
-    spdx-id: Apache-2.0
-    copyright-owner: Apache Software Foundation
+# TPC-H scale factor 100 configuration.
+# Per-scale-factor shuffle parallelism and Spark/Hudi tuning parameters.
 
-  paths-ignore:
-    - 'LICENSE'
-    - 'NOTICE'
-    - '**/data/**'
-    - '.github/PULL_REQUEST_TEMPLATE.md'
-    - 'crates/core/schemas/**'
-    - 'benchmark/tpch/queries/**'
+shuffle_parallelism:
+  customer: 3
+  lineitem: 73
+  nation: 1
+  orders: 17
+  part: 3
+  partsupp: 12
+  region: 1
+  supplier: 1
 
-  comment: on-failure
+# Spark configs for 'create-tables' command
+create_tables:
+  spark_conf:
+    spark.driver.memory: 60g
 
-dependency:
-  files:
-    - Cargo.toml
+# Benchmark settings (shared across DataFusion and Spark)
+bench:
+  warmup: 2
+  iterations: 3
+  memory_limit: 60g
+  spark_conf:
+    spark.driver.memory: 60g
+    spark.sql.shuffle.partitions: "200"
+    spark.sql.autoBroadcastJoinThreshold: "134217728"

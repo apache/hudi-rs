@@ -15,21 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-header:
-  license:
-    spdx-id: Apache-2.0
-    copyright-owner: Apache Software Foundation
-
-  paths-ignore:
-    - 'LICENSE'
-    - 'NOTICE'
-    - '**/data/**'
-    - '.github/PULL_REQUEST_TEMPLATE.md'
-    - 'crates/core/schemas/**'
-    - 'benchmark/tpch/queries/**'
-
-  comment: on-failure
-
-dependency:
-  files:
-    - Cargo.toml
+target
+.git
+benchmark/tpch/data
+benchmark/tpch/results
+python/.venv

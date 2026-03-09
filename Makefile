@@ -49,7 +49,8 @@ COV_OUTPUT_DIR := ./cov-reports
 COV_THRESHOLD ?= 60
 COV_EXCLUDE := \
 	--exclude-files 'cpp/src/*' \
-	--exclude-files 'crates/core/src/avro_to_arrow/*'
+	--exclude-files 'crates/core/src/avro_to_arrow/*' \
+	--exclude-files 'benchmark/*'
 TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
 	--all-features --workspace $(COV_EXCLUDE) --skip-clean
 
@@ -158,3 +159,40 @@ coverage-check: ## Fail if coverage is below threshold (COV_THRESHOLD=60)
 .PHONY: clean-coverage
 clean-coverage: ## Remove coverage reports
 	rm -rf $(COV_OUTPUT_DIR)
+
+# =============================================================================
+# TPC-H Benchmark
+# =============================================================================
+SF ?= 0.001
+ENGINE ?= datafusion
+FORMAT ?= hudi
+MODE ?= native
+QUERIES ?=
+TPCH_DIR := benchmark/tpch
+TPCH_DATA_DIR := $(TPCH_DIR)/data
+TPCH_RESULTS_DIR := $(TPCH_DIR)/results
+
+.PHONY: tpch-generate
+tpch-generate: ## Generate TPC-H parquet tables (SF=0.001)
+	$(info --- Generate TPC-H parquet tables at SF=$(SF) ---)
+	$(TPCH_DIR)/run.sh generate --scale-factor $(SF)
+
+.PHONY: tpch-create-tables
+tpch-create-tables: ## Create Hudi COW tables from parquet (SF=0.001, requires Docker)
+	$(info --- Create Hudi tables at SF=$(SF) ---)
+	$(TPCH_DIR)/run.sh create-tables --scale-factor $(SF)
+
+.PHONY: bench-tpch
+bench-tpch: ## Run TPC-H benchmark (ENGINE=datafusion|spark SF=0.001 MODE=native|docker QUERIES=1,3,6)
+	$(info --- Benchmark at SF=$(SF) MODE=$(MODE) ---)
+ifeq ($(ENGINE),spark)
+	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) --output-dir $(TPCH_RESULTS_DIR)
+else ifeq ($(ENGINE),datafusion)
+	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-datafusion --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) --output-dir $(TPCH_RESULTS_DIR)
+else
+	$(error Unknown ENGINE=$(ENGINE). Use datafusion or spark)
+endif
+
+.PHONY: tpch-compare
+tpch-compare: ## Compare persisted TPC-H benchmark results (ENGINES=datafusion,spark SF=0.001)
+	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(ENGINES) --format $(FORMAT)

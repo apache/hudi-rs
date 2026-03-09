@@ -18,6 +18,8 @@
 /Cargo.lock
 /target
 **/target
+**/data
+**/results
 
 /.idea
 .vscode
