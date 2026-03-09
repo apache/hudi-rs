@@ -77,7 +77,7 @@ num-traits = { version = "0.2" }
 once_cell = { version = "1" }
 paste = { version = "1" }
 strum = { version = "0.28", features = ["derive"] }
-strum_macros = { version = "0.27" }
+strum_macros = { version = "0.28" }
 url = { version = "2" }
 
 # runtime / async
