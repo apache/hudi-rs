@@ -82,7 +82,6 @@ Options:
   --queries Q       Comma-separated query numbers (default: all 22)
   --iterations N    Number of measured iterations per query (from config)
   --warmup N        Number of unmeasured warmup iterations per query (from config)
-  --memory-limit M  DataFusion memory limit, e.g. "3g" (bench-datafusion only)
   --output-dir D    Directory to persist results as JSON (bench commands only)
   --engines E       Comma-separated engine names to compare (compare command only)
 
@@ -301,7 +300,6 @@ cmd_bench_datafusion() {
   local queries=""
   local iterations=""
   local warmup=""
-  local memory_limit=""
   local output_dir=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -310,7 +308,6 @@ cmd_bench_datafusion() {
       --queries) queries="$2"; shift 2 ;;
       --iterations) iterations="$2"; shift 2 ;;
       --warmup) warmup="$2"; shift 2 ;;
-      --memory-limit) memory_limit="$2"; shift 2 ;;
       --output-dir) output_dir="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -355,7 +352,7 @@ cmd_bench_datafusion() {
     [ -n "$queries" ] && bench_args+=(--queries "$queries")
     [ -n "$iterations" ] && bench_args+=(--iterations "$iterations")
     [ -n "$warmup" ] && bench_args+=(--warmup "$warmup")
-    [ -n "$memory_limit" ] && bench_args+=(--memory-limit "$memory_limit")
+
     if [ -n "$output_dir" ]; then
       mkdir -p "$output_dir"
       output_dir="$(cd "$output_dir" && pwd)"
@@ -382,7 +379,7 @@ cmd_bench_datafusion() {
     [ -n "$queries" ] && bench_args+=(--queries "$queries")
     [ -n "$iterations" ] && bench_args+=(--iterations "$iterations")
     [ -n "$warmup" ] && bench_args+=(--warmup "$warmup")
-    [ -n "$memory_limit" ] && bench_args+=(--memory-limit "$memory_limit")
+
     if [ -n "$output_dir" ]; then
       bench_args+=(--output-dir /opt/results --engine-label datafusion --format-label "${format:-hudi}" --display-name "datafusion+hudi-rs")
     fi

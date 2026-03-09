@@ -37,3 +37,4 @@ bench:
   warmup: 1
   iterations: 3
   driver_memory: 12g
+  memory_limit: 12g

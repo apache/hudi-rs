@@ -81,6 +81,8 @@ pub struct BenchConfig {
     #[serde(default)]
     pub driver_memory: String,
     #[serde(default)]
+    pub memory_limit: Option<String>,
+    #[serde(default)]
     pub spark_conf: BTreeMap<String, String>,
 }
 

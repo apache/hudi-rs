@@ -408,6 +408,7 @@ async fn main() -> Result<()> {
             })?;
             let warmup = warmup.unwrap_or(cfg.bench.warmup);
             let iterations = iterations.unwrap_or(cfg.bench.iterations);
+            let memory_limit = memory_limit.or(cfg.bench.memory_limit);
             run_bench(
                 hudi_dir.as_deref(),
                 parquet_dir.as_deref(),
@@ -555,8 +556,16 @@ async fn bench_source(
         let mut last_batches: Vec<RecordBatch> = Vec::new();
         let mut error = None;
 
+        // Strip SQL comment lines before splitting, so semicolons inside
+        // comments (e.g., license headers) don't produce spurious empty statements.
+        let sql_no_comments: String = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         // Split multi-statement queries (e.g., Q15: CREATE VIEW; SELECT; DROP VIEW)
-        let statements: Vec<&str> = sql
+        let statements: Vec<&str> = sql_no_comments
             .split(';')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
