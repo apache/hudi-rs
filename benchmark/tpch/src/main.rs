@@ -32,7 +32,6 @@ use arrow_array::RecordBatch;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Table};
-use serde::{Deserialize, Serialize};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
@@ -40,6 +39,7 @@ use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionConfig;
 use hudi::HudiDataSource;
+use serde::{Deserialize, Serialize};
 
 /// The 8 TPC-H tables.
 const TPCH_TABLES: &[&str] = &[
@@ -272,7 +272,9 @@ fn parse_memory_size(s: &str) -> std::result::Result<usize, String> {
 }
 
 /// Create a SessionContext, optionally bounded by a memory pool.
-fn create_session_context(memory_limit: Option<&str>) -> std::result::Result<SessionContext, String> {
+fn create_session_context(
+    memory_limit: Option<&str>,
+) -> std::result::Result<SessionContext, String> {
     match memory_limit {
         Some(limit) => {
             let pool_size = parse_memory_size(limit)?;
@@ -345,9 +347,8 @@ async fn main() -> Result<()> {
             parquet_base,
             hudi_base,
         } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("{e}"))
-            })?;
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
             print!("{}", cfg.render_ctas_sql(&parquet_base, &hudi_base));
             Ok(())
         }
@@ -357,9 +358,8 @@ async fn main() -> Result<()> {
             queries,
             iterations,
         } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("{e}"))
-            })?;
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
             let iterations = iterations.unwrap_or(cfg.bench.iterations);
             let query_nums = parse_query_numbers(queries);
             let sql = cfg
@@ -372,9 +372,8 @@ async fn main() -> Result<()> {
             scale_factor,
             command,
         } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("{e}"))
-            })?;
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
             let args = cfg
                 .render_spark_args(&command)
                 .map_err(datafusion::error::DataFusionError::Plan)?;
@@ -384,9 +383,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::BenchDefaults { scale_factor } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("{e}"))
-            })?;
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
             println!("{} {}", cfg.bench.warmup, cfg.bench.iterations);
             Ok(())
         }
@@ -403,9 +401,8 @@ async fn main() -> Result<()> {
             format_label,
             display_name,
         } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor).map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!("{e}"))
-            })?;
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
             let warmup = warmup.unwrap_or(cfg.bench.warmup);
             let iterations = iterations.unwrap_or(cfg.bench.iterations);
             let memory_limit = memory_limit.or(cfg.bench.memory_limit);
@@ -421,7 +418,8 @@ async fn main() -> Result<()> {
                 engine_label.as_deref(),
                 format_label.as_deref(),
                 display_name.as_deref(),
-            ).await
+            )
+            .await
         }
         Commands::Validate {
             hudi_dir,
@@ -429,7 +427,16 @@ async fn main() -> Result<()> {
             scale_factor,
             queries,
             memory_limit,
-        } => run_validate(&hudi_dir, &parquet_dir, scale_factor, queries, memory_limit.as_deref()).await,
+        } => {
+            run_validate(
+                &hudi_dir,
+                &parquet_dir,
+                scale_factor,
+                queries,
+                memory_limit.as_deref(),
+            )
+            .await
+        }
         Commands::ParseSparkOutput {
             input,
             output_dir,
@@ -455,7 +462,7 @@ fn parse_query_numbers(queries: Option<String>) -> Vec<usize> {
         Some(s) => s
             .split(',')
             .filter_map(|q| q.trim().parse::<usize>().ok())
-            .filter(|&q| q >= 1 && q <= NUM_QUERIES)
+            .filter(|&q| (1..=NUM_QUERIES).contains(&q))
             .collect(),
         None => (1..=NUM_QUERIES).collect(),
     }
@@ -475,8 +482,7 @@ fn load_query(query_num: usize, scale_factor: f64) -> std::result::Result<String
 
 /// Register all 8 TPC-H Hudi tables. Supports local paths and cloud URLs.
 async fn register_hudi_tables(ctx: &SessionContext, base_dir: &str) -> Result<()> {
-    let resolved =
-        resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
+    let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
 
     for table_name in TPCH_TABLES {
         let table_uri = if is_cloud_url(&resolved) {
@@ -500,8 +506,7 @@ async fn register_hudi_tables(ctx: &SessionContext, base_dir: &str) -> Result<()
 
 /// Register all 8 TPC-H parquet tables. Supports local paths and cloud URLs.
 async fn register_parquet_tables(ctx: &SessionContext, base_dir: &str) -> Result<()> {
-    let resolved =
-        resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
+    let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
 
     if is_cloud_url(&resolved) {
         register_cloud_store(ctx, &resolved)?;
@@ -755,20 +760,19 @@ fn save_results(
 
     let json = serde_json::to_string_pretty(&persisted)
         .map_err(|e| format!("Failed to serialize results: {e}"))?;
-    fs::write(&path, json)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
 
     println!("Results saved to {}", path.display());
     Ok(())
 }
 
 fn load_results(path: &str) -> std::result::Result<PersistedResults, String> {
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
+    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
     serde_json::from_str(&content).map_err(|e| format!("Failed to parse {path}: {e}"))
 }
 
 /// Run the benchmark against Hudi, Parquet, or both.
+#[allow(clippy::too_many_arguments)]
 async fn run_bench(
     hudi_dir: Option<&str>,
     parquet_dir: Option<&str>,
@@ -793,9 +797,7 @@ async fn run_bench(
     if let Some(limit) = memory_limit {
         println!("DataFusion memory limit: {limit}");
     }
-    println!(
-        "Warmup: {warmup} iteration(s), Measured: {iterations} iteration(s)"
-    );
+    println!("Warmup: {warmup} iteration(s), Measured: {iterations} iteration(s)");
 
     if let Some(hudi_dir) = hudi_dir {
         let ctx = create_session_context(memory_limit)
@@ -847,13 +849,13 @@ async fn run_validate(
     }
 
     println!("Registering Hudi tables from {hudi_dir}");
-    let hudi_ctx = create_session_context(memory_limit)
-        .map_err(datafusion::error::DataFusionError::Plan)?;
+    let hudi_ctx =
+        create_session_context(memory_limit).map_err(datafusion::error::DataFusionError::Plan)?;
     register_hudi_tables(&hudi_ctx, hudi_dir).await?;
 
     println!("Registering Parquet tables from {parquet_dir}");
-    let parquet_ctx = create_session_context(memory_limit)
-        .map_err(datafusion::error::DataFusionError::Plan)?;
+    let parquet_ctx =
+        create_session_context(memory_limit).map_err(datafusion::error::DataFusionError::Plan)?;
     register_parquet_tables(&parquet_ctx, parquet_dir).await?;
 
     println!("Running Hudi queries...");
@@ -988,8 +990,7 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
             };
 
             if let Some(stats) = r.queries.get(&q_str) {
-                let filled =
-                    ((stats.avg_ms / global_max) * bar_width as f64).round() as usize;
+                let filled = ((stats.avg_ms / global_max) * bar_width as f64).round() as usize;
                 let filled = filled.min(bar_width);
                 let empty = bar_width - filled;
                 println!(
@@ -999,10 +1000,7 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
                     stats.avg_ms,
                 );
             } else {
-                println!(
-                    "{label} |{} |       N/A",
-                    " ".repeat(bar_width),
-                );
+                println!("{label} |{} |       N/A", " ".repeat(bar_width),);
             }
         }
         println!();
@@ -1032,9 +1030,9 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
     if total_max > 0.0 {
         for (i, (engine, total)) in totals.iter().enumerate() {
             let label = if i == 0 {
-                format!("Tot  {:<width$}", engine, width = max_name_len)
+                format!("Tot  {engine:<max_name_len$}")
             } else {
-                format!("     {:<width$}", engine, width = max_name_len)
+                format!("     {engine:<max_name_len$}")
             };
             let filled = ((total / total_max) * bar_width as f64).round() as usize;
             let filled = filled.min(bar_width);
@@ -1055,12 +1053,11 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
         if geomean_max > 0.0 {
             for (i, (engine, geomean)) in geomeans.iter().enumerate() {
                 let label = if i == 0 {
-                    format!("Geo  {:<width$}", engine, width = max_name_len)
+                    format!("Geo  {engine:<max_name_len$}")
                 } else {
-                    format!("     {:<width$}", engine, width = max_name_len)
+                    format!("     {engine:<max_name_len$}")
                 };
-                let filled =
-                    ((geomean / geomean_max) * bar_width as f64).round() as usize;
+                let filled = ((geomean / geomean_max) * bar_width as f64).round() as usize;
                 let filled = filled.min(bar_width);
                 let empty = bar_width - filled;
                 println!(
@@ -1144,8 +1141,16 @@ fn print_validation_table(
             continue;
         }
 
-        let h_ms = hr.timings_ms.first().map(|t| format!("{t:.1}")).unwrap_or("-".into());
-        let p_ms = pr.timings_ms.first().map(|t| format!("{t:.1}")).unwrap_or("-".into());
+        let h_ms = hr
+            .timings_ms
+            .first()
+            .map(|t| format!("{t:.1}"))
+            .unwrap_or("-".into());
+        let p_ms = pr
+            .timings_ms
+            .first()
+            .map(|t| format!("{t:.1}"))
+            .unwrap_or("-".into());
         let validation = compare_batches(&hr.last_batches, &pr.last_batches);
 
         table.add_row(vec![

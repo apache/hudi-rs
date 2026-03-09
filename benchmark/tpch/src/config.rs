@@ -181,11 +181,7 @@ impl ScaleFactorConfig {
                 table.record_size_estimate
             )
             .unwrap();
-            writeln!(
-                sql,
-                ") AS SELECT * FROM parquet.`{parquet_base}/{name}/`;"
-            )
-            .unwrap();
+            writeln!(sql, ") AS SELECT * FROM parquet.`{parquet_base}/{name}/`;").unwrap();
             writeln!(sql).unwrap();
         }
         sql
