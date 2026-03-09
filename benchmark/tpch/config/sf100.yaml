@@ -41,4 +41,4 @@ bench:
   spark_conf:
     spark.driver.memory: 60g
     spark.sql.shuffle.partitions: "200"
-    spark.sql.autoBroadcastJoinThreshold: "134217728"
+    spark.sql.autoBroadcastJoinThreshold: "67108864"
