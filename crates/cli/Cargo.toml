@@ -54,4 +54,6 @@ arrow-schema = { workspace = true }
 assert_cmd = "2"
 predicates = "3"
 tempfile = { workspace = true }
+hudi-test = { path = "../test" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
