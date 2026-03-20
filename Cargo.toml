@@ -71,6 +71,7 @@ serde_json = { version = "1" }
 thiserror = { version = "2" }
 bytes = { version = "1" }
 chrono = { version = "0.4" }
+chrono-tz = { version = "0.10" }
 lazy_static = { version = "1" }
 log = { version = "0.4" }
 num-traits = { version = "0.2" }
