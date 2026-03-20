@@ -106,13 +106,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
         
       - name: install uv and set the python version
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: "0.7.19"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: "python/pyproject.toml"
-          
+
       - name: Setup Python venv and build
         run: |
           make setup-venv
@@ -159,7 +159,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Pre-pull base images
         run: |
           docker pull quay.io/minio/minio:latest
