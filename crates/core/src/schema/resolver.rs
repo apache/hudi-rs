@@ -33,25 +33,12 @@ use std::sync::Arc;
 /// Resolves the data [`arrow_schema::Schema`] for a given Hudi table, without Hudi meta fields.
 ///
 /// The resolution process follows these steps:
-/// - If the timeline has commit metadata, read the schema field from it.
-///   - If the commit metadata has no schema, read the schema from the base file pointed by the first entry in the write-status of the commit metadata.
-/// - If the timeline has no commit metadata, read [`HudiTableConfig::CreateSchema`] from `hoodie.properties`.
+/// 1. Try to get the schema from the timeline (commit metadata or base file).
+/// 2. Fall back to [`HudiTableConfig::CreateSchema`] from `hoodie.properties`.
 pub async fn resolve_data_schema(table: &Table) -> Result<Schema> {
-    let timeline = table.get_timeline();
-    match timeline.get_latest_commit_metadata().await {
-        Ok(metadata) => {
-            resolve_data_schema_from_commit_metadata(&metadata, timeline.storage.clone()).await
-        }
-        Err(CoreError::TimelineNoCommit) => {
-            if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
-                let avro_schema_str: String = create_schema.into();
-                arrow_schema_from_avro_schema_str(&avro_schema_str)
-            } else {
-                Err(CoreError::SchemaNotFound(
-                    "No completed commit, and no create schema for the table.".to_string(),
-                ))
-            }
-        }
+    match table.get_timeline().get_latest_schema().await {
+        Ok(schema) => Ok(schema),
+        Err(CoreError::TimelineNoCommit) => resolve_data_schema_from_create_schema(table),
         Err(e) => Err(e),
     }
 }
@@ -65,27 +52,17 @@ pub async fn resolve_schema(table: &Table) -> Result<Schema> {
 /// Resolves the [`apache_avro::schema::Schema`] as a [`String`] for a given Hudi table.
 ///
 /// The resolution process follows these steps:
-/// - If the timeline has commit metadata, read the schema field from it.
-/// - If the timeline has no commit metadata, read [`HudiTableConfig::CreateSchema`] from `hoodie.properties`.
+/// 1. Try to get the Avro schema from the timeline (commit metadata).
+/// 2. Fall back to [`HudiTableConfig::CreateSchema`] from `hoodie.properties`.
 ///
 /// ### Note
 ///
 /// - For resolving Avro schema, we don't read the schema from a base file like we do when resolving Arrow schema.
 /// - Avro schema does not contain [`MetaField`]s.
 pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
-    let timeline = table.get_timeline();
-    match timeline.get_latest_commit_metadata().await {
-        Ok(metadata) => resolve_avro_schema_from_commit_metadata(&metadata),
-        Err(CoreError::TimelineNoCommit) => {
-            if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
-                let create_schema: String = create_schema.into();
-                Ok(sanitize_avro_schema_str(&create_schema))
-            } else {
-                Err(CoreError::SchemaNotFound(
-                    "No completed commit, and no create schema for the table.".to_string(),
-                ))
-            }
-        }
+    match table.get_timeline().get_latest_avro_schema().await {
+        Ok(schema) => Ok(schema),
+        Err(CoreError::TimelineNoCommit) => resolve_avro_schema_from_create_schema(table),
         Err(e) => Err(e),
     }
 }
@@ -94,6 +71,28 @@ pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
 pub async fn resolve_avro_schema_with_meta_fields(table: &Table) -> Result<String> {
     let avro_schema_str = resolve_avro_schema(table).await?;
     prepend_meta_fields_to_avro_schema_str(&avro_schema_str)
+}
+
+fn resolve_data_schema_from_create_schema(table: &Table) -> Result<Schema> {
+    if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
+        let avro_schema_str: String = create_schema.into();
+        arrow_schema_from_avro_schema_str(&avro_schema_str)
+    } else {
+        Err(CoreError::SchemaNotFound(
+            "No completed commit, and no create schema for the table.".to_string(),
+        ))
+    }
+}
+
+fn resolve_avro_schema_from_create_schema(table: &Table) -> Result<String> {
+    if let Some(create_schema) = table.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
+        let create_schema: String = create_schema.into();
+        Ok(sanitize_avro_schema_str(&create_schema))
+    } else {
+        Err(CoreError::SchemaNotFound(
+            "No completed commit, and no create schema for the table.".to_string(),
+        ))
+    }
 }
 
 fn prepend_meta_fields_to_avro_schema_str(avro_schema_str: &str) -> Result<String> {
