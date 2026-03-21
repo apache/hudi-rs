@@ -760,7 +760,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_read_file_slice_from_paths_with_base_file_only() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
@@ -788,7 +788,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_read_file_slice_from_paths_read_optimized_mode() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(
@@ -823,7 +823,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_read_file_slice_from_paths_with_log_files() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
@@ -853,7 +853,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_read_file_slice_from_paths_error_handling() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
@@ -877,7 +877,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn test_read_file_slice() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
