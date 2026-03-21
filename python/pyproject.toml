@@ -44,12 +44,12 @@ dynamic = ["version"]
 devel = [
     "pytest==8.4.2",
     "coverage==7.10.7",
-    "ruff==0.14.13",
+    "ruff==0.15.7",
     "mypy==1.19.1",
     "pre-commit",
 ]
 lint = [
-    "ruff==0.14.13",
+    "ruff==0.15.7",
     "mypy==1.19.1",
 ]
 datafusion = [
