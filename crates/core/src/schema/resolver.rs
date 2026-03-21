@@ -20,7 +20,7 @@ use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::table::HudiTableConfig;
 use crate::error::{CoreError, Result};
 use crate::metadata::commit::HoodieCommitMetadata;
-use crate::schema::prepend_meta_fields;
+use crate::schema::{prepend_meta_fields, prepend_meta_fields_to_avro_schema_str};
 use crate::storage::Storage;
 use crate::table::Table;
 use apache_avro::schema::Schema as AvroSchema;
@@ -95,50 +95,6 @@ fn resolve_avro_schema_from_create_schema(table: &Table) -> Result<String> {
     }
 }
 
-fn prepend_meta_fields_to_avro_schema_str(avro_schema_str: &str) -> Result<String> {
-    use crate::metadata::meta_field::MetaField;
-
-    let mut schema: Value = serde_json::from_str(&sanitize_avro_schema_str(avro_schema_str))
-        .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema JSON: {e}")))?;
-
-    let fields = schema
-        .get_mut("fields")
-        .and_then(|f| f.as_array_mut())
-        .ok_or_else(|| CoreError::Schema("Avro schema has no 'fields' array".to_string()))?;
-
-    let meta_field_defs: Vec<Value> = MetaField::field_names()
-        .iter()
-        .map(|name| {
-            serde_json::json!({
-                "name": name,
-                "type": ["null", "string"],
-                "default": null
-            })
-        })
-        .collect();
-
-    let existing_names: std::collections::HashSet<&str> = fields
-        .iter()
-        .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
-        .collect();
-
-    let new_meta_fields: Vec<Value> = meta_field_defs
-        .into_iter()
-        .filter(|f| {
-            f.get("name")
-                .and_then(|n| n.as_str())
-                .is_none_or(|name| !existing_names.contains(name))
-        })
-        .collect();
-
-    let mut all_fields = new_meta_fields;
-    all_fields.append(fields);
-    *schema.get_mut("fields").unwrap() = Value::Array(all_fields);
-
-    serde_json::to_string(&schema)
-        .map_err(|e| CoreError::Schema(format!("Failed to serialize Avro schema: {e}")))
-}
-
 pub(crate) async fn resolve_data_schema_from_commit_metadata(
     commit_metadata: &Map<String, Value>,
     storage: Arc<Storage>,
@@ -211,7 +167,7 @@ async fn resolve_schema_from_base_file(
     ))
 }
 
-fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
+pub(crate) fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
     avro_schema_str.trim().replace("\\:", ":")
 }
 
@@ -321,34 +277,4 @@ mod tests {
         assert_eq!(schema, None);
     }
 
-    #[test]
-    fn test_prepend_meta_fields_to_avro_schema_str() {
-        let avro_schema =
-            r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#;
-        let result = prepend_meta_fields_to_avro_schema_str(avro_schema).unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let fields = parsed["fields"].as_array().unwrap();
-        assert_eq!(fields.len(), 6, "Expected 5 meta fields + 1 data field");
-        assert_eq!(fields[0]["name"], "_hoodie_commit_time");
-        assert_eq!(fields[5]["name"], "id");
-    }
-
-    #[test]
-    fn test_prepend_meta_fields_to_avro_schema_str_dedup() {
-        let avro_schema = r#"{"type":"record","name":"TestRecord","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"default":null},{"name":"id","type":"int"}]}"#;
-        let result = prepend_meta_fields_to_avro_schema_str(avro_schema).unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let fields = parsed["fields"].as_array().unwrap();
-        assert_eq!(
-            fields.len(),
-            6,
-            "Expected 5 meta fields + 1 data field (deduped existing meta field)"
-        );
-        // The existing _hoodie_commit_time should not be duplicated
-        let commit_time_count = fields
-            .iter()
-            .filter(|f| f["name"] == "_hoodie_commit_time")
-            .count();
-        assert_eq!(commit_time_count, 1);
-    }
 }
