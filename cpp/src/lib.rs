@@ -81,12 +81,13 @@ pub fn new_file_group_reader_with_options(
         }
     }
 
-    let reader = FileGroupReader::new_with_options(base_uri, opt_vec)
-        .expect("Failed to create FileGroupReader with options");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
+    let reader = rt
+        .block_on(FileGroupReader::new_with_options(base_uri, opt_vec))
+        .expect("Failed to create FileGroupReader with options");
     Box::new(HudiFileGroupReader { inner: reader, rt })
 }
 

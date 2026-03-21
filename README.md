@@ -210,7 +210,7 @@ record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet")
 use hudi::file_group::reader::FileGroupReader;
 
 let reader = FileGroupReader::new_with_options(
-    "/table/base/path", [("hoodie.read.file_group.start_timestamp", "0")])?;
+    "/table/base/path", [("hoodie.read.file_group.start_timestamp", "0")]).await?;
 
 // Returns an Arrow RecordBatch
 let record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet").await?;

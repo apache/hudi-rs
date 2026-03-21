@@ -86,7 +86,11 @@ impl HudiFileGroupReader {
         base_uri: &str,
         options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let inner = FileGroupReader::new_with_options(base_uri, options.unwrap_or_default())
+        let inner = rt()
+            .block_on(FileGroupReader::new_with_options(
+                base_uri,
+                options.unwrap_or_default(),
+            ))
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner })
     }
