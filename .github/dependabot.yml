@@ -35,6 +35,16 @@ updates:
         - dependency-name: "parquet"
         - dependency-name: "datafusion*"
 
+  - package-ecosystem: cargo
+    directory: /demo/apps/datafusion
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /demo/apps/hudi-table-api/rust
+    schedule:
+      interval: weekly
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
