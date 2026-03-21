@@ -25,6 +25,8 @@ header:
     - 'NOTICE'
     - '**/data/**'
     - '.github/PULL_REQUEST_TEMPLATE.md'
+    - '.github/copilot-instructions.md'
+    - '.github/instructions/**'
     - 'crates/core/schemas/**'
     - 'benchmark/tpch/queries/**'
 
