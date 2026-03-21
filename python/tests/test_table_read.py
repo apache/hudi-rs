@@ -32,7 +32,7 @@ from hudi import HudiTable
 def test_read_table_has_correct_schema(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    assert table.get_schema(includes_meta_fields=True).names == [
+    assert table.get_schema_with_meta_fields().names == [
         "_hoodie_commit_time",
         "_hoodie_commit_seqno",
         "_hoodie_record_key",

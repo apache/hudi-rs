@@ -208,9 +208,17 @@ class HudiTable:
             str: The timezone of the table.
         """
         ...
-    def get_avro_schema(self) -> str:
+    def get_schema_in_avro_str(self) -> str:
         """
-        Returns the Avro schema of the Hudi table.
+        Returns the Avro schema of the Hudi table, without meta fields.
+
+        Returns:
+            str: The Avro schema of the table.
+        """
+        ...
+    def get_schema_in_avro_str_with_meta_fields(self) -> str:
+        """
+        Returns the Avro schema of the Hudi table, with meta fields prepended.
 
         Returns:
             str: The Avro schema of the table.
@@ -218,7 +226,15 @@ class HudiTable:
         ...
     def get_schema(self) -> "pyarrow.Schema":
         """
-        Returns the schema of the Hudi table.
+        Returns the schema of the Hudi table, without meta fields.
+
+        Returns:
+            pyarrow.Schema: The schema of the table.
+        """
+        ...
+    def get_schema_with_meta_fields(self) -> "pyarrow.Schema":
+        """
+        Returns the schema of the Hudi table, with meta fields prepended.
 
         Returns:
             pyarrow.Schema: The schema of the table.
