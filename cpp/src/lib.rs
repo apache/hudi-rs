@@ -60,6 +60,7 @@ mod ffi {
 
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
+    rt: tokio::runtime::Runtime,
 }
 
 pub fn new_file_group_reader_with_options(
@@ -82,8 +83,11 @@ pub fn new_file_group_reader_with_options(
 
     let reader = FileGroupReader::new_with_options(base_uri, opt_vec)
         .expect("Failed to create FileGroupReader with options");
-    let reader_wrapper = HudiFileGroupReader { inner: reader };
-    Box::new(reader_wrapper)
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+    Box::new(HudiFileGroupReader { inner: reader, rt })
 }
 
 impl HudiFileGroupReader {
@@ -95,11 +99,8 @@ impl HudiFileGroupReader {
             .to_str()
             .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
-        let record_batch = rt
+        let record_batch = self
+            .rt
             .block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
             .expect("Failed to read file batch");
         let schema = record_batch.schema();
@@ -108,11 +109,8 @@ impl HudiFileGroupReader {
     }
 
     pub fn read_file_slice(&self, file_slice: &HudiFileSlice) -> *mut ffi::ArrowArrayStream {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
-        let record_batch = rt
+        let record_batch = self
+            .rt
             .block_on(self.inner.read_file_slice(&file_slice.inner))
             .expect("Failed to read file slice");
         let schema = record_batch.schema();
