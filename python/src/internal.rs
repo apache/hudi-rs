@@ -325,16 +325,24 @@ impl HudiTable {
     #[pyo3(signature = (includes_meta_fields=false))]
     fn get_schema_in_avro_str(&self, py: Python, includes_meta_fields: bool) -> PyResult<String> {
         py.detach(|| {
-            let avro_schema = rt()
-                .block_on(self.inner.get_schema_in_avro_str(includes_meta_fields))
-                .map_err(PythonError::from)?;
+            let avro_schema = if includes_meta_fields {
+                rt().block_on(self.inner.get_schema_in_avro_str_with_meta_fields())
+            } else {
+                rt().block_on(self.inner.get_schema_in_avro_str())
+            }
+            .map_err(PythonError::from)?;
             Ok(avro_schema)
         })
     }
 
     #[pyo3(signature = (includes_meta_fields=false))]
     fn get_schema(&self, py: Python, includes_meta_fields: bool) -> PyResult<Py<PyAny>> {
-        rt().block_on(self.inner.get_schema(includes_meta_fields))
+        let schema = if includes_meta_fields {
+            rt().block_on(self.inner.get_schema_with_meta_fields())
+        } else {
+            rt().block_on(self.inner.get_schema())
+        };
+        schema
             .map_err(PythonError::from)?
             .to_pyarrow(py)
             .map(|b| b.unbind())

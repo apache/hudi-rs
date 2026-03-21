@@ -41,7 +41,7 @@
 //!     use arrow_schema::Schema;
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let schema = hudi_table.get_schema(false).await.unwrap();
+//!     let schema = hudi_table.get_schema().await.unwrap();
 //! }
 //! ```
 //! 3. read hudi table
@@ -206,16 +206,25 @@ impl Table {
             .into()
     }
 
-    /// Get the latest Avro schema string of the table.
-    ///
-    /// When `includes_meta_fields` is `false`, returns the data schema
-    /// without guaranteed Hudi meta fields (`_hoodie_*`).
-    /// When `true`, meta fields are prepended to the schema.
+    /// Get the latest Avro schema string of the table, without Hudi meta fields (`_hoodie_*`).
     ///
     /// The implementation looks for the schema in the following order:
     /// 1. Timeline commit metadata.
     /// 2. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
-    pub async fn get_schema_in_avro_str(&self, includes_meta_fields: bool) -> Result<String> {
+    pub async fn get_schema_in_avro_str(&self) -> Result<String> {
+        self.get_schema_in_avro_str_internal(false).await
+    }
+
+    /// Get the latest Avro schema string of the table, with Hudi meta fields (`_hoodie_*`)
+    /// prepended.
+    pub async fn get_schema_in_avro_str_with_meta_fields(&self) -> Result<String> {
+        self.get_schema_in_avro_str_internal(true).await
+    }
+
+    async fn get_schema_in_avro_str_internal(
+        &self,
+        includes_meta_fields: bool,
+    ) -> Result<String> {
         if includes_meta_fields {
             resolve_avro_schema_with_meta_fields(self).await
         } else {
@@ -223,17 +232,24 @@ impl Table {
         }
     }
 
-    /// Get the latest [arrow_schema::Schema] of the table.
-    ///
-    /// When `includes_meta_fields` is `false`, returns the data schema
-    /// without guaranteed Hudi meta fields (`_hoodie_*`).
-    /// When `true`, meta fields are prepended to the schema.
+    /// Get the latest [arrow_schema::Schema] of the table, without Hudi meta fields
+    /// (`_hoodie_*`).
     ///
     /// The implementation looks for the schema in the following order:
     /// 1. Timeline commit metadata.
     /// 2. Base file schema.
     /// 3. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
-    pub async fn get_schema(&self, includes_meta_fields: bool) -> Result<Schema> {
+    pub async fn get_schema(&self) -> Result<Schema> {
+        self.get_schema_internal(false).await
+    }
+
+    /// Get the latest [arrow_schema::Schema] of the table, with Hudi meta fields (`_hoodie_*`)
+    /// prepended.
+    pub async fn get_schema_with_meta_fields(&self) -> Result<Schema> {
+        self.get_schema_internal(true).await
+    }
+
+    async fn get_schema_internal(&self, includes_meta_fields: bool) -> Result<Schema> {
         if includes_meta_fields {
             resolve_schema(self).await
         } else {
@@ -263,7 +279,7 @@ impl Table {
             fields.into_iter().collect()
         };
 
-        let schema = self.get_schema(false).await?;
+        let schema = self.get_schema().await?;
         let partition_fields: Vec<Arc<Field>> = schema
             .fields()
             .iter()
@@ -388,7 +404,7 @@ impl Table {
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
 
         // Get table schema for file pruning
-        let table_schema = self.get_schema(false).await?;
+        let table_schema = self.get_schema().await?;
 
         // Create file pruner with filters on non-partition columns
         let file_pruner = FilePruner::new(filters, &table_schema, &partition_schema)?;
@@ -886,11 +902,11 @@ mod tests {
     async fn hudi_table_get_schema_from_empty_table_without_create_schema() {
         let table = get_test_table_without_validation("table_props_no_create_schema").await;
 
-        let schema = table.get_schema(false).await;
+        let schema = table.get_schema().await;
         assert!(schema.is_err());
         assert!(matches!(schema.unwrap_err(), CoreError::SchemaNotFound(_)));
 
-        let schema = table.get_schema_in_avro_str(false).await;
+        let schema = table.get_schema_in_avro_str().await;
         assert!(schema.is_err());
         assert!(matches!(schema.unwrap_err(), CoreError::SchemaNotFound(_)));
     }
@@ -901,13 +917,13 @@ mod tests {
             let hudi_table = Table::new(base_url.path()).await.unwrap();
 
             // Validate the Arrow schema without meta fields
-            let schema = hudi_table.get_schema(false).await;
+            let schema = hudi_table.get_schema().await;
             assert!(schema.is_ok());
             let schema = schema.unwrap();
             assert_arrow_field_names_eq!(schema, ["id", "name", "isActive"]);
 
             // Validate the Arrow schema with meta fields
-            let schema = hudi_table.get_schema(true).await;
+            let schema = hudi_table.get_schema_with_meta_fields().await;
             assert!(schema.is_ok());
             let schema = schema.unwrap();
             assert_arrow_field_names_eq!(
@@ -916,13 +932,13 @@ mod tests {
             );
 
             // Validate the Avro schema without meta fields
-            let avro_schema = hudi_table.get_schema_in_avro_str(false).await;
+            let avro_schema = hudi_table.get_schema_in_avro_str().await;
             assert!(avro_schema.is_ok());
             let avro_schema = avro_schema.unwrap();
             assert_avro_field_names_eq!(&avro_schema, ["id", "name", "isActive"]);
 
             // Validate the Avro schema with meta fields
-            let avro_schema = hudi_table.get_schema_in_avro_str(true).await;
+            let avro_schema = hudi_table.get_schema_in_avro_str_with_meta_fields().await;
             assert!(avro_schema.is_ok());
             let avro_schema = avro_schema.unwrap();
             assert_avro_field_names_eq!(
@@ -960,13 +976,13 @@ mod tests {
         ];
 
         // Check Arrow schema without meta fields
-        let arrow_schema = hudi_table.get_schema(false).await;
+        let arrow_schema = hudi_table.get_schema().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
         assert_arrow_field_names_eq!(arrow_schema, original_field_names);
 
         // Check Arrow schema with meta fields
-        let arrow_schema = hudi_table.get_schema(true).await;
+        let arrow_schema = hudi_table.get_schema_with_meta_fields().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
         assert_arrow_field_names_eq!(
@@ -975,7 +991,7 @@ mod tests {
         );
 
         // Check Avro schema without meta fields
-        let avro_schema = hudi_table.get_schema_in_avro_str(false).await;
+        let avro_schema = hudi_table.get_schema_in_avro_str().await;
         assert!(avro_schema.is_ok());
         let avro_schema = avro_schema.unwrap();
         assert_avro_field_names_eq!(&avro_schema, original_field_names);
