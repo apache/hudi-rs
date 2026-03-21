@@ -74,7 +74,7 @@ pub fn prepend_meta_fields_to_avro_schema_str(avro_schema_str: &str) -> Result<S
 
     let mut all_fields = new_meta_fields;
     all_fields.append(fields);
-    *schema.get_mut("fields").unwrap() = Value::Array(all_fields);
+    *fields = all_fields;
 
     serde_json::to_string(&schema)
         .map_err(|e| CoreError::Schema(format!("Failed to serialize Avro schema: {e}")))

@@ -37,7 +37,7 @@ mod ffi {
         fn new_file_group_reader_with_options(
             base_uri: &CxxString,
             options: &CxxVector<CxxString>,
-        ) -> Box<HudiFileGroupReader>;
+        ) -> Result<Box<HudiFileGroupReader>>;
 
         type HudiFileSlice;
         fn new_file_slice_from_file_names(
@@ -49,12 +49,12 @@ mod ffi {
         fn read_file_slice_by_base_file_path(
             self: &HudiFileGroupReader,
             relative_path: &CxxString,
-        ) -> *mut ArrowArrayStream;
+        ) -> Result<*mut ArrowArrayStream>;
 
         fn read_file_slice(
             self: &HudiFileGroupReader,
             file_slice: &HudiFileSlice,
-        ) -> *mut ArrowArrayStream;
+        ) -> Result<*mut ArrowArrayStream>;
     }
 }
 
@@ -66,16 +66,16 @@ pub struct HudiFileGroupReader {
 pub fn new_file_group_reader_with_options(
     base_uri: &CxxString,
     options: &CxxVector<CxxString>,
-) -> Box<HudiFileGroupReader> {
+) -> std::result::Result<Box<HudiFileGroupReader>, String> {
     let base_uri = base_uri
         .to_str()
-        .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
 
     let mut opt_vec = Vec::new();
     for opt in options.iter() {
         let opt_str = opt
             .to_str()
-            .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
         if let Some((key, value)) = opt_str.split_once('=') {
             opt_vec.push((key, value))
         }
@@ -84,39 +84,48 @@ pub fn new_file_group_reader_with_options(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("Failed to create tokio runtime");
+        .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
     let reader = rt
         .block_on(FileGroupReader::new_with_options(base_uri, opt_vec))
-        .expect("Failed to create FileGroupReader with options");
-    Box::new(HudiFileGroupReader { inner: reader, rt })
+        .map_err(|e| format!("Failed to create FileGroupReader: {e}"))?;
+    Ok(Box::new(HudiFileGroupReader { inner: reader, rt }))
 }
 
 impl HudiFileGroupReader {
     pub fn read_file_slice_by_base_file_path(
         &self,
         relative_path: &CxxString,
-    ) -> *mut ffi::ArrowArrayStream {
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let relative_path = relative_path
             .to_str()
-            .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
 
         let record_batch = self
             .rt
             .block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
-            .expect("Failed to read file batch");
+            .map_err(|e| format!("Failed to read file batch: {e}"))?;
         let schema = record_batch.schema();
 
-        create_raw_pointer_for_record_batches(vec![record_batch], schema)
+        Ok(create_raw_pointer_for_record_batches(
+            vec![record_batch],
+            schema,
+        ))
     }
 
-    pub fn read_file_slice(&self, file_slice: &HudiFileSlice) -> *mut ffi::ArrowArrayStream {
+    pub fn read_file_slice(
+        &self,
+        file_slice: &HudiFileSlice,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let record_batch = self
             .rt
             .block_on(self.inner.read_file_slice(&file_slice.inner))
-            .expect("Failed to read file slice");
+            .map_err(|e| format!("Failed to read file slice: {e}"))?;
         let schema = record_batch.schema();
 
-        create_raw_pointer_for_record_batches(vec![record_batch], schema)
+        Ok(create_raw_pointer_for_record_batches(
+            vec![record_batch],
+            schema,
+        ))
     }
 }
 

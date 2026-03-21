@@ -23,7 +23,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::thread;
 
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -84,6 +83,8 @@ use hudi_core::table::Table as HudiTable;
 #[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
+    /// Cached table schema (with meta fields) for synchronous access in `TableProvider::schema()`.
+    schema: SchemaRef,
     /// Cached partition schema for determining partition columns.
     /// This is cached at construction since partition schema rarely changes
     /// and is needed synchronously in `supports_filters_pushdown`.
@@ -122,6 +123,16 @@ impl HudiDataSource {
             .await
             .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
 
+        // Cache schema with meta fields at construction for synchronous access
+        let schema = table
+            .get_schema_with_meta_fields()
+            .await
+            .map(SchemaRef::from)
+            .unwrap_or_else(|e| {
+                warn!("Failed to get table schema, using empty schema: {e}");
+                SchemaRef::from(Schema::empty())
+            });
+
         // Cache partition schema at construction for use in supports_filters_pushdown
         let partition_schema = match table.get_partition_schema().await {
             Ok(s) => s,
@@ -133,6 +144,7 @@ impl HudiDataSource {
 
         Ok(Self {
             table: Arc::new(table),
+            schema,
             partition_schema,
         })
     }
@@ -266,13 +278,7 @@ impl TableProvider for HudiDataSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        let table = self.table.clone();
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { table.get_schema_with_meta_fields().await })
-        });
-        let result = handle.join().unwrap().unwrap_or_else(|_| Schema::empty());
-        SchemaRef::from(result)
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {

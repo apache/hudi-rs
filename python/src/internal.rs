@@ -83,15 +83,17 @@ impl HudiFileGroupReader {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
     fn new_with_options(
+        py: Python,
         base_uri: &str,
         options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let inner = rt()
-            .block_on(FileGroupReader::new_with_options(
+        let inner = py.detach(|| {
+            rt().block_on(FileGroupReader::new_with_options(
                 base_uri,
                 options.unwrap_or_default(),
             ))
-            .map_err(PythonError::from)?;
+            .map_err(PythonError::from)
+        })?;
         Ok(HudiFileGroupReader { inner })
     }
 
@@ -289,15 +291,17 @@ impl HudiTable {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
     fn new_with_options(
+        py: Python,
         base_uri: &str,
         options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let inner: Table = rt()
-            .block_on(Table::new_with_options(
+        let inner: Table = py.detach(|| {
+            rt().block_on(Table::new_with_options(
                 base_uri,
                 options.unwrap_or_default(),
             ))
-            .map_err(PythonError::from)?;
+            .map_err(PythonError::from)
+        })?;
         Ok(HudiTable { inner })
     }
 
@@ -649,20 +653,22 @@ impl From<&Timeline> for HudiTimeline {
 #[pyfunction]
 #[pyo3(signature = (base_uri, hudi_options=None, storage_options=None, options=None))]
 pub fn build_hudi_table(
+    py: Python,
     base_uri: String,
     hudi_options: Option<HashMap<String, String>>,
     storage_options: Option<HashMap<String, String>>,
     options: Option<HashMap<String, String>>,
 ) -> PyResult<HudiTable> {
-    let inner = rt()
-        .block_on(
+    let inner = py.detach(|| {
+        rt().block_on(
             TableBuilder::from_base_uri(&base_uri)
                 .with_hudi_options(hudi_options.unwrap_or_default())
                 .with_storage_options(storage_options.unwrap_or_default())
                 .with_options(options.unwrap_or_default())
                 .build(),
         )
-        .map_err(PythonError::from)?;
+        .map_err(PythonError::from)
+    })?;
     Ok(HudiTable { inner })
 }
 
