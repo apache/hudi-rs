@@ -1277,10 +1277,7 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices = hudi_table
-            .get_file_slices(empty_filters())
-            .await
-            .unwrap();
+        let file_slices = hudi_table.get_file_slices(empty_filters()).await.unwrap();
         assert_eq!(
             file_slices
                 .iter()
@@ -1304,8 +1301,9 @@ mod tests {
         );
 
         // as of just smaller than the latest timestamp
-        let hudi_table =
-            Table::new_with_options(base_url.path(), empty_options()).await.unwrap();
+        let hudi_table = Table::new_with_options(base_url.path(), empty_options())
+            .await
+            .unwrap();
         let file_slices = hudi_table
             .get_file_slices_as_of("20240418173551905", empty_filters())
             .await
@@ -1319,8 +1317,9 @@ mod tests {
         );
 
         // as of non-exist old timestamp
-        let hudi_table =
-            Table::new_with_options(base_url.path(), empty_options()).await.unwrap();
+        let hudi_table = Table::new_with_options(base_url.path(), empty_options())
+            .await
+            .unwrap();
         let file_slices = hudi_table
             .get_file_slices_as_of("19700101000000", empty_filters())
             .await

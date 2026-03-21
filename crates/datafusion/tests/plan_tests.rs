@@ -32,7 +32,6 @@ use datafusion_common::{DataFusionError, ScalarValue};
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
-use hudi_core::metadata::meta_field::MetaField;
 use hudi_datafusion::{HudiDataSource, HudiTableFactory};
 use hudi_test::util::{get_bool_column, get_i32_column, get_str_column};
 use hudi_test::{SampleTable, assert_arrow_field_names_eq};

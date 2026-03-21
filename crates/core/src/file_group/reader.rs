@@ -97,8 +97,7 @@ impl FileGroupReader {
             let mut resolver = OptionResolver::new_with_options(base_uri, options);
             resolver.resolve_options().await?;
             let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
-            let storage =
-                Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+            let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
 
             Ok(Self {
                 hudi_configs,
@@ -773,7 +772,9 @@ mod tests {
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths: Vec<&str> = vec![];
 
-        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
+        let result = reader
+            .read_file_slice_from_paths(base_file_path, log_file_paths)
+            .await;
 
         match result {
             Ok(batch) => {
@@ -801,7 +802,9 @@ mod tests {
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
-        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
+        let result = reader
+            .read_file_slice_from_paths(base_file_path, log_file_paths)
+            .await;
 
         // In read-optimized mode, log files should be ignored
         // This should behave the same as read_file_slice_by_base_file_path
@@ -830,7 +833,9 @@ mod tests {
         let base_file_path = TEST_SAMPLE_BASE_FILE;
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
-        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
+        let result = reader
+            .read_file_slice_from_paths(base_file_path, log_file_paths)
+            .await;
 
         // The actual file reading might fail due to missing test data, which is expected
         match result {
@@ -859,7 +864,9 @@ mod tests {
         let base_file_path = "non_existent_file.parquet";
         let log_file_paths: Vec<&str> = vec![];
 
-        let result = reader.read_file_slice_from_paths(base_file_path, log_file_paths).await;
+        let result = reader
+            .read_file_slice_from_paths(base_file_path, log_file_paths)
+            .await;
 
         assert!(result.is_err(), "Should return error for non-existent file");
 

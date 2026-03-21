@@ -73,7 +73,8 @@ mod v6_tables {
             let hudi_table = Table::new_with_options(
                 base_url.path(),
                 [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-            ).await?;
+            )
+            .await?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -81,8 +82,9 @@ mod v6_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
-            let records =
-                hudi_table.read_snapshot_as_of(latest_commit, empty_filters()).await?;
+            let records = hudi_table
+                .read_snapshot_as_of(latest_commit, empty_filters())
+                .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -176,8 +178,9 @@ mod v6_tables {
                     .map(|i| i.timestamp.as_str())
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
-                let records =
-                    hudi_table.read_snapshot_as_of(first_commit, empty_filters()).await?;
+                let records = hudi_table
+                    .read_snapshot_as_of(first_commit, empty_filters())
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -224,7 +227,9 @@ mod v6_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of(first_commit, empty_filters()).await?;
+            let records = hudi_table
+                .read_snapshot_as_of(first_commit, empty_filters())
+                .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -270,7 +275,9 @@ mod v6_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of(first_commit, empty_filters()).await?;
+            let records = hudi_table
+                .read_snapshot_as_of(first_commit, empty_filters())
+                .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -320,7 +327,8 @@ mod v6_tables {
 
                 // read records changed from the beginning to the 1st commit
                 let records = hudi_table
-                    .read_incremental_records("19700101000000", Some(first_commit)).await?;
+                    .read_incremental_records("19700101000000", Some(first_commit))
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -332,7 +340,8 @@ mod v6_tables {
 
                 // read records changed from the 1st to the 2nd commit
                 let records = hudi_table
-                    .read_incremental_records(first_commit, Some(second_commit)).await?;
+                    .read_incremental_records(first_commit, Some(second_commit))
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -344,7 +353,8 @@ mod v6_tables {
 
                 // read records changed from the 2nd to the 3rd commit
                 let records = hudi_table
-                    .read_incremental_records(second_commit, Some(third_commit)).await?;
+                    .read_incremental_records(second_commit, Some(third_commit))
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -355,7 +365,9 @@ mod v6_tables {
                 );
 
                 // read records changed from the 1st commit
-                let records = hudi_table.read_incremental_records(first_commit, None).await?;
+                let records = hudi_table
+                    .read_incremental_records(first_commit, None)
+                    .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
@@ -366,7 +378,9 @@ mod v6_tables {
                 );
 
                 // read records changed from the 3rd commit
-                let records = hudi_table.read_incremental_records(third_commit, None).await?;
+                let records = hudi_table
+                    .read_incremental_records(third_commit, None)
+                    .await?;
                 assert!(
                     records.is_empty(),
                     "Should return 0 record as it's the latest commit"
@@ -534,7 +548,9 @@ mod v8_tables {
                 .map(|i| i.timestamp.as_str())
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
-            let records = hudi_table.read_snapshot_as_of(first_commit, empty_filters()).await?;
+            let records = hudi_table
+                .read_snapshot_as_of(first_commit, empty_filters())
+                .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -1196,8 +1212,9 @@ mod mdt_enabled_tables {
 
             // Read MDT files partition records
             let partition_pruner = PartitionPruner::empty();
-            let records =
-                hudi_table.read_metadata_table_files_partition(&partition_pruner).await?;
+            let records = hudi_table
+                .read_metadata_table_files_partition(&partition_pruner)
+                .await?;
 
             // For non-partitioned tables, the fast path only fetches the files record.
             // __all_partitions__ is not fetched to avoid redundant HFile lookup.

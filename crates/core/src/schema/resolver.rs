@@ -128,12 +128,12 @@ fn prepend_meta_fields_to_avro_schema_str(avro_schema_str: &str) -> Result<Strin
         .filter(|f| {
             f.get("name")
                 .and_then(|n| n.as_str())
-                .map_or(true, |name| !existing_names.contains(name))
+                .is_none_or(|name| !existing_names.contains(name))
         })
         .collect();
 
     let mut all_fields = new_meta_fields;
-    all_fields.extend(fields.drain(..));
+    all_fields.append(fields);
     *schema.get_mut("fields").unwrap() = Value::Array(all_fields);
 
     serde_json::to_string(&schema)
@@ -324,7 +324,8 @@ mod tests {
 
     #[test]
     fn test_prepend_meta_fields_to_avro_schema_str() {
-        let avro_schema = r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#;
+        let avro_schema =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#;
         let result = prepend_meta_fields_to_avro_schema_str(avro_schema).unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let fields = parsed["fields"].as_array().unwrap();
