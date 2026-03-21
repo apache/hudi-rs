@@ -32,6 +32,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 
 use hudi_core::config::read::HudiReadConfig::InputPartitions;
 use hudi_core::config::util::empty_options;
+use hudi_core::metadata::meta_field::MetaField;
 use hudi_datafusion::{HudiDataSource, HudiTableFactory};
 use hudi_test::util::{get_bool_column, get_i32_column, get_str_column};
 use hudi_test::{SampleTable, assert_arrow_field_names_eq};
@@ -195,9 +196,11 @@ mod v6_tests {
             HudiDataSource::new_with_options(V6Empty.path_to_cow().as_str(), empty_options())
                 .await
                 .unwrap();
-        // schema() returns data schema without meta fields
         let schema = table_provider.schema();
-        assert_arrow_field_names_eq!(schema, vec!["id", "name", "isActive"]);
+        assert_arrow_field_names_eq!(
+            schema,
+            [MetaField::field_names(), vec!["id", "name", "isActive"]].concat()
+        );
     }
 
     #[tokio::test]

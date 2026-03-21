@@ -18,6 +18,7 @@
  */
 use crate::error::{CoreError, Result};
 use crate::metadata::meta_field::MetaField;
+use crate::schema::resolver::sanitize_avro_schema_str;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::Value;
 
@@ -38,8 +39,6 @@ pub fn prepend_meta_fields_with_operation(schema: SchemaRef) -> Result<Schema> {
 }
 
 pub fn prepend_meta_fields_to_avro_schema_str(avro_schema_str: &str) -> Result<String> {
-    use crate::schema::resolver::sanitize_avro_schema_str;
-
     let mut schema: Value = serde_json::from_str(&sanitize_avro_schema_str(avro_schema_str))
         .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema JSON: {e}")))?;
 

@@ -221,10 +221,7 @@ impl Table {
         self.get_schema_in_avro_str_internal(true).await
     }
 
-    async fn get_schema_in_avro_str_internal(
-        &self,
-        includes_meta_fields: bool,
-    ) -> Result<String> {
+    async fn get_schema_in_avro_str_internal(&self, includes_meta_fields: bool) -> Result<String> {
         if includes_meta_fields {
             resolve_avro_schema_with_meta_fields(self).await
         } else {

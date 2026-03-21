@@ -276,5 +276,4 @@ mod tests {
         let schema = extract_avro_schema_from_commit_metadata(&metadata);
         assert_eq!(schema, None);
     }
-
 }
