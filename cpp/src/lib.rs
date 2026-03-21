@@ -44,7 +44,7 @@ mod ffi {
             partition_path: &CxxString,
             base_file_name: &CxxString,
             log_file_names: &CxxVector<CxxString>,
-        ) -> Box<HudiFileSlice>;
+        ) -> Result<Box<HudiFileSlice>>;
 
         fn read_file_slice_by_base_file_path(
             self: &HudiFileGroupReader,
@@ -137,38 +137,35 @@ pub fn new_file_slice_from_file_names(
     partition_path: &CxxString,
     base_file_name: &CxxString,
     log_file_names: &CxxVector<CxxString>,
-) -> Box<HudiFileSlice> {
+) -> std::result::Result<Box<HudiFileSlice>, String> {
     let partition_path = partition_path
         .to_str()
-        .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
     let base_file_name = base_file_name
         .to_str()
-        .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence");
+        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
 
     let log_file_names = log_file_names
         .iter()
         .map(|name| {
             name.to_str()
-                .expect("Failed to convert CxxString to str: Invalid UTF-8 sequence")
+                .map_err(|e| format!("Failed to convert CxxString to str: {e}"))
         })
-        .collect::<Vec<_>>();
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut file_group = FileGroup::new_with_base_file_name(base_file_name, partition_path)
-        .expect("Failed to create FileGroup");
+        .map_err(|e| format!("Failed to create FileGroup: {e}"))?;
     file_group
         .add_log_files_from_names(&log_file_names)
-        .expect("Failed to add files to FileGroup");
+        .map_err(|e| format!("Failed to add files to FileGroup: {e}"))?;
 
     let (_, file_slice) = file_group
         .file_slices
         .iter()
         .next()
-        .expect("Failed to get file slice from FileGroup");
+        .ok_or_else(|| format!("Failed to get file slice from FileGroup: {file_group:?}"))?;
 
-    // todo: add api to create file slice from names to avoid cloning
-    let file_slice_wrapper = HudiFileSlice {
+    Ok(Box::new(HudiFileSlice {
         inner: file_slice.clone(),
-    };
-
-    Box::new(file_slice_wrapper)
+    }))
 }
