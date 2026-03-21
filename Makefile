@@ -70,6 +70,14 @@ setup: ## Setup the requirements
 	$(info --- Setup dependencies ---)
 	uv pip install "$(MATURIN_VERSION)"
 
+.PHONY: setup-pre-commit
+setup-pre-commit: ## Install pre-commit hooks for local development
+	$(call check_uv)
+	$(info --- Setup pre-commit hooks ---)
+	uv pip install pre-commit
+	pre-commit install
+	pre-commit install --hook-type pre-push
+
 .PHONY: build
 build: setup ## Build Python binding of hudi-rs
 	$(info --- Build Python binding ---)

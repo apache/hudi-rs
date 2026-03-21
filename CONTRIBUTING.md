@@ -48,6 +48,31 @@ view, instead, they will be linked to the corresponding issues.
 - Have a compatible Python version installed (check [`python/pyproject.toml`](./python/pyproject.toml) for current
   requirement)
 
+## Pre-commit hooks (recommended)
+
+This project provides [pre-commit](https://pre-commit.com/) hooks to catch issues locally
+before they reach CI. After setting up the virtual environment:
+
+```shell
+make setup-pre-commit
+```
+
+The hooks are split into two stages for a fast development cycle:
+
+**On every commit** (~5 seconds):
+
+- File hygiene: trailing whitespace, end-of-file fixer, YAML validation, large file check, merge conflict markers
+- Rust formatting: auto-formats via `cargo fmt` (same as `make format-rust`)
+- Python formatting: auto-formats via `ruff format` (same as `make format-python`)
+
+**On every push** (thorough, ~1-5 minutes):
+
+- Rust checks: `cargo clippy` and format verification (same as `make check-rust`)
+- Python checks: `ruff` linting and `mypy` type checking (same as `make check-python`)
+
+These are the same checks that run in CI. To skip hooks temporarily:
+`git commit --no-verify` or `git push --no-verify`.
+
 ## Commonly used dev commands
 
 For most of the time, use dev commands specified in the [`Makefile`](Makefile).
@@ -132,7 +157,7 @@ When submitting a pull request, please follow these guidelines:
 
 ### Code coverage
 
-We use [codecov](https://app.codecov.io/github/apache/hudi-rs) to generate code coverage report and enforce code 
+We use [codecov](https://app.codecov.io/github/apache/hudi-rs) to generate code coverage report and enforce code
 coverage rate. See [codecov.yml](./codecov.yml) for the configuration.
 
 ## Learning
