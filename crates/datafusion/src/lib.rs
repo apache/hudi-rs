@@ -345,7 +345,17 @@ impl TableProvider for HudiDataSource {
             n => n,
         };
 
-        let pushdown_filters = exprs_to_filters(filters);
+        // Only push down partition column filters to Hudi's file listing layer.
+        // Non-partition filters would trigger Parquet footer reads for file-level
+        // stats pruning, which is redundant since DataFusion's ParquetSource already
+        // handles row-group/page-level pruning during the scan.
+        let partition_cols = self.get_partition_columns();
+        let partition_filters: Vec<Expr> = filters
+            .iter()
+            .filter(|expr| Self::is_partition_column_filter(expr, &partition_cols))
+            .cloned()
+            .collect();
+        let pushdown_filters = exprs_to_filters(&partition_filters);
         let file_slices = self
             .table
             .get_file_slices_splits(input_partitions, pushdown_filters)
