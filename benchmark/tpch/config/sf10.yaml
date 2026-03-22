@@ -44,5 +44,6 @@ bench:
     spark.sql.autoBroadcastJoinThreshold: "33554432"
   datafusion_conf:
     memory_limit: 12g
-    target_partitions: 16
-    hash_join_single_partition_threshold: 33554432
+    datafusion.execution.target_partitions: "16"
+    datafusion.execution.batch_size: "16384"
+    datafusion.optimizer.hash_join_single_partition_threshold: "33554432"
