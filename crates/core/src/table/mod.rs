@@ -1662,18 +1662,13 @@ mod tests {
         assert!(bytes > 0, "Should have estimated bytes > 0, got {bytes}");
     }
 
-    #[test]
-    fn test_compute_table_stats_without_mdt() {
+    #[tokio::test]
+    async fn test_compute_table_stats_without_mdt() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let table = Table::new_blocking(base_url.path()).unwrap();
+        let table = Table::new(base_url.path()).await.unwrap();
         assert!(!table.is_metadata_table_enabled());
 
-        let stats = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(table.compute_table_stats());
+        let stats = table.compute_table_stats().await;
         assert!(stats.is_none(), "Stats should be None for non-MDT table");
     }
-
 }
