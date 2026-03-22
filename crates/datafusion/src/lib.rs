@@ -152,7 +152,6 @@ impl HudiDataSource {
         // Falls back to None if metadata table is not enabled.
         let cached_stats = match table.compute_table_stats().await {
             Some((num_rows, total_byte_size)) => {
-                let schema = table.get_schema().await.unwrap_or_else(|_| Schema::empty());
                 let num_fields = schema.fields().len();
                 Some(Statistics {
                     num_rows: Precision::Inexact(num_rows),
