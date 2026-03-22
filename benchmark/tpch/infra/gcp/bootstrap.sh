@@ -32,7 +32,7 @@ set -euo pipefail
 # System deps + Rust + Docker + Java + PySpark
 sudo apt-get update
 sudo apt-get install -y build-essential protobuf-compiler pkg-config git curl \
-  openjdk-17-jdk-headless python3-pip
+  openjdk-17-jdk-headless python3-pip sysstat tmux
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 pip3 install --break-system-packages pyspark==3.5.8
@@ -50,6 +50,9 @@ cd hudi-rs
 git fetch origin pull/548/head:df-optimize
 git checkout df-optimize
 cargo build -p tpch --release
+
+# Spark local dirs for shuffle and event logs
+mkdir -p /tmp/spark-local /tmp/spark-events
 
 # Persist SPARK_HOME for future sessions
 echo "export SPARK_HOME=$SPARK_HOME" >> ~/.bashrc

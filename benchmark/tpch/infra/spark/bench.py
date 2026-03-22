@@ -21,6 +21,9 @@
 
 Measures wall-clock time around spark.sql().collect() for each query iteration,
 mirroring how DataFusion benchmarks are measured.
+
+A fresh Spark session is created per query to clean up shuffle files and avoid
+disk space exhaustion during long benchmark runs.
 """
 
 import argparse
@@ -44,6 +47,21 @@ def load_query(query_dir, query_num, scale_factor):
     return sql.replace("${Q11_FRACTION}", q11_fraction)
 
 
+def create_session_and_register(args):
+    """Create a new Spark session and register all TPC-H tables."""
+    spark = SparkSession.builder.getOrCreate()
+    if args.hudi_base:
+        for table in TPCH_TABLES:
+            spark.sql(
+                f"CREATE TABLE IF NOT EXISTS {table} USING hudi "
+                f"LOCATION '{args.hudi_base}/{table}'"
+            )
+    elif args.parquet_base:
+        for table in TPCH_TABLES:
+            spark.read.parquet(f"{args.parquet_base}/{table}").createOrReplaceTempView(table)
+    return spark
+
+
 def main():
     parser = argparse.ArgumentParser(description="TPC-H Spark SQL benchmark")
     parser.add_argument("--hudi-base", default=None)
@@ -65,21 +83,6 @@ def main():
 
     total_runs = args.warmup + args.iterations
 
-    print("Initializing Spark session...", flush=True)
-    spark = SparkSession.builder.getOrCreate()
-
-    # Register tables
-    if args.hudi_base:
-        for table in TPCH_TABLES:
-            print(f"  Registering Hudi table: {table}", flush=True)
-            spark.sql(
-                f"CREATE TABLE {table} USING hudi LOCATION '{args.hudi_base}/{table}'"
-            )
-    elif args.parquet_base:
-        for table in TPCH_TABLES:
-            print(f"  Registering Parquet table: {table}", flush=True)
-            spark.read.parquet(f"{args.parquet_base}/{table}").createOrReplaceTempView(table)
-
     print(
         f"Warmup: {args.warmup} iteration(s), Measured: {args.iterations} iteration(s)",
         flush=True,
@@ -88,6 +91,10 @@ def main():
     result_file = open(args.output, "w")
 
     for qn in query_nums:
+        # Fresh session per query to clean up shuffle files
+        print(f"  Registering tables for Q{qn:02d}...", flush=True)
+        spark = create_session_and_register(args)
+
         sql = load_query(args.query_dir, qn, args.scale_factor)
         statements = [s.strip() for s in sql.split(";") if s.strip()]
 
@@ -110,8 +117,9 @@ def main():
                 result_file.write(json.dumps({"query": qn, "elapsed_ms": elapsed_ms}) + "\n")
                 result_file.flush()
 
+        spark.stop()
+
     result_file.close()
-    spark.stop()
 
 
 if __name__ == "__main__":
