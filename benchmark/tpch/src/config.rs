@@ -84,13 +84,14 @@ pub struct BenchConfig {
 
 #[derive(Deserialize, Default)]
 pub struct DataFusionConfig {
-    /// Memory pool limit (e.g., "16g", "512m"); unlimited if not set
+    /// Memory pool limit (e.g., "16g", "512m"); unlimited if not set.
+    /// Handled specially because it requires creating a memory pool at runtime.
     pub memory_limit: Option<String>,
-    /// Number of target partitions for parallelism (like Spark's shuffle.partitions)
-    pub target_partitions: Option<usize>,
-    /// Size threshold in bytes for collecting a join side into a single partition
-    /// (like Spark's autoBroadcastJoinThreshold). Default: 1MB.
-    pub hash_join_single_partition_threshold: Option<usize>,
+    /// Additional DataFusion session config key-value pairs.
+    /// Keys use DataFusion's dotted config namespace (e.g., "datafusion.execution.target_partitions").
+    /// Values are passed directly to `SessionConfig::set()`.
+    #[serde(default, flatten)]
+    pub settings: BTreeMap<String, String>,
 }
 
 fn default_iterations() -> usize {

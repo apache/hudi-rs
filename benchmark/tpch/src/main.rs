@@ -38,6 +38,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionConfig;
+use datafusion::common::ScalarValue;
 use hudi::HudiDataSource;
 use serde::{Deserialize, Serialize};
 
@@ -276,14 +277,8 @@ fn create_session_context(
     df_conf: &config::DataFusionConfig,
 ) -> std::result::Result<SessionContext, String> {
     let mut session_config = SessionConfig::new();
-    if let Some(partitions) = df_conf.target_partitions {
-        session_config = session_config.with_target_partitions(partitions);
-    }
-    if let Some(threshold) = df_conf.hash_join_single_partition_threshold {
-        session_config
-            .options_mut()
-            .optimizer
-            .hash_join_single_partition_threshold = threshold;
+    for (key, value) in &df_conf.settings {
+        session_config = session_config.set(key, &ScalarValue::Utf8(Some(value.clone())));
     }
     match &df_conf.memory_limit {
         Some(limit) => {
