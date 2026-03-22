@@ -77,9 +77,20 @@ pub struct BenchConfig {
     #[serde(default = "default_iterations")]
     pub iterations: usize,
     #[serde(default)]
-    pub memory_limit: Option<String>,
-    #[serde(default)]
     pub spark_conf: BTreeMap<String, String>,
+    #[serde(default)]
+    pub datafusion_conf: DataFusionConfig,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DataFusionConfig {
+    /// Memory pool limit (e.g., "16g", "512m"); unlimited if not set
+    pub memory_limit: Option<String>,
+    /// Number of target partitions for parallelism (like Spark's shuffle.partitions)
+    pub target_partitions: Option<usize>,
+    /// Size threshold in bytes for collecting a join side into a single partition
+    /// (like Spark's autoBroadcastJoinThreshold). Default: 1MB.
+    pub hash_join_single_partition_threshold: Option<usize>,
 }
 
 fn default_iterations() -> usize {

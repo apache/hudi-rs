@@ -37,9 +37,12 @@ create_tables:
 bench:
   warmup: 1
   iterations: 3
-  memory_limit: 16g
   spark_conf:
     spark.driver.memory: 16g
     spark.driver.memoryOverhead: 4g
     spark.sql.shuffle.partitions: "16"
     spark.sql.autoBroadcastJoinThreshold: "33554432"
+  datafusion_conf:
+    memory_limit: 16g
+    target_partitions: 16
+    hash_join_single_partition_threshold: 33554432
