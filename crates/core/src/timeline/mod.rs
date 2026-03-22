@@ -31,7 +31,7 @@ use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::builder::replaced_file_groups_from_replace_commit;
 use crate::schema::resolver::{
-    resolve_avro_schema_from_commit_metadata, resolve_schema_from_commit_metadata,
+    resolve_avro_schema_from_commit_metadata, resolve_data_schema_from_commit_metadata,
 };
 use crate::storage::Storage;
 use crate::timeline::builder::TimelineBuilder;
@@ -270,14 +270,14 @@ impl Timeline {
         resolve_avro_schema_from_commit_metadata(&commit_metadata)
     }
 
-    /// Get the latest [arrow_schema::Schema] from the [Timeline].
+    /// Get the latest data [arrow_schema::Schema] from the [Timeline], without Hudi meta fields.
     ///
     /// ### Note
     /// This API behaves differently from [crate::table::Table::get_schema],
     /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
-        resolve_schema_from_commit_metadata(&commit_metadata, self.storage.clone()).await
+        resolve_data_schema_from_commit_metadata(&commit_metadata, self.storage.clone()).await
     }
 
     pub(crate) async fn get_replaced_file_groups_as_of(
@@ -485,7 +485,8 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let timeline = create_test_timeline(base_url).await;
         let table_schema = timeline.get_latest_schema().await.unwrap();
-        assert_eq!(table_schema.fields.len(), 21)
+        // get_latest_schema returns data schema without meta fields
+        assert_eq!(table_schema.fields.len(), 16)
     }
 
     #[tokio::test]
@@ -594,17 +595,13 @@ mod tests {
         .unwrap();
         let timeline = create_test_timeline(base_url).await;
 
-        // Check Arrow schema
+        // Check Arrow schema — get_latest_schema returns data schema without meta fields
         let arrow_schema = timeline.get_latest_schema().await;
         assert!(arrow_schema.is_ok());
         let arrow_schema = arrow_schema.unwrap();
         assert_arrow_field_names_eq!(
             arrow_schema,
-            [
-                MetaField::field_names(),
-                vec!["ts", "uuid", "rider", "driver", "fare", "city"]
-            ]
-            .concat()
+            vec!["ts", "uuid", "rider", "driver", "fare", "city"]
         );
 
         // Check Avro schema
