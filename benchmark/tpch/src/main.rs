@@ -271,11 +271,21 @@ fn parse_memory_size(s: &str) -> std::result::Result<usize, String> {
     Ok((num * multiplier as f64) as usize)
 }
 
-/// Create a SessionContext, optionally bounded by a memory pool.
+/// Create a SessionContext from DataFusion config.
 fn create_session_context(
-    memory_limit: Option<&str>,
+    df_conf: &config::DataFusionConfig,
 ) -> std::result::Result<SessionContext, String> {
-    match memory_limit {
+    let mut session_config = SessionConfig::new();
+    if let Some(partitions) = df_conf.target_partitions {
+        session_config = session_config.with_target_partitions(partitions);
+    }
+    if let Some(threshold) = df_conf.hash_join_single_partition_threshold {
+        session_config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = threshold;
+    }
+    match &df_conf.memory_limit {
         Some(limit) => {
             let pool_size = parse_memory_size(limit)?;
             let pool = FairSpillPool::new(pool_size);
@@ -283,12 +293,9 @@ fn create_session_context(
                 .with_memory_pool(Arc::new(pool))
                 .build_arc()
                 .map_err(|e| format!("Failed to build runtime: {e}"))?;
-            Ok(SessionContext::new_with_config_rt(
-                SessionConfig::new(),
-                runtime,
-            ))
+            Ok(SessionContext::new_with_config_rt(session_config, runtime))
         }
-        None => Ok(SessionContext::new()),
+        None => Ok(SessionContext::new_with_config(session_config)),
     }
 }
 
@@ -405,7 +412,10 @@ async fn main() -> Result<()> {
                 .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
             let warmup = warmup.unwrap_or(cfg.bench.warmup);
             let iterations = iterations.unwrap_or(cfg.bench.iterations);
-            let memory_limit = memory_limit.or(cfg.bench.memory_limit);
+            let mut df_conf = cfg.bench.datafusion_conf;
+            if memory_limit.is_some() {
+                df_conf.memory_limit = memory_limit;
+            }
             run_bench(
                 hudi_dir.as_deref(),
                 parquet_dir.as_deref(),
@@ -413,7 +423,7 @@ async fn main() -> Result<()> {
                 queries,
                 warmup,
                 iterations,
-                memory_limit.as_deref(),
+                &df_conf,
                 output_dir.as_deref(),
                 engine_label.as_deref(),
                 format_label.as_deref(),
@@ -428,14 +438,13 @@ async fn main() -> Result<()> {
             queries,
             memory_limit,
         } => {
-            run_validate(
-                &hudi_dir,
-                &parquet_dir,
-                scale_factor,
-                queries,
-                memory_limit.as_deref(),
-            )
-            .await
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
+            let mut df_conf = cfg.bench.datafusion_conf;
+            if memory_limit.is_some() {
+                df_conf.memory_limit = memory_limit;
+            }
+            run_validate(&hudi_dir, &parquet_dir, scale_factor, queries, &df_conf).await
         }
         Commands::ParseSparkOutput {
             input,
@@ -780,7 +789,7 @@ async fn run_bench(
     queries: Option<String>,
     warmup: usize,
     iterations: usize,
-    memory_limit: Option<&str>,
+    df_conf: &config::DataFusionConfig,
     output_dir: Option<&str>,
     engine_label: Option<&str>,
     format_label: Option<&str>,
@@ -794,14 +803,14 @@ async fn run_bench(
 
     let query_nums = parse_query_numbers(queries);
 
-    if let Some(limit) = memory_limit {
+    if let Some(limit) = &df_conf.memory_limit {
         println!("DataFusion memory limit: {limit}");
     }
     println!("Warmup: {warmup} iteration(s), Measured: {iterations} iteration(s)");
 
     if let Some(hudi_dir) = hudi_dir {
-        let ctx = create_session_context(memory_limit)
-            .map_err(datafusion::error::DataFusionError::Plan)?;
+        let ctx =
+            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
         println!("Registering Hudi tables from {hudi_dir}");
         register_hudi_tables(&ctx, hudi_dir).await?;
         println!("Benchmarking Hudi...");
@@ -816,8 +825,8 @@ async fn run_bench(
     }
 
     if let Some(parquet_dir) = parquet_dir {
-        let ctx = create_session_context(memory_limit)
-            .map_err(datafusion::error::DataFusionError::Plan)?;
+        let ctx =
+            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
         println!("Registering Parquet tables from {parquet_dir}");
         register_parquet_tables(&ctx, parquet_dir).await?;
         println!("Benchmarking Parquet...");
@@ -840,22 +849,22 @@ async fn run_validate(
     parquet_dir: &str,
     scale_factor: f64,
     queries: Option<String>,
-    memory_limit: Option<&str>,
+    df_conf: &config::DataFusionConfig,
 ) -> Result<()> {
     let query_nums = parse_query_numbers(queries);
 
-    if let Some(limit) = memory_limit {
+    if let Some(limit) = &df_conf.memory_limit {
         println!("DataFusion memory limit: {limit}");
     }
 
     println!("Registering Hudi tables from {hudi_dir}");
     let hudi_ctx =
-        create_session_context(memory_limit).map_err(datafusion::error::DataFusionError::Plan)?;
+        create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
     register_hudi_tables(&hudi_ctx, hudi_dir).await?;
 
     println!("Registering Parquet tables from {parquet_dir}");
     let parquet_ctx =
-        create_session_context(memory_limit).map_err(datafusion::error::DataFusionError::Plan)?;
+        create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
     register_parquet_tables(&parquet_ctx, parquet_dir).await?;
 
     println!("Running Hudi queries...");
