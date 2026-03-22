@@ -32,7 +32,7 @@ set -euo pipefail
 # System deps + Rust + Docker + Java + PySpark
 sudo apt-get update
 sudo apt-get install -y build-essential protobuf-compiler pkg-config git curl \
-  openjdk-17-jdk-headless python3-pip sysstat tmux
+  openjdk-17-jdk-headless python3-pip sysstat tmux glances
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 pip3 install --break-system-packages pyspark==3.5.8
@@ -51,8 +51,15 @@ git fetch origin pull/548/head:df-optimize
 git checkout df-optimize
 cargo build -p tpch --release
 
-# Spark local dirs for shuffle and event logs
-mkdir -p /tmp/spark-local /tmp/spark-events
+# Spark local dirs for shuffle and event logs.
+# If a local NVMe SSD is mounted at /mnt/nvme, symlink shuffle dir there for faster I/O.
+if mountpoint -q /mnt/nvme 2>/dev/null; then
+  mkdir -p /mnt/nvme/spark-local
+  ln -sfn /mnt/nvme/spark-local /tmp/spark-local
+else
+  mkdir -p /tmp/spark-local
+fi
+mkdir -p /tmp/spark-events
 
 # Persist SPARK_HOME for future sessions
 echo "export SPARK_HOME=$SPARK_HOME" >> ~/.bashrc
