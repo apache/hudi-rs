@@ -22,7 +22,6 @@
 **/results
 
 /.idea
-.vscode
 
 # python
 .venv

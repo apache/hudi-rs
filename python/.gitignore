@@ -85,7 +85,7 @@ docs/_build/
 .idea/
 
 # VSCode
-.vscode/
+.vscode
 
 # Pyenv
 .python-version
