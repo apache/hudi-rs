@@ -39,7 +39,7 @@ bench:
   iterations: 2
   spark_conf:
     spark.driver.memory: 2g
-    spark.driver.memoryOverhead: 512m
+    spark.driver.memoryOverhead: 256m
     spark.sql.shuffle.partitions: "4"
     spark.sql.autoBroadcastJoinThreshold: "16777216"
   datafusion_conf:
