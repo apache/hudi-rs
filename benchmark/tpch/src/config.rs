@@ -77,9 +77,21 @@ pub struct BenchConfig {
     #[serde(default = "default_iterations")]
     pub iterations: usize,
     #[serde(default)]
-    pub memory_limit: Option<String>,
-    #[serde(default)]
     pub spark_conf: BTreeMap<String, String>,
+    #[serde(default)]
+    pub datafusion_conf: DataFusionConfig,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DataFusionConfig {
+    /// Memory pool limit (e.g., "16g", "512m"); unlimited if not set.
+    /// Handled specially because it requires creating a memory pool at runtime.
+    pub memory_limit: Option<String>,
+    /// Additional DataFusion session config key-value pairs.
+    /// Keys use DataFusion's dotted config namespace (e.g., "datafusion.execution.target_partitions").
+    /// Values are passed directly to `SessionConfig::set()`.
+    #[serde(default, flatten)]
+    pub settings: BTreeMap<String, String>,
 }
 
 fn default_iterations() -> usize {

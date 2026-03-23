@@ -22,17 +22,16 @@ pub struct FileMetadata {
     /// File name
     pub name: String,
 
-    /// Size in bytes on storage
+    /// Size in bytes on storage (compressed, on-disk)
     pub size: u64,
 
-    /// Size in bytes in memory
+    /// Estimated uncompressed size in bytes in memory.
+    /// Inferred from on-disk size and a sampled compression ratio.
     pub byte_size: i64,
 
-    /// Number of records in the file
+    /// Estimated number of records in the file.
+    /// Inferred from on-disk size and a sampled average row size.
     pub num_records: i64,
-
-    /// Whether all the properties are populated or not
-    pub fully_populated: bool,
 }
 
 impl FileMetadata {
@@ -42,7 +41,6 @@ impl FileMetadata {
             size,
             byte_size: 0,
             num_records: 0,
-            fully_populated: false,
         }
     }
 }

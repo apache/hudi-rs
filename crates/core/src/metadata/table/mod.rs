@@ -153,7 +153,7 @@ impl Table {
         &self,
         partition_pruner: &PartitionPruner,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let metadata_table = self.new_metadata_table().await?;
+        let metadata_table = self.get_or_init_metadata_table().await?;
         metadata_table
             .fetch_files_partition_records(partition_pruner)
             .await
@@ -185,7 +185,7 @@ impl Table {
             return self.read_files_partition(&[]).await;
         }
 
-        // Partitioned table with filters: partition pruning
+        // Partitioned table with filters: prune partitions first, then read only matching records
         let all_partitions_records = self
             .read_files_partition(&[FilesPartitionRecord::ALL_PARTITIONS_KEY])
             .await?;
@@ -195,7 +195,6 @@ impl Table {
             .map(|r| r.partition_names())
             .unwrap_or_default();
 
-        // Step 2: Apply partition pruning
         let pruned: Vec<&str> = partition_names
             .into_iter()
             .filter(|p| partition_pruner.should_include(p))
@@ -205,7 +204,6 @@ impl Table {
             return Ok(HashMap::new());
         }
 
-        // Step 3: Read only the pruned partition records
         self.read_files_partition(&pruned).await
     }
 

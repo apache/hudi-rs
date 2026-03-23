@@ -62,6 +62,13 @@ setup_spark_native() {
   cp "$SCRIPT_DIR/infra/spark/log4j2.properties" "$SPARK_HOME/conf/log4j2.properties"
 }
 
+is_cloud_url() {
+  case "$1" in
+    s3://*|s3a://*|gs://*|wasb://*|wasbs://*|az://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 Usage: $0 <command> [options]
@@ -79,6 +86,8 @@ Environment:
 Options:
   --scale-factor N  TPC-H scale factor (default: $DEFAULT_SCALE_FACTOR)
   --format F        Table format: hudi or parquet (default: auto)
+  --hudi-dir D      Hudi data directory or cloud URL (default: data/sf{N}-hudi)
+  --parquet-dir D   Parquet data directory or cloud URL (default: data/sf{N}-parquet)
   --queries Q       Comma-separated query numbers (default: all 22)
   --iterations N    Number of measured iterations per query (from config)
   --warmup N        Number of unmeasured warmup iterations per query (from config)
@@ -91,6 +100,7 @@ Examples:
   MODE=native $0 bench-spark --scale-factor 1 --queries 1,3,6
   MODE=native $0 bench-datafusion --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 1 --output-dir results
+  $0 bench-datafusion --scale-factor 100 --hudi-dir gs://bucket/sf100-hudi
   $0 compare --scale-factor 1 --engines datafusion,spark --format hudi
 EOF
 }
@@ -174,6 +184,8 @@ cmd_bench_spark() {
   local warmup=""
   local output_dir=""
   local format="hudi"
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
@@ -182,6 +194,8 @@ cmd_bench_spark() {
       --warmup) warmup="$2"; shift 2 ;;
       --output-dir) output_dir="$2"; shift 2 ;;
       --format) format="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
@@ -199,8 +213,8 @@ cmd_bench_spark() {
     iterations="${iterations:-$cfg_iterations}"
   fi
 
-  local hudi_dir="$SCRIPT_DIR/data/sf$sf-hudi"
-  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
   local data_dir=""
   local bench_data_arg=""
@@ -216,7 +230,7 @@ cmd_bench_spark() {
     *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
   esac
 
-  if [ ! -d "$data_dir" ]; then
+  if ! is_cloud_url "$data_dir" && [ ! -d "$data_dir" ]; then
     echo "Error: $format data not found at $data_dir." >&2
     exit 1
   fi
@@ -301,6 +315,8 @@ cmd_bench_datafusion() {
   local iterations=""
   local warmup=""
   local output_dir=""
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
@@ -309,12 +325,14 @@ cmd_bench_datafusion() {
       --iterations) iterations="$2"; shift 2 ;;
       --warmup) warmup="$2"; shift 2 ;;
       --output-dir) output_dir="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
-  local hudi_dir="$SCRIPT_DIR/data/sf$sf-hudi"
-  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
   # Determine which formats to bench
   local use_hudi=false
@@ -323,9 +341,17 @@ cmd_bench_datafusion() {
     hudi)    use_hudi=true ;;
     parquet) use_parquet=true ;;
     "")
-      # Default: use whichever data dirs exist
-      [ -d "$hudi_dir" ] && use_hudi=true
-      [ -d "$parquet_dir" ] && use_parquet=true
+      # Default: for cloud URLs trust the user; for local paths check existence
+      if is_cloud_url "$hudi_dir"; then
+        use_hudi=true
+      else
+        [ -d "$hudi_dir" ] && use_hudi=true
+      fi
+      if is_cloud_url "$parquet_dir"; then
+        use_parquet=true
+      else
+        [ -d "$parquet_dir" ] && use_parquet=true
+      fi
       ;;
     *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
   esac
@@ -334,11 +360,11 @@ cmd_bench_datafusion() {
     echo "Error: no data found for sf$sf. Run 'generate' and/or 'create-tables' first." >&2
     exit 1
   fi
-  if [ "$use_hudi" = true ] && [ ! -d "$hudi_dir" ]; then
+  if [ "$use_hudi" = true ] && ! is_cloud_url "$hudi_dir" && [ ! -d "$hudi_dir" ]; then
     echo "Error: Hudi data not found at $hudi_dir. Run 'create-tables' first." >&2
     exit 1
   fi
-  if [ "$use_parquet" = true ] && [ ! -d "$parquet_dir" ]; then
+  if [ "$use_parquet" = true ] && ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
     echo "Error: Parquet data not found at $parquet_dir. Run 'generate' first." >&2
     exit 1
   fi

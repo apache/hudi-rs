@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
+use tokio::sync::OnceCell;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -37,6 +38,29 @@ use crate::table::partition::PartitionPruner;
 use crate::timeline::view::TimelineView;
 use dashmap::DashMap;
 
+/// Cached ratios derived from a single Parquet footer sample.
+/// Used to estimate `byte_size` and `num_records` for all files.
+#[derive(Clone, Debug)]
+pub(crate) struct FileStatsEstimator {
+    /// Average row size on disk in bytes (compressed).
+    avg_row_size_on_disk: f64,
+    /// Ratio of uncompressed to compressed size.
+    compression_ratio: f64,
+}
+
+impl FileStatsEstimator {
+    /// Estimate metadata fields from on-disk size.
+    pub(crate) fn estimate(&self, size: u64) -> (i64, i64) {
+        let byte_size = (size as f64 * self.compression_ratio) as i64;
+        let num_records = if self.avg_row_size_on_disk > 0.0 {
+            (size as f64 / self.avg_row_size_on_disk) as i64
+        } else {
+            0
+        };
+        (byte_size, num_records)
+    }
+}
+
 /// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and
 /// access the file groups and file slices.
 #[derive(Clone, Debug)]
@@ -45,6 +69,7 @@ pub struct FileSystemView {
     pub(crate) hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
     partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
+    file_stats_estimator: Arc<OnceCell<FileStatsEstimator>>,
 }
 
 impl FileSystemView {
@@ -58,7 +83,89 @@ impl FileSystemView {
             hudi_configs,
             storage,
             partition_to_file_groups,
+            file_stats_estimator: Arc::new(OnceCell::new()),
         })
+    }
+
+    /// Initialize the file stats estimator by reading a single Parquet footer.
+    async fn init_file_stats_estimator(
+        &self,
+        relative_path: &str,
+    ) -> crate::Result<FileStatsEstimator> {
+        let parquet_meta = self
+            .storage
+            .get_parquet_file_metadata(relative_path)
+            .await?;
+        let on_disk: i64 = parquet_meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.compressed_size())
+            .sum();
+        let uncompressed: i64 = parquet_meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.total_byte_size())
+            .sum();
+        let num_rows = parquet_meta.file_metadata().num_rows();
+
+        let compression_ratio = if on_disk > 0 {
+            uncompressed as f64 / on_disk as f64
+        } else {
+            1.0
+        };
+        let avg_row_size_on_disk = if num_rows > 0 {
+            on_disk as f64 / num_rows as f64
+        } else {
+            0.0
+        };
+
+        Ok(FileStatsEstimator {
+            avg_row_size_on_disk,
+            compression_ratio,
+        })
+    }
+
+    /// Get or initialize the file stats estimator.
+    pub(crate) async fn get_or_init_estimator(
+        &self,
+        sample_file_path: Option<&str>,
+    ) -> Option<&FileStatsEstimator> {
+        if let Some(path) = sample_file_path {
+            match self
+                .file_stats_estimator
+                .get_or_try_init(|| self.init_file_stats_estimator(path))
+                .await
+            {
+                Ok(estimator) => Some(estimator),
+                Err(e) => {
+                    log::warn!("Failed to initialize file stats estimator: {e}");
+                    None
+                }
+            }
+        } else {
+            self.file_stats_estimator.get()
+        }
+    }
+
+    /// Find a sample Parquet file path from metadata table records.
+    pub(crate) fn find_sample_parquet_path_from_records(
+        records: &HashMap<String, FilesPartitionRecord>,
+    ) -> Option<String> {
+        for (key, record) in records {
+            if record.is_all_partitions() {
+                continue;
+            }
+            for file_info in record.files.values() {
+                if !file_info.is_deleted && file_info.name.to_lowercase().ends_with(".parquet") {
+                    return Some(if key.is_empty() {
+                        file_info.name.clone()
+                    } else {
+                        format!("{key}/{}", file_info.name)
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Load file groups from the appropriate source (storage or metadata table records)
@@ -88,18 +195,24 @@ impl FileSystemView {
         timeline_view: &TimelineView,
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
     ) -> Result<()> {
-        // TODO: Enhance PartitionPruner with partition_stats support
-        // - Load partition_stats from metadata table into PartitionPruner
-        // - PartitionPruner.should_include() will use both partition column values AND partition_stats
-        // - For non-partitioned tables: check partition_pruner.can_any_partition_match() for early return
+        // Step 1: Initialize the file stats estimator from MDT records if available.
+        // This reads ONE Parquet footer to derive compression ratio and avg row size,
+        // allowing the file group builder to populate estimated metadata inline.
+        if let Some(records) = files_partition_records {
+            let sample_path = Self::find_sample_parquet_path_from_records(records);
+            self.get_or_init_estimator(sample_path.as_deref()).await;
+        }
 
-        // Step 1: Get file groups from appropriate source
+        // Step 2: Get file groups from appropriate source
         let file_groups_map = if let Some(records) = files_partition_records {
-            // Use pre-fetched metadata table records
             let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
-            file_groups_from_files_partition_records(records, &base_file_format, timeline_view)?
+            file_groups_from_files_partition_records(
+                records,
+                &base_file_format,
+                timeline_view,
+                self.file_stats_estimator.get(),
+            )?
         } else {
-            // Use storage listing
             let lister = FileLister::new(
                 self.hudi_configs.clone(),
                 self.storage.clone(),
@@ -110,12 +223,8 @@ impl FileSystemView {
                 .await?
         };
 
-        // Step 2: Apply partition pruning (for metadata table path) and stats pruning
-        // Note: Storage listing path already applies partition pruning via FileLister
-        // TODO: Check if metadata table column_stats partition is available
-        // and use that instead of Parquet footers for better performance
+        // Step 3: Apply partition pruning (for metadata table path) and stats pruning
         for (partition_path, file_groups) in file_groups_map {
-            // Skip partitions that don't match the pruner (for metadata table path)
             if files_partition_records.is_some()
                 && !partition_pruner.is_empty()
                 && !partition_pruner.should_include(&partition_path)
@@ -227,8 +336,7 @@ impl FileSystemView {
             if !partition_pruner.should_include(partition_entry.key()) {
                 continue;
             }
-            let file_groups = partition_entry.value();
-            for fg in file_groups.iter() {
+            for fg in partition_entry.value().iter() {
                 if excluding_file_groups.contains(fg) {
                     continue;
                 }
@@ -236,10 +344,6 @@ impl FileSystemView {
                     file_slices.push(fsl.clone());
                 }
             }
-        }
-
-        for fsl in &mut file_slices {
-            fsl.load_metadata_if_needed(&self.storage).await?;
         }
 
         Ok(file_slices)
@@ -261,7 +365,7 @@ impl FileSystemView {
     /// * `file_pruner` - Filters files based on column statistics
     /// * `table_schema` - Table schema for statistics extraction
     /// * `timeline_view` - The timeline view containing query context
-    /// * `metadata_table` - Optional metadata table instance
+    /// * `metadata_table` - Optional metadata table instance for file listing
     pub(crate) async fn get_file_slices(
         &self,
         partition_pruner: &PartitionPruner,
@@ -270,7 +374,6 @@ impl FileSystemView {
         timeline_view: &TimelineView,
         metadata_table: Option<&Table>,
     ) -> Result<Vec<FileSlice>> {
-        // Fetch records from metadata table if available
         let files_partition_records = if let Some(mdt) = metadata_table {
             Some(mdt.fetch_files_partition_records(partition_pruner).await?)
         } else {
@@ -367,7 +470,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.file_metadata.as_ref().unwrap().num_records, 4);
+            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            assert!(metadata.size > 0);
         }
     }
 
@@ -408,7 +512,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.file_metadata.as_ref().unwrap().num_records, 1);
+            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            assert!(metadata.size > 0);
         }
     }
 
@@ -460,7 +565,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.file_metadata.as_ref().unwrap().num_records, 2);
+            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            assert!(metadata.size > 0);
         }
     }
 }
