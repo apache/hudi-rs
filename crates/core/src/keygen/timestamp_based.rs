@@ -454,6 +454,25 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
             return Ok(vec![filter.clone()]);
         }
 
+        // Check for unsupported operators first before parsing
+        match filter.operator {
+            ExprOperator::Ne => {
+                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
+                    "Not-equal (!=) operator is not supported for timestamp-based partition \
+                     pruning on field '{}'. Rewrite the query without != on partition columns.",
+                    filter.field_name
+                ))));
+            }
+            ExprOperator::In | ExprOperator::NotIn => {
+                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
+                    "IN/NOT IN operators are not supported for timestamp-based partition \
+                     pruning on field '{}'. Rewrite the query using equality/range comparisons.",
+                    filter.field_name
+                ))));
+            }
+            _ => {}
+        }
+
         let dt = self.parse_timestamp(&filter.field_value)?;
         let partition_values = self.extract_partition_values(&dt);
 
@@ -498,19 +517,9 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                     }
                 }
             }
-            ExprOperator::Ne => {
-                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
-                    "Not-equal (!=) operator is not supported for timestamp-based partition \
-                     pruning on field '{}'. Rewrite the query without != on partition columns.",
-                    filter.field_name
-                ))));
-            }
-            ExprOperator::In | ExprOperator::NotIn => {
-                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
-                    "IN/NOT IN operators are not supported for timestamp-based partition \
-                     pruning on field '{}'. Rewrite the query using equality/range comparisons.",
-                    filter.field_name
-                ))));
+            // Ne, In, NotIn are already handled above before parsing
+            ExprOperator::Ne | ExprOperator::In | ExprOperator::NotIn => {
+                unreachable!("Unsupported operators should have been caught earlier")
             }
         }
 
@@ -940,5 +949,37 @@ mod tests {
             field_values: Vec::new(),
         };
         assert!(unix_keygen.transform_filter(&filter).is_err());
+    }
+
+    #[test]
+    fn test_in_not_in_operators_return_error() {
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
+
+        // IN operator should return error
+        let filter = Filter::new_multi(
+            "ts_str".to_string(),
+            ExprOperator::In,
+            vec!["2023-04-01T12:00:00.000Z".to_string()],
+        );
+        let result = keygen.transform_filter(&filter);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("IN/NOT IN operators are not supported"));
+
+        // NOT IN operator should also return error
+        let filter = Filter::new_multi(
+            "ts_str".to_string(),
+            ExprOperator::NotIn,
+            vec!["2023-04-01T12:00:00.000Z".to_string()],
+        );
+        let result = keygen.transform_filter(&filter);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("IN/NOT IN operators are not supported"));
     }
 }

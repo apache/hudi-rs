@@ -753,4 +753,27 @@ mod tests {
         assert_eq!(result[0].0, "id");
         assert_eq!(result[0].1, "IN");
     }
+
+    #[test]
+    fn test_convert_in_list_error_paths() {
+        // Test non-literal values - should not be pushed down
+        let in_list = Expr::InList(InList::new(
+            Box::new(col("col1")),
+            vec![col("col2"), col("col3")],
+            false,
+        ));
+        assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
+
+        // Test non-column expression - should not be pushed down
+        let in_list = Expr::InList(InList::new(
+            Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("col1")),
+                Operator::Plus,
+                Box::new(col("col2")),
+            ))),
+            vec![lit(1i32)],
+            false,
+        ));
+        assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
+    }
 }

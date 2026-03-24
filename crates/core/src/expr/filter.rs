@@ -373,6 +373,25 @@ mod tests {
     }
 
     #[test]
+    fn test_schemable_filter_in_empty_values_error() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("int_col", DataType::Int64, true)]);
+
+        // IN operator with empty field_values should error
+        let filter = Filter::new_multi("int_col".to_string(), ExprOperator::In, vec![]);
+        let result = SchemableFilter::try_from((filter, &schema));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("non-empty field_values"));
+
+        // NOT IN operator with empty field_values should also error
+        let filter = Filter::new_multi("int_col".to_string(), ExprOperator::NotIn, vec![]);
+        let result = SchemableFilter::try_from((filter, &schema));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("non-empty field_values"));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_schemable_filter_cast_value() -> Result<()> {
         // Test casting to string
         let string_value = SchemableFilter::cast_value(&["test"], &DataType::Utf8)?;

@@ -536,6 +536,33 @@ mod tests {
     }
 
     #[test]
+    fn test_in_not_in_operators_no_prune() {
+        let table_schema = create_test_schema();
+        let partition_schema = Schema::empty();
+
+        // IN operator should not prune (conservative approach)
+        let filters = vec![Filter::new_multi(
+            "id".to_string(),
+            ExprOperator::In,
+            vec!["5".to_string(), "10".to_string()],
+        )];
+        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+
+        // Even though 5 and 10 are below min=50, conservative approach includes file
+        let stats = create_stats_with_int_range("id", 50, 100);
+        assert!(pruner.should_include(&stats));
+
+        // NOT IN operator should also not prune
+        let filters = vec![Filter::new_multi(
+            "id".to_string(),
+            ExprOperator::NotIn,
+            vec!["5".to_string(), "10".to_string()],
+        )];
+        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+        assert!(pruner.should_include(&stats));
+    }
+
+    #[test]
     fn test_missing_column_stats_includes_file() {
         let table_schema = create_test_schema();
         let partition_schema = Schema::empty();
