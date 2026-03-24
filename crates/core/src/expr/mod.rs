@@ -35,6 +35,8 @@ pub enum ExprOperator {
     Lte,
     Gt,
     Gte,
+    In,
+    NotIn,
 }
 
 impl Display for ExprOperator {
@@ -47,18 +49,22 @@ impl Display for ExprOperator {
             ExprOperator::Lte => write!(f, "<="),
             ExprOperator::Gt => write!(f, ">"),
             ExprOperator::Gte => write!(f, ">="),
+            ExprOperator::In => write!(f, "IN"),
+            ExprOperator::NotIn => write!(f, "NOT IN"),
         }
     }
 }
 
 impl ExprOperator {
-    pub const TOKEN_OP_PAIRS: [(&'static str, ExprOperator); 6] = [
+    pub const TOKEN_OP_PAIRS: [(&'static str, ExprOperator); 8] = [
         ("=", ExprOperator::Eq),
         ("!=", ExprOperator::Ne),
         ("<", ExprOperator::Lt),
         ("<=", ExprOperator::Lte),
         (">", ExprOperator::Gt),
         (">=", ExprOperator::Gte),
+        ("IN", ExprOperator::In),
+        ("NOT IN", ExprOperator::NotIn),
     ];
 
     /// Negates the operator.
@@ -70,6 +76,8 @@ impl ExprOperator {
             ExprOperator::Lte => Some(ExprOperator::Gt),
             ExprOperator::Gt => Some(ExprOperator::Lte),
             ExprOperator::Gte => Some(ExprOperator::Lt),
+            ExprOperator::In => Some(ExprOperator::NotIn),
+            ExprOperator::NotIn => Some(ExprOperator::In),
         }
     }
 }
@@ -103,6 +111,11 @@ mod tests {
         assert_eq!(ExprOperator::from_str("<=").unwrap(), ExprOperator::Lte);
         assert_eq!(ExprOperator::from_str(">").unwrap(), ExprOperator::Gt);
         assert_eq!(ExprOperator::from_str(">=").unwrap(), ExprOperator::Gte);
+        assert_eq!(ExprOperator::from_str("IN").unwrap(), ExprOperator::In);
+        assert_eq!(
+            ExprOperator::from_str("NOT IN").unwrap(),
+            ExprOperator::NotIn
+        );
         assert!(ExprOperator::from_str("??").is_err());
     }
 
@@ -114,5 +127,7 @@ mod tests {
         assert_eq!(ExprOperator::Lte.to_string(), "<=");
         assert_eq!(ExprOperator::Gt.to_string(), ">");
         assert_eq!(ExprOperator::Gte.to_string(), ">=");
+        assert_eq!(ExprOperator::In.to_string(), "IN");
+        assert_eq!(ExprOperator::NotIn.to_string(), "NOT IN");
     }
 }

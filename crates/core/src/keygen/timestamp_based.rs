@@ -467,6 +467,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                             field_name: field_name.clone(),
                             operator: ExprOperator::Eq,
                             field_value: value.clone(),
+            field_values: Vec::new(),
                         });
                     }
                 }
@@ -480,6 +481,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                             field_name: first_field.clone(),
                             operator: ExprOperator::Gte,
                             field_value: value.clone(),
+            field_values: Vec::new(),
                         });
                     }
                 }
@@ -491,6 +493,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                             field_name: first_field.clone(),
                             operator: ExprOperator::Lte,
                             field_value: value.clone(),
+            field_values: Vec::new(),
                         });
                     }
                 }
@@ -499,6 +502,13 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                 return Err(CoreError::Config(ConfigError::InvalidValue(format!(
                     "Not-equal (!=) operator is not supported for timestamp-based partition \
                      pruning on field '{}'. Rewrite the query without != on partition columns.",
+                    filter.field_name
+                ))));
+            }
+            ExprOperator::In | ExprOperator::NotIn => {
+                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
+                    "IN/NOT IN operators are not supported for timestamp-based partition \
+                     pruning on field '{}'. Rewrite the query using equality/range comparisons.",
                     filter.field_name
                 ))));
             }
@@ -833,6 +843,7 @@ mod tests {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Eq,
             field_value: "2023-04-01T12:01:00.123Z".to_string(),
+            field_values: Vec::new(),
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
         assert_eq!(transformed.len(), 4);
@@ -879,6 +890,7 @@ mod tests {
                 field_name: "event_timestamp".to_string(),
                 operator: input_op,
                 field_value: "1706140800".to_string(),
+                field_values: Vec::new(),
             };
             let transformed = keygen.transform_filter(&filter).unwrap();
             assert_eq!(transformed.len(), 1, "Expected 1 filter for {input_op:?}");
@@ -896,6 +908,7 @@ mod tests {
             field_name: "other_field".to_string(),
             operator: ExprOperator::Eq,
             field_value: "value".to_string(),
+            field_values: Vec::new(),
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
         assert_eq!(transformed.len(), 1);
@@ -906,6 +919,7 @@ mod tests {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Ne,
             field_value: "2023-04-01T12:01:00.123Z".to_string(),
+            field_values: Vec::new(),
         };
         assert!(
             keygen
@@ -923,6 +937,7 @@ mod tests {
             field_name: "event_timestamp".to_string(),
             operator: ExprOperator::Eq,
             field_value: "not_a_number".to_string(),
+            field_values: Vec::new(),
         };
         assert!(unix_keygen.transform_filter(&filter).is_err());
     }
