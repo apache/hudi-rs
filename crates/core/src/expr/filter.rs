@@ -239,8 +239,7 @@ impl TryFrom<(Filter, &Schema)> for SchemableFilter {
                 // For IN/NOT IN, use field_values
                 if filter.field_values.is_empty() {
                     return Err(CoreError::Schema(format!(
-                        "IN/NOT IN operator requires non-empty field_values for field '{}'",
-                        field_name
+                        "IN/NOT IN operator requires non-empty field_values for field '{field_name}'"
                     )));
                 }
                 let values: Result<Vec<_>> = filter.field_values
