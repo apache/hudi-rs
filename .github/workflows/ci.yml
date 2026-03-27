@@ -82,7 +82,7 @@ jobs:
     # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
     if: false    
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Run unit tests on Windows with no coverage report
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
 
