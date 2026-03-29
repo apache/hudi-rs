@@ -252,15 +252,14 @@ mod tests {
         let expected_filter = HudiFilter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Eq,
-            field_value: "42".to_string(),
-            field_values: Vec::new(),
+            values: vec!["42".to_string()],
         };
         assert_eq!(
             result[0],
             (
                 expected_filter.field_name,
                 expected_filter.operator.to_string(),
-                expected_filter.field_value
+                expected_filter.values[0].clone()
             )
         );
     }
@@ -285,15 +284,14 @@ mod tests {
         let expected_filter = HudiFilter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Ne,
-            field_value: "42".to_string(),
-            field_values: Vec::new(),
+            values: vec!["42".to_string()],
         };
         assert_eq!(
             result[0],
             (
                 expected_filter.field_name,
                 expected_filter.operator.to_string(),
-                expected_filter.field_value
+                expected_filter.values[0].clone()
             )
         );
     }
@@ -307,8 +305,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("int32_col"),
                     operator: ExprOperator::Eq,
-                    field_value: String::from("42"),
-                    field_values: Vec::new(),
+                    values: vec![String::from("42")],
                 }),
             ),
             (
@@ -316,8 +313,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("int64_col"),
                     operator: ExprOperator::Gte,
-                    field_value: String::from("100"),
-                    field_values: Vec::new(),
+                    values: vec![String::from("100")],
                 }),
             ),
             (
@@ -325,8 +321,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("float64_col"),
                     operator: ExprOperator::Lt,
-                    field_value: "32.666".to_string(),
-                    field_values: Vec::new(),
+                    values: vec!["32.666".to_string()],
                 }),
             ),
             (
@@ -334,8 +329,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("string_col"),
                     operator: ExprOperator::Ne,
-                    field_value: String::from("test"),
-                    field_values: Vec::new(),
+                    values: vec![String::from("test")],
                 }),
             ),
         ];
@@ -355,7 +349,7 @@ mod tests {
                 &(
                     expected_filter.field_name.clone(),
                     expected_filter.operator.to_string(),
-                    expected_filter.field_value.clone()
+                    expected_filter.values[0].clone()
                 )
             );
         }
@@ -389,15 +383,14 @@ mod tests {
             let expected_filter = HudiFilter {
                 field_name: schema.field(0).name().to_string(),
                 operator: expected_op,
-                field_value: String::from("42"),
-                field_values: Vec::new(),
+                values: vec![String::from("42")],
             };
             assert_eq!(
                 result[0],
                 (
                     expected_filter.field_name,
                     expected_filter.operator.to_string(),
-                    expected_filter.field_value
+                    expected_filter.values[0].clone()
                 )
             );
         }
@@ -724,8 +717,8 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "part");
         assert_eq!(result[0].1, "IN");
-        // For IN/NOT IN, field_values contains the list
-        // The tuple representation uses field_value which should be empty or a representation
+        // For IN/NOT IN, values contains the list
+        // The tuple representation joins values with comma
     }
 
     #[test]

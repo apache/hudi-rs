@@ -254,7 +254,7 @@ impl FilePruner {
 
     /// Extracts the filter value as an ArrayRef.
     fn extract_filter_array(&self, filter: &SchemableFilter) -> Option<ArrayRef> {
-        let (array, is_scalar) = filter.value.get();
+        let (array, is_scalar) = filter.values[0].get();
         if array.is_empty() {
             return None;
         }
@@ -541,11 +541,14 @@ mod tests {
         let partition_schema = Schema::empty();
 
         // IN operator should not prune (conservative approach)
-        let filters = vec![Filter::new_multi(
-            "id".to_string(),
-            ExprOperator::In,
-            vec!["5".to_string(), "10".to_string()],
-        )];
+        let filters = vec![
+            Filter::new(
+                "id".to_string(),
+                ExprOperator::In,
+                vec!["5".to_string(), "10".to_string()],
+            )
+            .unwrap(),
+        ];
         let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
 
         // Even though 5 and 10 are below min=50, conservative approach includes file
@@ -553,11 +556,14 @@ mod tests {
         assert!(pruner.should_include(&stats));
 
         // NOT IN operator should also not prune
-        let filters = vec![Filter::new_multi(
-            "id".to_string(),
-            ExprOperator::NotIn,
-            vec!["5".to_string(), "10".to_string()],
-        )];
+        let filters = vec![
+            Filter::new(
+                "id".to_string(),
+                ExprOperator::NotIn,
+                vec!["5".to_string(), "10".to_string()],
+            )
+            .unwrap(),
+        ];
         let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
         assert!(pruner.should_include(&stats));
     }

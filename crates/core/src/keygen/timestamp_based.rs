@@ -473,7 +473,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
             _ => {}
         }
 
-        let dt = self.parse_timestamp(&filter.field_value)?;
+        let dt = self.parse_timestamp(&filter.values[0])?;
         let partition_values = self.extract_partition_values(&dt);
 
         let mut filters = Vec::new();
@@ -485,8 +485,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                         filters.push(Filter {
                             field_name: field_name.clone(),
                             operator: ExprOperator::Eq,
-                            field_value: value.clone(),
-                            field_values: Vec::new(),
+                            values: vec![value.clone()],
                         });
                     }
                 }
@@ -499,8 +498,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                         filters.push(Filter {
                             field_name: first_field.clone(),
                             operator: ExprOperator::Gte,
-                            field_value: value.clone(),
-                            field_values: Vec::new(),
+                            values: vec![value.clone()],
                         });
                     }
                 }
@@ -511,8 +509,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                         filters.push(Filter {
                             field_name: first_field.clone(),
                             operator: ExprOperator::Lte,
-                            field_value: value.clone(),
-                            field_values: Vec::new(),
+                            values: vec![value.clone()],
                         });
                     }
                 }
@@ -851,36 +848,35 @@ mod tests {
         let filter = Filter {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-04-01T12:01:00.123Z".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
         assert_eq!(transformed.len(), 4);
         assert_eq!(
             (
                 transformed[0].field_name.as_str(),
-                transformed[0].field_value.as_str()
+                transformed[0].values[0].as_str()
             ),
             ("year", "2023")
         );
         assert_eq!(
             (
                 transformed[1].field_name.as_str(),
-                transformed[1].field_value.as_str()
+                transformed[1].values[0].as_str()
             ),
             ("month", "04")
         );
         assert_eq!(
             (
                 transformed[2].field_name.as_str(),
-                transformed[2].field_value.as_str()
+                transformed[2].values[0].as_str()
             ),
             ("day", "01")
         );
         assert_eq!(
             (
                 transformed[3].field_name.as_str(),
-                transformed[3].field_value.as_str()
+                transformed[3].values[0].as_str()
             ),
             ("hour", "12")
         );
@@ -898,8 +894,7 @@ mod tests {
             let filter = Filter {
                 field_name: "event_timestamp".to_string(),
                 operator: input_op,
-                field_value: "1706140800".to_string(),
-                field_values: Vec::new(),
+                values: vec!["1706140800".to_string()],
             };
             let transformed = keygen.transform_filter(&filter).unwrap();
             assert_eq!(transformed.len(), 1, "Expected 1 filter for {input_op:?}");
@@ -916,8 +911,7 @@ mod tests {
         let filter = Filter {
             field_name: "other_field".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "value".to_string(),
-            field_values: Vec::new(),
+            values: vec!["value".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
         assert_eq!(transformed.len(), 1);
@@ -927,8 +921,7 @@ mod tests {
         let filter = Filter {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Ne,
-            field_value: "2023-04-01T12:01:00.123Z".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         assert!(
             keygen
@@ -945,8 +938,7 @@ mod tests {
         let filter = Filter {
             field_name: "event_timestamp".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "not_a_number".to_string(),
-            field_values: Vec::new(),
+            values: vec!["not_a_number".to_string()],
         };
         assert!(unix_keygen.transform_filter(&filter).is_err());
     }
@@ -957,11 +949,12 @@ mod tests {
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
 
         // IN operator should return error
-        let filter = Filter::new_multi(
+        let filter = Filter::new(
             "ts_str".to_string(),
             ExprOperator::In,
             vec!["2023-04-01T12:00:00.000Z".to_string()],
-        );
+        )
+        .unwrap();
         let result = keygen.transform_filter(&filter);
         assert!(result.is_err());
         assert!(
@@ -972,11 +965,12 @@ mod tests {
         );
 
         // NOT IN operator should also return error
-        let filter = Filter::new_multi(
+        let filter = Filter::new(
             "ts_str".to_string(),
             ExprOperator::NotIn,
             vec!["2023-04-01T12:00:00.000Z".to_string()],
-        );
+        )
+        .unwrap();
         let result = keygen.transform_filter(&filter);
         assert!(result.is_err());
         assert!(

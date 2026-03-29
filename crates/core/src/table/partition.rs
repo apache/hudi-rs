@@ -392,15 +392,14 @@ mod tests {
         let filter = Filter {
             field_name: "date".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-01-01".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2023-01-01".to_string()],
         };
 
         let partition_filter = SchemableFilter::try_from((filter, &schema)).unwrap();
         assert_eq!(partition_filter.field.name(), "date");
         assert_eq!(partition_filter.operator, ExprOperator::Eq);
 
-        let value_inner = partition_filter.value.into_inner();
+        let value_inner = partition_filter.values[0].clone().into_inner();
 
         let date_array = value_inner.as_any().downcast_ref::<Date32Array>().unwrap();
 
@@ -414,8 +413,7 @@ mod tests {
         let filter = Filter {
             field_name: "invalid_field".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-01-01".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2023-01-01".to_string()],
         };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
@@ -433,8 +431,7 @@ mod tests {
         let filter = Filter {
             field_name: "count".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "not_a_number".to_string(),
-            field_values: Vec::new(),
+            values: vec!["not_a_number".to_string()],
         };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
@@ -446,12 +443,12 @@ mod tests {
         for (op, op_enum) in ExprOperator::TOKEN_OP_PAIRS {
             let filter = match op_enum {
                 ExprOperator::In | ExprOperator::NotIn => {
-                    // IN/NOT IN require field_values
-                    Filter::new_multi("count".to_string(), op_enum, vec!["5".to_string()])
+                    // IN/NOT IN require multiple values
+                    Filter::new("count".to_string(), op_enum, vec!["5".to_string()]).unwrap()
                 }
                 _ => {
-                    // Other operators use field_value
-                    Filter::new_single("count".to_string(), op_enum, "5".to_string())
+                    // Other operators use a single value
+                    Filter::new("count".to_string(), op_enum, vec!["5".to_string()]).unwrap()
                 }
             };
             let partition_filter = SchemableFilter::try_from((filter, &schema));
@@ -488,8 +485,7 @@ mod tests {
         let user_filter = Filter {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Gte,
-            field_value: "2023-04-15T12:00:00.000Z".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -502,7 +498,7 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field_name, "year");
         assert_eq!(transformed[0].operator, ExprOperator::Gte);
-        assert_eq!(transformed[0].field_value, "2023");
+        assert_eq!(transformed[0].values[0], "2023");
 
         // Equality filter: UNIX_TIMESTAMP Eq → yyyy/MM/dd Eq
         let configs = HudiConfigs::new([
@@ -526,8 +522,7 @@ mod tests {
         let user_filter = Filter {
             field_name: "event_time".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "1706140800".to_string(),
-            field_values: Vec::new(),
+            values: vec!["1706140800".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -539,11 +534,11 @@ mod tests {
 
         assert_eq!(transformed.len(), 3);
         assert_eq!(transformed[0].field_name, "yyyy");
-        assert_eq!(transformed[0].field_value, "2024");
+        assert_eq!(transformed[0].values[0], "2024");
         assert_eq!(transformed[1].field_name, "MM");
-        assert_eq!(transformed[1].field_value, "01");
+        assert_eq!(transformed[1].values[0], "01");
         assert_eq!(transformed[2].field_name, "dd");
-        assert_eq!(transformed[2].field_value, "25");
+        assert_eq!(transformed[2].values[0], "25");
 
         // v8 detection via keygenerator.type=TIMESTAMP (no keygenerator.class)
         let configs = HudiConfigs::new([
@@ -567,8 +562,7 @@ mod tests {
         let user_filter = Filter {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-04-15T12:00:00.000Z".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -580,7 +574,7 @@ mod tests {
 
         assert_eq!(transformed.len(), 3);
         assert_eq!(transformed[0].field_name, "year");
-        assert_eq!(transformed[0].field_value, "2023");
+        assert_eq!(transformed[0].values[0], "2023");
     }
 
     #[test]
@@ -599,8 +593,7 @@ mod tests {
         let user_filter = Filter {
             field_name: "region".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "us-west".to_string(),
-            field_values: Vec::new(),
+            values: vec!["us-west".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -612,7 +605,7 @@ mod tests {
 
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field_name, user_filter.field_name);
-        assert_eq!(transformed[0].field_value, user_filter.field_value);
+        assert_eq!(transformed[0].values[0], user_filter.values[0]);
     }
 
     #[test]
@@ -642,8 +635,7 @@ mod tests {
         let user_filter = Filter {
             field_name: "ts".to_string(),
             operator: ExprOperator::Gte,
-            field_value: "2024-01-15T00:00:00Z".to_string(),
-            field_values: Vec::new(),
+            values: vec!["2024-01-15T00:00:00Z".to_string()],
         };
 
         let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
