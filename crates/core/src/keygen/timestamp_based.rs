@@ -25,6 +25,7 @@ use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::expr::filter::Filter;
 use crate::keygen::KeyGeneratorFilterTransformer;
+use crate::table::partition::PARTITION_PATH_FIELD_NAME;
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::HashMap;
@@ -57,7 +58,6 @@ pub struct TimestampBasedKeyGenerator {
     output_timezone: Tz,
 
     /// Whether partitions use Hive-style naming (e.g., year=2024 vs 2024)
-    #[allow(dead_code)]
     is_hive_style: bool,
 
     /// Partition field names derived from output format (e.g., ["year", "month", "day", "hour"])
@@ -418,29 +418,72 @@ impl TimestampBasedKeyGenerator {
             .replace("'T'", "T")
     }
 
-    /// Extracts partition values from a datetime based on output format,
-    /// applying the configured output timezone.
-    fn extract_partition_values(&self, dt: &DateTime<Utc>) -> HashMap<String, String> {
+    /// Formats a datetime into the full partition path string.
+    ///
+    /// For non-hive-style with format `yyyy/MM/dd`: `"2023/04/15"`
+    /// For hive-style with format `yyyy/MM/dd`: `"year=2023/month=04/day=15"`
+    fn format_partition_path(&self, dt: &DateTime<Utc>) -> String {
         let local_dt = dt.with_timezone(&self.output_timezone);
-        let mut values = HashMap::new();
+
+        let segments: Vec<String> = self
+            .output_dateformat
+            .split('/')
+            .enumerate()
+            .map(|(i, segment)| {
+                let value = Self::format_segment_value(segment, &local_dt);
+                if self.is_hive_style {
+                    let field_name = &self.partition_fields[i];
+                    format!("{field_name}={value}")
+                } else {
+                    value
+                }
+            })
+            .collect();
+
+        segments.join("/")
+    }
+
+    /// Formats a single date segment into its value string.
+    fn format_segment_value<T: Datelike + Timelike>(segment: &str, dt: &T) -> String {
+        match segment {
+            "yyyy" => format!("{:04}", dt.year()),
+            "MM" => format!("{:02}", dt.month()),
+            "dd" => format!("{:02}", dt.day()),
+            "HH" => format!("{:02}", dt.hour()),
+            "mm" => format!("{:02}", dt.minute()),
+            "ss" => format!("{:02}", dt.second()),
+            _ => segment.to_string(),
+        }
+    }
+
+    /// Returns true if the output date format produces lexicographically sortable
+    /// partition paths (i.e., string comparison preserves chronological order).
+    ///
+    /// This requires format segments to appear in strict descending significance:
+    /// year > month > day > hour > minute > second.
+    fn is_lex_sortable_format(&self) -> bool {
+        let rank = |seg: &str| -> Option<u8> {
+            match seg {
+                "yyyy" => Some(6),
+                "MM" => Some(5),
+                "dd" => Some(4),
+                "HH" => Some(3),
+                "mm" => Some(2),
+                "ss" => Some(1),
+                _ => None,
+            }
+        };
 
         let segments: Vec<&str> = self.output_dateformat.split('/').collect();
 
-        for (i, segment) in segments.iter().enumerate() {
-            let field_name = &self.partition_fields[i];
-            let value = match *segment {
-                "yyyy" => format!("{:04}", local_dt.year()),
-                "MM" => format!("{:02}", local_dt.month()),
-                "dd" => format!("{:02}", local_dt.day()),
-                "HH" => format!("{:02}", local_dt.hour()),
-                "mm" => format!("{:02}", local_dt.minute()),
-                "ss" => format!("{:02}", local_dt.second()),
-                _ => segment.to_string(),
-            };
-            values.insert(field_name.clone(), value);
-        }
+        // Every segment must be a known date component
+        let ranks: Vec<u8> = match segments.iter().map(|s| rank(s)).collect() {
+            Some(r) => r,
+            None => return false,
+        };
 
-        values
+        // Must be in strictly descending order
+        ranks.windows(2).all(|w| w[0] > w[1])
     }
 }
 
@@ -454,73 +497,53 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
             return Ok(vec![filter.clone()]);
         }
 
-        // Check for unsupported operators first before parsing
+        let field_name = PARTITION_PATH_FIELD_NAME.to_string();
+
         match filter.operator {
-            ExprOperator::Ne => {
-                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
-                    "Not-equal (!=) operator is not supported for timestamp-based partition \
-                     pruning on field '{}'. Rewrite the query without != on partition columns.",
-                    filter.field_name
-                ))));
+            ExprOperator::Eq | ExprOperator::Ne => {
+                let dt = self.parse_timestamp(&filter.values[0])?;
+                let path = self.format_partition_path(&dt);
+                Ok(vec![Filter {
+                    field_name,
+                    operator: filter.operator,
+                    values: vec![path],
+                }])
             }
             ExprOperator::In | ExprOperator::NotIn => {
-                return Err(CoreError::Config(ConfigError::InvalidValue(format!(
-                    "IN/NOT IN operators are not supported for timestamp-based partition \
-                     pruning on field '{}'. Rewrite the query using equality/range comparisons.",
-                    filter.field_name
-                ))));
+                let paths: Result<Vec<String>> = filter
+                    .values
+                    .iter()
+                    .map(|v| {
+                        let dt = self.parse_timestamp(v)?;
+                        Ok(self.format_partition_path(&dt))
+                    })
+                    .collect();
+                Ok(vec![Filter {
+                    field_name,
+                    operator: filter.operator,
+                    values: paths?,
+                }])
             }
-            _ => {}
-        }
-
-        let dt = self.parse_timestamp(&filter.values[0])?;
-        let partition_values = self.extract_partition_values(&dt);
-
-        let mut filters = Vec::new();
-
-        match filter.operator {
-            ExprOperator::Eq => {
-                for field_name in &self.partition_fields {
-                    if let Some(value) = partition_values.get(field_name) {
-                        filters.push(Filter {
-                            field_name: field_name.clone(),
-                            operator: ExprOperator::Eq,
-                            values: vec![value.clone()],
-                        });
-                    }
+            ExprOperator::Gt | ExprOperator::Gte | ExprOperator::Lt | ExprOperator::Lte => {
+                if !self.is_lex_sortable_format() {
+                    // Not safe for string comparison; skip pruning
+                    return Ok(vec![]);
                 }
-            }
-            ExprOperator::Gte | ExprOperator::Gt => {
-                // Only compare the first partition field for simplicity.
-                // May scan more partitions than necessary but avoids complex multi-field range logic.
-                if let Some(first_field) = self.partition_fields.first() {
-                    if let Some(value) = partition_values.get(first_field) {
-                        filters.push(Filter {
-                            field_name: first_field.clone(),
-                            operator: ExprOperator::Gte,
-                            values: vec![value.clone()],
-                        });
-                    }
-                }
-            }
-            ExprOperator::Lte | ExprOperator::Lt => {
-                if let Some(first_field) = self.partition_fields.first() {
-                    if let Some(value) = partition_values.get(first_field) {
-                        filters.push(Filter {
-                            field_name: first_field.clone(),
-                            operator: ExprOperator::Lte,
-                            values: vec![value.clone()],
-                        });
-                    }
-                }
-            }
-            // Ne, In, NotIn are already handled above before parsing
-            ExprOperator::Ne | ExprOperator::In | ExprOperator::NotIn => {
-                unreachable!("Unsupported operators should have been caught earlier")
+                let dt = self.parse_timestamp(&filter.values[0])?;
+                let path = self.format_partition_path(&dt);
+                // Widen Gt→Gte and Lt→Lte for safe partition boundary approximation
+                let op = match filter.operator {
+                    ExprOperator::Gt => ExprOperator::Gte,
+                    ExprOperator::Lt => ExprOperator::Lte,
+                    other => other,
+                };
+                Ok(vec![Filter {
+                    field_name,
+                    operator: op,
+                    values: vec![path],
+                }])
             }
         }
-
-        Ok(filters)
     }
 }
 
@@ -788,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timezone_config_and_partition_values() {
+    fn test_timezone_config_and_partition_path() {
         // output.timezone shifts date components
         let configs = HudiConfigs::new([
             ("hoodie.table.partition.fields", "ts"),
@@ -802,10 +825,12 @@ mod tests {
         ]);
         let keygen = TimestampBasedKeyGenerator::from_configs(&configs).unwrap();
 
-        // 2024-01-25 03:00:00 UTC = 2024-01-24 22:00:00 EST → day=24
+        // 2024-01-25 03:00:00 UTC = 2024-01-24 22:00:00 EST
         let dt = keygen.parse_timestamp("1706151600").unwrap();
-        let values = keygen.extract_partition_values(&dt);
-        assert_eq!(values.get("day"), Some(&"24".to_string()));
+        assert_eq!(
+            keygen.format_partition_path(&dt),
+            "year=2024/month=01/day=24"
+        );
 
         // Fallback: hoodie.keygen.timebased.timezone used when output.timezone absent
         let configs = HudiConfigs::new([
@@ -818,10 +843,12 @@ mod tests {
         let keygen = TimestampBasedKeyGenerator::from_configs(&configs).unwrap();
         assert_eq!(keygen.output_timezone, chrono_tz::Asia::Tokyo);
 
-        // 2024-01-25 20:00:00 UTC = 2024-01-26 05:00:00 JST → day=26
+        // 2024-01-25 20:00:00 UTC = 2024-01-26 05:00:00 JST
         let dt = keygen.parse_timestamp("1706212800").unwrap();
-        let values = keygen.extract_partition_values(&dt);
-        assert_eq!(values.get("day"), Some(&"26".to_string()));
+        assert_eq!(
+            keygen.format_partition_path(&dt),
+            "year=2024/month=01/day=26"
+        );
 
         // Precedence: deprecated shared `timezone` wins over specific `output.timezone`
         let configs = HudiConfigs::new([
@@ -841,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_transform_filter() {
-        // Equality: DATE_STRING → expands to all partition fields
+        // Equality: DATE_STRING → single _hoodie_partition_path filter with full path
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
 
@@ -851,37 +878,45 @@ mod tests {
             values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 4);
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].field_name, "_hoodie_partition_path");
+        assert_eq!(transformed[0].operator, ExprOperator::Eq);
         assert_eq!(
-            (
-                transformed[0].field_name.as_str(),
-                transformed[0].values[0].as_str()
-            ),
-            ("year", "2023")
-        );
-        assert_eq!(
-            (
-                transformed[1].field_name.as_str(),
-                transformed[1].values[0].as_str()
-            ),
-            ("month", "04")
-        );
-        assert_eq!(
-            (
-                transformed[2].field_name.as_str(),
-                transformed[2].values[0].as_str()
-            ),
-            ("day", "01")
-        );
-        assert_eq!(
-            (
-                transformed[3].field_name.as_str(),
-                transformed[3].values[0].as_str()
-            ),
-            ("hour", "12")
+            transformed[0].values[0],
+            "year=2023/month=04/day=01/hour=12"
         );
 
-        // Range operators: Gt/Gte → Gte, Lt/Lte → Lte (safe widening for partition boundaries)
+        // Non-hive-style equality
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&create_test_configs_unix_timestamp())
+                .unwrap();
+        // 2024-01-25 00:00:00 UTC = 1706140800 seconds
+        let filter = Filter {
+            field_name: "event_timestamp".to_string(),
+            operator: ExprOperator::Eq,
+            values: vec!["1706140800".to_string()],
+        };
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].values[0], "2024/01/25");
+
+        // Not-equal: now supported
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
+        let filter = Filter {
+            field_name: "ts_str".to_string(),
+            operator: ExprOperator::Ne,
+            values: vec!["2023-04-01T12:01:00.123Z".to_string()],
+        };
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].operator, ExprOperator::Ne);
+        assert_eq!(
+            transformed[0].values[0],
+            "year=2023/month=04/day=01/hour=12"
+        );
+
+        // Range operators: Gt/Gte → Gte, Lt/Lte → Lte (safe widening)
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_unix_timestamp())
                 .unwrap();
@@ -898,7 +933,8 @@ mod tests {
             };
             let transformed = keygen.transform_filter(&filter).unwrap();
             assert_eq!(transformed.len(), 1, "Expected 1 filter for {input_op:?}");
-            assert_eq!(transformed[0].field_name, "yyyy");
+            assert_eq!(transformed[0].field_name, "_hoodie_partition_path");
+            assert_eq!(transformed[0].values[0], "2024/01/25");
             assert_eq!(
                 transformed[0].operator, expected_op,
                 "{input_op:?} should coerce to {expected_op:?}"
@@ -917,20 +953,6 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field_name, "other_field");
 
-        // Not-equal operator is rejected
-        let filter = Filter {
-            field_name: "ts_str".to_string(),
-            operator: ExprOperator::Ne,
-            values: vec!["2023-04-01T12:01:00.123Z".to_string()],
-        };
-        assert!(
-            keygen
-                .transform_filter(&filter)
-                .unwrap_err()
-                .to_string()
-                .contains("Not-equal (!=) operator is not supported")
-        );
-
         // Invalid timestamp value produces error, not panic
         let unix_keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_unix_timestamp())
@@ -944,40 +966,94 @@ mod tests {
     }
 
     #[test]
-    fn test_in_not_in_operators_return_error() {
+    fn test_transform_filter_in_not_in() {
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
 
-        // IN operator should return error
+        // IN: multiple timestamps → multiple formatted paths in one filter
         let filter = Filter::new(
             "ts_str".to_string(),
             ExprOperator::In,
-            vec!["2023-04-01T12:00:00.000Z".to_string()],
+            vec![
+                "2023-04-01T12:00:00.000Z".to_string(),
+                "2023-06-15T08:00:00.000Z".to_string(),
+            ],
         )
         .unwrap();
-        let result = keygen.transform_filter(&filter);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("IN/NOT IN operators are not supported")
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].operator, ExprOperator::In);
+        assert_eq!(
+            transformed[0].values,
+            vec![
+                "year=2023/month=04/day=01/hour=12",
+                "year=2023/month=06/day=15/hour=08"
+            ]
         );
 
-        // NOT IN operator should also return error
+        // NOT IN
         let filter = Filter::new(
             "ts_str".to_string(),
             ExprOperator::NotIn,
             vec!["2023-04-01T12:00:00.000Z".to_string()],
         )
         .unwrap();
-        let result = keygen.transform_filter(&filter);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("IN/NOT IN operators are not supported")
-        );
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].operator, ExprOperator::NotIn);
+    }
+
+    #[test]
+    fn test_transform_filter_non_lex_sortable_skips_range() {
+        // Format MM/dd/yyyy is not lex-sortable → range ops return empty
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            ("hoodie.keygen.timebased.timestamp.type", "UNIX_TIMESTAMP"),
+            ("hoodie.keygen.timebased.output.dateformat", "MM/dd/yyyy"),
+            ("hoodie.datasource.write.hive_style_partitioning", "false"),
+        ]);
+        let keygen = TimestampBasedKeyGenerator::from_configs(&configs).unwrap();
+
+        // Range ops should return empty (skip pruning)
+        let filter = Filter {
+            field_name: "ts".to_string(),
+            operator: ExprOperator::Gte,
+            values: vec!["1706140800".to_string()],
+        };
+        assert!(keygen.transform_filter(&filter).unwrap().is_empty());
+
+        // But Eq still works
+        let filter = Filter {
+            field_name: "ts".to_string(),
+            operator: ExprOperator::Eq,
+            values: vec!["1706140800".to_string()],
+        };
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].operator, ExprOperator::Eq);
+    }
+
+    #[test]
+    fn test_is_lex_sortable_format() {
+        let make_keygen = |fmt: &str| -> TimestampBasedKeyGenerator {
+            let configs = HudiConfigs::new([
+                ("hoodie.table.partition.fields", "ts"),
+                ("hoodie.keygen.timebased.timestamp.type", "UNIX_TIMESTAMP"),
+                ("hoodie.keygen.timebased.output.dateformat", fmt),
+                ("hoodie.datasource.write.hive_style_partitioning", "false"),
+            ]);
+            TimestampBasedKeyGenerator::from_configs(&configs).unwrap()
+        };
+
+        // Lex-sortable formats
+        assert!(make_keygen("yyyy/MM/dd").is_lex_sortable_format());
+        assert!(make_keygen("yyyy/MM/dd/HH").is_lex_sortable_format());
+        assert!(make_keygen("yyyy/MM").is_lex_sortable_format());
+        assert!(make_keygen("yyyy").is_lex_sortable_format());
+
+        // Not lex-sortable
+        assert!(!make_keygen("MM/dd/yyyy").is_lex_sortable_format());
+        assert!(!make_keygen("dd/MM/yyyy").is_lex_sortable_format());
+        assert!(!make_keygen("yyyyMMdd").is_lex_sortable_format()); // compound, not splittable
     }
 }

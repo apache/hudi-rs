@@ -112,7 +112,9 @@ use crate::schema::resolver::{
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
-use crate::table::partition::PartitionPruner;
+use crate::table::partition::{
+    PARTITION_PATH_FIELD_NAME, PartitionPruner, is_timestamp_based_keygen,
+};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
@@ -266,6 +268,16 @@ impl Table {
         if self.is_metadata_table() {
             return Ok(Schema::new(vec![Field::new(
                 METADATA_TABLE_PARTITION_FIELD,
+                arrow_schema::DataType::Utf8,
+                false,
+            )]));
+        }
+
+        // Timestamp-based keygen: the source field is transformed into partition path
+        // strings, so use a single _hoodie_partition_path field.
+        if is_timestamp_based_keygen(&self.hudi_configs) {
+            return Ok(Schema::new(vec![Field::new(
+                PARTITION_PATH_FIELD_NAME,
                 arrow_schema::DataType::Utf8,
                 false,
             )]));
@@ -1001,7 +1013,7 @@ mod tests {
         let schema = hudi_table.get_partition_schema().await;
         assert!(schema.is_ok());
         let schema = schema.unwrap();
-        assert_arrow_field_names_eq!(schema, ["ts_str"]);
+        assert_arrow_field_names_eq!(schema, [PARTITION_PATH_FIELD_NAME]);
     }
 
     #[tokio::test]
