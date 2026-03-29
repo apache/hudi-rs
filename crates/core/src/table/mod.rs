@@ -112,9 +112,8 @@ use crate::schema::resolver::{
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
-use crate::table::partition::{
-    PARTITION_PATH_FIELD_NAME, PartitionPruner, is_timestamp_based_keygen,
-};
+use crate::keygen::is_timestamp_based_keygen;
+use crate::table::partition::{PARTITION_PATH_FIELD_NAME, PartitionPruner};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;

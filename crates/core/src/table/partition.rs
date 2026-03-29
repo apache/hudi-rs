@@ -28,6 +28,7 @@ use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
 
 use crate::config::table::HudiTableConfig::{KeyGeneratorClass, PartitionFields};
+use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::meta_field::MetaField;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,34 +36,6 @@ use std::sync::Arc;
 pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
 pub const EMPTY_PARTITION_PATH: &str = "";
 pub const PARTITION_PATH_FIELD_NAME: &str = "_hoodie_partition_path";
-
-/// Returns true if the table uses a timestamp-based key generator,
-/// checking both `hoodie.table.keygenerator.class` (v6) and
-/// `hoodie.table.keygenerator.type` (v8+).
-pub fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> bool {
-    // v6: hoodie.table.keygenerator.class contains "TimestampBasedKeyGenerator"
-    let by_class: bool = hudi_configs
-        .try_get(KeyGeneratorClass)
-        .map(|v| {
-            let s: String = v.into();
-            s.contains("TimestampBasedKeyGenerator")
-        })
-        .unwrap_or(false);
-
-    if by_class {
-        return true;
-    }
-
-    // v8+: hoodie.table.keygenerator.type = "TIMESTAMP" or "TIMESTAMP_AVRO"
-    let options = hudi_configs.as_options();
-    options
-        .get("hoodie.table.keygenerator.type")
-        .map(|v| {
-            let upper = v.to_uppercase();
-            upper == "TIMESTAMP" || upper == "TIMESTAMP_AVRO"
-        })
-        .unwrap_or(false)
-}
 
 pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
     let has_partition_fields = {
