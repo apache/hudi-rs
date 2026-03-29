@@ -209,7 +209,7 @@ jobs:
           merge-multiple: true
           path: ./cov-reports
       - name: Upload coverage reports to codecov.io
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
