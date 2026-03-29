@@ -191,6 +191,12 @@ fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
         }
     };
 
+    // Skip empty lists
+    if in_list.list.is_empty() {
+        debug!("IN list is empty, cannot be pushed down");
+        return None;
+    }
+
     // Extract literal values from the list
     let values: Vec<String> = in_list
         .list
@@ -774,6 +780,10 @@ mod tests {
             vec![lit(1i32)],
             false,
         ));
+        assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
+
+        // Test empty IN list - should not be pushed down
+        let in_list = Expr::InList(InList::new(Box::new(col("col1")), vec![], false));
         assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
     }
 }

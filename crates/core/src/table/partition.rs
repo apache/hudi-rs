@@ -393,7 +393,8 @@ mod tests {
             field_name: "date".to_string(),
             operator: ExprOperator::Eq,
             field_value: "2023-01-01".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
 
         let partition_filter = SchemableFilter::try_from((filter, &schema)).unwrap();
         assert_eq!(partition_filter.field.name(), "date");
@@ -414,7 +415,8 @@ mod tests {
             field_name: "invalid_field".to_string(),
             operator: ExprOperator::Eq,
             field_value: "2023-01-01".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
         assert!(
@@ -432,7 +434,8 @@ mod tests {
             field_name: "count".to_string(),
             operator: ExprOperator::Eq,
             field_value: "not_a_number".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
     }
@@ -486,7 +489,8 @@ mod tests {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Gte,
             field_value: "2023-04-15T12:00:00.000Z".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
@@ -523,7 +527,8 @@ mod tests {
             field_name: "event_time".to_string(),
             operator: ExprOperator::Eq,
             field_value: "1706140800".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
@@ -563,7 +568,8 @@ mod tests {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Eq,
             field_value: "2023-04-15T12:00:00.000Z".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
@@ -594,7 +600,8 @@ mod tests {
             field_name: "region".to_string(),
             operator: ExprOperator::Eq,
             field_value: "us-west".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
             &[user_filter.clone()],
@@ -636,7 +643,8 @@ mod tests {
             field_name: "ts".to_string(),
             operator: ExprOperator::Gte,
             field_value: "2024-01-15T00:00:00Z".to_string(),
-            field_values: Vec::new(),        };
+            field_values: Vec::new(),
+        };
 
         let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
 

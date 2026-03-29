@@ -48,7 +48,11 @@ impl Filter {
     }
 
     /// Create a filter with multiple values (for IN/NOT IN)
-    pub fn new_multi(field_name: String, operator: ExprOperator, field_values: Vec<String>) -> Self {
+    pub fn new_multi(
+        field_name: String,
+        operator: ExprOperator,
+        field_values: Vec<String>,
+    ) -> Self {
         Self {
             field_name,
             operator,
@@ -75,11 +79,7 @@ impl From<Filter> for (String, String, String) {
             // For IN/NOT IN, join values with comma
             filter.field_values.join(",")
         };
-        (
-            filter.field_name,
-            filter.operator.to_string(),
-            value_str,
-        )
+        (filter.field_name, filter.operator.to_string(), value_str)
     }
 }
 
@@ -93,14 +93,30 @@ impl TryFrom<(&str, &str, &str)> for Filter {
 
         let operator = ExprOperator::from_str(operator_str)?;
 
-        let field_value = field_value.to_string();
-
-        Ok(Filter {
-            field_name,
-            operator,
-            field_value,
-            field_values: Vec::new(),
-        })
+        match operator {
+            ExprOperator::In | ExprOperator::NotIn => {
+                let field_values: Vec<String> = field_value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if field_values.is_empty() {
+                    return Err(CoreError::Schema(format!(
+                        "IN/NOT IN operator requires non-empty values for field '{field_name}'"
+                    )));
+                }
+                Ok(Filter::new_multi(field_name, operator, field_values))
+            }
+            _ => {
+                let field_value = field_value.to_string();
+                Ok(Filter {
+                    field_name,
+                    operator,
+                    field_value,
+                    field_values: Vec::new(),
+                })
+            }
+        }
     }
 }
 
@@ -242,7 +258,8 @@ impl TryFrom<(Filter, &Schema)> for SchemableFilter {
                         "IN/NOT IN operator requires non-empty field_values for field '{field_name}'"
                     )));
                 }
-                let values: Result<Vec<_>> = filter.field_values
+                let values: Result<Vec<_>> = filter
+                    .field_values
                     .iter()
                     .map(|v| Self::cast_value(&[v.as_str()], field.data_type()))
                     .collect();
@@ -379,13 +396,23 @@ mod tests {
         let filter = Filter::new_multi("int_col".to_string(), ExprOperator::In, vec![]);
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-empty field_values"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty field_values")
+        );
 
         // NOT IN operator with empty field_values should also error
         let filter = Filter::new_multi("int_col".to_string(), ExprOperator::NotIn, vec![]);
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-empty field_values"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty field_values")
+        );
 
         Ok(())
     }
@@ -524,6 +551,48 @@ mod tests {
         let test_array = Int64Array::from(vec![40, 50, 60]);
         let result = schemable.apply_comparison(&test_array)?;
         assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_try_from_tuple_in_operator() -> Result<()> {
+        // TryFrom should parse comma-separated values for IN
+        let filter = Filter::try_from(("col", "IN", "a,b,c"))?;
+        assert_eq!(filter.operator, ExprOperator::In);
+        assert_eq!(filter.field_values, vec!["a", "b", "c"]);
+        assert!(filter.field_value.is_empty());
+
+        // TryFrom should parse comma-separated values for NOT IN
+        let filter = Filter::try_from(("col", "NOT IN", "x, y"))?;
+        assert_eq!(filter.operator, ExprOperator::NotIn);
+        assert_eq!(filter.field_values, vec!["x", "y"]);
+
+        // Empty value string for IN should error
+        let result = Filter::try_from(("col", "IN", ""));
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_roundtrip_in_operator() -> Result<()> {
+        // Round-trip: Filter -> (String, String, String) -> Filter
+        let original = Filter::new_multi(
+            "col".to_string(),
+            ExprOperator::In,
+            vec!["a".to_string(), "b".to_string()],
+        );
+
+        let tuple: (String, String, String) = original.into();
+        assert_eq!(
+            tuple,
+            ("col".to_string(), "IN".to_string(), "a,b".to_string())
+        );
+
+        let restored = Filter::try_from((tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str()))?;
+        assert_eq!(restored.operator, ExprOperator::In);
+        assert_eq!(restored.field_values, vec!["a", "b"]);
 
         Ok(())
     }

@@ -486,7 +486,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                             field_name: field_name.clone(),
                             operator: ExprOperator::Eq,
                             field_value: value.clone(),
-            field_values: Vec::new(),
+                            field_values: Vec::new(),
                         });
                     }
                 }
@@ -500,7 +500,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                             field_name: first_field.clone(),
                             operator: ExprOperator::Gte,
                             field_value: value.clone(),
-            field_values: Vec::new(),
+                            field_values: Vec::new(),
                         });
                     }
                 }
@@ -512,7 +512,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                             field_name: first_field.clone(),
                             operator: ExprOperator::Lte,
                             field_value: value.clone(),
-            field_values: Vec::new(),
+                            field_values: Vec::new(),
                         });
                     }
                 }
@@ -964,10 +964,12 @@ mod tests {
         );
         let result = keygen.transform_filter(&filter);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("IN/NOT IN operators are not supported"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("IN/NOT IN operators are not supported")
+        );
 
         // NOT IN operator should also return error
         let filter = Filter::new_multi(
@@ -977,9 +979,11 @@ mod tests {
         );
         let result = keygen.transform_filter(&filter);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("IN/NOT IN operators are not supported"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("IN/NOT IN operators are not supported")
+        );
     }
 }
