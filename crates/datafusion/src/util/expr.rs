@@ -18,6 +18,7 @@
  */
 
 use datafusion::logical_expr::Operator;
+use datafusion_expr::expr::InList;
 use datafusion_expr::{Between, BinaryExpr, Expr};
 use hudi_core::expr::filter::{Filter as HudiFilter, col};
 use log::{debug, warn};
@@ -33,6 +34,7 @@ use log::{debug, warn};
 /// - `NOT` expressions: negates inner binary expression
 /// - `AND` compound expressions: recursively flattens both sides
 /// - `BETWEEN` expressions: converts to `>= low AND <= high`
+/// - `IN` / `NOT IN` expressions: converts to `IN` / `NOT IN` filters
 ///
 /// # OR Expression Handling
 ///
@@ -91,6 +93,7 @@ fn expr_to_filters(expr: &Expr) -> Vec<HudiFilter> {
         },
         Expr::Not(not_expr) => not_expr_to_filter(not_expr).into_iter().collect(),
         Expr::Between(between) => between_to_filters(between),
+        Expr::InList(in_list) => inlist_expr_to_filter(in_list).into_iter().collect(),
         _ => vec![],
     }
 }
@@ -176,6 +179,46 @@ fn between_to_filters(between: &Between) -> Vec<HudiFilter> {
     ]
 }
 
+/// Converts an IN list expression into a HudiFilter with IN or NOT IN operator.
+///
+/// Returns None if the expression cannot be pushed down (non-column expr,
+/// non-literal values, or empty list).
+fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
+    let column = match in_list.expr.as_ref() {
+        Expr::Column(col) => col,
+        _ => {
+            debug!("IN list with non-column expression cannot be pushed down");
+            return None;
+        }
+    };
+
+    if in_list.list.is_empty() {
+        debug!("Empty IN list cannot be pushed down");
+        return None;
+    }
+
+    let values: Vec<String> = in_list
+        .list
+        .iter()
+        .filter_map(|expr| match expr {
+            Expr::Literal(lit, _) => Some(lit.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    if values.len() != in_list.list.len() {
+        debug!("IN list contains non-literal values, cannot be pushed down");
+        return None;
+    }
+
+    let field = col(column.name());
+    if in_list.negated {
+        Some(field.not_in_list(values))
+    } else {
+        Some(field.in_list(values))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,14 +248,14 @@ mod tests {
         let expected_filter = HudiFilter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Eq,
-            field_value: "42".to_string(),
+            values: vec!["42".to_string()],
         };
         assert_eq!(
             result[0],
             (
                 expected_filter.field_name,
                 expected_filter.operator.to_string(),
-                expected_filter.field_value
+                expected_filter.values.join(",")
             )
         );
     }
@@ -237,14 +280,14 @@ mod tests {
         let expected_filter = HudiFilter {
             field_name: schema.field(0).name().to_string(),
             operator: ExprOperator::Ne,
-            field_value: "42".to_string(),
+            values: vec!["42".to_string()],
         };
         assert_eq!(
             result[0],
             (
                 expected_filter.field_name,
                 expected_filter.operator.to_string(),
-                expected_filter.field_value
+                expected_filter.values.join(",")
             )
         );
     }
@@ -258,7 +301,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("int32_col"),
                     operator: ExprOperator::Eq,
-                    field_value: String::from("42"),
+                    values: vec![String::from("42")],
                 }),
             ),
             (
@@ -266,7 +309,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("int64_col"),
                     operator: ExprOperator::Gte,
-                    field_value: String::from("100"),
+                    values: vec![String::from("100")],
                 }),
             ),
             (
@@ -274,7 +317,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("float64_col"),
                     operator: ExprOperator::Lt,
-                    field_value: "32.666".to_string(),
+                    values: vec!["32.666".to_string()],
                 }),
             ),
             (
@@ -282,7 +325,7 @@ mod tests {
                 Some(HudiFilter {
                     field_name: String::from("string_col"),
                     operator: ExprOperator::Ne,
-                    field_value: String::from("test"),
+                    values: vec![String::from("test")],
                 }),
             ),
         ];
@@ -302,7 +345,7 @@ mod tests {
                 &(
                     expected_filter.field_name.clone(),
                     expected_filter.operator.to_string(),
-                    expected_filter.field_value.clone()
+                    expected_filter.values.join(",").clone()
                 )
             );
         }
@@ -336,14 +379,14 @@ mod tests {
             let expected_filter = HudiFilter {
                 field_name: schema.field(0).name().to_string(),
                 operator: expected_op,
-                field_value: String::from("42"),
+                values: vec![String::from("42")],
             };
             assert_eq!(
                 result[0],
                 (
                     expected_filter.field_name,
                     expected_filter.operator.to_string(),
-                    expected_filter.field_value
+                    expected_filter.values.join(",")
                 )
             );
         }
@@ -654,5 +697,69 @@ mod tests {
             "Expected 1 filter from first expr, OR expr skipped"
         );
         assert_eq!(result[0].0, "col_a");
+    }
+
+    #[test]
+    fn test_convert_in_list() {
+        // col IN ('a', 'b', 'c')
+        let in_list = Expr::InList(InList::new(
+            Box::new(col("part")),
+            vec![lit("a"), lit("b"), lit("c")],
+            false,
+        ));
+        let result = exprs_to_filters(&[in_list]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "part");
+        assert_eq!(result[0].1, "IN");
+        assert_eq!(result[0].2, "a,b,c");
+
+        // col NOT IN ('x', 'y')
+        let not_in = Expr::InList(InList::new(
+            Box::new(col("part")),
+            vec![lit("x"), lit("y")],
+            true,
+        ));
+        let result = exprs_to_filters(&[not_in]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "part");
+        assert_eq!(result[0].1, "NOT IN");
+        assert_eq!(result[0].2, "x,y");
+
+        // Integer IN list
+        let in_int = Expr::InList(InList::new(
+            Box::new(col("id")),
+            vec![lit(40i32), lit(60i32)],
+            false,
+        ));
+        let result = exprs_to_filters(&[in_int]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, "IN");
+    }
+
+    #[test]
+    fn test_convert_in_list_unsupported_cases() {
+        // Empty list
+        let empty = Expr::InList(InList::new(Box::new(col("col1")), vec![], false));
+        assert!(exprs_to_filters(&[empty]).is_empty());
+
+        // Non-literal values
+        let non_lit = Expr::InList(InList::new(
+            Box::new(col("col1")),
+            vec![col("col2"), col("col3")],
+            false,
+        ));
+        assert!(exprs_to_filters(&[non_lit]).is_empty());
+
+        // Non-column expression
+        let non_col = Expr::InList(InList::new(
+            Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("col1")),
+                Operator::Plus,
+                Box::new(col("col2")),
+            ))),
+            vec![lit(1i32)],
+            false,
+        ));
+        assert!(exprs_to_filters(&[non_col]).is_empty());
     }
 }

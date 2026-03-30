@@ -27,7 +27,9 @@ use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
 
-use crate::config::table::HudiTableConfig::{KeyGeneratorClass, PartitionFields};
+use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType, PartitionFields};
+use crate::keygen::is_timestamp_based_keygen;
+use crate::metadata::meta_field::MetaField;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -48,12 +50,11 @@ pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
         })
         .unwrap_or(false);
 
-    // v8+: also check hoodie.table.keygenerator.type for NON_PARTITION variants
     let uses_non_partitioned_type = hudi_configs
-        .as_options()
-        .get("hoodie.table.keygenerator.type")
+        .try_get(KeyGeneratorType)
         .map(|v| {
-            let upper = v.to_uppercase();
+            let s: String = v.into();
+            let upper = s.to_uppercase();
             upper == "NON_PARTITION" || upper == "NON_PARTITION_AVRO"
         })
         .unwrap_or(false);
@@ -144,34 +145,6 @@ impl PartitionPruner {
         })
     }
 
-    /// Returns true if the table uses a timestamp-based key generator,
-    /// checking both `hoodie.table.keygenerator.class` (v6) and
-    /// `hoodie.table.keygenerator.type` (v8+).
-    fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> bool {
-        // v6: hoodie.table.keygenerator.class contains "TimestampBasedKeyGenerator"
-        let by_class: bool = hudi_configs
-            .try_get(KeyGeneratorClass)
-            .map(|v| {
-                let s: String = v.into();
-                s.contains("TimestampBasedKeyGenerator")
-            })
-            .unwrap_or(false);
-
-        if by_class {
-            return true;
-        }
-
-        // v8+: hoodie.table.keygenerator.type = "TIMESTAMP" or "TIMESTAMP_AVRO"
-        let options = hudi_configs.as_options();
-        options
-            .get("hoodie.table.keygenerator.type")
-            .map(|v| {
-                let upper = v.to_uppercase();
-                upper == "TIMESTAMP" || upper == "TIMESTAMP_AVRO"
-            })
-            .unwrap_or(false)
-    }
-
     /// Transforms user filters on data columns to filters on partition path columns
     /// based on the configured key generator.
     fn transform_filters_for_keygen(
@@ -179,7 +152,7 @@ impl PartitionPruner {
         _partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
     ) -> Result<Vec<Filter>> {
-        if Self::is_timestamp_based_keygen(hudi_configs) {
+        if is_timestamp_based_keygen(hudi_configs) {
             match TimestampBasedKeyGenerator::from_configs(hudi_configs) {
                 Ok(transformer) => {
                     return Self::apply_transformer_to_filters(filters, &transformer);
@@ -216,6 +189,20 @@ impl PartitionPruner {
         } else {
             partition_path.to_string()
         };
+
+        // Special case: single _hoodie_partition_path field uses the raw path as-is
+        if self.schema.fields().len() == 1
+            && self.schema.field(0).name() == MetaField::PartitionPath.as_ref()
+        {
+            let scalar = SchemableFilter::cast_value(
+                &[partition_path.as_str()],
+                &arrow_schema::DataType::Utf8,
+            )?;
+            return Ok(HashMap::from([(
+                MetaField::PartitionPath.as_ref().to_string(),
+                scalar,
+            )]));
+        }
 
         let parts: Vec<&str> = partition_path.split('/').collect();
 
@@ -392,14 +379,14 @@ mod tests {
         let filter = Filter {
             field_name: "date".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-01-01".to_string(),
+            values: vec!["2023-01-01".to_string()],
         };
 
         let partition_filter = SchemableFilter::try_from((filter, &schema)).unwrap();
         assert_eq!(partition_filter.field.name(), "date");
         assert_eq!(partition_filter.operator, ExprOperator::Eq);
 
-        let value_inner = partition_filter.value.into_inner();
+        let value_inner = partition_filter.values[0].clone().into_inner();
 
         let date_array = value_inner.as_any().downcast_ref::<Date32Array>().unwrap();
 
@@ -413,7 +400,7 @@ mod tests {
         let filter = Filter {
             field_name: "invalid_field".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-01-01".to_string(),
+            values: vec!["2023-01-01".to_string()],
         };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
@@ -431,7 +418,7 @@ mod tests {
         let filter = Filter {
             field_name: "count".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "not_a_number".to_string(),
+            values: vec!["not_a_number".to_string()],
         };
         let result = SchemableFilter::try_from((filter, &schema));
         assert!(result.is_err());
@@ -440,12 +427,8 @@ mod tests {
     #[test]
     fn test_partition_filter_try_from_all_operators() {
         let schema = create_test_schema();
-        for (op, _) in ExprOperator::TOKEN_OP_PAIRS {
-            let filter = Filter {
-                field_name: "count".to_string(),
-                operator: ExprOperator::from_str(op).unwrap(),
-                field_value: "5".to_string(),
-            };
+        for (op, op_enum) in ExprOperator::TOKEN_OP_PAIRS {
+            let filter = Filter::new("count".to_string(), op_enum, vec!["5".to_string()]).unwrap();
             let partition_filter = SchemableFilter::try_from((filter, &schema));
             let filter = partition_filter.unwrap();
             assert_eq!(filter.field.name(), "count");
@@ -455,7 +438,13 @@ mod tests {
 
     #[test]
     fn test_transform_filters_for_keygen_timestamp_based() {
-        // Range filter: DATE_STRING Gte → year Gte
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+
+        // Range filter: DATE_STRING Gte → single _hoodie_partition_path Gte
         let configs = HudiConfigs::new([
             ("hoodie.table.partition.fields", "ts_str"),
             (
@@ -471,16 +460,10 @@ mod tests {
             ("hoodie.datasource.write.hive_style_partitioning", "true"),
         ]);
 
-        let partition_schema = Schema::new(vec![
-            Field::new("year", DataType::Utf8, false),
-            Field::new("month", DataType::Utf8, false),
-            Field::new("day", DataType::Utf8, false),
-        ]);
-
         let user_filter = Filter {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Gte,
-            field_value: "2023-04-15T12:00:00.000Z".to_string(),
+            values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -491,11 +474,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, "year");
+        assert_eq!(transformed[0].field_name, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].operator, ExprOperator::Gte);
-        assert_eq!(transformed[0].field_value, "2023");
+        assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
 
-        // Equality filter: UNIX_TIMESTAMP Eq → yyyy/MM/dd Eq
+        // Equality filter: UNIX_TIMESTAMP Eq → single path
         let configs = HudiConfigs::new([
             ("hoodie.table.partition.fields", "event_time"),
             (
@@ -507,17 +490,11 @@ mod tests {
             ("hoodie.datasource.write.hive_style_partitioning", "false"),
         ]);
 
-        let partition_schema = Schema::new(vec![
-            Field::new("yyyy", DataType::Utf8, false),
-            Field::new("MM", DataType::Utf8, false),
-            Field::new("dd", DataType::Utf8, false),
-        ]);
-
         // 2024-01-25 00:00:00 UTC = 1706140800 seconds
         let user_filter = Filter {
             field_name: "event_time".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "1706140800".to_string(),
+            values: vec!["1706140800".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -527,13 +504,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(transformed.len(), 3);
-        assert_eq!(transformed[0].field_name, "yyyy");
-        assert_eq!(transformed[0].field_value, "2024");
-        assert_eq!(transformed[1].field_name, "MM");
-        assert_eq!(transformed[1].field_value, "01");
-        assert_eq!(transformed[2].field_name, "dd");
-        assert_eq!(transformed[2].field_value, "25");
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].field_name, MetaField::PartitionPath.as_ref());
+        assert_eq!(transformed[0].values[0], "2024/01/25");
 
         // v8 detection via keygenerator.type=TIMESTAMP (no keygenerator.class)
         let configs = HudiConfigs::new([
@@ -548,16 +521,10 @@ mod tests {
             ("hoodie.datasource.write.hive_style_partitioning", "true"),
         ]);
 
-        let partition_schema = Schema::new(vec![
-            Field::new("year", DataType::Utf8, false),
-            Field::new("month", DataType::Utf8, false),
-            Field::new("day", DataType::Utf8, false),
-        ]);
-
         let user_filter = Filter {
             field_name: "ts_str".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "2023-04-15T12:00:00.000Z".to_string(),
+            values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -567,9 +534,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(transformed.len(), 3);
-        assert_eq!(transformed[0].field_name, "year");
-        assert_eq!(transformed[0].field_value, "2023");
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
     }
 
     #[test]
@@ -588,7 +554,7 @@ mod tests {
         let user_filter = Filter {
             field_name: "region".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "us-west".to_string(),
+            values: vec!["us-west".to_string()],
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
@@ -600,7 +566,7 @@ mod tests {
 
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field_name, user_filter.field_name);
-        assert_eq!(transformed[0].field_value, user_filter.field_value);
+        assert_eq!(transformed[0].values[0], user_filter.values[0]);
     }
 
     #[test]
@@ -621,29 +587,56 @@ mod tests {
             ("hoodie.datasource.write.partitionpath.urlencode", "false"),
         ]);
 
-        let partition_schema = Schema::new(vec![
-            Field::new("year", DataType::Utf8, false),
-            Field::new("month", DataType::Utf8, false),
-            Field::new("day", DataType::Utf8, false),
-        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
 
         let user_filter = Filter {
             field_name: "ts".to_string(),
             operator: ExprOperator::Gte,
-            field_value: "2024-01-15T00:00:00Z".to_string(),
+            values: vec!["2024-01-15T00:00:00Z".to_string()],
         };
 
         let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
 
         assert!(!pruner.is_empty());
 
-        // Should include partitions >= 2024
+        // Full path string comparison on _hoodie_partition_path
         assert!(pruner.should_include("year=2024/month=01/day=15"));
         assert!(pruner.should_include("year=2024/month=06/day=30"));
         assert!(pruner.should_include("year=2025/month=01/day=01"));
 
-        // Should exclude partitions < 2024
+        // Should exclude partitions < 2024/01/15
         assert!(!pruner.should_include("year=2023/month=12/day=31"));
         assert!(!pruner.should_include("year=2022/month=01/day=01"));
+
+        // Non-hive-style: verify the same logic works
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "false"),
+        ]);
+
+        let user_filter = Filter {
+            field_name: "ts".to_string(),
+            operator: ExprOperator::Eq,
+            values: vec!["2024-01-15T00:00:00Z".to_string()],
+        };
+
+        let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
+        assert!(pruner.should_include("2024/01/15"));
+        assert!(!pruner.should_include("2024/01/16"));
+        assert!(!pruner.should_include("2023/12/31"));
     }
 }

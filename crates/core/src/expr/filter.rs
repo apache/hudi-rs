@@ -20,6 +20,7 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
+use arrow_arith::boolean;
 use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar, StringArray};
 use arrow_cast::{CastOptions, cast_with_options};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -30,7 +31,29 @@ use std::str::FromStr;
 pub struct Filter {
     pub field_name: String,
     pub operator: ExprOperator,
-    pub field_value: String,
+    pub values: Vec<String>,
+}
+
+impl Filter {
+    pub fn new(field_name: String, operator: ExprOperator, values: Vec<String>) -> Result<Self> {
+        if operator.is_multi_value() {
+            if values.is_empty() {
+                return Err(CoreError::Schema(format!(
+                    "{operator} operator requires at least one value for field '{field_name}'"
+                )));
+            }
+        } else if values.len() != 1 {
+            return Err(CoreError::Schema(format!(
+                "Operator {operator} requires exactly one value for field '{field_name}', got {}",
+                values.len()
+            )));
+        }
+        Ok(Self {
+            field_name,
+            operator,
+            values,
+        })
+    }
 }
 
 impl Filter {
@@ -44,11 +67,8 @@ impl Filter {
 
 impl From<Filter> for (String, String, String) {
     fn from(filter: Filter) -> Self {
-        (
-            filter.field_name,
-            filter.operator.to_string(),
-            filter.field_value,
-        )
+        let value_str = filter.values.join(",");
+        (filter.field_name, filter.operator.to_string(), value_str)
     }
 }
 
@@ -57,18 +77,18 @@ impl TryFrom<(&str, &str, &str)> for Filter {
 
     fn try_from(binary_expr_tuple: (&str, &str, &str)) -> Result<Self, Self::Error> {
         let (field_name, operator_str, field_value) = binary_expr_tuple;
-
         let field_name = field_name.to_string();
-
         let operator = ExprOperator::from_str(operator_str)?;
-
-        let field_value = field_value.to_string();
-
-        Ok(Filter {
-            field_name,
-            operator,
-            field_value,
-        })
+        let values = if operator.is_multi_value() {
+            field_value
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![field_value.to_string()]
+        };
+        Filter::new(field_name, operator, values)
     }
 }
 
@@ -100,7 +120,7 @@ impl FilterField {
         Filter {
             field_name: self.name.clone(),
             operator: ExprOperator::Eq,
-            field_value: value.into(),
+            values: vec![value.into()],
         }
     }
 
@@ -108,7 +128,7 @@ impl FilterField {
         Filter {
             field_name: self.name.clone(),
             operator: ExprOperator::Ne,
-            field_value: value.into(),
+            values: vec![value.into()],
         }
     }
 
@@ -116,7 +136,7 @@ impl FilterField {
         Filter {
             field_name: self.name.clone(),
             operator: ExprOperator::Lt,
-            field_value: value.into(),
+            values: vec![value.into()],
         }
     }
 
@@ -124,7 +144,7 @@ impl FilterField {
         Filter {
             field_name: self.name.clone(),
             operator: ExprOperator::Lte,
-            field_value: value.into(),
+            values: vec![value.into()],
         }
     }
 
@@ -132,7 +152,7 @@ impl FilterField {
         Filter {
             field_name: self.name.clone(),
             operator: ExprOperator::Gt,
-            field_value: value.into(),
+            values: vec![value.into()],
         }
     }
 
@@ -140,7 +160,31 @@ impl FilterField {
         Filter {
             field_name: self.name.clone(),
             operator: ExprOperator::Gte,
-            field_value: value.into(),
+            values: vec![value.into()],
+        }
+    }
+
+    pub fn in_list<I, S>(&self, values: I) -> Filter
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Filter {
+            field_name: self.name.clone(),
+            operator: ExprOperator::In,
+            values: values.into_iter().map(|v| v.into()).collect(),
+        }
+    }
+
+    pub fn not_in_list<I, S>(&self, values: I) -> Filter
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Filter {
+            field_name: self.name.clone(),
+            operator: ExprOperator::NotIn,
+            values: values.into_iter().map(|v| v.into()).collect(),
         }
     }
 }
@@ -153,7 +197,7 @@ pub fn col(name: impl Into<String>) -> FilterField {
 pub struct SchemableFilter {
     pub field: Field,
     pub operator: ExprOperator,
-    pub value: Scalar<ArrayRef>,
+    pub values: Vec<Scalar<ArrayRef>>,
 }
 
 impl TryFrom<(Filter, &Schema)> for SchemableFilter {
@@ -166,14 +210,19 @@ impl TryFrom<(Filter, &Schema)> for SchemableFilter {
         })?;
 
         let operator = filter.operator;
-        let value = &[filter.field_value.as_str()];
-        let value = Self::cast_value(value, field.data_type())?;
+
+        let values: Result<Vec<_>> = filter
+            .values
+            .iter()
+            .map(|v| Self::cast_value(&[v.as_str()], field.data_type()))
+            .collect();
+        let values = values?;
 
         let field = field.clone();
         Ok(SchemableFilter {
             field,
             operator,
-            value,
+            values,
         })
     }
 }
@@ -195,12 +244,30 @@ impl SchemableFilter {
 
     pub fn apply_comparison(&self, value: &dyn Datum) -> Result<BooleanArray> {
         match self.operator {
-            ExprOperator::Eq => eq(value, &self.value),
-            ExprOperator::Ne => neq(value, &self.value),
-            ExprOperator::Lt => lt(value, &self.value),
-            ExprOperator::Lte => lt_eq(value, &self.value),
-            ExprOperator::Gt => gt(value, &self.value),
-            ExprOperator::Gte => gt_eq(value, &self.value),
+            ExprOperator::Eq => eq(value, &self.values[0]),
+            ExprOperator::Ne => neq(value, &self.values[0]),
+            ExprOperator::Lt => lt(value, &self.values[0]),
+            ExprOperator::Lte => lt_eq(value, &self.values[0]),
+            ExprOperator::Gt => gt(value, &self.values[0]),
+            ExprOperator::Gte => gt_eq(value, &self.values[0]),
+            ExprOperator::In => {
+                // IN: value == values[0] OR value == values[1] OR ...
+                let mut result = eq(value, &self.values[0])?;
+                for filter_value in &self.values[1..] {
+                    let comparison = eq(value, filter_value)?;
+                    result = boolean::or(&result, &comparison)?;
+                }
+                Ok(result)
+            }
+            ExprOperator::NotIn => {
+                // NOT IN: value != values[0] AND value != values[1] AND ...
+                let mut result = neq(value, &self.values[0])?;
+                for filter_value in &self.values[1..] {
+                    let comparison = neq(value, filter_value)?;
+                    result = boolean::and(&result, &comparison)?;
+                }
+                Ok(result)
+            }
         }
         .map_err(|e| e.into())
     }
@@ -227,7 +294,7 @@ mod tests {
         let string_filter = Filter {
             field_name: "string_col".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "test_value".to_string(),
+            values: vec!["test_value".to_string()],
         };
 
         let schemable = SchemableFilter::try_from((string_filter, &schema))?;
@@ -239,7 +306,7 @@ mod tests {
         let int_filter = Filter {
             field_name: "int_col".to_string(),
             operator: ExprOperator::Gt,
-            field_value: "42".to_string(),
+            values: vec!["42".to_string()],
         };
 
         let schemable = SchemableFilter::try_from((int_filter, &schema))?;
@@ -251,10 +318,35 @@ mod tests {
         let invalid_filter = Filter {
             field_name: "non_existent".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "value".to_string(),
+            values: vec!["value".to_string()],
         };
 
         assert!(SchemableFilter::try_from((invalid_filter, &schema)).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_in_empty_values_error() -> Result<()> {
+        // IN operator with empty values should error at construction
+        let result = Filter::new("int_col".to_string(), ExprOperator::In, vec![]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one value")
+        );
+
+        // NOT IN operator with empty values should also error at construction
+        let result = Filter::new("int_col".to_string(), ExprOperator::NotIn, vec![]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one value")
+        );
 
         Ok(())
     }
@@ -284,7 +376,7 @@ mod tests {
         let eq_filter = Filter {
             field_name: "string_col".to_string(),
             operator: ExprOperator::Eq,
-            field_value: "test".to_string(),
+            values: vec!["test".to_string()],
         };
         let schemable = SchemableFilter::try_from((eq_filter, &schema))?;
 
@@ -296,7 +388,7 @@ mod tests {
         let gt_filter = Filter {
             field_name: "int_col".to_string(),
             operator: ExprOperator::Gt,
-            field_value: "50".to_string(),
+            values: vec!["50".to_string()],
         };
         let schemable = SchemableFilter::try_from((gt_filter, &schema))?;
 
@@ -325,7 +417,7 @@ mod tests {
             let filter = Filter {
                 field_name: "int_col".to_string(),
                 operator,
-                field_value: value.to_string(),
+                values: vec![value.to_string()],
             };
 
             let schemable = SchemableFilter::try_from((filter, &schema))?;
@@ -336,6 +428,105 @@ mod tests {
                 "Failed for operator {operator:?} with value {value}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schemable_filter_in() -> Result<()> {
+        let schema = create_test_schema();
+
+        let in_filter = Filter::new(
+            "string_col".to_string(),
+            ExprOperator::In,
+            vec!["foo".to_string(), "bar".to_string()],
+        )
+        .unwrap();
+
+        let schemable = SchemableFilter::try_from((in_filter, &schema))?;
+        let test_array = StringArray::from(vec!["foo", "baz", "bar", "qux"]);
+        let result = schemable.apply_comparison(&test_array)?;
+        assert_eq!(result, BooleanArray::from(vec![true, false, true, false]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schemable_filter_not_in() -> Result<()> {
+        let schema = create_test_schema();
+
+        let not_in_filter = Filter::new(
+            "string_col".to_string(),
+            ExprOperator::NotIn,
+            vec!["foo".to_string(), "bar".to_string()],
+        )
+        .unwrap();
+
+        let schemable = SchemableFilter::try_from((not_in_filter, &schema))?;
+        let test_array = StringArray::from(vec!["foo", "baz", "bar", "qux"]);
+        let result = schemable.apply_comparison(&test_array)?;
+        assert_eq!(result, BooleanArray::from(vec![false, true, false, true]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schemable_filter_in_with_integers() -> Result<()> {
+        let schema = create_test_schema();
+
+        let in_filter = Filter::new(
+            "int_col".to_string(),
+            ExprOperator::In,
+            vec!["40".to_string(), "60".to_string()],
+        )
+        .unwrap();
+
+        let schemable = SchemableFilter::try_from((in_filter, &schema))?;
+        let test_array = Int64Array::from(vec![40, 50, 60]);
+        let result = schemable.apply_comparison(&test_array)?;
+        assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_try_from_tuple_in_operator() -> Result<()> {
+        // TryFrom should parse comma-separated values for IN
+        let filter = Filter::try_from(("col", "IN", "a,b,c"))?;
+        assert_eq!(filter.operator, ExprOperator::In);
+        assert_eq!(filter.values, vec!["a", "b", "c"]);
+
+        // TryFrom should parse comma-separated values for NOT IN
+        let filter = Filter::try_from(("col", "NOT IN", "x, y"))?;
+        assert_eq!(filter.operator, ExprOperator::NotIn);
+        assert_eq!(filter.values, vec!["x", "y"]);
+
+        // Empty value string for IN should error
+        let result = Filter::try_from(("col", "IN", ""));
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_roundtrip_in_operator() -> Result<()> {
+        // Round-trip: Filter -> (String, String, String) -> Filter
+        let original = Filter::new(
+            "col".to_string(),
+            ExprOperator::In,
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .unwrap();
+
+        let tuple: (String, String, String) = original.into();
+        assert_eq!(
+            tuple,
+            ("col".to_string(), "IN".to_string(), "a,b".to_string())
+        );
+
+        let restored = Filter::try_from((tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str()))?;
+        assert_eq!(restored.operator, ExprOperator::In);
+        assert_eq!(restored.values, vec!["a", "b"]);
 
         Ok(())
     }

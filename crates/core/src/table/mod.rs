@@ -105,7 +105,9 @@ use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
+use crate::metadata::meta_field::MetaField;
 use crate::schema::resolver::{
     resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
 };
@@ -266,6 +268,16 @@ impl Table {
         if self.is_metadata_table() {
             return Ok(Schema::new(vec![Field::new(
                 METADATA_TABLE_PARTITION_FIELD,
+                arrow_schema::DataType::Utf8,
+                false,
+            )]));
+        }
+
+        // Timestamp-based keygen: the source field is transformed into partition path
+        // strings, so use a single _hoodie_partition_path field.
+        if is_timestamp_based_keygen(&self.hudi_configs) {
+            return Ok(Schema::new(vec![Field::new(
+                MetaField::PartitionPath.as_ref(),
                 arrow_schema::DataType::Utf8,
                 false,
             )]));
@@ -1001,7 +1013,7 @@ mod tests {
         let schema = hudi_table.get_partition_schema().await;
         assert!(schema.is_ok());
         let schema = schema.unwrap();
-        assert_arrow_field_names_eq!(schema, ["ts_str"]);
+        assert_arrow_field_names_eq!(schema, [MetaField::PartitionPath.as_ref()]);
     }
 
     #[tokio::test]

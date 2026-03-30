@@ -121,6 +121,12 @@ impl FilePruner {
     ///
     /// Returns `true` if the file can definitely be pruned (no rows can match).
     fn can_prune_by_filter(&self, filter: &SchemableFilter, col_stats: &ColumnStatistics) -> bool {
+        // Multi-value operators not yet supported for file-level pruning
+        // TODO: support IN/NOT IN by checking if all values are outside the min/max range
+        if filter.operator.is_multi_value() {
+            return false;
+        }
+
         // Get the filter value as an ArrayRef
         let filter_array = self.extract_filter_array(filter);
         let Some(filter_value) = filter_array else {
@@ -154,6 +160,9 @@ impl FilePruner {
             ExprOperator::Gte => {
                 // Prune if: max < value
                 self.can_prune_gte(&filter_value, max)
+            }
+            ExprOperator::In | ExprOperator::NotIn => {
+                unreachable!("Multi-value operators are short-circuited above")
             }
         }
     }
@@ -250,7 +259,7 @@ impl FilePruner {
 
     /// Extracts the filter value as an ArrayRef.
     fn extract_filter_array(&self, filter: &SchemableFilter) -> Option<ArrayRef> {
-        let (array, is_scalar) = filter.value.get();
+        let (array, is_scalar) = filter.values[0].get();
         if array.is_empty() {
             return None;
         }
@@ -529,6 +538,39 @@ mod tests {
         // Stats: min="apple", max="zebra". Filter: name = "banana". Should include.
         let stats2 = create_stats_with_string_range("name", "apple", "zebra");
         assert!(pruner.should_include(&stats2));
+    }
+
+    #[test]
+    fn test_in_not_in_operators_no_prune() {
+        let table_schema = create_test_schema();
+        let partition_schema = Schema::empty();
+
+        // IN operator should not prune (conservative approach)
+        let filters = vec![
+            Filter::new(
+                "id".to_string(),
+                ExprOperator::In,
+                vec!["5".to_string(), "10".to_string()],
+            )
+            .unwrap(),
+        ];
+        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+
+        // Even though 5 and 10 are below min=50, conservative approach includes file
+        let stats = create_stats_with_int_range("id", 50, 100);
+        assert!(pruner.should_include(&stats));
+
+        // NOT IN operator should also not prune
+        let filters = vec![
+            Filter::new(
+                "id".to_string(),
+                ExprOperator::NotIn,
+                vec!["5".to_string(), "10".to_string()],
+            )
+            .unwrap(),
+        ];
+        let pruner = FilePruner::new(&filters, &table_schema, &partition_schema).unwrap();
+        assert!(pruner.should_include(&stats));
     }
 
     #[test]

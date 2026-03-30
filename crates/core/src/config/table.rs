@@ -78,6 +78,9 @@ pub enum HudiTableConfig {
     /// Key Generator class property for the hoodie table
     KeyGeneratorClass,
 
+    /// Key Generator type property for the hoodie table (v8+)
+    KeyGeneratorType,
+
     /// Fields used to partition the table. Concatenated values of these fields are used as
     /// the partition path, by invoking toString().
     /// These fields also include the partition type which is used by custom key generators
@@ -156,6 +159,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::IsHiveStylePartitioning => "hoodie.datasource.write.hive_style_partitioning",
             Self::IsPartitionPathUrlencoded => "hoodie.datasource.write.partitionpath.urlencode",
             Self::KeyGeneratorClass => "hoodie.table.keygenerator.class",
+            Self::KeyGeneratorType => "hoodie.table.keygenerator.type",
             Self::PartitionFields => "hoodie.table.partition.fields",
             Self::PrecombineField => "hoodie.table.precombine.field",
             Self::PopulatesMetaFields => "hoodie.populate.meta.fields",
@@ -245,6 +249,7 @@ impl ConfigParser for HudiTableConfig {
                 })
                 .map(HudiConfigValue::Boolean),
             Self::KeyGeneratorClass => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
             Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
