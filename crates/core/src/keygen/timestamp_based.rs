@@ -444,46 +444,55 @@ impl TimestampBasedKeyGenerator {
     }
 
     /// Formats a single date segment into its value string.
+    ///
+    /// Supports both simple tokens like `"yyyy"` and compound patterns like
+    /// `"yyyyMMdd"` or `"yyyy-MM-dd"` by progressively replacing known tokens.
     fn format_segment_value<T: Datelike + Timelike>(segment: &str, dt: &T) -> String {
-        match segment {
-            "yyyy" => format!("{:04}", dt.year()),
-            "MM" => format!("{:02}", dt.month()),
-            "dd" => format!("{:02}", dt.day()),
-            "HH" => format!("{:02}", dt.hour()),
-            "mm" => format!("{:02}", dt.minute()),
-            "ss" => format!("{:02}", dt.second()),
-            _ => segment.to_string(),
-        }
+        // Order matters: longer tokens must not be partially consumed by shorter ones.
+        // "mm" (minute) vs "MM" (month) are case-sensitive so they don't conflict.
+        segment
+            .replace("yyyy", &format!("{:04}", dt.year()))
+            .replace("MM", &format!("{:02}", dt.month()))
+            .replace("dd", &format!("{:02}", dt.day()))
+            .replace("HH", &format!("{:02}", dt.hour()))
+            .replace("mm", &format!("{:02}", dt.minute()))
+            .replace("ss", &format!("{:02}", dt.second()))
     }
 
     /// Returns true if the output date format produces lexicographically sortable
     /// partition paths (i.e., string comparison preserves chronological order).
     ///
-    /// This requires format segments to appear in strict descending significance:
-    /// year > month > day > hour > minute > second.
+    /// This requires date tokens across the full format to appear in strict
+    /// descending significance: year > month > day > hour > minute > second.
+    /// Supports both `/`-separated formats like `yyyy/MM/dd` and compound
+    /// formats like `yyyyMMdd` or `yyyy-MM-dd`.
     fn is_lex_sortable_format(&self) -> bool {
-        let rank = |seg: &str| -> Option<u8> {
-            match seg {
-                "yyyy" => Some(6),
-                "MM" => Some(5),
-                "dd" => Some(4),
-                "HH" => Some(3),
-                "mm" => Some(2),
-                "ss" => Some(1),
-                _ => None,
+        // Known tokens in search order (longest first to avoid partial matches)
+        const TOKENS: &[(&str, u8)] = &[
+            ("yyyy", 6),
+            ("MM", 5),
+            ("dd", 4),
+            ("HH", 3),
+            ("mm", 2),
+            ("ss", 1),
+        ];
+
+        // Extract all token ranks in order of appearance
+        let mut ranks: Vec<u8> = Vec::new();
+        let mut remaining = self.output_dateformat.as_str();
+
+        while !remaining.is_empty() {
+            if let Some((token, rank)) = TOKENS.iter().find(|(t, _)| remaining.starts_with(t)) {
+                ranks.push(*rank);
+                remaining = &remaining[token.len()..];
+            } else {
+                // Skip non-token characters (separators like '/', '-', etc.)
+                remaining = &remaining[1..];
             }
-        };
+        }
 
-        let segments: Vec<&str> = self.output_dateformat.split('/').collect();
-
-        // Every segment must be a known date component
-        let ranks: Vec<u8> = match segments.iter().map(|s| rank(s)).collect() {
-            Some(r) => r,
-            None => return false,
-        };
-
-        // Must be in strictly descending order
-        ranks.windows(2).all(|w| w[0] > w[1])
+        // Must have at least one token and be in strictly descending order
+        !ranks.is_empty() && ranks.windows(2).all(|w| w[0] > w[1])
     }
 }
 
@@ -1050,10 +1059,13 @@ mod tests {
         assert!(make_keygen("yyyy/MM/dd/HH").is_lex_sortable_format());
         assert!(make_keygen("yyyy/MM").is_lex_sortable_format());
         assert!(make_keygen("yyyy").is_lex_sortable_format());
+        assert!(make_keygen("yyyyMMdd").is_lex_sortable_format());
+        assert!(make_keygen("yyyyMMddHH").is_lex_sortable_format());
+        assert!(make_keygen("yyyy-MM-dd").is_lex_sortable_format());
 
         // Not lex-sortable
         assert!(!make_keygen("MM/dd/yyyy").is_lex_sortable_format());
         assert!(!make_keygen("dd/MM/yyyy").is_lex_sortable_format());
-        assert!(!make_keygen("yyyyMMdd").is_lex_sortable_format()); // compound, not splittable
+        assert!(!make_keygen("ddMMyyyy").is_lex_sortable_format());
     }
 }

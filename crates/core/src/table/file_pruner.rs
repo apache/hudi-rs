@@ -121,6 +121,12 @@ impl FilePruner {
     ///
     /// Returns `true` if the file can definitely be pruned (no rows can match).
     fn can_prune_by_filter(&self, filter: &SchemableFilter, col_stats: &ColumnStatistics) -> bool {
+        // Multi-value operators not yet supported for file-level pruning
+        // TODO: support IN/NOT IN by checking if all values are outside the min/max range
+        if filter.operator.is_multi_value() {
+            return false;
+        }
+
         // Get the filter value as an ArrayRef
         let filter_array = self.extract_filter_array(filter);
         let Some(filter_value) = filter_array else {
@@ -156,8 +162,7 @@ impl FilePruner {
                 self.can_prune_gte(&filter_value, max)
             }
             ExprOperator::In | ExprOperator::NotIn => {
-                // TODO: Multi-value operators not yet supported for file-level pruning
-                false
+                unreachable!("Multi-value operators are short-circuited above")
             }
         }
     }
