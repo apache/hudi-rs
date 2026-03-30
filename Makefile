@@ -174,7 +174,6 @@ clean-coverage: ## Remove coverage reports
 SF ?= 0.001
 ENGINE ?= datafusion
 FORMAT ?= hudi
-MODE ?= native
 QUERIES ?=
 HUDI_DIR ?=
 PARQUET_DIR ?=
@@ -188,17 +187,17 @@ tpch-generate: ## Generate TPC-H parquet tables (SF=0.001)
 	$(TPCH_DIR)/run.sh generate --scale-factor $(SF)
 
 .PHONY: tpch-create-tables
-tpch-create-tables: ## Create Hudi COW tables from parquet (SF=0.001, requires Docker)
+tpch-create-tables: ## Create Hudi COW tables from parquet (SF=0.001, requires Spark)
 	$(info --- Create Hudi tables at SF=$(SF) ---)
 	$(TPCH_DIR)/run.sh create-tables --scale-factor $(SF)
 
 .PHONY: bench-tpch
-bench-tpch: ## Run TPC-H benchmark (ENGINE=datafusion|spark SF=0.001 MODE=native|docker QUERIES=1,3,6 HUDI_DIR=gs://...)
-	$(info --- Benchmark at SF=$(SF) MODE=$(MODE) ---)
+bench-tpch: ## Run TPC-H benchmark (ENGINE=datafusion|spark SF=0.001 QUERIES=1,3,6 HUDI_DIR=gs://...)
+	$(info --- Benchmark at SF=$(SF) ---)
 ifeq ($(ENGINE),spark)
-	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(HUDI_DIR),--hudi-dir $(HUDI_DIR)) $(if $(PARQUET_DIR),--parquet-dir $(PARQUET_DIR)) --output-dir $(TPCH_RESULTS_DIR)
+	$(TPCH_DIR)/run.sh bench-spark --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(HUDI_DIR),--hudi-dir $(HUDI_DIR)) $(if $(PARQUET_DIR),--parquet-dir $(PARQUET_DIR)) --output-dir $(TPCH_RESULTS_DIR)
 else ifeq ($(ENGINE),datafusion)
-	MODE=$(MODE) $(TPCH_DIR)/run.sh bench-datafusion --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(HUDI_DIR),--hudi-dir $(HUDI_DIR)) $(if $(PARQUET_DIR),--parquet-dir $(PARQUET_DIR)) --output-dir $(TPCH_RESULTS_DIR)
+	$(TPCH_DIR)/run.sh bench-datafusion --scale-factor $(SF) --format $(FORMAT) $(if $(QUERIES),--queries $(QUERIES)) $(if $(HUDI_DIR),--hudi-dir $(HUDI_DIR)) $(if $(PARQUET_DIR),--parquet-dir $(PARQUET_DIR)) --output-dir $(TPCH_RESULTS_DIR)
 else
 	$(error Unknown ENGINE=$(ENGINE). Use datafusion or spark)
 endif
