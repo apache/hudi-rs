@@ -156,7 +156,7 @@ impl FilePruner {
                 self.can_prune_gte(&filter_value, max)
             }
             ExprOperator::In | ExprOperator::NotIn => {
-                // Multi-value operators not yet supported for file-level pruning
+                // TODO: Multi-value operators not yet supported for file-level pruning
                 false
             }
         }

@@ -27,7 +27,7 @@ use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::Schema;
 
-use crate::config::table::HudiTableConfig::{KeyGeneratorClass, PartitionFields};
+use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType, PartitionFields};
 use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::meta_field::MetaField;
 use std::collections::HashMap;
@@ -51,12 +51,11 @@ pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
         })
         .unwrap_or(false);
 
-    // v8+: also check hoodie.table.keygenerator.type for NON_PARTITION variants
     let uses_non_partitioned_type = hudi_configs
-        .as_options()
-        .get("hoodie.table.keygenerator.type")
+        .try_get(KeyGeneratorType)
         .map(|v| {
-            let upper = v.to_uppercase();
+            let s: String = v.into();
+            let upper = s.to_uppercase();
             upper == "NON_PARTITION" || upper == "NON_PARTITION_AVRO"
         })
         .unwrap_or(false);

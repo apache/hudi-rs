@@ -34,6 +34,7 @@ use log::{debug, warn};
 /// - `NOT` expressions: negates inner binary expression
 /// - `AND` compound expressions: recursively flattens both sides
 /// - `BETWEEN` expressions: converts to `>= low AND <= high`
+/// - `IN` / `NOT IN` expressions: converts to `IN` / `NOT IN` filters
 ///
 /// # OR Expression Handling
 ///
@@ -180,9 +181,9 @@ fn between_to_filters(between: &Between) -> Vec<HudiFilter> {
 
 /// Converts an IN list expression into a HudiFilter with IN or NOT IN operator.
 ///
-/// Returns None if the expression is not supported (non-column expression or non-literal values).
+/// Returns None if the expression cannot be pushed down (non-column expr,
+/// non-literal values, or empty list).
 fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
-    // Extract column name
     let column = match in_list.expr.as_ref() {
         Expr::Column(col) => col,
         _ => {
@@ -191,13 +192,11 @@ fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
         }
     };
 
-    // Skip empty lists
     if in_list.list.is_empty() {
-        debug!("IN list is empty, cannot be pushed down");
+        debug!("Empty IN list cannot be pushed down");
         return None;
     }
 
-    // Extract literal values from the list
     let values: Vec<String> = in_list
         .list
         .iter()
@@ -207,20 +206,17 @@ fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
         })
         .collect();
 
-    // If not all values are literals, skip pushdown
     if values.len() != in_list.list.len() {
         debug!("IN list contains non-literal values, cannot be pushed down");
         return None;
     }
 
     let field = col(column.name());
-    let filter = if in_list.negated {
-        field.not_in_list(values)
+    if in_list.negated {
+        Some(field.not_in_list(values))
     } else {
-        field.in_list(values)
-    };
-
-    Some(filter)
+        Some(field.in_list(values))
+    }
 }
 
 #[cfg(test)]
@@ -259,7 +255,7 @@ mod tests {
             (
                 expected_filter.field_name,
                 expected_filter.operator.to_string(),
-                expected_filter.values[0].clone()
+                expected_filter.values.join(",")
             )
         );
     }
@@ -291,7 +287,7 @@ mod tests {
             (
                 expected_filter.field_name,
                 expected_filter.operator.to_string(),
-                expected_filter.values[0].clone()
+                expected_filter.values.join(",")
             )
         );
     }
@@ -349,7 +345,7 @@ mod tests {
                 &(
                     expected_filter.field_name.clone(),
                     expected_filter.operator.to_string(),
-                    expected_filter.values[0].clone()
+                    expected_filter.values.join(",").clone()
                 )
             );
         }
@@ -390,7 +386,7 @@ mod tests {
                 (
                     expected_filter.field_name,
                     expected_filter.operator.to_string(),
-                    expected_filter.values[0].clone()
+                    expected_filter.values.join(",")
                 )
             );
         }
@@ -705,66 +701,57 @@ mod tests {
 
     #[test]
     fn test_convert_in_list() {
-        // Test: col IN ('a', 'b', 'c') should produce one IN filter
+        // col IN ('a', 'b', 'c')
         let in_list = Expr::InList(InList::new(
             Box::new(col("part")),
             vec![lit("a"), lit("b"), lit("c")],
             false,
         ));
-
         let result = exprs_to_filters(&[in_list]);
-
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "part");
         assert_eq!(result[0].1, "IN");
-        // For IN/NOT IN, values contains the list
-        // The tuple representation joins values with comma
-    }
+        assert_eq!(result[0].2, "a,b,c");
 
-    #[test]
-    fn test_convert_not_in_list() {
-        // Test: col NOT IN ('x', 'y') should produce one NOT IN filter
-        let not_in_list = Expr::InList(InList::new(
+        // col NOT IN ('x', 'y')
+        let not_in = Expr::InList(InList::new(
             Box::new(col("part")),
             vec![lit("x"), lit("y")],
-            true, // negated
+            true,
         ));
-
-        let result = exprs_to_filters(&[not_in_list]);
-
+        let result = exprs_to_filters(&[not_in]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "part");
         assert_eq!(result[0].1, "NOT IN");
-    }
+        assert_eq!(result[0].2, "x,y");
 
-    #[test]
-    fn test_convert_in_list_with_integers() {
-        // Test: col IN (40, 60) should produce one IN filter with integers
-        let in_list = Expr::InList(InList::new(
+        // Integer IN list
+        let in_int = Expr::InList(InList::new(
             Box::new(col("id")),
             vec![lit(40i32), lit(60i32)],
             false,
         ));
-
-        let result = exprs_to_filters(&[in_list]);
-
+        let result = exprs_to_filters(&[in_int]);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "id");
         assert_eq!(result[0].1, "IN");
     }
 
     #[test]
-    fn test_convert_in_list_error_paths() {
-        // Test non-literal values - should not be pushed down
-        let in_list = Expr::InList(InList::new(
+    fn test_convert_in_list_unsupported_cases() {
+        // Empty list
+        let empty = Expr::InList(InList::new(Box::new(col("col1")), vec![], false));
+        assert!(exprs_to_filters(&[empty]).is_empty());
+
+        // Non-literal values
+        let non_lit = Expr::InList(InList::new(
             Box::new(col("col1")),
             vec![col("col2"), col("col3")],
             false,
         ));
-        assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
+        assert!(exprs_to_filters(&[non_lit]).is_empty());
 
-        // Test non-column expression - should not be pushed down
-        let in_list = Expr::InList(InList::new(
+        // Non-column expression
+        let non_col = Expr::InList(InList::new(
             Box::new(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("col1")),
                 Operator::Plus,
@@ -773,10 +760,6 @@ mod tests {
             vec![lit(1i32)],
             false,
         ));
-        assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
-
-        // Test empty IN list - should not be pushed down
-        let in_list = Expr::InList(InList::new(Box::new(col("col1")), vec![], false));
-        assert_eq!(exprs_to_filters(&[in_list]).len(), 0);
+        assert!(exprs_to_filters(&[non_col]).is_empty());
     }
 }

@@ -23,14 +23,13 @@ pub mod timestamp_based;
 
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::table::HudiTableConfig::KeyGeneratorClass;
+use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType};
 use crate::expr::filter::Filter;
 
 /// Returns true if the table uses a timestamp-based key generator,
-/// checking both `hoodie.table.keygenerator.class` (v6) and
-/// `hoodie.table.keygenerator.type` (v8+).
+/// checking both `hoodie.table.keygenerator.class` and
+/// `hoodie.table.keygenerator.type`.
 pub fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> bool {
-    // v6: hoodie.table.keygenerator.class contains "TimestampBasedKeyGenerator"
     let by_class: bool = hudi_configs
         .try_get(KeyGeneratorClass)
         .map(|v| {
@@ -43,12 +42,11 @@ pub fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> bool {
         return true;
     }
 
-    // v8+: hoodie.table.keygenerator.type = "TIMESTAMP" or "TIMESTAMP_AVRO"
-    let options = hudi_configs.as_options();
-    options
-        .get("hoodie.table.keygenerator.type")
+    hudi_configs
+        .try_get(KeyGeneratorType)
         .map(|v| {
-            let upper = v.to_uppercase();
+            let s: String = v.into();
+            let upper = s.to_uppercase();
             upper == "TIMESTAMP" || upper == "TIMESTAMP_AVRO"
         })
         .unwrap_or(false)
