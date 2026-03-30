@@ -107,13 +107,14 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
+use crate::metadata::meta_field::MetaField;
 use crate::schema::resolver::{
     resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
 };
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
-use crate::table::partition::{PARTITION_PATH_FIELD_NAME, PartitionPruner};
+use crate::table::partition::PartitionPruner;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
@@ -276,7 +277,7 @@ impl Table {
         // strings, so use a single _hoodie_partition_path field.
         if is_timestamp_based_keygen(&self.hudi_configs) {
             return Ok(Schema::new(vec![Field::new(
-                PARTITION_PATH_FIELD_NAME,
+                MetaField::PartitionPath.as_ref(),
                 arrow_schema::DataType::Utf8,
                 false,
             )]));
@@ -1012,7 +1013,7 @@ mod tests {
         let schema = hudi_table.get_partition_schema().await;
         assert!(schema.is_ok());
         let schema = schema.unwrap();
-        assert_arrow_field_names_eq!(schema, [PARTITION_PATH_FIELD_NAME]);
+        assert_arrow_field_names_eq!(schema, [MetaField::PartitionPath.as_ref()]);
     }
 
     #[tokio::test]

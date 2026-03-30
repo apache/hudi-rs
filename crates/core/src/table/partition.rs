@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
 pub const EMPTY_PARTITION_PATH: &str = "";
-pub const PARTITION_PATH_FIELD_NAME: &str = "_hoodie_partition_path";
 
 pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
     let has_partition_fields = {
@@ -200,7 +199,7 @@ impl PartitionPruner {
                 &arrow_schema::DataType::Utf8,
             )?;
             return Ok(HashMap::from([(
-                PARTITION_PATH_FIELD_NAME.to_string(),
+                MetaField::PartitionPath.as_ref().to_string(),
                 scalar,
             )]));
         }
@@ -440,7 +439,7 @@ mod tests {
     #[test]
     fn test_transform_filters_for_keygen_timestamp_based() {
         let partition_schema = Schema::new(vec![Field::new(
-            PARTITION_PATH_FIELD_NAME,
+            MetaField::PartitionPath.as_ref(),
             DataType::Utf8,
             false,
         )]);
@@ -475,7 +474,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, PARTITION_PATH_FIELD_NAME);
+        assert_eq!(transformed[0].field_name, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].operator, ExprOperator::Gte);
         assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
 
@@ -506,7 +505,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, PARTITION_PATH_FIELD_NAME);
+        assert_eq!(transformed[0].field_name, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].values[0], "2024/01/25");
 
         // v8 detection via keygenerator.type=TIMESTAMP (no keygenerator.class)
@@ -589,7 +588,7 @@ mod tests {
         ]);
 
         let partition_schema = Schema::new(vec![Field::new(
-            PARTITION_PATH_FIELD_NAME,
+            MetaField::PartitionPath.as_ref(),
             DataType::Utf8,
             false,
         )]);

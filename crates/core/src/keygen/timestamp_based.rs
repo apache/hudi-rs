@@ -25,7 +25,7 @@ use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::expr::filter::Filter;
 use crate::keygen::KeyGeneratorFilterTransformer;
-use crate::table::partition::PARTITION_PATH_FIELD_NAME;
+use crate::metadata::meta_field::MetaField;
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::HashMap;
@@ -497,7 +497,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
             return Ok(vec![filter.clone()]);
         }
 
-        let field_name = PARTITION_PATH_FIELD_NAME.to_string();
+        let field_name = MetaField::PartitionPath.as_ref().to_string();
 
         match filter.operator {
             ExprOperator::Eq | ExprOperator::Ne => {
