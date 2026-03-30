@@ -32,13 +32,13 @@ use arrow_array::RecordBatch;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Table};
+use datafusion::common::ScalarValue;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionConfig;
-use datafusion::common::ScalarValue;
 use hudi::HudiDataSource;
 use serde::{Deserialize, Serialize};
 

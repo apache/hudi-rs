@@ -100,7 +100,7 @@ fn default_iterations() -> usize {
 
 impl ScaleFactorConfig {
     /// Supported scale factors that have config files.
-    const SUPPORTED: &[u64] = &[1, 10, 100, 1000];
+    const SUPPORTED: &[u64] = &[1, 10, 100];
 
     /// Load common table definitions and per-SF overrides, then merge them.
     pub fn load(scale_factor: f64) -> Result<Self, Box<dyn std::error::Error>> {

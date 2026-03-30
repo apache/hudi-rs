@@ -842,16 +842,19 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
-    /// Compute estimated table-level statistics using metadata table and commit metadata.
+    /// Compute estimated table-level statistics from the metadata table for scan planning.
     ///
     /// Returns `(estimated_num_rows, estimated_total_byte_size)` where byte size is the
     /// estimated uncompressed in-memory size.
     ///
     /// The approach:
-    /// 1. Read MDT files partition to get all active files with on-disk sizes (no footer reads)
-    /// 2. Read the latest commit's write stats to compute average row size on disk
-    /// 3. Read ONE Parquet footer from a sampled file to derive compression ratio
-    /// 4. Infer total rows and uncompressed byte size for all files
+    /// 1. Read MDT files partition to get all active base files with on-disk sizes
+    /// 2. Read ONE Parquet footer from a sampled file to derive compression ratio
+    /// 3. Infer total rows and uncompressed byte size for all base files
+    ///
+    /// Only base files are counted (log files are excluded).
+    ///
+    /// TODO: support including log files in the estimation for MOR tables for scan planning.
     ///
     /// Returns `None` if metadata table is not enabled or if statistics cannot be computed.
     pub async fn compute_table_stats(&self) -> Option<(usize, usize)> {
@@ -869,10 +872,17 @@ impl Table {
             .await
             .ok()?;
 
+        // Only count base files (exclude log files which start with '.').
+        let base_file_format: String = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::BaseFileFormat)
+            .into();
+        let base_file_suffix = format!(".{base_file_format}");
         let total_on_disk_size: u64 = records
             .values()
             .filter(|r| !r.is_all_partitions())
             .flat_map(|r| r.active_files_with_sizes())
+            .filter(|(name, _)| name.ends_with(&base_file_suffix))
             .map(|(_, size)| size)
             .sum();
         let sample_file_path = FileSystemView::find_sample_parquet_path_from_records(&records);
