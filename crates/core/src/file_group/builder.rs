@@ -24,6 +24,8 @@ use crate::file_group::log_file::LogFile;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::metadata::table_record::FilesPartitionRecord;
+use crate::storage::file_metadata::FileMetadata;
+use crate::table::fs_view::FileStatsEstimator;
 use crate::timeline::completion_time::CompletionTimeView;
 use dashmap::DashMap;
 use serde_json::{Map, Value};
@@ -151,10 +153,11 @@ pub fn replaced_file_groups_from_replace_commit(
 ///
 /// # Returns
 /// A map of partition paths to their FileGroups.
-pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
+pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
     records: &HashMap<String, FilesPartitionRecord>,
     base_file_extension: &str,
     completion_time_view: &V,
+    estimator: Option<&FileStatsEstimator>,
 ) -> Result<DashMap<String, Vec<FileGroup>>> {
     let file_groups_map = DashMap::new();
     let base_file_suffix = format!(".{base_file_extension}");
@@ -168,7 +171,7 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
         let mut file_id_to_base_files: HashMap<String, Vec<BaseFile>> = HashMap::new();
         let mut file_id_to_log_files: HashMap<String, Vec<LogFile>> = HashMap::new();
 
-        for file_name in record.active_file_names() {
+        for (file_name, file_size) in record.active_files_with_sizes() {
             if file_name.starts_with('.') {
                 // Log file: starts with '.'
                 let mut log_file = LogFile::from_str(file_name).map_err(|e| {
@@ -204,6 +207,18 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                     && base_file.completion_timestamp.is_none()
                 {
                     continue;
+                }
+                // Populate file metadata with on-disk size from MDT,
+                // and estimated byte_size/num_records if estimator is available.
+                if file_size > 0 {
+                    let (byte_size, num_records) =
+                        estimator.map(|e| e.estimate(file_size)).unwrap_or((0, 0));
+                    base_file.file_metadata = Some(FileMetadata {
+                        name: file_name.to_string(),
+                        size: file_size,
+                        byte_size,
+                        num_records,
+                    });
                 }
                 file_id_to_base_files
                     .entry(base_file.file_id.clone())
@@ -669,6 +684,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -685,6 +701,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -708,6 +725,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -741,6 +759,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -777,6 +796,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -803,6 +823,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -831,6 +852,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -857,6 +879,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -884,6 +907,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -915,7 +939,7 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -938,7 +962,7 @@ mod tests {
 
             let view = create_layout_v2_view(&[]);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -965,7 +989,7 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1008,7 +1032,7 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1047,7 +1071,7 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view);
+            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1078,6 +1102,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -1103,6 +1128,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -1131,6 +1157,7 @@ mod tests {
                 &records,
                 "parquet",
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
@@ -1152,6 +1179,7 @@ mod tests {
                 &records,
                 "hfile", // Different base file extension
                 &create_layout_v1_view(),
+                None,
             );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
