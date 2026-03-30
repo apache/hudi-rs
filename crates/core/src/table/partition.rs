@@ -430,16 +430,7 @@ mod tests {
     fn test_partition_filter_try_from_all_operators() {
         let schema = create_test_schema();
         for (op, op_enum) in ExprOperator::TOKEN_OP_PAIRS {
-            let filter = match op_enum {
-                ExprOperator::In | ExprOperator::NotIn => {
-                    // IN/NOT IN require multiple values
-                    Filter::new("count".to_string(), op_enum, vec!["5".to_string()]).unwrap()
-                }
-                _ => {
-                    // Other operators use a single value
-                    Filter::new("count".to_string(), op_enum, vec!["5".to_string()]).unwrap()
-                }
-            };
+            let filter = Filter::new("count".to_string(), op_enum, vec!["5".to_string()]).unwrap();
             let partition_filter = SchemableFilter::try_from((filter, &schema));
             let filter = partition_filter.unwrap();
             assert_eq!(filter.field.name(), "count");

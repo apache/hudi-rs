@@ -36,22 +36,17 @@ pub struct Filter {
 
 impl Filter {
     pub fn new(field_name: String, operator: ExprOperator, values: Vec<String>) -> Result<Self> {
-        match operator {
-            ExprOperator::In | ExprOperator::NotIn => {
-                if values.is_empty() {
-                    return Err(CoreError::Schema(format!(
-                        "IN/NOT IN operator requires at least one value for field '{field_name}'"
-                    )));
-                }
+        if operator.is_multi_value() {
+            if values.is_empty() {
+                return Err(CoreError::Schema(format!(
+                    "{operator} operator requires at least one value for field '{field_name}'"
+                )));
             }
-            _ => {
-                if values.len() != 1 {
-                    return Err(CoreError::Schema(format!(
-                        "Operator {operator} requires exactly one value for field '{field_name}', got {}",
-                        values.len()
-                    )));
-                }
-            }
+        } else if values.len() != 1 {
+            return Err(CoreError::Schema(format!(
+                "Operator {operator} requires exactly one value for field '{field_name}', got {}",
+                values.len()
+            )));
         }
         Ok(Self {
             field_name,
@@ -84,13 +79,14 @@ impl TryFrom<(&str, &str, &str)> for Filter {
         let (field_name, operator_str, field_value) = binary_expr_tuple;
         let field_name = field_name.to_string();
         let operator = ExprOperator::from_str(operator_str)?;
-        let values = match operator {
-            ExprOperator::In | ExprOperator::NotIn => field_value
+        let values = if operator.is_multi_value() {
+            field_value
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect(),
-            _ => vec![field_value.to_string()],
+                .collect()
+        } else {
+            vec![field_value.to_string()]
         };
         Filter::new(field_name, operator, values)
     }

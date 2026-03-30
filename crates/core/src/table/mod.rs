@@ -105,6 +105,7 @@ use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::schema::resolver::{
     resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
@@ -112,7 +113,6 @@ use crate::schema::resolver::{
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
-use crate::keygen::is_timestamp_based_keygen;
 use crate::table::partition::{PARTITION_PATH_FIELD_NAME, PartitionPruner};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};

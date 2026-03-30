@@ -67,6 +67,11 @@ impl ExprOperator {
         ("NOT IN", ExprOperator::NotIn),
     ];
 
+    /// Returns true if the operator expects multiple values (IN, NOT IN).
+    pub fn is_multi_value(&self) -> bool {
+        matches!(self, ExprOperator::In | ExprOperator::NotIn)
+    }
+
     /// Negates the operator.
     pub fn negate(&self) -> Option<ExprOperator> {
         match self {
