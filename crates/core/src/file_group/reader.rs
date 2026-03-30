@@ -116,11 +116,79 @@ impl FileGroupReader {
         relative_path: &str,
     ) -> Result<RecordBatch> {
         log::debug!("FileGroupReader: reading base file '{relative_path}' (non-streaming)");
-        let records: RecordBatch = self
-            .storage
-            .get_parquet_file_data(relative_path)
-            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
-            .await?;
+
+        // If the caller supplied output columns, extend them with the fields
+        // required for a correct MOR merge before projecting the parquet read.
+        let output_columns: Option<String> = self
+            .hudi_configs
+            .try_get(HudiReadConfig::OutputColumns)
+            .map(|v| v.into());
+
+        let records: RecordBatch = if let Some(ref cols_str) = output_columns {
+            let mut projection: Vec<String> = cols_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            // Always required for RecordMerger dedup / sort.
+            let merge_cols = [
+                MetaField::RecordKey.as_ref(),
+                MetaField::CommitSeqno.as_ref(),
+            ];
+            for col in &merge_cols {
+                if !projection.iter().any(|c| c == col) {
+                    projection.push(col.to_string());
+                }
+            }
+
+            // Ordering field (e.g. "ts") is needed for EVENT_TIME_ORDERING.
+            let ordering_field: Option<String> = self
+                .hudi_configs
+                .try_get(HudiTableConfig::PrecombineField)
+                .map(|v| v.into());
+            if let Some(ref of) = ordering_field {
+                if !projection.iter().any(|c| c == of) {
+                    projection.push(of.clone());
+                }
+            }
+
+            // _hoodie_commit_time is required by RecordMerger (create_commit_time_ordering_converter)
+            // whenever meta fields are present, regardless of time-travel mode.
+            let populates_meta_fields: bool = self
+                .hudi_configs
+                .get_or_default(HudiTableConfig::PopulatesMetaFields)
+                .into();
+            if populates_meta_fields {
+                let ct = MetaField::CommitTime.as_ref().to_string();
+                if !projection.iter().any(|c| c == &ct) {
+                    projection.push(ct);
+                }
+            }
+
+            log::debug!(
+                "FileGroupReader: projecting {n} cols for '{relative_path}': [{cols}]",
+                n = projection.len(),
+                cols = projection.join(", "),
+            );
+
+            self.storage
+                .get_parquet_file_data_with_options(
+                    relative_path,
+                    ParquetReadOptions::new().with_projection(projection),
+                )
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+                })
+                .await?
+        } else {
+            self.storage
+                .get_parquet_file_data(relative_path)
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+                })
+                .await?
+        };
 
         let populates_meta_fields: bool = self
             .hudi_configs
@@ -262,6 +330,42 @@ impl FileGroupReader {
                 .read_file_slice_by_base_file_path(base_file_path)
                 .await?;
             let schema = base_batch.schema();
+
+            // When column projection is active, the base batch may have fewer columns
+            // than the log batches (which are always read in full from the log scanner).
+            // Project each log data batch down to the base schema so concat_batches
+            // receives uniformly-schemaed inputs.
+            let log_batches = if let Some(first) = log_batches.data_batches.first() {
+                if first.num_columns() > schema.fields().len() {
+                    let indices: Vec<usize> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            first
+                                .schema()
+                                .index_of(f.name())
+                                .map_err(CoreError::ArrowError)
+                        })
+                        .collect::<Result<_>>()?;
+                    let mut projected = RecordBatches::new_with_capacity(
+                        log_batches.num_data_batches(),
+                        log_batches.num_delete_batches(),
+                    );
+                    for batch in &log_batches.data_batches {
+                        projected
+                            .push_data_batch(batch.project(&indices).map_err(CoreError::ArrowError)?);
+                    }
+                    for (batch, ts) in log_batches.delete_batches {
+                        projected.push_delete_batch(batch, ts);
+                    }
+                    projected
+                } else {
+                    log_batches
+                }
+            } else {
+                log_batches
+            };
+
             let num_data_batches = log_batches.num_data_batches() + 1;
             let num_delete_batches = log_batches.num_delete_batches();
             let mut all_batches =

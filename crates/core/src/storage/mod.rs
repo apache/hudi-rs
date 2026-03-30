@@ -304,6 +304,28 @@ impl Storage {
         Ok(concat_batches(&schema, &batches)?)
     }
 
+    /// Same as [get_parquet_file_data] but applies column projection from `options`.
+    /// Delegates to [get_parquet_file_stream] so the "Parquet column projection" log fires.
+    pub async fn get_parquet_file_data_with_options(
+        &self,
+        relative_path: &str,
+        options: ParquetReadOptions,
+    ) -> Result<RecordBatch> {
+        let file_stream = self
+            .get_parquet_file_stream(relative_path, options)
+            .await?;
+        let schema = file_stream.schema().clone();
+        let mut pinned = Box::pin(file_stream.into_stream());
+        let mut batches = Vec::new();
+        while let Some(r) = pinned.next().await {
+            batches.push(r?);
+        }
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
     /// Get a streaming reader for a Parquet file.
     ///
     /// Returns a [ParquetFileStream] that yields record batches as they are read,
@@ -394,7 +416,23 @@ impl Storage {
             );
         }
 
-        let schema = builder.schema().clone();
+        // builder.schema() always returns the full file schema regardless of projection.
+        // Build the projected schema explicitly so callers that consume the stream
+        // (e.g. get_parquet_file_data_with_options) can use the correct column count.
+        // IMPORTANT: preserve the parquet file's column order (not the caller's order),
+        // because the stream yields columns in file order after projection.
+        let schema = if let Some(ref column_names) = options.projection {
+            let full_schema = builder.schema();
+            let projected_fields: Vec<arrow_schema::FieldRef> = full_schema
+                .fields()
+                .iter()
+                .filter(|f| column_names.iter().any(|n| n == f.name()))
+                .cloned()
+                .collect();
+            Arc::new(arrow_schema::Schema::new(projected_fields))
+        } else {
+            builder.schema().clone()
+        };
         let stream = builder.build()?;
 
         Ok(ParquetFileStream {

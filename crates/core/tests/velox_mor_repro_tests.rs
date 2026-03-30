@@ -66,7 +66,6 @@
 //! logs must be identical for the repro to be valid.
 
 use arrow_array::{Array, Int32Array, StringArray};
-use hudi_core::config::util::empty_options;
 use hudi_core::error::Result;
 use hudi_core::file_group::FileGroup;
 use hudi_core::file_group::reader::FileGroupReader;
@@ -202,12 +201,21 @@ async fn test_velox_mor_repro_partitioned_table() -> Result<()> {
     // always passes java.util.Collections.emptyList() for hudiOptions.
     // hudi-rs resolves all table config from hoodie.properties at baseUri.
     // =========================================================================
+    // Simulates what HudiSplitReader::prepareSplit() will do after the fix:
+    // serialize readerOutputType_ (Spark's ReadSchema columns) into hudiOptions.
+    // For this test table the query selects id, name, age — matching the 3-col ReadSchema
+    // used in the acceptance-criteria Spark run.
+    let output_cols = "id,name,age";
     eprintln!(
         "[VELOX-REPRO] prepareSplit: creating FileGroupReader\
          \n[VELOX-REPRO]   baseUri={BASE_URI}\
-         \n[VELOX-REPRO]   hudiOptions=0  (empty — loaded from hoodie.properties)"
+         \n[VELOX-REPRO]   hudiOptions=1  hoodie.read.output.columns={output_cols}"
     );
-    let reader = FileGroupReader::new_with_options(BASE_URI, empty_options()).await?;
+    let reader = FileGroupReader::new_with_options(
+        BASE_URI,
+        [("hoodie.read.output.columns", output_cols)],
+    )
+    .await?;
     eprintln!("[VELOX-REPRO] prepareSplit: FileGroupReader created OK");
 
     // =========================================================================
@@ -279,6 +287,49 @@ async fn test_velox_mor_repro_partitioned_table() -> Result<()> {
         // -----------------------------------------------------------------------
         // Assertions
         // -----------------------------------------------------------------------
+
+        // Column projection: must have exactly 7 cols (output + merge-required),
+        // NOT all 10 from the parquet file.
+        // Expected: _hoodie_commit_time, _hoodie_commit_seqno, _hoodie_record_key, id, name, age, ts
+        // (_hoodie_commit_time is required by RecordMerger for delete-marker comparison)
+        let expected_cols = [
+            "_hoodie_commit_time",
+            "_hoodie_record_key",
+            "_hoodie_commit_seqno",
+            "id",
+            "name",
+            "age",
+            "ts",
+        ];
+        assert_eq!(
+            batch.num_columns(),
+            expected_cols.len(),
+            "[{}] Expected {} projected cols, got {} — schema: {:?}",
+            case.partition_path,
+            expected_cols.len(),
+            batch.num_columns(),
+            batch.schema()
+        );
+        let schema = batch.schema();
+        let actual_col_names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        for expected in &expected_cols {
+            assert!(
+                actual_col_names.contains(expected),
+                "[{}] Column '{}' missing from projected schema: {:?}",
+                case.partition_path,
+                expected,
+                actual_col_names,
+            );
+        }
+        eprintln!(
+            "[VELOX-REPRO]   column projection OK: {} cols {:?}",
+            batch.num_columns(),
+            actual_col_names,
+        );
 
         // Row count: each partition has 2 rows after MOR merge
         assert_eq!(
