@@ -25,7 +25,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   check-pr:
@@ -39,12 +38,10 @@ jobs:
           node-version: 20
 
       - name: Linting commit
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           npm i -g conventional-changelog-conventionalcommits
           npm i -g commitlint@latest
-          echo "${{ github.event.pull_request.title }}" | npx commitlint
+          echo "$PR_TITLE" | npx commitlint
 
-      - name: Labeling
-        uses: actions/labeler@v6
-        # disable until figuring out a way to do this without pull_request_target
-        if: false
