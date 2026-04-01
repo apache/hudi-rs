@@ -23,6 +23,19 @@ use cxx::{CxxString, CxxVector};
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
+use std::sync::OnceLock;
+
+static LOGGER: OnceLock<()> = OnceLock::new();
+
+/// Initialize env_logger exactly once for the lifetime of the loaded shared library.
+///
+/// Reads RUST_LOG from the environment at the time the first FileGroupReader is created.
+/// Example: RUST_LOG=hudi_core=debug enables all hudi-core debug logs.
+fn init_logger() {
+    LOGGER.get_or_init(|| {
+        let _ = env_logger::try_init();
+    });
+}
 
 #[cxx::bridge]
 mod ffi {
@@ -67,6 +80,8 @@ pub fn new_file_group_reader_with_options(
     base_uri: &CxxString,
     options: &CxxVector<CxxString>,
 ) -> std::result::Result<Box<HudiFileGroupReader>, String> {
+    init_logger();
+
     let base_uri = base_uri
         .to_str()
         .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;

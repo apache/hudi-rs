@@ -27,11 +27,11 @@ use apache_avro::{
     types::Value,
 };
 use arrow::array::{
-    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, LargeStringArray,
-    ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StringBuilder,
-    StringDictionaryBuilder, make_array,
+    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, Decimal128Builder,
+    LargeStringArray, ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray,
+    StringBuilder, StringDictionaryBuilder, make_array,
 };
-use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
+use arrow::array::{BinaryArray, BooleanArray, FixedSizeBinaryArray, GenericListArray, MapArray};
 use arrow::buffer::{Buffer, MutableBuffer};
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNumericType, ArrowPrimitiveType, DataType, Date32Type, Date64Type,
@@ -393,9 +393,10 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                 _ => Err(SchemaError("unsupported dictionary key type".to_string())),
             }
         } else {
-            Err(SchemaError(
-                "dictionary types other than UTF-8 not yet supported".to_string(),
-            ))
+            Err(SchemaError(format!(
+                "dictionary types other than UTF-8 not yet supported: col={col_name} key={key_type:?} value={value_type:?} full_schema={:?}",
+                self.schema
+            )))
         }
     }
 
@@ -730,6 +731,41 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             .build()?;
                         make_array(data)
                     }
+                    DataType::Decimal128(precision, scale) => {
+                        let mut builder = Decimal128Builder::with_capacity(rows.len())
+                            .with_data_type(DataType::Decimal128(*precision, *scale));
+                        for row in rows {
+                            let maybe_value = self.field_lookup(&field_path, row);
+                            match maybe_value.map(maybe_resolve_union) {
+                                None | Some(Value::Null) => builder.append_null(),
+                                Some(Value::Decimal(d)) => {
+                                    let bytes = Vec::<u8>::try_from(d).map_err(|e| {
+                                        SchemaError(format!("Decimal bytes error: {e}"))
+                                    })?;
+                                    // Sign-extend big-endian two's-complement bytes to 16 bytes
+                                    let sign_byte =
+                                        if bytes.first().map_or(0, |b| *b) & 0x80 != 0 {
+                                            0xFFu8
+                                        } else {
+                                            0u8
+                                        };
+                                    let mut buf = [sign_byte; 16];
+                                    let n = bytes.len().min(16);
+                                    buf[16 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
+                                    builder.append_value(i128::from_be_bytes(buf));
+                                }
+                                Some(other) => {
+                                    return Err(SchemaError(format!(
+                                        "Expected Decimal value, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
+                    }
+                    DataType::Map(entries_field, _) => {
+                        self.build_map_array(rows, &field_path, entries_field)?
+                    }
                     _ => {
                         return Err(SchemaError(format!(
                             "type {} not supported",
@@ -769,11 +805,134 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
         array.to_data()
     }
 
+    /// Build an Arrow `MapArray` for a single Map-typed field across `rows`.
+    ///
+    /// `entries_field` is the inner `Struct([key: Utf8, value: V])` field as encoded in
+    /// `DataType::Map(entries_field, _)`.  AVRO maps always have `String` keys.
+    fn build_map_array(
+        &self,
+        rows: RecordSlice,
+        field_path: &str,
+        entries_field: &Arc<Field>,
+    ) -> ArrowResult<ArrayRef> {
+        let (key_field, value_field) = match entries_field.data_type() {
+            DataType::Struct(fields) if fields.len() == 2 => (&fields[0], &fields[1]),
+            _ => {
+                return Err(SchemaError(
+                    "Map entries_field must be Struct with 2 fields".to_string(),
+                ))
+            }
+        };
+
+        let n = rows.len();
+        let mut offsets: Vec<i32> = Vec::with_capacity(n + 1);
+        offsets.push(0);
+        let mut map_nulls = MutableBuffer::from_len_zeroed(bit_util::ceil(n, 8));
+        let mut all_keys: Vec<Option<String>> = Vec::new();
+        let mut all_values: Vec<&Value> = Vec::new();
+
+        for (i, row) in rows.iter().enumerate() {
+            let v = self.field_lookup(field_path, row);
+            let v = v.map(maybe_resolve_union);
+            match v {
+                None | Some(Value::Null) => {
+                    offsets.push(*offsets.last().unwrap());
+                }
+                Some(Value::Map(map)) => {
+                    bit_util::set_bit(&mut map_nulls, i);
+                    for (k, val) in map.iter() {
+                        all_keys.push(Some(k.clone()));
+                        all_values.push(val);
+                    }
+                    let prev = *offsets.last().unwrap();
+                    offsets.push(prev + map.len() as i32);
+                }
+                _ => {
+                    return Err(SchemaError(format!(
+                        "Expected Map value at '{field_path}'"
+                    )))
+                }
+            }
+        }
+
+        let entry_count = all_keys.len();
+
+        // Key array is always Utf8.
+        let key_array: ArrayRef = Arc::new(all_keys.into_iter().collect::<StringArray>());
+
+        // Value array depends on the declared value type.
+        let value_array =
+            build_flat_values_array(&all_values, value_field.data_type())?;
+
+        // Entries StructArray (no null buffer — individual map entries are always present).
+        let entries_data = ArrayData::builder(entries_field.data_type().clone())
+            .len(entry_count)
+            .add_child_data(key_array.to_data())
+            .add_child_data(value_array.to_data())
+            .build()
+            .map_err(|e| SchemaError(format!("MapArray entries build error: {e}")))?;
+
+        // MapArray = offsets buffer + child StructArray.
+        let map_data = ArrayData::builder(DataType::Map(entries_field.clone(), false))
+            .len(n)
+            .add_buffer(Buffer::from_slice_ref(&offsets))
+            .add_child_data(entries_data)
+            .null_bit_buffer(Some(map_nulls.into()))
+            .build()
+            .map_err(|e| SchemaError(format!("MapArray build error: {e}")))?;
+
+        Ok(Arc::new(MapArray::from(map_data)))
+    }
+
     fn field_lookup<'b>(&self, name: &str, row: &'b [(String, Value)]) -> Option<&'b Value> {
         self.schema_lookup
             .get(name)
             .and_then(|i| row.get(*i))
             .map(|o| &o.1)
+    }
+}
+
+/// Build an Arrow array from a flat slice of AVRO `Value`s for a known `DataType`.
+/// Used to construct the value child of a `MapArray`.
+fn build_flat_values_array(values: &[&Value], data_type: &DataType) -> ArrowResult<ArrayRef> {
+    macro_rules! build_primitive {
+        ($t:ty) => {
+            Ok(Arc::new(
+                values
+                    .iter()
+                    .map(|v| resolve_item::<$t>(v))
+                    .collect::<PrimitiveArray<$t>>(),
+            ) as ArrayRef)
+        };
+    }
+    match data_type {
+        DataType::Int8 => build_primitive!(Int8Type),
+        DataType::Int16 => build_primitive!(Int16Type),
+        DataType::Int32 => build_primitive!(Int32Type),
+        DataType::Int64 => build_primitive!(Int64Type),
+        DataType::UInt8 => build_primitive!(UInt8Type),
+        DataType::UInt16 => build_primitive!(UInt16Type),
+        DataType::UInt32 => build_primitive!(UInt32Type),
+        DataType::UInt64 => build_primitive!(UInt64Type),
+        DataType::Float32 => build_primitive!(Float32Type),
+        DataType::Float64 => build_primitive!(Float64Type),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let arr: StringArray = values
+                .iter()
+                .map(|v| resolve_string(v).ok().flatten())
+                .collect();
+            Ok(Arc::new(arr) as ArrayRef)
+        }
+        DataType::Boolean => {
+            let arr: BooleanArray = values
+                .iter()
+                .map(|v| resolve_boolean(maybe_resolve_union(v)))
+                .collect();
+            Ok(Arc::new(arr) as ArrayRef)
+        }
+        other => Err(SchemaError(format!(
+            "Map value type {other} not yet supported"
+        ))),
     }
 }
 
@@ -928,5 +1087,103 @@ where
             Value::Null => None,
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apache_avro::Decimal;
+    use apache_avro::types::Value as AvroValue;
+    use apache_avro::Schema as AvroSchema;
+    use arrow::array::{Decimal128Array, Int32Array, MapArray, StringArray};
+
+    /// Build a single-row AvroArrowArrayReader and return its first RecordBatch.
+    fn read_one_row(
+        avro_schema_json: &str,
+        field_name: &str,
+        value: AvroValue,
+    ) -> RecordBatch {
+        let schema = AvroSchema::parse_str(avro_schema_json).unwrap();
+        let row = AvroValue::Record(vec![(field_name.to_string(), value)]);
+        let iter = std::iter::once(Ok(row));
+        let mut reader = AvroArrowArrayReader::try_new(iter, &schema).unwrap();
+        reader.next_batch(10).unwrap().unwrap()
+    }
+
+    #[test]
+    fn test_decimal128_round_trip() {
+        // 9999 big-endian = 0x270F; with precision=10, scale=2 this represents 99.99
+        let avro_schema_json = r#"{
+            "type": "record",
+            "name": "R",
+            "fields": [{
+                "name": "col_decimal",
+                "type": {
+                    "type": "bytes",
+                    "logicalType": "decimal",
+                    "precision": 10,
+                    "scale": 2
+                }
+            }]
+        }"#;
+
+        let decimal_value = AvroValue::Decimal(Decimal::from(vec![0x27u8, 0x0Fu8]));
+        let batch = read_one_row(avro_schema_json, "col_decimal", decimal_value);
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("expected Decimal128Array");
+
+        assert_eq!(col.len(), 1);
+        assert_eq!(col.value(0), 9999_i128);
+        assert_eq!(col.precision(), 10);
+        assert_eq!(col.scale(), 2);
+    }
+
+    #[test]
+    fn test_map_int_values() {
+        let avro_schema_json = r#"{
+            "type": "record",
+            "name": "R",
+            "fields": [{
+                "name": "col_map",
+                "type": {"type": "map", "values": "int"}
+            }]
+        }"#;
+
+        // Build a deterministic single-entry map so assertions are simple.
+        let mut map_data = std::collections::HashMap::new();
+        map_data.insert("k1".to_string(), AvroValue::Int(42));
+        let map_value = AvroValue::Map(map_data);
+
+        let batch = read_one_row(avro_schema_json, "col_map", map_value);
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("expected MapArray");
+
+        assert_eq!(col.len(), 1);
+
+        let entries = col.value(0); // StructArray for row 0
+        assert_eq!(entries.len(), 1);
+
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("expected StringArray keys");
+        assert_eq!(keys.value(0), "k1");
+
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("expected Int32Array values");
+        assert_eq!(values.value(0), 42);
     }
 }

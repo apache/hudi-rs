@@ -95,6 +95,27 @@ impl PartitionPruner {
             .get_or_default(HudiTableConfig::IsPartitionPathUrlencoded)
             .into();
         let is_partitioned = is_table_partitioned(hudi_configs);
+
+        if and_filters.is_empty() {
+            log::debug!(
+                "PartitionPruner: no filters — all partitions included \
+                 (hive_style={is_hive_style}, url_encoded={is_url_encoded}, \
+                 partitioned={is_partitioned})"
+            );
+        } else {
+            let exprs: Vec<String> = transformed_filters
+                .iter()
+                .map(|f| format!("{} {} {}", f.field_name, f.operator, f.field_value))
+                .collect();
+            log::debug!(
+                "PartitionPruner: {} filter(s): [{}] \
+                 (hive_style={is_hive_style}, url_encoded={is_url_encoded}, \
+                 partitioned={is_partitioned})",
+                and_filters.len(),
+                exprs.join(" AND "),
+            );
+        }
+
         Ok(PartitionPruner {
             schema,
             is_hive_style,
@@ -127,22 +148,49 @@ impl PartitionPruner {
 
     /// Returns `true` if the partition path should be included based on the filters.
     pub fn should_include(&self, partition_path: &str) -> bool {
+        if self.and_filters.is_empty() {
+            return true;
+        }
+
         let segments = match self.parse_segments(partition_path) {
             Ok(s) => s,
-            Err(_) => return true, // Include the partition regardless of parsing error
+            Err(e) => {
+                log::debug!(
+                    "PartitionPruner: parse error for '{}': {e} — including conservatively",
+                    partition_path
+                );
+                return true;
+            }
         };
 
-        self.and_filters.iter().all(|filter| {
+        let included = self.and_filters.iter().all(|filter| {
             match segments.get(filter.field.name()) {
                 Some(segment_value) => {
                     match filter.apply_comparison(segment_value) {
                         Ok(scalar) => scalar.value(0),
-                        Err(_) => true, // Include the partition when comparison error occurs
+                        Err(_) => true,
                     }
                 }
-                None => true, // Include the partition when filtering field does not match any field in the partition
+                None => true,
             }
-        })
+        });
+
+        if !included {
+            let filter_exprs: Vec<String> = self
+                .and_filters
+                .iter()
+                .map(|f| format!("{} {}", f.field.name(), f.operator))
+                .collect();
+            log::debug!(
+                "PartitionPruner: pruning '{}' (filters: [{}])",
+                partition_path,
+                filter_exprs.join(" AND "),
+            );
+        } else {
+            log::debug!("PartitionPruner: including '{}'", partition_path);
+        }
+
+        included
     }
 
     /// Transforms user filters on data columns to filters on partition path columns
