@@ -184,7 +184,8 @@ mod tests {
         assert_eq!(base_file.commit_timestamp, "20240402144910683");
         let file_metadata = base_file.file_metadata.unwrap();
         assert_eq!(file_metadata.size, 1024);
-        assert!(!file_metadata.fully_populated);
+        assert_eq!(file_metadata.byte_size, 0);
+        assert_eq!(file_metadata.num_records, 0);
     }
 
     #[test]
