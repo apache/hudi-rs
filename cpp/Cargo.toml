@@ -39,6 +39,7 @@ arrow = { workspace = true , features = ["ffi"]}
 arrow-array = { workspace = true , features = ["ffi"]}
 tokio = { workspace = true }
 env_logger = { version = "0.11" }
+log = { version = "0.4" }
 
 [build-dependencies]
 cxx-build = { version = "1.0" }
