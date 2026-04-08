@@ -114,7 +114,20 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         latest_instant_time: &str,
         record_key_field: &str,
     ) -> Result<RecordBufferLoadResult> {
-        let merge_mode = "EVENT_TIME_ORDERING".to_string();
+        // Read merge mode from config (hoodie.record.merge.mode).
+        // Default to EVENT_TIME_ORDERING if not set.
+        let merge_mode = hudi_configs
+            .as_options()
+            .get("hoodie.record.merge.mode")
+            .cloned()
+            .unwrap_or_else(|| "EVENT_TIME_ORDERING".to_string());
+
+        log::debug!(
+            "[DefaultFileGroupRecordBufferLoader] getRecordBuffer: merge_mode={merge_mode} \
+             record_key_field={record_key_field} ordering_fields={ordering_field_names:?} \
+             log_files={} latest_instant_time={latest_instant_time}",
+            input_split.log_file_paths.len(),
+        );
 
         // STEP: Instantiate buffer (strategy selection)
         let record_buffer = Box::new(KeyBasedFileGroupRecordBuffer::new(

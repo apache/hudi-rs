@@ -165,6 +165,19 @@ impl HoodieFileGroupReader {
         latest_instant_time: String,
         record_key_field: String,
     ) -> Self {
+        log::debug!(
+            "HoodieFileGroupReader::new partition={} base_file={} log_files={} \
+             ordering_fields={:?} latest_instant_time={} record_key_field={}",
+            input_split.partition_path,
+            input_split.base_file_path.as_deref().unwrap_or("<none>"),
+            input_split.log_file_paths.len(),
+            ordering_field_names,
+            latest_instant_time,
+            record_key_field,
+        );
+        for (i, lf) in input_split.log_file_paths.iter().enumerate() {
+            log::debug!("  log_file[{i}]: {lf}");
+        }
         Self {
             hudi_configs,
             storage,
@@ -213,11 +226,30 @@ impl HoodieFileGroupReader {
     ///        → recordBuffer.setBaseFileIterator(baseFileIterator)
     /// ```
     async fn init_record_iterators(&mut self) -> Result<RecordBatch> {
+        log::debug!(
+            "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
+            self.input_split.partition_path,
+            self.input_split.base_file_path.as_deref().unwrap_or("<none>"),
+            self.input_split.log_file_paths.len(),
+        );
+
         // Step 1: Make base file iterator (read base file data)
         let base_file_batches = self.make_base_file_batches().await?;
+        let base_rows: usize = base_file_batches.iter().map(|b| b.num_rows()).sum();
+        log::debug!(
+            "[HoodieFileGroupReader] makeBaseFileIterator: {} batches, {} total rows",
+            base_file_batches.len(),
+            base_rows,
+        );
+        if let Some(first) = base_file_batches.first() {
+            let schema = first.schema();
+            let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            log::debug!("[HoodieFileGroupReader] base file schema: {:?}", field_names);
+        }
 
         // Step 2: If no records to merge (no log files), return base file data directly
         if self.input_split.has_no_records_to_merge() {
+            log::debug!("[HoodieFileGroupReader] no log files → returning base file data directly ({base_rows} rows)");
             if base_file_batches.is_empty() {
                 return Err(CoreError::ReadFileSliceError(
                     "No base file data to read".to_string(),
@@ -235,6 +267,11 @@ impl HoodieFileGroupReader {
         }
 
         // Step 3: Load record buffer (scan log files + create buffer)
+        log::debug!(
+            "[HoodieFileGroupReader] scanning {} log file(s) with latest_instant_time={}",
+            self.input_split.log_file_paths.len(),
+            self.latest_instant_time,
+        );
         let instant_range = self.create_instant_range();
         let load_result = self
             .record_buffer_loader
@@ -254,11 +291,31 @@ impl HoodieFileGroupReader {
         let mut record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
 
+        log::debug!(
+            "[HoodieFileGroupReader] log scan complete: buffer_size={} valid_instants={:?} \
+             stats: log_blocks={} log_records={} corrupt={} rollbacks={}",
+            record_buffer.size(),
+            self.valid_block_instants,
+            self.read_stats.total_log_blocks,
+            self.read_stats.total_log_records,
+            self.read_stats.total_corrupt_log_blocks,
+            self.read_stats.total_rollback_blocks,
+        );
+
         // Step 4: Set base file iterator on the buffer
         record_buffer.set_base_file_iterator(base_file_batches);
+        log::debug!(
+            "[HoodieFileGroupReader] set base file iterator ({base_rows} rows), starting merge_and_collect"
+        );
 
         // Step 5: Merge and collect
-        record_buffer.merge_and_collect()
+        let result = record_buffer.merge_and_collect()?;
+        log::debug!(
+            "[HoodieFileGroupReader] merge_and_collect complete: {} rows, {} columns",
+            result.num_rows(),
+            result.num_columns(),
+        );
+        Ok(result)
     }
 
     /// Read base file data.

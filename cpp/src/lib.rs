@@ -31,16 +31,18 @@ static LOGGER: OnceLock<()> = OnceLock::new();
 
 /// Initialize env_logger exactly once for the lifetime of the loaded shared library.
 ///
-/// Always enables `debug` level for all `hudi*` modules regardless of `RUST_LOG`.
-/// `RUST_LOG` directives are still parsed on top and can raise the floor for other crates.
+/// Defaults to debug-level logging for the entire repo. If RUST_LOG is already
+/// set, it is respected as-is.
 fn init_logger() {
     LOGGER.get_or_init(|| {
-        let _ = env_logger::Builder::new()
-            .filter_module("hudi", log::LevelFilter::Debug)
-            .parse_default_env()
-            .try_init();
+        match std::env::var("RUST_LOG") {
+            Ok(_) => {}
+            Err(_) => unsafe { std::env::set_var("RUST_LOG", "debug") },
+        }
+        let _ = env_logger::try_init();
     });
 }
+
 
 #[cxx::bridge]
 mod ffi {

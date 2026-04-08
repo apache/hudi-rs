@@ -92,23 +92,36 @@ pub fn forward_scan_pass1(
     let mut total_corrupt_blocks: u64 = 0;
     let mut total_rollbacks: u64 = 0;
 
+    log::debug!(
+        "[Pass1] forward_scan: {} total blocks, latest_instant_time={}, has_instant_range={}",
+        all_blocks.len(),
+        latest_instant_time,
+        instant_range.is_some(),
+    );
+
     for block in all_blocks {
         total_log_blocks += 1;
 
         // Gate 1: Corrupt blocks → skip
         if block.block_type == BlockType::Corrupted {
+            log::debug!("[Pass1] Gate1: corrupt block #{total_log_blocks} skipped");
             total_corrupt_blocks += 1;
             continue;
         }
 
         let instant_time = match block.instant_time() {
             Ok(t) => t.to_string(),
-            Err(_) => continue,
+            Err(_) => {
+                log::debug!("[Pass1] block #{total_log_blocks} has no instant time, skipping");
+                continue;
+            }
         };
 
         // Gate 2: Future blocks → skip (instant > latestInstantTime)
-        // Only applies to data/delete blocks (not command blocks)
         if block.block_type != BlockType::Command && instant_time.as_str() > latest_instant_time {
+            log::debug!(
+                "[Pass1] Gate2: future block #{total_log_blocks} instant={instant_time} > {latest_instant_time}, skipped"
+            );
             continue;
         }
 
@@ -118,10 +131,18 @@ pub fn forward_scan_pass1(
         if block.block_type != BlockType::Command {
             if let Some(range) = instant_range {
                 if range.not_in_range(&instant_time, timezone)? {
+                    log::debug!(
+                        "[Pass1] Gate4: block #{total_log_blocks} instant={instant_time} out of range, skipped"
+                    );
                     continue;
                 }
             }
         }
+
+        log::debug!(
+            "[Pass1] block #{total_log_blocks} passed all gates: type={:?} instant={instant_time}",
+            block.block_type,
+        );
 
         // Classify the block
         match block.block_type {
@@ -142,6 +163,7 @@ pub fn forward_scan_pass1(
                     total_rollbacks += 1;
                     if let Ok(target) = block.target_instant_time() {
                         let target = target.to_string();
+                        log::debug!("[Pass1] ROLLBACK: removing instant={target}");
                         target_rollback_instants.insert(target.clone());
                         ordered_instants_list.retain(|t| t != &target);
                         instant_to_blocks_map.remove(&target);
@@ -150,6 +172,21 @@ pub fn forward_scan_pass1(
             }
             _ => {}
         }
+    }
+
+    log::debug!(
+        "[Pass1] complete: ordered_instants={:?} total_blocks={} corrupt={} rollbacks={}",
+        ordered_instants_list,
+        total_log_blocks,
+        total_corrupt_blocks,
+        total_rollbacks,
+    );
+    for (instant, blocks) in &instant_to_blocks_map {
+        log::debug!(
+            "[Pass1]   instant={instant}: {} block(s) [{:?}]",
+            blocks.len(),
+            blocks.iter().map(|b| format!("{:?}", b.block_type)).collect::<Vec<_>>(),
+        );
     }
 
     Ok(Pass1Result {
@@ -198,6 +235,11 @@ pub struct Pass2Result {
 /// **Invariant 4**: `current_instant_log_blocks` is ordered latest-first (reverse chronological).
 /// Drain via `pop_back` produces oldest-first processing order.
 pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
+    log::debug!(
+        "[Pass2] reverse_scan: {} instants to process (newest→oldest)",
+        pass1.ordered_instants_list.len(),
+    );
+
     let mut current_instant_log_blocks: VecDeque<LogBlock> = VecDeque::new();
     let mut instant_times_included: HashSet<String> = HashSet::new();
     let mut valid_block_instants: Vec<String> = Vec::new();
@@ -260,6 +302,12 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
             }
         }
     }
+
+    log::debug!(
+        "[Pass2] complete: {} blocks in deque, valid_instants={:?}",
+        current_instant_log_blocks.len(),
+        valid_block_instants,
+    );
 
     Pass2Result {
         current_instant_log_blocks,
@@ -369,26 +417,59 @@ impl BaseHoodieLogRecordReader {
         &mut self,
         log_blocks: &mut VecDeque<LogBlock>,
     ) -> Result<()> {
+        log::debug!(
+            "[Pass3] processQueuedBlocksForInstant: {} blocks to process (pop_back = oldest first)",
+            log_blocks.len(),
+        );
+        let mut block_num = 0u64;
+
         while let Some(mut block) = log_blocks.pop_back() {
+            block_num += 1;
+            let instant_time = block.instant_time().unwrap_or("unknown").to_string();
+            log::debug!(
+                "[Pass3] block #{block_num}: type={:?} instant={instant_time} content_empty={} has_location={}",
+                block.block_type,
+                block.content.is_empty(),
+                block.content_location.is_some(),
+            );
+
             // Lazy inflate: load and decode block content from storage on demand.
-            // Mirrors Java's HoodieDataBlock.readRecordsFromBlockPayload() calling inflate().
             block
                 .inflate(self.hudi_configs.clone(), self.storage.clone())
                 .await?;
 
-            let instant_time = block.instant_time().unwrap_or("unknown").to_string();
+            log::debug!(
+                "[Pass3] block #{block_num} inflated: content_empty={}",
+                block.content.is_empty(),
+            );
 
             match block.block_type {
                 BlockType::AvroData | BlockType::HfileData | BlockType::ParquetData => {
                     if let LogBlockContent::Records(record_batches) = block.content {
+                        let total_rows: usize = record_batches.data_batches.iter().map(|b| b.num_rows()).sum();
+                        log::debug!(
+                            "[Pass3] DATA block #{block_num}: {} data batches, {} total rows",
+                            record_batches.data_batches.len(),
+                            total_rows,
+                        );
                         for batch in record_batches.data_batches {
                             self.record_buffer
                                 .process_data_block(batch, &instant_time)?;
                         }
+                        log::debug!(
+                            "[Pass3] after processing block #{block_num}: buffer size={}",
+                            self.record_buffer.size(),
+                        );
                     }
                 }
                 BlockType::Delete => {
                     if let LogBlockContent::Records(record_batches) = block.content {
+                        let total_deletes: usize = record_batches.delete_batches.iter().map(|(b, _)| b.num_rows()).sum();
+                        log::debug!(
+                            "[Pass3] DELETE block #{block_num}: {} delete batches, {} total deletes",
+                            record_batches.delete_batches.len(),
+                            total_deletes,
+                        );
                         for pair in record_batches.delete_batches {
                             let batch = pair.0;
                             let inst = pair.1;

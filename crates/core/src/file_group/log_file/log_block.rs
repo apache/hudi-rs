@@ -381,6 +381,10 @@ impl LogBlock {
         storage: std::sync::Arc<crate::storage::Storage>,
     ) -> crate::Result<()> {
         if !self.content.is_empty() {
+            log::debug!(
+                "[LogBlock::inflate] content already populated for {:?} block, skipping",
+                self.block_type,
+            );
             return Ok(()); // Already inflated
         }
 
@@ -389,6 +393,15 @@ impl LogBlock {
                 "No content location for inflate".to_string(),
             )
         })?;
+
+        log::debug!(
+            "[LogBlock::inflate] type={:?} file={} pos={} len={} block_len={}",
+            self.block_type,
+            loc.log_file_path,
+            loc.content_position,
+            loc.content_length,
+            loc.block_length,
+        );
 
         let mut reader = storage.get_storage_reader(&loc.log_file_path).await?;
         use std::io::{Seek, SeekFrom};

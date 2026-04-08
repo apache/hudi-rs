@@ -193,6 +193,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         record: BufferedRecord,
         key: &str,
     ) -> Result<()> {
+        let has_existing = self.base.records.contains_key(key);
         let existing = self.base.records.get(key);
         self.base.total_log_records += 1;
 
@@ -202,7 +203,15 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             .delta_merge(&record, existing)?;
 
         if let Some(merged_record) = merged {
+            log::debug!(
+                "[KeyBasedBuffer] processNextDataRecord: key={key} has_existing={has_existing} → merged (is_delete={})",
+                merged_record.is_delete(),
+            );
             self.base.records.insert(key.to_string(), merged_record);
+        } else {
+            log::debug!(
+                "[KeyBasedBuffer] processNextDataRecord: key={key} has_existing={has_existing} → dropped by merger",
+            );
         }
 
         Ok(())
@@ -244,6 +253,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         delete_record: DeleteRecord,
         key: &str,
     ) {
+        let has_existing = self.base.records.contains_key(key);
         let existing = self.base.records.get(key);
         self.base.total_log_records += 1;
 
@@ -252,10 +262,17 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             .buffered_record_merger
             .delta_merge_delete(&delete_record, existing);
 
-        if let Ok(Some(surviving_delete)) = surviving {
+        if let Ok(Some(surviving_delete)) = &surviving {
+            log::debug!(
+                "[KeyBasedBuffer] processNextDeletedRecord: key={key} has_existing={has_existing} → delete wins",
+            );
             self.base.records.insert(
                 key.to_string(),
-                BufferedRecords::from_delete_record(&surviving_delete),
+                BufferedRecords::from_delete_record(surviving_delete),
+            );
+        } else {
+            log::debug!(
+                "[KeyBasedBuffer] processNextDeletedRecord: key={key} has_existing={has_existing} → existing survives",
             );
         }
     }
@@ -302,10 +319,17 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// Drives the `has_next()`/`next()` iterator to completion and
     /// collects all records into a single batch.
     fn merge_and_collect(mut self: Box<Self>) -> Result<RecordBatch> {
+        let base_rows: usize = self.base.base_file_batches.iter().map(|b| b.num_rows()).sum();
+        let log_records = self.base.records.len();
+        log::debug!(
+            "[KeyBasedBuffer] merge_and_collect: base_rows={base_rows} log_records_in_map={log_records} \
+             total_log_records_processed={}",
+            self.base.total_log_records,
+        );
+
         let schema = if !self.base.base_file_batches.is_empty() {
             self.base.base_file_batches[0].schema()
         } else {
-            // Try to get schema from first log record
             let first_record = self.base.records.values().next();
             match first_record.and_then(|r| r.data.as_ref()) {
                 Some(batch) => batch.schema(),
@@ -318,11 +342,24 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         };
 
         let mut output_records: Vec<BufferedRecord> = Vec::new();
+        let mut deletes = 0u64;
         while self.has_next()? {
             if let Some(record) = self.next() {
-                output_records.push(record);
+                if record.is_delete() {
+                    deletes += 1;
+                } else {
+                    // Simplified: if it came from base+log merge it's an update,
+                    // if from log-only it's an insert. We count all as output.
+                    output_records.push(record);
+                }
             }
         }
+
+        log::debug!(
+            "[KeyBasedBuffer] merge_and_collect output: {} data records, {} deletes skipped",
+            output_records.len(),
+            deletes,
+        );
 
         records_to_batch(output_records, schema)
     }
