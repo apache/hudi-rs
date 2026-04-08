@@ -18,13 +18,13 @@
  */
 use crate::Result;
 use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::log_file::avro::AvroDataBlockContentReader;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
 };
 use crate::file_group::log_file::log_format::LogFormatVersion;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
@@ -38,14 +38,14 @@ use std::sync::Arc;
 #[allow(dead_code)]
 pub struct Decoder {
     batch_size: usize,
-    hudi_configs: Arc<HudiConfigs>,
+    reader_context: Arc<ReaderContext>,
 }
 
 impl Decoder {
-    pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
+    pub fn new(reader_context: Arc<ReaderContext>) -> Self {
         Self {
             batch_size: 1024,
-            hudi_configs,
+            reader_context,
         }
     }
     pub fn decode_content(
@@ -326,8 +326,7 @@ mod tests {
         write_record(&mut buf, record2)?;
 
         // Create decoder and test
-        let hudi_configs = HudiConfigs::empty();
-        let decoder = Decoder::new(Arc::new(hudi_configs));
+        let decoder = Decoder::new(Arc::new(ReaderContext::empty()));
         let reader = Cursor::new(buf);
 
         let mut header = HashMap::new();
@@ -383,8 +382,7 @@ mod tests {
             writer.close()?;
         }
 
-        let hudi_configs = HudiConfigs::empty();
-        let decoder = Decoder::new(Arc::new(hudi_configs));
+        let decoder = Decoder::new(Arc::new(ReaderContext::empty()));
         let bytes = Bytes::from(buf);
         let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
 

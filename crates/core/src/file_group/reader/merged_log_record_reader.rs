@@ -31,12 +31,11 @@
 //! ```
 
 use crate::Result;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::log_record_reader::BaseHoodieLogRecordReader;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
-use crate::timeline::selector::InstantRange;
 use std::sync::Arc;
 
 /// Statistics from the log scanning operation.
@@ -58,7 +57,7 @@ pub struct ScanStats {
 /// ## Usage (matching Java):
 /// ```ignore
 /// let reader = HoodieMergedLogRecordReader::new_builder()
-///     .with_hudi_configs(configs)
+///     .with_reader_context(reader_context)
 ///     .with_storage(storage)
 ///     .with_log_files(log_file_paths)
 ///     .with_latest_instant_time(latest_time)
@@ -196,19 +195,19 @@ impl HoodieMergedLogRecordReader {
 /// `force_full_scan=true` (the default, matching Java).
 #[derive(Default)]
 pub struct Builder {
-    hudi_configs: Option<Arc<HudiConfigs>>,
+    reader_context: Option<Arc<ReaderContext>>,
     storage: Option<Arc<Storage>>,
     log_file_paths: Vec<String>,
     latest_instant_time: Option<String>,
-    instant_range: Option<InstantRange>,
     record_buffer: Option<Box<dyn HoodieFileGroupRecordBuffer>>,
     force_full_scan: bool,
     allow_inflight_instants: bool,
 }
 
 impl Builder {
-    pub fn with_hudi_configs(mut self, configs: Arc<HudiConfigs>) -> Self {
-        self.hudi_configs = Some(configs);
+    /// Mirrors Java's `withHoodieReaderContext(readerContext)`.
+    pub fn with_reader_context(mut self, ctx: Arc<ReaderContext>) -> Self {
+        self.reader_context = Some(ctx);
         self
     }
 
@@ -226,12 +225,6 @@ impl Builder {
 
     pub fn with_latest_instant_time(mut self, time: String) -> Self {
         self.latest_instant_time = Some(time);
-        self
-    }
-
-    /// Mirrors Java's `withInstantRange(Option<InstantRange>)`.
-    pub fn with_instant_range(mut self, range: Option<InstantRange>) -> Self {
-        self.instant_range = range;
         self
     }
 
@@ -258,9 +251,9 @@ impl Builder {
     /// Mirrors Java's `build()` which calls the constructor, and the
     /// constructor calls `performScan()` when `forceFullScan=true`.
     pub async fn build(self) -> Result<HoodieMergedLogRecordReader> {
-        let hudi_configs = self
-            .hudi_configs
-            .ok_or_else(|| CoreError::ReadFileSliceError("hudi_configs required".into()))?;
+        let reader_context = self
+            .reader_context
+            .ok_or_else(|| CoreError::ReadFileSliceError("reader_context required".into()))?;
         let storage = self
             .storage
             .ok_or_else(|| CoreError::ReadFileSliceError("storage required".into()))?;
@@ -269,13 +262,12 @@ impl Builder {
             .ok_or_else(|| CoreError::ReadFileSliceError("record_buffer required".into()))?;
 
         let base = BaseHoodieLogRecordReader {
-            hudi_configs,
+            reader_context,
             storage,
             log_file_paths: self.log_file_paths,
             latest_instant_time: self
                 .latest_instant_time
                 .unwrap_or_else(|| "99991231235959999".to_string()),
-            instant_range: self.instant_range,
             record_buffer,
             allow_inflight_instants: self.allow_inflight_instants,
             valid_block_instants: Vec::new(),
@@ -303,16 +295,20 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HudiConfigs;
     use crate::file_group::reader::buffer::key_based::KeyBasedFileGroupRecordBuffer;
     use crate::file_group::reader::read_stats::HoodieReadStats;
     use crate::storage::util::parse_uri;
+    use std::collections::HashMap;
+
+    fn make_test_reader_context() -> Arc<ReaderContext> {
+        Arc::new(ReaderContext::empty())
+    }
 
     fn make_test_buffer() -> Box<dyn HoodieFileGroupRecordBuffer> {
-        let configs = Arc::new(HudiConfigs::empty());
+        let ctx = make_test_reader_context();
         let stats = HoodieReadStats::default();
         Box::new(KeyBasedFileGroupRecordBuffer::new(
-            configs,
+            ctx,
             vec![],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
@@ -327,11 +323,11 @@ mod tests {
     /// Then:  Error returned
     #[tokio::test]
     async fn test_builder_requires_record_buffer() {
-        let configs = Arc::new(HudiConfigs::empty());
+        let ctx = make_test_reader_context();
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
 
         let result = HoodieMergedLogRecordReader::new_builder()
-            .with_hudi_configs(configs)
+            .with_reader_context(ctx)
             .with_storage(storage)
             .with_force_full_scan(false)
             .build()
@@ -345,11 +341,11 @@ mod tests {
         );
     }
 
-    /// Given: Builder without hudi_configs
+    /// Given: Builder without reader_context
     /// When:  build()
     /// Then:  Error returned
     #[tokio::test]
-    async fn test_builder_requires_hudi_configs() {
+    async fn test_builder_requires_reader_context() {
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
         let buffer = make_test_buffer();
 
@@ -363,8 +359,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("hudi_configs"),
-            "Error should mention hudi_configs: {err}"
+            err.contains("reader_context"),
+            "Error should mention reader_context: {err}"
         );
     }
 
@@ -373,12 +369,12 @@ mod tests {
     /// Then:  Reader created successfully, num_merged_records=0
     #[tokio::test]
     async fn test_perform_scan_empty_log_files() {
-        let configs = Arc::new(HudiConfigs::empty());
+        let ctx = make_test_reader_context();
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
         let buffer = make_test_buffer();
 
         let reader = HoodieMergedLogRecordReader::new_builder()
-            .with_hudi_configs(configs)
+            .with_reader_context(ctx)
             .with_storage(storage.clone())
             .with_log_files(vec![]) // empty
             .with_record_buffer(buffer)
@@ -397,12 +393,12 @@ mod tests {
     /// Then:  Reader created without scanning (lazy mode)
     #[tokio::test]
     async fn test_builder_lazy_mode() {
-        let configs = Arc::new(HudiConfigs::empty());
+        let ctx = make_test_reader_context();
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
         let buffer = make_test_buffer();
 
         let reader = HoodieMergedLogRecordReader::new_builder()
-            .with_hudi_configs(configs)
+            .with_reader_context(ctx)
             .with_storage(storage.clone())
             .with_record_buffer(buffer)
             .with_force_full_scan(false)
@@ -421,12 +417,12 @@ mod tests {
     /// into_parts() returns buffer, valid instants, and stats.
     #[tokio::test]
     async fn test_into_parts_returns_components() {
-        let configs = Arc::new(HudiConfigs::empty());
+        let ctx = make_test_reader_context();
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
         let buffer = make_test_buffer();
 
         let reader = HoodieMergedLogRecordReader::new_builder()
-            .with_hudi_configs(configs)
+            .with_reader_context(ctx)
             .with_storage(storage.clone())
             .with_log_files(vec![])
             .with_record_buffer(buffer)

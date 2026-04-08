@@ -40,12 +40,12 @@
 //! Drain deque via `pollLast` (tail-first) = oldest instant processed first.
 
 use crate::Result;
-use crate::config::HudiConfigs;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlock, LogBlockContent,
 };
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -324,11 +324,10 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
 ///
 /// Mirrors Java's `BaseHoodieLogRecordReader<T>`.
 pub struct BaseHoodieLogRecordReader {
-    pub hudi_configs: Arc<HudiConfigs>,
+    pub reader_context: Arc<ReaderContext>,
     pub storage: Arc<Storage>,
     pub log_file_paths: Vec<String>,
     pub latest_instant_time: String,
-    pub instant_range: Option<InstantRange>,
     pub record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
     pub allow_inflight_instants: bool,
 
@@ -352,10 +351,7 @@ impl BaseHoodieLogRecordReader {
         self.total_corrupt_blocks = 0;
         self.total_rollbacks = 0;
 
-        let timezone: String = self
-            .hudi_configs
-            .get_or_default(crate::config::table::HudiTableConfig::TimelineTimezone)
-            .into();
+        let timezone = self.reader_context.timezone();
 
         // Read all blocks as metadata-only (no content decoding).
         // Mirrors Java's Pass 1 where content bytes are skipped via seek().
@@ -363,7 +359,7 @@ impl BaseHoodieLogRecordReader {
         let mut all_blocks: Vec<LogBlock> = Vec::new();
         for path in &self.log_file_paths.clone() {
             let mut reader =
-                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), path).await?;
+                LogFileReader::new(self.reader_context.clone(), self.storage.clone(), path).await?;
             let blocks = reader.read_all_blocks_metadata_only(path)?;
             self.total_log_files += 1;
             all_blocks.extend(blocks);
@@ -373,7 +369,7 @@ impl BaseHoodieLogRecordReader {
         let mut pass1 = forward_scan_pass1(
             all_blocks,
             &self.latest_instant_time,
-            &self.instant_range,
+            &self.reader_context.instant_range,
             &timezone,
         )?;
 
@@ -435,7 +431,7 @@ impl BaseHoodieLogRecordReader {
 
             // Lazy inflate: load and decode block content from storage on demand.
             block
-                .inflate(self.hudi_configs.clone(), self.storage.clone())
+                .inflate(self.reader_context.clone(), self.storage.clone())
                 .await?;
 
             log::debug!(
@@ -988,10 +984,10 @@ mod tests {
     }
 
     fn make_test_buffer() -> Box<KeyBasedFileGroupRecordBuffer> {
-        let configs = std::sync::Arc::new(HudiConfigs::empty());
+        let ctx = std::sync::Arc::new(ReaderContext::empty());
         let stats = HoodieReadStats::default();
         Box::new(KeyBasedFileGroupRecordBuffer::new(
-            configs,
+            ctx,
             vec!["ts".to_string()],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,

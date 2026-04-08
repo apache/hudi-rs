@@ -71,15 +71,13 @@ pub mod iterator_mode;
 pub mod log_record_reader;
 pub mod merged_log_record_reader;
 pub mod read_stats;
+pub mod reader_context;
 pub mod reader_parameters;
 pub mod record_merger;
 pub mod schema_handler;
 pub mod update_processor;
 
 use crate::Result;
-use crate::config::HudiConfigs;
-use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::reader::buffer::loader::{
     DefaultFileGroupRecordBufferLoader, FileGroupRecordBufferLoader,
@@ -87,10 +85,10 @@ use crate::file_group::reader::buffer::loader::{
 use crate::file_group::reader::input_split::InputSplit;
 use crate::file_group::reader::iterator_mode::IteratorMode;
 use crate::file_group::reader::read_stats::HoodieReadStats;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use crate::storage::Storage;
-use crate::timeline::selector::InstantRange;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
@@ -111,9 +109,9 @@ use std::sync::Arc;
 /// directly with [`HoodieFileGroupReader::new()`].
 #[derive(Debug)]
 pub struct HoodieFileGroupReader {
-    // ── Context (mirrors HoodieReaderContext<T> fields) ────────────────
-    /// Hudi table and reader configuration.
-    hudi_configs: Arc<HudiConfigs>,
+    // ── Context (mirrors Java's HoodieReaderContext<T>) ────────────────
+    /// Reader context carrying merge mode, instant range, and config maps.
+    reader_context: Arc<ReaderContext>,
 
     /// Storage for reading base files and log files.
     storage: Arc<Storage>,
@@ -128,12 +126,6 @@ pub struct HoodieFileGroupReader {
     // ── Configuration ──────────────────────────────────────────────────
     /// Reader flags: use_record_position, emit_delete, sort_output, etc.
     reader_parameters: ReaderParameters,
-
-    /// The latest commit time (high watermark for log block filtering).
-    latest_instant_time: String,
-
-    /// Record key field name (e.g. `_hoodie_record_key`).
-    record_key_field: String,
 
     /// Schema management for the read pipeline.
     schema_handler: FileGroupReaderSchemaHandler,
@@ -157,35 +149,31 @@ pub struct HoodieFileGroupReader {
 impl HoodieFileGroupReader {
     /// Create a new file group reader.
     pub fn new(
-        hudi_configs: Arc<HudiConfigs>,
+        reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: InputSplit,
         ordering_field_names: Vec<String>,
         reader_parameters: ReaderParameters,
-        latest_instant_time: String,
-        record_key_field: String,
     ) -> Self {
         log::debug!(
             "HoodieFileGroupReader::new partition={} base_file={} log_files={} \
-             ordering_fields={:?} latest_instant_time={} record_key_field={}",
+             ordering_fields={:?} latest_commit_time={} record_key_field={}",
             input_split.partition_path,
             input_split.base_file_path.as_deref().unwrap_or("<none>"),
             input_split.log_file_paths.len(),
             ordering_field_names,
-            latest_instant_time,
-            record_key_field,
+            reader_context.latest_commit_time,
+            reader_context.record_key_field,
         );
         for (i, lf) in input_split.log_file_paths.iter().enumerate() {
             log::debug!("  log_file[{i}]: {lf}");
         }
         Self {
-            hudi_configs,
+            reader_context,
             storage,
             input_split,
             ordering_field_names,
             reader_parameters,
-            latest_instant_time,
-            record_key_field,
             schema_handler: FileGroupReaderSchemaHandler::new(),
             iterator_mode: IteratorMode::EngineRecord,
             record_buffer_loader: DefaultFileGroupRecordBufferLoader::new(),
@@ -268,23 +256,19 @@ impl HoodieFileGroupReader {
 
         // Step 3: Load record buffer (scan log files + create buffer)
         log::debug!(
-            "[HoodieFileGroupReader] scanning {} log file(s) with latest_instant_time={}",
+            "[HoodieFileGroupReader] scanning {} log file(s) with latest_commit_time={}",
             self.input_split.log_file_paths.len(),
-            self.latest_instant_time,
+            self.reader_context.latest_commit_time,
         );
-        let instant_range = self.create_instant_range();
         let load_result = self
             .record_buffer_loader
             .get_record_buffer(
-                self.hudi_configs.clone(),
+                self.reader_context.clone(),
                 self.storage.clone(),
                 &self.input_split,
                 self.ordering_field_names.clone(),
                 &self.reader_parameters,
                 &mut self.read_stats,
-                &instant_range,
-                &self.latest_instant_time,
-                &self.record_key_field,
             )
             .await?;
 
@@ -340,23 +324,6 @@ impl HoodieFileGroupReader {
         }
     }
 
-    /// Create an InstantRange for log file scanning.
-    fn create_instant_range(&self) -> InstantRange {
-        let timezone: String = self
-            .hudi_configs
-            .get_or_default(HudiTableConfig::TimelineTimezone)
-            .into();
-        let start_timestamp = self
-            .hudi_configs
-            .try_get(HudiReadConfig::FileGroupStartTimestamp)
-            .map(|v| -> String { v.into() });
-        let end_timestamp = self
-            .hudi_configs
-            .try_get(HudiReadConfig::FileGroupEndTimestamp)
-            .map(|v| -> String { v.into() });
-        InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
-    }
-
     // =========================================================================
     // Accessors
     // =========================================================================
@@ -381,19 +348,17 @@ impl HoodieFileGroupReader {
 /// Mirrors Java's `HoodieFileGroupReader.Builder<T>`.
 #[derive(Debug, Default)]
 pub struct HoodieFileGroupReaderBuilder {
-    hudi_configs: Option<Arc<HudiConfigs>>,
+    reader_context: Option<Arc<ReaderContext>>,
     storage: Option<Arc<Storage>>,
     input_split: Option<InputSplit>,
     ordering_field_names: Vec<String>,
     reader_parameters: ReaderParameters,
-    latest_instant_time: Option<String>,
-    record_key_field: Option<String>,
     schema_handler: Option<FileGroupReaderSchemaHandler>,
 }
 
 impl HoodieFileGroupReaderBuilder {
-    pub fn with_configs(mut self, configs: Arc<HudiConfigs>) -> Self {
-        self.hudi_configs = Some(configs);
+    pub fn with_reader_context(mut self, ctx: Arc<ReaderContext>) -> Self {
+        self.reader_context = Some(ctx);
         self
     }
 
@@ -417,46 +382,28 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
-    pub fn with_latest_instant_time(mut self, time: String) -> Self {
-        self.latest_instant_time = Some(time);
-        self
-    }
-
-    pub fn with_record_key_field(mut self, field: String) -> Self {
-        self.record_key_field = Some(field);
-        self
-    }
-
     pub fn with_schema_handler(mut self, handler: FileGroupReaderSchemaHandler) -> Self {
         self.schema_handler = Some(handler);
         self
     }
 
     pub fn build(self) -> Result<HoodieFileGroupReader> {
-        let hudi_configs = self
-            .hudi_configs
-            .ok_or_else(|| CoreError::ReadFileSliceError("hudi_configs is required".into()))?;
+        let reader_context = self
+            .reader_context
+            .ok_or_else(|| CoreError::ReadFileSliceError("reader_context is required".into()))?;
         let storage = self
             .storage
             .ok_or_else(|| CoreError::ReadFileSliceError("storage is required".into()))?;
         let input_split = self
             .input_split
             .ok_or_else(|| CoreError::ReadFileSliceError("input_split is required".into()))?;
-        let latest_instant_time = self
-            .latest_instant_time
-            .unwrap_or_else(|| "99991231235959999".to_string());
-        let record_key_field = self
-            .record_key_field
-            .unwrap_or_else(|| crate::metadata::meta_field::MetaField::RecordKey.as_ref().to_string());
 
         let mut reader = HoodieFileGroupReader::new(
-            hudi_configs,
+            reader_context,
             storage,
             input_split,
             self.ordering_field_names,
             self.reader_parameters,
-            latest_instant_time,
-            record_key_field,
         );
 
         if let Some(handler) = self.schema_handler {

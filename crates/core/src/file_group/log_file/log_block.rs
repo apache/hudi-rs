@@ -377,7 +377,7 @@ impl LogBlock {
     /// No-op if content is already populated.
     pub async fn inflate(
         &mut self,
-        hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
+        reader_context: std::sync::Arc<crate::file_group::reader::reader_context::ReaderContext>,
         storage: std::sync::Arc<crate::storage::Storage>,
     ) -> crate::Result<()> {
         if !self.content.is_empty() {
@@ -407,7 +407,7 @@ impl LogBlock {
         use std::io::{Seek, SeekFrom};
         reader.seek(SeekFrom::Start(loc.content_position))?;
 
-        let decoder = crate::file_group::log_file::content::Decoder::new(hudi_configs);
+        let decoder = crate::file_group::log_file::content::Decoder::new(reader_context);
         self.content = decoder.decode_content(
             &mut reader,
             &self.format_version,

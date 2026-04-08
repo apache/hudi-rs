@@ -19,16 +19,19 @@
 pub mod context;
 mod util;
 
-use crate::context::FileGroupReaderContext;
+use crate::context::{FileGroupReaderContext, HoodieSchema};
 use crate::util::create_raw_pointer_for_record_batches;
 use hudi::config::HudiConfigs;
 use hudi::config::table::HudiTableConfig;
 use hudi::config::util::split_hudi_options_from_others;
 use hudi::file_group::reader::HoodieFileGroupReader;
 use hudi::file_group::reader::input_split::InputSplit;
+use hudi::file_group::reader::reader_context::ReaderContext;
 use hudi::file_group::reader::reader_parameters::ReaderParameters;
 use hudi::metadata::meta_field::MetaField;
 use hudi::storage::Storage;
+use hudi::timeline::selector::InstantRange;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -155,16 +158,20 @@ mod ffi {
 }
 
 pub struct HudiFileGroupReader {
-    hudi_configs: Arc<HudiConfigs>,
+    // ── 1:1 with Java HoodieFileGroupReader fields ─────────────────
+    reader_context: Arc<ReaderContext>,
     storage: Arc<Storage>,
-    rt: tokio::runtime::Runtime,
-    fgrc: FileGroupReaderContext,
-    split_ctx: SplitContext,
-}
+    table_path: String,
+    latest_commit_time: String,
+    data_schema: Option<HoodieSchema>,
+    requested_schema: Option<HoodieSchema>,
+    props: HashMap<String, String>,
+    reader_parameters: ReaderParameters,
+    input_split: InputSplit,
+    ordering_field_names: Vec<String>,
 
-struct SplitContext {
-    base_file_name: String,
-    log_file_names: Vec<String>,
+    // ── Rust-only ──────────────────────────────────────────────────
+    rt: tokio::runtime::Runtime,
 }
 
 /// Creates a `HudiFileGroupReader` from a full `FfiReaderContext`.
@@ -173,11 +180,11 @@ pub fn new_file_group_reader_with_context(
 ) -> std::result::Result<Box<HudiFileGroupReader>, String> {
     init_logger();
 
-    let split_ctx = SplitContext {
-        base_file_name: ctx.base_file_name.clone(),
-        log_file_names: ctx.log_file_names.iter().cloned().collect(),
-    };
+    // Capture transport-only file names before ctx is consumed by .into().
+    let base_file_name = ctx.base_file_name.clone();
+    let log_file_names: Vec<String> = ctx.log_file_names.iter().cloned().collect();
 
+    // Convert flat FFI struct → nested Rust types (intermediate, not stored).
     let fgrc: FileGroupReaderContext = ctx.into();
 
     log::debug!(
@@ -229,20 +236,15 @@ pub fn new_file_group_reader_with_context(
     log::debug!(
         "new_file_group_reader_with_context: split base_file_name={base_file_name} \
          log_file_names={log_file_names:?}",
-        base_file_name = split_ctx.base_file_name,
-        log_file_names = split_ctx.log_file_names,
     );
 
-    // Build options from config maps.
-    // Order: table_config < props < hoodie_reader_config (higher = takes precedence).
+    // ── 1. Build merged props ───────────────────────────────────────
+    // Order: hoodie.base.path + table_config < props < hoodie_reader_config
     let mut options: Vec<(String, String)> = Vec::new();
-
-    // Inject table_path as hoodie.base.path so Storage knows where to read from.
     options.push((
         HudiTableConfig::BasePath.as_ref().to_string(),
         fgrc.table_path.clone(),
     ));
-
     if let Some(rc) = fgrc.reader_context.as_ref() {
         for (k, v) in &rc.table_config {
             options.push((k.clone(), v.clone()));
@@ -257,22 +259,125 @@ pub fn new_file_group_reader_with_context(
         }
     }
 
+    // ── 2. Create Storage (needs temporary HudiConfigs) ─────────────
     let (hudi_opts, storage_opts) = split_hudi_options_from_others(options);
-    let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
-    let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())
+    let props: HashMap<String, String> = hudi_opts;
+    let hudi_configs = Arc::new(HudiConfigs::new(props.clone()));
+    let storage = Storage::new(Arc::new(storage_opts), hudi_configs)
         .map_err(|e| format!("Failed to create Storage: {e}"))?;
 
+    // ── 3. Build ReaderParameters ───────────────────────────────────
+    let reader_parameters = ReaderParameters {
+        use_record_position: fgrc.should_use_record_position,
+        emit_delete: fgrc.emit_delete,
+        sort_output: fgrc.sort_output,
+        allow_inflight_instants: fgrc.allow_inflight_instants,
+    };
+
+    // ── 4. Build InputSplit ─────────────────────────────────────────
+    let base_file_path = if base_file_name.is_empty() {
+        None
+    } else if fgrc.partition_path.is_empty() {
+        Some(base_file_name)
+    } else {
+        Some(format!("{}/{}", fgrc.partition_path, base_file_name))
+    };
+    let log_file_paths: Vec<String> = log_file_names
+        .into_iter()
+        .map(|name| {
+            if fgrc.partition_path.is_empty() {
+                name
+            } else {
+                format!("{}/{}", fgrc.partition_path, name)
+            }
+        })
+        .collect();
+    let input_split = InputSplit::new(
+        base_file_path,
+        None,
+        log_file_paths,
+        fgrc.partition_path,
+    );
+
+    // ── 5. Extract ordering field names from merged props ───────────
+    let ordering_field_names: Vec<String> = props
+        .get("hoodie.table.precombine.field")
+        .or_else(|| props.get("hoodie.table.ordering.fields"))
+        .map(|f| vec![f.clone()])
+        .unwrap_or_default();
+
+    // ── 6. Convert FFI ReaderContext → core ReaderContext ────────────
+    let core_reader_context = if let Some(ffi_rc) = fgrc.reader_context {
+        let instant_range = ffi_rc.instant_range.map(|ir| {
+            let timezone = ffi_rc.table_config
+                .get(HudiTableConfig::TimelineTimezone.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "utc".to_string());
+            let (start_inclusive, end_inclusive) = match ir.range_type.as_str() {
+                "CLOSED_CLOSED" => (true, true),
+                "OPEN_CLOSED" => (false, true),
+                "CLOSED_OPEN" => (true, false),
+                _ => (false, true), // default
+            };
+            let start = if ir.start_instant.is_empty() { None } else { Some(ir.start_instant) };
+            let end = if ir.end_instant.is_empty() { None } else { Some(ir.end_instant) };
+            InstantRange::new(timezone, start, end, start_inclusive, end_inclusive)
+        });
+        Arc::new(ReaderContext {
+            table_path: ffi_rc.table_path,
+            latest_commit_time: ffi_rc.latest_commit_time,
+            base_file_format: ffi_rc.base_file_format,
+            has_log_files: ffi_rc.has_log_files,
+            has_bootstrap_base_file: ffi_rc.has_bootstrap_base_file,
+            needs_bootstrap_merge: ffi_rc.needs_bootstrap_merge,
+            should_merge_use_record_position: ffi_rc.should_merge_use_record_position,
+            enable_logical_timestamp_field_repair: ffi_rc.enable_logical_timestamp_field_repair,
+            iterator_mode: ffi_rc.iterator_mode,
+            merge_mode: ffi_rc.merge_mode,
+            merge_strategy_id: ffi_rc.merge_strategy_id,
+            instant_range,
+            record_key_field: MetaField::RecordKey.as_ref().to_string(),
+            table_config: ffi_rc.table_config,
+            hoodie_reader_config: ffi_rc.hoodie_reader_config,
+        })
+    } else {
+        Arc::new(ReaderContext {
+            table_path: fgrc.table_path.clone(),
+            latest_commit_time: fgrc.latest_commit_time.clone(),
+            base_file_format: String::new(),
+            has_log_files: false,
+            has_bootstrap_base_file: false,
+            needs_bootstrap_merge: false,
+            should_merge_use_record_position: false,
+            enable_logical_timestamp_field_repair: false,
+            iterator_mode: String::new(),
+            merge_mode: String::new(),
+            merge_strategy_id: String::new(),
+            instant_range: None,
+            record_key_field: MetaField::RecordKey.as_ref().to_string(),
+            table_config: HashMap::new(),
+            hoodie_reader_config: HashMap::new(),
+        })
+    };
+
+    // ── 7. Build tokio runtime ──────────────────────────────────────
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
 
     Ok(Box::new(HudiFileGroupReader {
-        hudi_configs,
+        reader_context: core_reader_context.clone(),
         storage,
+        table_path: fgrc.table_path,
+        latest_commit_time: fgrc.latest_commit_time,
+        data_schema: fgrc.data_schema,
+        requested_schema: fgrc.requested_schema,
+        props,
+        reader_parameters,
+        input_split,
+        ordering_field_names,
         rt,
-        fgrc,
-        split_ctx,
     }))
 }
 
@@ -281,66 +386,23 @@ impl HudiFileGroupReader {
     pub fn get_closable_iterator(
         &self,
     ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
-        let fgrc = &self.fgrc;
-        let split_ctx = &self.split_ctx;
-
-        let base_file_path = if fgrc.partition_path.is_empty() {
-            split_ctx.base_file_name.clone()
-        } else {
-            format!("{}/{}", fgrc.partition_path, split_ctx.base_file_name)
-        };
-        let log_file_paths: Vec<String> = split_ctx
-            .log_file_names
-            .iter()
-            .map(|name| {
-                if fgrc.partition_path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", fgrc.partition_path, name)
-                }
-            })
-            .collect();
-
-        let input_split = InputSplit::new(
-            Some(base_file_path),
-            None,
-            log_file_paths,
-            fgrc.partition_path.clone(),
-        );
-
-        let reader_parameters = ReaderParameters {
-            use_record_position: fgrc.should_use_record_position,
-            emit_delete: fgrc.emit_delete,
-            sort_output: fgrc.sort_output,
-            allow_inflight_instants: fgrc.allow_inflight_instants,
-        };
-
-        let options = self.hudi_configs.as_options();
-        let ordering_field_names: Vec<String> = options
-            .get("hoodie.table.precombine.field")
-            .or_else(|| options.get("hoodie.table.ordering.fields"))
-            .map(|f| vec![f.clone()])
-            .unwrap_or_default();
-
         log::debug!(
-            "get_closable_iterator: partition={} base_file={} log_files={} \
+            "get_closable_iterator: partition={} base_file={:?} log_files={} \
              latest_instant_time={} ordering_fields={:?} merge_mode={}",
-            fgrc.partition_path,
-            split_ctx.base_file_name,
-            split_ctx.log_file_names.len(),
-            fgrc.latest_commit_time,
-            ordering_field_names,
-            fgrc.reader_context.as_ref().map(|rc| rc.merge_mode.as_str()).unwrap_or("?"),
+            self.input_split.partition_path,
+            self.input_split.base_file_path,
+            self.input_split.log_file_paths.len(),
+            self.latest_commit_time,
+            self.ordering_field_names,
+            self.reader_context.merge_mode.as_str(),
         );
 
         let mut reader = HoodieFileGroupReader::new(
-            self.hudi_configs.clone(),
+            self.reader_context.clone(),
             self.storage.clone(),
-            input_split,
-            ordering_field_names,
-            reader_parameters,
-            fgrc.latest_commit_time.clone(),
-            MetaField::RecordKey.as_ref().to_string(),
+            self.input_split.clone(),
+            self.ordering_field_names.clone(),
+            self.reader_parameters.clone(),
         );
 
         let record_batch = self

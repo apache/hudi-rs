@@ -18,14 +18,13 @@
  */
 
 use crate::Result;
-use crate::config::HudiConfigs;
-use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock, LogBlockContentLocation,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
 use crate::storage::reader::StorageReader;
 use crate::timeline::selector::InstantRange;
@@ -36,23 +35,21 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct LogFileReader<R: Read + Seek> {
-    hudi_configs: Arc<HudiConfigs>,
+    reader_context: Arc<ReaderContext>,
     reader: R,
     timezone: String,
 }
 
 impl LogFileReader<StorageReader> {
     pub async fn new(
-        hudi_configs: Arc<HudiConfigs>,
+        reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
         let reader = storage.get_storage_reader(relative_path).await?;
-        let timezone: String = hudi_configs
-            .get_or_default(HudiTableConfig::TimelineTimezone)
-            .into();
+        let timezone = reader_context.timezone();
         Ok(Self {
-            hudi_configs,
+            reader_context,
             reader,
             timezone,
         })
@@ -285,7 +282,7 @@ impl<R: Read + Seek> LogFileReader<R> {
             )));
         }
 
-        let decoder = Decoder::new(self.hudi_configs.clone());
+        let decoder = Decoder::new(self.reader_context.clone());
         let content = decoder.decode_content(
             self.reader.by_ref(),
             &format_version,
@@ -416,9 +413,8 @@ mod tests {
         file_name: &str,
     ) -> Result<LogFileReader<StorageReader>> {
         let dir_url = parse_uri(dir)?;
-        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::PrecombineField, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
-        LogFileReader::new(hudi_configs, storage, file_name).await
+        LogFileReader::new(Arc::new(ReaderContext::empty()), storage, file_name).await
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::reader::HoodieFileGroupReader;
 use crate::file_group::reader::input_split::InputSplit;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::metadata::merger::FilesPartitionMerger;
@@ -278,13 +279,11 @@ impl FileGroupReader {
                 .unwrap_or_else(|| "99991231235959999".to_string());
 
             let mut reader = HoodieFileGroupReader::new(
-                self.hudi_configs.clone(),
+                Arc::new(ReaderContext::empty()),
                 self.storage.clone(),
                 input_split,
                 ordering_field_names,
                 ReaderParameters::default(),
-                latest_instant_time,
-                MetaField::RecordKey.as_ref().to_string(),
             );
 
             reader.read().await
@@ -627,7 +626,7 @@ impl FileGroupReader {
             vec![]
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            let scan_result = LogFileScanner::new(Arc::new(ReaderContext::empty()), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
 

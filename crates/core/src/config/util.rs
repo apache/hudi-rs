@@ -35,6 +35,17 @@ pub fn empty_filters<'a>() -> std::iter::Empty<(&'a str, &'a str, &'a str)> {
 }
 
 /// Splits the given options into two maps: one for Hudi options, and the other for others, which could be storage options for example.
+// Full Flow: Props/Config from Scala → Rust
+
+// Scala (buildProps)          → Java (proto builder)     → Proto (wire)
+//   → C++ gluten (unpack)     → C++ velox (copy)         → C++ (build FfiReaderContext)
+//   → Rust (new_file_group_reader_with_context)
+
+// The root cause: In Scala buildProps(), ALL options (hoodie.* + cloud creds like fs.s3a.*) go into props. Same in
+//  buildReaderContext() → tableConfig. Rust then has to split them apart because Storage::new() needs cloud creds
+// and HudiConfigs needs hoodie.* keys.
+
+// To eliminate split_hudi_options_from_others, we need storage_opts as a separate field
 pub fn split_hudi_options_from_others<I, K, V>(
     all_options: I,
 ) -> (HashMap<String, String>, HashMap<String, String>)

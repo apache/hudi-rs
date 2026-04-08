@@ -29,7 +29,7 @@ repository = "https://github.com/apache/hudi-rs/tree/main/cpp/"
 
 [lib]
 name = "hudi"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 hudi = { path = "../crates/hudi", version = "0.5.0-dev" }

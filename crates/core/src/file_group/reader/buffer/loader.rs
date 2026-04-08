@@ -33,15 +33,14 @@
 //! ```
 
 use crate::Result;
-use crate::config::HudiConfigs;
 use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::buffer::key_based::KeyBasedFileGroupRecordBuffer;
 use crate::file_group::reader::input_split::InputSplit;
 use crate::file_group::reader::merged_log_record_reader::HoodieMergedLogRecordReader;
 use crate::file_group::reader::read_stats::HoodieReadStats;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::storage::Storage;
-use crate::timeline::selector::InstantRange;
 use std::sync::Arc;
 
 /// Result of loading a record buffer.
@@ -61,15 +60,12 @@ pub trait FileGroupRecordBufferLoader: Send + Sync + std::fmt::Debug {
     /// Mirrors Java's `getRecordBuffer(...)`.
     fn get_record_buffer(
         &self,
-        hudi_configs: Arc<HudiConfigs>,
+        reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: &InputSplit,
         ordering_field_names: Vec<String>,
         reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
-        instant_range: &InstantRange,
-        latest_instant_time: &str,
-        record_key_field: &str,
     ) -> impl std::future::Future<Output = Result<RecordBufferLoadResult>> + Send;
 }
 
@@ -104,48 +100,43 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
     /// 3. Call `scanLogFiles()` to populate the buffer
     async fn get_record_buffer(
         &self,
-        hudi_configs: Arc<HudiConfigs>,
+        reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: &InputSplit,
         ordering_field_names: Vec<String>,
         _reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
-        instant_range: &InstantRange,
-        latest_instant_time: &str,
-        record_key_field: &str,
     ) -> Result<RecordBufferLoadResult> {
-        // Read merge mode from config (hoodie.record.merge.mode).
-        // Default to EVENT_TIME_ORDERING if not set.
-        let merge_mode = hudi_configs
-            .as_options()
-            .get("hoodie.record.merge.mode")
-            .cloned()
-            .unwrap_or_else(|| "EVENT_TIME_ORDERING".to_string());
+        // Use merge mode from reader context directly (mirrors Java: readerContext.getMergeMode()).
+        let merge_mode = if reader_context.merge_mode.is_empty() {
+            "EVENT_TIME_ORDERING".to_string()
+        } else {
+            reader_context.merge_mode.clone()
+        };
 
         log::debug!(
             "[DefaultFileGroupRecordBufferLoader] getRecordBuffer: merge_mode={merge_mode} \
-             record_key_field={record_key_field} ordering_fields={ordering_field_names:?} \
-             log_files={} latest_instant_time={latest_instant_time}",
+             record_key_field={} ordering_fields={ordering_field_names:?} \
+             log_files={} latest_commit_time={}",
+            reader_context.record_key_field,
             input_split.log_file_paths.len(),
+            reader_context.latest_commit_time,
         );
 
         // STEP: Instantiate buffer (strategy selection)
         let record_buffer = Box::new(KeyBasedFileGroupRecordBuffer::new(
-            hudi_configs.clone(),
+            reader_context.clone(),
             ordering_field_names,
             merge_mode,
             read_stats,
-            record_key_field.to_string(),
         ));
 
         // STEP: scanLogFiles — build and run HoodieMergedLogRecordReader
         let (populated_buffer, valid_block_instants, stats) = scan_log_files(
-            hudi_configs,
+            reader_context,
             storage,
             input_split,
             record_buffer,
-            instant_range,
-            latest_instant_time,
         )
         .await?;
 
@@ -171,12 +162,10 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
 /// Builds a `HoodieMergedLogRecordReader` via builder, which calls
 /// `performScan()` → `scanInternal()` during construction.
 async fn scan_log_files(
-    hudi_configs: Arc<HudiConfigs>,
+    reader_context: Arc<ReaderContext>,
     storage: Arc<Storage>,
     input_split: &InputSplit,
     record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
-    instant_range: &InstantRange,
-    latest_instant_time: &str,
 ) -> Result<(
     Box<dyn HoodieFileGroupRecordBuffer>,
     Vec<String>,
@@ -196,12 +185,12 @@ async fn scan_log_files(
     //     .withRecordBuffer(recordBuffer)
     //     .withAllowInflightInstants(readerParameters.allowInflightInstants())
     //     .build()
+    let latest_instant_time = reader_context.latest_commit_time.clone();
     let reader = HoodieMergedLogRecordReader::new_builder()
-        .with_hudi_configs(hudi_configs)
+        .with_reader_context(reader_context)
         .with_storage(storage)
         .with_log_files(input_split.log_file_paths.clone())
-        .with_latest_instant_time(latest_instant_time.to_string())
-        .with_instant_range(Some(instant_range.clone()))
+        .with_latest_instant_time(latest_instant_time)
         .with_record_buffer(record_buffer)
         .with_force_full_scan(true)
         .build()

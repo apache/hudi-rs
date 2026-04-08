@@ -37,7 +37,6 @@
 //! - `hasNextBaseRecord` → `has_next_base_record`
 
 use crate::Result;
-use crate::config::HudiConfigs;
 use crate::file_group::reader::buffer::row_extraction::{
     batch_to_buffered_records, delete_batch_to_buffered_records, extract_record_keys,
     records_to_batch,
@@ -46,6 +45,7 @@ use crate::file_group::reader::buffer::record_buffer::FileGroupRecordBuffer;
 use crate::file_group::reader::buffer::{BufferType, HoodieFileGroupRecordBuffer};
 use crate::file_group::reader::buffered_record::{BufferedRecord, BufferedRecords, DeleteRecord};
 use crate::file_group::reader::read_stats::HoodieReadStats;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::record_merger::BufferedRecordMergerFactory;
 use crate::file_group::reader::update_processor::create_update_processor;
 use arrow_array::RecordBatch;
@@ -84,8 +84,8 @@ pub struct KeyBasedFileGroupRecordBuffer {
     /// Common buffer state.
     pub base: FileGroupRecordBuffer,
 
-    /// Hudi configuration.
-    pub hudi_configs: Arc<HudiConfigs>,
+    /// Reader context (mirrors Java's readerContext).
+    pub reader_context: Arc<ReaderContext>,
 
     /// Record key field name (e.g. `_hoodie_record_key`).
     pub record_key_field: String,
@@ -93,14 +93,14 @@ pub struct KeyBasedFileGroupRecordBuffer {
 
 impl KeyBasedFileGroupRecordBuffer {
     pub fn new(
-        hudi_configs: Arc<HudiConfigs>,
+        reader_context: Arc<ReaderContext>,
         ordering_field_names: Vec<String>,
         merge_mode: String,
         read_stats: &HoodieReadStats,
-        record_key_field: String,
     ) -> Self {
         let merger = BufferedRecordMergerFactory::create(&merge_mode);
         let update_processor = create_update_processor(read_stats, false);
+        let record_key_field = reader_context.record_key_field.clone();
 
         Self {
             base: FileGroupRecordBuffer::new(
@@ -109,7 +109,7 @@ impl KeyBasedFileGroupRecordBuffer {
                 merger,
                 update_processor,
             ),
-            hudi_configs,
+            reader_context,
             record_key_field,
         }
     }
@@ -421,10 +421,10 @@ mod tests {
 
     /// Build a KeyBasedFileGroupRecordBuffer with the given merge mode.
     fn build_key_based_buffer(merge_mode: &str) -> KeyBasedFileGroupRecordBuffer {
-        let hudi_configs = Arc::new(HudiConfigs::empty());
+        let ctx = Arc::new(ReaderContext::empty());
         let read_stats = HoodieReadStats::default();
         KeyBasedFileGroupRecordBuffer::new(
-            hudi_configs,
+            ctx,
             vec!["ts".to_string()],
             merge_mode.to_string(),
             &read_stats,
