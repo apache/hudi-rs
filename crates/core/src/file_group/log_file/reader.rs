@@ -23,7 +23,7 @@ use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
-    BlockMetadataKey, BlockMetadataType, BlockType, LogBlock,
+    BlockMetadataKey, BlockMetadataType, BlockType, LogBlock, LogBlockContentLocation,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
 use crate::storage::Storage;
@@ -64,6 +64,43 @@ impl LogFileReader<StorageReader> {
             if block.skipped {
                 continue;
             }
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    /// Read all blocks from the log file without instant-range filtering.
+    ///
+    /// Unlike [`read_all_blocks`], this method returns ALL blocks including those
+    /// that would normally be skipped by instant-range filtering. This is needed
+    /// by [`BaseHoodieLogRecordReader::scan_internal`] which implements its own
+    /// 4-gate filtering algorithm.
+    pub fn read_all_blocks_unfiltered(&mut self) -> Result<Vec<LogBlock>> {
+        let wide_range = InstantRange::up_to("99991231235959999", &self.timezone);
+        let mut blocks = Vec::new();
+        while let Some(block) = self.read_next_block(&wide_range)? {
+            // Include all blocks (even skipped ones) since the caller
+            // handles filtering via the 4-gate algorithm.
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    /// Read all blocks as metadata-only (no content decoding).
+    ///
+    /// Mirrors Java's Pass 1 behavior: reads block headers and records
+    /// `content_location` for later lazy `inflate()`, but seeks past the
+    /// content bytes without decoding them. Only one block's content is
+    /// in memory at a time during Pass 3.
+    ///
+    /// # Arguments
+    /// * `log_file_path` - The relative path to the log file (stored in `LogBlockContentLocation`)
+    pub fn read_all_blocks_metadata_only(
+        &mut self,
+        log_file_path: &str,
+    ) -> Result<Vec<LogBlock>> {
+        let mut blocks = Vec::new();
+        while let Some(block) = self.read_next_block_metadata_only(log_file_path)? {
             blocks.push(block);
         }
         Ok(blocks)
@@ -265,6 +302,69 @@ impl<R: Read + Seek> LogFileReader<R> {
             header,
             content,
             footer,
+        )))
+    }
+
+    /// Read the next block as metadata-only (no content decoding).
+    ///
+    /// Mirrors Java's `HoodieLogFileReader.readBlock()` with `shouldReadLazily=true`:
+    /// reads the block header, records the content position in a `LogBlockContentLocation`,
+    /// then seeks past the content + footer without decoding them.
+    ///
+    /// The returned `LogBlock` has `content = Empty` and `content_location = Some(...)`.
+    /// Call `LogBlock::inflate()` later to load and decode the content on demand.
+    fn read_next_block_metadata_only(
+        &mut self,
+        log_file_path: &str,
+    ) -> Result<Option<LogBlock>> {
+        if !self.read_magic()? {
+            return Ok(None);
+        }
+
+        let curr_pos = self
+            .reader
+            .stream_position()
+            .map_err(CoreError::ReadLogFileError)?;
+
+        let (block_length, _) = self.read_block_length_or_corrupted_block(curr_pos)?;
+        let format_version = self.read_log_format_version()?;
+        let block_type = self.read_block_type(&format_version)?;
+        let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+
+        // Record where the content starts (current position after header)
+        let content_position = self
+            .reader
+            .stream_position()
+            .map_err(CoreError::ReadLogFileError)?;
+
+        // Calculate content length: block_length covers everything from after the 8-byte
+        // length field to the end of the block. We've consumed format_version (4) +
+        // block_type (4) + header (variable). The remaining bytes are content + footer +
+        // total_block_length. We store the raw content_length for decode_content().
+        let header_consumed = content_position - (curr_pos + 8);
+        let content_length = block_length.saturating_sub(header_consumed);
+
+        // Seek past the rest of the block (content + footer + total_block_length)
+        let block_end = curr_pos
+            .checked_add(8)
+            .and_then(|v| v.checked_add(block_length))
+            .ok_or_else(|| CoreError::LogFormatError("Block length overflow".to_string()))?;
+        self.reader
+            .seek(SeekFrom::Start(block_end))
+            .map_err(CoreError::ReadLogFileError)?;
+
+        let content_loc = LogBlockContentLocation {
+            log_file_path: log_file_path.to_string(),
+            content_position,
+            content_length,
+            block_length,
+        };
+
+        Ok(Some(LogBlock::new_lazy(
+            format_version,
+            block_type,
+            header,
+            content_loc,
         )))
     }
 }

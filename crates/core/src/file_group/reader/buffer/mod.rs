@@ -21,31 +21,34 @@
 //!
 //! Mirrors the Java package `org.apache.hudi.common.table.read.buffer`.
 //!
-//! ## Interface Hierarchy
+//! ## Interface Hierarchy (matches Java 1:1)
 //!
 //! ```text
-//!   «trait» HoodieFileGroupRecordBuffer
+//!   «trait» HoodieFileGroupRecordBuffer          (Java interface)
 //!       │
 //!       │ implements
 //!       ▼
-//!   FileGroupRecordBuffer  (base struct with common state)
+//!   FileGroupRecordBuffer  (common state struct)  (Java abstract class)
 //!       │
-//!       ├── KeyBasedFileGroupRecordBuffer   (KEY_BASED_MERGE, default)
-//!       ├── [PositionBasedFileGroupRecordBuffer]   (future)
-//!       ├── [SortedKeyBasedFileGroupRecordBuffer]  (future)
-//!       └── [UnmergedFileGroupRecordBuffer]         (future)
+//!       ├── KeyBasedFileGroupRecordBuffer          (KEY_BASED_MERGE, default)
+//!       ├── [PositionBasedFileGroupRecordBuffer]    (future)
+//!       ├── [SortedKeyBasedFileGroupRecordBuffer]   (future)
+//!       └── [UnmergedFileGroupRecordBuffer]          (future)
 //! ```
 
 pub mod key_based;
 pub mod loader;
 pub mod record_buffer;
+pub mod row_extraction;
 
 pub use key_based::KeyBasedFileGroupRecordBuffer;
 pub use loader::{DefaultFileGroupRecordBufferLoader, FileGroupRecordBufferLoader};
 pub use record_buffer::FileGroupRecordBuffer;
 
 use crate::Result;
+use crate::file_group::reader::buffered_record::{BufferedRecord, DeleteRecord};
 use arrow_array::RecordBatch;
+use std::collections::HashMap;
 
 /// The type of merge buffer in use.
 ///
@@ -54,11 +57,9 @@ use arrow_array::RecordBatch;
 pub enum BufferType {
     /// Key-based merge: deduplicates by record key, keeps latest by ordering value.
     KeyBasedMerge,
-
-    /// Position-based merge: uses record positions for merging (not yet implemented).
+    /// Position-based merge (not yet implemented).
     PositionBasedMerge,
-
-    /// Unmerged: skips merge, emits all records (not yet implemented).
+    /// Unmerged: skips merge (not yet implemented).
     Unmerged,
 }
 
@@ -66,49 +67,86 @@ pub enum BufferType {
 ///
 /// Mirrors Java's `HoodieFileGroupRecordBuffer<T>` interface.
 ///
-/// During log scanning, `process_data_block` and `process_delete_block` are
-/// called to populate the buffer. After scanning, `set_base_file_iterator` is
-/// called to provide base file records. Then `has_next`/`next` iterate the
-/// merged output.
+/// Method names match Java 1:1:
+/// - `processDataBlock` → `process_data_block`
+/// - `processNextDataRecord` → `process_next_data_record`
+/// - `processDeleteBlock` → `process_delete_block`
+/// - `processNextDeletedRecord` → `process_next_deleted_record`
+/// - `containsLogRecord` → `contains_log_record`
+/// - `setBaseFileIterator` → `set_base_file_iterator`
+/// - `hasNext` / `next` → `has_next` / `next`
 pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
     /// Returns the buffer type.
-    fn buffer_type(&self) -> BufferType;
+    fn get_buffer_type(&self) -> BufferType;
 
     /// Process a data block from log scanning.
     ///
-    /// In Java, this takes a `HoodieDataBlock`. In Rust, we receive the
-    /// already-deserialized `RecordBatch` from log file reading.
-    fn process_data_batch(
+    /// Mirrors Java's `processDataBlock(HoodieDataBlock, Option<KeySpec>)`.
+    /// In Rust, the block is already deserialized to a `RecordBatch`.
+    fn process_data_block(
         &mut self,
         batch: RecordBatch,
         instant_time: &str,
+    ) -> Result<()>;
+
+    /// Process a single data record within a data block.
+    ///
+    /// Mirrors Java's `processNextDataRecord(BufferedRecord<T>, Serializable)`.
+    fn process_next_data_record(
+        &mut self,
+        record: BufferedRecord,
+        key: &str,
     ) -> Result<()>;
 
     /// Process a delete block from log scanning.
     ///
-    /// In Java, this takes a `HoodieDeleteBlock`. In Rust, we receive the
-    /// delete batch and instant time from log file reading.
-    fn process_delete_batch(
+    /// Mirrors Java's `processDeleteBlock(HoodieDeleteBlock)`.
+    fn process_delete_block(
         &mut self,
         batch: RecordBatch,
         instant_time: &str,
     ) -> Result<()>;
 
-    /// Set the base file record batches for merge iteration.
-    fn set_base_file_batches(&mut self, batches: Vec<RecordBatch>);
+    /// Process a single deleted record within a delete block.
+    ///
+    /// Mirrors Java's `processNextDeletedRecord(DeleteRecord, Serializable)`.
+    fn process_next_deleted_record(
+        &mut self,
+        delete_record: DeleteRecord,
+        key: &str,
+    );
 
-    /// Returns true if there is a log record for the given key.
+    /// Check if a record exists in the buffered records.
+    ///
+    /// Mirrors Java's `containsLogRecord(String)`.
     fn contains_log_record(&self, record_key: &str) -> bool;
 
     /// Returns the number of records in the buffer.
     fn size(&self) -> usize;
 
     /// Returns the total number of log records processed.
-    fn total_log_records(&self) -> u64;
+    fn get_total_log_records(&self) -> u64;
 
-    /// Consume the buffer and produce the merged output as a single `RecordBatch`.
+    /// Returns the underlying records map.
+    fn get_log_records(&self) -> &HashMap<String, BufferedRecord>;
+
+    /// Set the base file batches for merge iteration.
     ///
-    /// This is the Rust-idiomatic way of "iterating" - we do a batch-level merge
-    /// rather than per-record iteration, since Arrow is columnar.
+    /// Mirrors Java's `setBaseFileIterator(ClosableIterator<T>)`.
+    fn set_base_file_iterator(&mut self, batches: Vec<RecordBatch>);
+
+    /// Check if next merged record exists.
+    ///
+    /// Mirrors Java's `hasNext()`.
+    fn has_next(&mut self) -> Result<bool>;
+
+    /// Return the next merged buffered record.
+    ///
+    /// Mirrors Java's `next()`.
+    fn next(&mut self) -> Option<BufferedRecord>;
+
+    /// Consume the buffer and produce the merged output as a `RecordBatch`.
+    ///
+    /// This is Rust-specific — Java uses the `hasNext()`/`next()` iterator instead.
     fn merge_and_collect(self: Box<Self>) -> Result<RecordBatch>;
 }

@@ -50,6 +50,12 @@ pub enum QuickstartTripsTable {
     V6Trips8I3D,
     #[strum(serialize = "v8_trips_8i3u1d")]
     V8Trips8I3U1D,
+    /// v9 MOR table, 8 inserts + 4 updates, COMMIT_TIME_ORDERING.
+    /// Schema: id INT, name STRING, age INT, ts STRING, city STRING (partitioned by city)
+    /// Commit 1: INSERT 8 rows → base .parquet per partition
+    /// Commit 2: UPSERT 4 rows (ids 1,3,5,7) → .log files
+    #[strum(serialize = "v9_mor_8i4u_commit_time")]
+    V9Mor8I4UCommitTime,
 }
 
 impl QuickstartTripsTable {
@@ -105,6 +111,38 @@ impl QuickstartTripsTable {
     pub fn url_to_mor_avro(&self) -> Url {
         let path = self.path_to_mor_avro();
         Url::from_file_path(path).unwrap()
+    }
+
+    /// Extract (id, name, age) tuples from a RecordBatch (for v9_mor tables), sorted by id.
+    pub fn id_name_age(record_batch: &RecordBatch) -> Vec<(i32, String, i32)> {
+        let ids = record_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = record_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = record_batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut result: Vec<(i32, String, i32)> = ids
+            .iter()
+            .zip(names.iter())
+            .zip(ages.iter())
+            .map(|((id, name), age)| {
+                (id.unwrap(), name.unwrap().to_string(), age.unwrap())
+            })
+            .collect();
+        result.sort_by_key(|(id, _, _)| *id);
+        result
     }
 }
 

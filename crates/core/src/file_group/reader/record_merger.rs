@@ -127,6 +127,47 @@ impl BufferedRecordMerger for EventTimeRecordMerger {
     }
 }
 
+/// Commit-time based record merger.
+///
+/// Mirrors Java's `CommitTimeRecordMerger`. In this mode, the most recently
+/// written record always wins — no ordering value comparison is performed.
+///
+/// Semantics:
+/// - `delta_merge`: new record always wins (unconditional overwrite)
+/// - `delta_merge_delete`: delete always wins (unconditional)
+/// - `final_merge`: log record always wins over base record
+#[derive(Debug)]
+pub struct CommitTimeRecordMerger;
+
+impl BufferedRecordMerger for CommitTimeRecordMerger {
+    fn delta_merge(
+        &self,
+        new_record: &BufferedRecord,
+        _existing_record: Option<&BufferedRecord>,
+    ) -> Result<Option<BufferedRecord>> {
+        // In commit time ordering, last writer always wins — no ordering comparison
+        Ok(Some(new_record.clone()))
+    }
+
+    fn delta_merge_delete(
+        &self,
+        delete_record: &DeleteRecord,
+        _existing_record: Option<&BufferedRecord>,
+    ) -> Result<Option<DeleteRecord>> {
+        // Delete always wins in commit time ordering
+        Ok(Some(delete_record.clone()))
+    }
+
+    fn final_merge(
+        &self,
+        _older_record: &BufferedRecord,
+        newer_record: &BufferedRecord,
+    ) -> Result<BufferedRecord> {
+        // Log record always wins over base file record
+        Ok(newer_record.clone())
+    }
+}
+
 /// Factory for creating `BufferedRecordMerger` instances.
 ///
 /// Mirrors Java's `BufferedRecordMergerFactory`.
@@ -135,10 +176,214 @@ pub struct BufferedRecordMergerFactory;
 impl BufferedRecordMergerFactory {
     /// Create a merger based on the merge mode.
     ///
-    /// Currently only supports event-time ordering. Other modes
-    /// (partial update, custom payload) are placeholders.
-    pub fn create(_merge_mode: &str) -> Box<dyn BufferedRecordMerger> {
-        // For now, all modes use EventTimeRecordMerger
-        Box::new(EventTimeRecordMerger)
+    /// - `"COMMIT_TIME_ORDERING"` → `CommitTimeRecordMerger` (last writer wins)
+    /// - `"EVENT_TIME_ORDERING"` or others → `EventTimeRecordMerger` (ordering value comparison)
+    pub fn create(merge_mode: &str) -> Box<dyn BufferedRecordMerger> {
+        match merge_mode {
+            "COMMIT_TIME_ORDERING" => Box::new(CommitTimeRecordMerger),
+            _ => Box::new(EventTimeRecordMerger),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_group::reader::buffered_record::OrderingValue;
+
+    fn make_data_record(key: &str, ordering: Option<i64>) -> BufferedRecord {
+        BufferedRecord {
+            record_key: key.to_string(),
+            data: None,
+            ordering_value: ordering.map(OrderingValue::Long),
+            is_delete: false,
+        }
+    }
+
+    fn make_delete_record(key: &str, ordering: Option<i64>) -> DeleteRecord {
+        DeleteRecord {
+            record_key: key.to_string(),
+            partition_path: String::new(),
+            ordering_value: ordering.map(OrderingValue::Long),
+        }
+    }
+
+    // =========================================================================
+    // CommitTimeRecordMerger tests
+    // =========================================================================
+
+    /// Given: CommitTimeRecordMerger, new_record with lower ordering value than existing
+    /// When:  delta_merge(new_record, Some(existing_record))
+    /// Then:  new_record is returned (ordering value is irrelevant in commit-time mode)
+    #[test]
+    fn test_commit_time_delta_merge_new_always_wins() {
+        let merger = CommitTimeRecordMerger;
+        let new_rec = make_data_record("k1", Some(0));
+        let existing = make_data_record("k1", Some(100));
+
+        let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().record_key, "k1");
+    }
+
+    /// Given: CommitTimeRecordMerger, no existing record
+    /// When:  delta_merge(new_record, None)
+    /// Then:  new_record is returned
+    #[test]
+    fn test_commit_time_delta_merge_no_existing() {
+        let merger = CommitTimeRecordMerger;
+        let new_rec = make_data_record("k1", Some(1));
+
+        let result = merger.delta_merge(&new_rec, None).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().record_key, "k1");
+    }
+
+    /// Given: CommitTimeRecordMerger, delete with lower ordering than existing data
+    /// When:  delta_merge_delete(delete, Some(existing))
+    /// Then:  delete is returned (always wins in commit-time mode)
+    #[test]
+    fn test_commit_time_delta_merge_delete_always_wins() {
+        let merger = CommitTimeRecordMerger;
+        let delete = make_delete_record("k1", Some(0));
+        let existing = make_data_record("k1", Some(100));
+
+        let result = merger.delta_merge_delete(&delete, Some(&existing)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().record_key, "k1");
+    }
+
+    /// Given: CommitTimeRecordMerger
+    /// When:  final_merge(base_record, log_record)
+    /// Then:  log_record is returned (log always wins over base)
+    #[test]
+    fn test_commit_time_final_merge_log_wins() {
+        let merger = CommitTimeRecordMerger;
+        let base = make_data_record("k1", Some(100));
+        let log = make_data_record("k1", Some(1));
+
+        let result = merger.final_merge(&base, &log).unwrap();
+        assert_eq!(result.record_key, "k1");
+        // Log record wins (ordering=1), not base (ordering=100)
+        assert_eq!(result.ordering_value, Some(OrderingValue::Long(1)));
+    }
+
+    // =========================================================================
+    // EventTimeRecordMerger tests
+    // =========================================================================
+
+    /// Given: EventTimeRecordMerger, new record has higher ordering (ts=2) than existing (ts=1)
+    /// When:  delta_merge(new, Some(existing))
+    /// Then:  new_record wins (higher ordering value)
+    #[test]
+    fn test_event_time_delta_merge_higher_ordering_wins() {
+        let merger = EventTimeRecordMerger;
+        let new_rec = make_data_record("k1", Some(2));
+        let existing = make_data_record("k1", Some(1));
+
+        let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().ordering_value,
+            Some(OrderingValue::Long(2))
+        );
+    }
+
+    /// Given: EventTimeRecordMerger, new record has lower ordering (ts=0) than existing (ts=1)
+    /// When:  delta_merge(new, Some(existing))
+    /// Then:  existing_record survives (higher ordering value)
+    #[test]
+    fn test_event_time_delta_merge_lower_ordering_loses() {
+        let merger = EventTimeRecordMerger;
+        let new_rec = make_data_record("k1", Some(0));
+        let existing = make_data_record("k1", Some(1));
+
+        let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().ordering_value,
+            Some(OrderingValue::Long(1))
+        );
+    }
+
+    /// Given: EventTimeRecordMerger, equal ordering values
+    /// When:  delta_merge(new(ts=1), Some(existing(ts=1)))
+    /// Then:  new_record wins (>= comparison)
+    #[test]
+    fn test_event_time_delta_merge_equal_ordering_new_wins() {
+        let merger = EventTimeRecordMerger;
+        let new_rec = make_data_record("new", Some(1));
+        let existing = make_data_record("existing", Some(1));
+
+        let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().record_key, "new");
+    }
+
+    /// Given: EventTimeRecordMerger
+    /// When:  delta_merge_delete(delete(ts=2), Some(existing(ts=1)))
+    /// Then:  delete wins (higher ordering)
+    /// When:  delta_merge_delete(delete(ts=0), Some(existing(ts=1)))
+    /// Then:  existing survives (None returned, lower ordering delete loses)
+    #[test]
+    fn test_event_time_delta_merge_delete_ordering_check() {
+        let merger = EventTimeRecordMerger;
+
+        // Delete with higher ordering wins
+        let delete_high = make_delete_record("k1", Some(2));
+        let existing = make_data_record("k1", Some(1));
+        let result = merger
+            .delta_merge_delete(&delete_high, Some(&existing))
+            .unwrap();
+        assert!(result.is_some(), "delete(ts=2) should win over data(ts=1)");
+
+        // Delete with lower ordering loses
+        let delete_low = make_delete_record("k1", Some(0));
+        let result = merger
+            .delta_merge_delete(&delete_low, Some(&existing))
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "delete(ts=0) should lose to data(ts=1)"
+        );
+    }
+
+    /// Given: EventTimeRecordMerger, no existing record
+    /// When:  delta_merge(new, None)
+    /// Then:  new_record is returned
+    #[test]
+    fn test_event_time_delta_merge_no_existing() {
+        let merger = EventTimeRecordMerger;
+        let new_rec = make_data_record("k1", Some(5));
+
+        let result = merger.delta_merge(&new_rec, None).unwrap();
+        assert!(result.is_some());
+    }
+
+    // =========================================================================
+    // Factory tests
+    // =========================================================================
+
+    #[test]
+    fn test_factory_commit_time_ordering() {
+        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING");
+        let new_rec = make_data_record("k", Some(0));
+        let existing = make_data_record("k", Some(100));
+        // CommitTime: new always wins regardless of ordering
+        let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
+        assert_eq!(result.unwrap().ordering_value, Some(OrderingValue::Long(0)));
+    }
+
+    #[test]
+    fn test_factory_event_time_ordering() {
+        let merger = BufferedRecordMergerFactory::create("EVENT_TIME_ORDERING");
+        let new_rec = make_data_record("k", Some(0));
+        let existing = make_data_record("k", Some(100));
+        // EventTime: higher ordering wins → existing survives
+        let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
+        assert_eq!(
+            result.unwrap().ordering_value,
+            Some(OrderingValue::Long(100))
+        );
     }
 }

@@ -68,6 +68,8 @@ pub mod buffered_record;
 pub mod delete_context;
 pub mod input_split;
 pub mod iterator_mode;
+pub mod log_record_reader;
+pub mod merged_log_record_reader;
 pub mod read_stats;
 pub mod reader_parameters;
 pub mod record_merger;
@@ -127,6 +129,12 @@ pub struct HoodieFileGroupReader {
     /// Reader flags: use_record_position, emit_delete, sort_output, etc.
     reader_parameters: ReaderParameters,
 
+    /// The latest commit time (high watermark for log block filtering).
+    latest_instant_time: String,
+
+    /// Record key field name (e.g. `_hoodie_record_key`).
+    record_key_field: String,
+
     /// Schema management for the read pipeline.
     schema_handler: FileGroupReaderSchemaHandler,
 
@@ -154,6 +162,8 @@ impl HoodieFileGroupReader {
         input_split: InputSplit,
         ordering_field_names: Vec<String>,
         reader_parameters: ReaderParameters,
+        latest_instant_time: String,
+        record_key_field: String,
     ) -> Self {
         Self {
             hudi_configs,
@@ -161,6 +171,8 @@ impl HoodieFileGroupReader {
             input_split,
             ordering_field_names,
             reader_parameters,
+            latest_instant_time,
+            record_key_field,
             schema_handler: FileGroupReaderSchemaHandler::new(),
             iterator_mode: IteratorMode::EngineRecord,
             record_buffer_loader: DefaultFileGroupRecordBufferLoader::new(),
@@ -234,14 +246,16 @@ impl HoodieFileGroupReader {
                 &self.reader_parameters,
                 &mut self.read_stats,
                 &instant_range,
+                &self.latest_instant_time,
+                &self.record_key_field,
             )
             .await?;
 
         let mut record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
 
-        // Step 4: Set base file batches on the buffer
-        record_buffer.set_base_file_batches(base_file_batches);
+        // Step 4: Set base file iterator on the buffer
+        record_buffer.set_base_file_iterator(base_file_batches);
 
         // Step 5: Merge and collect
         record_buffer.merge_and_collect()
@@ -315,6 +329,8 @@ pub struct HoodieFileGroupReaderBuilder {
     input_split: Option<InputSplit>,
     ordering_field_names: Vec<String>,
     reader_parameters: ReaderParameters,
+    latest_instant_time: Option<String>,
+    record_key_field: Option<String>,
     schema_handler: Option<FileGroupReaderSchemaHandler>,
 }
 
@@ -344,6 +360,16 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
+    pub fn with_latest_instant_time(mut self, time: String) -> Self {
+        self.latest_instant_time = Some(time);
+        self
+    }
+
+    pub fn with_record_key_field(mut self, field: String) -> Self {
+        self.record_key_field = Some(field);
+        self
+    }
+
     pub fn with_schema_handler(mut self, handler: FileGroupReaderSchemaHandler) -> Self {
         self.schema_handler = Some(handler);
         self
@@ -359,6 +385,12 @@ impl HoodieFileGroupReaderBuilder {
         let input_split = self
             .input_split
             .ok_or_else(|| CoreError::ReadFileSliceError("input_split is required".into()))?;
+        let latest_instant_time = self
+            .latest_instant_time
+            .unwrap_or_else(|| "99991231235959999".to_string());
+        let record_key_field = self
+            .record_key_field
+            .unwrap_or_else(|| crate::metadata::meta_field::MetaField::RecordKey.as_ref().to_string());
 
         let mut reader = HoodieFileGroupReader::new(
             hudi_configs,
@@ -366,6 +398,8 @@ impl HoodieFileGroupReaderBuilder {
             input_split,
             self.ordering_field_names,
             self.reader_parameters,
+            latest_instant_time,
+            record_key_field,
         );
 
         if let Some(handler) = self.schema_handler {
