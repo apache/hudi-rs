@@ -21,25 +21,20 @@ mod util;
 
 use crate::context::FileGroupReaderContext;
 use crate::util::create_raw_pointer_for_record_batches;
-use cxx::{CxxString, CxxVector};
 use hudi::config::HudiConfigs;
+use hudi::config::table::HudiTableConfig;
 use hudi::config::util::split_hudi_options_from_others;
-use hudi::file_group::FileGroup;
-use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::HoodieFileGroupReader;
 use hudi::file_group::reader::input_split::InputSplit;
 use hudi::file_group::reader::reader_parameters::ReaderParameters;
+use hudi::metadata::meta_field::MetaField;
 use hudi::storage::Storage;
-use hudi::table::builder::OptionResolver;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 static LOGGER: OnceLock<()> = OnceLock::new();
 
 /// Initialize env_logger exactly once for the lifetime of the loaded shared library.
-///
-/// Defaults to debug-level logging for the entire repo. If RUST_LOG is already
-/// set, it is respected as-is.
 fn init_logger() {
     LOGGER.get_or_init(|| {
         match std::env::var("RUST_LOG") {
@@ -53,11 +48,6 @@ fn init_logger() {
 
 #[cxx::bridge]
 mod ffi {
-    // ── CXX shared structs ─────────────────────────────────────────────
-    //
-    // These are flat/flattened for CXX safety.  The proper Rust hierarchy
-    // lives in `context.rs` — use `FileGroupReaderContext::from(ffi)` to convert.
-
     /// Mirrors `HudiReadOptions.LogFile` proto (CXX-safe, used in `Vec`).
     #[derive(Default)]
     struct FfiLogFile {
@@ -71,20 +61,15 @@ mod ffi {
         file_size: i64,
     }
 
-    /// FFI-safe flat representation of `HudiReadOptions.HoodieFileGroupReaderContext`
-    /// proto, carried across the CXX bridge in a single call.
+    /// FFI-safe flat representation of `HudiReadOptions.HoodieFileGroupReaderContext`.
     ///
-    /// All nested messages are flattened for CXX compatibility:
-    ///   - **Outer primitives** (proto fields 1–9): `table_path`, `partition_path`,
-    ///     `latest_commit_time`, `start`, `length`, `should_use_record_position`, …
-    ///   - **props** (proto field 10): parallel `props_keys`/`props_values` vecs
-    ///   - **BaseFile** (proto field 11): flattened with `base_file_*` prefix
-    ///   - **LogFile[]** (proto field 12): `Vec<FfiLogFile>`
-    ///   - **HoodieSchema** (proto fields 13–14): inlined as `*_json` strings
-    ///   - **ReaderContext** (proto field 15): flattened; maps use parallel key/value vecs
-    ///   - **Extra**: file-slice split fields (not in proto — transport only)
-    ///
-    /// Use `FileGroupReaderContext::from(ctx)` to reconstruct the proto hierarchy.
+    /// Contains everything the file group reader needs:
+    ///   - Table path (used as `hoodie.base.path` for Storage)
+    ///   - Partition, commit time, reader flags
+    ///   - Config maps (table_config, props, hoodie_reader_config)
+    ///   - Base file / log file details
+    ///   - Schemas, merge mode, instant range
+    ///   - Split-level transport fields (base_file_name, log_file_names)
     #[derive(Default)]
     struct FfiReaderContext {
         // ── outer primitives (HoodieFileGroupReaderContext fields 1–9) ──
@@ -109,7 +94,6 @@ mod ffi {
         base_file_file_size: i64,
         base_file_file_id: String,
         base_file_commit_time: String,
-        // bootstrap sub-file (proto BaseFile.bootstrap_base_file, flattened)
         base_file_has_bootstrap: bool,
         base_file_bootstrap_path: String,
         base_file_bootstrap_file_name: String,
@@ -134,7 +118,6 @@ mod ffi {
         iterator_mode: String,
         merge_mode: String,
         merge_strategy_id: String,
-        // InstantRange (proto field 15.12, flattened)
         has_instant_range: bool,
         instant_range_start: String,
         instant_range_end: String,
@@ -158,32 +141,15 @@ mod ffi {
     extern "Rust" {
         type HudiFileGroupReader;
 
-        type HudiFileSlice;
-        fn new_file_slice_from_file_names(
-            partition_path: &CxxString,
-            base_file_name: &CxxString,
-            log_file_names: &CxxVector<CxxString>,
-        ) -> Result<Box<HudiFileSlice>>;
-
-        // ── context-based APIs (mimicking Hudi OSS builder pattern) ─────
-        //
-        // Usage from C++:
-        //   auto reader = new_file_group_reader_with_context(baseUri, ctx);
-        //   auto slice  = new_file_slice_from_context(*reader);
-        //   auto stream = reader->get_closable_iterator(*slice);
-        //
+        /// Create a file group reader from the full context.
+        /// `table_path` inside `ctx` is used as the storage base URI.
         fn new_file_group_reader_with_context(
-            base_uri: &CxxString,
             ctx: FfiReaderContext,
         ) -> Result<Box<HudiFileGroupReader>>;
 
-        fn new_file_slice_from_context(
-            reader: &HudiFileGroupReader,
-        ) -> Result<Box<HudiFileSlice>>;
-
+        /// Read the file group and return merged results as an ArrowArrayStream.
         fn get_closable_iterator(
             self: &HudiFileGroupReader,
-            file_slice: &HudiFileSlice,
         ) -> Result<*mut ArrowArrayStream>;
     }
 }
@@ -192,47 +158,30 @@ pub struct HudiFileGroupReader {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     rt: tokio::runtime::Runtime,
-    /// Full file-group reader context converted from FfiReaderContext.
     fgrc: FileGroupReaderContext,
-    /// File-slice split fields (not in proto) needed to build the FileSlice.
     split_ctx: SplitContext,
 }
 
-/// File-slice fields that come from the split (not from the proto).
 struct SplitContext {
     base_file_name: String,
     log_file_names: Vec<String>,
 }
 
-// ── context-based APIs ──────────────────────────────────────────────────────
-
-/// Creates a `HudiFileGroupReader` from a base URI and a full `FfiReaderContext`.
-///
-/// Builds `HudiConfigs` and `Storage` directly from the context's config maps,
-/// then uses the Java-style `HoodieFileGroupReader` for all reads.
+/// Creates a `HudiFileGroupReader` from a full `FfiReaderContext`.
 pub fn new_file_group_reader_with_context(
-    base_uri: &CxxString,
     ctx: ffi::FfiReaderContext,
 ) -> std::result::Result<Box<HudiFileGroupReader>, String> {
     init_logger();
 
-    let base_uri = base_uri
-        .to_str()
-        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
-
-    // Stash the split-level fields before converting to FileGroupReaderContext
-    // (these are transport-only and not part of the proto hierarchy).
     let split_ctx = SplitContext {
         base_file_name: ctx.base_file_name.clone(),
         log_file_names: ctx.log_file_names.iter().cloned().collect(),
     };
 
-    // Convert flat FfiReaderContext → proper proto-matching hierarchy.
     let fgrc: FileGroupReaderContext = ctx.into();
 
-    // ── log the full context at debug level ───────────────────────────────
     log::debug!(
-        "new_file_group_reader_with_context: base_uri={base_uri} \
+        "new_file_group_reader_with_context: \
          table_path={table_path} partition_path={partition_path} \
          latest_commit_time={latest_commit_time} start={start} length={length} \
          should_use_record_position={surp} allow_inflight_instants={aii} \
@@ -284,9 +233,16 @@ pub fn new_file_group_reader_with_context(
         log_file_names = split_ctx.log_file_names,
     );
 
-    // Build options from the inner ReaderContext config maps plus outer props.
+    // Build options from config maps.
     // Order: table_config < props < hoodie_reader_config (higher = takes precedence).
     let mut options: Vec<(String, String)> = Vec::new();
+
+    // Inject table_path as hoodie.base.path so Storage knows where to read from.
+    options.push((
+        HudiTableConfig::BasePath.as_ref().to_string(),
+        fgrc.table_path.clone(),
+    ));
+
     if let Some(rc) = fgrc.reader_context.as_ref() {
         for (k, v) in &rc.table_config {
             options.push((k.clone(), v.clone()));
@@ -301,7 +257,6 @@ pub fn new_file_group_reader_with_context(
         }
     }
 
-    // Build HudiConfigs and Storage directly (same as reader_v1 did internally).
     let (hudi_opts, storage_opts) = split_hudi_options_from_others(options);
     let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
     let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())
@@ -322,16 +277,13 @@ pub fn new_file_group_reader_with_context(
 }
 
 impl HudiFileGroupReader {
-    /// Uses the Java-style `HoodieFileGroupReader` which implements the full
-    /// 3-phase merge: scan log files into key-based buffer → merge with base → emit.
+    /// Uses the Java-style `HoodieFileGroupReader` for the full 3-phase merge.
     pub fn get_closable_iterator(
         &self,
-        _file_slice: &HudiFileSlice,
     ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let fgrc = &self.fgrc;
         let split_ctx = &self.split_ctx;
 
-        // Build InputSplit from context.
         let base_file_path = if fgrc.partition_path.is_empty() {
             split_ctx.base_file_name.clone()
         } else {
@@ -356,7 +308,6 @@ impl HudiFileGroupReader {
             fgrc.partition_path.clone(),
         );
 
-        // Build ReaderParameters from context.
         let reader_parameters = ReaderParameters {
             use_record_position: fgrc.should_use_record_position,
             emit_delete: fgrc.emit_delete,
@@ -364,15 +315,12 @@ impl HudiFileGroupReader {
             allow_inflight_instants: fgrc.allow_inflight_instants,
         };
 
-        // Extract ordering field names (precombine field) from config, if present.
         let options = self.hudi_configs.as_options();
         let ordering_field_names: Vec<String> = options
             .get("hoodie.table.precombine.field")
             .or_else(|| options.get("hoodie.table.ordering.fields"))
             .map(|f| vec![f.clone()])
             .unwrap_or_default();
-
-        let record_key_field = "_hoodie_record_key".to_string();
 
         log::debug!(
             "get_closable_iterator: partition={} base_file={} log_files={} \
@@ -392,7 +340,7 @@ impl HudiFileGroupReader {
             ordering_field_names,
             reader_parameters,
             fgrc.latest_commit_time.clone(),
-            record_key_field,
+            MetaField::RecordKey.as_ref().to_string(),
         );
 
         let record_batch = self
@@ -412,72 +360,4 @@ impl HudiFileGroupReader {
             schema,
         ))
     }
-}
-
-/// Creates a `HudiFileSlice` from the split context stashed inside the reader.
-pub fn new_file_slice_from_context(
-    reader: &HudiFileGroupReader,
-) -> std::result::Result<Box<HudiFileSlice>, String> {
-    let split_ctx = &reader.split_ctx;
-    let partition_path = reader.fgrc.partition_path.as_str();
-
-    let mut file_group =
-        FileGroup::new_with_base_file_name(&split_ctx.base_file_name, partition_path)
-            .map_err(|e| format!("Failed to create FileGroup: {e}"))?;
-
-    let log_refs: Vec<&str> = split_ctx.log_file_names.iter().map(|s| s.as_str()).collect();
-    file_group
-        .add_log_files_from_names(&log_refs)
-        .map_err(|e| format!("Failed to add log files to FileGroup: {e}"))?;
-
-    let (_, file_slice) = file_group
-        .file_slices
-        .iter()
-        .next()
-        .ok_or_else(|| format!("Failed to get file slice from FileGroup: {file_group:?}"))?;
-
-    Ok(Box::new(HudiFileSlice {
-        inner: file_slice.clone(),
-    }))
-}
-
-pub struct HudiFileSlice {
-    inner: FileSlice,
-}
-
-pub fn new_file_slice_from_file_names(
-    partition_path: &CxxString,
-    base_file_name: &CxxString,
-    log_file_names: &CxxVector<CxxString>,
-) -> std::result::Result<Box<HudiFileSlice>, String> {
-    let partition_path = partition_path
-        .to_str()
-        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
-    let base_file_name = base_file_name
-        .to_str()
-        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
-
-    let log_file_names = log_file_names
-        .iter()
-        .map(|name| {
-            name.to_str()
-                .map_err(|e| format!("Failed to convert CxxString to str: {e}"))
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut file_group = FileGroup::new_with_base_file_name(base_file_name, partition_path)
-        .map_err(|e| format!("Failed to create FileGroup: {e}"))?;
-    file_group
-        .add_log_files_from_names(&log_file_names)
-        .map_err(|e| format!("Failed to add files to FileGroup: {e}"))?;
-
-    let (_, file_slice) = file_group
-        .file_slices
-        .iter()
-        .next()
-        .ok_or_else(|| format!("Failed to get file slice from FileGroup: {file_group:?}"))?;
-
-    Ok(Box::new(HudiFileSlice {
-        inner: file_slice.clone(),
-    }))
 }
