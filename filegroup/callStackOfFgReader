@@ -1,0 +1,41 @@
+
+  HoodieFileGroupReader.getClosableIterator()          [HoodieFileGroupReader.java:301]
+    └─ getBufferedRecordIterator(IteratorMode)          [line 291]
+         └─ initRecordIterators()                       [line 292]
+              │
+              ├─── makeBaseFileIterator()               [line 129]  ← BASE FILE SCAN (iterator created here)
+              │      └─ readerContext.getFileRecordIterator(...)     [line 157/163]
+              │           (returns a lazy Parquet/HFile iterator — not yet consumed)
+              │
+              └─── recordBufferLoader.getRecordBuffer(...) [line 134]  ← LOG FILE SCAN (eagerly consumed here)
+                    │
+                    └─ DefaultFileGroupRecordBufferLoader.getRecordBuffer()   [DefaultFileGroupRecordBufferLoader.java:54]
+                          ├─ new KeyBasedFileGroupRecordBuffer(...)            [line 78]
+                          └─ scanLogFiles(readerContext, storage, inputSplit, ..., recordBuffer)  [line 81]
+                               │
+                               └─ LogScanningRecordBufferLoader.scanLogFiles() [LogScanningRecordBufferLoader.java:37]
+                                    └─ HoodieMergedLogRecordReader.newBuilder()...build()  [line 41-52]
+                                         └─ HoodieMergedLogRecordReader constructor        [HoodieMergedLogRecordReader.java:66]
+                                              └─ performScan()                             [line 75]  (forceFullScan=true)
+                                                   └─ BaseHoodieLogRecordReader.scanInternal()  [BaseHoodieLogRecordReader.java:192]
+                                                        │
+                                                        ├─ [Pass 1] HoodieLogFormatReader.next() × N blocks  [line 249-317]
+                                                        │     (reads block headers, builds instantToBlocksMap, strips rollbacks)
+                                                        │
+                                                        ├─ [Pass 2] orderedInstantsList reverse iteration   [line 336-375]
+                                                        │     (resolves compaction, builds currentInstantLogBlocks deque)
+                                                        │
+                                                        └─ processQueuedBlocksForInstant(deque)             [line 385]
+                                                             └─ [for each block, oldest→newest via pollLast]
+                                                                  ├─ recordBuffer.processDataBlock(dataBlock, keySpecOpt)   [line 437]
+                                                                  │    └─ KeyBasedFileGroupRecordBuffer.processDataBlock()  [line 73]
+                                                                  │         └─ [for each record in block]
+                                                                  │              BufferedRecords.fromEngineRecord(...)
+                                                                  │              └─ processNextDataRecord(bufferedRecord, key)  [line 105]
+                                                                  │                   └─ records.put(key, deltaMerge(new, existing))  ← MAP UPDATED
+                                                                  │
+                                                                  └─ recordBuffer.processDeleteBlock(deleteBlock)           [line 440]
+                                                                       └─ KeyBasedFileGroupRecordBuffer.processDeleteBlock() [line 113]
+                                                                            └─ processNextDeletedRecord(deleteRecord, key)   [line 122]
+                                                                                 └─ records.put(key, fromDeleteRecord(...))  ← MAP UPDATED
+

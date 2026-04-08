@@ -29,7 +29,7 @@ use datafusion::error::DataFusionError;
 use hudi::error::CoreError;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
-use hudi::file_group::reader::FileGroupReader;
+use hudi::file_group::reader_v1::FileGroupReader;
 use hudi::storage::error::StorageError;
 use hudi::table::Table;
 use hudi::table::builder::TableBuilder;

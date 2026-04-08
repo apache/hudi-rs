@@ -25,6 +25,7 @@ pub mod builder;
 pub mod file_slice;
 pub mod log_file;
 pub mod reader;
+pub mod reader_v1;
 pub mod record_batches;
 
 use crate::Result;

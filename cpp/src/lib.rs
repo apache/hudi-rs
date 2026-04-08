@@ -24,7 +24,7 @@ use crate::util::create_raw_pointer_for_record_batches;
 use cxx::{CxxString, CxxVector};
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
-use hudi::file_group::reader::FileGroupReader;
+use hudi::file_group::reader_v1::FileGroupReader;
 use std::sync::OnceLock;
 
 static LOGGER: OnceLock<()> = OnceLock::new();
