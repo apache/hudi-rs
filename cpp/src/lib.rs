@@ -22,12 +22,16 @@ mod util;
 use crate::context::FileGroupReaderContext;
 use crate::util::create_raw_pointer_for_record_batches;
 use cxx::{CxxString, CxxVector};
+use hudi::config::HudiConfigs;
+use hudi::config::util::split_hudi_options_from_others;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::HoodieFileGroupReader;
 use hudi::file_group::reader::input_split::InputSplit;
 use hudi::file_group::reader::reader_parameters::ReaderParameters;
-use hudi::file_group::reader_v1::FileGroupReader;
+use hudi::storage::Storage;
+use hudi::table::builder::OptionResolver;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 static LOGGER: OnceLock<()> = OnceLock::new();
@@ -154,12 +158,6 @@ mod ffi {
     extern "Rust" {
         type HudiFileGroupReader;
 
-        // ── legacy APIs (kept for backward compatibility) ───────────────
-        fn new_file_group_reader_with_options(
-            base_uri: &CxxString,
-            options: &CxxVector<CxxString>,
-        ) -> Result<Box<HudiFileGroupReader>>;
-
         type HudiFileSlice;
         fn new_file_slice_from_file_names(
             partition_path: &CxxString,
@@ -167,17 +165,7 @@ mod ffi {
             log_file_names: &CxxVector<CxxString>,
         ) -> Result<Box<HudiFileSlice>>;
 
-        fn read_file_slice_by_base_file_path(
-            self: &HudiFileGroupReader,
-            relative_path: &CxxString,
-        ) -> Result<*mut ArrowArrayStream>;
-
-        fn read_file_slice(
-            self: &HudiFileGroupReader,
-            file_slice: &HudiFileSlice,
-        ) -> Result<*mut ArrowArrayStream>;
-
-        // ── new context-based APIs (mimicking Hudi OSS builder pattern) ─
+        // ── context-based APIs (mimicking Hudi OSS builder pattern) ─────
         //
         // Usage from C++:
         //   auto reader = new_file_group_reader_with_context(baseUri, ctx);
@@ -201,13 +189,13 @@ mod ffi {
 }
 
 pub struct HudiFileGroupReader {
-    inner: FileGroupReader,
+    hudi_configs: Arc<HudiConfigs>,
+    storage: Arc<Storage>,
     rt: tokio::runtime::Runtime,
     /// Full file-group reader context converted from FfiReaderContext.
-    /// Mirrors `HoodieFileGroupReaderContext` proto hierarchy.
-    fgrc: Option<FileGroupReaderContext>,
+    fgrc: FileGroupReaderContext,
     /// File-slice split fields (not in proto) needed to build the FileSlice.
-    split_ctx: Option<SplitContext>,
+    split_ctx: SplitContext,
 }
 
 /// File-slice fields that come from the split (not from the proto).
@@ -216,219 +204,12 @@ struct SplitContext {
     log_file_names: Vec<String>,
 }
 
-// ── legacy APIs ──────────────────────────────────────────────────────────────
+// ── context-based APIs ──────────────────────────────────────────────────────
 
-pub fn new_file_group_reader_with_options(
-    base_uri: &CxxString,
-    options: &CxxVector<CxxString>,
-) -> std::result::Result<Box<HudiFileGroupReader>, String> {
-    init_logger();
-
-    let base_uri = base_uri
-        .to_str()
-        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
-
-    let mut opt_vec = Vec::new();
-    for opt in options.iter() {
-        let opt_str = opt
-            .to_str()
-            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
-        if let Some((key, value)) = opt_str.split_once('=') {
-            opt_vec.push((key, value))
-        }
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
-    let reader = rt
-        .block_on(FileGroupReader::new_with_options(base_uri, opt_vec))
-        .map_err(|e| format!("Failed to create FileGroupReader: {e}"))?;
-    Ok(Box::new(HudiFileGroupReader {
-        inner: reader,
-        rt,
-        fgrc: None,
-        split_ctx: None,
-    }))
-}
-
-impl HudiFileGroupReader {
-    pub fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &CxxString,
-    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
-        let relative_path = relative_path
-            .to_str()
-            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
-
-        let record_batch = self
-            .rt
-            .block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
-            .map_err(|e| format!("Failed to read file batch: {e}"))?;
-        let schema = record_batch.schema();
-
-        Ok(create_raw_pointer_for_record_batches(
-            vec![record_batch],
-            schema,
-        ))
-    }
-
-    pub fn read_file_slice(
-        &self,
-        file_slice: &HudiFileSlice,
-    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
-        let record_batch = self
-            .rt
-            .block_on(self.inner.read_file_slice(&file_slice.inner))
-            .map_err(|e| format!("Failed to read file slice: {e}"))?;
-        let schema = record_batch.schema();
-
-        Ok(create_raw_pointer_for_record_batches(
-            vec![record_batch],
-            schema,
-        ))
-    }
-
-    /// New API: equivalent to `read_file_slice` but named to match Hudi OSS
-    /// `HoodieFileGroupReader.getClosableIterator()`.
-    /// Returns an `ArrowArrayStream*` that the C++ caller owns.
-    ///
-    /// When a full `FileGroupReaderContext` is available (context-based API),
-    /// this uses the Java-style `HoodieFileGroupReader` which supports proper
-    /// key-based merge with `COMMIT_TIME_ORDERING`.  Otherwise it falls back
-    /// to the legacy `reader_v1` path.
-    pub fn get_closable_iterator(
-        &self,
-        file_slice: &HudiFileSlice,
-    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
-        // When we have a full context, use the Java-style reader for proper
-        // merge support (COMMIT_TIME_ORDERING, key-based dedup, etc.)
-        if let (Some(fgrc), Some(split_ctx)) = (&self.fgrc, &self.split_ctx) {
-            return self.get_closable_iterator_java_style(fgrc, split_ctx);
-        }
-
-        // Legacy path: delegate to reader_v1
-        let record_batch = self
-            .rt
-            .block_on(self.inner.read_file_slice(&file_slice.inner))
-            .map_err(|e| format!("Failed to read file slice: {e}"))?;
-        let schema = record_batch.schema();
-
-        Ok(create_raw_pointer_for_record_batches(
-            vec![record_batch],
-            schema,
-        ))
-    }
-
-    /// Use the Java-style `HoodieFileGroupReader` (from `file_group::reader`)
-    /// which implements the full 3-phase merge: scan log → merge by key → emit.
-    fn get_closable_iterator_java_style(
-        &self,
-        fgrc: &FileGroupReaderContext,
-        split_ctx: &SplitContext,
-    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
-        let hudi_configs = self.inner.hudi_configs().clone();
-        let storage = self.inner.storage().clone();
-
-        // Build InputSplit from context.
-        let base_file_path = if fgrc.partition_path.is_empty() {
-            split_ctx.base_file_name.clone()
-        } else {
-            format!("{}/{}", fgrc.partition_path, split_ctx.base_file_name)
-        };
-        let log_file_paths: Vec<String> = split_ctx
-            .log_file_names
-            .iter()
-            .map(|name| {
-                if fgrc.partition_path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", fgrc.partition_path, name)
-                }
-            })
-            .collect();
-
-        let input_split = InputSplit::new(
-            Some(base_file_path),
-            None, // base_file_commit_time extracted from log block headers
-            log_file_paths,
-            fgrc.partition_path.clone(),
-        );
-
-        // Build ReaderParameters from context.
-        let reader_parameters = ReaderParameters {
-            use_record_position: fgrc.should_use_record_position,
-            emit_delete: fgrc.emit_delete,
-            sort_output: fgrc.sort_output,
-            allow_inflight_instants: fgrc.allow_inflight_instants,
-        };
-
-        // Extract ordering field names (precombine field) from config, if present.
-        let options = hudi_configs.as_options();
-        let ordering_field_names: Vec<String> = options
-            .get("hoodie.table.precombine.field")
-            .or_else(|| options.get("hoodie.table.ordering.fields"))
-            .map(|f| vec![f.clone()])
-            .unwrap_or_default();
-
-        let record_key_field = "_hoodie_record_key".to_string();
-
-        log::debug!(
-            "get_closable_iterator_java_style: partition={} base_file={} log_files={} \
-             latest_instant_time={} ordering_fields={:?} merge_mode={}",
-            fgrc.partition_path,
-            split_ctx.base_file_name,
-            split_ctx.log_file_names.len(),
-            fgrc.latest_commit_time,
-            ordering_field_names,
-            fgrc.reader_context.as_ref().map(|rc| rc.merge_mode.as_str()).unwrap_or("?"),
-        );
-
-        let mut reader = HoodieFileGroupReader::new(
-            hudi_configs,
-            storage,
-            input_split,
-            ordering_field_names,
-            reader_parameters,
-            fgrc.latest_commit_time.clone(),
-            record_key_field,
-        );
-
-        let record_batch = self
-            .rt
-            .block_on(reader.read())
-            .map_err(|e| format!("Failed to read file group (java-style merge): {e}"))?;
-        let schema = record_batch.schema();
-
-        log::debug!(
-            "get_closable_iterator_java_style: merge complete, {} rows, {} cols",
-            record_batch.num_rows(),
-            record_batch.num_columns(),
-        );
-
-        Ok(create_raw_pointer_for_record_batches(
-            vec![record_batch],
-            schema,
-        ))
-    }
-}
-
-// ── new context-based APIs ───────────────────────────────────────────────────
-
-/// Creates a `FileGroupReader` from a base URI and a full `FfiReaderContext`.
+/// Creates a `HudiFileGroupReader` from a base URI and a full `FfiReaderContext`.
 ///
-/// Mimics Hudi OSS:
-/// ```java
-/// HoodieFileGroupReader.newBuilder()
-///     .withReaderContext(readerContext)
-///     .withHoodieTableMetaClient(metaClient)  // → table_config
-///     .withLatestCommitTime(queryTimestamp)
-///     .withProps(props)                        // → hoodie_reader_config
-///     .withShouldUseRecordPosition(...)
-///     ...
-///     .build()
-/// ```
+/// Builds `HudiConfigs` and `Storage` directly from the context's config maps,
+/// then uses the Java-style `HoodieFileGroupReader` for all reads.
 pub fn new_file_group_reader_with_context(
     base_uri: &CxxString,
     ctx: ffi::FfiReaderContext,
@@ -520,44 +301,125 @@ pub fn new_file_group_reader_with_context(
         }
     }
 
-    // TODO: map remaining context fields (merge_mode, iterator_mode,
-    // instant_range, schemas, etc.) to hudi-rs config options once
-    // hudi-rs supports them natively.
+    // Build HudiConfigs and Storage directly (same as reader_v1 did internally).
+    let (hudi_opts, storage_opts) = split_hudi_options_from_others(options);
+    let hudi_configs = Arc::new(HudiConfigs::new(hudi_opts));
+    let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())
+        .map_err(|e| format!("Failed to create Storage: {e}"))?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
-    let reader = rt
-        .block_on(FileGroupReader::new_with_options(base_uri, options))
-        .map_err(|e| format!("Failed to create FileGroupReader with context: {e}"))?;
 
     Ok(Box::new(HudiFileGroupReader {
-        inner: reader,
+        hudi_configs,
+        storage,
         rt,
-        fgrc: Some(fgrc),
-        split_ctx: Some(split_ctx),
+        fgrc,
+        split_ctx,
     }))
 }
 
+impl HudiFileGroupReader {
+    /// Uses the Java-style `HoodieFileGroupReader` which implements the full
+    /// 3-phase merge: scan log files into key-based buffer → merge with base → emit.
+    pub fn get_closable_iterator(
+        &self,
+        _file_slice: &HudiFileSlice,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+        let fgrc = &self.fgrc;
+        let split_ctx = &self.split_ctx;
+
+        // Build InputSplit from context.
+        let base_file_path = if fgrc.partition_path.is_empty() {
+            split_ctx.base_file_name.clone()
+        } else {
+            format!("{}/{}", fgrc.partition_path, split_ctx.base_file_name)
+        };
+        let log_file_paths: Vec<String> = split_ctx
+            .log_file_names
+            .iter()
+            .map(|name| {
+                if fgrc.partition_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", fgrc.partition_path, name)
+                }
+            })
+            .collect();
+
+        let input_split = InputSplit::new(
+            Some(base_file_path),
+            None,
+            log_file_paths,
+            fgrc.partition_path.clone(),
+        );
+
+        // Build ReaderParameters from context.
+        let reader_parameters = ReaderParameters {
+            use_record_position: fgrc.should_use_record_position,
+            emit_delete: fgrc.emit_delete,
+            sort_output: fgrc.sort_output,
+            allow_inflight_instants: fgrc.allow_inflight_instants,
+        };
+
+        // Extract ordering field names (precombine field) from config, if present.
+        let options = self.hudi_configs.as_options();
+        let ordering_field_names: Vec<String> = options
+            .get("hoodie.table.precombine.field")
+            .or_else(|| options.get("hoodie.table.ordering.fields"))
+            .map(|f| vec![f.clone()])
+            .unwrap_or_default();
+
+        let record_key_field = "_hoodie_record_key".to_string();
+
+        log::debug!(
+            "get_closable_iterator: partition={} base_file={} log_files={} \
+             latest_instant_time={} ordering_fields={:?} merge_mode={}",
+            fgrc.partition_path,
+            split_ctx.base_file_name,
+            split_ctx.log_file_names.len(),
+            fgrc.latest_commit_time,
+            ordering_field_names,
+            fgrc.reader_context.as_ref().map(|rc| rc.merge_mode.as_str()).unwrap_or("?"),
+        );
+
+        let mut reader = HoodieFileGroupReader::new(
+            self.hudi_configs.clone(),
+            self.storage.clone(),
+            input_split,
+            ordering_field_names,
+            reader_parameters,
+            fgrc.latest_commit_time.clone(),
+            record_key_field,
+        );
+
+        let record_batch = self
+            .rt
+            .block_on(reader.read())
+            .map_err(|e| format!("Failed to read file group: {e}"))?;
+        let schema = record_batch.schema();
+
+        log::debug!(
+            "get_closable_iterator: merge complete, {} rows, {} cols",
+            record_batch.num_rows(),
+            record_batch.num_columns(),
+        );
+
+        Ok(create_raw_pointer_for_record_batches(
+            vec![record_batch],
+            schema,
+        ))
+    }
+}
+
 /// Creates a `HudiFileSlice` from the split context stashed inside the reader.
-/// This avoids a second round-trip of file-slice fields from C++.
 pub fn new_file_slice_from_context(
     reader: &HudiFileGroupReader,
 ) -> std::result::Result<Box<HudiFileSlice>, String> {
-    let split_ctx = reader
-        .split_ctx
-        .as_ref()
-        .ok_or_else(|| {
-            "new_file_slice_from_context called on a reader created with \
-             new_file_group_reader_with_options (no stashed context)"
-                .to_string()
-        })?;
-    let partition_path = reader
-        .fgrc
-        .as_ref()
-        .map(|fgrc| fgrc.partition_path.as_str())
-        .unwrap_or("");
+    let split_ctx = &reader.split_ctx;
+    let partition_path = reader.fgrc.partition_path.as_str();
 
     let mut file_group =
         FileGroup::new_with_base_file_name(&split_ctx.base_file_name, partition_path)

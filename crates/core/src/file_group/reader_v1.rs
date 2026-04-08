@@ -26,9 +26,10 @@ use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
-use crate::file_group::record_batches::RecordBatches;
+use crate::file_group::reader::HoodieFileGroupReader;
+use crate::file_group::reader::input_split::InputSplit;
+use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::merge::record_merger::RecordMerger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
@@ -248,39 +249,45 @@ impl FileGroupReader {
             self.read_file_slice_by_base_file_path(base_file_path).await
         } else {
             log::debug!(
-                "FileGroupReader: MOR merge for '{base_file_path}' \
+                "FileGroupReader: MOR merge (java-style) for '{base_file_path}' \
                  with {} log file(s): [{}]",
                 log_file_paths.len(),
                 log_file_paths.join(", "),
             );
-            let instant_range = self.create_instant_range_for_log_file_scan();
-            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
-                .scan(log_file_paths, &instant_range)
-                .await?;
 
-            let log_batches = match scan_result {
-                ScanResult::RecordBatches(batches) => batches,
-                ScanResult::Empty => RecordBatches::new(),
-                ScanResult::HFileRecords(_) => {
-                    return Err(CoreError::LogBlockError(
-                        "Unexpected HFile records in regular table log file".to_string(),
-                    ));
-                }
-            };
+            // Delegate to the Java-style HoodieFileGroupReader for proper
+            // key-based merge (supports COMMIT_TIME_ORDERING, etc.)
+            let input_split = InputSplit::new(
+                Some(base_file_path.to_string()),
+                None,
+                log_file_paths,
+                String::new(),
+            );
 
-            let base_batch = self
-                .read_file_slice_by_base_file_path(base_file_path)
-                .await?;
-            let schema = base_batch.schema();
-            let num_data_batches = log_batches.num_data_batches() + 1;
-            let num_delete_batches = log_batches.num_delete_batches();
-            let mut all_batches =
-                RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-            all_batches.push_data_batch(base_batch);
-            all_batches.extend(log_batches);
+            let options = self.hudi_configs.as_options();
+            let ordering_field_names: Vec<String> = options
+                .get("hoodie.table.precombine.field")
+                .or_else(|| options.get("hoodie.table.ordering.fields"))
+                .map(|f| vec![f.clone()])
+                .unwrap_or_default();
 
-            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)
+            let latest_instant_time = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                .map(|v| -> String { v.into() })
+                .unwrap_or_else(|| "99991231235959999".to_string());
+
+            let mut reader = HoodieFileGroupReader::new(
+                self.hudi_configs.clone(),
+                self.storage.clone(),
+                input_split,
+                ordering_field_names,
+                ReaderParameters::default(),
+                latest_instant_time,
+                MetaField::RecordKey.as_ref().to_string(),
+            );
+
+            reader.read().await
         }
     }
 
