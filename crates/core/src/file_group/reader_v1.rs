@@ -104,6 +104,16 @@ impl FileGroupReader {
         })
     }
 
+    /// Returns a reference to the Hudi configuration.
+    pub fn hudi_configs(&self) -> &Arc<HudiConfigs> {
+        &self.hudi_configs
+    }
+
+    /// Returns a reference to the storage layer.
+    pub fn storage(&self) -> &Arc<Storage> {
+        &self.storage
+    }
+
     /// Reads the data from the base file at the given relative path.
     ///
     /// # Arguments
