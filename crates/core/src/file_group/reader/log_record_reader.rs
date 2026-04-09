@@ -46,7 +46,6 @@ use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
-use arrow_schema::SchemaRef;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -351,20 +350,6 @@ pub struct BaseHoodieLogRecordReader {
     pub record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
     pub allow_inflight_instants: bool,
 
-    /// Mirrors Java's `protected final HoodieSchema readerSchema` (line 81).
-    ///
-    /// Set from `readerContext.getSchemaHandler().getRequiredSchema()` (Java line 143).
-    /// In Rust, we receive it via the builder from `schemaHandler.getRequiredSchema()`.
-    ///
-    /// In Java, this flows down to `HoodieLogFormatReader` → `HoodieLogFileReader` →
-    /// `HoodieDataBlock.readerSchema`, where it is used by `GenericDatumReader(writerSchema,
-    /// readerSchema)` for deserialization-time projection.
-    ///
-    /// In Rust, Avro/Parquet decoding always uses the writer schema from the block header.
-    /// Projection to `reader_schema` happens post-inflate in `process_queued_blocks_for_instant`,
-    /// which is the Rust equivalent of Java's deserialization-time projection.
-    pub reader_schema: Option<SchemaRef>,
-
     // ── Stats / state (mirrors Java's AtomicLong counters + progress) ──
     pub valid_block_instants: Vec<String>,
     pub total_log_files: u64,
@@ -508,12 +493,7 @@ impl BaseHoodieLogRecordReader {
 
             match block.block_type {
                 BlockType::AvroData | BlockType::HfileData | BlockType::ParquetData => {
-                    // Pass self.reader_schema to the buffer, mirroring Java where
-                    // dataBlock.readerSchema is set from BaseHoodieLogRecordReader.readerSchema
-                    self.record_buffer.process_data_block(
-                        &mut block,
-                        self.reader_schema.as_ref(),
-                    )?;
+                    self.record_buffer.process_data_block(&mut block)?;
                     log::debug!(
                         "[Pass3] after processing data block #{block_num}: buffer size={}",
                         self.record_buffer.size(),
@@ -1076,7 +1056,7 @@ mod tests {
             let instant = block.instant_time().unwrap().to_string();
             order.push(instant.clone());
             // Process through the buffer (same as processQueuedBlocksForInstant)
-            buffer.process_data_block(&mut block, None).unwrap();
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Verify processing order: oldest → newest
@@ -1153,7 +1133,7 @@ mod tests {
                     order_values.push(counters.value(0));
                 }
             }
-            buffer.process_data_block(&mut block, None).unwrap();
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Processing order: blockA(t1) → blockB(t1) → blockC(t2)
@@ -1186,15 +1166,15 @@ mod tests {
 
         // Simulate oldest→newest processing (as pollLast produces)
         let mut block_t1 = make_data_block_with_content("t1", &[("K", 1, 10)]);
-        buffer.process_data_block(&mut block_t1, None).unwrap();
+        buffer.process_data_block(&mut block_t1).unwrap();
         assert_eq!(buffer.size(), 1);
 
         let mut block_t2 = make_data_block_with_content("t2", &[("K", 2, 20)]);
-        buffer.process_data_block(&mut block_t2, None).unwrap();
+        buffer.process_data_block(&mut block_t2).unwrap();
         assert_eq!(buffer.size(), 1); // same key, overwritten
 
         let mut block_t3 = make_data_block_with_content("t3", &[("K", 3, 30)]);
-        buffer.process_data_block(&mut block_t3, None).unwrap();
+        buffer.process_data_block(&mut block_t3).unwrap();
         assert_eq!(buffer.size(), 1);
 
         // All 3 records were processed
@@ -1230,7 +1210,7 @@ mod tests {
 
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
-            buffer.process_data_block(&mut block, None).unwrap();
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Verify map state
@@ -1279,7 +1259,7 @@ mod tests {
 
         let mut buffer = make_test_buffer();
         while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
-            buffer.process_data_block(&mut block, None).unwrap();
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Set base file with original value for K

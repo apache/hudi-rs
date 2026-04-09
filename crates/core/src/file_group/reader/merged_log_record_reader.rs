@@ -37,7 +37,6 @@ use crate::file_group::reader::log_record_reader::BaseHoodieLogRecordReader;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
-use arrow_schema::SchemaRef;
 use std::sync::Arc;
 
 /// Statistics from the log scanning operation.
@@ -239,9 +238,6 @@ pub struct Builder {
     /// Whether instant_range was explicitly set via `with_instant_range()`.
     instant_range_explicitly_set: bool,
     record_buffer: Option<Box<dyn HoodieFileGroupRecordBuffer>>,
-    /// Mirrors Java's `BaseHoodieLogRecordReader.readerSchema` (line 81).
-    /// Set from `schemaHandler.getRequiredSchema()` via `HoodieFileGroupReader`.
-    reader_schema: Option<SchemaRef>,
     /// By default true, matching Java: `private boolean forceFullScan = true;`
     force_full_scan: bool,
     allow_inflight_instants: bool,
@@ -257,7 +253,6 @@ impl Default for Builder {
             instant_range: None,
             instant_range_explicitly_set: false,
             record_buffer: None,
-            reader_schema: None,
             force_full_scan: true,
             allow_inflight_instants: false,
         }
@@ -301,15 +296,6 @@ impl Builder {
         self
     }
 
-    /// Set the reader schema for log block column projection.
-    ///
-    /// Mirrors Java's `BaseHoodieLogRecordReader.readerSchema` which is set from
-    /// `readerContext.getSchemaHandler().getRequiredSchema()` (Java line 143).
-    pub fn with_reader_schema(mut self, schema: SchemaRef) -> Self {
-        self.reader_schema = Some(schema);
-        self
-    }
-
     /// Mirrors Java's `withForceFullScan(boolean)`.
     pub fn with_force_full_scan(mut self, force: bool) -> Self {
         self.force_full_scan = force;
@@ -348,9 +334,6 @@ impl Builder {
             reader_context.instant_range.clone()
         };
 
-        // Java line 143: this.readerSchema = readerContext.getSchemaHandler() != null
-        //   ? readerContext.getSchemaHandler().getRequiredSchema() : null
-        // In Rust, this is passed explicitly via the builder.
         let base = BaseHoodieLogRecordReader {
             reader_context,
             storage,
@@ -362,7 +345,6 @@ impl Builder {
             force_full_scan: self.force_full_scan,
             record_buffer,
             allow_inflight_instants: self.allow_inflight_instants,
-            reader_schema: self.reader_schema,
             valid_block_instants: Vec::new(),
             total_log_files: 0,
             total_log_blocks: 0,

@@ -49,7 +49,6 @@ use crate::Result;
 use crate::file_group::log_file::log_block::LogBlock;
 use crate::file_group::reader::buffered_record::{BufferedRecord, DeleteRecord};
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
 use std::collections::HashMap;
 
 /// The type of merge buffer in use.
@@ -87,15 +86,9 @@ pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
     /// The buffer is responsible for inflating the block and extracting records,
     /// matching Java where inflate/deserialize/deflate happens inside the block
     /// triggered by the buffer's `getRecordsIterator`.
-    ///
-    /// `reader_schema` mirrors Java's `dataBlock.readerSchema` field — the required
-    /// schema set on the block by `BaseHoodieLogRecordReader` (Java line 143).
-    /// In Java, `GenericDatumReader(writerSchema, readerSchema)` projects during
-    /// Avro deserialization. In Rust, we project post-inflate to the same effect.
     fn process_data_block(
         &mut self,
         block: &mut LogBlock,
-        reader_schema: Option<&SchemaRef>,
     ) -> Result<()>;
 
     /// Process a single data record within a data block.
