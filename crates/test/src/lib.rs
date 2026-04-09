@@ -63,6 +63,18 @@ pub enum QuickstartTripsTable {
     /// Commit 3: MERGE INTO UPDATE 3 rows (ids 4,5,6) → .log file 2 (avro data block)
     #[strum(serialize = "v9_mor_nonpart_3commits")]
     V9MorNonpart3Commits,
+    /// v9 MOR non-partitioned, log-only with compacted log block (5 log files).
+    #[strum(serialize = "table_log_compaction")]
+    MorLayoutLogCompaction,
+    /// v9 MOR non-partitioned, log-only (3 log files: insert + update + delete).
+    #[strum(serialize = "table_log_only")]
+    MorLayoutLogOnly,
+    /// v9 MOR non-partitioned, base + 2 log files (update + delete), all column types.
+    #[strum(serialize = "table_column_projection")]
+    MorLayoutColumnProjection,
+    /// v9 MOR non-partitioned, base + 3 log files (update + delete + update), all data types.
+    #[strum(serialize = "table_all_data_types")]
+    MorLayoutAllDataTypes,
 }
 
 impl QuickstartTripsTable {
@@ -113,6 +125,11 @@ impl QuickstartTripsTable {
         let zip_path = self.zip_path("mor", Some("avro"));
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn path_to_mor_avro_gold(&self) -> String {
+        let table = self.path_to_mor_avro();
+        format!("{table}/gold_data")
     }
 
     pub fn url_to_mor_avro(&self) -> Url {
@@ -306,7 +323,11 @@ mod tests {
                 | QuickstartTripsTable::V6Trips8I3D
                 | QuickstartTripsTable::V8Trips8I3U1D
                 | QuickstartTripsTable::V9Mor8I4UCommitTime
-                | QuickstartTripsTable::V9MorNonpart3Commits => {
+                | QuickstartTripsTable::V9MorNonpart3Commits
+                | QuickstartTripsTable::MorLayoutLogCompaction
+                | QuickstartTripsTable::MorLayoutLogOnly
+                | QuickstartTripsTable::MorLayoutColumnProjection
+                | QuickstartTripsTable::MorLayoutAllDataTypes => {
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists(), "Missing zip for {:?}: {:?}", t, path);
                 }

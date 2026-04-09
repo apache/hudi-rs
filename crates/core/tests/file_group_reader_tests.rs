@@ -72,10 +72,12 @@ async fn read_file_group(
 ) -> Result<arrow_array::RecordBatch> {
     let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
 
-    let base_path = if partition.is_empty() {
-        base_file.to_string()
+    let base_path = if base_file.is_empty() {
+        None
+    } else if partition.is_empty() {
+        Some(base_file.to_string())
     } else {
-        format!("{}/{}", partition, base_file)
+        Some(format!("{}/{}", partition, base_file))
     };
     let log_paths: Vec<String> = log_files
         .iter()
@@ -89,7 +91,7 @@ async fn read_file_group(
         .collect();
 
     let input_split = InputSplit::new(
-        Some(base_path),
+        base_path,
         None,
         log_paths,
         partition.to_string(),
@@ -318,39 +320,6 @@ async fn test_e2e_v9_mor_commit_time_nonpart_multi_log() -> Result<()> {
 // All tables: v9, MOR, COMMIT_TIME_ORDERING, non-partitioned, 1 file group.
 // =============================================================================
 
-/// Read a file group from a table at an absolute path on disk.
-///
-/// For log-only tables, `base_file` is None.
-async fn read_file_group_abs(
-    table_path: &str,
-    base_file: Option<&str>,
-    log_files: Vec<&str>,
-) -> Result<arrow_array::RecordBatch> {
-    let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
-
-    let input_split = InputSplit::new(
-        base_file.map(|s| s.to_string()),
-        None,
-        log_files.iter().map(|s| s.to_string()).collect(),
-        String::new(), // non-partitioned
-    );
-
-    let mut reader_context = ReaderContext::empty();
-    reader_context.latest_commit_time = "99991231235959999".to_string();
-    reader_context.record_key_field = "_hoodie_record_key".to_string();
-    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
-
-    let mut reader = HoodieFileGroupReader::new(
-        Arc::new(reader_context),
-        storage,
-        input_split,
-        vec!["ts".to_string()],
-        ReaderParameters::default(),
-    );
-
-    reader.read().await
-}
-
 /// Read gold parquet data from disk.
 fn read_gold_parquet(gold_dir: &str) -> arrow_array::RecordBatch {
     let entries: Vec<_> = std::fs::read_dir(gold_dir)
@@ -434,7 +403,6 @@ fn assert_matches_gold(
             arrow_schema::DataType::Timestamp(_, _)
         );
         if is_timestamp && actual_col.data_type() != gold_col.data_type() {
-            // Compare epoch values instead of string representations
             continue;
         }
 
@@ -461,11 +429,13 @@ fn assert_matches_gold(
 /// Expected: 3 rows — matches gold data from SELECT * via Spark.
 #[tokio::test]
 async fn test_e2e_v9_mor_log_compaction() -> Result<()> {
-    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_log_compaction";
+    let table_path = QuickstartTripsTable::MorLayoutLogCompaction.path_to_mor_avro();
+    let gold_dir = QuickstartTripsTable::MorLayoutLogCompaction.path_to_mor_avro_gold();
 
-    let result = read_file_group_abs(
-        table_path,
-        None, // log-only: no base file
+    let result = read_file_group(
+        &table_path,
+        "",
+        "",
         vec![
             ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030511461.log.1_0-16-23",
             ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030518232.log.1_0-30-49",
@@ -476,7 +446,7 @@ async fn test_e2e_v9_mor_log_compaction() -> Result<()> {
     )
     .await?;
 
-    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    let gold = read_gold_parquet(&gold_dir);
     assert_matches_gold(&result, &gold, "table_log_compaction");
     Ok(())
 }
@@ -491,11 +461,13 @@ async fn test_e2e_v9_mor_log_compaction() -> Result<()> {
 /// Expected: 2 rows — k3 deleted, matches gold data.
 #[tokio::test]
 async fn test_e2e_v9_mor_log_only() -> Result<()> {
-    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_log_only";
+    let table_path = QuickstartTripsTable::MorLayoutLogOnly.path_to_mor_avro();
+    let gold_dir = QuickstartTripsTable::MorLayoutLogOnly.path_to_mor_avro_gold();
 
-    let result = read_file_group_abs(
-        table_path,
-        None, // log-only: no base file
+    let result = read_file_group(
+        &table_path,
+        "",
+        "",
         vec![
             ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030525348.log.1_0-102-176",
             ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030527298.log.1_0-116-202",
@@ -504,7 +476,7 @@ async fn test_e2e_v9_mor_log_only() -> Result<()> {
     )
     .await?;
 
-    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    let gold = read_gold_parquet(&gold_dir);
     assert_matches_gold(&result, &gold, "table_log_only");
     Ok(())
 }
@@ -519,11 +491,13 @@ async fn test_e2e_v9_mor_log_only() -> Result<()> {
 /// Expected: 2 rows — k3 deleted, matches gold data.
 #[tokio::test]
 async fn test_e2e_v9_mor_column_projection() -> Result<()> {
-    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_column_projection";
+    let table_path = QuickstartTripsTable::MorLayoutColumnProjection.path_to_mor_avro();
+    let gold_dir = QuickstartTripsTable::MorLayoutColumnProjection.path_to_mor_avro_gold();
 
-    let result = read_file_group_abs(
-        table_path,
-        Some("78076137-b2c4-410d-8473-3d6366ae0985-0_0-165-279_20260409030530945.parquet"),
+    let result = read_file_group(
+        &table_path,
+        "",
+        "78076137-b2c4-410d-8473-3d6366ae0985-0_0-165-279_20260409030530945.parquet",
         vec![
             ".78076137-b2c4-410d-8473-3d6366ae0985-0_20260409030532996.log.1_0-179-305",
             ".78076137-b2c4-410d-8473-3d6366ae0985-0_20260409030534379.log.1_0-193-334",
@@ -531,7 +505,7 @@ async fn test_e2e_v9_mor_column_projection() -> Result<()> {
     )
     .await?;
 
-    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    let gold = read_gold_parquet(&gold_dir);
     assert_matches_gold(&result, &gold, "table_column_projection");
     Ok(())
 }
@@ -546,11 +520,13 @@ async fn test_e2e_v9_mor_column_projection() -> Result<()> {
 /// Expected: 4 rows — k4 deleted, matches gold data.
 #[tokio::test]
 async fn test_e2e_v9_mor_all_data_types() -> Result<()> {
-    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_all_data_types";
+    let table_path = QuickstartTripsTable::MorLayoutAllDataTypes.path_to_mor_avro();
+    let gold_dir = QuickstartTripsTable::MorLayoutAllDataTypes.path_to_mor_avro_gold();
 
-    let result = read_file_group_abs(
-        table_path,
-        Some("c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet"),
+    let result = read_file_group(
+        &table_path,
+        "",
+        "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
         vec![
             ".c887c1e8-5fb9-475e-8171-769c5cf10c61-0_20260409030539332.log.1_0-254-421",
             ".c887c1e8-5fb9-475e-8171-769c5cf10c61-0_20260409030540482.log.1_0-268-450",
@@ -559,7 +535,7 @@ async fn test_e2e_v9_mor_all_data_types() -> Result<()> {
     )
     .await?;
 
-    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    let gold = read_gold_parquet(&gold_dir);
     assert_matches_gold(&result, &gold, "table_all_data_types");
     Ok(())
 }
