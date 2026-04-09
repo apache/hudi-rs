@@ -1,0 +1,46 @@
+{
+  "partitionToWriteStats" : {
+    "" : [ {
+      "numInserts" : 0,
+      "numUpdates" : 0,
+      "numDeletes" : 1,
+      "totalLogReadTimeMs" : 0,
+      "totalLogRecords" : 0,
+      "totalLogFilesCompacted" : 0,
+      "totalLogSizeCompacted" : 0,
+      "totalUpdatedRecordsCompacted" : 0,
+      "totalLogBlocks" : 0,
+      "totalCorruptLogBlock" : 0,
+      "totalRollbackBlocks" : 0,
+      "fileId" : "fdd2682e-040c-4ab8-98f8-3a977459d300-0",
+      "path" : ".fdd2682e-040c-4ab8-98f8-3a977459d300-0_20260409023822045.log.2_0-8-18",
+      "cdcStats" : null,
+      "prevCommit" : "20260409023822045",
+      "numWrites" : 0,
+      "numUpdateWrites" : 0,
+      "totalWriteBytes" : 953,
+      "totalWriteErrors" : 0,
+      "tempPath" : null,
+      "partitionPath" : "",
+      "fileSizeInBytes" : 953,
+      "minEventTime" : null,
+      "maxEventTime" : null,
+      "prevBaseFile" : null,
+      "runtimeStats" : {
+        "totalScanTime" : 0,
+        "totalUpsertTime" : 232,
+        "totalCreateTime" : 0
+      },
+      "logVersion" : 2,
+      "logOffset" : 0,
+      "baseFile" : "fdd2682e-040c-4ab8-98f8-3a977459d300-0_0-3-10_20260409023822045.parquet",
+      "logFiles" : [ ".fdd2682e-040c-4ab8-98f8-3a977459d300-0_20260409023822045.log.1_0-8-18", ".fdd2682e-040c-4ab8-98f8-3a977459d300-0_20260409023822045.log.2_0-8-18" ]
+    } ]
+  },
+  "compacted" : false,
+  "extraMetadata" : {
+    "schema" : "{\"type\":\"record\",\"name\":\"htestmorfileslicelayouts_1_record\",\"namespace\":\"hoodie.htestmorfileslicelayouts_1\",\"fields\":[{\"name\":\"key\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"level\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"severity\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"partition\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"round\",\"type\":[\"null\",\"int\"],\"default\":null}]}",
+    "_hoodie.spark.sql.writes.prepped" : "true"
+  },
+  "operationType" : "DELETE_PREPPED"
+}

@@ -37,18 +37,116 @@
               "doc": "Ordering value determining the order of merging on the same key",
               "type": [
                 "null",
-                "int",
-                "long",
-                "float",
-                "double",
-                "bytes",
-                "string",
-                { "type": "bytes", "logicalType": "decimal", "precision":  30, "scale": 15 },
-                { "type": "int", "logicalType": "date" },
-                { "type": "int", "logicalType": "time-millis" },
-                { "type": "long", "logicalType": "time-micros" },
-                { "type": "long", "logicalType": "timestamp-millis" },
-                { "type": "long", "logicalType": "timestamp-micros" }
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "BooleanWrapper",
+                  "doc": "A record wrapping boolean type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "boolean", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "IntWrapper",
+                  "doc": "A record wrapping int type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "int", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "LongWrapper",
+                  "doc": "A record wrapping long type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "long", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "FloatWrapper",
+                  "doc": "A record wrapping float type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "float", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "DoubleWrapper",
+                  "doc": "A record wrapping double type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "double", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "BytesWrapper",
+                  "doc": "A record wrapping bytes type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "bytes", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "StringWrapper",
+                  "doc": "A record wrapping string type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "string", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "DateWrapper",
+                  "doc": "A record wrapping Date logical type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "int", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "DecimalWrapper",
+                  "doc": "A record wrapping Decimal logical type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": { "type": "bytes", "logicalType": "decimal", "precision": 30, "scale": 15 }, "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "TimeMicrosWrapper",
+                  "doc": "A record wrapping Time-micros logical type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": { "type": "long", "logicalType": "time-micros" }, "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "TimestampMicrosWrapper",
+                  "doc": "A record wrapping Timestamp-micros logical type to be able to be used it w/in Avro's Union",
+                  "fields": [{ "type": "long", "name": "value" }]
+                },
+                {
+                  "namespace": "org.apache.hudi.avro.model",
+                  "type": "record",
+                  "name": "ArrayWrapper",
+                  "doc": "A record containing a list of wrapped values.",
+                  "fields": [
+                    {
+                      "name": "wrappedValues",
+                      "doc": "An array where each element is one of the supported wrapper types.",
+                      "type": [
+                        "null",
+                        {
+                          "type": "array",
+                          "items": [
+                            "null",
+                            "org.apache.hudi.avro.model.BooleanWrapper",
+                            "org.apache.hudi.avro.model.IntWrapper",
+                            "org.apache.hudi.avro.model.LongWrapper",
+                            "org.apache.hudi.avro.model.FloatWrapper",
+                            "org.apache.hudi.avro.model.DoubleWrapper",
+                            "org.apache.hudi.avro.model.BytesWrapper",
+                            "org.apache.hudi.avro.model.StringWrapper",
+                            "org.apache.hudi.avro.model.DateWrapper",
+                            "org.apache.hudi.avro.model.DecimalWrapper",
+                            "org.apache.hudi.avro.model.TimeMicrosWrapper",
+                            "org.apache.hudi.avro.model.TimestampMicrosWrapper"
+                          ]
+                        }
+                      ],
+                      "default": null
+                    }
+                  ]
+                }
               ],
               "default": null
             }

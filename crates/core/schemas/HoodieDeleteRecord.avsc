@@ -27,18 +27,103 @@
       "doc": "Ordering value determining the order of merging on the same key",
       "type": [
         "null",
-        "int",
-        "long",
-        "float",
-        "double",
-        "bytes",
-        "string",
-        { "type": "bytes", "logicalType": "decimal", "precision":  30, "scale": 15 },
-        { "type": "int", "logicalType": "date" },
-        { "type": "int", "logicalType": "time-millis" },
-        { "type": "long", "logicalType": "time-micros" },
-        { "type": "long", "logicalType": "timestamp-millis" },
-        { "type": "long", "logicalType": "timestamp-micros" }
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "BooleanWrapper",
+          "fields": [{ "type": "boolean", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "IntWrapper",
+          "fields": [{ "type": "int", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "LongWrapper",
+          "fields": [{ "type": "long", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "FloatWrapper",
+          "fields": [{ "type": "float", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "DoubleWrapper",
+          "fields": [{ "type": "double", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "BytesWrapper",
+          "fields": [{ "type": "bytes", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "StringWrapper",
+          "fields": [{ "type": "string", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "DateWrapper",
+          "fields": [{ "type": "int", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "DecimalWrapper",
+          "fields": [{ "type": { "type": "bytes", "logicalType": "decimal", "precision": 30, "scale": 15 }, "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "TimeMicrosWrapper",
+          "fields": [{ "type": { "type": "long", "logicalType": "time-micros" }, "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "TimestampMicrosWrapper",
+          "fields": [{ "type": "long", "name": "value" }]
+        },
+        {
+          "namespace": "org.apache.hudi.avro.model",
+          "type": "record",
+          "name": "ArrayWrapper",
+          "fields": [
+            {
+              "name": "wrappedValues",
+              "type": [
+                "null",
+                {
+                  "type": "array",
+                  "items": [
+                    "null",
+                    "org.apache.hudi.avro.model.BooleanWrapper",
+                    "org.apache.hudi.avro.model.IntWrapper",
+                    "org.apache.hudi.avro.model.LongWrapper",
+                    "org.apache.hudi.avro.model.FloatWrapper",
+                    "org.apache.hudi.avro.model.DoubleWrapper",
+                    "org.apache.hudi.avro.model.BytesWrapper",
+                    "org.apache.hudi.avro.model.StringWrapper",
+                    "org.apache.hudi.avro.model.DateWrapper",
+                    "org.apache.hudi.avro.model.DecimalWrapper",
+                    "org.apache.hudi.avro.model.TimeMicrosWrapper",
+                    "org.apache.hudi.avro.model.TimestampMicrosWrapper"
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        }
       ],
       "default": null
     }

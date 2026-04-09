@@ -50,7 +50,9 @@ pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<
         }
     };
 
-    // Extract the ordering value type position from the union (always at field position 2)
+    // Extract the ordering value type position from the union (always at field position 2).
+    // The ordering value is a union of [null, BooleanWrapper, IntWrapper, LongWrapper, ...].
+    // Each wrapper is a record with a single "value" field.
     let ordering_val = &fields[2].1;
     let ordering_val_type_pos = match ordering_val {
         AvroValue::Union(type_pos, _) => {
@@ -213,27 +215,42 @@ mod tests {
                     assert_eq!(union.variants()[0], AvroSchema::Null);
                     assert_eq!(union.variants()[1], minimized_type);
                 } else {
+                    // The orderingVal union contains wrapper record types:
+                    // [null, BooleanWrapper, IntWrapper, LongWrapper, FloatWrapper,
+                    //  DoubleWrapper, BytesWrapper, StringWrapper, DateWrapper,
+                    //  DecimalWrapper, TimeMicrosWrapper, TimestampMicrosWrapper, ArrayWrapper]
                     assert_eq!(union.variants().len(), 13);
                     assert_eq!(union.variants()[0], AvroSchema::Null);
-                    assert_eq!(union.variants()[1], AvroSchema::Int);
-                    assert_eq!(union.variants()[2], AvroSchema::Long);
-                    assert_eq!(union.variants()[3], AvroSchema::Float);
-                    assert_eq!(union.variants()[4], AvroSchema::Double);
-                    assert_eq!(union.variants()[5], AvroSchema::Bytes);
-                    assert_eq!(union.variants()[6], AvroSchema::String);
-                    assert_eq!(
-                        union.variants()[7],
-                        AvroSchema::Decimal(DecimalSchema {
-                            precision: 30,
-                            scale: 15,
-                            inner: Box::new(AvroSchema::Bytes)
-                        })
-                    );
-                    assert_eq!(union.variants()[8], AvroSchema::Date);
-                    assert_eq!(union.variants()[9], AvroSchema::TimeMillis);
-                    assert_eq!(union.variants()[10], AvroSchema::TimeMicros);
-                    assert_eq!(union.variants()[11], AvroSchema::TimestampMillis);
-                    assert_eq!(union.variants()[12], AvroSchema::TimestampMicros);
+                    // Remaining variants are wrapper records — just check they are records
+                    let wrapper_names = [
+                        "BooleanWrapper",
+                        "IntWrapper",
+                        "LongWrapper",
+                        "FloatWrapper",
+                        "DoubleWrapper",
+                        "BytesWrapper",
+                        "StringWrapper",
+                        "DateWrapper",
+                        "DecimalWrapper",
+                        "TimeMicrosWrapper",
+                        "TimestampMicrosWrapper",
+                        "ArrayWrapper",
+                    ];
+                    for (i, name) in wrapper_names.iter().enumerate() {
+                        match &union.variants()[i + 1] {
+                            AvroSchema::Record(RecordSchema {
+                                name: schema_name, ..
+                            }) => {
+                                assert_eq!(schema_name.name, *name, "wrapper at index {} mismatch", i + 1);
+                            }
+                            other => panic!(
+                                "Expected Record schema for {} at index {}, got {:?}",
+                                name,
+                                i + 1,
+                                other
+                            ),
+                        }
+                    }
                 }
             }
             _ => panic!("Expected a Union schema for orderingVal"),
@@ -242,6 +259,8 @@ mod tests {
 
     #[test]
     fn test_schema_for_delete_record() {
+        // The ordering value uses wrapper records: union index 2 = IntWrapper
+        let int_wrapper = AvroValue::Record(vec![("value".to_string(), AvroValue::Int(42))]);
         let delete_record_value = AvroValue::Record(vec![
             (
                 "recordKey".to_string(),
@@ -253,7 +272,7 @@ mod tests {
             ),
             (
                 "orderingVal".to_string(),
-                AvroValue::Union(1, Box::new(AvroValue::Int(42))),
+                AvroValue::Union(2, Box::new(int_wrapper)),
             ),
         ]);
 
@@ -264,7 +283,20 @@ mod tests {
 
         match schema {
             AvroSchema::Record(RecordSchema { fields, .. }) => {
-                validate_delete_fields(&fields, Some(AvroSchema::Int));
+                // The minimized type is the IntWrapper record (at union index 2)
+                match &fields[2].schema {
+                    AvroSchema::Union(union) => {
+                        assert_eq!(union.variants().len(), 2);
+                        assert_eq!(union.variants()[0], AvroSchema::Null);
+                        match &union.variants()[1] {
+                            AvroSchema::Record(RecordSchema { name, .. }) => {
+                                assert_eq!(name.name, "IntWrapper");
+                            }
+                            other => panic!("Expected IntWrapper record, got {:?}", other),
+                        }
+                    }
+                    _ => panic!("Expected Union schema"),
+                }
             }
             _ => panic!("Expected a Record schema"),
         }
