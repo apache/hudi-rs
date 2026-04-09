@@ -1,0 +1,12 @@
+{
+  "indexDefinitions" : {
+    "column_stats" : {
+      "indexName" : "column_stats",
+      "indexType" : "column_stats",
+      "indexFunction" : "column_stats",
+      "sourceFields" : [ "_hoodie_commit_time", "_hoodie_partition_path", "_hoodie_record_key", "key", "ts", "level", "severity", "double_field", "float_field", "int_field", "long_field", "boolean_field", "string_field", "bytes_field", "decimal_field", "enum_field", "date_nullable_field", "timestamp_millis_nullable_field", "timestamp_micros_nullable_field", "timestamp_local_millis_nullable_field", "timestamp_local_micros_nullable_field", "partition", "round" ],
+      "indexOptions" : { },
+      "version" : "V2"
+    }
+  }
+}

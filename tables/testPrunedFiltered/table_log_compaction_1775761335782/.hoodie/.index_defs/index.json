@@ -1,0 +1,12 @@
+{
+  "indexDefinitions" : {
+    "column_stats" : {
+      "indexName" : "column_stats",
+      "indexType" : "column_stats",
+      "indexFunction" : "column_stats",
+      "sourceFields" : [ "_hoodie_commit_time", "_hoodie_partition_path", "_hoodie_record_key", "timestamp", "_row_key", "partition_path", "trip_type", "rider", "driver", "begin_lat", "begin_lon", "end_lat", "end_lon", "distance_in_meters", "seconds_since_epoch", "weight", "nation", "current_date", "current_ts", "height", "_hoodie_is_deleted" ],
+      "indexOptions" : { },
+      "version" : "V2"
+    }
+  }
+}

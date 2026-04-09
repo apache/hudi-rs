@@ -1,0 +1,13 @@
+# run java based hudi functional test. If you want to run without gluten velox, just drop -Dgluten.bundle.jar=$BUNDLE_JAR
+WS=ws3
+cd /home/ubuntu/$WS/hudi
+BUNDLE_JAR=/home/ubuntu/$WS/gluten-internal/package/target/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.5.1-SNAPSHOT.jar
+# Common args for surefire:test (no -am needed — deps already compiled)
+SUREFIRE_COMMON=(-pl hudi-spark-datasource/hudi-spark
+-Dgluten.bundle.jar=$BUNDLE_JAR
+-Dsurefire-log4j.file=log4j2-surefire-quiet.properties
+-DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+-DskipUTs=true -Dcheckstyle.skip=true -Dscalastyle.skip=true
+-DredirectTestOutputToFile=false -Dspotless.check.skip=true)
+mvn surefire:test "${SUREFIRE_COMMON[@]}" -Dtest=TestMORDataSource#testPrunedFiltered
+

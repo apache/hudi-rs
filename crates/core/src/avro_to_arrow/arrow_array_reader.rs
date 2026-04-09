@@ -435,8 +435,10 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                 let mut bool_nulls = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
                 let mut curr_index = 0;
                 rows.iter().for_each(|v| {
+                    let v = maybe_resolve_union(v);
                     if let Value::Array(vs) = v {
                         vs.iter().for_each(|value| {
+                            let value = maybe_resolve_union(value);
                             if let Value::Boolean(child) = value {
                                 // if valid boolean, append value
                                 if *child {
@@ -1216,5 +1218,138 @@ where
             Value::Null => None,
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apache_avro::schema::Schema as AvroSchema;
+    use arrow::array::{AsArray, BooleanArray, Int32Array, ListArray};
+
+    /// Helper: build an AvroArrowArrayReader from an Avro schema JSON string
+    /// and a vec of Avro record Values, then read all into a RecordBatch.
+    fn read_records(schema_json: &str, records: Vec<Value>) -> RecordBatch {
+        let avro_schema = AvroSchema::parse_str(schema_json).unwrap();
+        let values = records.into_iter().map(Ok);
+        let mut reader = AvroArrowArrayReader::try_new(values, &avro_schema).unwrap();
+        reader.next_batch(1024).unwrap().expect("expected a batch")
+    }
+
+    /// Regression test: ARRAY<BOOLEAN> elements wrapped in Avro unions
+    /// must be resolved before matching.  Without the maybe_resolve_union
+    /// call, every boolean element is treated as null and reads back as
+    /// false (the zero-initialized default).
+    ///
+    /// Uses the same nullable-array schema that Hudi generates:
+    ///   {"type": ["null", {"type": "array", "items": ["null", "boolean"]}]}
+    #[test]
+    fn test_boolean_array_with_union_elements() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "key", "type": "string"},
+                {"name": "arr_bool", "type": ["null", {
+                    "type": "array",
+                    "items": ["null", "boolean"]
+                }]}
+            ]
+        }"#;
+
+        let records = vec![
+            Value::Record(vec![
+                ("key".into(), Value::String("k1".into())),
+                ("arr_bool".into(), Value::Union(1, Box::new(Value::Array(vec![
+                    Value::Union(1, Box::new(Value::Boolean(false))),
+                    Value::Union(1, Box::new(Value::Boolean(true))),
+                    Value::Union(1, Box::new(Value::Boolean(false))),
+                ])))),
+            ]),
+            Value::Record(vec![
+                ("key".into(), Value::String("k2".into())),
+                ("arr_bool".into(), Value::Union(1, Box::new(Value::Array(vec![
+                    Value::Union(1, Box::new(Value::Boolean(true))),
+                    Value::Union(1, Box::new(Value::Boolean(true))),
+                    Value::Union(1, Box::new(Value::Boolean(true))),
+                ])))),
+            ]),
+            Value::Record(vec![
+                ("key".into(), Value::String("k3".into())),
+                ("arr_bool".into(), Value::Union(1, Box::new(Value::Array(vec![
+                    Value::Union(1, Box::new(Value::Boolean(true))),
+                    Value::Union(1, Box::new(Value::Boolean(false))),
+                    Value::Union(1, Box::new(Value::Boolean(true))),
+                ])))),
+            ]),
+        ];
+
+        let batch = read_records(schema_json, records);
+        assert_eq!(batch.num_rows(), 3);
+
+        let arr_col = batch.column_by_name("arr_bool").unwrap();
+        let list_arr = arr_col.as_any().downcast_ref::<ListArray>().unwrap();
+
+        // k1: [false, true, false]
+        let k1_vals = list_arr.value(0);
+        let k1_bools = k1_vals.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(k1_bools.len(), 3);
+        assert_eq!(k1_bools.value(0), false);
+        assert_eq!(k1_bools.value(1), true); // THIS was the bug: returned false
+        assert_eq!(k1_bools.value(2), false);
+
+        // k2: [true, true, true]
+        let k2_vals = list_arr.value(1);
+        let k2_bools = k2_vals.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(k2_bools.len(), 3);
+        assert_eq!(k2_bools.value(0), true);
+        assert_eq!(k2_bools.value(1), true);
+        assert_eq!(k2_bools.value(2), true);
+
+        // k3: [true, false, true]
+        let k3_vals = list_arr.value(2);
+        let k3_bools = k3_vals.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(k3_bools.len(), 3);
+        assert_eq!(k3_bools.value(0), true);
+        assert_eq!(k3_bools.value(1), false);
+        assert_eq!(k3_bools.value(2), true);
+    }
+
+    /// Sanity check: ARRAY<INT> with union elements works correctly
+    /// (the primitive path already calls maybe_resolve_union via resolve_item).
+    #[test]
+    fn test_int_array_with_union_elements() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "key", "type": "string"},
+                {"name": "arr_int", "type": ["null", {
+                    "type": "array",
+                    "items": ["null", "int"]
+                }]}
+            ]
+        }"#;
+
+        let records = vec![
+            Value::Record(vec![
+                ("key".into(), Value::String("k1".into())),
+                ("arr_int".into(), Value::Union(1, Box::new(Value::Array(vec![
+                    Value::Union(1, Box::new(Value::Int(10))),
+                    Value::Union(1, Box::new(Value::Int(20))),
+                    Value::Union(1, Box::new(Value::Int(30))),
+                ])))),
+            ]),
+        ];
+
+        let batch = read_records(schema_json, records);
+        let arr_col = batch.column_by_name("arr_int").unwrap();
+        let list_arr = arr_col.as_any().downcast_ref::<ListArray>().unwrap();
+        let k1_vals = list_arr.value(0);
+        let k1_ints = k1_vals.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(k1_ints.len(), 3);
+        assert_eq!(k1_ints.value(0), 10);
+        assert_eq!(k1_ints.value(1), 20);
+        assert_eq!(k1_ints.value(2), 30);
     }
 }
