@@ -195,6 +195,7 @@ mod tests {
         BufferedRecord {
             record_key: key.to_string(),
             data: None,
+            binary_data: None,
             ordering_value: ordering.map(OrderingValue::Long),
             is_delete: false,
         }

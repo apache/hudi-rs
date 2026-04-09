@@ -188,16 +188,18 @@ pub fn records_to_batch(
     records: Vec<BufferedRecord>,
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
-    let batches: Vec<&RecordBatch> = records
+    // Mirrors Java: BufferedRecord.getRecord() unwraps from binary if needed
+    let batches: Vec<RecordBatch> = records
         .iter()
-        .filter_map(|r| r.data.as_ref())
+        .filter_map(|r| r.get_record())
         .collect();
 
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    arrow::compute::concat_batches(&schema, batches.iter().copied())
+    let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
+    arrow::compute::concat_batches(&schema, batch_refs.into_iter())
         .map_err(|e| CoreError::ReadFileSliceError(format!("Failed to concat record batches: {e}")))
 }
 
@@ -263,7 +265,7 @@ mod tests {
         assert_eq!(records[1].0, "key_1");
         assert_eq!(records[2].0, "key_2");
         assert!(!records[0].1.is_delete());
-        assert!(records[0].1.data.is_some());
+        assert!(!records[0].1.is_empty());
     }
 
     #[test]

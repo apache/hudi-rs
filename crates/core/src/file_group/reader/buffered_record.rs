@@ -31,6 +31,8 @@
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 
+use super::record_context::RecordContext;
+
 /// The universal record envelope flowing through the merge pipeline.
 ///
 /// Mirrors Java's `BufferedRecord<T>`. In Rust/Arrow, a single
@@ -45,8 +47,13 @@ pub struct BufferedRecord {
     pub record_key: String,
 
     /// The engine-native record data (Arrow RecordBatch).
-    /// `None` for delete records.
+    /// `None` for delete records, or after `to_binary()` has been called.
     pub data: Option<RecordBatch>,
+
+    /// The binary form of the record data (Arrow IPC bytes).
+    /// Populated by `to_binary()`, consumed by `get_record()`.
+    /// Mirrors Java's binary representation after `toBinary(RecordContext)`.
+    pub binary_data: Option<Vec<u8>>,
 
     /// The ordering value used for merge conflict resolution.
     /// Higher ordering value wins during delta merge.
@@ -62,6 +69,7 @@ impl BufferedRecord {
         Self {
             record_key,
             data: Some(data),
+            binary_data: None,
             ordering_value,
             is_delete: false,
         }
@@ -72,6 +80,7 @@ impl BufferedRecord {
         Self {
             record_key,
             data: None,
+            binary_data: None,
             ordering_value,
             is_delete: true,
         }
@@ -82,9 +91,57 @@ impl BufferedRecord {
         self.is_delete
     }
 
-    /// Returns true if this record has no data payload.
+    /// Returns true if this record has no data payload (neither batch nor binary).
     pub fn is_empty(&self) -> bool {
-        self.data.is_none()
+        self.data.is_none() && self.binary_data.is_none()
+    }
+
+    /// Convert the record data to binary format for compact storage.
+    ///
+    /// Mirrors Java's `BufferedRecord.toBinary(RecordContext<T> recordContext)`.
+    ///
+    /// ```java
+    /// public BufferedRecord<T> toBinary(RecordContext<T> recordContext) {
+    ///     if (record != null) {
+    ///         HoodieSchema schema = recordContext.getSchemaFromBufferRecord(this);
+    ///         if (schema != null) {
+    ///             record = recordContext.seal(recordContext.toBinaryRow(schema, record));
+    ///         }
+    ///     }
+    ///     return this;
+    /// }
+    /// ```
+    ///
+    /// For Arrow: serializes the `RecordBatch` to IPC bytes via
+    /// `RecordContext::to_binary_row()` + `RecordContext::seal()`,
+    /// stores in `binary_data`, clears `data`.
+    pub fn to_binary(&mut self, _record_context: &RecordContext) -> &mut Self {
+        if self.data.is_some() {
+            let schema = RecordContext::get_schema_from_buffer_record(self);
+            if let Some(ref schema) = schema {
+                let batch = self.data.take().unwrap();
+                let bytes = RecordContext::to_binary_row(schema, &batch);
+                self.binary_data = Some(RecordContext::seal(bytes));
+            }
+        }
+        self
+    }
+
+    /// Return the record data, deserializing from binary if needed.
+    ///
+    /// Mirrors Java's `BufferedRecord.getRecord()`.
+    ///
+    /// In Java, `getRecord()` returns the record as-is (UnsafeRow IS InternalRow).
+    /// In Rust/Arrow, after `to_binary()` we must explicitly deserialize IPC bytes
+    /// back to `RecordBatch`.
+    pub fn get_record(&self) -> Option<RecordBatch> {
+        if let Some(ref batch) = self.data {
+            return Some(batch.clone());
+        }
+        if let Some(ref bytes) = self.binary_data {
+            return RecordContext::from_binary(bytes).ok();
+        }
+        None
     }
 }
 

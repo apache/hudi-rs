@@ -41,6 +41,7 @@
 use hudi_core::config::HudiConfigs;
 use hudi_core::error::Result;
 use hudi_core::file_group::reader::input_split::InputSplit;
+use hudi_core::file_group::reader::reader_context::ReaderContext;
 use hudi_core::file_group::reader::reader_parameters::ReaderParameters;
 use hudi_core::file_group::reader::HoodieFileGroupReader;
 use hudi_core::storage::Storage;
@@ -82,14 +83,17 @@ async fn read_file_group(
         partition.to_string(),
     );
 
+    let mut reader_context = ReaderContext::empty();
+    reader_context.latest_commit_time = "99991231235959999".to_string();
+    reader_context.record_key_field = "_hoodie_record_key".to_string();
+    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+
     let mut reader = HoodieFileGroupReader::new(
-        hudi_configs,
+        Arc::new(reader_context),
         storage,
         input_split,
         vec!["ts".to_string()],
         ReaderParameters::default(),
-        "99991231235959999".to_string(),
-        "_hoodie_record_key".to_string(),
     );
 
     reader.read().await

@@ -217,11 +217,14 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             .buffered_record_merger
             .delta_merge(&record, existing)?;
 
-        if let Some(merged_record) = merged {
+        if let Some(mut merged_record) = merged {
             log::debug!(
                 "[KeyBasedBuffer] processNextDataRecord: key={key} has_existing={has_existing} → merged (is_delete={})",
                 merged_record.is_delete(),
             );
+            // Mirrors Java: records.put(recordKey, merged.toBinary(readerContext.getRecordContext()))
+            let record_context = self.reader_context.get_record_context();
+            merged_record.to_binary(&record_context);
             self.base.records.insert(key.to_string(), merged_record);
         } else {
             log::debug!(
@@ -358,7 +361,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             self.base.base_file_batches[0].schema()
         } else {
             let first_record = self.base.records.values().next();
-            match first_record.and_then(|r| r.data.as_ref()) {
+            match first_record.and_then(|r| r.get_record()).as_ref() {
                 Some(batch) => batch.schema(),
                 None => {
                     return Err(crate::error::CoreError::ReadFileSliceError(

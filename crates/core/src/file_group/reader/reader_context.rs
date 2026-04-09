@@ -27,6 +27,7 @@
 
 use crate::config::table::HudiTableConfig;
 use crate::timeline::selector::InstantRange;
+use super::record_context::RecordContext;
 use std::collections::HashMap;
 
 /// Reader context that flows through the file group reader call stack.
@@ -67,6 +68,16 @@ pub struct ReaderContext {
 }
 
 impl ReaderContext {
+    /// Get the record context for record-level operations.
+    ///
+    /// Mirrors Java's `HoodieReaderContext.getRecordContext()`.
+    ///
+    /// In Java, `RecordContext<T>` is engine-specific (Spark, Flink).
+    /// In Rust/Arrow, there is a single concrete `RecordContext`.
+    pub fn get_record_context(&self) -> RecordContext {
+        RecordContext
+    }
+
     /// Get the timeline timezone from table config, defaulting to "utc".
     pub fn timezone(&self) -> String {
         self.table_config
