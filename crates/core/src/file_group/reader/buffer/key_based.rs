@@ -50,6 +50,7 @@ use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::record_merger::BufferedRecordMergerFactory;
 use crate::file_group::reader::update_processor::create_update_processor;
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,13 +104,15 @@ impl KeyBasedFileGroupRecordBuffer {
         let update_processor = create_update_processor(read_stats, false);
         let record_key_field = reader_context.record_key_field.clone();
 
+        let base = FileGroupRecordBuffer::new(
+            ordering_field_names,
+            merge_mode,
+            merger,
+            update_processor,
+        );
+
         Self {
-            base: FileGroupRecordBuffer::new(
-                ordering_field_names,
-                merge_mode,
-                merger,
-                update_processor,
-            ),
+            base,
             reader_context,
             record_key_field,
         }
@@ -135,6 +138,28 @@ impl KeyBasedFileGroupRecordBuffer {
 
         self.base
             .has_next_base_record(&base_record, log_record.as_ref())
+    }
+
+    /// Project a batch to `reader_schema` column set, in `reader_schema` field order.
+    ///
+    /// Mirrors the effect of Java's `GenericDatumReader(writerSchema, readerSchema)`:
+    /// only columns present in `reader_schema` are retained, in `reader_schema`'s order.
+    /// Columns in `reader_schema` but missing from the batch (schema evolution) are skipped.
+    fn project_to_reader_schema(
+        batch: RecordBatch,
+        reader_schema: &SchemaRef,
+    ) -> Result<RecordBatch> {
+        let batch_schema = batch.schema();
+        let indices: Vec<usize> = reader_schema
+            .fields()
+            .iter()
+            .filter_map(|f| batch_schema.index_of(f.name()).ok())
+            .collect();
+        batch.project(&indices).map_err(|e| {
+            crate::error::CoreError::ReadFileSliceError(format!(
+                "Failed to project log batch to reader schema: {e}"
+            ))
+        })
     }
 
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.doHasNext()`.
@@ -165,12 +190,19 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// happens inside the block triggered by `getRecordsIterator`), then iterates
     /// each record, extracts the key, creates a BufferedRecord, and calls
     /// `process_next_data_record`.
+    /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.processDataBlock(HoodieDataBlock, Option<KeySpec>)`.
+    ///
+    /// `reader_schema` mirrors Java's `dataBlock.readerSchema`, which is set from
+    /// `BaseHoodieLogRecordReader.readerSchema` → `HoodieLogFileReader` → `HoodieDataBlock`.
+    /// Java's `GenericDatumReader(writerSchema, readerSchema)` projects during Avro
+    /// deserialization. In Rust, we project post-inflate to the same effect.
     fn process_data_block(
         &mut self,
         block: &mut LogBlock,
+        reader_schema: Option<&SchemaRef>,
     ) -> Result<()> {
         // Mirrors Java: getRecordsIterator → getEngineRecordIterator
-        //   → readRecordsFromBlockPayload → inflate → deserializeRecords → deflate
+        //   → readRecordsFromBlockPayload → inflate → deserializeRecords(readerSchema) → deflate
         block.inflate_from_bytes(self.reader_context.clone())?;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
@@ -181,6 +213,13 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 total_rows,
             );
             for batch in record_batches.data_batches {
+                // Mirrors Java: GenericDatumReader(writerSchema, readerSchema) projection.
+                // In Rust, Avro/Parquet decode uses writer schema; we project post-inflate.
+                let batch = if let Some(schema) = reader_schema {
+                    Self::project_to_reader_schema(batch, schema)?
+                } else {
+                    batch
+                };
                 let records = batch_to_buffered_records(
                     &batch,
                     &self.record_key_field,
@@ -532,7 +571,7 @@ mod tests {
             ("2", 1, 2), // record2 update
             ("2", 1, 0), // record2 earlier update (overwrites in commit-time)
         ]);
-        buffer.process_data_block(&mut make_data_block(block1, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block1, "instant1"), None).unwrap();
 
         // Process DataBlock2
         let block2 = create_test_batch(&[
@@ -540,7 +579,7 @@ mod tests {
             ("3", 1, 2), // record3 update
             ("3", 3, 1), // record3 delete by field value (counter=3)
         ]);
-        buffer.process_data_block(&mut make_data_block(block2, "instant2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block2, "instant2"), None).unwrap();
 
         // Set base file
         let base = create_test_batch(&[("1", 1, 1), ("2", 1, 1), ("3", 1, 1)]);
@@ -584,7 +623,7 @@ mod tests {
             ("3", 1, 2), // record3 update (ts=2)
             ("3", 3, 1), // record3 "delete" (ts=1 < ts=2 → ignored)
         ]);
-        buffer.process_data_block(&mut make_data_block(block, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block, "instant1"), None).unwrap();
 
         let base = create_test_batch(&[("1", 1, 1), ("2", 1, 1), ("3", 1, 1)]);
         buffer.set_base_file_iterator(vec![base]);
@@ -613,7 +652,7 @@ mod tests {
 
         // Two records for same key in one block
         let block = create_test_batch(&[("k", 1, 10), ("k", 2, 20)]);
-        buffer.process_data_block(&mut make_data_block(block, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block, "instant1"), None).unwrap();
 
         assert_eq!(buffer.size(), 1);
         let record = buffer.base.records.get("k").unwrap();
@@ -631,7 +670,7 @@ mod tests {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
 
         let log_block = create_test_batch(&[("k1", 2, 2)]);
-        buffer.process_data_block(&mut make_data_block(log_block, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(log_block, "instant1"), None).unwrap();
 
         let base = create_test_batch(&[("k1", 1, 1)]);
         buffer.set_base_file_iterator(vec![base]);
@@ -698,7 +737,7 @@ mod tests {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
 
         let log_block = create_test_batch(&[("k4", 1, 1)]);
-        buffer.process_data_block(&mut make_data_block(log_block, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(log_block, "instant1"), None).unwrap();
 
         // No base file
         buffer.set_base_file_iterator(vec![]);
@@ -741,7 +780,7 @@ mod tests {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
 
         let log_block = create_test_batch(&[("k1", 1, 1), ("k2", 2, 2)]);
-        buffer.process_data_block(&mut make_data_block(log_block, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(log_block, "instant1"), None).unwrap();
 
         buffer.set_base_file_iterator(vec![]);
 
@@ -761,15 +800,15 @@ mod tests {
 
         // Block 1: key "k" with counter=1
         let block1 = create_test_batch(&[("k", 1, 10)]);
-        buffer.process_data_block(&mut make_data_block(block1, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block1, "i1"), None).unwrap();
 
         // Block 2: same key with counter=2
         let block2 = create_test_batch(&[("k", 2, 20)]);
-        buffer.process_data_block(&mut make_data_block(block2, "i2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block2, "i2"), None).unwrap();
 
         // Block 3: same key with counter=3
         let block3 = create_test_batch(&[("k", 3, 30)]);
-        buffer.process_data_block(&mut make_data_block(block3, "i3")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block3, "i3"), None).unwrap();
 
         assert_eq!(buffer.size(), 1);
 
@@ -791,7 +830,7 @@ mod tests {
 
         // Log: update k1, update k2
         let log_block = create_test_batch(&[("k1", 10, 100), ("k2", 20, 200)]);
-        buffer.process_data_block(&mut make_data_block(log_block, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(log_block, "i1"), None).unwrap();
 
         // Log: delete k3 (insert as delete record directly)
         buffer.base.records.insert(
@@ -801,7 +840,7 @@ mod tests {
 
         // Log: insert k4 (new key not in base)
         let log_insert = create_test_batch(&[("k4", 40, 400)]);
-        buffer.process_data_block(&mut make_data_block(log_insert, "i2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(log_insert, "i2"), None).unwrap();
 
         // Base file
         let base = create_test_batch(&[("k1", 1, 1), ("k2", 2, 2), ("k3", 3, 3)]);
@@ -823,7 +862,7 @@ mod tests {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
 
         let block = create_test_batch(&[("k1", 1, 1), ("k2", 2, 2)]);
-        buffer.process_data_block(&mut make_data_block(block, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block, "i1"), None).unwrap();
 
         assert_eq!(buffer.get_total_log_records(), 2);
     }
@@ -834,7 +873,7 @@ mod tests {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
 
         let block = create_test_batch(&[("k1", 1, 1)]);
-        buffer.process_data_block(&mut make_data_block(block, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block, "i1"), None).unwrap();
 
         assert!(buffer.contains_log_record("k1"));
         assert!(!buffer.contains_log_record("k2"));
@@ -865,7 +904,7 @@ mod tests {
             ("3", 2, 2), // record3 update
             ("4", 2, 2), // record4 update (earlier ts doesn't matter in commit-time)
         ]);
-        buffer.process_data_block(&mut make_data_block(updates, "instant2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(updates, "instant2"), None).unwrap();
 
         // Log: deletes for keys 5,6
         buffer.base.records.insert(
@@ -879,7 +918,7 @@ mod tests {
 
         // Log: insert new key 7
         let insert = create_test_batch(&[("7", 1, 5)]);
-        buffer.process_data_block(&mut make_data_block(insert, "instant2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(insert, "instant2"), None).unwrap();
 
         // Base file: records 1-6
         let base = create_test_batch(&[
@@ -932,7 +971,7 @@ mod tests {
             ("2", 2, 2), // key 2 update (ts=2)
             ("3", 1, 1), // key 3 (ts=1)
         ]);
-        buffer.process_data_block(&mut make_data_block(block1, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block1, "instant1"), None).unwrap();
 
         // DeleteBlock: delete key "1" with ts=2 (wins over existing ts=1)
         // For EVENT_TIME_ORDERING, delete with higher ts wins
@@ -964,7 +1003,7 @@ mod tests {
             ("2", 1, 0), // key 2 earlier update (ts=0, loses to ts=2)
             ("3", 1, 2), // key 3 update (ts=2, wins over delete with no ordering)
         ]);
-        buffer.process_data_block(&mut make_data_block(block2, "instant2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block2, "instant2"), None).unwrap();
 
         // Base file
         let base = create_test_batch(&[("1", 1, 1), ("2", 1, 1), ("3", 1, 1)]);
@@ -1000,7 +1039,7 @@ mod tests {
         assert!(buffer.base.records.is_empty(), "Map should start empty");
 
         let block = create_test_batch(&[("k1", 1, 10)]);
-        buffer.process_data_block(&mut make_data_block(block, "instant1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block, "instant1"), None).unwrap();
 
         // Map now has exactly 1 entry
         assert_eq!(buffer.base.records.len(), 1);
@@ -1022,12 +1061,12 @@ mod tests {
 
         // First record
         let block1 = create_test_batch(&[("k1", 1, 10)]);
-        buffer.process_data_block(&mut make_data_block(block1, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block1, "i1"), None).unwrap();
         assert_eq!(buffer.base.records.len(), 1);
 
         // Second record for same key — overwrites
         let block2 = create_test_batch(&[("k1", 2, 20)]);
-        buffer.process_data_block(&mut make_data_block(block2, "i2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block2, "i2"), None).unwrap();
 
         // Still 1 entry (same key), but value updated
         assert_eq!(buffer.base.records.len(), 1);
@@ -1054,15 +1093,15 @@ mod tests {
 
         // Simulate oldest→newest processing order (as pollLast produces)
         let block_i1 = create_test_batch(&[("K", 1, 10)]); // oldest
-        buffer.process_data_block(&mut make_data_block(block_i1, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block_i1, "i1"), None).unwrap();
         assert_eq!(buffer.base.records.len(), 1);
 
         let block_i2 = create_test_batch(&[("K", 2, 20)]);
-        buffer.process_data_block(&mut make_data_block(block_i2, "i2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block_i2, "i2"), None).unwrap();
         assert_eq!(buffer.base.records.len(), 1); // still 1 key
 
         let block_i3 = create_test_batch(&[("K", 3, 30)]); // newest
-        buffer.process_data_block(&mut make_data_block(block_i3, "i3")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block_i3, "i3"), None).unwrap();
         assert_eq!(buffer.base.records.len(), 1);
 
         // total_log_records counts ALL records processed, not just unique keys
@@ -1087,7 +1126,7 @@ mod tests {
 
         // Data record first
         let block = create_test_batch(&[("k1", 1, 10)]);
-        buffer.process_data_block(&mut make_data_block(block, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block, "i1"), None).unwrap();
         assert!(!buffer.base.records["k1"].is_delete());
 
         // Delete for same key
@@ -1129,10 +1168,10 @@ mod tests {
 
         // Phase A: process log blocks oldest→newest
         let block_i1 = create_test_batch(&[("A", 1, 10), ("B", 1, 10)]);
-        buffer.process_data_block(&mut make_data_block(block_i1, "i1")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block_i1, "i1"), None).unwrap();
 
         let block_i2 = create_test_batch(&[("A", 2, 20)]);
-        buffer.process_data_block(&mut make_data_block(block_i2, "i2")).unwrap();
+        buffer.process_data_block(&mut make_data_block(block_i2, "i2"), None).unwrap();
 
         // Delete B
         let delete_b = DeleteRecord {

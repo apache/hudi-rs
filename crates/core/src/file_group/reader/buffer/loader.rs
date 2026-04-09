@@ -41,6 +41,7 @@ use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::storage::Storage;
+use arrow_schema::SchemaRef;
 use std::sync::Arc;
 
 /// Result of loading a record buffer.
@@ -66,6 +67,7 @@ pub trait FileGroupRecordBufferLoader: Send + Sync + std::fmt::Debug {
         ordering_field_names: Vec<String>,
         reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
+        reader_schema: Option<SchemaRef>,
     ) -> impl std::future::Future<Output = Result<RecordBufferLoadResult>> + Send;
 }
 
@@ -106,6 +108,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         ordering_field_names: Vec<String>,
         _reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
+        reader_schema: Option<SchemaRef>,
     ) -> Result<RecordBufferLoadResult> {
         // Use merge mode from reader context directly (mirrors Java: readerContext.getMergeMode()).
         let merge_mode = if reader_context.merge_mode.is_empty() {
@@ -137,6 +140,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
             storage,
             input_split,
             record_buffer,
+            reader_schema,
         )
         .await?;
 
@@ -166,6 +170,7 @@ async fn scan_log_files(
     storage: Arc<Storage>,
     input_split: &InputSplit,
     record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
+    reader_schema: Option<SchemaRef>,
 ) -> Result<(
     Box<dyn HoodieFileGroupRecordBuffer>,
     Vec<String>,
@@ -186,15 +191,17 @@ async fn scan_log_files(
     //     .withAllowInflightInstants(readerParameters.allowInflightInstants())
     //     .build()
     let latest_instant_time = reader_context.latest_commit_time.clone();
-    let reader = HoodieMergedLogRecordReader::new_builder()
+    let mut builder = HoodieMergedLogRecordReader::new_builder()
         .with_reader_context(reader_context)
         .with_storage(storage)
         .with_log_files(input_split.log_file_paths.clone())
         .with_latest_instant_time(latest_instant_time)
         .with_record_buffer(record_buffer)
-        .with_force_full_scan(true)
-        .build()
-        .await?;
+        .with_force_full_scan(true);
+    if let Some(schema) = reader_schema {
+        builder = builder.with_reader_schema(schema);
+    }
+    let reader = builder.build().await?;
 
     // Decompose: get populated buffer + stats
     Ok(reader.into_parts())
