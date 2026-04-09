@@ -240,9 +240,10 @@ impl HoodieFileGroupReader {
         if self.input_split.has_no_records_to_merge() {
             log::debug!("[HoodieFileGroupReader] no log files → returning base file data directly ({base_rows} rows)");
             if base_file_batches.is_empty() {
-                return Err(CoreError::ReadFileSliceError(
-                    "No base file data to read".to_string(),
-                ));
+                // No base file and no log files — return empty batch.
+                return Ok(RecordBatch::new_empty(std::sync::Arc::new(
+                    arrow_schema::Schema::empty(),
+                )));
             }
             return arrow::compute::concat_batches(
                 &base_file_batches[0].schema(),

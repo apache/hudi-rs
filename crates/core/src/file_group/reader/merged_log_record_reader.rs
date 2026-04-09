@@ -389,7 +389,7 @@ mod tests {
             vec![],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
-        ))
+        ).unwrap())
     }
 
     /// Java: TestHoodieMergedLogRecordReader — builder validation

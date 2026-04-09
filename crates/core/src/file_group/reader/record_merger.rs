@@ -117,13 +117,24 @@ impl BufferedRecordMerger for EventTimeRecordMerger {
         }
     }
 
+    /// Mirrors Java's `shouldKeepNewerRecord(olderRecord, newerRecord)`.
+    ///
+    /// Compares ordering values: higher wins. If either has no ordering value,
+    /// the newer (log) record wins.
+    ///
+    /// TODO: Java has special handling for `isCommitTimeOrderingDelete()` where
+    /// DELETE records always win regardless of ordering value. Not yet implemented.
     fn final_merge(
         &self,
-        _older_record: &BufferedRecord,
+        older_record: &BufferedRecord,
         newer_record: &BufferedRecord,
     ) -> Result<BufferedRecord> {
-        // Log record always wins over base file record in final merge
-        Ok(newer_record.clone())
+        match (&newer_record.ordering_value, &older_record.ordering_value) {
+            (Some(new_val), Some(old_val)) if new_val >= old_val => Ok(newer_record.clone()),
+            (Some(_), Some(_)) => Ok(older_record.clone()),
+            // If either has no ordering value, newer (log) record wins
+            _ => Ok(newer_record.clone()),
+        }
     }
 }
 
@@ -177,11 +188,15 @@ impl BufferedRecordMergerFactory {
     /// Create a merger based on the merge mode.
     ///
     /// - `"COMMIT_TIME_ORDERING"` → `CommitTimeRecordMerger` (last writer wins)
-    /// - `"EVENT_TIME_ORDERING"` or others → `EventTimeRecordMerger` (ordering value comparison)
-    pub fn create(merge_mode: &str) -> Box<dyn BufferedRecordMerger> {
+    /// - `"EVENT_TIME_ORDERING"` → `EventTimeRecordMerger` (ordering value comparison)
+    /// - Others → Error (CUSTOM merge mode not yet supported)
+    pub fn create(merge_mode: &str) -> Result<Box<dyn BufferedRecordMerger>> {
         match merge_mode {
-            "COMMIT_TIME_ORDERING" => Box::new(CommitTimeRecordMerger),
-            _ => Box::new(EventTimeRecordMerger),
+            "COMMIT_TIME_ORDERING" => Ok(Box::new(CommitTimeRecordMerger)),
+            "EVENT_TIME_ORDERING" => Ok(Box::new(EventTimeRecordMerger)),
+            unsupported => Err(crate::error::CoreError::ReadFileSliceError(format!(
+                "Unsupported merge mode for record merger: '{unsupported}'"
+            ))),
         }
     }
 }
@@ -367,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_factory_commit_time_ordering() {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING");
+        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
         let new_rec = make_data_record("k", Some(0));
         let existing = make_data_record("k", Some(100));
         // CommitTime: new always wins regardless of ordering
@@ -377,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_factory_event_time_ordering() {
-        let merger = BufferedRecordMergerFactory::create("EVENT_TIME_ORDERING");
+        let merger = BufferedRecordMergerFactory::create("EVENT_TIME_ORDERING").unwrap();
         let new_rec = make_data_record("k", Some(0));
         let existing = make_data_record("k", Some(100));
         // EventTime: higher ordering wins → existing survives

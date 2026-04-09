@@ -1019,7 +1019,7 @@ mod tests {
             vec!["ts".to_string()],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
-        ))
+        ).unwrap())
     }
 
     /// Commit-time ordering: oldest instant processed first, newest last.

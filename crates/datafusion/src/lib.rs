@@ -329,14 +329,22 @@ impl TableProvider for HudiDataSource {
         for file_slice_vec in file_slices {
             let mut parquet_file_group_vec = Vec::new();
             for f in file_slice_vec {
-                let relative_path = f.base_file_relative_path().map_err(|e| {
-                    Execution(format!(
-                        "Failed to get base file relative path for {f:?} due to {e:?}"
-                    ))
-                })?;
+                let relative_path = match f.base_file_relative_path() {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue, // Log-only slice: skip for DataFusion COW path
+                    Err(e) => {
+                        return Err(Execution(format!(
+                            "Failed to get base file relative path for {f:?} due to {e:?}"
+                        )));
+                    }
+                };
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
-                let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
+                let size = f
+                    .base_file
+                    .as_ref()
+                    .and_then(|bf| bf.file_metadata.as_ref())
+                    .map_or(0, |m| m.size);
                 let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }

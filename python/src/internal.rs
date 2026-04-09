@@ -135,8 +135,12 @@ impl From<&FileSlice> for HudiFileSlice {
         let file_id = f.file_id().to_string();
         let partition_path = f.partition_path.to_string();
         let creation_instant_time = f.creation_instant_time().to_string();
-        let base_file_name = f.base_file.file_name();
-        let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
+        let base_file_name = f.base_file.as_ref().map_or(String::new(), |bf| bf.file_name());
+        let file_metadata = f
+            .base_file
+            .as_ref()
+            .and_then(|bf| bf.file_metadata.clone())
+            .unwrap_or_default();
         let base_file_size = file_metadata.size;
         let base_file_byte_size = file_metadata.byte_size;
         let log_file_names = f.log_files.iter().map(|l| l.file_name()).collect();

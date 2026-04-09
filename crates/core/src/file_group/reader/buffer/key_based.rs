@@ -98,12 +98,12 @@ impl KeyBasedFileGroupRecordBuffer {
         ordering_field_names: Vec<String>,
         merge_mode: String,
         read_stats: &HoodieReadStats,
-    ) -> Self {
-        let merger = BufferedRecordMergerFactory::create(&merge_mode);
+    ) -> crate::Result<Self> {
+        let merger = BufferedRecordMergerFactory::create(&merge_mode)?;
         let update_processor = create_update_processor(read_stats, false);
         let record_key_field = reader_context.record_key_field.clone();
 
-        Self {
+        Ok(Self {
             base: FileGroupRecordBuffer::new(
                 ordering_field_names,
                 merge_mode,
@@ -112,7 +112,7 @@ impl KeyBasedFileGroupRecordBuffer {
             ),
             reader_context,
             record_key_field,
-        }
+        })
     }
 
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.hasNextBaseRecord(T baseRecord)`.
@@ -478,6 +478,7 @@ mod tests {
             merge_mode.to_string(),
             &read_stats,
         )
+        .unwrap()
     }
 
     /// Extract (key, counter, ts) tuples from a RecordBatch, sorted by key.

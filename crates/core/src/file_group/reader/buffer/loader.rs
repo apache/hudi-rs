@@ -104,15 +104,27 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         storage: Arc<Storage>,
         input_split: &InputSplit,
         ordering_field_names: Vec<String>,
-        _reader_parameters: &ReaderParameters,
+        reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
     ) -> Result<RecordBufferLoadResult> {
         // Use merge mode from reader context directly (mirrors Java: readerContext.getMergeMode()).
         let merge_mode = if reader_context.merge_mode.is_empty() {
-            "EVENT_TIME_ORDERING".to_string()
+            "COMMIT_TIME_ORDERING".to_string()
         } else {
             reader_context.merge_mode.clone()
         };
+
+        // Guard: only COMMIT_TIME_ORDERING and EVENT_TIME_ORDERING are supported.
+        // CUSTOM merge mode requires partial-update / custom merger which is not yet implemented.
+        match merge_mode.as_str() {
+            "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING" => {}
+            unsupported => {
+                return Err(crate::error::CoreError::ReadFileSliceError(format!(
+                    "Unsupported merge mode: '{unsupported}'. \
+                     Only COMMIT_TIME_ORDERING and EVENT_TIME_ORDERING are supported."
+                )));
+            }
+        }
 
         log::debug!(
             "[DefaultFileGroupRecordBufferLoader] getRecordBuffer: merge_mode={merge_mode} \
@@ -129,7 +141,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
             ordering_field_names,
             merge_mode,
             read_stats,
-        ));
+        )?);
 
         // STEP: scanLogFiles — build and run HoodieMergedLogRecordReader
         let (populated_buffer, valid_block_instants, stats) = scan_log_files(
@@ -137,6 +149,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
             storage,
             input_split,
             record_buffer,
+            reader_parameters,
         )
         .await?;
 
@@ -166,6 +179,7 @@ async fn scan_log_files(
     storage: Arc<Storage>,
     input_split: &InputSplit,
     record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
+    reader_parameters: &ReaderParameters,
 ) -> Result<(
     Box<dyn HoodieFileGroupRecordBuffer>,
     Vec<String>,
@@ -192,6 +206,7 @@ async fn scan_log_files(
         .with_log_files(input_split.log_file_paths.clone())
         .with_latest_instant_time(latest_instant_time)
         .with_record_buffer(record_buffer)
+        .with_allow_inflight_instants(reader_parameters.allow_inflight_instants)
         .with_force_full_scan(true)
         .build()
         .await?;

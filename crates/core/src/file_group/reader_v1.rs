@@ -204,8 +204,17 @@ impl FileGroupReader {
         } else {
             vec![]
         };
-        self.read_file_slice_from_paths(&base_file_path, log_file_paths)
-            .await
+        match base_file_path {
+            Some(path) => {
+                self.read_file_slice_from_paths(&path, log_file_paths)
+                    .await
+            }
+            None => {
+                // Log-only file slice: delegate directly to the Java-style reader
+                self.read_file_slice_from_paths_log_only(log_file_paths)
+                    .await
+            }
+        }
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -290,6 +299,37 @@ impl FileGroupReader {
         }
     }
 
+    /// Read a log-only file slice (no base file) via the Java-style HoodieFileGroupReader.
+    async fn read_file_slice_from_paths_log_only(
+        &self,
+        log_file_paths: Vec<String>,
+    ) -> Result<RecordBatch> {
+        log::debug!(
+            "FileGroupReader: log-only MOR merge with {} log file(s): [{}]",
+            log_file_paths.len(),
+            log_file_paths.join(", "),
+        );
+
+        let input_split = InputSplit::new(None, None, log_file_paths, String::new());
+
+        let options = self.hudi_configs.as_options();
+        let ordering_field_names: Vec<String> = options
+            .get("hoodie.table.precombine.field")
+            .or_else(|| options.get("hoodie.table.ordering.fields"))
+            .map(|f| vec![f.clone()])
+            .unwrap_or_default();
+
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(ReaderContext::empty()),
+            self.storage.clone(),
+            input_split,
+            ordering_field_names,
+            ReaderParameters::default(),
+        );
+
+        reader.read().await
+    }
+
     // =========================================================================
     // Streaming Read APIs
     // =========================================================================
@@ -347,8 +387,19 @@ impl FileGroupReader {
             vec![]
         };
 
-        self.read_file_slice_from_paths_stream(&base_file_path, log_file_paths, options)
-            .await
+        match base_file_path {
+            Some(path) => {
+                self.read_file_slice_from_paths_stream(&path, log_file_paths, options)
+                    .await
+            }
+            None => {
+                // Log-only: fall back to the non-streaming collect-and-merge path
+                let batch = self
+                    .read_file_slice_from_paths_log_only(log_file_paths)
+                    .await?;
+                Ok(Box::pin(futures::stream::once(async { Ok(batch) })))
+            }
+        }
     }
 
     /// Reads a file slice from paths as a stream of record batches.
@@ -574,7 +625,9 @@ impl FileGroupReader {
         file_slice: &FileSlice,
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let base_file_path = file_slice.base_file_relative_path()?;
+        let base_file_path = file_slice.base_file_relative_path()?.ok_or_else(|| {
+            ReadFileSliceError("Metadata table file slice must have a base file".to_string())
+        })?;
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
             file_slice
                 .log_files
