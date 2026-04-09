@@ -241,6 +241,27 @@ impl<R: Read + Seek> LogFileReader<R> {
         Ok(Some(u64::from_be_bytes(size_buf)))
     }
 
+    /// Read 8 bytes for the content length, or fall back to `block_length` for V0.
+    ///
+    /// Mirrors Java's `HoodieLogFileReader.readBlock()` step 5:
+    /// ```java
+    /// int contentLength = nextBlockVersion.getVersion() != DEFAULT_VERSION
+    ///     ? (int) inputStream.readLong() : blockSize;
+    /// ```
+    fn read_content_length(
+        &mut self,
+        format_version: &LogFormatVersion,
+        block_length: u64,
+    ) -> Result<u64> {
+        if format_version.has_content_length() {
+            let mut buf = [0u8; 8];
+            self.reader.read_exact(&mut buf)?;
+            Ok(u64::from_be_bytes(buf))
+        } else {
+            Ok(block_length)
+        }
+    }
+
     fn should_skip_block(
         &self,
         header: &HashMap<BlockMetadataKey, String>,
@@ -289,11 +310,13 @@ impl<R: Read + Seek> LogFileReader<R> {
             )));
         }
 
+        // Read content length before decoding, matching Java step 5→6
+        let content_length = self.read_content_length(&format_version, block_length)?;
+
         let decoder = Decoder::new(self.reader_context.clone());
         let content = decoder.decode_content(
             self.reader.by_ref(),
-            &format_version,
-            block_length,
+            content_length,
             &block_type,
             &header,
         )?;
@@ -335,18 +358,17 @@ impl<R: Read + Seek> LogFileReader<R> {
         let block_type = self.read_block_type(&format_version)?;
         let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
 
-        // Record where the content starts (current position after header)
+        // Read the content length field (8 bytes for V1+), matching Java step 5:
+        //   int contentLength = nextBlockVersion.getVersion() != DEFAULT_VERSION
+        //       ? (int) inputStream.readLong() : blockSize;
+        let content_length = self.read_content_length(&format_version, block_length)?;
+
+        // Record where the content starts — AFTER the content_length field,
+        // matching Java step 6: contentPosition = inputStream.getPos()
         let content_position = self
             .reader
             .stream_position()
             .map_err(CoreError::ReadLogFileError)?;
-
-        // Calculate content length: block_length covers everything from after the 8-byte
-        // length field to the end of the block. We've consumed format_version (4) +
-        // block_type (4) + header (variable). The remaining bytes are content + footer +
-        // total_block_length. We store the raw content_length for decode_content().
-        let header_consumed = content_position - (curr_pos + 8);
-        let content_length = block_length.saturating_sub(header_consumed);
 
         // Seek past the rest of the block (content + footer + total_block_length)
         let block_end = curr_pos

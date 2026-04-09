@@ -70,10 +70,20 @@ async fn read_file_group(
 ) -> Result<arrow_array::RecordBatch> {
     let (hudi_configs, storage) = create_configs_and_storage(table_path).await?;
 
-    let base_path = format!("{}/{}", partition, base_file);
+    let base_path = if partition.is_empty() {
+        base_file.to_string()
+    } else {
+        format!("{}/{}", partition, base_file)
+    };
     let log_paths: Vec<String> = log_files
         .iter()
-        .map(|lf| format!("{}/{}", partition, lf))
+        .map(|lf| {
+            if partition.is_empty() {
+                lf.to_string()
+            } else {
+                format!("{}/{}", partition, lf)
+            }
+        })
         .collect();
 
     let input_split = InputSplit::new(
@@ -250,6 +260,48 @@ async fn test_e2e_v9_mor_base_only_read() -> Result<()> {
     assert_eq!(records.len(), 2, "base-only should have 2 rows");
     assert_eq!(records[0], (1, "Alice".to_string(), 30), "id=1 should be original (no update)");
     assert_eq!(records[1], (2, "Bob".to_string(), 25), "id=2 should be original");
+
+    Ok(())
+}
+
+// =============================================================================
+// v9 MOR COMMIT_TIME_ORDERING: Non-partitioned, 2 log files (delete + update)
+// =============================================================================
+
+/// Extract (id, name, price) tuples from a RecordBatch, sorted by id.
+fn extract_id_name_price(batch: &arrow_array::RecordBatch) -> Vec<(i32, String, f64)> {
+    QuickstartTripsTable::id_name_price(batch)
+}
+
+/// E2E: Read non-partitioned file group with 2 log files — reproduces multi-log merge.
+///
+/// Given: v9 MOR COMMIT_TIME_ORDERING non-partitioned table
+///        Base: 7 rows (ids 0-6) from INSERT
+///        Log 1: MERGE INTO DELETE (ids 0,1,2) — delete block
+///        Log 2: MERGE INTO UPDATE (ids 4,5,6 → D2/E2/F2) — avro data block
+/// When:  Read file group through HoodieFileGroupReader
+/// Then:  4 rows after merge: (3,C,30.0), (4,D2,45.0), (5,E2,55.0), (6,F2,65.0)
+#[tokio::test]
+async fn test_e2e_v9_mor_commit_time_nonpart_multi_log() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9MorNonpart3Commits.path_to_mor_avro();
+
+    let result = read_file_group(
+        &table_path,
+        "",  // non-partitioned
+        "960a29a0-0f78-401d-85b1-1cbc44b34121-0_0-846-1597_20260409002001492.parquet",
+        vec![
+            ".960a29a0-0f78-401d-85b1-1cbc44b34121-0_20260409002002957.log.1_0-868-1644",
+            ".960a29a0-0f78-401d-85b1-1cbc44b34121-0_20260409002003963.log.1_0-890-1691",
+        ],
+    )
+    .await?;
+
+    let records = extract_id_name_price(&result);
+    assert_eq!(records.len(), 4, "should have 4 rows after merge (3 deleted, 3 updated)");
+    assert_eq!(records[0], (3, "C".to_string(), 30.0), "id=3 should be unchanged");
+    assert_eq!(records[1], (4, "D2".to_string(), 45.0), "id=4 should be updated");
+    assert_eq!(records[2], (5, "E2".to_string(), 55.0), "id=5 should be updated");
+    assert_eq!(records[3], (6, "F2".to_string(), 65.0), "id=6 should be updated");
 
     Ok(())
 }

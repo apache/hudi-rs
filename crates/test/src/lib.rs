@@ -56,6 +56,13 @@ pub enum QuickstartTripsTable {
     /// Commit 2: UPSERT 4 rows (ids 1,3,5,7) → .log files
     #[strum(serialize = "v9_mor_8i4u_commit_time")]
     V9Mor8I4UCommitTime,
+    /// v9 MOR non-partitioned table, 3 commits (insert + merge-delete + merge-update).
+    /// Schema: id INT, name STRING, price DOUBLE, ts LONG (non-partitioned)
+    /// Commit 1: INSERT 7 rows (ids 0-6) → base .parquet
+    /// Commit 2: MERGE INTO DELETE 3 rows (ids 0,1,2) → .log file 1 (delete block)
+    /// Commit 3: MERGE INTO UPDATE 3 rows (ids 4,5,6) → .log file 2 (avro data block)
+    #[strum(serialize = "v9_mor_nonpart_3commits")]
+    V9MorNonpart3Commits,
 }
 
 impl QuickstartTripsTable {
@@ -111,6 +118,38 @@ impl QuickstartTripsTable {
     pub fn url_to_mor_avro(&self) -> Url {
         let path = self.path_to_mor_avro();
         Url::from_file_path(path).unwrap()
+    }
+
+    /// Extract (id, name, price) tuples from a RecordBatch (for v9_mor_nonpart tables), sorted by id.
+    pub fn id_name_price(record_batch: &RecordBatch) -> Vec<(i32, String, f64)> {
+        let ids = record_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = record_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let prices = record_batch
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut result: Vec<(i32, String, f64)> = ids
+            .iter()
+            .zip(names.iter())
+            .zip(prices.iter())
+            .map(|((id, name), price)| {
+                (id.unwrap(), name.unwrap().to_string(), price.unwrap())
+            })
+            .collect();
+        result.sort_by_key(|(id, _, _)| *id);
+        result
     }
 
     /// Extract (id, name, age) tuples from a RecordBatch (for v9_mor tables), sorted by id.
@@ -263,17 +302,13 @@ mod tests {
     fn quickstart_trips_table_zip_file_should_exist() {
         for t in QuickstartTripsTable::iter() {
             match t {
-                QuickstartTripsTable::V6Trips8I1U => {
+                QuickstartTripsTable::V6Trips8I1U
+                | QuickstartTripsTable::V6Trips8I3D
+                | QuickstartTripsTable::V8Trips8I3U1D
+                | QuickstartTripsTable::V9Mor8I4UCommitTime
+                | QuickstartTripsTable::V9MorNonpart3Commits => {
                     let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                QuickstartTripsTable::V6Trips8I3D => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                QuickstartTripsTable::V8Trips8I3U1D => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
+                    assert!(path.exists(), "Missing zip for {:?}: {:?}", t, path);
                 }
             }
         }

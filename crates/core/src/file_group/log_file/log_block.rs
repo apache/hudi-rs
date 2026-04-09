@@ -418,11 +418,21 @@ impl LogBlock {
         let mut cursor = Cursor::new(bytes.clone());
         cursor.seek(SeekFrom::Start(loc.content_position))?;
 
+        eprintln!(
+            "[inflate_from_bytes] type={:?} file={} pos={} content_len={} block_len={} source_bytes_len={} first_16_bytes={:02x?}",
+            self.block_type,
+            loc.log_file_path,
+            loc.content_position,
+            loc.content_length,
+            loc.block_length,
+            bytes.len(),
+            &bytes[loc.content_position as usize..std::cmp::min(bytes.len(), loc.content_position as usize + 16)],
+        );
+
         let decoder = Decoder::new(reader_context);
         self.content = decoder.decode_content(
             &mut cursor,
-            &self.format_version,
-            loc.block_length,
+            loc.content_length,
             &self.block_type,
             &self.header,
         )?;

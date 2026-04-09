@@ -1,0 +1,41 @@
+{
+  "partitionToWriteStats" : {
+    "" : [ {
+      "numInserts" : 3,
+      "numUpdates" : 0,
+      "numDeletes" : 0,
+      "totalLogReadTimeMs" : 0,
+      "totalLogRecords" : 0,
+      "totalLogFilesCompacted" : 0,
+      "totalLogSizeCompacted" : 0,
+      "totalUpdatedRecordsCompacted" : 0,
+      "totalLogBlocks" : 0,
+      "totalCorruptLogBlock" : 0,
+      "totalRollbackBlocks" : 0,
+      "fileId" : "d8f82a15-23c9-4614-b01c-3e4d6e9f73fc-0",
+      "path" : "d8f82a15-23c9-4614-b01c-3e4d6e9f73fc-0_0-6-18_20260409023046900.parquet",
+      "cdcStats" : null,
+      "prevCommit" : "null",
+      "numWrites" : 3,
+      "numUpdateWrites" : 0,
+      "totalWriteBytes" : 435694,
+      "totalWriteErrors" : 0,
+      "tempPath" : null,
+      "partitionPath" : "",
+      "fileSizeInBytes" : 435694,
+      "minEventTime" : null,
+      "maxEventTime" : null,
+      "prevBaseFile" : null,
+      "runtimeStats" : {
+        "totalScanTime" : 0,
+        "totalUpsertTime" : 0,
+        "totalCreateTime" : 571
+      }
+    } ]
+  },
+  "compacted" : false,
+  "extraMetadata" : {
+    "schema" : "{\"type\":\"record\",\"name\":\"htestmorfileslicelayouts_1_record\",\"namespace\":\"hoodie.htestmorfileslicelayouts_1\",\"fields\":[{\"name\":\"key\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"ts\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"level\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"severity\",\"type\":[\"null\",\"int\"],\"default\":null},{\"name\":\"partition\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"round\",\"type\":[\"null\",\"int\"],\"default\":null}]}"
+  },
+  "operationType" : "INSERT"
+}

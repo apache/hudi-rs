@@ -1,0 +1,35 @@
+{
+  "partitionToWriteStats" : {
+    "" : [ {
+      "numInserts" : 3,
+      "numUpdates" : 0,
+      "numDeletes" : 0,
+      "totalLogReadTimeMs" : 0,
+      "totalLogRecords" : 0,
+      "totalLogFilesCompacted" : 0,
+      "totalLogSizeCompacted" : 0,
+      "totalUpdatedRecordsCompacted" : 0,
+      "totalLogBlocks" : 0,
+      "totalCorruptLogBlock" : 0,
+      "totalRollbackBlocks" : 0,
+      "fileId" : "",
+      "path" : null,
+      "cdcStats" : null,
+      "prevCommit" : "null",
+      "numWrites" : 0,
+      "numUpdateWrites" : 0,
+      "totalWriteBytes" : 0,
+      "totalWriteErrors" : 0,
+      "tempPath" : null,
+      "partitionPath" : null,
+      "fileSizeInBytes" : 0,
+      "minEventTime" : null,
+      "maxEventTime" : null,
+      "prevBaseFile" : null,
+      "runtimeStats" : null
+    } ]
+  },
+  "compacted" : false,
+  "extraMetadata" : { },
+  "operationType" : "INSERT"
+}
