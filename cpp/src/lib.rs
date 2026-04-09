@@ -21,6 +21,7 @@ mod util;
 
 use crate::context::{FileGroupReaderContext, HoodieSchema};
 use crate::util::create_raw_pointer_for_record_batches;
+use hudi::avro_to_arrow::to_arrow_schema;
 use hudi::config::HudiConfigs;
 use hudi::config::table::HudiTableConfig;
 use hudi::config::util::split_hudi_options_from_others;
@@ -28,6 +29,7 @@ use hudi::file_group::reader::HoodieFileGroupReader;
 use hudi::file_group::reader::input_split::InputSplit;
 use hudi::file_group::reader::reader_context::ReaderContext;
 use hudi::file_group::reader::reader_parameters::ReaderParameters;
+use hudi::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use hudi::metadata::meta_field::MetaField;
 use hudi::storage::Storage;
 use hudi::timeline::selector::InstantRange;
@@ -360,6 +362,15 @@ pub fn new_file_group_reader_with_context(
         })
     };
 
+    // ── 6b. Guard: only COMMIT_TIME_ORDERING is supported ──────────
+    let merge_mode = core_reader_context.merge_mode.as_str();
+    if !merge_mode.is_empty() && merge_mode != "COMMIT_TIME_ORDERING" {
+        return Err(format!(
+            "Unsupported merge mode: '{merge_mode}'. \
+             Only COMMIT_TIME_ORDERING is currently supported by the native reader."
+        ));
+    }
+
     // ── 7. Build tokio runtime ──────────────────────────────────────
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -397,13 +408,33 @@ impl HudiFileGroupReader {
             self.reader_context.merge_mode.as_str(),
         );
 
-        let mut reader = HoodieFileGroupReader::new(
-            self.reader_context.clone(),
-            self.storage.clone(),
-            self.input_split.clone(),
-            self.ordering_field_names.clone(),
-            self.reader_parameters.clone(),
-        );
+        // Build schema handler from Avro schemas passed via FFI.
+        // This ensures merge_and_collect has a schema even for log-only
+        // file groups where all records might be deletes.
+        let schema_handler = {
+            let mut handler = FileGroupReaderSchemaHandler::new();
+            if let Some(hs) = self.data_schema.as_ref() {
+                if let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json) {
+                    handler = handler.with_data_schema(Arc::new(arrow_schema));
+                }
+            }
+            if let Some(hs) = self.requested_schema.as_ref() {
+                if let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json) {
+                    handler = handler.with_requested_schema(Arc::new(arrow_schema));
+                }
+            }
+            handler
+        };
+
+        let mut reader = HoodieFileGroupReader::builder()
+            .with_reader_context(self.reader_context.clone())
+            .with_storage(self.storage.clone())
+            .with_input_split(self.input_split.clone())
+            .with_ordering_field_names(self.ordering_field_names.clone())
+            .with_reader_parameters(self.reader_parameters.clone())
+            .with_schema_handler(schema_handler)
+            .build()
+            .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 
         let record_batch = self
             .rt
@@ -422,4 +453,14 @@ impl HudiFileGroupReader {
             schema,
         ))
     }
+}
+
+/// Convert an Avro schema JSON string to an Arrow Schema.
+fn avro_json_to_arrow_schema(
+    avro_json: &str,
+) -> std::result::Result<arrow_schema::Schema, String> {
+    let sanitized = avro_json.trim().replace("\\:", ":");
+    let avro_schema = apache_avro::Schema::parse_str(&sanitized)
+        .map_err(|e| format!("Failed to parse Avro schema: {e}"))?;
+    to_arrow_schema(&avro_schema).map_err(|e| format!("Failed to convert Avro→Arrow: {e}"))
 }

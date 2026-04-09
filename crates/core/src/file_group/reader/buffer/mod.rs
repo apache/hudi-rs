@@ -49,6 +49,7 @@ use crate::Result;
 use crate::file_group::log_file::log_block::LogBlock;
 use crate::file_group::reader::buffered_record::{BufferedRecord, DeleteRecord};
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use std::collections::HashMap;
 
 /// The type of merge buffer in use.
@@ -131,6 +132,13 @@ pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
 
     /// Returns the underlying records map.
     fn get_log_records(&self) -> &HashMap<String, BufferedRecord>;
+
+    /// Set the reader schema for merge output.
+    ///
+    /// This schema is used as a fallback when no base file is present
+    /// and the first record in the buffer is a delete (which has no schema).
+    /// Mirrors Java's readerSchema from FileGroupReaderSchemaHandler.
+    fn set_reader_schema(&mut self, schema: SchemaRef);
 
     /// Set the base file batches for merge iteration.
     ///

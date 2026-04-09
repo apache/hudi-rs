@@ -50,6 +50,7 @@ use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::record_merger::BufferedRecordMergerFactory;
 use crate::file_group::reader::update_processor::create_update_processor;
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -323,6 +324,10 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         &self.base.records
     }
 
+    fn set_reader_schema(&mut self, schema: SchemaRef) {
+        self.base.reader_schema = Some(schema);
+    }
+
     fn set_base_file_iterator(&mut self, batches: Vec<RecordBatch>) {
         self.base.base_file_batches = batches;
         self.base.base_batch_idx = 0;
@@ -362,8 +367,15 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         } else if let Some(schema) = &self.base.reader_schema {
             schema.clone()
         } else {
-            let first_record = self.base.records.values().next();
-            match first_record.and_then(|r| r.get_record()).as_ref() {
+            // Fallback: find any non-delete record in the buffer.
+            // HashMap iteration order is non-deterministic, so we must
+            // search all records — the first entry could be a delete.
+            let any_data_record = self
+                .base
+                .records
+                .values()
+                .find_map(|r| r.get_record());
+            match any_data_record.as_ref() {
                 Some(batch) => batch.schema(),
                 None => {
                     return Err(crate::error::CoreError::ReadFileSliceError(

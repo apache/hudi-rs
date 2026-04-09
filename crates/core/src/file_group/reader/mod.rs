@@ -288,7 +288,22 @@ impl HoodieFileGroupReader {
             self.read_stats.total_rollback_blocks,
         );
 
-        // Step 4: Set base file iterator on the buffer
+        // Step 4a: Propagate reader schema to the buffer (mirrors Java's
+        // readerContext.getSchemaHandler().getRequiredSchema()). This ensures
+        // merge_and_collect has a schema even when there is no base file and
+        // all records in the buffer are deletes (HashMap iteration is
+        // non-deterministic, so the first record could be a delete with no
+        // data schema).
+        if let Some(schema) = self
+            .schema_handler
+            .data_schema
+            .as_ref()
+            .or(self.schema_handler.requested_schema.as_ref())
+        {
+            record_buffer.set_reader_schema(schema.clone());
+        }
+
+        // Step 4b: Set base file iterator on the buffer
         record_buffer.set_base_file_iterator(base_file_batches);
         log::debug!(
             "[HoodieFileGroupReader] set base file iterator ({base_rows} rows), starting merge_and_collect"
