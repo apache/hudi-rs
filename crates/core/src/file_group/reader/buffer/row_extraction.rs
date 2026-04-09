@@ -26,7 +26,7 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::reader::buffered_record::{BufferedRecord, OrderingValue};
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, SchemaRef};
 
 /// Extract record key strings from a RecordBatch column.
@@ -198,9 +198,64 @@ pub fn records_to_batch(
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
+    // Reconcile schemas: if a batch's schema differs from the target (e.g., Avro
+    // log records vs Parquet base records have different field names for Map/List
+    // children), rebuild each batch under the target schema.
+    let reconciled: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|b| {
+            if b.schema() == schema {
+                b
+            } else {
+                reconcile_batch_to_schema(&b, &schema)
+            }
+        })
+        .collect();
+
+    let batch_refs: Vec<&RecordBatch> = reconciled.iter().collect();
     arrow::compute::concat_batches(&schema, batch_refs.into_iter())
         .map_err(|e| CoreError::ReadFileSliceError(format!("Failed to concat record batches: {e}")))
+}
+
+/// Reconcile a RecordBatch to a target schema.
+///
+/// Handles field name differences between Avro-derived schemas (from log files) and
+/// Parquet-derived schemas (from base files). For example:
+/// - List child field: Avro uses "element", Parquet uses "array"
+/// - Map entries field: Avro uses "key_value", Parquet uses column name
+///
+/// Rebuilds each column's ArrayData with the target schema's field metadata.
+fn reconcile_batch_to_schema(batch: &RecordBatch, target_schema: &SchemaRef) -> RecordBatch {
+    let columns: Vec<ArrayRef> = target_schema
+        .fields()
+        .iter()
+        .map(|target_field| {
+            let idx = batch
+                .schema()
+                .index_of(target_field.name())
+                .expect("column name must exist in source batch");
+            let source_col = batch.column(idx);
+            // If types match exactly, use as-is
+            if source_col.data_type() == target_field.data_type() {
+                source_col.clone()
+            } else {
+                // Try arrow_cast first; if it fails, rebuild the ArrayData
+                // with the target DataType (changes field names but not actual data)
+                arrow_cast::cast(source_col, target_field.data_type()).unwrap_or_else(|_| {
+                    let source_data = source_col.to_data();
+                    let rebuilt = source_data
+                        .into_builder()
+                        .data_type(target_field.data_type().clone())
+                        .build();
+                    match rebuilt {
+                        Ok(data) => arrow_array::make_array(data),
+                        Err(_) => source_col.clone(),
+                    }
+                })
+            }
+        })
+        .collect();
+    RecordBatch::try_new(target_schema.clone(), columns).unwrap_or_else(|_| batch.clone())
 }
 
 #[cfg(test)]

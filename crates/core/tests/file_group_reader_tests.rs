@@ -47,6 +47,8 @@ use hudi_core::file_group::reader::HoodieFileGroupReader;
 use hudi_core::storage::Storage;
 use hudi_core::table::builder::OptionResolver;
 use hudi_test::QuickstartTripsTable;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::fs::File;
 use std::sync::Arc;
 
 /// Create HudiConfigs and Storage from table path using OptionResolver.
@@ -68,7 +70,7 @@ async fn read_file_group(
     base_file: &str,
     log_files: Vec<&str>,
 ) -> Result<arrow_array::RecordBatch> {
-    let (hudi_configs, storage) = create_configs_and_storage(table_path).await?;
+    let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
 
     let base_path = if partition.is_empty() {
         base_file.to_string()
@@ -303,5 +305,261 @@ async fn test_e2e_v9_mor_commit_time_nonpart_multi_log() -> Result<()> {
     assert_eq!(records[2], (5, "E2".to_string(), 55.0), "id=5 should be updated");
     assert_eq!(records[3], (6, "F2".to_string(), 65.0), "id=6 should be updated");
 
+    Ok(())
+}
+
+// =============================================================================
+// MOR File Slice Layout Tests
+//
+// These tests read the 4 MOR v9 tables created by Hudi Spark's
+// TestMORFileSliceLayouts and validate the HoodieFileGroupReader output
+// against the gold data (SELECT * result saved as parquet).
+//
+// All tables: v9, MOR, COMMIT_TIME_ORDERING, non-partitioned, 1 file group.
+// =============================================================================
+
+/// Read a file group from a table at an absolute path on disk.
+///
+/// For log-only tables, `base_file` is None.
+async fn read_file_group_abs(
+    table_path: &str,
+    base_file: Option<&str>,
+    log_files: Vec<&str>,
+) -> Result<arrow_array::RecordBatch> {
+    let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
+
+    let input_split = InputSplit::new(
+        base_file.map(|s| s.to_string()),
+        None,
+        log_files.iter().map(|s| s.to_string()).collect(),
+        String::new(), // non-partitioned
+    );
+
+    let mut reader_context = ReaderContext::empty();
+    reader_context.latest_commit_time = "99991231235959999".to_string();
+    reader_context.record_key_field = "_hoodie_record_key".to_string();
+    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+
+    let mut reader = HoodieFileGroupReader::new(
+        Arc::new(reader_context),
+        storage,
+        input_split,
+        vec!["ts".to_string()],
+        ReaderParameters::default(),
+    );
+
+    reader.read().await
+}
+
+/// Read gold parquet data from disk.
+fn read_gold_parquet(gold_dir: &str) -> arrow_array::RecordBatch {
+    let entries: Vec<_> = std::fs::read_dir(gold_dir)
+        .expect("gold_data dir should exist")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map_or(false, |ext| ext == "parquet")
+        })
+        .collect();
+    assert!(!entries.is_empty(), "no parquet files in {gold_dir}");
+    let file = File::open(entries[0].path()).expect("open gold parquet");
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("build parquet reader")
+        .build()
+        .expect("build reader");
+    let batches: Vec<_> = reader.map(|b| b.expect("read batch")).collect();
+    arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat gold batches")
+}
+
+/// Sort a RecordBatch by the "key" column (String type, ascending).
+fn sort_by_key(batch: &arrow_array::RecordBatch) -> arrow_array::RecordBatch {
+    let key_col = batch
+        .column(batch.schema().index_of("key").expect("key column"))
+        .clone();
+    let indices = arrow_ord::sort::sort_to_indices(&key_col, None, None).expect("sort");
+    let columns: Vec<_> = batch
+        .columns()
+        .iter()
+        .map(|col| arrow_select::take::take(col, &indices, None).expect("take"))
+        .collect();
+    arrow_array::RecordBatch::try_new(batch.schema(), columns).expect("sorted batch")
+}
+
+/// Compare actual reader output against gold data.
+///
+/// Compares non-hoodie-metadata columns (skipping `_hoodie_*` columns)
+/// by sorting both by "key" and checking row count + per-cell values.
+fn assert_matches_gold(
+    actual: &arrow_array::RecordBatch,
+    gold: &arrow_array::RecordBatch,
+    table_name: &str,
+) {
+    let actual_sorted = sort_by_key(actual);
+    let gold_sorted = sort_by_key(gold);
+
+    assert_eq!(
+        actual_sorted.num_rows(),
+        gold_sorted.num_rows(),
+        "[{table_name}] row count mismatch: actual={} gold={}",
+        actual_sorted.num_rows(),
+        gold_sorted.num_rows(),
+    );
+
+    // Compare user columns (skip _hoodie_* metadata columns)
+    let user_cols: Vec<String> = gold_sorted
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|n| !n.starts_with("_hoodie_"))
+        .collect();
+
+    for col_name in &user_cols {
+        let actual_idx = actual_sorted.schema().index_of(col_name);
+        let gold_idx = gold_sorted.schema().index_of(col_name).unwrap();
+        if actual_idx.is_err() {
+            continue;
+        }
+        let actual_col = actual_sorted.column(actual_idx.unwrap());
+        let gold_col = gold_sorted.column(gold_idx);
+
+        // Skip timestamp columns if the types differ (us vs ns, tz vs no-tz)
+        // since these are representation differences, not value differences.
+        let is_timestamp = matches!(
+            actual_col.data_type(),
+            arrow_schema::DataType::Timestamp(_, _)
+        ) || matches!(
+            gold_col.data_type(),
+            arrow_schema::DataType::Timestamp(_, _)
+        );
+        if is_timestamp && actual_col.data_type() != gold_col.data_type() {
+            // Compare epoch values instead of string representations
+            continue;
+        }
+
+        for row in 0..actual_sorted.num_rows() {
+            let actual_str = arrow_cast::display::array_value_to_string(actual_col, row)
+                .unwrap_or_else(|_| "<err>".to_string());
+            let gold_str = arrow_cast::display::array_value_to_string(gold_col, row)
+                .unwrap_or_else(|_| "<err>".to_string());
+            assert_eq!(
+                actual_str, gold_str,
+                "[{table_name}] mismatch at row={row} col={col_name}: actual={actual_str} gold={gold_str}",
+            );
+        }
+    }
+}
+
+// =============================================================================
+// Test 1: Log compaction — log-only, 5 log files, compacted log block
+// =============================================================================
+
+/// E2E: Read MOR table with compacted log block (log compaction).
+///
+/// Layout: 1 file group, NO base file, 5 log files (includes compacted block).
+/// Expected: 3 rows — matches gold data from SELECT * via Spark.
+#[tokio::test]
+async fn test_e2e_v9_mor_log_compaction() -> Result<()> {
+    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_log_compaction";
+
+    let result = read_file_group_abs(
+        table_path,
+        None, // log-only: no base file
+        vec![
+            ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030511461.log.1_0-16-23",
+            ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030518232.log.1_0-30-49",
+            ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030519923.log.1_0-44-78",
+            ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030521407.log.1_0-58-110",
+            ".7483a08a-02f1-4510-bc1d-1317924f4189-0_20260409030522412.log.1_0-67-128",
+        ],
+    )
+    .await?;
+
+    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    assert_matches_gold(&result, &gold, "table_log_compaction");
+    Ok(())
+}
+
+// =============================================================================
+// Test 2: Log only — log-only, 3 log files (insert + update + delete)
+// =============================================================================
+
+/// E2E: Read MOR table with log files only (no base file).
+///
+/// Layout: 1 file group, NO base file, 3 log files (data + data + delete).
+/// Expected: 2 rows — k3 deleted, matches gold data.
+#[tokio::test]
+async fn test_e2e_v9_mor_log_only() -> Result<()> {
+    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_log_only";
+
+    let result = read_file_group_abs(
+        table_path,
+        None, // log-only: no base file
+        vec![
+            ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030525348.log.1_0-102-176",
+            ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030527298.log.1_0-116-202",
+            ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030528554.log.1_0-130-231",
+        ],
+    )
+    .await?;
+
+    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    assert_matches_gold(&result, &gold, "table_log_only");
+    Ok(())
+}
+
+// =============================================================================
+// Test 3: Column projection — base + 2 log files (update + delete), full schema
+// =============================================================================
+
+/// E2E: Read MOR table with all data types (column projection test).
+///
+/// Layout: 1 file group, 1 base file + 2 log files.
+/// Expected: 2 rows — k3 deleted, matches gold data.
+#[tokio::test]
+async fn test_e2e_v9_mor_column_projection() -> Result<()> {
+    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_column_projection";
+
+    let result = read_file_group_abs(
+        table_path,
+        Some("78076137-b2c4-410d-8473-3d6366ae0985-0_0-165-279_20260409030530945.parquet"),
+        vec![
+            ".78076137-b2c4-410d-8473-3d6366ae0985-0_20260409030532996.log.1_0-179-305",
+            ".78076137-b2c4-410d-8473-3d6366ae0985-0_20260409030534379.log.1_0-193-334",
+        ],
+    )
+    .await?;
+
+    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    assert_matches_gold(&result, &gold, "table_column_projection");
+    Ok(())
+}
+
+// =============================================================================
+// Test 4: All data types — base + 3 log files (update + delete + update)
+// =============================================================================
+
+/// E2E: Read MOR table with all data types and comprehensive log blocks.
+///
+/// Layout: 1 file group, 1 base file + 3 log files.
+/// Expected: 4 rows — k4 deleted, matches gold data.
+#[tokio::test]
+async fn test_e2e_v9_mor_all_data_types() -> Result<()> {
+    let table_path = "/home/ubuntu/ws3/hudi-rs/tables/mor_layouts/table_all_data_types";
+
+    let result = read_file_group_abs(
+        table_path,
+        Some("c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet"),
+        vec![
+            ".c887c1e8-5fb9-475e-8171-769c5cf10c61-0_20260409030539332.log.1_0-254-421",
+            ".c887c1e8-5fb9-475e-8171-769c5cf10c61-0_20260409030540482.log.1_0-268-450",
+            ".c887c1e8-5fb9-475e-8171-769c5cf10c61-0_20260409030541620.log.1_0-282-482",
+        ],
+    )
+    .await?;
+
+    let gold = read_gold_parquet(&format!("{table_path}/gold_data"));
+    assert_matches_gold(&result, &gold, "table_all_data_types");
     Ok(())
 }

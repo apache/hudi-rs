@@ -27,9 +27,9 @@ use apache_avro::{
     types::Value,
 };
 use arrow::array::{
-    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, LargeStringArray,
-    ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StringBuilder,
-    StringDictionaryBuilder, make_array,
+    Array, ArrayBuilder, ArrayData, ArrayDataBuilder, ArrayRef, BooleanBuilder, Decimal128Array,
+    LargeStringArray, ListBuilder, MapArray, NullArray, OffsetSizeTrait, PrimitiveArray,
+    StringArray, StringBuilder, StringDictionaryBuilder, StructArray, make_array,
 };
 use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
 use arrow::buffer::{Buffer, MutableBuffer};
@@ -542,8 +542,24 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     })
                     .collect();
 
+                // Check if schema_lookup covers the nested struct fields.
+                // If not (e.g., list items from Avro log data), build directly from records.
                 let sub_parent_field_name = format!("{}.{}", parent_field_name, list_field.name());
-                let arrays = self.build_struct_array(&rows, &sub_parent_field_name, fields)?;
+                let first_child_path = format!("{}.{}", sub_parent_field_name, fields[0].name());
+                let has_lookup = self.schema_lookup.contains_key(&first_child_path);
+                let arrays = if has_lookup {
+                    self.build_struct_array(&rows, &sub_parent_field_name, fields)?
+                } else {
+                    // Build arrays directly from Record field names
+                    let avro_values: Vec<Value> = rows
+                        .iter()
+                        .map(|r| Value::Record(r.to_vec()))
+                        .collect();
+                    fields
+                        .iter()
+                        .map(|f| build_struct_field_from_avro_values(&avro_values, f))
+                        .collect::<ArrowResult<Vec<ArrayRef>>>()?
+                };
                 let data_type = DataType::Struct(fields.clone());
                 ArrayDataBuilder::new(data_type)
                     .len(rows.len())
@@ -673,6 +689,25 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                             *size,
                         )?) as ArrayRef
                     }
+                    DataType::Decimal128(precision, scale) => {
+                        let precision = *precision;
+                        let scale = *scale;
+                        let values: Vec<Option<i128>> = rows
+                            .iter()
+                            .map(|row| {
+                                let maybe_value = self.field_lookup(&field_path, row);
+                                maybe_value.and_then(|v| resolve_decimal(v))
+                            })
+                            .collect();
+                        Arc::new(
+                            Decimal128Array::from(values)
+                                .with_precision_and_scale(precision, scale)
+                                .map_err(|e| SchemaError(format!("Decimal128 error: {e}")))?,
+                        ) as ArrayRef
+                    }
+                    DataType::Map(map_field, _sorted_keys) => {
+                        self.build_map_array(rows, &field_path, map_field)?
+                    }
                     DataType::List(list_field) => {
                         match list_field.data_type() {
                             DataType::Dictionary(key_ty, _) => {
@@ -741,6 +776,127 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             })
             .collect();
         arrays
+    }
+
+    /// Build a MapArray from Avro Map values.
+    ///
+    /// Avro maps are `Value::Map(HashMap<String, Value>)`. The Arrow Map type
+    /// has a struct child with "key" and "value" fields.
+    fn build_map_array(
+        &self,
+        rows: RecordSlice,
+        field_path: &str,
+        entries_field: &arrow::datatypes::FieldRef,
+    ) -> ArrowResult<ArrayRef> {
+        // entries_field is a Struct field with children: key (String) and value (any type)
+        let entries_struct = match entries_field.data_type() {
+            DataType::Struct(fields) => fields,
+            other => {
+                return Err(SchemaError(format!(
+                    "Map entries field should be Struct, got {other}"
+                )));
+            }
+        };
+
+        // Collect all map entries flattened, tracking offsets
+        let mut offsets: Vec<i32> = vec![0];
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut all_values: Vec<Value> = Vec::new();
+        let mut null_bitmap: Vec<bool> = Vec::new();
+
+        for row in rows {
+            let maybe_value = self.field_lookup(field_path, row);
+            match maybe_value.map(maybe_resolve_union) {
+                Some(Value::Map(map)) => {
+                    null_bitmap.push(true);
+                    for (k, v) in map {
+                        all_keys.push(k.clone());
+                        all_values.push(v.clone());
+                    }
+                    offsets.push(*offsets.last().unwrap() + map.len() as i32);
+                }
+                None | Some(Value::Null) => {
+                    null_bitmap.push(false);
+                    offsets.push(*offsets.last().unwrap());
+                }
+                other => {
+                    return Err(SchemaError(format!(
+                        "Expected Map value for {field_path}, got {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Build key array (always String)
+        let key_array: ArrayRef = Arc::new(StringArray::from(all_keys));
+
+        // Build value array
+        let value_field = &entries_struct[1]; // "value" field
+        let value_array = match value_field.data_type() {
+            DataType::Struct(value_struct_fields) => {
+                // Build struct array directly from Avro Record values.
+                // Can't use build_struct_array because schema_lookup doesn't cover map value fields.
+                let len = all_values.len();
+                let child_arrays: ArrowResult<Vec<ArrayRef>> = value_struct_fields
+                    .iter()
+                    .map(|sf| {
+                        build_struct_field_from_avro_values(&all_values, sf)
+                    })
+                    .collect();
+                let child_arrays = child_arrays?;
+                let data = ArrayDataBuilder::new(DataType::Struct(value_struct_fields.clone()))
+                    .len(len)
+                    .child_data(child_arrays.into_iter().map(|a| a.to_data()).collect())
+                    .build()?;
+                make_array(data)
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let strings: Vec<Option<String>> = all_values
+                    .iter()
+                    .map(|v| resolve_string(maybe_resolve_union(v)).ok().flatten())
+                    .collect();
+                Arc::new(StringArray::from(strings)) as ArrayRef
+            }
+            DataType::Int32 => {
+                let vals: Vec<Option<i32>> = all_values
+                    .iter()
+                    .map(|v| {
+                        let v = maybe_resolve_union(v);
+                        match v {
+                            Value::Int(i) => Some(*i),
+                            Value::Long(l) => Some(*l as i32),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                Arc::new(arrow_array::Int32Array::from(vals)) as ArrayRef
+            }
+            other => {
+                return Err(SchemaError(format!(
+                    "Map value type {other} not yet supported in build_map_array"
+                )));
+            }
+        };
+
+        // Build the entries struct array (key, value)
+        let entries_data = ArrayDataBuilder::new(DataType::Struct(entries_struct.clone()))
+            .len(key_array.len())
+            .child_data(vec![key_array.to_data(), value_array.to_data()])
+            .build()?;
+        let entries_array = make_array(entries_data);
+
+        // Build offsets buffer
+        let offsets_buffer = Buffer::from_slice_ref(&offsets);
+        let null_buffer: arrow::buffer::NullBuffer = null_bitmap.into();
+
+        let map_data = ArrayDataBuilder::new(DataType::Map(entries_field.clone(), false))
+            .len(rows.len())
+            .add_buffer(offsets_buffer)
+            .null_bit_buffer(Some(null_buffer.inner().inner().clone()))
+            .child_data(vec![entries_array.to_data()])
+            .build()?;
+
+        Ok(make_array(map_data))
     }
 
     /// Read the primitive list's values into ArrayData
@@ -875,6 +1031,138 @@ fn resolve_fixed(v: &Value, size: usize) -> Option<Vec<u8>> {
         }
         _ => None,
     }
+}
+
+/// Build a single field's array from a list of Avro Values that are Records.
+///
+/// Extracts the named field from each Record value and builds the appropriate Arrow array.
+fn build_struct_field_from_avro_values(
+    values: &[Value],
+    field: &arrow::datatypes::FieldRef,
+) -> ArrowResult<ArrayRef> {
+    let field_name = field.name();
+    let extracted: Vec<Option<&Value>> = values
+        .iter()
+        .map(|v| {
+            let v = maybe_resolve_union(v);
+            match v {
+                Value::Record(fields) => fields
+                    .iter()
+                    .find(|(n, _)| n == field_name)
+                    .map(|(_, val)| val),
+                _ => None,
+            }
+        })
+        .collect();
+
+    match field.data_type() {
+        DataType::Int32 => {
+            let arr: Vec<Option<i32>> = extracted
+                .iter()
+                .map(|v| {
+                    v.and_then(|v| {
+                        let v = maybe_resolve_union(v);
+                        match v {
+                            Value::Int(i) => Some(*i),
+                            Value::Long(l) => Some(*l as i32),
+                            _ => None,
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(arrow_array::Int32Array::from(arr)) as ArrayRef)
+        }
+        DataType::Int64 => {
+            let arr: Vec<Option<i64>> = extracted
+                .iter()
+                .map(|v| {
+                    v.and_then(|v| {
+                        let v = maybe_resolve_union(v);
+                        match v {
+                            Value::Long(l) => Some(*l),
+                            Value::Int(i) => Some(*i as i64),
+                            _ => None,
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(arrow_array::Int64Array::from(arr)) as ArrayRef)
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let arr: Vec<Option<String>> = extracted
+                .iter()
+                .map(|v| v.and_then(|v| resolve_string(maybe_resolve_union(v)).ok().flatten()))
+                .collect();
+            Ok(Arc::new(StringArray::from(arr)) as ArrayRef)
+        }
+        DataType::Float64 => {
+            let arr: Vec<Option<f64>> = extracted
+                .iter()
+                .map(|v| {
+                    v.and_then(|v| {
+                        let v = maybe_resolve_union(v);
+                        match v {
+                            Value::Double(d) => Some(*d),
+                            Value::Float(f) => Some(*f as f64),
+                            _ => None,
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(arrow_array::Float64Array::from(arr)) as ArrayRef)
+        }
+        DataType::Boolean => {
+            let arr: Vec<Option<bool>> = extracted
+                .iter()
+                .map(|v| {
+                    v.and_then(|v| {
+                        let v = maybe_resolve_union(v);
+                        match v {
+                            Value::Boolean(b) => Some(*b),
+                            _ => None,
+                        }
+                    })
+                })
+                .collect();
+            Ok(Arc::new(arrow_array::BooleanArray::from(arr)) as ArrayRef)
+        }
+        other => Err(SchemaError(format!(
+            "Map struct field type {other} not yet supported in build_struct_field_from_avro_values"
+        ))),
+    }
+}
+
+/// Resolve an Avro decimal value (Fixed or Bytes) to i128.
+///
+/// Avro stores decimals as big-endian two's complement bytes in Fixed or Bytes.
+fn resolve_decimal(v: &Value) -> Option<i128> {
+    let v = if let Value::Union(_, b) = v { b } else { v };
+    let bytes = match v {
+        Value::Fixed(_, bytes) => bytes.as_slice(),
+        Value::Bytes(bytes) => bytes.as_slice(),
+        Value::Decimal(decimal) => {
+            // apache-avro crate's Decimal: use TryFrom to get big-endian bytes
+            let bytes: Vec<u8> = Vec::<u8>::try_from(decimal).ok()?;
+            return Some(decimal_bytes_to_i128(&bytes));
+        }
+        Value::Null => return None,
+        _ => return None,
+    };
+    Some(decimal_bytes_to_i128(bytes))
+}
+
+/// Convert big-endian two's complement bytes to i128.
+fn decimal_bytes_to_i128(bytes: &[u8]) -> i128 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    // Sign-extend to 16 bytes
+    let is_negative = bytes[0] & 0x80 != 0;
+    let pad = if is_negative { 0xFF } else { 0x00 };
+    let mut buf = [pad; 16];
+    let start = 16 - bytes.len();
+    buf[start..].copy_from_slice(bytes);
+    i128::from_be_bytes(buf)
 }
 
 fn resolve_boolean(value: &Value) -> Option<bool> {

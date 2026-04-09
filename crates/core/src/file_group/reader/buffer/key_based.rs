@@ -359,6 +359,8 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
 
         let schema = if !self.base.base_file_batches.is_empty() {
             self.base.base_file_batches[0].schema()
+        } else if let Some(schema) = &self.base.reader_schema {
+            schema.clone()
         } else {
             let first_record = self.base.records.values().next();
             match first_record.and_then(|r| r.get_record()).as_ref() {
