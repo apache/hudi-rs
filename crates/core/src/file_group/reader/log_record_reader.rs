@@ -40,9 +40,7 @@
 //! Drain deque via `pollLast` (tail-first) = oldest instant processed first.
 
 use crate::Result;
-use crate::file_group::log_file::log_block::{
-    BlockMetadataKey, BlockType, LogBlock, LogBlockContent,
-};
+use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlock};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::reader_context::ReaderContext;
@@ -421,8 +419,7 @@ impl BaseHoodieLogRecordReader {
         // Mirrors Java: if (!currentInstantLogBlocks.isEmpty() && !skipProcessingBlocks) { ... }
         if !pass2.current_instant_log_blocks.is_empty() && !skip_processing_blocks {
             log::debug!("Merging the final data blocks");
-            self.process_queued_blocks_for_instant(&mut pass2.current_instant_log_blocks)
-                .await?;
+            self.process_queued_blocks_for_instant(&mut pass2.current_instant_log_blocks)?;
         }
 
         // Done
@@ -473,14 +470,10 @@ impl BaseHoodieLogRecordReader {
     /// Mirrors Java's `processQueuedBlocksForInstant(Deque<HoodieLogBlock>, ...)`.
     ///
     /// Drains the deque from the back (oldest→newest via `pop_back`/`pollLast`).
-    ///
-    /// For each block:
-    /// 1. `inflate()` — load content from storage on demand (one block at a time)
-    /// 2. Dispatch to `record_buffer.process_data_block()` or `process_delete_block()`
-    /// 3. Block goes out of scope — content memory freed (implicit `deflate`)
-    ///
-    /// This matches Java's pattern: `inflate()` → `deserializeRecords()` → `deflate()`.
-    async fn process_queued_blocks_for_instant(
+    /// Dispatches each block to the record buffer — the buffer is responsible for
+    /// inflating, extracting records, and deflating (matching Java's design where
+    /// `processQueuedBlocksForInstant` does NOT call `inflate()`).
+    fn process_queued_blocks_for_instant(
         &mut self,
         log_blocks: &mut VecDeque<LogBlock>,
     ) -> Result<()> {
@@ -494,61 +487,26 @@ impl BaseHoodieLogRecordReader {
             block_num += 1;
             let instant_time = block.instant_time().unwrap_or("unknown").to_string();
             log::debug!(
-                "[Pass3] block #{block_num}: type={:?} instant={instant_time} content_empty={} has_location={}",
+                "[Pass3] block #{block_num}: type={:?} instant={instant_time}",
                 block.block_type,
-                block.content.is_empty(),
-                block.content_location.is_some(),
-            );
-
-            // Lazy inflate: load and decode block content from storage on demand.
-            block
-                .inflate(self.reader_context.clone(), self.storage.clone())
-                .await?;
-
-            log::debug!(
-                "[Pass3] block #{block_num} inflated: content_empty={}",
-                block.content.is_empty(),
             );
 
             match block.block_type {
                 BlockType::AvroData | BlockType::HfileData | BlockType::ParquetData => {
-                    if let LogBlockContent::Records(record_batches) = block.content {
-                        let total_rows: usize = record_batches.data_batches.iter().map(|b| b.num_rows()).sum();
-                        log::debug!(
-                            "[Pass3] DATA block #{block_num}: {} data batches, {} total rows",
-                            record_batches.data_batches.len(),
-                            total_rows,
-                        );
-                        for batch in record_batches.data_batches {
-                            self.record_buffer.process_data_block(batch, &instant_time)?;
-                        }
-                        log::debug!(
-                            "[Pass3] after processing block #{block_num}: buffer size={}",
-                            self.record_buffer.size(),
-                        );
-                    }
+                    self.record_buffer.process_data_block(&mut block)?;
+                    log::debug!(
+                        "[Pass3] after processing data block #{block_num}: buffer size={}",
+                        self.record_buffer.size(),
+                    );
                 }
                 BlockType::Delete => {
-                    if let LogBlockContent::Records(record_batches) = block.content {
-                        let total_deletes: usize = record_batches.delete_batches.iter().map(|(b, _)| b.num_rows()).sum();
-                        log::debug!(
-                            "[Pass3] DELETE block #{block_num}: {} delete batches, {} total deletes",
-                            record_batches.delete_batches.len(),
-                            total_deletes,
-                        );
-                        for pair in record_batches.delete_batches {
-                            let batch = pair.0;
-                            let inst = pair.1;
-                            self.record_buffer.process_delete_block(batch, &inst)?;
-                        }
-                    }
+                    self.record_buffer.process_delete_block(&mut block)?;
                 }
                 BlockType::Corrupted => {
                     log::warn!("Found corrupt block not rolled back");
                 }
                 _ => {}
             }
-            // block goes out of scope here — content memory is freed (implicit deflate)
         }
         Ok(())
     }
@@ -561,7 +519,7 @@ impl BaseHoodieLogRecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_group::log_file::log_block::CommandBlock;
+    use crate::file_group::log_file::log_block::{CommandBlock, LogBlockContent};
     use crate::file_group::log_file::log_format::LogFormatVersion;
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -1094,15 +1052,11 @@ mod tests {
         // Verify deque ordering: pop_back gives t1, t2, t3 (oldest first)
         let mut buffer = make_test_buffer();
         let mut order = Vec::new();
-        while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
+        while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
             let instant = block.instant_time().unwrap().to_string();
             order.push(instant.clone());
             // Process through the buffer (same as processQueuedBlocksForInstant)
-            if let LogBlockContent::Records(rb) = block.content {
-                for batch in rb.data_batches {
-                    buffer.process_data_block(batch, &instant).unwrap();
-                }
-            }
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Verify processing order: oldest → newest
@@ -1165,10 +1119,11 @@ mod tests {
         let mut buffer = make_test_buffer();
         let mut order_instants = Vec::new();
         let mut order_values = Vec::new();
-        while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
+        while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
             let instant = block.instant_time().unwrap().to_string();
             order_instants.push(instant.clone());
-            if let LogBlockContent::Records(rb) = block.content {
+            // Peek at content to record ordering before processing
+            if let LogBlockContent::Records(ref rb) = block.content {
                 for batch in &rb.data_batches {
                     let counters = batch
                         .column(1)
@@ -1177,10 +1132,8 @@ mod tests {
                         .unwrap();
                     order_values.push(counters.value(0));
                 }
-                for batch in rb.data_batches {
-                    buffer.process_data_block(batch, &instant).unwrap();
-                }
             }
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Processing order: blockA(t1) → blockB(t1) → blockC(t2)
@@ -1212,16 +1165,16 @@ mod tests {
         let mut buffer = make_test_buffer();
 
         // Simulate oldest→newest processing (as pollLast produces)
-        let batch_t1 = test_batch(&[("K", 1, 10)]);
-        buffer.process_data_block(batch_t1, "t1").unwrap();
+        let mut block_t1 = make_data_block_with_content("t1", &[("K", 1, 10)]);
+        buffer.process_data_block(&mut block_t1).unwrap();
         assert_eq!(buffer.size(), 1);
 
-        let batch_t2 = test_batch(&[("K", 2, 20)]);
-        buffer.process_data_block(batch_t2, "t2").unwrap();
+        let mut block_t2 = make_data_block_with_content("t2", &[("K", 2, 20)]);
+        buffer.process_data_block(&mut block_t2).unwrap();
         assert_eq!(buffer.size(), 1); // same key, overwritten
 
-        let batch_t3 = test_batch(&[("K", 3, 30)]);
-        buffer.process_data_block(batch_t3, "t3").unwrap();
+        let mut block_t3 = make_data_block_with_content("t3", &[("K", 3, 30)]);
+        buffer.process_data_block(&mut block_t3).unwrap();
         assert_eq!(buffer.size(), 1);
 
         // All 3 records were processed
@@ -1256,13 +1209,8 @@ mod tests {
         let mut pass2 = reverse_scan_pass2(&mut pass1);
 
         let mut buffer = make_test_buffer();
-        while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
-            let instant = block.instant_time().unwrap().to_string();
-            if let LogBlockContent::Records(rb) = block.content {
-                for batch in rb.data_batches {
-                    buffer.process_data_block(batch, &instant).unwrap();
-                }
-            }
+        while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Verify map state
@@ -1310,13 +1258,8 @@ mod tests {
         let mut pass2 = reverse_scan_pass2(&mut pass1);
 
         let mut buffer = make_test_buffer();
-        while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
-            let instant = block.instant_time().unwrap().to_string();
-            if let LogBlockContent::Records(rb) = block.content {
-                for batch in rb.data_batches {
-                    buffer.process_data_block(batch, &instant).unwrap();
-                }
-            }
+        while let Some(mut block) = pass2.current_instant_log_blocks.pop_back() {
+            buffer.process_data_block(&mut block).unwrap();
         }
 
         // Set base file with original value for K

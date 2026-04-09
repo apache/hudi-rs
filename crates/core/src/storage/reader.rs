@@ -35,6 +35,13 @@ impl StorageReader {
         let reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
         Ok(Self { reader })
     }
+
+    /// Get a reference to the underlying file bytes.
+    ///
+    /// `Bytes` is ref-counted — cloning is O(1).
+    pub fn get_ref_bytes(&self) -> &Bytes {
+        self.reader.get_ref().get_ref()
+    }
 }
 
 impl Read for StorageReader {

@@ -19,11 +19,16 @@
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_format::LogFormatVersion;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::io::{Cursor, Seek, SeekFrom};
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Internal block content version.
 ///
@@ -301,8 +306,12 @@ pub struct LogBlock {
     pub footer: HashMap<BlockMetadataKey, String>,
     pub skipped: bool,
     /// Content location for lazy inflate. When set, content starts as `Empty`
-    /// and is loaded on demand via `inflate()`.
+    /// and is loaded on demand via `inflate_from_bytes()`.
     pub content_location: Option<LogBlockContentLocation>,
+    /// Pre-fetched file bytes for sync inflate. Set during Pass 1 when the
+    /// log file is already in memory. `Bytes` is ref-counted — cloning is O(1).
+    /// Mirrors Java's `inputStreamSupplier` on `HoodieLogBlock`.
+    pub source_bytes: Option<Bytes>,
 }
 
 impl LogBlock {
@@ -322,6 +331,7 @@ impl LogBlock {
             footer,
             skipped: false,
             content_location: None,
+            source_bytes: None,
         }
     }
 
@@ -344,6 +354,7 @@ impl LogBlock {
             footer: HashMap::new(),
             skipped: false,
             content_location: Some(content_location),
+            source_bytes: None,
         }
     }
 
@@ -363,39 +374,40 @@ impl LogBlock {
             footer: HashMap::new(),
             skipped: true,
             content_location: None,
+            source_bytes: None,
         }
     }
 
-    /// Load and decode block content from storage on demand (lazy inflate).
+    /// Set pre-fetched file bytes for sync inflate.
     ///
-    /// Mirrors Java's `HoodieLogBlock.inflate()` + `HoodieDataBlock.readRecordsFromBlockPayload()`.
+    /// Called during Pass 1 when the log file is already in memory.
+    /// `Bytes` is ref-counted — cloning is O(1).
+    pub fn set_source_bytes(&mut self, bytes: Bytes) {
+        self.source_bytes = Some(bytes);
+    }
+
+    /// Decode block content from pre-fetched file bytes (sync).
     ///
-    /// In Java, `inflate()` reads raw `byte[]`, then `deserializeRecords()` parses it,
-    /// then `deflate()` releases the `byte[]`. In Rust, `inflate()` does both: reads
-    /// from storage and decodes into `LogBlockContent::Records`.
+    /// Mirrors Java's `HoodieDataBlock.readRecordsFromBlockPayload()`:
+    /// `inflate()` → `deserializeRecords()` → `deflate()`.
     ///
-    /// No-op if content is already populated.
-    pub async fn inflate(
-        &mut self,
-        reader_context: std::sync::Arc<crate::file_group::reader::reader_context::ReaderContext>,
-        storage: std::sync::Arc<crate::storage::Storage>,
-    ) -> crate::Result<()> {
+    /// No-op if content is already populated (e.g., eagerly decoded blocks
+    /// or blocks already inflated).
+    pub fn inflate_from_bytes(&mut self, reader_context: Arc<ReaderContext>) -> Result<()> {
         if !self.content.is_empty() {
-            log::debug!(
-                "[LogBlock::inflate] content already populated for {:?} block, skipping",
-                self.block_type,
-            );
-            return Ok(()); // Already inflated
+            return Ok(());
         }
 
         let loc = self.content_location.as_ref().ok_or_else(|| {
-            crate::error::CoreError::LogBlockError(
-                "No content location for inflate".to_string(),
-            )
+            CoreError::LogBlockError("No content location for inflate".to_string())
+        })?;
+
+        let bytes = self.source_bytes.as_ref().ok_or_else(|| {
+            CoreError::LogBlockError("No source bytes for inflate".to_string())
         })?;
 
         log::debug!(
-            "[LogBlock::inflate] type={:?} file={} pos={} len={} block_len={}",
+            "[LogBlock::inflate_from_bytes] type={:?} file={} pos={} len={} block_len={}",
             self.block_type,
             loc.log_file_path,
             loc.content_position,
@@ -403,18 +415,20 @@ impl LogBlock {
             loc.block_length,
         );
 
-        let mut reader = storage.get_storage_reader(&loc.log_file_path).await?;
-        use std::io::{Seek, SeekFrom};
-        reader.seek(SeekFrom::Start(loc.content_position))?;
+        let mut cursor = Cursor::new(bytes.clone());
+        cursor.seek(SeekFrom::Start(loc.content_position))?;
 
-        let decoder = crate::file_group::log_file::content::Decoder::new(reader_context);
+        let decoder = Decoder::new(reader_context);
         self.content = decoder.decode_content(
-            &mut reader,
+            &mut cursor,
             &self.format_version,
             loc.block_length,
             &self.block_type,
             &self.header,
         )?;
+
+        // Release raw bytes — mirrors Java's deflate() releasing the byte[]
+        self.source_bytes = None;
 
         Ok(())
     }

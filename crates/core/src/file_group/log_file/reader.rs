@@ -86,9 +86,14 @@ impl LogFileReader<StorageReader> {
     /// Read all blocks as metadata-only (no content decoding).
     ///
     /// Mirrors Java's Pass 1 behavior: reads block headers and records
-    /// `content_location` for later lazy `inflate()`, but seeks past the
+    /// `content_location` for later lazy inflate, but seeks past the
     /// content bytes without decoding them. Only one block's content is
     /// in memory at a time during Pass 3.
+    ///
+    /// Each block receives a clone of the underlying file `Bytes` (O(1) ref-count
+    /// increment), mirroring Java's `inputStreamSupplier` on `HoodieLogBlock`.
+    /// This enables the buffer to call `inflate_from_bytes()` synchronously
+    /// during Pass 3 without re-downloading the file.
     ///
     /// # Arguments
     /// * `log_file_path` - The relative path to the log file (stored in `LogBlockContentLocation`)
@@ -96,8 +101,10 @@ impl LogFileReader<StorageReader> {
         &mut self,
         log_file_path: &str,
     ) -> Result<Vec<LogBlock>> {
+        let file_bytes = self.reader.get_ref_bytes().clone();
         let mut blocks = Vec::new();
-        while let Some(block) = self.read_next_block_metadata_only(log_file_path)? {
+        while let Some(mut block) = self.read_next_block_metadata_only(log_file_path)? {
+            block.set_source_bytes(file_bytes.clone());
             blocks.push(block);
         }
         Ok(blocks)

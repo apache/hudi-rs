@@ -46,6 +46,7 @@ pub use loader::{DefaultFileGroupRecordBufferLoader, FileGroupRecordBufferLoader
 pub use record_buffer::FileGroupRecordBuffer;
 
 use crate::Result;
+use crate::file_group::log_file::log_block::LogBlock;
 use crate::file_group::reader::buffered_record::{BufferedRecord, DeleteRecord};
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
@@ -82,11 +83,12 @@ pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
     /// Process a data block from log scanning.
     ///
     /// Mirrors Java's `processDataBlock(HoodieDataBlock, Option<KeySpec>)`.
-    /// In Rust, the block is already deserialized to a `RecordBatch`.
+    /// The buffer is responsible for inflating the block and extracting records,
+    /// matching Java where inflate/deserialize/deflate happens inside the block
+    /// triggered by the buffer's `getRecordsIterator`.
     fn process_data_block(
         &mut self,
-        batch: RecordBatch,
-        instant_time: &str,
+        block: &mut LogBlock,
     ) -> Result<()>;
 
     /// Process a single data record within a data block.
@@ -101,10 +103,10 @@ pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
     /// Process a delete block from log scanning.
     ///
     /// Mirrors Java's `processDeleteBlock(HoodieDeleteBlock)`.
+    /// The buffer inflates the block and extracts delete records internally.
     fn process_delete_block(
         &mut self,
-        batch: RecordBatch,
-        instant_time: &str,
+        block: &mut LogBlock,
     ) -> Result<()>;
 
     /// Process a single deleted record within a delete block.
