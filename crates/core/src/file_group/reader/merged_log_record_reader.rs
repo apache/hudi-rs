@@ -36,6 +36,7 @@ use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::log_record_reader::BaseHoodieLogRecordReader;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
+use crate::timeline::selector::InstantRange;
 use std::sync::Arc;
 
 /// Statistics from the log scanning operation.
@@ -94,17 +95,46 @@ impl HoodieMergedLogRecordReader {
 
     /// Scan delta-log files processing blocks.
     ///
+    /// Mirrors Java's `scan()`:
+    /// ```java
+    /// public final void scan() { scan(false); }
+    /// ```
+    pub async fn scan(&mut self) -> Result<()> {
+        self.scan_with_skip(false).await
+    }
+
+    /// Scan with control over block processing.
+    ///
+    /// Mirrors Java's `scan(boolean skipProcessingBlocks)`:
+    /// ```java
+    /// public final void scan(boolean skipProcessingBlocks) {
+    ///     if (forceFullScan) { return; } // already scanned in constructor
+    ///     scanInternal(Option.empty(), skipProcessingBlocks);
+    /// }
+    /// ```
+    pub async fn scan_with_skip(&mut self, skip_processing_blocks: bool) -> Result<()> {
+        if self.base.force_full_scan {
+            // When full-scan is enforced, scanning is invoked upfront (during initialization)
+            return Ok(());
+        }
+        self.base.scan_internal(skip_processing_blocks).await
+    }
+
     /// Mirrors Java's `performScan()`:
     /// ```java
-    /// timer.startTimer();
-    /// scanInternal(keySpecOpt, false);
-    /// this.totalTimeTakenToReadAndMergeBlocks = timer.endTimer();
-    /// this.numMergedRecordsInLog = recordBuffer.size();
+    /// private void performScan() {
+    ///     timer.startTimer();
+    ///     Option<KeySpec> keySpecOpt = createKeySpec(readerContext.getKeyFilterOpt());
+    ///     scanInternal(keySpecOpt, false);
+    ///     this.totalTimeTakenToReadAndMergeBlocks = timer.endTimer();
+    ///     this.numMergedRecordsInLog = recordBuffer.size();
+    /// }
     /// ```
     async fn perform_scan(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
 
-        self.base.scan_internal().await?;
+        // KeySpec filtering not yet implemented in Rust; pass skip=false
+        self.base.scan_internal(false).await?;
 
         self.total_time_taken_to_read_and_merge_blocks_ms =
             start.elapsed().as_millis() as u64;
@@ -148,6 +178,8 @@ impl HoodieMergedLogRecordReader {
         (buffer, valid_instants, stats)
     }
 
+    // ── Getters (delegate to base, mirrors Java's inherited access) ─────
+
     pub fn get_num_merged_records_in_log(&self) -> u64 {
         self.num_merged_records_in_log
     }
@@ -157,51 +189,74 @@ impl HoodieMergedLogRecordReader {
     }
 
     pub fn get_total_log_files(&self) -> u64 {
-        self.base.total_log_files
+        self.base.get_total_log_files()
     }
 
     pub fn get_total_log_records(&self) -> u64 {
-        self.base.total_log_records
+        self.base.get_total_log_records()
     }
 
     pub fn get_total_log_blocks(&self) -> u64 {
-        self.base.total_log_blocks
+        self.base.get_total_log_blocks()
     }
 
     pub fn get_total_corrupt_blocks(&self) -> u64 {
-        self.base.total_corrupt_blocks
+        self.base.get_total_corrupt_blocks()
     }
 
     pub fn get_total_rollbacks(&self) -> u64 {
-        self.base.total_rollbacks
+        self.base.get_total_rollbacks()
     }
 
     pub fn get_valid_block_instants(&self) -> &[String] {
-        &self.base.valid_block_instants
+        self.base.get_valid_block_instants()
+    }
+
+    pub fn get_progress(&self) -> f32 {
+        self.base.get_progress()
     }
 }
 
 /// Builder for `HoodieMergedLogRecordReader`.
 ///
-/// Mirrors Java's `HoodieMergedLogRecordReader.Builder<T>`.
+/// Mirrors Java's `HoodieMergedLogRecordReader.Builder<T> extends BaseHoodieLogRecordReader.Builder<T>`.
 ///
 /// ## Required fields:
-/// - `hudi_configs`
+/// - `reader_context`
 /// - `storage`
 /// - `record_buffer`
 ///
 /// ## Builder flow:
 /// `build()` constructs the reader and calls `perform_scan()` when
 /// `force_full_scan=true` (the default, matching Java).
-#[derive(Default)]
 pub struct Builder {
     reader_context: Option<Arc<ReaderContext>>,
     storage: Option<Arc<Storage>>,
     log_file_paths: Vec<String>,
     latest_instant_time: Option<String>,
+    instant_range: Option<InstantRange>,
+    /// Whether instant_range was explicitly set via `with_instant_range()`.
+    instant_range_explicitly_set: bool,
     record_buffer: Option<Box<dyn HoodieFileGroupRecordBuffer>>,
+    /// By default true, matching Java: `private boolean forceFullScan = true;`
     force_full_scan: bool,
     allow_inflight_instants: bool,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            reader_context: None,
+            storage: None,
+            log_file_paths: Vec::new(),
+            latest_instant_time: None,
+            instant_range: None,
+            instant_range_explicitly_set: false,
+            record_buffer: None,
+            force_full_scan: true,
+            allow_inflight_instants: false,
+        }
+    }
 }
 
 impl Builder {
@@ -228,6 +283,13 @@ impl Builder {
         self
     }
 
+    /// Mirrors Java's `withInstantRange(Option<InstantRange>)`.
+    pub fn with_instant_range(mut self, range: Option<InstantRange>) -> Self {
+        self.instant_range = range;
+        self.instant_range_explicitly_set = true;
+        self
+    }
+
     /// Mirrors Java's `withRecordBuffer(HoodieFileGroupRecordBuffer<T>)`.
     pub fn with_record_buffer(mut self, buffer: Box<dyn HoodieFileGroupRecordBuffer>) -> Self {
         self.record_buffer = Some(buffer);
@@ -250,6 +312,10 @@ impl Builder {
     ///
     /// Mirrors Java's `build()` which calls the constructor, and the
     /// constructor calls `performScan()` when `forceFullScan=true`.
+    ///
+    /// If `instant_range` was not explicitly set, it is derived from
+    /// `reader_context.instant_range` (matching Java's pattern where
+    /// the caller passes `readerContext.getInstantRange()` to the builder).
     pub async fn build(self) -> Result<HoodieMergedLogRecordReader> {
         let reader_context = self
             .reader_context
@@ -261,6 +327,13 @@ impl Builder {
             .record_buffer
             .ok_or_else(|| CoreError::ReadFileSliceError("record_buffer required".into()))?;
 
+        // Derive instant_range from reader_context if not explicitly set
+        let instant_range = if self.instant_range_explicitly_set {
+            self.instant_range
+        } else {
+            reader_context.instant_range.clone()
+        };
+
         let base = BaseHoodieLogRecordReader {
             reader_context,
             storage,
@@ -268,6 +341,8 @@ impl Builder {
             latest_instant_time: self
                 .latest_instant_time
                 .unwrap_or_else(|| "99991231235959999".to_string()),
+            instant_range,
+            force_full_scan: self.force_full_scan,
             record_buffer,
             allow_inflight_instants: self.allow_inflight_instants,
             valid_block_instants: Vec::new(),
@@ -276,6 +351,7 @@ impl Builder {
             total_log_records: 0,
             total_corrupt_blocks: 0,
             total_rollbacks: 0,
+            progress: 0.0,
         };
 
         let mut reader = HoodieMergedLogRecordReader {
@@ -284,6 +360,7 @@ impl Builder {
             total_time_taken_to_read_and_merge_blocks_ms: 0,
         };
 
+        // Mirrors Java constructor: if (forceFullScan) { performScan(); }
         if self.force_full_scan {
             reader.perform_scan().await?;
         }
@@ -312,7 +389,6 @@ mod tests {
             vec![],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
-            "_hoodie_record_key".to_string(),
         ))
     }
 

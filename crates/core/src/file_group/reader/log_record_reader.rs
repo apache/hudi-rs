@@ -275,7 +275,7 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
                 if instant_times_included.contains(&final_instant) {
                     continue;
                 }
-                if let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) {
+            if let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) {
                     let mut reversed = blocks.clone();
                     reversed.reverse();
                     for block in reversed {
@@ -322,29 +322,58 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
 
 /// The base log record reader implementing the 3-pass scanning algorithm.
 ///
-/// Mirrors Java's `BaseHoodieLogRecordReader<T>`.
+/// Mirrors Java's `BaseHoodieLogRecordReader<T>` (abstract base class).
+///
+/// ## Java hierarchy:
+/// ```text
+/// BaseHoodieLogRecordReader<T>  (abstract — this struct)
+///   └─ HoodieMergedLogRecordReader<T>  (concrete — wraps this via composition)
+/// ```
+///
+/// ## Fields matching Java:
+/// - `reader_context` ↔ `readerContext`
+/// - `storage` ↔ `storage`
+/// - `log_file_paths` ↔ `logFiles`
+/// - `latest_instant_time` ↔ `latestInstantTime`
+/// - `instant_range` ↔ `instantRange`
+/// - `force_full_scan` ↔ `forceFullScan`
+/// - `record_buffer` ↔ `recordBuffer`
+/// - `allow_inflight_instants` ↔ `allowInflightInstants`
 pub struct BaseHoodieLogRecordReader {
     pub reader_context: Arc<ReaderContext>,
     pub storage: Arc<Storage>,
     pub log_file_paths: Vec<String>,
     pub latest_instant_time: String,
+    /// Mirrors Java's `private final Option<InstantRange> instantRange`.
+    pub instant_range: Option<InstantRange>,
+    /// Mirrors Java's `protected final boolean forceFullScan`.
+    /// When true, scanning happens eagerly in the constructor.
+    pub force_full_scan: bool,
     pub record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
     pub allow_inflight_instants: bool,
 
-    // ── Stats counters ──────────────────────────────────────────────────
+    // ── Stats / state (mirrors Java's AtomicLong counters + progress) ──
     pub valid_block_instants: Vec<String>,
     pub total_log_files: u64,
     pub total_log_blocks: u64,
     pub total_log_records: u64,
     pub total_corrupt_blocks: u64,
     pub total_rollbacks: u64,
+    /// Mirrors Java's `private float progress` (0.0 → 1.0).
+    pub progress: f32,
 }
 
 impl BaseHoodieLogRecordReader {
-    /// Mirrors Java's `scanInternal(keySpecOpt, skipProcessingBlocks)`.
-    pub async fn scan_internal(&mut self) -> Result<()> {
-        // Reset state
+    /// Mirrors Java's `scanInternal(Option<KeySpec> keySpecOpt, boolean skipProcessingBlocks)`.
+    ///
+    /// # Arguments
+    /// - `skip_processing_blocks` — when `true`, Pass 3 (block processing) is skipped.
+    ///   Java's `HoodieMergedLogRecordReader.scan(true)` uses this to collect block
+    ///   metadata without actually merging records.
+    pub async fn scan_internal(&mut self, skip_processing_blocks: bool) -> Result<()> {
+        // Reset state (mirrors Java: currentInstantLogBlocks = new ArrayDeque<>(), progress = 0.0f, ...)
         self.valid_block_instants.clear();
+        self.progress = 0.0;
         self.total_log_files = 0;
         self.total_log_blocks = 0;
         self.total_log_records = 0;
@@ -369,7 +398,7 @@ impl BaseHoodieLogRecordReader {
         let mut pass1 = forward_scan_pass1(
             all_blocks,
             &self.latest_instant_time,
-            &self.reader_context.instant_range,
+            &self.instant_range,
             &timezone,
         )?;
 
@@ -389,14 +418,56 @@ impl BaseHoodieLogRecordReader {
         );
 
         // Pass 3: Process queued blocks (oldest → newest via pop_back).
-        // Each block is inflated (content loaded from storage) one at a time,
-        // then dropped after processing — matching Java's inflate/deflate pattern.
-        self.process_queued_blocks_for_instant(&mut pass2.current_instant_log_blocks)
-            .await?;
+        // Mirrors Java: if (!currentInstantLogBlocks.isEmpty() && !skipProcessingBlocks) { ... }
+        if !pass2.current_instant_log_blocks.is_empty() && !skip_processing_blocks {
+            log::debug!("Merging the final data blocks");
+            self.process_queued_blocks_for_instant(&mut pass2.current_instant_log_blocks)
+                .await?;
+        }
 
+        // Done
+        self.progress = 1.0;
         self.total_log_records = self.record_buffer.get_total_log_records();
 
         Ok(())
+    }
+
+    /// Mirrors Java's `shouldLookupRecords()`.
+    ///
+    /// Point-wise record lookups are only enabled when scanner is NOT in
+    /// full-scan mode.
+    pub fn should_lookup_records(&self) -> bool {
+        !self.force_full_scan
+    }
+
+    // ── Getters (mirrors Java's getter methods on BaseHoodieLogRecordReader) ──
+
+    pub fn get_progress(&self) -> f32 {
+        self.progress
+    }
+
+    pub fn get_total_log_files(&self) -> u64 {
+        self.total_log_files
+    }
+
+    pub fn get_total_log_records(&self) -> u64 {
+        self.total_log_records
+    }
+
+    pub fn get_total_log_blocks(&self) -> u64 {
+        self.total_log_blocks
+    }
+
+    pub fn get_total_rollbacks(&self) -> u64 {
+        self.total_rollbacks
+    }
+
+    pub fn get_total_corrupt_blocks(&self) -> u64 {
+        self.total_corrupt_blocks
+    }
+
+    pub fn get_valid_block_instants(&self) -> &[String] {
+        &self.valid_block_instants
     }
 
     /// Mirrors Java's `processQueuedBlocksForInstant(Deque<HoodieLogBlock>, ...)`.
@@ -449,8 +520,7 @@ impl BaseHoodieLogRecordReader {
                             total_rows,
                         );
                         for batch in record_batches.data_batches {
-                            self.record_buffer
-                                .process_data_block(batch, &instant_time)?;
+                            self.record_buffer.process_data_block(batch, &instant_time)?;
                         }
                         log::debug!(
                             "[Pass3] after processing block #{block_num}: buffer size={}",
@@ -991,7 +1061,6 @@ mod tests {
             vec!["ts".to_string()],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
-            "_hoodie_record_key".to_string(),
         ))
     }
 

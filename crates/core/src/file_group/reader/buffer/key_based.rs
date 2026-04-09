@@ -428,7 +428,6 @@ mod tests {
             vec!["ts".to_string()],
             merge_mode.to_string(),
             &read_stats,
-            "_hoodie_record_key".to_string(),
         )
     }
 
