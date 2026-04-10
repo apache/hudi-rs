@@ -965,6 +965,7 @@ mod tests {
     // =====================================================================
 
     use crate::config::HudiConfigs;
+    use crate::config::table::HudiTableConfig;
     use crate::file_group::reader::buffer::key_based::KeyBasedFileGroupRecordBuffer;
     use crate::file_group::reader::read_stats::HoodieReadStats;
     use crate::file_group::record_batches::RecordBatches;
@@ -1012,11 +1013,16 @@ mod tests {
     }
 
     fn make_test_buffer() -> Box<KeyBasedFileGroupRecordBuffer> {
-        let ctx = std::sync::Arc::new(ReaderContext::empty());
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::PrecombineField.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let ctx = std::sync::Arc::new(ctx);
         let stats = HoodieReadStats::default();
         Box::new(KeyBasedFileGroupRecordBuffer::new(
             ctx,
-            vec!["ts".to_string()],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
         ).unwrap())

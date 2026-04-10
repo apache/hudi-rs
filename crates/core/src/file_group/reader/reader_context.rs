@@ -45,6 +45,7 @@ use std::collections::HashMap;
 /// | `readerContext.getInstantRange()`           | `instant_range`                         |
 /// | `readerContext.getRecordContext().format()`  | `base_file_format`                      |
 /// | `readerContext.getHasLogFiles()`            | `has_log_files`                         |
+/// | `readerContext.getRecordContext()`          | `record_context`                        |
 /// | `metaClient.getTableConfig()` (config map)  | `table_config`                          |
 /// | `props` (hoodie reader config overrides)    | `hoodie_reader_config`                  |
 #[derive(Debug, Clone)]
@@ -61,8 +62,16 @@ pub struct ReaderContext {
     pub merge_mode: String,
     pub merge_strategy_id: String,
     pub instant_range: Option<InstantRange>,
-    /// Record key field name (e.g. `_hoodie_record_key`).
-    pub record_key_field: String,
+    /// The engine-specific record context for record-level operations.
+    ///
+    /// Mirrors Java's `HoodieReaderContext.recordContext` field.
+    /// In Java this is a persistent mutable field set at construction and
+    /// shared across all consumers. In Rust it is set once and shared via
+    /// `Arc<ReaderContext>`.
+    ///
+    /// Constructed from `table_config` + `partition_path`, mirroring Java's
+    /// `RecordContext(tableConfig, typeConverter)`.
+    pub record_context: RecordContext,
     pub table_config: HashMap<String, String>,
     pub hoodie_reader_config: HashMap<String, String>,
 }
@@ -72,10 +81,28 @@ impl ReaderContext {
     ///
     /// Mirrors Java's `HoodieReaderContext.getRecordContext()`.
     ///
-    /// In Java, `RecordContext<T>` is engine-specific (Spark, Flink).
-    /// In Rust/Arrow, there is a single concrete `RecordContext`.
-    pub fn get_record_context(&self) -> RecordContext {
-        RecordContext
+    /// In Java, `RecordContext<T>` is a persistent field on the reader context,
+    /// shared across all consumers. In Rust, it is stored as a field and
+    /// returned by reference.
+    pub fn get_record_context(&self) -> &RecordContext {
+        &self.record_context
+    }
+
+    /// Convenience accessor — mirrors Java's
+    /// `readerContext.getRecordContext().recordKeyField`.
+    pub fn record_key_field(&self) -> &str {
+        &self.record_context.record_key_field
+    }
+
+    /// Convenience accessor — mirrors Java's ordering field names used by
+    /// the merge pipeline.
+    pub fn ordering_field_names(&self) -> &[String] {
+        &self.record_context.ordering_field_names
+    }
+
+    /// Convenience accessor for the partition path stored on record_context.
+    pub fn partition_path(&self) -> &str {
+        &self.record_context.partition_path
     }
 
     /// Get the timeline timezone from table config, defaulting to "utc".
@@ -84,6 +111,14 @@ impl ReaderContext {
             .get(HudiTableConfig::TimelineTimezone.as_ref())
             .cloned()
             .unwrap_or_else(|| "utc".to_string())
+    }
+
+    /// Rebuild the stored `record_context` from the current `table_config`
+    /// and the given `partition_path`.
+    ///
+    /// Use this after mutating `table_config` to keep `record_context` in sync.
+    pub fn rebuild_record_context(&mut self, partition_path: String) {
+        self.record_context = RecordContext::new(&self.table_config, partition_path);
     }
 
     /// Create an empty reader context (for legacy/test code).
@@ -101,7 +136,7 @@ impl ReaderContext {
             merge_mode: String::new(),
             merge_strategy_id: String::new(),
             instant_range: None,
-            record_key_field: "_hoodie_record_key".to_string(),
+            record_context: RecordContext::default(),
             table_config: HashMap::new(),
             hoodie_reader_config: HashMap::new(),
         }

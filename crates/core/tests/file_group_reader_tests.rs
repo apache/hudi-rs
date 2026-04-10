@@ -39,6 +39,7 @@
 //!   id=8  Hank      age=45  city=la
 
 use hudi_core::config::HudiConfigs;
+use hudi_core::config::table::HudiTableConfig;
 use hudi_core::error::Result;
 use hudi_core::file_group::reader::input_split::InputSplit;
 use hudi_core::file_group::reader::reader_context::ReaderContext;
@@ -99,14 +100,17 @@ async fn read_file_group(
 
     let mut reader_context = ReaderContext::empty();
     reader_context.latest_commit_time = "99991231235959999".to_string();
-    reader_context.record_key_field = "_hoodie_record_key".to_string();
     reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+    reader_context.table_config.insert(
+        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    reader_context.rebuild_record_context(partition.to_string());
 
     let mut reader = HoodieFileGroupReader::new(
         Arc::new(reader_context),
         storage,
         input_split,
-        vec!["ts".to_string()],
         ReaderParameters::default(),
     );
 

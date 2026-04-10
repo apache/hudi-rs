@@ -1,0 +1,45 @@
+Here is how hudi-internal contruct the record context and inject into the fg reader
+
+  HoodieFileGroupReaderBasedFileFormat.buildReaderWithPartitionValues()     :227
+    │  [Spark scan layer — one readerContext per task]
+    │
+    └─ new SparkFileFormatInternalRowReaderContext(
+           fileGroupBaseFileReader,
+           filters,
+           requiredFilters,
+           storageConf,
+           metaClient.getTableConfig()     ← HoodieTableConfig from .hoodie/hoodie.properties
+       )
+         │
+         └─ SparkFileFormatInternalRowReaderContext.<init>()                  :63
+              └─ extends BaseSparkInternalRowReaderContext(
+                     storageConf,
+                     tableConfig,
+                     new SparkFileFormatInternalRecordContext(tableConfig)    ← RecordContext built here
+                 )
+                   │
+                   ├─ [RecordContext construction path]
+                   │    SparkFileFormatInternalRecordContext.<init>(tableConfig)
+                   │      └─ extends BaseSparkInternalRecordContext(tableConfig)
+                   │           └─ BaseSparkInternalRecordContext.<init>(tableConfig)  :54
+                   │                └─ super(tableConfig, new DefaultJavaTypeConverter())
+                   │                     │
+                   │                     └─ RecordContext.<init>(tableConfig, typeConverter)  :70
+                   │                          │
+                   │                          └─ tableConfig.populateMetaFields()             :72
+                   │                               │
+                   │                               ├─ true  → recordKeyExtractor = metadataKeyExtractor()
+                   │                               │            reads _hoodie_record_key meta field directly
+                   │                               │            getValue(record, schema, RECORD_KEY_METADATA_FIELD)
+                   │                               │
+                   │                               └─ false → recordKeyExtractor = virtualKeyExtractor(
+                   │                                            tableConfig.getRecordKeyFields())
+                   │                                            computes key from user-defined key fields
+                   └─ [ReaderContext construction path]                                                         
+                        BaseSparkInternalRowReaderContext.<init>(storageConf, tableConfig, recordContext) :54   
+                          └─ super(storageConf, tableConfig, Option.empty(), Option.empty(), recordContext)     
+                               │                                                                                
+                               └─ HoodieReaderContext.<init>()                           :98                    
+                                    this.recordContext = recordContext   ← stores the already-built    
+
+We should restrict the construction part of the record context to take the same set of variables  (seems to be tableConfig only) and do the same injection into the fg reader

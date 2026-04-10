@@ -148,6 +148,44 @@ HoodieFileGroupReader.getClosableBufferedRecordIterator() → ClosableIterator<B
 
 # Object Construction
 
+
+  HoodieFileGroupReaderBasedFileFormat.buildReaderWithPartitionValues()     :227
+    │  [Spark scan layer — one readerContext per task]
+    │
+    └─ new SparkFileFormatInternalRowReaderContext(
+           fileGroupBaseFileReader,
+           filters,
+           requiredFilters,
+           storageConf,
+           metaClient.getTableConfig()     ← HoodieTableConfig from .hoodie/hoodie.properties
+       )
+         │
+         └─ SparkFileFormatInternalRowReaderContext.<init>()                  :63
+              └─ extends BaseSparkInternalRowReaderContext(
+                     storageConf,
+                     tableConfig,
+                     new SparkFileFormatInternalRecordContext(tableConfig)    ← RecordContext built here
+                 )
+                   │
+                   ├─ [RecordContext construction path]
+                   │    SparkFileFormatInternalRecordContext.<init>(tableConfig)
+                   │      └─ extends BaseSparkInternalRecordContext(tableConfig)
+                   │           └─ BaseSparkInternalRecordContext.<init>(tableConfig)  :54
+                   │                └─ super(tableConfig, new DefaultJavaTypeConverter())
+                   │                     │
+                   │                     └─ RecordContext.<init>(tableConfig, typeConverter)  :70
+                   │                          │
+                   │                          └─ tableConfig.populateMetaFields()             :72
+                   │                               │
+                   │                               ├─ true  → recordKeyExtractor = metadataKeyExtractor()
+                   │                               │            reads _hoodie_record_key meta field directly
+                   │                               │            getValue(record, schema, RECORD_KEY_METADATA_FIELD)
+                   │                               │
+                   │                               └─ false → recordKeyExtractor = virtualKeyExtractor(
+                   │                                            tableConfig.getRecordKeyFields())
+                   │                                            computes key from user-defined key fields
+
+
 ---
 RecordContext Construction Chain
 
@@ -233,7 +271,7 @@ This lets recordContext stamp partition path onto HoodieRecord objects it constr
 
 ────────────────────────────────────────────────────────────────────────────────
 👤 USER:
-in hoodie file group reader we have reader context which contains recordContext.                                                          
+in hoodie file group reader we have reader context which contains recordContext.
   could you walk through consumers within the fg reader and see what are the set of APIs that actually got consumed
 
 ────────────────────────────────────────────────────────────────────────────────
@@ -752,8 +790,8 @@ RecordContext.constructFinalHoodieRecord(BufferedRecord<T>)   ← egress
 
 ────────────────────────────────────────────────────────────────────────────────
 👤 USER:
-could you tell me how the record type that hoodie file group reader returns and what are the intermediate     
-  format it uses at various stages to store the records extracted from log file and base file. Show me in a     
+could you tell me how the record type that hoodie file group reader returns and what are the intermediate
+  format it uses at various stages to store the records extracted from log file and base file. Show me in a
   call stack tree so I know both the stage and the record type
 
 ────────────────────────────────────────────────────────────────────────────────

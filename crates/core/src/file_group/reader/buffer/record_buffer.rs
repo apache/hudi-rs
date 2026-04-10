@@ -55,9 +55,6 @@ pub struct FileGroupRecordBuffer {
     /// The reader schema.
     pub reader_schema: Option<SchemaRef>,
 
-    /// Names of the ordering (precombine) fields.
-    pub ordering_field_names: Vec<String>,
-
     /// The merge mode string (e.g. "COMMIT_TIME_ORDERING").
     pub record_merge_mode: String,
 
@@ -93,7 +90,6 @@ pub struct FileGroupRecordBuffer {
 
 impl FileGroupRecordBuffer {
     pub fn new(
-        ordering_field_names: Vec<String>,
         record_merge_mode: String,
         buffered_record_merger: Box<dyn BufferedRecordMerger>,
         update_processor: Box<dyn UpdateProcessor>,
@@ -101,7 +97,6 @@ impl FileGroupRecordBuffer {
         Self {
             records: HashMap::new(),
             reader_schema: None,
-            ordering_field_names,
             record_merge_mode,
             buffered_record_merger,
             delete_context: None,

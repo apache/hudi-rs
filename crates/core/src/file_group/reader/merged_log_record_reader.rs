@@ -386,7 +386,6 @@ mod tests {
         let stats = HoodieReadStats::default();
         Box::new(KeyBasedFileGroupRecordBuffer::new(
             ctx,
-            vec![],
             "COMMIT_TIME_ORDERING".to_string(),
             &stats,
         ).unwrap())

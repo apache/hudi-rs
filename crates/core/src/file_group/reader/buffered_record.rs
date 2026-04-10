@@ -29,7 +29,6 @@
 //! the final output.
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
 
 use super::record_context::RecordContext;
 
@@ -225,33 +224,3 @@ impl BufferedRecords {
     }
 }
 
-/// Converts engine records to `BufferedRecord` form for the merge pipeline.
-///
-/// Mirrors Java's `org.apache.hudi.common.table.read.BufferedRecordConverter`.
-///
-/// In hudi-rs, this handles extracting record keys and ordering values
-/// from Arrow RecordBatch rows.
-pub struct BufferedRecordConverter {
-    /// Name of the record key field in the schema.
-    pub record_key_field: String,
-
-    /// Names of the ordering (precombine) fields.
-    pub ordering_field_names: Vec<String>,
-
-    /// The schema used for reading.
-    pub schema: SchemaRef,
-}
-
-impl BufferedRecordConverter {
-    pub fn new(
-        record_key_field: String,
-        ordering_field_names: Vec<String>,
-        schema: SchemaRef,
-    ) -> Self {
-        Self {
-            record_key_field,
-            ordering_field_names,
-            schema,
-        }
-    }
-}

@@ -274,24 +274,22 @@ impl FileGroupReader {
                 String::new(),
             );
 
-            let options = self.hudi_configs.as_options();
-            let ordering_field_names: Vec<String> = options
-                .get("hoodie.table.precombine.field")
-                .or_else(|| options.get("hoodie.table.ordering.fields"))
-                .map(|f| vec![f.clone()])
-                .unwrap_or_default();
-
-            let latest_instant_time = self
+            let _latest_instant_time = self
                 .hudi_configs
                 .try_get(HudiReadConfig::FileGroupEndTimestamp)
                 .map(|v| -> String { v.into() })
                 .unwrap_or_else(|| "99991231235959999".to_string());
 
+            let mut reader_context = ReaderContext::empty();
+            // Populate table_config from hudi_configs so RecordContext can
+            // derive ordering fields and key extraction strategy.
+            reader_context.table_config = self.hudi_configs.as_options();
+            reader_context.rebuild_record_context(String::new());
+
             let mut reader = HoodieFileGroupReader::new(
-                Arc::new(ReaderContext::empty()),
+                Arc::new(reader_context),
                 self.storage.clone(),
                 input_split,
-                ordering_field_names,
                 ReaderParameters::default(),
             );
 
@@ -312,18 +310,14 @@ impl FileGroupReader {
 
         let input_split = InputSplit::new(None, None, log_file_paths, String::new());
 
-        let options = self.hudi_configs.as_options();
-        let ordering_field_names: Vec<String> = options
-            .get("hoodie.table.precombine.field")
-            .or_else(|| options.get("hoodie.table.ordering.fields"))
-            .map(|f| vec![f.clone()])
-            .unwrap_or_default();
+        let mut reader_context = ReaderContext::empty();
+        reader_context.table_config = self.hudi_configs.as_options();
+        reader_context.rebuild_record_context(String::new());
 
         let mut reader = HoodieFileGroupReader::new(
-            Arc::new(ReaderContext::empty()),
+            Arc::new(reader_context),
             self.storage.clone(),
             input_split,
-            ordering_field_names,
             ReaderParameters::default(),
         );
 

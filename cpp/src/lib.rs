@@ -29,8 +29,8 @@ use hudi::file_group::reader::HoodieFileGroupReader as CoreFileGroupReader;
 use hudi::file_group::reader::input_split::InputSplit;
 use hudi::file_group::reader::reader_context::ReaderContext;
 use hudi::file_group::reader::reader_parameters::ReaderParameters;
+use hudi::file_group::reader::record_context::RecordContext;
 use hudi::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
-use hudi::metadata::meta_field::MetaField;
 use hudi::storage::Storage;
 use hudi::timeline::selector::InstantRange;
 use std::collections::HashMap;
@@ -173,7 +173,6 @@ pub struct HoodieFileGroupReader {
     props: HashMap<String, String>,
     reader_parameters: ReaderParameters,
     input_split: InputSplit,
-    ordering_field_names: Vec<String>,
     schema_handler: FileGroupReaderSchemaHandler,
 
     // ── Rust-only ──────────────────────────────────────────────────
@@ -302,14 +301,7 @@ pub fn new_file_group_reader_with_context(
         fgrc.partition_path,
     );
 
-    // ── 5. Extract ordering field names from merged props ───────────
-    let ordering_field_names: Vec<String> = props
-        .get("hoodie.table.precombine.field")
-        .or_else(|| props.get("hoodie.table.ordering.fields"))
-        .map(|f| vec![f.clone()])
-        .unwrap_or_default();
-
-    // ── 6. Convert FFI ReaderContext → core ReaderContext ────────────
+    // ── 5. Convert FFI ReaderContext → core ReaderContext ────────────
     let ffi_rc = fgrc.reader_context;
     let instant_range = ffi_rc.instant_range.map(|ir| {
         let timezone = ffi_rc.table_config
@@ -326,6 +318,13 @@ pub fn new_file_group_reader_with_context(
         let end = if ir.end_instant.is_empty() { None } else { Some(ir.end_instant) };
         InstantRange::new(timezone, start, end, start_inclusive, end_inclusive)
     });
+    // RecordContext is constructed from table_config, matching Java's
+    // RecordContext(tableConfig, typeConverter) pattern. The table_config
+    // carries hoodie.populate.meta.fields, hoodie.table.precombine.field,
+    // and hoodie.table.recordkey.fields — RecordContext derives everything
+    // from these.
+    let partition_path = input_split.partition_path.clone();
+    let record_context = RecordContext::new(&ffi_rc.table_config, partition_path);
     let core_reader_context = Arc::new(ReaderContext {
         table_path: ffi_rc.table_path,
         latest_commit_time: ffi_rc.latest_commit_time,
@@ -339,7 +338,7 @@ pub fn new_file_group_reader_with_context(
         merge_mode: ffi_rc.merge_mode,
         merge_strategy_id: ffi_rc.merge_strategy_id,
         instant_range,
-        record_key_field: MetaField::RecordKey.as_ref().to_string(),
+        record_context,
         table_config: ffi_rc.table_config,
         hoodie_reader_config: ffi_rc.hoodie_reader_config,
     });
@@ -372,7 +371,6 @@ pub fn new_file_group_reader_with_context(
         props,
         reader_parameters,
         input_split,
-        ordering_field_names,
         schema_handler,
         rt,
     }))
@@ -390,7 +388,7 @@ impl HoodieFileGroupReader {
             self.input_split.base_file_path,
             self.input_split.log_file_paths.len(),
             self.reader_context.latest_commit_time,
-            self.ordering_field_names,
+            self.reader_context.ordering_field_names(),
             self.reader_context.merge_mode.as_str(),
         );
 
@@ -398,7 +396,6 @@ impl HoodieFileGroupReader {
             .with_reader_context(self.reader_context.clone())
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
-            .with_ordering_field_names(self.ordering_field_names.clone())
             .with_reader_parameters(self.reader_parameters.clone())
             .with_schema_handler(self.schema_handler.clone())
             .build()

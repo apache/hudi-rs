@@ -39,20 +39,21 @@
 use crate::Result;
 use crate::file_group::log_file::log_block::{LogBlock, LogBlockContent};
 use crate::file_group::reader::buffer::record_buffer::FileGroupRecordBuffer;
-use crate::file_group::reader::buffer::row_extraction::{
-    batch_to_buffered_records, delete_batch_to_buffered_records, extract_record_keys,
-    records_to_batch,
-};
+use crate::file_group::reader::buffer::row_extraction::records_to_batch;
 use crate::file_group::reader::buffer::{BufferType, HoodieFileGroupRecordBuffer};
 use crate::file_group::reader::buffered_record::{BufferedRecord, BufferedRecords, DeleteRecord};
 use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
+use crate::file_group::reader::record_context::RecordContext;
 use crate::file_group::reader::record_merger::BufferedRecordMergerFactory;
 use crate::file_group::reader::update_processor::create_update_processor;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[cfg(test)]
+use crate::config::table::HudiTableConfig;
 
 /// Key-based file group record buffer.
 ///
@@ -89,30 +90,31 @@ pub struct KeyBasedFileGroupRecordBuffer {
     /// Reader context (mirrors Java's readerContext).
     pub reader_context: Arc<ReaderContext>,
 
-    /// Record key field name (e.g. `_hoodie_record_key`).
-    pub record_key_field: String,
+    /// Record context for record-level operations (key extraction, ordering, etc.).
+    /// Mirrors Java's `readerContext.getRecordContext()`.
+    pub record_context: RecordContext,
 }
 
 impl KeyBasedFileGroupRecordBuffer {
     pub fn new(
         reader_context: Arc<ReaderContext>,
-        ordering_field_names: Vec<String>,
         merge_mode: String,
         read_stats: &HoodieReadStats,
     ) -> crate::Result<Self> {
         let merger = BufferedRecordMergerFactory::create(&merge_mode)?;
         let update_processor = create_update_processor(read_stats, false);
-        let record_key_field = reader_context.record_key_field.clone();
+        // Get the shared RecordContext from ReaderContext (mirrors Java's
+        // readerContext.getRecordContext() returning the same instance).
+        let record_context = reader_context.get_record_context().clone();
 
         Ok(Self {
             base: FileGroupRecordBuffer::new(
-                ordering_field_names,
                 merge_mode,
                 merger,
                 update_processor,
             ),
             reader_context,
-            record_key_field,
+            record_context,
         })
     }
 
@@ -124,7 +126,7 @@ impl KeyBasedFileGroupRecordBuffer {
         &mut self,
         base_row: &RecordBatch,
     ) -> Result<bool> {
-        let keys = extract_record_keys(base_row, &self.record_key_field)?;
+        let keys = self.record_context.get_record_keys(base_row)?;
         let key = &keys[0]; // single-row batch
         let log_record = self.base.records.remove(key);
 
@@ -182,11 +184,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 total_rows,
             );
             for batch in record_batches.data_batches {
-                let records = batch_to_buffered_records(
-                    &batch,
-                    &self.record_key_field,
-                    &self.base.ordering_field_names,
-                )?;
+                let records = self.record_context.batch_to_buffered_records(&batch)?;
                 for (key, record) in records {
                     self.process_next_data_record(record, &key)?;
                 }
@@ -224,8 +222,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 merged_record.is_delete(),
             );
             // Mirrors Java: records.put(recordKey, merged.toBinary(readerContext.getRecordContext()))
-            let record_context = self.reader_context.get_record_context();
-            merged_record.to_binary(&record_context);
+            merged_record.to_binary(&self.record_context);
             self.base.records.insert(key.to_string(), merged_record);
         } else {
             log::debug!(
@@ -255,7 +252,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 total_deletes,
             );
             for (batch, _inst) in record_batches.delete_batches {
-                let delete_records = delete_batch_to_buffered_records(&batch)?;
+                let delete_records = self.record_context.delete_batch_to_buffered_records(&batch)?;
                 for (key, _record) in delete_records {
                     let delete_record = DeleteRecord {
                         record_key: key.clone(),
@@ -482,11 +479,16 @@ mod tests {
 
     /// Build a KeyBasedFileGroupRecordBuffer with the given merge mode.
     fn build_key_based_buffer(merge_mode: &str) -> KeyBasedFileGroupRecordBuffer {
-        let ctx = Arc::new(ReaderContext::empty());
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::PrecombineField.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let ctx = Arc::new(ctx);
         let read_stats = HoodieReadStats::default();
         KeyBasedFileGroupRecordBuffer::new(
             ctx,
-            vec!["ts".to_string()],
             merge_mode.to_string(),
             &read_stats,
         )

@@ -121,9 +121,6 @@ pub struct HoodieFileGroupReader {
     /// Describes what to read: base file, log files, partition path.
     input_split: InputSplit,
 
-    /// Ordering field names for merge conflict resolution (precombine fields).
-    ordering_field_names: Vec<String>,
-
     // ── Configuration ──────────────────────────────────────────────────
     /// Reader flags: use_record_position, emit_delete, sort_output, etc.
     reader_parameters: ReaderParameters,
@@ -153,7 +150,6 @@ impl HoodieFileGroupReader {
         reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: InputSplit,
-        ordering_field_names: Vec<String>,
         reader_parameters: ReaderParameters,
     ) -> Self {
         log::debug!(
@@ -162,9 +158,9 @@ impl HoodieFileGroupReader {
             input_split.partition_path,
             input_split.base_file_path.as_deref().unwrap_or("<none>"),
             input_split.log_file_paths.len(),
-            ordering_field_names,
+            reader_context.ordering_field_names(),
             reader_context.latest_commit_time,
-            reader_context.record_key_field,
+            reader_context.record_key_field(),
         );
         for (i, lf) in input_split.log_file_paths.iter().enumerate() {
             log::debug!("  log_file[{i}]: {lf}");
@@ -173,7 +169,6 @@ impl HoodieFileGroupReader {
             reader_context,
             storage,
             input_split,
-            ordering_field_names,
             reader_parameters,
             schema_handler: FileGroupReaderSchemaHandler::new(),
             iterator_mode: IteratorMode::EngineRecord,
@@ -268,7 +263,6 @@ impl HoodieFileGroupReader {
                 self.reader_context.clone(),
                 self.storage.clone(),
                 &self.input_split,
-                self.ordering_field_names.clone(),
                 &self.reader_parameters,
                 &mut self.read_stats,
             )
@@ -368,7 +362,6 @@ pub struct HoodieFileGroupReaderBuilder {
     reader_context: Option<Arc<ReaderContext>>,
     storage: Option<Arc<Storage>>,
     input_split: Option<InputSplit>,
-    ordering_field_names: Vec<String>,
     reader_parameters: ReaderParameters,
     schema_handler: Option<FileGroupReaderSchemaHandler>,
 }
@@ -386,11 +379,6 @@ impl HoodieFileGroupReaderBuilder {
 
     pub fn with_input_split(mut self, input_split: InputSplit) -> Self {
         self.input_split = Some(input_split);
-        self
-    }
-
-    pub fn with_ordering_field_names(mut self, names: Vec<String>) -> Self {
-        self.ordering_field_names = names;
         self
     }
 
@@ -419,7 +407,6 @@ impl HoodieFileGroupReaderBuilder {
             reader_context,
             storage,
             input_split,
-            self.ordering_field_names,
             self.reader_parameters,
         );
 

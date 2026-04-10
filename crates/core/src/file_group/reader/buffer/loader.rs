@@ -63,7 +63,6 @@ pub trait FileGroupRecordBufferLoader: Send + Sync + std::fmt::Debug {
         reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: &InputSplit,
-        ordering_field_names: Vec<String>,
         reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
     ) -> impl std::future::Future<Output = Result<RecordBufferLoadResult>> + Send;
@@ -103,7 +102,6 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: &InputSplit,
-        ordering_field_names: Vec<String>,
         reader_parameters: &ReaderParameters,
         read_stats: &mut HoodieReadStats,
     ) -> Result<RecordBufferLoadResult> {
@@ -128,9 +126,10 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
 
         log::debug!(
             "[DefaultFileGroupRecordBufferLoader] getRecordBuffer: merge_mode={merge_mode} \
-             record_key_field={} ordering_fields={ordering_field_names:?} \
+             record_key_field={} ordering_fields={:?} \
              log_files={} latest_commit_time={}",
-            reader_context.record_key_field,
+            reader_context.record_key_field(),
+            reader_context.ordering_field_names(),
             input_split.log_file_paths.len(),
             reader_context.latest_commit_time,
         );
@@ -138,7 +137,6 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         // STEP: Instantiate buffer (strategy selection)
         let record_buffer = Box::new(KeyBasedFileGroupRecordBuffer::new(
             reader_context.clone(),
-            ordering_field_names,
             merge_mode,
             read_stats,
         )?);
