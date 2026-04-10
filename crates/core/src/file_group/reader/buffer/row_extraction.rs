@@ -163,7 +163,7 @@ mod tests {
         let batch = make_test_batch(3);
         let schema = batch.schema();
         let ctx = RecordContext::default();
-        let records = ctx.batch_to_buffered_records(&batch).unwrap();
+        let records = ctx.batch_to_buffered_records(&batch, None).unwrap();
         let buffered: Vec<BufferedRecord> = records.into_iter().map(|(_, r)| r).collect();
 
         let result = records_to_batch(buffered, schema.clone()).unwrap();

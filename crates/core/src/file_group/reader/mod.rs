@@ -88,7 +88,6 @@ use crate::file_group::reader::iterator_mode::IteratorMode;
 use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
-use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use crate::storage::Storage;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
@@ -124,9 +123,6 @@ pub struct HoodieFileGroupReader {
     // ── Configuration ──────────────────────────────────────────────────
     /// Reader flags: use_record_position, emit_delete, sort_output, etc.
     reader_parameters: ReaderParameters,
-
-    /// Schema management for the read pipeline.
-    schema_handler: FileGroupReaderSchemaHandler,
 
     /// The current iterator mode.
     #[allow(dead_code)]
@@ -170,7 +166,6 @@ impl HoodieFileGroupReader {
             storage,
             input_split,
             reader_parameters,
-            schema_handler: FileGroupReaderSchemaHandler::new(),
             iterator_mode: IteratorMode::EngineRecord,
             record_buffer_loader: DefaultFileGroupRecordBufferLoader::new(),
             read_stats: HoodieReadStats::default(),
@@ -289,10 +284,11 @@ impl HoodieFileGroupReader {
         // non-deterministic, so the first record could be a delete with no
         // data schema).
         if let Some(schema) = self
+            .reader_context
             .schema_handler
             .data_schema
             .as_ref()
-            .or(self.schema_handler.requested_schema.as_ref())
+            .or(self.reader_context.schema_handler.requested_schema.as_ref())
         {
             record_buffer.set_reader_schema(schema.clone());
         }
@@ -363,7 +359,6 @@ pub struct HoodieFileGroupReaderBuilder {
     storage: Option<Arc<Storage>>,
     input_split: Option<InputSplit>,
     reader_parameters: ReaderParameters,
-    schema_handler: Option<FileGroupReaderSchemaHandler>,
 }
 
 impl HoodieFileGroupReaderBuilder {
@@ -387,11 +382,6 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
-    pub fn with_schema_handler(mut self, handler: FileGroupReaderSchemaHandler) -> Self {
-        self.schema_handler = Some(handler);
-        self
-    }
-
     pub fn build(self) -> Result<HoodieFileGroupReader> {
         let reader_context = self
             .reader_context
@@ -403,16 +393,12 @@ impl HoodieFileGroupReaderBuilder {
             .input_split
             .ok_or_else(|| CoreError::ReadFileSliceError("input_split is required".into()))?;
 
-        let mut reader = HoodieFileGroupReader::new(
+        let reader = HoodieFileGroupReader::new(
             reader_context,
             storage,
             input_split,
             self.reader_parameters,
         );
-
-        if let Some(handler) = self.schema_handler {
-            reader.schema_handler = handler;
-        }
 
         Ok(reader)
     }

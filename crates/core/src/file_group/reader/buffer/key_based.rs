@@ -42,6 +42,7 @@ use crate::file_group::reader::buffer::record_buffer::FileGroupRecordBuffer;
 use crate::file_group::reader::buffer::row_extraction::records_to_batch;
 use crate::file_group::reader::buffer::{BufferType, HoodieFileGroupRecordBuffer};
 use crate::file_group::reader::buffered_record::{BufferedRecord, BufferedRecords, DeleteRecord};
+use crate::file_group::reader::delete_context::DeleteContext;
 use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::record_context::RecordContext;
@@ -107,12 +108,22 @@ impl KeyBasedFileGroupRecordBuffer {
         // readerContext.getRecordContext() returning the same instance).
         let record_context = reader_context.get_record_context().clone();
 
+        // Create DeleteContext from table properties (Phase 1).
+        // Mirrors Java's `new DeleteContext(properties, tableSchema)` in
+        // FileGroupReaderSchemaHandler, then enriched with reader schema
+        // in FileGroupRecordBuffer. Here we create from props only;
+        // `set_reader_schema` will enrich with schema info later.
+        let delete_context = DeleteContext::from_props(&reader_context.table_config);
+
+        let mut base = FileGroupRecordBuffer::new(
+            merge_mode,
+            merger,
+            update_processor,
+        );
+        base.delete_context = Some(delete_context);
+
         Ok(Self {
-            base: FileGroupRecordBuffer::new(
-                merge_mode,
-                merger,
-                update_processor,
-            ),
+            base,
             reader_context,
             record_context,
         })
@@ -184,7 +195,10 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 total_rows,
             );
             for batch in record_batches.data_batches {
-                let records = self.record_context.batch_to_buffered_records(&batch)?;
+                let records = self.record_context.batch_to_buffered_records(
+                    &batch,
+                    self.base.delete_context.as_ref(),
+                )?;
                 for (key, record) in records {
                     self.process_next_data_record(record, &key)?;
                 }
@@ -322,7 +336,13 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     }
 
     fn set_reader_schema(&mut self, schema: SchemaRef) {
-        self.base.reader_schema = Some(schema);
+        self.base.reader_schema = Some(schema.clone());
+        // Phase 2: Enrich DeleteContext with the reader schema.
+        // Mirrors Java's `deleteContext.withReaderSchema(this.readerSchema)`
+        // in FileGroupRecordBuffer constructor.
+        if let Some(ctx) = self.base.delete_context.take() {
+            self.base.delete_context = Some(ctx.with_reader_schema(schema));
+        }
     }
 
     fn set_base_file_iterator(&mut self, batches: Vec<RecordBatch>) {
@@ -1174,5 +1194,151 @@ mod tests {
         assert_eq!(result.num_rows(), 2, "A=updated, B=deleted, C=base");
         assert_eq!(records[0], ("A".to_string(), 2, 20)); // log wins
         assert_eq!(records[1], ("C".to_string(), 9, 99)); // base passthrough
+    }
+
+    // =========================================================================
+    // Exact ports from Java TestKeyBasedFileGroupRecordBuffer
+    // (with custom delete marker support)
+    // =========================================================================
+
+    /// Build a KeyBasedFileGroupRecordBuffer with a custom delete marker.
+    /// Mirrors Java's `buildKeyBasedFileGroupRecordBuffer(..., deleteMarkerKeyValue)`.
+    fn build_key_based_buffer_with_delete_marker(
+        merge_mode: &str,
+        delete_key: &str,
+        delete_marker_value: &str,
+    ) -> KeyBasedFileGroupRecordBuffer {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::PrecombineField.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.datasource.write.payload.delete.field".to_string(),
+            delete_key.to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.datasource.write.payload.delete.marker".to_string(),
+            delete_marker_value.to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let ctx = Arc::new(ctx);
+        let read_stats = HoodieReadStats::default();
+        KeyBasedFileGroupRecordBuffer::new(ctx, merge_mode.to_string(), &read_stats).unwrap()
+    }
+
+    /// Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrdering
+    ///
+    /// COMMIT_TIME_ORDERING with custom delete marker (counter=3).
+    /// Last writer always wins. Record with counter=3 detected as delete.
+    /// Expected: 2 output rows (key=3 deleted by custom marker).
+    #[test]
+    fn test_java_read_with_commit_time_ordering() {
+        let mut buffer = build_key_based_buffer_with_delete_marker(
+            "COMMIT_TIME_ORDERING",
+            "counter",
+            "3",
+        );
+
+        // DataBlock1: testRecord1UpdateWithSameTime, testRecord2Update, testRecord2EarlierUpdate
+        let block1 = create_test_batch(&[
+            ("1", 2, 1), // record1UpdateWithSameTime
+            ("2", 1, 2), // record2Update
+            ("2", 1, 0), // record2EarlierUpdate (overwrites in commit-time)
+        ]);
+        buffer
+            .process_data_block(&mut make_data_block(block1, "instant1"))
+            .unwrap();
+
+        // DataBlock2: testRecord2EarlierUpdate, testRecord3Update, testRecord3DeleteByFieldValue
+        let block2 = create_test_batch(&[
+            ("2", 1, 0), // record2EarlierUpdate (same value, overwrites)
+            ("3", 1, 2), // record3Update
+            ("3", 3, 1), // record3DeleteByFieldValue (counter=3 → delete, overwrites)
+        ]);
+        buffer
+            .process_data_block(&mut make_data_block(block2, "instant2"))
+            .unwrap();
+
+        let base = create_test_batch(&[("1", 1, 1), ("2", 1, 1), ("3", 1, 1)]);
+        buffer.set_base_file_iterator(vec![base]);
+
+        let result = Box::new(buffer).merge_and_collect().unwrap();
+        let records = extract_records(&result);
+
+        // Java: assertEquals(Arrays.asList(testRecord1UpdateWithSameTime,
+        //       testRecord2EarlierUpdate), actualRecords);
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(records[0], ("1".to_string(), 2, 1)); // record1UpdateWithSameTime
+        assert_eq!(records[1], ("2".to_string(), 1, 0)); // record2EarlierUpdate (last write)
+    }
+
+    /// Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrderingWithRecords
+    ///
+    /// COMMIT_TIME_ORDERING with pre-built records including deletes.
+    /// In commit-time mode, log always wins over base.
+    /// Expected: 5 output rows (keys 5,6 deleted).
+    #[test]
+    fn test_java_read_with_commit_time_ordering_with_records() {
+        let mut buffer = build_key_based_buffer_with_delete_marker(
+            "COMMIT_TIME_ORDERING",
+            "counter",
+            "3",
+        );
+
+        // Data records (log updates)
+        let updates = create_test_batch(&[
+            ("1", 2, 1), // record1UpdateWithSameTime
+            ("2", 1, 2), // record2Update
+            ("3", 1, 2), // record3Update
+            ("4", 1, 0), // record4EarlierUpdate
+            ("7", 1, 5), // record7 (log-only insert)
+        ]);
+        buffer
+            .process_data_block(&mut make_data_block(updates, "instant2"))
+            .unwrap();
+
+        // Delete records with default ordering (0) for commit-time mode
+        // In Java: convertToHoodieRecordsListForDeletes(..., true) → ordering=0 (default)
+        let delete_5 = DeleteRecord {
+            record_key: "5".to_string(),
+            partition_path: String::new(),
+            ordering_value: Some(OrderingValue::Long(0)),
+        };
+        buffer.process_next_deleted_record(delete_5, "5");
+
+        let delete_6 = DeleteRecord {
+            record_key: "6".to_string(),
+            partition_path: String::new(),
+            ordering_value: Some(OrderingValue::Long(0)),
+        };
+        buffer.process_next_deleted_record(delete_6, "6");
+
+        // Base file: testRecord1-6
+        let base = create_test_batch(&[
+            ("1", 1, 1),
+            ("2", 1, 1),
+            ("3", 1, 1),
+            ("4", 2, 1), // testRecord4 (counter=2)
+            ("5", 1, 1),
+            ("6", 1, 5), // testRecord6 (ts=5)
+        ]);
+        buffer.set_base_file_iterator(vec![base]);
+
+        let result = Box::new(buffer).merge_and_collect().unwrap();
+        let records = extract_records(&result);
+
+        // Commit-time: log always wins over base
+        // key=1-4: log data wins → updated values
+        // key=5,6: log delete wins → DELETED
+        // key=7: log-only → INSERT
+        // Java: assertEquals(Stream.of(testRecord1UpdateWithSameTime, testRecord2Update,
+        //       testRecord3Update, testRecord4EarlierUpdate, testRecord7), actualRecords);
+        assert_eq!(result.num_rows(), 5);
+        assert_eq!(records[0], ("1".to_string(), 2, 1));
+        assert_eq!(records[1], ("2".to_string(), 1, 2));
+        assert_eq!(records[2], ("3".to_string(), 1, 2));
+        assert_eq!(records[3], ("4".to_string(), 1, 0));
+        assert_eq!(records[4], ("7".to_string(), 1, 5));
     }
 }

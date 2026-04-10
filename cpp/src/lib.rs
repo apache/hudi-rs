@@ -173,7 +173,7 @@ pub struct HoodieFileGroupReader {
     props: HashMap<String, String>,
     reader_parameters: ReaderParameters,
     input_split: InputSplit,
-    schema_handler: FileGroupReaderSchemaHandler,
+    partition_path_fields: Option<Vec<String>>,
 
     // ── Rust-only ──────────────────────────────────────────────────
     rt: tokio::runtime::Runtime,
@@ -325,25 +325,24 @@ pub fn new_file_group_reader_with_context(
     // from these.
     let partition_path = input_split.partition_path.clone();
     let record_context = RecordContext::new(&ffi_rc.table_config, partition_path);
-    let core_reader_context = Arc::new(ReaderContext {
-        table_path: ffi_rc.table_path,
-        latest_commit_time: ffi_rc.latest_commit_time,
-        base_file_format: ffi_rc.base_file_format,
-        has_log_files: ffi_rc.has_log_files,
-        has_bootstrap_base_file: ffi_rc.has_bootstrap_base_file,
-        needs_bootstrap_merge: ffi_rc.needs_bootstrap_merge,
-        should_merge_use_record_position: ffi_rc.should_merge_use_record_position,
-        enable_logical_timestamp_field_repair: ffi_rc.enable_logical_timestamp_field_repair,
-        iterator_mode: ffi_rc.iterator_mode,
-        merge_mode: ffi_rc.merge_mode,
-        merge_strategy_id: ffi_rc.merge_strategy_id,
-        instant_range,
-        record_context,
-        table_config: ffi_rc.table_config,
-        hoodie_reader_config: ffi_rc.hoodie_reader_config,
-    });
+
+    // ── Extract partition path fields from table config ─────────────
+    // Mirrors Java's: tableConfig.getPartitionFields() which reads
+    // "hoodie.table.partition.fields", splits on ",", and strips
+    // custom key-generator partition type suffixes (split on ":").
+    // e.g. "date:TIMESTAMP,region:SIMPLE" → ["date", "region"]
+    let partition_path_fields: Option<Vec<String>> = ffi_rc
+        .table_config
+        .get("hoodie.table.partition.fields")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().split(':').next().unwrap_or("").to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
 
     // ── 6. Build schema handler from Avro schemas passed via FFI ──
+    // Set on ReaderContext to match Java's HoodieReaderContext.schemaHandler.
     let schema_handler = {
         let mut handler = FileGroupReaderSchemaHandler::new();
         if let Some(hs) = fgrc.data_schema.as_ref() {
@@ -359,6 +358,25 @@ pub fn new_file_group_reader_with_context(
         handler
     };
 
+    let core_reader_context = Arc::new(ReaderContext {
+        table_path: ffi_rc.table_path,
+        latest_commit_time: ffi_rc.latest_commit_time,
+        base_file_format: ffi_rc.base_file_format,
+        has_log_files: ffi_rc.has_log_files,
+        has_bootstrap_base_file: ffi_rc.has_bootstrap_base_file,
+        needs_bootstrap_merge: ffi_rc.needs_bootstrap_merge,
+        should_merge_use_record_position: ffi_rc.should_merge_use_record_position,
+        enable_logical_timestamp_field_repair: ffi_rc.enable_logical_timestamp_field_repair,
+        iterator_mode: ffi_rc.iterator_mode,
+        merge_mode: ffi_rc.merge_mode,
+        merge_strategy_id: ffi_rc.merge_strategy_id,
+        instant_range,
+        record_context,
+        schema_handler,
+        table_config: ffi_rc.table_config,
+        hoodie_reader_config: ffi_rc.hoodie_reader_config,
+    });
+
     // ── 7. Build tokio runtime ──────────────────────────────────────
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -371,7 +389,7 @@ pub fn new_file_group_reader_with_context(
         props,
         reader_parameters,
         input_split,
-        schema_handler,
+        partition_path_fields,
         rt,
     }))
 }
@@ -397,7 +415,6 @@ impl HoodieFileGroupReader {
             .with_storage(self.storage.clone())
             .with_input_split(self.input_split.clone())
             .with_reader_parameters(self.reader_parameters.clone())
-            .with_schema_handler(self.schema_handler.clone())
             .build()
             .map_err(|e| format!("Failed to build file group reader: {e}"))?;
 

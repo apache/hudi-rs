@@ -28,6 +28,7 @@
 use crate::config::table::HudiTableConfig;
 use crate::timeline::selector::InstantRange;
 use super::record_context::RecordContext;
+use super::schema_handler::FileGroupReaderSchemaHandler;
 use std::collections::HashMap;
 
 /// Reader context that flows through the file group reader call stack.
@@ -46,6 +47,7 @@ use std::collections::HashMap;
 /// | `readerContext.getRecordContext().format()`  | `base_file_format`                      |
 /// | `readerContext.getHasLogFiles()`            | `has_log_files`                         |
 /// | `readerContext.getRecordContext()`          | `record_context`                        |
+/// | `readerContext.getSchemaHandler()`          | `schema_handler`                        |
 /// | `metaClient.getTableConfig()` (config map)  | `table_config`                          |
 /// | `props` (hoodie reader config overrides)    | `hoodie_reader_config`                  |
 #[derive(Debug, Clone)]
@@ -72,6 +74,11 @@ pub struct ReaderContext {
     /// Constructed from `table_config` + `partition_path`, mirroring Java's
     /// `RecordContext(tableConfig, typeConverter)`.
     pub record_context: RecordContext,
+    /// Schema management for the read pipeline.
+    ///
+    /// Mirrors Java's `HoodieReaderContext.schemaHandler` field
+    /// (`FileGroupReaderSchemaHandler<T>`).
+    pub schema_handler: FileGroupReaderSchemaHandler,
     pub table_config: HashMap<String, String>,
     pub hoodie_reader_config: HashMap<String, String>,
 }
@@ -137,6 +144,7 @@ impl ReaderContext {
             merge_strategy_id: String::new(),
             instant_range: None,
             record_context: RecordContext::default(),
+            schema_handler: FileGroupReaderSchemaHandler::new(),
             table_config: HashMap::new(),
             hoodie_reader_config: HashMap::new(),
         }

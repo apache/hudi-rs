@@ -31,6 +31,7 @@ use crate::Result;
 use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::reader::buffered_record::{BufferedRecord, OrderingValue};
+use crate::file_group::reader::delete_context::DeleteContext;
 use crate::metadata::meta_field::MetaField;
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_ipc::reader::StreamReader;
@@ -231,18 +232,21 @@ impl RecordContext {
     /// Convert a multi-row RecordBatch into a Vec of (key, BufferedRecord) pairs.
     ///
     /// Each row becomes an individual `BufferedRecord` with a single-row `RecordBatch`
-    /// as its data payload. Combines `get_record_keys` + `get_ordering_values`.
+    /// as its data payload. Combines `get_record_keys` + `get_ordering_values` +
+    /// `is_delete_record` per row.
     ///
-    /// Mirrors the Java pattern:
+    /// Mirrors the Java pattern in `KeyBasedFileGroupRecordBuffer.processDataBlock()`:
     /// ```text
     /// for each record in dataBlock.getEngineRecordIterator():
     ///     key = recordContext.getRecordKey(record, schema)
     ///     ordering = recordContext.getOrderingValue(record, schema, orderingFields)
-    ///     buffered = BufferedRecords.fromEngineRecord(record, key, ordering, ...)
+    ///     isDelete = recordContext.isDeleteRecord(record, deleteContext)
+    ///     buffered = BufferedRecords.fromEngineRecord(record, key, ordering, isDelete)
     /// ```
     pub fn batch_to_buffered_records(
         &self,
         batch: &RecordBatch,
+        delete_context: Option<&DeleteContext>,
     ) -> Result<Vec<(String, BufferedRecord)>> {
         if batch.num_rows() == 0 {
             return Ok(Vec::new());
@@ -253,12 +257,18 @@ impl RecordContext {
         let mut records = Vec::with_capacity(batch.num_rows());
 
         for (row_idx, key) in keys.into_iter().enumerate() {
-            let row_batch = slice_row(batch, row_idx);
             let ordering_value = ordering_values
                 .as_ref()
                 .and_then(|vals| vals.get(row_idx).cloned())
                 .flatten();
-            let record = BufferedRecord::new_data(key.clone(), row_batch, ordering_value);
+            // Mirrors Java: boolean isDelete = recordContext.isDeleteRecord(nextRecord, deleteContext)
+            let is_delete = self.is_delete_record(batch, row_idx, delete_context);
+            let record = if is_delete {
+                BufferedRecord::new_delete(key.clone(), ordering_value)
+            } else {
+                let row_batch = slice_row(batch, row_idx);
+                BufferedRecord::new_data(key.clone(), row_batch, ordering_value)
+            };
             records.push((key, record));
         }
 
@@ -309,15 +319,42 @@ impl RecordContext {
     ///
     /// Mirrors Java's `RecordContext.isDeleteRecord(T record, DeleteContext deleteContext)`.
     ///
-    /// Checks (in order):
-    /// 1. `_hoodie_is_deleted` field is true (built-in delete marker)
-    /// 2. `_hoodie_operation` field is DELETE or UPDATE_BEFORE
+    /// Checks (in order, matching Java):
+    /// 1. Built-in: `_hoodie_is_deleted` field is true
+    /// 2. Operation: `_hoodie_operation` field is DELETE or UPDATE_BEFORE
+    /// 3. Custom: user-configured delete marker field matches configured value
     ///
-    /// Returns false if the batch has no delete markers.
-    pub fn is_delete_record(&self, batch: &RecordBatch, row_idx: usize) -> bool {
-        let schema = batch.schema();
+    /// When `delete_context` is `Some`, uses pre-computed field positions and
+    /// custom delete marker config from the context. When `None`, falls back
+    /// to inline schema lookups (no custom marker support).
+    pub fn is_delete_record(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        delete_context: Option<&DeleteContext>,
+    ) -> bool {
+        self.is_built_in_delete_record(batch, row_idx, delete_context)
+            || self.is_delete_hoodie_operation(batch, row_idx, delete_context)
+            || self.is_custom_delete_record(batch, row_idx, delete_context)
+    }
 
-        // Check _hoodie_is_deleted field
+    /// Check 1: Built-in `_hoodie_is_deleted` field.
+    ///
+    /// Mirrors Java's `RecordContext.isBuiltInDeleteRecord(T, DeleteContext)`.
+    fn is_built_in_delete_record(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        delete_context: Option<&DeleteContext>,
+    ) -> bool {
+        // Fast path: if DeleteContext says the field doesn't exist, skip
+        if let Some(ctx) = delete_context {
+            if !ctx.has_built_in_delete_field {
+                return false;
+            }
+        }
+
+        let schema = batch.schema();
         if let Some((idx, _)) = schema.column_with_name("_hoodie_is_deleted") {
             if let Some(arr) = batch
                 .column(idx)
@@ -329,23 +366,93 @@ impl RecordContext {
                 }
             }
         }
+        false
+    }
 
-        // Check _hoodie_operation field for DELETE or UPDATE_BEFORE
-        if let Some((idx, _)) = schema.column_with_name("_hoodie_operation") {
-            if let Some(arr) = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-            {
-                if !arr.is_null(row_idx) {
-                    let op = arr.value(row_idx);
-                    if op == "DELETE" || op == "UPDATE_BEFORE" {
-                        return true;
-                    }
+    /// Check 2: `_hoodie_operation` field is DELETE or UPDATE_BEFORE.
+    ///
+    /// Mirrors Java's `RecordContext.isDeleteHoodieOperation(T, DeleteContext)`.
+    fn is_delete_hoodie_operation(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        delete_context: Option<&DeleteContext>,
+    ) -> bool {
+        // Use pre-computed position from DeleteContext if available
+        let col_idx = if let Some(ctx) = delete_context {
+            match ctx.hoodie_operation_pos {
+                Some(pos) => pos,
+                None => return false, // field not in schema
+            }
+        } else {
+            // Fallback: inline schema lookup
+            match batch.schema().column_with_name("_hoodie_operation") {
+                Some((idx, _)) => idx,
+                None => return false,
+            }
+        };
+
+        if let Some(arr) = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+        {
+            if !arr.is_null(row_idx) {
+                let op = arr.value(row_idx);
+                if op == "DELETE" || op == "UPDATE_BEFORE" {
+                    return true;
                 }
             }
         }
+        false
+    }
 
+    /// Check 3: Custom delete marker field matches configured value.
+    ///
+    /// Mirrors Java's `RecordContext.isCustomDeleteRecord(T, DeleteContext)`.
+    /// Only applies when DeleteContext has a custom_delete_marker configured.
+    fn is_custom_delete_record(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        delete_context: Option<&DeleteContext>,
+    ) -> bool {
+        let (key_field, marker_value) = match delete_context {
+            Some(ctx) => match &ctx.custom_delete_marker {
+                Some((k, v)) => (k.as_str(), v.as_str()),
+                None => return false,
+            },
+            None => return false, // No custom marker without DeleteContext
+        };
+
+        let schema = batch.schema();
+        if let Some((idx, _)) = schema.column_with_name(key_field) {
+            let col = batch.column(idx);
+            // String column
+            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                if !arr.is_null(row_idx) && arr.value(row_idx) == marker_value {
+                    return true;
+                }
+            }
+            // Int32 column — compare stringified value against marker
+            if let Some(arr) = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+            {
+                if !arr.is_null(row_idx) && arr.value(row_idx).to_string() == marker_value {
+                    return true;
+                }
+            }
+            // Int64 column — compare stringified value against marker
+            if let Some(arr) = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+            {
+                if !arr.is_null(row_idx) && arr.value(row_idx).to_string() == marker_value {
+                    return true;
+                }
+            }
+        }
         false
     }
 
@@ -413,6 +520,7 @@ impl RecordContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_group::reader::delete_context::DeleteContext;
     use arrow_array::{BooleanArray, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -561,7 +669,7 @@ mod tests {
     fn test_batch_to_buffered_records() {
         let ctx = make_record_context();
         let batch = make_keyed_batch(3);
-        let records = ctx.batch_to_buffered_records(&batch).unwrap();
+        let records = ctx.batch_to_buffered_records(&batch, None).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].0, "key_0");
         assert_eq!(records[1].0, "key_1");
@@ -579,7 +687,7 @@ mod tests {
     fn test_batch_to_buffered_records_empty() {
         let ctx = make_record_context();
         let batch = make_keyed_batch(0);
-        let records = ctx.batch_to_buffered_records(&batch).unwrap();
+        let records = ctx.batch_to_buffered_records(&batch, None).unwrap();
         assert!(records.is_empty());
     }
 
@@ -599,8 +707,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(ctx.is_delete_record(&batch, 0));
-        assert!(!ctx.is_delete_record(&batch, 1));
+        assert!(ctx.is_delete_record(&batch, 0, None));
+        assert!(!ctx.is_delete_record(&batch, 1, None));
     }
 
     #[test]
@@ -623,9 +731,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(ctx.is_delete_record(&batch, 0));
-        assert!(ctx.is_delete_record(&batch, 1));
-        assert!(!ctx.is_delete_record(&batch, 2));
+        assert!(ctx.is_delete_record(&batch, 0, None));
+        assert!(ctx.is_delete_record(&batch, 1, None));
+        assert!(!ctx.is_delete_record(&batch, 2, None));
     }
 
     #[test]
@@ -644,7 +752,34 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!ctx.is_delete_record(&batch, 0));
+        assert!(!ctx.is_delete_record(&batch, 0, None));
+    }
+
+    #[test]
+    fn test_is_custom_delete_record_int32_marker() {
+        let ctx = RecordContext::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("counter", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["k1", "k2"])),
+                Arc::new(arrow_array::Int32Array::from(vec![3, 1])),
+            ],
+        )
+        .unwrap();
+        let delete_ctx = DeleteContext {
+            custom_delete_marker: Some(("counter".to_string(), "3".to_string())),
+            has_built_in_delete_field: false,
+            hoodie_operation_pos: None,
+            reader_schema: schema,
+        };
+        // counter=3 matches marker → delete
+        assert!(ctx.is_delete_record(&batch, 0, Some(&delete_ctx)));
+        // counter=1 does not match → not delete
+        assert!(!ctx.is_delete_record(&batch, 1, Some(&delete_ctx)));
     }
 
     #[test]
