@@ -17,9 +17,9 @@
  * under the License.
  */
 use crate::Result;
-use crate::config::HudiConfigs;
 use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
 use crate::file_group::log_file::reader::LogFileReader;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
 use crate::storage::Storage;
@@ -125,14 +125,14 @@ impl CollectedBlocks {
 
 #[derive(Debug)]
 pub struct LogFileScanner {
-    hudi_configs: Arc<HudiConfigs>,
+    reader_context: Arc<ReaderContext>,
     storage: Arc<Storage>,
 }
 
 impl LogFileScanner {
-    pub fn new(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+    pub fn new(reader_context: Arc<ReaderContext>, storage: Arc<Storage>) -> Self {
         Self {
-            hudi_configs,
+            reader_context,
             storage,
         }
     }
@@ -148,7 +148,7 @@ impl LogFileScanner {
 
         for path in relative_paths {
             let mut reader =
-                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path).await?;
+                LogFileReader::new(self.reader_context.clone(), self.storage.clone(), &path).await?;
             let blocks = reader.read_all_blocks(instant_range)?;
 
             // Collect rollback targets from command blocks
@@ -456,8 +456,7 @@ mod tests {
 
         let dir_url = parse_uri(metadata_dir.to_str().unwrap())?;
         let storage = Storage::new_with_base_url(dir_url)?;
-        let hudi_configs = Arc::new(HudiConfigs::empty());
-        let scanner = LogFileScanner::new(hudi_configs, Arc::clone(&storage));
+        let scanner = LogFileScanner::new(Arc::new(ReaderContext::empty()), Arc::clone(&storage));
         let instant_range = InstantRange::up_to("99991231235959999", "utc");
 
         // Scan each log file individually and validate record counts

@@ -281,6 +281,15 @@ impl Storage {
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let schema = builder.schema().clone();
+
+        let all_cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        log::debug!(
+            "Parquet full read (non-streaming) for '{relative_path}': \
+             reading all {n} cols: [{cols}]",
+            n = all_cols.len(),
+            cols = all_cols.join(", "),
+        );
+
         let mut stream = builder.build()?;
         let mut batches = Vec::new();
 
@@ -317,12 +326,37 @@ impl Storage {
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
 
         if let Some(batch_size) = options.batch_size {
+            log::debug!(
+                "Parquet reader: batch_size={batch_size} for '{relative_path}'"
+            );
             builder = builder.with_batch_size(batch_size);
         }
 
         // Handle projection: convert column names to indices using builder's schema
         if let Some(ref column_names) = options.projection {
             let arrow_schema = builder.schema();
+            let file_cols: Vec<&str> = arrow_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            let pruned_cols: Vec<&str> = file_cols
+                .iter()
+                .copied()
+                .filter(|&c| !column_names.iter().any(|n| n == c))
+                .collect();
+            log::debug!(
+                "Parquet column projection for '{relative_path}': \
+                 file schema [{file_schema}] ({n_file} cols), \
+                 projecting [{proj}] ({n_proj} cols), \
+                 pruning [{pruned}] ({n_pruned} cols)",
+                file_schema = file_cols.join(", "),
+                n_file = file_cols.len(),
+                proj = column_names.join(", "),
+                n_proj = column_names.len(),
+                pruned = pruned_cols.join(", "),
+                n_pruned = pruned_cols.len(),
+            );
             let projection: Vec<usize> = column_names
                 .iter()
                 .map(|name| {
@@ -345,6 +379,19 @@ impl Storage {
                 projection.iter().copied(),
             );
             builder = builder.with_projection(projection_mask);
+        } else {
+            let arrow_schema = builder.schema();
+            let all_cols: Vec<&str> = arrow_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            log::debug!(
+                "Parquet column projection for '{relative_path}': no projection, \
+                 reading all {n} cols: [{cols}]",
+                n = all_cols.len(),
+                cols = all_cols.join(", "),
+            );
         }
 
         let schema = builder.schema().clone();

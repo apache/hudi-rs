@@ -451,8 +451,10 @@ mod tests {
         // Set up scanner
         let dir_url = parse_uri(metadata_dir.to_str().unwrap())?;
         let storage = Storage::new_with_base_url(dir_url)?;
-        let hudi_configs = Arc::new(HudiConfigs::empty());
-        let scanner = LogFileScanner::new(hudi_configs, Arc::clone(&storage));
+        let scanner = LogFileScanner::new(
+            Arc::new(crate::file_group::reader::reader_context::ReaderContext::empty()),
+            Arc::clone(&storage),
+        );
         let instant_range = InstantRange::up_to("99991231235959999", "utc");
 
         // Scan all log files

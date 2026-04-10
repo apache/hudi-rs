@@ -29,7 +29,6 @@ use datafusion::error::DataFusionError;
 use hudi::error::CoreError;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
-use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
 use hudi::table::Table;
 use hudi::table::builder::TableBuilder;
@@ -70,91 +69,6 @@ impl From<PythonError> for PyErr {
     }
 }
 
-#[cfg(not(tarpaulin_include))]
-#[derive(Clone, Debug)]
-#[pyclass]
-pub struct HudiFileGroupReader {
-    inner: FileGroupReader,
-}
-
-#[cfg(not(tarpaulin_include))]
-#[pymethods]
-impl HudiFileGroupReader {
-    #[new]
-    #[pyo3(signature = (base_uri, options=None))]
-    fn new_with_options(
-        py: Python,
-        base_uri: &str,
-        options: Option<HashMap<String, String>>,
-    ) -> PyResult<Self> {
-        let inner = py.detach(|| {
-            rt().block_on(FileGroupReader::new_with_options(
-                base_uri,
-                options.unwrap_or_default(),
-            ))
-            .map_err(PythonError::from)
-        })?;
-        Ok(HudiFileGroupReader { inner })
-    }
-
-    fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &str,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        py.detach(|| {
-            rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
-                .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-
-    fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<Py<PyAny>> {
-        let mut file_group = FileGroup::new_with_base_file_name(
-            &file_slice.base_file_name,
-            &file_slice.partition_path,
-        )
-        .map_err(PythonError::from)?;
-        let log_file_names = &file_slice.log_file_names;
-        file_group
-            .add_log_files_from_names(log_file_names)
-            .map_err(PythonError::from)?;
-        let (_, file_slice) = file_group
-            .file_slices
-            .iter()
-            .next()
-            .ok_or_else(|| {
-                CoreError::FileGroup(format!(
-                    "Failed to get file slice from file group: {file_group:?}"
-                ))
-            })
-            .map_err(PythonError::from)?;
-        py.detach(|| {
-            rt().block_on(self.inner.read_file_slice(file_slice))
-                .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-
-    fn read_file_slice_from_paths(
-        &self,
-        base_file_path: &str,
-        log_file_paths: Vec<String>,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        py.detach(|| {
-            rt().block_on(
-                self.inner
-                    .read_file_slice_from_paths(base_file_path, log_file_paths),
-            )
-            .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-}
 
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
@@ -221,8 +135,12 @@ impl From<&FileSlice> for HudiFileSlice {
         let file_id = f.file_id().to_string();
         let partition_path = f.partition_path.to_string();
         let creation_instant_time = f.creation_instant_time().to_string();
-        let base_file_name = f.base_file.file_name();
-        let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
+        let base_file_name = f.base_file.as_ref().map_or(String::new(), |bf| bf.file_name());
+        let file_metadata = f
+            .base_file
+            .as_ref()
+            .and_then(|bf| bf.file_metadata.clone())
+            .unwrap_or_default();
         let base_file_size = file_metadata.size;
         let base_file_byte_size = file_metadata.byte_size;
         let log_file_names = f.log_files.iter().map(|l| l.file_name()).collect();
@@ -477,18 +395,6 @@ impl HudiTable {
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(HudiFileSlice::from).collect())
         })
-    }
-
-    #[pyo3(signature = (options=None))]
-    fn create_file_group_reader_with_options(
-        &self,
-        options: Option<HashMap<String, String>>,
-    ) -> PyResult<HudiFileGroupReader> {
-        let fg_reader = self
-            .inner
-            .create_file_group_reader_with_options(options.unwrap_or_default())
-            .map_err(PythonError::from)?;
-        Ok(HudiFileGroupReader { inner: fg_reader })
     }
 
     #[pyo3(signature = (filters=None))]

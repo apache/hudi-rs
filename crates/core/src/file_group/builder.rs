@@ -214,8 +214,6 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
         }
 
         // Build FileGroups from parsed files
-        // Note: Currently only supports file groups with base files.
-        // TODO: Support file groups with only log files (P1 task)
         let mut file_groups = Vec::new();
         for (file_id, base_files) in file_id_to_base_files {
             let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
@@ -226,6 +224,14 @@ pub fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 fg.add_log_files(log_files)?;
             }
 
+            file_groups.push(fg);
+        }
+
+        // Build FileGroups for log-only file groups (no base files).
+        // Remaining entries in file_id_to_log_files are file_ids NOT in file_id_to_base_files.
+        for (file_id, log_files) in file_id_to_log_files {
+            let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
+            fg.add_log_files(log_files)?;
             file_groups.push(fg);
         }
 
@@ -502,7 +508,7 @@ mod tests {
             assert_eq!(file_group.file_slices.len(), 1);
             let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
             assert_eq!(
-                file_slice.base_file.file_name(),
+                file_slice.base_file.as_ref().unwrap().file_name(),
                 "file-id-0_0-7-24_20240418173200000.parquet"
             );
             assert_eq!(file_slice.log_files.len(), 2);
@@ -586,7 +592,7 @@ mod tests {
             let file_group = file_groups.iter().next().unwrap();
             let file_slice = file_group.file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -976,7 +982,7 @@ mod tests {
             // Verify completion timestamp was set
             let file_slice = file_groups[0].file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -1115,7 +1121,7 @@ mod tests {
         }
 
         #[test]
-        fn test_log_files_without_base_file_not_included() {
+        fn test_log_files_without_base_file_creates_log_only_group() {
             let mut records = HashMap::new();
             // Only log files, no base file
             let (key, record) = create_files_record(
@@ -1135,8 +1141,17 @@ mod tests {
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
-            // Log-only file groups are not yet supported (see P1 task)
-            assert!(file_groups_map.is_empty());
+            // Log-only file groups are now supported
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+            let fg = &file_groups[0];
+            assert_eq!(fg.file_id, "file-id-0");
+            // The file group should have a single log-only file slice
+            assert_eq!(fg.file_slices.len(), 1);
+            let slice = fg.file_slices.values().next().unwrap();
+            assert!(slice.base_file.is_none());
+            assert_eq!(slice.log_files.len(), 2);
         }
 
         #[test]

@@ -1,0 +1,115 @@
+╭─── Claude Code v2.1.92 ─────────────────────────────────────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started                                          │
+│           Welcome back Davis!           │ Run /init to create a CLAUDE.md file with instructions for Claude │
+│                                         │ ───────────────────────────────────────────────────────────────── │
+│                ▗ ▗   ▖ ▖                │ Recent activity                                                   │
+│                                         │ No recent activity                                                │
+│                  ▘▘ ▝▝                  │                                                                   │
+│                                         │                                                                   │
+│   Sonnet 4.6 · Claude Team · Onehouse   │                                                                   │
+│               ~/hudi-oss                │                                                                   │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+❯ how is HoodieFileGroupReader got constructed for MOR table read. What are all the input it get. show me raw code                             
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+⏺ Now let me look at how it's constructed in the Spark path for MOR reads:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Here's the full picture of how HoodieFileGroupReader is constructed for MOR reads.
+
+  ---
+  Constructor (private, via Builder)
+
+  HoodieFileGroupReader.java:91-123
+  private HoodieFileGroupReader(HoodieReaderContext<T> readerContext, HoodieStorage storage, String tablePath,
+                                String latestCommitTime, HoodieSchema dataSchema, HoodieSchema requestedSchema,
+                                Option<InternalSchema> internalSchemaOpt, HoodieTableMetaClient hoodieTableMetaClient,
+                                TypedProperties props, ReaderParameters readerParameters, InputSplit inputSplit,
+                                Option<BaseFileUpdateCallback<T>> updateCallback,
+                                FileGroupRecordBufferLoader<T> recordBufferLoader)
+
+  ---
+  Builder fields (all inputs)
+
+  HoodieFileGroupReader.java:363-384
+  public static class Builder<T> {
+      private HoodieReaderContext<T> readerContext;        // engine-specific (Spark InternalRow, Flink RowData)
+      private HoodieStorage storage;                       // derived from metaClient + storageConf
+      private String tablePath;                            // base path
+      private String latestCommitTime;                     // query timestamp / end instant
+      private HoodieSchema dataSchema;                     // full table schema
+      private HoodieSchema requestedSchema;                // projected schema (required cols only)
+      private Option<InternalSchema> internalSchemaOpt = Option.empty(); // schema evolution
+      private HoodieTableMetaClient hoodieTableMetaClient;
+      private TypedProperties props;                       // merged hoodie + spark configs
+      private Option<HoodieBaseFile> baseFileOption;       // parquet/orc base file (can be absent for log-only)
+      private Stream<HoodieLogFile> logFiles;              // log files in the file slice (MOR delta logs)
+      private String partitionPath;
+      private long start = 0;                              // byte offset into base file (for splitting)
+      private long length = Long.MAX_VALUE;                // byte length to read from base file
+      private Iterator<HoodieRecord> recordIterator;       // alternative: pre-built record stream
+      private boolean shouldUseRecordPosition = false;     // use parquet row-index for faster merge
+      private boolean allowInflightInstants = false;
+      private boolean emitDelete;                          // whether to emit delete records
+      private boolean sortOutput = false;
+      private Option<BaseFileUpdateCallback<T>> fileGroupUpdateCallback = Option.empty();
+      private FileGroupRecordBufferLoader<T> recordBufferLoader; // how log records are loaded into buffer
+  }
+
+  The InputSplit wraps: baseFileOption + logFiles (or recordIterator) + partitionPath + start + length.
+
+  ---
+  Spark MOR construction site
+
+  HoodieFileGroupReaderBasedFileFormat.scala:262-284
+  val readerContext = new SparkFileFormatInternalRowReaderContext(
+      fileGroupBaseFileReader.value, filters, requiredFilters, storageConf, metaClient.getTableConfig)
+  readerContext.setEnableLogicalTimestampFieldRepair(...)
+
+  val reader = HoodieFileGroupReader.newBuilder()
+      .withReaderContext(readerContext)          // SparkFileFormatInternalRowReaderContext
+      .withHoodieTableMetaClient(metaClient)    // built on driver, broadcast implicitly
+      .withLatestCommitTime(queryTimestamp)     // snapshot commit time
+      .withFileSlice(fileSlice)                 // baseFile + logFiles + partitionPath
+      .withDataSchema(dataSchema)               // full table avro schema
+      .withRequestedSchema(requestedSchema)     // pruned projection schema
+      .withInternalSchema(internalSchemaOpt)    // schema evolution (may be empty)
+      .withProps(props)                         // table config props + spark options + memory config
+      .withStart(file.start)                    // PartitionedFile split offset
+      .withLength(baseFileLength)               // base file byte length
+      .withShouldUseRecordPosition(shouldUseRecordPosition)
+      .build()
+
+  props at line 264-266 is assembled as:
+  val props = metaClient.getTableConfig.getProps   // table-level hoodie configs
+  options.foreach(kv => props.setProperty(kv._1, kv._2))  // spark datasource options
+  props.put(HoodieMemoryConfig.MAX_MEMORY_FOR_MERGE.key(), String.valueOf(maxMemoryPerCompaction))
+
+  ---
+  Key things that happen inside the constructor
+
+  ┌────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────┐
+  │                        Step                        │                                        What                                        │
+  ├────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ InputSplit built                                   │ wraps base file + log files + partition path + byte range                          │
+  ├────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ readerContext.setHasLogFiles(...)                  │ MOR flag set from whether inputSplit.hasLogFiles()                                 │
+  ├────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ readerContext.setShouldMergeUseRecordPosition(...) │ only true when: shouldUseRecordPosition && hasLogFiles && isParquetBaseFile &&     │
+  │                                                    │ !skipMerge                                                                         │
+  ├────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ readerContext.setSchemaHandler(...)                │ either ParquetRowIndexBasedSchemaHandler or FileGroupReaderSchemaHandler           │
+  ├────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ orderingFieldNames                                 │ derived from mergeMode + table config (precombine fields)                          │
+  └────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────┘
+
+✻ Sautéed for 45s
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts · hold Space to speak                                                                                                      
+

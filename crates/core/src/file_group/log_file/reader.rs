@@ -18,14 +18,13 @@
  */
 
 use crate::Result;
-use crate::config::HudiConfigs;
-use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
-    BlockMetadataKey, BlockMetadataType, BlockType, LogBlock,
+    BlockMetadataKey, BlockMetadataType, BlockType, LogBlock, LogBlockContentLocation,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::storage::Storage;
 use crate::storage::reader::StorageReader;
 use crate::timeline::selector::InstantRange;
@@ -36,23 +35,21 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct LogFileReader<R: Read + Seek> {
-    hudi_configs: Arc<HudiConfigs>,
+    reader_context: Arc<ReaderContext>,
     reader: R,
     timezone: String,
 }
 
 impl LogFileReader<StorageReader> {
     pub async fn new(
-        hudi_configs: Arc<HudiConfigs>,
+        reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
         let reader = storage.get_storage_reader(relative_path).await?;
-        let timezone: String = hudi_configs
-            .get_or_default(HudiTableConfig::TimelineTimezone)
-            .into();
+        let timezone = reader_context.timezone();
         Ok(Self {
-            hudi_configs,
+            reader_context,
             reader,
             timezone,
         })
@@ -64,6 +61,50 @@ impl LogFileReader<StorageReader> {
             if block.skipped {
                 continue;
             }
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    /// Read all blocks from the log file without instant-range filtering.
+    ///
+    /// Unlike [`read_all_blocks`], this method returns ALL blocks including those
+    /// that would normally be skipped by instant-range filtering. This is needed
+    /// by [`BaseHoodieLogRecordReader::scan_internal`] which implements its own
+    /// 4-gate filtering algorithm.
+    pub fn read_all_blocks_unfiltered(&mut self) -> Result<Vec<LogBlock>> {
+        let wide_range = InstantRange::up_to("99991231235959999", &self.timezone);
+        let mut blocks = Vec::new();
+        while let Some(block) = self.read_next_block(&wide_range)? {
+            // Include all blocks (even skipped ones) since the caller
+            // handles filtering via the 4-gate algorithm.
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    /// Read all blocks as metadata-only (no content decoding).
+    ///
+    /// Mirrors Java's Pass 1 behavior: reads block headers and records
+    /// `content_location` for later lazy inflate, but seeks past the
+    /// content bytes without decoding them. Only one block's content is
+    /// in memory at a time during Pass 3.
+    ///
+    /// Each block receives a clone of the underlying file `Bytes` (O(1) ref-count
+    /// increment), mirroring Java's `inputStreamSupplier` on `HoodieLogBlock`.
+    /// This enables the buffer to call `inflate_from_bytes()` synchronously
+    /// during Pass 3 without re-downloading the file.
+    ///
+    /// # Arguments
+    /// * `log_file_path` - The relative path to the log file (stored in `LogBlockContentLocation`)
+    pub fn read_all_blocks_metadata_only(
+        &mut self,
+        log_file_path: &str,
+    ) -> Result<Vec<LogBlock>> {
+        let file_bytes = self.reader.get_ref_bytes().clone();
+        let mut blocks = Vec::new();
+        while let Some(mut block) = self.read_next_block_metadata_only(log_file_path)? {
+            block.set_source_bytes(file_bytes.clone());
             blocks.push(block);
         }
         Ok(blocks)
@@ -200,6 +241,27 @@ impl<R: Read + Seek> LogFileReader<R> {
         Ok(Some(u64::from_be_bytes(size_buf)))
     }
 
+    /// Read 8 bytes for the content length, or fall back to `block_length` for V0.
+    ///
+    /// Mirrors Java's `HoodieLogFileReader.readBlock()` step 5:
+    /// ```java
+    /// int contentLength = nextBlockVersion.getVersion() != DEFAULT_VERSION
+    ///     ? (int) inputStream.readLong() : blockSize;
+    /// ```
+    fn read_content_length(
+        &mut self,
+        format_version: &LogFormatVersion,
+        block_length: u64,
+    ) -> Result<u64> {
+        if format_version.has_content_length() {
+            let mut buf = [0u8; 8];
+            self.reader.read_exact(&mut buf)?;
+            Ok(u64::from_be_bytes(buf))
+        } else {
+            Ok(block_length)
+        }
+    }
+
     fn should_skip_block(
         &self,
         header: &HashMap<BlockMetadataKey, String>,
@@ -248,11 +310,13 @@ impl<R: Read + Seek> LogFileReader<R> {
             )));
         }
 
-        let decoder = Decoder::new(self.hudi_configs.clone());
+        // Read content length before decoding, matching Java step 5→6
+        let content_length = self.read_content_length(&format_version, block_length)?;
+
+        let decoder = Decoder::new(self.reader_context.clone());
         let content = decoder.decode_content(
             self.reader.by_ref(),
-            &format_version,
-            block_length,
+            content_length,
             &block_type,
             &header,
         )?;
@@ -265,6 +329,68 @@ impl<R: Read + Seek> LogFileReader<R> {
             header,
             content,
             footer,
+        )))
+    }
+
+    /// Read the next block as metadata-only (no content decoding).
+    ///
+    /// Mirrors Java's `HoodieLogFileReader.readBlock()` with `shouldReadLazily=true`:
+    /// reads the block header, records the content position in a `LogBlockContentLocation`,
+    /// then seeks past the content + footer without decoding them.
+    ///
+    /// The returned `LogBlock` has `content = Empty` and `content_location = Some(...)`.
+    /// Call `LogBlock::inflate()` later to load and decode the content on demand.
+    fn read_next_block_metadata_only(
+        &mut self,
+        log_file_path: &str,
+    ) -> Result<Option<LogBlock>> {
+        if !self.read_magic()? {
+            return Ok(None);
+        }
+
+        let curr_pos = self
+            .reader
+            .stream_position()
+            .map_err(CoreError::ReadLogFileError)?;
+
+        let (block_length, _) = self.read_block_length_or_corrupted_block(curr_pos)?;
+        let format_version = self.read_log_format_version()?;
+        let block_type = self.read_block_type(&format_version)?;
+        let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+
+        // Read the content length field (8 bytes for V1+), matching Java step 5:
+        //   int contentLength = nextBlockVersion.getVersion() != DEFAULT_VERSION
+        //       ? (int) inputStream.readLong() : blockSize;
+        let content_length = self.read_content_length(&format_version, block_length)?;
+
+        // Record where the content starts — AFTER the content_length field,
+        // matching Java step 6: contentPosition = inputStream.getPos()
+        let content_position = self
+            .reader
+            .stream_position()
+            .map_err(CoreError::ReadLogFileError)?;
+
+        // Seek past the rest of the block (content + footer + total_block_length)
+        let block_end = curr_pos
+            .checked_add(8)
+            .and_then(|v| v.checked_add(block_length))
+            .ok_or_else(|| CoreError::LogFormatError("Block length overflow".to_string()))?;
+        self.reader
+            .seek(SeekFrom::Start(block_end))
+            .map_err(CoreError::ReadLogFileError)?;
+
+        let content_loc = LogBlockContentLocation {
+            log_file_path: log_file_path.to_string(),
+            content_position,
+            content_length,
+            block_length,
+        };
+
+        Ok(Some(LogBlock::new_lazy(
+            format_version,
+            block_type,
+            header,
+            content_loc,
         )))
     }
 }
@@ -316,9 +442,8 @@ mod tests {
         file_name: &str,
     ) -> Result<LogFileReader<StorageReader>> {
         let dir_url = parse_uri(dir)?;
-        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::PrecombineField, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
-        LogFileReader::new(hudi_configs, storage, file_name).await
+        LogFileReader::new(Arc::new(ReaderContext::empty()), storage, file_name).await
     }
 
     #[tokio::test]

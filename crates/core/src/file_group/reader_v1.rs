@@ -26,9 +26,11 @@ use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
-use crate::file_group::record_batches::RecordBatches;
+use crate::file_group::reader::HoodieFileGroupReader;
+use crate::file_group::reader::input_split::InputSplit;
+use crate::file_group::reader::reader_context::ReaderContext;
+use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::merge::record_merger::RecordMerger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
@@ -104,6 +106,16 @@ impl FileGroupReader {
         })
     }
 
+    /// Returns a reference to the Hudi configuration.
+    pub fn hudi_configs(&self) -> &Arc<HudiConfigs> {
+        &self.hudi_configs
+    }
+
+    /// Returns a reference to the storage layer.
+    pub fn storage(&self) -> &Arc<Storage> {
+        &self.storage
+    }
+
     /// Reads the data from the base file at the given relative path.
     ///
     /// # Arguments
@@ -115,11 +127,45 @@ impl FileGroupReader {
         &self,
         relative_path: &str,
     ) -> Result<RecordBatch> {
+        log::debug!("FileGroupReader: reading base file '{relative_path}' (non-streaming)");
         let records: RecordBatch = self
             .storage
             .get_parquet_file_data(relative_path)
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
             .await?;
+
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        if populates_meta_fields {
+            let start_ts = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupStartTimestamp)
+                .map(|v| -> String { v.into() });
+            match start_ts {
+                Some(ref start) => {
+                    let end_ts = self
+                        .hudi_configs
+                        .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                        .map(|v| -> String { v.into() });
+                    log::debug!(
+                        "FileGroupReader: commit time filter for '{relative_path}': \
+                         _hoodie_commit_time > '{start}'{}",
+                        end_ts
+                            .as_deref()
+                            .map(|e| format!(" AND _hoodie_commit_time <= '{e}'"))
+                            .unwrap_or_default(),
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "FileGroupReader: no commit time filter for '{relative_path}' \
+                         (snapshot/time-travel query)"
+                    );
+                }
+            }
+        }
 
         apply_commit_time_filter(&self.hudi_configs, records)
     }
@@ -158,8 +204,17 @@ impl FileGroupReader {
         } else {
             vec![]
         };
-        self.read_file_slice_from_paths(&base_file_path, log_file_paths)
-            .await
+        match base_file_path {
+            Some(path) => {
+                self.read_file_slice_from_paths(&path, log_file_paths)
+                    .await
+            }
+            None => {
+                // Log-only file slice: delegate directly to the Java-style reader
+                self.read_file_slice_from_paths_log_only(log_file_paths)
+                    .await
+            }
+        }
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -190,37 +245,89 @@ impl FileGroupReader {
         let base_file_only = log_file_paths.is_empty() || use_read_optimized;
 
         if base_file_only {
+            if log_file_paths.is_empty() {
+                log::debug!(
+                    "FileGroupReader: COW/base-only read for '{base_file_path}' (no log files)"
+                );
+            } else {
+                log::debug!(
+                    "FileGroupReader: read-optimized mode for '{base_file_path}' \
+                     (skipping {} log file(s))",
+                    log_file_paths.len()
+                );
+            }
             self.read_file_slice_by_base_file_path(base_file_path).await
         } else {
-            let instant_range = self.create_instant_range_for_log_file_scan();
-            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
-                .scan(log_file_paths, &instant_range)
-                .await?;
+            log::debug!(
+                "FileGroupReader: MOR merge (java-style) for '{base_file_path}' \
+                 with {} log file(s): [{}]",
+                log_file_paths.len(),
+                log_file_paths.join(", "),
+            );
 
-            let log_batches = match scan_result {
-                ScanResult::RecordBatches(batches) => batches,
-                ScanResult::Empty => RecordBatches::new(),
-                ScanResult::HFileRecords(_) => {
-                    return Err(CoreError::LogBlockError(
-                        "Unexpected HFile records in regular table log file".to_string(),
-                    ));
-                }
-            };
+            // Delegate to the Java-style HoodieFileGroupReader for proper
+            // key-based merge (supports COMMIT_TIME_ORDERING, etc.)
+            let input_split = InputSplit::new(
+                Some(base_file_path.to_string()),
+                None,
+                log_file_paths,
+                String::new(),
+            );
 
-            let base_batch = self
-                .read_file_slice_by_base_file_path(base_file_path)
-                .await?;
-            let schema = base_batch.schema();
-            let num_data_batches = log_batches.num_data_batches() + 1;
-            let num_delete_batches = log_batches.num_delete_batches();
-            let mut all_batches =
-                RecordBatches::new_with_capacity(num_data_batches, num_delete_batches);
-            all_batches.push_data_batch(base_batch);
-            all_batches.extend(log_batches);
+            let options = self.hudi_configs.as_options();
+            let ordering_field_names: Vec<String> = options
+                .get("hoodie.table.precombine.field")
+                .or_else(|| options.get("hoodie.table.ordering.fields"))
+                .map(|f| vec![f.clone()])
+                .unwrap_or_default();
 
-            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)
+            let latest_instant_time = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                .map(|v| -> String { v.into() })
+                .unwrap_or_else(|| "99991231235959999".to_string());
+
+            let mut reader = HoodieFileGroupReader::new(
+                Arc::new(ReaderContext::empty()),
+                self.storage.clone(),
+                input_split,
+                ordering_field_names,
+                ReaderParameters::default(),
+            );
+
+            reader.read().await
         }
+    }
+
+    /// Read a log-only file slice (no base file) via the Java-style HoodieFileGroupReader.
+    async fn read_file_slice_from_paths_log_only(
+        &self,
+        log_file_paths: Vec<String>,
+    ) -> Result<RecordBatch> {
+        log::debug!(
+            "FileGroupReader: log-only MOR merge with {} log file(s): [{}]",
+            log_file_paths.len(),
+            log_file_paths.join(", "),
+        );
+
+        let input_split = InputSplit::new(None, None, log_file_paths, String::new());
+
+        let options = self.hudi_configs.as_options();
+        let ordering_field_names: Vec<String> = options
+            .get("hoodie.table.precombine.field")
+            .or_else(|| options.get("hoodie.table.ordering.fields"))
+            .map(|f| vec![f.clone()])
+            .unwrap_or_default();
+
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(ReaderContext::empty()),
+            self.storage.clone(),
+            input_split,
+            ordering_field_names,
+            ReaderParameters::default(),
+        );
+
+        reader.read().await
     }
 
     // =========================================================================
@@ -280,8 +387,19 @@ impl FileGroupReader {
             vec![]
         };
 
-        self.read_file_slice_from_paths_stream(&base_file_path, log_file_paths, options)
-            .await
+        match base_file_path {
+            Some(path) => {
+                self.read_file_slice_from_paths_stream(&path, log_file_paths, options)
+                    .await
+            }
+            None => {
+                // Log-only: fall back to the non-streaming collect-and-merge path
+                let batch = self
+                    .read_file_slice_from_paths_log_only(log_file_paths)
+                    .await?;
+                Ok(Box::pin(futures::stream::once(async { Ok(batch) })))
+            }
+        }
     }
 
     /// Reads a file slice from paths as a stream of record batches.
@@ -359,12 +477,77 @@ impl FileGroupReader {
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
+        log::debug!(
+            "FileGroupReader: reading '{}' | batch_size={batch_size}{}",
+            relative_path,
+            if options.batch_size.is_some() { " (from ReadOptions)" } else { " (default)" },
+        );
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
         // Add projection pushdown using column names (converted to indices internally
         // by get_parquet_file_stream using the same schema the projection is applied to)
         if let Some(ref projection_names) = options.projection {
+            log::debug!(
+                "FileGroupReader: column projection for '{}': [{}]",
+                relative_path,
+                projection_names.join(", "),
+            );
             parquet_options = parquet_options.with_projection(projection_names.clone());
+        } else {
+            log::debug!(
+                "FileGroupReader: no column projection for '{}' — all columns will be read",
+                relative_path,
+            );
+        }
+
+        // Log commit time filter (evaluated once here; applied per batch inside the stream)
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        if populates_meta_fields {
+            let start_ts = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupStartTimestamp)
+                .map(|v| -> String { v.into() });
+            match start_ts {
+                Some(ref start) => {
+                    let end_ts = self
+                        .hudi_configs
+                        .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                        .map(|v| -> String { v.into() });
+                    log::debug!(
+                        "FileGroupReader: commit time filter for '{}': \
+                         _hoodie_commit_time > '{}'{}",
+                        relative_path,
+                        start,
+                        end_ts
+                            .as_deref()
+                            .map(|e| format!(" AND _hoodie_commit_time <= '{e}'"))
+                            .unwrap_or_default(),
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "FileGroupReader: no commit time filter for '{}' \
+                         (snapshot/time-travel query)",
+                        relative_path,
+                    );
+                }
+            }
+        } else {
+            log::debug!(
+                "FileGroupReader: commit time filter skipped for '{}' \
+                 (PopulatesMetaFields=false)",
+                relative_path,
+            );
+        }
+
+        if options.row_predicate.is_some() {
+            log::debug!(
+                "FileGroupReader: user row predicate active for '{}'",
+                relative_path,
+            );
         }
 
         let hudi_configs = self.hudi_configs.clone();
@@ -442,7 +625,9 @@ impl FileGroupReader {
         file_slice: &FileSlice,
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let base_file_path = file_slice.base_file_relative_path()?;
+        let base_file_path = file_slice.base_file_relative_path()?.ok_or_else(|| {
+            ReadFileSliceError("Metadata table file slice must have a base file".to_string())
+        })?;
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
             file_slice
                 .log_files
@@ -494,7 +679,7 @@ impl FileGroupReader {
             vec![]
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            let scan_result = LogFileScanner::new(Arc::new(ReaderContext::empty()), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
 

@@ -21,7 +21,7 @@ pub mod completion_time;
 pub mod instant;
 pub mod loader;
 pub mod lsm_tree;
-pub(crate) mod selector;
+pub mod selector;
 pub(crate) mod util;
 pub mod view;
 

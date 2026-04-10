@@ -217,6 +217,19 @@ impl ConfigParser for HudiTableConfig {
             .map(|v| v.as_str())
             .ok_or(NotFound(self.key()));
 
+        // For PrecombineField, also check hoodie.table.ordering.fields (Hudi 1.x
+        // renamed precombine.field to ordering.fields; the old key is an alternative).
+        let get_result = if matches!(self, Self::PrecombineField) {
+            get_result.or_else(|_| {
+                configs
+                    .get("hoodie.table.ordering.fields")
+                    .map(|v| v.as_str())
+                    .ok_or(NotFound(self.key()))
+            })
+        } else {
+            get_result
+        };
+
         match self {
             Self::BaseFileFormat => get_result
                 .and_then(BaseFileFormatValue::from_str)
@@ -303,8 +316,10 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    if !configs.contains_key(HudiTableConfig::PrecombineField.as_ref()) {
-                        // When precombine field is not available, we treat the table as append-only
+                    if !configs.contains_key(HudiTableConfig::PrecombineField.as_ref())
+                        && !configs.contains_key("hoodie.table.ordering.fields")
+                    {
+                        // When precombine/ordering field is not available, we treat the table as append-only
                         return HudiConfigValue::String(
                             RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
                         );

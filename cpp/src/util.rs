@@ -28,6 +28,26 @@ pub fn create_raw_pointer_for_record_batches(
     let batches = batches.into_iter().map(Ok);
     let batch_iterator = RecordBatchIterator::new(batches, schema);
     let ffi_array_stream = FFI_ArrowArrayStream::new(Box::new(batch_iterator));
+    // Heap-allocate and leak into a raw pointer.  free_arrow_stream() below
+    // is the only correct way to reclaim this allocation.
     let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
     raw_ptr as *mut ffi::ArrowArrayStream
+}
+
+/// Free an `ArrowArrayStream` that was heap-allocated by
+/// [`create_raw_pointer_for_record_batches`] via `Box::into_raw`.
+///
+/// This reclaims the memory through Rust's own allocator, making it safe
+/// regardless of which global allocator the Rust library was compiled with.
+/// The caller must not use `ptr` after this call.
+pub unsafe fn free_arrow_stream(ptr: *mut ffi::ArrowArrayStream) {
+    if !ptr.is_null() {
+        // Reconstruct the original Box<FFI_ArrowArrayStream>.  This is the
+        // exact type that Box::into_raw() produced in create_raw_pointer_for_record_batches();
+        // the pointer was only cast to *mut ffi::ArrowArrayStream (layout-compatible
+        // CXX opaque type) for transport across the FFI boundary.
+        // Dropping the Box invokes FFI_ArrowArrayStream's Drop impl (which calls
+        // the Arrow release callback) and then frees the heap allocation.
+        unsafe { drop(Box::from_raw(ptr as *mut FFI_ArrowArrayStream)) };
+    }
 }

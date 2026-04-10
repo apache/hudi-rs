@@ -136,7 +136,6 @@ impl FileLister {
         }
 
         let mut file_groups: Vec<FileGroup> = Vec::new();
-        // TODO support creating file groups without base files
         for (file_id, base_files) in file_id_to_base_files.into_iter() {
             let mut file_group = FileGroup::new(file_id.to_owned(), partition_path.to_string());
 
@@ -147,6 +146,14 @@ impl FileLister {
 
             file_groups.push(file_group);
         }
+
+        // Build FileGroups for log-only file groups (no base files).
+        for (file_id, log_files) in file_id_to_log_files.into_iter() {
+            let mut file_group = FileGroup::new(file_id.to_owned(), partition_path.to_string());
+            file_group.add_log_files(log_files)?;
+            file_groups.push(file_group);
+        }
+
         Ok(file_groups)
     }
 

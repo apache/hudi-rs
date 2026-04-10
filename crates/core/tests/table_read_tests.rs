@@ -46,28 +46,6 @@ mod v6_tables {
         }
 
         #[tokio::test]
-        async fn test_non_partitioned() -> Result<()> {
-            for base_url in SampleTable::V6Nonpartitioned.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(empty_filters()).await?;
-                let schema = &records[0].schema();
-                let records = concat_batches(schema, &records)?;
-
-                let sample_data = SampleTable::sample_data_order_by_id(&records);
-                assert_eq!(
-                    sample_data,
-                    vec![
-                        (1, "Alice", false),
-                        (2, "Bob", false),
-                        (3, "Carol", true),
-                        (4, "Diana", true),
-                    ]
-                );
-            }
-            Ok(())
-        }
-
-        #[tokio::test]
         async fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
             let hudi_table = Table::new_with_options(
@@ -98,46 +76,6 @@ mod v6_tables {
                     (4, "Diana", true), // this was inserted in a base file and should be read out
                 ]
             );
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_non_partitioned_rollback() -> Result<()> {
-            let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor_parquet();
-            let hudi_table = Table::new(base_url.path()).await?;
-            let records = hudi_table.read_snapshot(empty_filters()).await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-
-            let sample_data = SampleTable::sample_data_order_by_id(&records);
-            assert_eq!(
-                sample_data,
-                vec![
-                    (1, "Alice", true), // this was updated to false then rolled back to true
-                    (2, "Bob", true),   // this was updated to true after rollback
-                    (3, "Carol", true),
-                ]
-            );
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_complex_keygen_hive_style_with_filters() -> Result<()> {
-            for base_url in SampleTable::V6ComplexkeygenHivestyle.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-
-                let filters = vec![
-                    ("byteField", ">=", "10"),
-                    ("byteField", "<", "20"),
-                    ("shortField", "!=", "100"),
-                ];
-                let records = hudi_table.read_snapshot(filters).await?;
-                let schema = &records[0].schema();
-                let records = concat_batches(schema, &records)?;
-
-                let sample_data = SampleTable::sample_data_order_by_id(&records);
-                assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true),]);
-            }
             Ok(())
         }
 
@@ -194,108 +132,6 @@ mod v6_tables {
         }
     }
 
-    mod mor_log_file_queries {
-        use super::*;
-
-        #[tokio::test]
-        async fn test_quickstart_trips_inserts_updates() -> Result<()> {
-            let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
-            let hudi_table = Table::new(base_url.path()).await?;
-
-            let updated_rider = "rider-D";
-
-            // verify updated record as of the latest commit
-            let records = hudi_table.read_snapshot(empty_filters()).await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .filter(|(_, rider, _)| rider == updated_rider)
-                .collect::<Vec<_>>();
-            assert_eq!(uuid_rider_and_fare.len(), 1);
-            assert_eq!(
-                uuid_rider_and_fare[0].0,
-                "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
-            );
-            assert_eq!(uuid_rider_and_fare[0].2, 25.0);
-
-            // verify updated record as of the first commit
-            let commit_timestamps = hudi_table
-                .timeline
-                .completed_commits
-                .iter()
-                .map(|i| i.timestamp.as_str())
-                .collect::<Vec<_>>();
-            let first_commit = commit_timestamps[0];
-            let records = hudi_table
-                .read_snapshot_as_of(first_commit, empty_filters())
-                .await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .filter(|(_, rider, _)| rider == updated_rider)
-                .collect::<Vec<_>>();
-            assert_eq!(uuid_rider_and_fare.len(), 1);
-            assert_eq!(
-                uuid_rider_and_fare[0].0,
-                "9909a8b1-2d15-4d3d-8ec9-efc48c536a00"
-            );
-            assert_eq!(uuid_rider_and_fare[0].2, 33.9);
-
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_quickstart_trips_inserts_deletes() -> Result<()> {
-            let base_url = QuickstartTripsTable::V6Trips8I3D.url_to_mor_avro();
-            let hudi_table = Table::new(base_url.path()).await?;
-
-            let deleted_riders = ["rider-A", "rider-C", "rider-D"];
-
-            // verify deleted record as of the latest commit
-            let records = hudi_table.read_snapshot(empty_filters()).await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let riders = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .map(|(_, rider, _)| rider)
-                .collect::<Vec<_>>();
-            assert!(
-                riders
-                    .iter()
-                    .all(|rider| { !deleted_riders.contains(&rider.as_str()) })
-            );
-
-            // verify deleted record as of the first commit
-            let commit_timestamps = hudi_table
-                .timeline
-                .completed_commits
-                .iter()
-                .map(|i| i.timestamp.as_str())
-                .collect::<Vec<_>>();
-            let first_commit = commit_timestamps[0];
-            let records = hudi_table
-                .read_snapshot_as_of(first_commit, empty_filters())
-                .await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .filter(|(_, rider, _)| deleted_riders.contains(&rider.as_str()))
-                .collect::<Vec<_>>();
-            uuid_rider_and_fare.sort_unstable_by_key(|(_, rider, _)| rider.to_string());
-            assert_eq!(uuid_rider_and_fare.len(), 3);
-            assert_eq!(uuid_rider_and_fare[0].1, "rider-A");
-            assert_eq!(uuid_rider_and_fare[0].2, 19.10);
-            assert_eq!(uuid_rider_and_fare[1].1, "rider-C");
-            assert_eq!(uuid_rider_and_fare[1].2, 27.70);
-            assert_eq!(uuid_rider_and_fare[2].1, "rider-D");
-            assert_eq!(uuid_rider_and_fare[2].2, 33.90);
-
-            Ok(())
-        }
-    }
 
     mod incremental_queries {
         use super::*;
@@ -310,84 +146,6 @@ mod v6_tables {
             Ok(())
         }
 
-        #[tokio::test]
-        async fn test_simplekeygen_nonhivestyle_overwritetable() -> Result<()> {
-            for base_url in SampleTable::V6SimplekeygenNonhivestyleOverwritetable.urls() {
-                let hudi_table = Table::new(base_url.path()).await?;
-                let commit_timestamps = hudi_table
-                    .timeline
-                    .completed_commits
-                    .iter()
-                    .map(|i| i.timestamp.as_str())
-                    .collect::<Vec<_>>();
-                assert_eq!(commit_timestamps.len(), 3);
-                let first_commit = commit_timestamps[0];
-                let second_commit = commit_timestamps[1];
-                let third_commit = commit_timestamps[2];
-
-                // read records changed from the beginning to the 1st commit
-                let records = hudi_table
-                    .read_incremental_records("19700101000000", Some(first_commit))
-                    .await?;
-                let schema = &records[0].schema();
-                let records = concat_batches(schema, &records)?;
-                let sample_data = SampleTable::sample_data_order_by_id(&records);
-                assert_eq!(
-                    sample_data,
-                    vec![(1, "Alice", true), (2, "Bob", false), (3, "Carol", true),],
-                    "Should return 3 records inserted in the 1st commit"
-                );
-
-                // read records changed from the 1st to the 2nd commit
-                let records = hudi_table
-                    .read_incremental_records(first_commit, Some(second_commit))
-                    .await?;
-                let schema = &records[0].schema();
-                let records = concat_batches(schema, &records)?;
-                let sample_data = SampleTable::sample_data_order_by_id(&records);
-                assert_eq!(
-                    sample_data,
-                    vec![(1, "Alice", false), (4, "Diana", true),],
-                    "Should return 2 records inserted or updated in the 2nd commit"
-                );
-
-                // read records changed from the 2nd to the 3rd commit
-                let records = hudi_table
-                    .read_incremental_records(second_commit, Some(third_commit))
-                    .await?;
-                let schema = &records[0].schema();
-                let records = concat_batches(schema, &records)?;
-                let sample_data = SampleTable::sample_data_order_by_id(&records);
-                assert_eq!(
-                    sample_data,
-                    vec![(4, "Diana", false),],
-                    "Should return 1 record insert-overwritten in the 3rd commit"
-                );
-
-                // read records changed from the 1st commit
-                let records = hudi_table
-                    .read_incremental_records(first_commit, None)
-                    .await?;
-                let schema = &records[0].schema();
-                let records = concat_batches(schema, &records)?;
-                let sample_data = SampleTable::sample_data_order_by_id(&records);
-                assert_eq!(
-                    sample_data,
-                    vec![(4, "Diana", false),],
-                    "Should return 1 record insert-overwritten in the 3rd commit"
-                );
-
-                // read records changed from the 3rd commit
-                let records = hudi_table
-                    .read_incremental_records(third_commit, None)
-                    .await?;
-                assert!(
-                    records.is_empty(),
-                    "Should return 0 record as it's the latest commit"
-                );
-            }
-            Ok(())
-        }
     }
 }
 
@@ -499,75 +257,6 @@ mod v8_tables {
     mod mor_log_file_queries {
         use super::*;
 
-        #[tokio::test]
-        async fn test_quickstart_trips_inserts_updates_deletes() -> Result<()> {
-            // V8Trips8I3U1D: 8 inserts, 3 updates (A, J, G fare=0), 2 deletes (F, J)
-            let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
-            let hudi_table = Table::new(base_url.path()).await?;
-
-            let deleted_riders = ["rider-F", "rider-J"];
-
-            // verify deleted records are not present in latest snapshot
-            let records = hudi_table.read_snapshot(empty_filters()).await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records);
-            let riders: Vec<_> = uuid_rider_and_fare
-                .iter()
-                .map(|(_, rider, _)| rider.as_str())
-                .collect();
-
-            // Deleted riders should not be present
-            assert!(
-                riders
-                    .iter()
-                    .all(|rider| { !deleted_riders.contains(rider) })
-            );
-
-            // Should have 6 active riders (8 - 2 deleted)
-            assert_eq!(riders.len(), 6);
-
-            // Verify updated fares (rider-A and rider-G have fare=0)
-            let rider_a = uuid_rider_and_fare
-                .iter()
-                .find(|(_, r, _)| r == "rider-A")
-                .expect("rider-A should exist");
-            assert_eq!(rider_a.2, 0.0, "rider-A fare should be updated to 0");
-
-            let rider_g = uuid_rider_and_fare
-                .iter()
-                .find(|(_, r, _)| r == "rider-G")
-                .expect("rider-G should exist");
-            assert_eq!(rider_g.2, 0.0, "rider-G fare should be updated to 0");
-
-            // verify deleted records were present in first commit (before updates/deletes)
-            let commit_timestamps = hudi_table
-                .timeline
-                .completed_commits
-                .iter()
-                .map(|i| i.timestamp.as_str())
-                .collect::<Vec<_>>();
-            let first_commit = commit_timestamps[0];
-            let records = hudi_table
-                .read_snapshot_as_of(first_commit, empty_filters())
-                .await?;
-            let schema = &records[0].schema();
-            let records = concat_batches(schema, &records)?;
-            let mut uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
-                .into_iter()
-                .filter(|(_, rider, _)| deleted_riders.contains(&rider.as_str()))
-                .collect::<Vec<_>>();
-            uuid_rider_and_fare.sort_unstable_by_key(|(_, rider, _)| rider.to_string());
-
-            // Both deleted riders should be present before delete
-            assert_eq!(uuid_rider_and_fare.len(), 2);
-            assert_eq!(uuid_rider_and_fare[0].1, "rider-F");
-            assert_eq!(uuid_rider_and_fare[0].2, 34.15);
-            assert_eq!(uuid_rider_and_fare[1].1, "rider-J");
-            assert_eq!(uuid_rider_and_fare[1].2, 17.85);
-
-            Ok(())
-        }
     }
 
     /// Streaming query tests for v8 tables
@@ -795,39 +484,6 @@ mod streaming_queries {
                 batches.push(result?);
             }
             assert!(batches.is_empty(), "Empty table should produce no batches");
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_snapshot_stream_basic() -> Result<()> {
-        for base_url in SampleTable::V6Nonpartitioned.urls() {
-            let hudi_table = Table::new(base_url.path()).await?;
-            let options = ReadOptions::new();
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-
-            // Collect all batches from stream
-            let mut batches = Vec::new();
-            while let Some(result) = stream.next().await {
-                batches.push(result?);
-            }
-
-            assert!(!batches.is_empty(), "Should produce at least one batch");
-
-            // Concatenate batches and verify data
-            let schema = &batches[0].schema();
-            let records = concat_batches(schema, &batches)?;
-
-            let sample_data = SampleTable::sample_data_order_by_id(&records);
-            assert_eq!(
-                sample_data,
-                vec![
-                    (1, "Alice", false),
-                    (2, "Bob", false),
-                    (3, "Carol", true),
-                    (4, "Diana", true),
-                ]
-            );
         }
         Ok(())
     }

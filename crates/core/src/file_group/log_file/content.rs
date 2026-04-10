@@ -18,13 +18,12 @@
  */
 use crate::Result;
 use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
-use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::log_file::avro::AvroDataBlockContentReader;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
 };
-use crate::file_group::log_file::log_format::LogFormatVersion;
+use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
@@ -38,32 +37,27 @@ use std::sync::Arc;
 #[allow(dead_code)]
 pub struct Decoder {
     batch_size: usize,
-    hudi_configs: Arc<HudiConfigs>,
+    reader_context: Arc<ReaderContext>,
 }
 
 impl Decoder {
-    pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
+    pub fn new(reader_context: Arc<ReaderContext>) -> Self {
         Self {
             batch_size: 1024,
-            hudi_configs,
+            reader_context,
         }
     }
+    /// Decode block content from a reader already positioned at the start of the raw content.
+    ///
+    /// `content_length` is the true content-only byte count (matching Java's `contentLength`),
+    /// read by the caller before invoking this method.
     pub fn decode_content(
         &self,
         reader: &mut (impl Read + Seek),
-        log_format_version: &LogFormatVersion,
-        fallback_length: u64,
+        content_length: u64,
         block_type: &BlockType,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<LogBlockContent> {
-        let content_length = if log_format_version.has_content_length() {
-            let mut content_length_buf = [0u8; 8];
-            reader.read_exact(&mut content_length_buf)?;
-            u64::from_be_bytes(content_length_buf)
-        } else {
-            fallback_length
-        };
-
         let reader = reader.by_ref().take(content_length);
         match block_type {
             BlockType::AvroData => self
@@ -87,7 +81,7 @@ impl Decoder {
 
     /// Validate the log block version (first 4 bytes of block content).
     ///
-    /// This is NOT the same as [`LogFormatVersion`] (read from the file header).
+    /// This is NOT the same as `LogFormatVersion` (read from the file header).
     /// Modern Hudi tables use [`LogBlockVersion::V3`].
     fn validate_log_block_version(mut reader: impl Read) -> Result<()> {
         let mut version_buf = [0u8; 4];
@@ -326,8 +320,7 @@ mod tests {
         write_record(&mut buf, record2)?;
 
         // Create decoder and test
-        let hudi_configs = HudiConfigs::empty();
-        let decoder = Decoder::new(Arc::new(hudi_configs));
+        let decoder = Decoder::new(Arc::new(ReaderContext::empty()));
         let reader = Cursor::new(buf);
 
         let mut header = HashMap::new();
@@ -383,8 +376,7 @@ mod tests {
             writer.close()?;
         }
 
-        let hudi_configs = HudiConfigs::empty();
-        let decoder = Decoder::new(Arc::new(hudi_configs));
+        let decoder = Decoder::new(Arc::new(ReaderContext::empty()));
         let bytes = Bytes::from(buf);
         let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
 

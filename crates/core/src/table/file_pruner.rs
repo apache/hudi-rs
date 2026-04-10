@@ -61,12 +61,29 @@ impl FilePruner {
             .map(|f| f.name().as_str())
             .collect();
 
+        // Capture expressions before shadowing for logging
+        let input_exprs: Vec<String> = and_filters
+            .iter()
+            .filter(|f| !partition_columns.contains(f.field_name.as_str()))
+            .map(|f| format!("{} {} {}", f.field_name, f.operator, f.field_value))
+            .collect();
+
         // Only keep filters on non-partition columns that exist in the table schema
         let and_filters: Vec<SchemableFilter> = and_filters
             .iter()
             .filter(|filter| !partition_columns.contains(filter.field_name.as_str()))
             .filter_map(|filter| SchemableFilter::try_from((filter.clone(), table_schema)).ok())
             .collect();
+
+        if and_filters.is_empty() {
+            log::debug!("FilePruner: no data-column filters — all files included");
+        } else {
+            log::debug!(
+                "FilePruner: {} data-column filter(s): [{}]",
+                and_filters.len(),
+                input_exprs.join(" AND "),
+            );
+        }
 
         Ok(FilePruner { and_filters })
     }
@@ -110,7 +127,16 @@ impl FilePruner {
 
             // Check if this filter can prune the file
             if self.can_prune_by_filter(filter, col_stats) {
-                return false; // File can be pruned
+                log::debug!(
+                    "FilePruner: pruning — filter '{} {}' excludes file \
+                     (col '{}': min={:?}, max={:?})",
+                    filter.field.name(),
+                    filter.operator,
+                    col_stats.column_name,
+                    col_stats.min_value,
+                    col_stats.max_value,
+                );
+                return false;
             }
         }
 
