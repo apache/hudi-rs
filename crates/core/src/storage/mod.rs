@@ -304,6 +304,49 @@ impl Storage {
         Ok(concat_batches(&schema, &batches)?)
     }
 
+    /// Read a Parquet file with column projection (non-streaming).
+    ///
+    /// Like [`get_parquet_file_data`], but only reads the columns present in
+    /// `projection_schema`. Reuses the projection infrastructure from
+    /// [`get_parquet_file_stream`].
+    ///
+    /// Mirrors Java's `readerContext.getFileRecordIterator(pathInfo, start, len,
+    /// tableSchema, requiredSchema, storage)` where `requiredSchema` drives
+    /// column pruning.
+    pub async fn get_parquet_file_data_projected(
+        &self,
+        relative_path: &str,
+        projection_schema: &arrow_schema::SchemaRef,
+    ) -> Result<RecordBatch> {
+        let column_names: Vec<String> = projection_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        log::debug!(
+            "Parquet projected read (non-streaming) for '{relative_path}': \
+             projecting {n} cols: [{cols}]",
+            n = column_names.len(),
+            cols = column_names.join(", "),
+        );
+
+        let options = ParquetReadOptions::new().with_projection(column_names);
+        let mut stream = self.get_parquet_file_stream(relative_path, options).await?;
+        let schema = stream.schema.clone();
+
+        let mut batches = Vec::new();
+        while let Some(r) = stream.stream.next().await {
+            batches.push(r?);
+        }
+
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
     /// Get a streaming reader for a Parquet file.
     ///
     /// Returns a [ParquetFileStream] that yields record batches as they are read,
@@ -332,7 +375,9 @@ impl Storage {
             builder = builder.with_batch_size(batch_size);
         }
 
-        // Handle projection: convert column names to indices using builder's schema
+        // Handle projection: convert column names to indices using builder's schema.
+        // Build `projected_schema` that reflects the actual columns in the stream.
+        let projected_schema: SchemaRef;
         if let Some(ref column_names) = options.projection {
             let arrow_schema = builder.schema();
             let file_cols: Vec<&str> = arrow_schema
@@ -374,6 +419,17 @@ impl Storage {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            // Build the projected schema in parquet root column order (ascending index).
+            // ProjectionMask::roots produces columns sorted by their parquet index,
+            // so the schema must match that order.
+            let mut sorted_projection = projection.clone();
+            sorted_projection.sort();
+            let projected_fields: Vec<std::sync::Arc<arrow_schema::Field>> = sorted_projection
+                .iter()
+                .map(|&idx| arrow_schema.field(idx).clone().into())
+                .collect();
+            projected_schema = std::sync::Arc::new(arrow_schema::Schema::new(projected_fields));
+
             let projection_mask = parquet::arrow::ProjectionMask::roots(
                 builder.parquet_schema(),
                 projection.iter().copied(),
@@ -392,13 +448,13 @@ impl Storage {
                 n = all_cols.len(),
                 cols = all_cols.join(", "),
             );
+            projected_schema = arrow_schema.clone();
         }
 
-        let schema = builder.schema().clone();
         let stream = builder.build()?;
 
         Ok(ParquetFileStream {
-            schema,
+            schema: projected_schema,
             stream: Box::pin(stream),
         })
     }

@@ -29,10 +29,10 @@ repository = "https://github.com/apache/hudi-rs/tree/main/cpp/"
 
 [lib]
 name = "hudi"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-hudi = { path = "../crates/hudi", version = "0.5.0-dev" }
+hudi-dep = { package = "hudi", path = "../crates/hudi", version = "0.5.0-dev" }
 hudi-test = { path = "../crates/test", version = "0.5.0-dev" }
 cxx = { version = "1.0" }
 apache-avro = { workspace = true }
@@ -42,6 +42,17 @@ arrow-schema = { workspace = true }
 tokio = { workspace = true }
 env_logger = { version = "0.11" }
 log = { version = "0.4" }
+
+[dev-dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+hudi-test = { path = "../crates/test", version = "0.5.0-dev" }
+parquet = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]
 cxx-build = { version = "1.0" }

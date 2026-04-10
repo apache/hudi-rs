@@ -108,12 +108,16 @@ impl KeyBasedFileGroupRecordBuffer {
         // readerContext.getRecordContext() returning the same instance).
         let record_context = reader_context.get_record_context().clone();
 
-        // Create DeleteContext from table properties (Phase 1).
+        // Create DeleteContext from table properties and table schema (Phase 1).
         // Mirrors Java's `new DeleteContext(properties, tableSchema)` in
         // FileGroupReaderSchemaHandler, then enriched with reader schema
-        // in FileGroupRecordBuffer. Here we create from props only;
-        // `set_reader_schema` will enrich with schema info later.
-        let delete_context = DeleteContext::from_props(&reader_context.table_config);
+        // in FileGroupRecordBuffer via `set_reader_schema`.
+        let delete_context =
+            if let Some(table_schema) = &reader_context.schema_handler.table_schema {
+                DeleteContext::new(&reader_context.table_config, table_schema)
+            } else {
+                DeleteContext::from_props(&reader_context.table_config)
+            };
 
         let mut base = FileGroupRecordBuffer::new(
             merge_mode,
@@ -379,10 +383,14 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             self.base.total_log_records,
         );
 
-        let schema = if !self.base.base_file_batches.is_empty() {
-            self.base.base_file_batches[0].schema()
-        } else if let Some(schema) = &self.base.reader_schema {
+        // Use reader_schema (= required_schema) as the output schema when set,
+        // since it represents the merge-compatible schema. The base file may be
+        // projected to fewer columns, while log records have the full writer schema.
+        // reader_schema is the common ground that both are reconciled to.
+        let schema = if let Some(schema) = &self.base.reader_schema {
             schema.clone()
+        } else if !self.base.base_file_batches.is_empty() {
+            self.base.base_file_batches[0].schema()
         } else {
             // Fallback: find any non-delete record in the buffer.
             // HashMap iteration order is non-deterministic, so we must

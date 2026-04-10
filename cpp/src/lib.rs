@@ -19,20 +19,23 @@
 pub mod context;
 mod util;
 
+/// Re-export core types for integration tests and downstream consumers.
+pub use hudi_dep as hudi_core;
+
 use crate::context::FileGroupReaderContext;
 use crate::util::{create_raw_pointer_for_record_batches, free_arrow_stream};
-use hudi::avro_to_arrow::to_arrow_schema;
-use hudi::config::HudiConfigs;
-use hudi::config::table::HudiTableConfig;
-use hudi::config::util::split_hudi_options_from_others;
-use hudi::file_group::reader::HoodieFileGroupReader as CoreFileGroupReader;
-use hudi::file_group::reader::input_split::InputSplit;
-use hudi::file_group::reader::reader_context::ReaderContext;
-use hudi::file_group::reader::reader_parameters::ReaderParameters;
-use hudi::file_group::reader::record_context::RecordContext;
-use hudi::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
-use hudi::storage::Storage;
-use hudi::timeline::selector::InstantRange;
+use hudi_dep::avro_to_arrow::to_arrow_schema;
+use hudi_dep::config::HudiConfigs;
+use hudi_dep::config::table::HudiTableConfig;
+use hudi_dep::config::util::split_hudi_options_from_others;
+use hudi_dep::file_group::reader::HoodieFileGroupReader as CoreFileGroupReader;
+use hudi_dep::file_group::reader::input_split::InputSplit;
+use hudi_dep::file_group::reader::reader_context::ReaderContext;
+use hudi_dep::file_group::reader::reader_parameters::ReaderParameters;
+use hudi_dep::file_group::reader::record_context::RecordContext;
+use hudi_dep::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
+use hudi_dep::storage::Storage;
+use hudi_dep::timeline::selector::InstantRange;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -343,11 +346,19 @@ pub fn new_file_group_reader_with_context(
 
     // ── 6. Build schema handler from Avro schemas passed via FFI ──
     // Set on ReaderContext to match Java's HoodieReaderContext.schemaHandler.
+    //
+    // The `data_schema` from the Scala planning layer is the pruned table
+    // data schema (full table columns minus "op" and partition columns).
+    // This serves as both `table_schema` (field lookup source for mandatory
+    // fields) and `data_schema` (base file reading schema).
     let schema_handler = {
         let mut handler = FileGroupReaderSchemaHandler::new();
         if let Some(hs) = fgrc.data_schema.as_ref() {
             if let Ok(arrow_schema) = avro_json_to_arrow_schema(&hs.avro_schema_json) {
-                handler = handler.with_data_schema(Arc::new(arrow_schema));
+                let schema_ref = Arc::new(arrow_schema);
+                handler = handler
+                    .with_table_schema(schema_ref.clone())
+                    .with_data_schema(schema_ref);
             }
         }
         if let Some(hs) = fgrc.requested_schema.as_ref() {
@@ -395,12 +406,36 @@ pub fn new_file_group_reader_with_context(
 }
 
 impl HoodieFileGroupReader {
-    /// Uses the core `HoodieFileGroupReader` for the full 3-phase merge.
-    pub fn get_closable_iterator(
+    /// Construct a `HoodieFileGroupReader` directly (for testing without FFI).
+    pub fn new(
+        reader_context: Arc<ReaderContext>,
+        storage: Arc<Storage>,
+        props: HashMap<String, String>,
+        reader_parameters: ReaderParameters,
+        input_split: InputSplit,
+        partition_path_fields: Option<Vec<String>>,
+    ) -> std::result::Result<Self, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+        Ok(Self {
+            reader_context,
+            storage,
+            props,
+            reader_parameters,
+            input_split,
+            partition_path_fields,
+            rt,
+        })
+    }
+
+    /// Runs the full 3-phase merge and returns the resulting `RecordBatch` and its schema.
+    pub fn read_record_batch(
         &self,
-    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+    ) -> std::result::Result<(arrow_array::RecordBatch, arrow_schema::SchemaRef), String> {
         log::debug!(
-            "get_closable_iterator: partition={} base_file={:?} log_files={} \
+            "read_record_batch: partition={} base_file={:?} log_files={} \
              latest_instant_time={} ordering_fields={:?} merge_mode={}",
             self.input_split.partition_path,
             self.input_split.base_file_path,
@@ -425,11 +460,19 @@ impl HoodieFileGroupReader {
         let schema = record_batch.schema();
 
         log::debug!(
-            "get_closable_iterator: merge complete, {} rows, {} cols",
+            "read_record_batch: merge complete, {} rows, {} cols",
             record_batch.num_rows(),
             record_batch.num_columns(),
         );
 
+        Ok((record_batch, schema))
+    }
+
+    /// Uses the core `HoodieFileGroupReader` for the full 3-phase merge.
+    pub fn get_closable_iterator(
+        &self,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+        let (record_batch, schema) = self.read_record_batch()?;
         Ok(create_raw_pointer_for_record_batches(
             vec![record_batch],
             schema,

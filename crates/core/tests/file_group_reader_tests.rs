@@ -48,6 +48,7 @@ use hudi_core::file_group::reader::HoodieFileGroupReader;
 use hudi_core::storage::Storage;
 use hudi_core::table::builder::OptionResolver;
 use hudi_test::QuickstartTripsTable;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::sync::Arc;
@@ -112,6 +113,83 @@ async fn read_file_group(
         storage,
         input_split,
         ReaderParameters::default(),
+        None, // data_schema — None means no projection
+        None, // requested_schema
+    );
+
+    reader.read().await
+}
+
+/// Read a file group with column projection.
+///
+/// Passes `data_schema` + `requested_schema` to `HoodieFileGroupReader::new()`,
+/// which mirrors Java's constructor: it creates the schema handler internally,
+/// calls `prepare_required_schema()` to add mandatory merge fields, and sets
+/// the `output_converter` for final projection.
+async fn read_file_group_with_projection(
+    table_path: &str,
+    partition: &str,
+    base_file: &str,
+    log_files: Vec<&str>,
+    requested_schema: SchemaRef,
+) -> Result<arrow_array::RecordBatch> {
+    let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
+
+    let base_path = if base_file.is_empty() {
+        None
+    } else if partition.is_empty() {
+        Some(base_file.to_string())
+    } else {
+        Some(format!("{}/{}", partition, base_file))
+    };
+    let log_paths: Vec<String> = log_files
+        .iter()
+        .map(|lf| {
+            if partition.is_empty() {
+                lf.to_string()
+            } else {
+                format!("{}/{}", partition, lf)
+            }
+        })
+        .collect();
+
+    let input_split = InputSplit::new(
+        base_path.clone(),
+        None,
+        log_paths,
+        partition.to_string(),
+    );
+
+    let mut reader_context = ReaderContext::empty();
+    reader_context.latest_commit_time = "99991231235959999".to_string();
+    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+    reader_context.table_config.insert(
+        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    reader_context.rebuild_record_context(partition.to_string());
+
+    // Read table schema from base file parquet metadata.
+    let data_schema: Option<SchemaRef> = if let Some(ref bp) = base_path {
+        storage
+            .get_parquet_file_schema(bp)
+            .await
+            .ok()
+            .map(|s| Arc::new(s) as SchemaRef)
+    } else {
+        None
+    };
+
+    // Pass data_schema + requested_schema to the constructor.
+    // The constructor creates the schema handler, calls prepare_required_schema,
+    // and sets the output_converter — matching Java's pattern.
+    let mut reader = HoodieFileGroupReader::new(
+        Arc::new(reader_context),
+        storage,
+        input_split,
+        ReaderParameters::default(),
+        data_schema,
+        Some(requested_schema),
     );
 
     reader.read().await
@@ -486,15 +564,15 @@ async fn test_e2e_v9_mor_log_only() -> Result<()> {
 }
 
 // =============================================================================
-// Test 3: Column projection — base + 2 log files (update + delete), full schema
+// Test 3: Mixed column types — base + 2 log files (update + delete), full schema
 // =============================================================================
 
-/// E2E: Read MOR table with all data types (column projection test).
+/// E2E: Read MOR table with mixed column types (int, string, double, array, map, etc.).
 ///
 /// Layout: 1 file group, 1 base file + 2 log files.
 /// Expected: 2 rows — k3 deleted, matches gold data.
 #[tokio::test]
-async fn test_e2e_v9_mor_column_projection() -> Result<()> {
+async fn test_e2e_v9_mor_mixed_column_types() -> Result<()> {
     let table_path = QuickstartTripsTable::MorLayoutColumnProjection.path_to_mor_avro();
     let gold_dir = QuickstartTripsTable::MorLayoutColumnProjection.path_to_mor_avro_gold();
 
@@ -541,5 +619,565 @@ async fn test_e2e_v9_mor_all_data_types() -> Result<()> {
 
     let gold = read_gold_parquet(&gold_dir);
     assert_matches_gold(&result, &gold, "table_all_data_types");
+    Ok(())
+}
+
+// =============================================================================
+// Test: Column projection — request subset of columns through schema handler
+// =============================================================================
+
+/// E2E: Column projection via `FileGroupReaderSchemaHandler` — explicit schemas.
+///
+/// Uses the city=sf partition (base + log merge) from V9Mor8I4UCommitTime.
+/// Requests only `id` and `name` columns. The schema handler should:
+///   1. Add `_hoodie_record_key` to required_schema (mandatory for merge)
+///   2. Read base file with only [id, name, _hoodie_record_key]
+///   3. Merge with log file (which also has _hoodie_record_key)
+///   4. Project output back to [id, name] via OutputConverter
+///
+/// NOTE: This test passes `data_schema` and `requested_schema` directly to
+/// `HoodieFileGroupReader::new()`. This exercises the direct construction path
+/// but does NOT test the FFI/builder path where schemas live on
+/// `ReaderContext.schema_handler`. See `test_e2e_v9_mor_column_projection_via_builder`
+/// for the builder path test.
+#[tokio::test]
+async fn test_e2e_v9_mor_column_projection_via_schema_handler() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+
+    // Request only id and name — NOT _hoodie_record_key, age, ts, city, etc.
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let result = read_file_group_with_projection(
+        &table_path,
+        "city=sf",
+        "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet",
+        vec![".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73"],
+        requested_schema,
+    )
+    .await?;
+
+    // Output should have exactly 2 columns: id and name.
+    let schema = result.schema();
+    let output_col_names: Vec<&str> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(
+        output_col_names,
+        vec!["id", "name"],
+        "output should contain only the requested columns"
+    );
+
+    // Verify merge results are correct (same as the non-projected test).
+    let ids = result
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .unwrap();
+    let names = result
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    let mut rows: Vec<(i32, String)> = ids
+        .iter()
+        .zip(names.iter())
+        .map(|(id, name)| (id.unwrap(), name.unwrap().to_string()))
+        .collect();
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(rows.len(), 2, "sf partition should have 2 rows");
+    assert_eq!(rows[0], (1, "Alice-V2".to_string()), "id=1 should be updated");
+    assert_eq!(rows[1], (2, "Bob".to_string()), "id=2 should be unchanged");
+
+    Ok(())
+}
+
+// =============================================================================
+// Tests: Column projection via the builder path (schemas on ReaderContext)
+//
+// These tests exercise the code path used by the FFI bridge, where schemas
+// are placed on `ReaderContext.schema_handler` and the `CoreFileGroupReader`
+// is constructed via `.builder()` WITHOUT explicit `data_schema` /
+// `requested_schema`.
+//
+// Before FIX 1 (commit wiring ReaderContext.schema_handler), the builder path
+// created an empty schema handler, so `required_schema = None`, the base file
+// was read with ALL columns, and no output projection was applied.
+// =============================================================================
+
+use hudi_core::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
+
+/// Helper: Read a file group via the builder path (schemas on ReaderContext).
+///
+/// Mimics the FFI bridge flow:
+///   1. Populate `ReaderContext.schema_handler` with table_schema, data_schema,
+///      and requested_schema (just like `new_file_group_reader_with_context` does).
+///   2. Construct `HoodieFileGroupReader` via `.builder()` WITHOUT calling
+///      `.with_data_schema()` or `.with_requested_schema()`.
+///   3. The constructor should pick up schemas from `reader_context.schema_handler`.
+async fn read_file_group_via_builder(
+    table_path: &str,
+    partition: &str,
+    base_file: &str,
+    log_files: Vec<&str>,
+    requested_schema: SchemaRef,
+) -> Result<arrow_array::RecordBatch> {
+    let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
+
+    let base_path = if base_file.is_empty() {
+        None
+    } else if partition.is_empty() {
+        Some(base_file.to_string())
+    } else {
+        Some(format!("{}/{}", partition, base_file))
+    };
+    let log_paths: Vec<String> = log_files
+        .iter()
+        .map(|lf| {
+            if partition.is_empty() {
+                lf.to_string()
+            } else {
+                format!("{}/{}", partition, lf)
+            }
+        })
+        .collect();
+
+    let input_split = InputSplit::new(
+        base_path.clone(),
+        None,
+        log_paths,
+        partition.to_string(),
+    );
+
+    // Read table schema from the base file parquet metadata (like the FFI bridge does).
+    let table_schema: Option<SchemaRef> = if let Some(ref bp) = base_path {
+        storage
+            .get_parquet_file_schema(bp)
+            .await
+            .ok()
+            .map(|s| Arc::new(s) as SchemaRef)
+    } else {
+        None
+    };
+
+    // Build schema handler the same way the FFI bridge does:
+    //   data_schema → with_table_schema + with_data_schema
+    //   requested_schema → with_requested_schema
+    let schema_handler = {
+        let mut handler = FileGroupReaderSchemaHandler::new();
+        if let Some(ts) = table_schema {
+            handler = handler
+                .with_table_schema(ts.clone())
+                .with_data_schema(ts);
+        }
+        handler = handler.with_requested_schema(requested_schema);
+        handler
+    };
+
+    let mut reader_context = ReaderContext::empty();
+    reader_context.latest_commit_time = "99991231235959999".to_string();
+    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+    reader_context.table_config.insert(
+        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    reader_context.rebuild_record_context(partition.to_string());
+    reader_context.schema_handler = schema_handler;
+    reader_context.has_log_files = !log_files.is_empty();
+
+    // Use the builder WITHOUT setting data_schema or requested_schema.
+    // This forces the constructor to use reader_context.schema_handler.
+    let mut reader = HoodieFileGroupReader::builder()
+        .with_reader_context(Arc::new(reader_context))
+        .with_storage(storage)
+        .with_input_split(input_split)
+        .with_reader_parameters(ReaderParameters::default())
+        .build()?;
+
+    reader.read().await
+}
+
+/// E2E: Column projection via the builder path — MOR merge with projection.
+///
+/// This is the critical test that would have caught the original bug:
+/// schemas are on `ReaderContext.schema_handler` (not passed as explicit args).
+/// The constructor must pick them up from `reader_context.schema_handler`.
+///
+/// Requests only `id` and `name` on the city=sf partition (MOR with log files).
+/// Validates that:
+///   - Output has exactly [id, name] — merge-internal fields stripped
+///   - Merge results are correct (Alice-V2, Bob)
+///   - Base file was NOT read with all columns (indirectly: if required_schema
+///     was None the output would have all columns, failing the schema assert)
+#[tokio::test]
+async fn test_e2e_v9_mor_column_projection_via_builder() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let result = read_file_group_via_builder(
+        &table_path,
+        "city=sf",
+        "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet",
+        vec![".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73"],
+        requested_schema,
+    )
+    .await?;
+
+    // Output should have exactly 2 columns: id and name.
+    let schema = result.schema();
+    let output_col_names: Vec<&str> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(
+        output_col_names,
+        vec!["id", "name"],
+        "builder path: output should contain only the requested columns, \
+         not all parquet columns (was the bug before FIX 1)"
+    );
+
+    // Verify merge results are correct.
+    let ids = result.column_by_name("id").unwrap().as_any()
+        .downcast_ref::<arrow_array::Int32Array>().unwrap();
+    let names = result.column_by_name("name").unwrap().as_any()
+        .downcast_ref::<arrow_array::StringArray>().unwrap();
+    let mut rows: Vec<(i32, String)> = ids.iter().zip(names.iter())
+        .map(|(id, name)| (id.unwrap(), name.unwrap().to_string())).collect();
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (1, "Alice-V2".to_string()));
+    assert_eq!(rows[1], (2, "Bob".to_string()));
+
+    Ok(())
+}
+
+/// E2E: COW (base-only) column projection via builder — no log files.
+///
+/// Tests that column pruning works on the COW path (no merge needed).
+/// Requests only `id` and `age` columns. No log files, so
+/// `generate_required_schema` returns `requested_schema` as-is (COW path).
+/// Output should have exactly [id, age] with correct values.
+#[tokio::test]
+async fn test_e2e_cow_column_projection_via_builder() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("age", DataType::Int32, true),
+    ]));
+
+    // No log files → COW path.
+    let result = read_file_group_via_builder(
+        &table_path,
+        "city=sf",
+        "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet",
+        vec![],
+        requested_schema,
+    )
+    .await?;
+
+    let schema = result.schema();
+    let output_col_names: Vec<&str> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(
+        output_col_names,
+        vec!["id", "age"],
+        "COW builder path: output should contain only [id, age]"
+    );
+
+    assert_eq!(result.num_rows(), 2, "sf base has 2 rows");
+
+    let ids = result.column_by_name("id").unwrap().as_any()
+        .downcast_ref::<arrow_array::Int32Array>().unwrap();
+    let ages = result.column_by_name("age").unwrap().as_any()
+        .downcast_ref::<arrow_array::Int32Array>().unwrap();
+    let mut rows: Vec<(i32, i32)> = ids.iter().zip(ages.iter())
+        .map(|(id, age)| (id.unwrap(), age.unwrap())).collect();
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(rows[0], (1, 30), "id=1 original age=30 (no merge)");
+    assert_eq!(rows[1], (2, 25), "id=2 original age=25");
+
+    Ok(())
+}
+
+/// E2E: Single column projection via builder — request only `name`.
+///
+/// Validates minimal column projection: only 1 user column requested.
+/// For MOR, the schema handler must still add `_hoodie_record_key` +
+/// `_hoodie_is_deleted` + `_hoodie_operation` internally, but the output
+/// must contain ONLY [name].
+#[tokio::test]
+async fn test_e2e_mor_single_column_projection_via_builder() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let result = read_file_group_via_builder(
+        &table_path,
+        "city=sf",
+        "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet",
+        vec![".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73"],
+        requested_schema,
+    )
+    .await?;
+
+    let schema = result.schema();
+    let output_col_names: Vec<&str> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(
+        output_col_names,
+        vec!["name"],
+        "single column projection: output should contain only [name]"
+    );
+
+    assert_eq!(result.num_rows(), 2);
+
+    let names = result.column_by_name("name").unwrap().as_any()
+        .downcast_ref::<arrow_array::StringArray>().unwrap();
+    let mut values: Vec<String> = names.iter()
+        .map(|n| n.unwrap().to_string()).collect();
+    values.sort();
+
+    assert!(values.contains(&"Alice-V2".to_string()), "merged name should be Alice-V2");
+    assert!(values.contains(&"Bob".to_string()), "unchanged name should be Bob");
+
+    Ok(())
+}
+
+// =============================================================================
+// Component tests: validate schema_handler.required_schema has the right columns
+// =============================================================================
+
+/// Component: Verify `required_schema` includes only the expected columns.
+///
+/// Constructs a `FileGroupReaderSchemaHandler` mimicking the FFI flow, calls
+/// `prepare_required_schema`, and verifies the computed `required_schema`
+/// contains the requested columns PLUS mandatory merge fields, but NOT the
+/// full parquet schema.
+#[test]
+fn test_component_required_schema_is_pruned_not_full() {
+    let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("_hoodie_commit_time", DataType::Utf8, true),
+        Field::new("_hoodie_commit_seqno", DataType::Utf8, true),
+        Field::new("_hoodie_record_key", DataType::Utf8, true),
+        Field::new("_hoodie_partition_path", DataType::Utf8, true),
+        Field::new("_hoodie_file_name", DataType::Utf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("age", DataType::Int32, true),
+        Field::new("ts", DataType::Utf8, true),
+    ]));
+
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let mut handler = FileGroupReaderSchemaHandler::new()
+        .with_table_schema(table_schema.clone())
+        .with_data_schema(table_schema)
+        .with_requested_schema(requested_schema);
+
+    let mut props = std::collections::HashMap::new();
+    props.insert(
+        "hoodie.table.precombine.field".to_string(),
+        "ts".to_string(),
+    );
+    props.insert(
+        "hoodie.table.recordkey.fields".to_string(),
+        "_hoodie_record_key".to_string(),
+    );
+
+    handler.prepare_required_schema(
+        true, // has_log_files (MOR)
+        &["_hoodie_record_key".to_string()],
+        &[], // no ordering fields for COMMIT_TIME_ORDERING
+        &props,
+        "COMMIT_TIME_ORDERING",
+    );
+
+    let required = handler.required_schema.as_ref()
+        .expect("required_schema should be computed");
+    let required_cols: Vec<&str> = required.fields().iter()
+        .map(|f| f.name().as_str()).collect();
+
+    // Must include user-requested columns.
+    assert!(required_cols.contains(&"id"), "must include requested 'id'");
+    assert!(required_cols.contains(&"name"), "must include requested 'name'");
+
+    // Must include merge-mandatory field.
+    assert!(
+        required_cols.contains(&"_hoodie_record_key"),
+        "must include _hoodie_record_key for merge"
+    );
+
+    // Must NOT include columns that are neither requested nor mandatory.
+    assert!(
+        !required_cols.contains(&"age"),
+        "should NOT include 'age' — not requested and not mandatory"
+    );
+    assert!(
+        !required_cols.contains(&"ts"),
+        "should NOT include 'ts' — not requested, not mandatory \
+         (COMMIT_TIME_ORDERING does not require ordering fields)"
+    );
+    assert!(
+        !required_cols.contains(&"_hoodie_commit_seqno"),
+        "should NOT include _hoodie_commit_seqno — not mandatory"
+    );
+    assert!(
+        !required_cols.contains(&"_hoodie_partition_path"),
+        "should NOT include _hoodie_partition_path — not mandatory"
+    );
+    assert!(
+        !required_cols.contains(&"_hoodie_file_name"),
+        "should NOT include _hoodie_file_name — not mandatory"
+    );
+
+    // output_converter should exist because required ≠ requested.
+    assert!(
+        handler.get_output_converter().is_some(),
+        "output_converter should be Some because required_schema has more \
+         columns than requested_schema"
+    );
+}
+
+/// Component: COW path — required_schema equals requested_schema.
+///
+/// For COW (no log files), `generate_required_schema` should return the
+/// requested schema as-is. No mandatory fields are added.
+#[test]
+fn test_component_cow_required_equals_requested() {
+    let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("_hoodie_commit_time", DataType::Utf8, true),
+        Field::new("_hoodie_record_key", DataType::Utf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("age", DataType::Int32, true),
+    ]));
+
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+    ]));
+
+    let mut handler = FileGroupReaderSchemaHandler::new()
+        .with_table_schema(table_schema.clone())
+        .with_data_schema(table_schema)
+        .with_requested_schema(requested_schema.clone());
+
+    handler.prepare_required_schema(
+        false, // no log files (COW)
+        &["_hoodie_record_key".to_string()],
+        &[],
+        &std::collections::HashMap::new(),
+        "COMMIT_TIME_ORDERING",
+    );
+
+    let required = handler.required_schema.as_ref().unwrap();
+    assert_eq!(
+        required, &requested_schema,
+        "COW: required_schema should equal requested_schema exactly"
+    );
+
+    // No output converter needed (required == requested).
+    assert!(
+        handler.get_output_converter().is_none(),
+        "COW: no output converter when required == requested"
+    );
+}
+
+/// Component: When schemas are on ReaderContext, the builder should use them.
+///
+/// This is the component-level equivalent of the E2E builder tests.
+/// Constructs ReaderContext with a pre-populated schema_handler and verifies
+/// that `HoodieFileGroupReader::new()` with `data_schema=None` picks it up.
+#[tokio::test]
+async fn test_component_builder_uses_reader_context_schema_handler() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    let (_hudi_configs, storage) = create_configs_and_storage(&table_path).await?;
+
+    let base_file = "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+
+    // Read the full parquet schema.
+    let full_schema: SchemaRef = Arc::new(storage.get_parquet_file_schema(base_file).await?);
+    let full_col_count = full_schema.fields().len();
+
+    // Request only 2 columns.
+    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let schema_handler = FileGroupReaderSchemaHandler::new()
+        .with_table_schema(full_schema.clone())
+        .with_data_schema(full_schema)
+        .with_requested_schema(requested_schema);
+
+    let mut reader_context = ReaderContext::empty();
+    reader_context.latest_commit_time = "99991231235959999".to_string();
+    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+    reader_context.table_config.insert(
+        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    reader_context.rebuild_record_context("city=sf".to_string());
+    reader_context.schema_handler = schema_handler;
+
+    // COW path (no log files) — simplest case.
+    let input_split = InputSplit::new(
+        Some(base_file.to_string()),
+        None,
+        Vec::new(),
+        "city=sf".to_string(),
+    );
+
+    // Build via builder — no explicit schemas.
+    let mut reader = HoodieFileGroupReader::builder()
+        .with_reader_context(Arc::new(reader_context))
+        .with_storage(storage)
+        .with_input_split(input_split)
+        .with_reader_parameters(ReaderParameters::default())
+        .build()?;
+
+    let result = reader.read().await?;
+
+    // The base parquet has many columns, but output should have only 2.
+    assert!(
+        full_col_count > 2,
+        "parquet should have more than 2 columns (has {full_col_count})"
+    );
+    assert_eq!(
+        result.num_columns(), 2,
+        "builder path with schema_handler: output should have only 2 columns, \
+         not all {full_col_count} parquet columns"
+    );
+
+    let schema = result.schema();
+    let output_col_names: Vec<&str> = schema.fields().iter()
+        .map(|f| f.name().as_str()).collect();
+    assert_eq!(output_col_names, vec!["id", "name"]);
+
     Ok(())
 }

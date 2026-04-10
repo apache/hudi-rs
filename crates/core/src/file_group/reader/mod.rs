@@ -65,11 +65,13 @@
 
 pub mod buffer;
 pub mod buffered_record;
+pub mod buffered_record_converter;
 pub mod delete_context;
 pub mod input_split;
 pub mod iterator_mode;
 pub mod log_record_reader;
 pub mod merged_log_record_reader;
+pub mod output_converter;
 pub mod read_stats;
 pub mod reader_context;
 pub mod reader_parameters;
@@ -83,13 +85,18 @@ use crate::error::CoreError;
 use crate::file_group::reader::buffer::loader::{
     DefaultFileGroupRecordBufferLoader, FileGroupRecordBufferLoader,
 };
+use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
+use crate::file_group::reader::buffered_record_converter::BufferedRecordConverter;
 use crate::file_group::reader::input_split::InputSplit;
 use crate::file_group::reader::iterator_mode::IteratorMode;
+use crate::file_group::reader::output_converter::OutputConverter;
 use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
+use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use crate::storage::Storage;
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use std::sync::Arc;
 
 /// The top-level file group reader orchestrator.
@@ -98,10 +105,11 @@ use std::sync::Arc;
 ///
 /// This is the main entry point for reading a file group. It:
 /// 1. Accepts an `InputSplit` describing what to read (base file + log files)
-/// 2. Creates base file iterators via storage
-/// 3. Delegates log scanning + buffer creation to `FileGroupRecordBufferLoader`
-/// 4. Merges base file records with log records via the buffer
-/// 5. Returns the merged output
+/// 2. Creates the [`FileGroupReaderSchemaHandler`] from `data_schema` + `requested_schema`
+/// 3. Creates base file iterators via storage
+/// 4. Delegates log scanning + buffer creation to `FileGroupRecordBufferLoader`
+/// 5. Merges base file records with log records via the buffer
+/// 6. Projects output back to `requested_schema` via `OutputConverter`
 ///
 /// ## Construction
 ///
@@ -128,25 +136,70 @@ pub struct HoodieFileGroupReader {
     #[allow(dead_code)]
     iterator_mode: IteratorMode,
 
+    // ── Schema (mirrors Java's readerContext.getSchemaHandler()) ───────
+    /// Schema handler created in the constructor from `data_schema` +
+    /// `requested_schema`, exactly like Java lines 119-121.
+    /// Owns the `required_schema` used for base file projection and the
+    /// `output_converter` used for final projection.
+    schema_handler: FileGroupReaderSchemaHandler,
+
     // ── Strategy ───────────────────────────────────────────────────────
     /// Buffer loader: selects buffer impl + triggers log scan.
     record_buffer_loader: DefaultFileGroupRecordBufferLoader,
 
     // ── Mutable state (populated during read) ──────────────────────────
+    /// Core structure to store and process records.
+    /// Mirrors Java's `HoodieFileGroupRecordBuffer<T> recordBuffer`.
+    record_buffer: Option<Box<dyn HoodieFileGroupRecordBuffer>>,
+
+    /// Base file record iterator (set during `initRecordIterators`).
+    /// Mirrors Java's `ClosableIterator<T> baseFileIterator`.
+    base_file_iterator: Option<Vec<RecordBatch>>,
+
+    /// Optional converter for projecting/transforming output records.
+    /// Mirrors Java's `Option<UnaryOperator<T>> outputConverter`.
+    output_converter: Option<Box<dyn OutputConverter>>,
+
     /// Read statistics accumulator.
     read_stats: HoodieReadStats,
 
     /// Valid block instants from log scanning.
     valid_block_instants: Vec<String>,
+
+    /// Converter for engine records to [`BufferedRecord`].
+    /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
+    buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
 }
 
 impl HoodieFileGroupReader {
     /// Create a new file group reader.
+    ///
+    /// Mirrors Java's `HoodieFileGroupReader(readerContext, storage, tablePath,
+    /// latestCommitTime, dataSchema, requestedSchema, ...)` constructor.
+    ///
+    /// The constructor:
+    /// 1. Creates a [`FileGroupReaderSchemaHandler`] from `data_schema` +
+    ///    `requested_schema` (Java lines 119-121)
+    /// 2. Calls `prepare_required_schema()` to compute the `required_schema`
+    ///    (Java: automatic in `FileGroupReaderSchemaHandler` constructor, line 105)
+    /// 3. Obtains the `output_converter` from the schema handler (Java line 122)
+    ///
+    /// # Arguments
+    /// * `reader_context` — Engine context with merge mode, ordering fields, table config.
+    /// * `storage` — Storage layer for reading base files and log files.
+    /// * `input_split` — Describes what to read (base file path, log file paths, partition).
+    /// * `reader_parameters` — Reader flags (use_record_position, emit_delete, etc.).
+    /// * `data_schema` — Full table schema (what columns exist in the files).
+    ///    Maps to Java's `dataSchema` / `tableSchema` parameter.
+    /// * `requested_schema` — Column projection requested by the caller.
+    ///    Maps to Java's `requestedSchema` parameter. `None` means all columns.
     pub fn new(
         reader_context: Arc<ReaderContext>,
         storage: Arc<Storage>,
         input_split: InputSplit,
         reader_parameters: ReaderParameters,
+        data_schema: Option<SchemaRef>,
+        requested_schema: Option<SchemaRef>,
     ) -> Self {
         log::debug!(
             "HoodieFileGroupReader::new partition={} base_file={} log_files={} \
@@ -161,15 +214,69 @@ impl HoodieFileGroupReader {
         for (i, lf) in input_split.log_file_paths.iter().enumerate() {
             log::debug!("  log_file[{i}]: {lf}");
         }
+
+        // Mirrors Java lines 119-121:
+        // readerContext.setSchemaHandler(
+        //     new FileGroupReaderSchemaHandler(readerContext, dataSchema, requestedSchema, ...));
+        //
+        // When schemas are explicitly provided (direct construction / tests), create
+        // a new handler. When they are not provided (FFI path via builder), use the
+        // handler already on reader_context — which was populated by the FFI bridge
+        // from the Avro JSON schemas passed through the Substrait proto.
+        let mut schema_handler = if data_schema.is_some() || requested_schema.is_some() {
+            let mut handler = FileGroupReaderSchemaHandler::new();
+            if let Some(ds) = data_schema {
+                handler = handler.with_table_schema(ds.clone()).with_data_schema(ds);
+            }
+            if let Some(rs) = requested_schema {
+                handler = handler.with_requested_schema(rs);
+            }
+            handler
+        } else {
+            reader_context.schema_handler.clone()
+        };
+
+        // Mirrors Java FileGroupReaderSchemaHandler constructor line 105:
+        // this.requiredSchema = prepareRequiredSchema(this.deleteContext);
+        schema_handler.prepare_required_schema(
+            input_split.has_log_files(),
+            &[reader_context.record_key_field().to_string()],
+            &reader_context.ordering_field_names().to_vec(),
+            &reader_context.table_config,
+            &reader_context.merge_mode,
+        );
+
+        // Bootstrap merge reordering is not yet supported in hudi-rs.
+        // Java's prepareRequiredSchema() (lines 280-288) partitions fields into
+        // meta and data columns and reorders them for bootstrap tables. Until
+        // that is implemented, reject bootstrap merge at construction time.
+        if reader_context.needs_bootstrap_merge {
+            panic!(
+                "Bootstrap merge is not yet supported in hudi-rs. \
+                 Table at '{}' has bootstrap base files that require \
+                 meta/data column reordering.",
+                reader_context.table_path,
+            );
+        }
+
+        // Mirrors Java line 122:
+        // this.outputConverter = readerContext.getSchemaHandler().getOutputConverter();
+        let output_converter = schema_handler.get_output_converter();
+
         Self {
             reader_context,
             storage,
             input_split,
             reader_parameters,
             iterator_mode: IteratorMode::EngineRecord,
+            schema_handler,
             record_buffer_loader: DefaultFileGroupRecordBufferLoader::new(),
+            record_buffer: None,
+            base_file_iterator: None,
+            output_converter,
             read_stats: HoodieReadStats::default(),
             valid_block_instants: Vec::new(),
+            buffered_record_converter: None,
         }
     }
 
@@ -213,6 +320,7 @@ impl HoodieFileGroupReader {
         );
 
         // Step 1: Make base file iterator (read base file data)
+        // Mirrors Java: this.baseFileIterator = makeBaseFileIterator();
         let base_file_batches = self.make_base_file_batches().await?;
         let base_rows: usize = base_file_batches.iter().map(|b| b.num_rows()).sum();
         log::debug!(
@@ -225,28 +333,32 @@ impl HoodieFileGroupReader {
             let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             log::debug!("[HoodieFileGroupReader] base file schema: {:?}", field_names);
         }
+        self.base_file_iterator = Some(base_file_batches);
 
         // Step 2: If no records to merge (no log files), return base file data directly
         if self.input_split.has_no_records_to_merge() {
+            let batches = self.base_file_iterator.as_ref().unwrap();
             log::debug!("[HoodieFileGroupReader] no log files → returning base file data directly ({base_rows} rows)");
-            if base_file_batches.is_empty() {
+            if batches.is_empty() {
                 // No base file and no log files — return empty batch.
-                return Ok(RecordBatch::new_empty(std::sync::Arc::new(
-                    arrow_schema::Schema::empty(),
-                )));
+                return self.apply_output_converter(RecordBatch::new_empty(
+                    std::sync::Arc::new(arrow_schema::Schema::empty()),
+                ));
             }
-            return arrow::compute::concat_batches(
-                &base_file_batches[0].schema(),
-                &base_file_batches,
+            let result = arrow::compute::concat_batches(
+                &batches[0].schema(),
+                batches,
             )
             .map_err(|e| {
                 CoreError::ReadFileSliceError(format!(
                     "Failed to concatenate base file batches: {e}"
                 ))
-            });
+            })?;
+            return self.apply_output_converter(result);
         }
 
         // Step 3: Load record buffer (scan log files + create buffer)
+        // Mirrors Java: this.recordBuffer = recordBufferLoader.getRecordBuffer(...).getLeft();
         log::debug!(
             "[HoodieFileGroupReader] scanning {} log file(s) with latest_commit_time={}",
             self.input_split.log_file_paths.len(),
@@ -263,8 +375,10 @@ impl HoodieFileGroupReader {
             )
             .await?;
 
-        let mut record_buffer = load_result.record_buffer;
+        self.record_buffer = Some(load_result.record_buffer);
         self.valid_block_instants = load_result.valid_block_instants;
+
+        let record_buffer = self.record_buffer.as_mut().unwrap();
 
         log::debug!(
             "[HoodieFileGroupReader] log scan complete: buffer_size={} valid_instants={:?} \
@@ -284,51 +398,114 @@ impl HoodieFileGroupReader {
         // non-deterministic, so the first record could be a delete with no
         // data schema).
         if let Some(schema) = self
-            .reader_context
             .schema_handler
-            .data_schema
+            .required_schema
             .as_ref()
-            .or(self.reader_context.schema_handler.requested_schema.as_ref())
+            .or(self.schema_handler.data_schema.as_ref())
+            .or(self.schema_handler.requested_schema.as_ref())
         {
             record_buffer.set_reader_schema(schema.clone());
         }
 
         // Step 4b: Set base file iterator on the buffer
-        record_buffer.set_base_file_iterator(base_file_batches);
+        // Mirrors Java: recordBuffer.setBaseFileIterator(baseFileIterator);
+        let base_batches = self.base_file_iterator.take().unwrap_or_default();
+        record_buffer.set_base_file_iterator(base_batches);
         log::debug!(
             "[HoodieFileGroupReader] set base file iterator ({base_rows} rows), starting merge_and_collect"
         );
 
-        // Step 5: Merge and collect
+        // Step 5: Merge and collect — take ownership of the buffer since
+        // merge_and_collect consumes it (mirrors Java's close() lifecycle).
+        let record_buffer = self.record_buffer.take().unwrap();
         let result = record_buffer.merge_and_collect()?;
         log::debug!(
             "[HoodieFileGroupReader] merge_and_collect complete: {} rows, {} columns",
             result.num_rows(),
             result.num_columns(),
         );
-        Ok(result)
+        self.apply_output_converter(result)
     }
 
-    /// Read base file data.
+    /// Read base file data and initialize the buffered record converter.
     ///
-    /// Mirrors Java's `HoodieFileGroupReader.makeBaseFileIterator()` which calls
-    /// `readerContext.getFileRecordIterator(...)`.
-    async fn make_base_file_batches(&self) -> Result<Vec<RecordBatch>> {
+    /// Mirrors Java's `HoodieFileGroupReader.makeBaseFileIterator()` which:
+    /// 1. Returns empty iterator if no base file
+    /// 2. Creates `bufferedRecordConverter` via `BufferedRecordConverter.createConverter(...)`
+    /// 3. Reads the base file via `readerContext.getFileRecordIterator(...)`
+    async fn make_base_file_batches(&mut self) -> Result<Vec<RecordBatch>> {
         match &self.input_split.base_file_path {
             Some(path) => {
-                let batch = self
-                    .storage
-                    .get_parquet_file_data(path)
-                    .await
-                    .map_err(|e| {
-                        CoreError::ReadFileSliceError(format!(
-                            "Failed to read base file '{path}': {e:?}"
-                        ))
-                    })?;
+                // Mirrors Java: this.bufferedRecordConverter = BufferedRecordConverter.createConverter(
+                //     readerContext.getIteratorMode(), readerContext.getSchemaHandler().getRequiredSchema(),
+                //     readerContext.getRecordContext(), orderingFieldNames);
+                // In Rust, the converter is set externally or already present; log if missing.
+                if self.buffered_record_converter.is_none() {
+                    log::debug!(
+                        "[HoodieFileGroupReader] makeBaseFileIterator: no bufferedRecordConverter set \
+                         (batch-level read does not require per-record conversion)"
+                    );
+                }
+
+                // Mirrors Java line 159-162:
+                // readerContext.getFileRecordIterator(pathInfo, start, len,
+                //     schemaHandler.getTableSchema(), schemaHandler.getRequiredSchema(), storage)
+                let batch = if let Some(required_schema) =
+                    &self.schema_handler.required_schema
+                {
+                    self.storage
+                        .get_parquet_file_data_projected(path, required_schema)
+                        .await
+                        .map_err(|e| {
+                            CoreError::ReadFileSliceError(format!(
+                                "Failed to read base file '{path}' with projection: {e:?}"
+                            ))
+                        })?
+                } else {
+                    self.storage
+                        .get_parquet_file_data(path)
+                        .await
+                        .map_err(|e| {
+                            CoreError::ReadFileSliceError(format!(
+                                "Failed to read base file '{path}': {e:?}"
+                            ))
+                        })?
+                };
                 Ok(vec![batch])
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Apply the output converter to the final result, if set.
+    ///
+    /// Mirrors Java's `next()`:
+    /// ```java
+    /// if (outputConverter.isPresent()) {
+    ///     return nextVal.project(outputConverter.get());
+    /// }
+    /// ```
+    fn apply_output_converter(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        match &self.output_converter {
+            Some(converter) => converter.apply(batch),
+            None => Ok(batch),
+        }
+    }
+
+    // =========================================================================
+    // Setters (mirrors Java's mutable field assignments)
+    // =========================================================================
+
+    /// Set the output converter.
+    /// Mirrors Java: `this.outputConverter = readerContext.getSchemaHandler().getOutputConverter()`.
+    pub fn set_output_converter(&mut self, converter: Box<dyn OutputConverter>) {
+        self.output_converter = Some(converter);
+    }
+
+    /// Set the buffered record converter.
+    /// Mirrors Java: `this.bufferedRecordConverter = BufferedRecordConverter.createConverter(...)`.
+    pub fn set_buffered_record_converter(&mut self, converter: Box<dyn BufferedRecordConverter>) {
+        self.buffered_record_converter = Some(converter);
     }
 
     // =========================================================================
@@ -359,6 +536,8 @@ pub struct HoodieFileGroupReaderBuilder {
     storage: Option<Arc<Storage>>,
     input_split: Option<InputSplit>,
     reader_parameters: ReaderParameters,
+    data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
 }
 
 impl HoodieFileGroupReaderBuilder {
@@ -382,6 +561,20 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
+    /// Set the data schema (full table schema).
+    /// Mirrors Java's `Builder.withDataSchema(Schema dataSchema)`.
+    pub fn with_data_schema(mut self, schema: SchemaRef) -> Self {
+        self.data_schema = Some(schema);
+        self
+    }
+
+    /// Set the requested schema (column projection).
+    /// Mirrors Java's `Builder.withRequestedSchema(Schema requestedSchema)`.
+    pub fn with_requested_schema(mut self, schema: SchemaRef) -> Self {
+        self.requested_schema = Some(schema);
+        self
+    }
+
     pub fn build(self) -> Result<HoodieFileGroupReader> {
         let reader_context = self
             .reader_context
@@ -398,6 +591,8 @@ impl HoodieFileGroupReaderBuilder {
             storage,
             input_split,
             self.reader_parameters,
+            self.data_schema,
+            self.requested_schema,
         );
 
         Ok(reader)

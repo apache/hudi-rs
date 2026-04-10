@@ -30,6 +30,7 @@ use crate::file_group::reader::HoodieFileGroupReader;
 use crate::file_group::reader::input_split::InputSplit;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
+use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
@@ -285,12 +286,34 @@ impl FileGroupReader {
             // derive ordering fields and key extraction strategy.
             reader_context.table_config = self.hudi_configs.as_options();
             reader_context.rebuild_record_context(String::new());
+            reader_context.has_log_files = true;
+
+            // Populate schema_handler from base file parquet metadata.
+            // Mirrors Java: readerContext.setSchemaHandler(new FileGroupReaderSchemaHandler(
+            //     readerContext, dataSchema, requestedSchema, ...))
+            if let Ok(table_schema) = self.storage.get_parquet_file_schema(base_file_path).await {
+                let table_schema: arrow_schema::SchemaRef = Arc::new(table_schema);
+                let mut schema_handler = FileGroupReaderSchemaHandler::new()
+                    .with_table_schema(table_schema.clone())
+                    .with_data_schema(table_schema);
+                // requested_schema = None → "all columns" (user projection wired in follow-up)
+                schema_handler.prepare_required_schema(
+                    true, // has_log_files
+                    &[reader_context.record_key_field().to_string()],
+                    &reader_context.ordering_field_names().to_vec(),
+                    &reader_context.table_config,
+                    &reader_context.merge_mode,
+                );
+                reader_context.schema_handler = schema_handler;
+            }
 
             let mut reader = HoodieFileGroupReader::new(
                 Arc::new(reader_context),
                 self.storage.clone(),
                 input_split,
                 ReaderParameters::default(),
+                None,
+                None,
             );
 
             reader.read().await
@@ -319,6 +342,8 @@ impl FileGroupReader {
             self.storage.clone(),
             input_split,
             ReaderParameters::default(),
+            None,
+            None,
         );
 
         reader.read().await
