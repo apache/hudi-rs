@@ -43,3 +43,10 @@ Here is how hudi-internal contruct the record context and inject into the fg rea
                                     this.recordContext = recordContext   ← stores the already-built    
 
 We should restrict the construction part of the record context to take the same set of variables  (seems to be tableConfig only) and do the same injection into the fg reader
+
+====
+
+  B1: isDeleteRecord() never called during data block processing
+
+  - Java: processDataBlock:99 calls recordContext.isDeleteRecord(nextRecord, deleteContext) for every data record
+  - hudi-rs: process_data_block() (key_based.rs:172-196) never calls it — soft-delete records (_hoodie_is_deleted=true) are ingested as normal records

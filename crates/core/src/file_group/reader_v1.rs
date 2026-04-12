@@ -176,15 +176,15 @@ impl FileGroupReader {
             .hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into();
-        let start_timestamp = self
+        let start_instant = self
             .hudi_configs
             .try_get(HudiReadConfig::FileGroupStartTimestamp)
             .map(|v| -> String { v.into() });
-        let end_timestamp = self
+        let end_instant = self
             .hudi_configs
             .try_get(HudiReadConfig::FileGroupEndTimestamp)
             .map(|v| -> String { v.into() });
-        InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
+        InstantRange::new(timezone, start_instant, end_instant, false, true)
     }
 
     /// Reads the data from the given file slice.
@@ -299,9 +299,10 @@ impl FileGroupReader {
                 // requested_schema = None → "all columns" (user projection wired in follow-up)
                 schema_handler.prepare_required_schema(
                     true, // has_log_files
-                    &[reader_context.record_key_field().to_string()],
+                    &reader_context.record_key_fields(),
                     &reader_context.ordering_field_names().to_vec(),
                     &reader_context.table_config,
+                    reader_context.instant_range.is_some(),
                     &reader_context.merge_mode,
                 );
                 reader_context.schema_handler = schema_handler;

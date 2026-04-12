@@ -95,7 +95,7 @@ use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::reader_parameters::ReaderParameters;
 use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use crate::storage::Storage;
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
 
@@ -238,11 +238,17 @@ impl HoodieFileGroupReader {
 
         // Mirrors Java FileGroupReaderSchemaHandler constructor line 105:
         // this.requiredSchema = prepareRequiredSchema(this.deleteContext);
+        //
+        // Uses record_key_fields() (all key fields) instead of record_key_field()
+        // (single) to support composite record keys in virtual-key mode.
+        // Mirrors Java's getMandatoryFieldsForMerging() lines 250-258.
+        let has_instant_range = reader_context.instant_range.is_some();
         schema_handler.prepare_required_schema(
             input_split.has_log_files(),
-            &[reader_context.record_key_field().to_string()],
+            &reader_context.record_key_fields(),
             &reader_context.ordering_field_names().to_vec(),
             &reader_context.table_config,
+            has_instant_range,
             &reader_context.merge_mode,
         );
 
@@ -262,6 +268,17 @@ impl HoodieFileGroupReader {
         // Mirrors Java line 122:
         // this.outputConverter = readerContext.getSchemaHandler().getOutputConverter();
         let output_converter = schema_handler.get_output_converter();
+
+        // Propagate the prepared schema_handler back onto a new reader_context
+        // so downstream consumers (record buffer, log scanner) see the canonical
+        // schema_handler with its stored DeleteContext. Mirrors Java's
+        // `readerContext.setSchemaHandler(...)` — in Java the reader context is
+        // mutable; in Rust we create a new Arc with the updated handler.
+        let reader_context = {
+            let mut updated = (*reader_context).clone();
+            updated.schema_handler = schema_handler.clone();
+            Arc::new(updated)
+        };
 
         Self {
             reader_context,
@@ -321,7 +338,7 @@ impl HoodieFileGroupReader {
 
         // Step 1: Make base file iterator (read base file data)
         // Mirrors Java: this.baseFileIterator = makeBaseFileIterator();
-        let base_file_batches = self.make_base_file_batches().await?;
+        let mut base_file_batches = self.make_base_file_batches().await?;
         let base_rows: usize = base_file_batches.iter().map(|b| b.num_rows()).sum();
         log::debug!(
             "[HoodieFileGroupReader] makeBaseFileIterator: {} batches, {} total rows",
@@ -333,6 +350,20 @@ impl HoodieFileGroupReader {
             let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             log::debug!("[HoodieFileGroupReader] base file schema: {:?}", field_names);
         }
+
+        // Apply instant range filter on base file records.
+        // Mirrors Java's makeBaseFileIterator() lines 169-171:
+        //   return readerContext.getInstantRange().isPresent()
+        //       ? readerContext.applyInstantRangeFilter(recordIterator)
+        //       : recordIterator;
+        if self.reader_context.instant_range.is_some() {
+            base_file_batches = self.apply_instant_range_filter(base_file_batches)?;
+            let filtered_rows: usize = base_file_batches.iter().map(|b| b.num_rows()).sum();
+            log::debug!(
+                "[HoodieFileGroupReader] applyInstantRangeFilter: {base_rows} → {filtered_rows} rows"
+            );
+        }
+
         self.base_file_iterator = Some(base_file_batches);
 
         // Step 2: If no records to merge (no log files), return base file data directly
@@ -490,6 +521,110 @@ impl HoodieFileGroupReader {
             Some(converter) => converter.apply(batch),
             None => Ok(batch),
         }
+    }
+
+    /// Filter base file records by instant range on `_hoodie_commit_time`.
+    ///
+    /// Mirrors Java's `HoodieReaderContext.applyInstantRangeFilter()` (lines 354-365):
+    /// ```java
+    /// if (HoodieTableMetadata.isMetadataTable(tablePath)) {
+    ///     return fileRecordIterator; // skip for metadata table
+    /// }
+    /// InstantRange instantRange = getInstantRange().get();
+    /// int commitTimePos = schemaHandler.getRequiredSchema().getField(COMMIT_TIME_METADATA_FIELD).pos();
+    /// Predicate<T> instantFilter = row -> instantRange.isInRange(getMetaFieldValue(row, commitTimePos));
+    /// return new CloseableFilterIterator<>(fileRecordIterator, instantFilter);
+    /// ```
+    ///
+    /// In Rust/Arrow, we use columnar filtering: extract the `_hoodie_commit_time`
+    /// column, build a boolean mask, and use `arrow::compute::filter_record_batch`.
+    fn apply_instant_range_filter(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        let instant_range = match &self.reader_context.instant_range {
+            Some(range) => range,
+            None => return Ok(batches),
+        };
+
+        // Skip filtering for metadata table (mirrors Java line 356).
+        if crate::util::path::is_metadata_table_path(&self.reader_context.table_path) {
+            return Ok(batches);
+        }
+
+        let timezone = self.reader_context.timezone();
+        let mut filtered = Vec::with_capacity(batches.len());
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                filtered.push(batch);
+                continue;
+            }
+
+            // Find _hoodie_commit_time column position.
+            let commit_time_idx = match batch.schema().index_of("_hoodie_commit_time") {
+                Ok(idx) => idx,
+                Err(_) => {
+                    // Column not present — cannot filter. Pass through.
+                    // This can happen if the schema didn't include commit_time
+                    // (e.g., schema was not properly prepared).
+                    log::warn!(
+                        "[HoodieFileGroupReader] applyInstantRangeFilter: \
+                         _hoodie_commit_time column not found in base file schema, \
+                         skipping filter"
+                    );
+                    filtered.push(batch);
+                    continue;
+                }
+            };
+
+            let commit_time_col = batch
+                .column(commit_time_idx)
+                .as_any()
+                .downcast_ref::<StringArray>();
+
+            let commit_time_col = match commit_time_col {
+                Some(col) => col,
+                None => {
+                    log::warn!(
+                        "[HoodieFileGroupReader] applyInstantRangeFilter: \
+                         _hoodie_commit_time is not a StringArray, skipping filter"
+                    );
+                    filtered.push(batch);
+                    continue;
+                }
+            };
+
+            // Build boolean mask: true for rows in range.
+            let mut mask_builder =
+                arrow_array::builder::BooleanBuilder::with_capacity(batch.num_rows());
+            for i in 0..commit_time_col.len() {
+                if commit_time_col.is_null(i) {
+                    mask_builder.append_value(false);
+                } else {
+                    let ts = commit_time_col.value(i);
+                    let in_range = instant_range
+                        .is_in_range(ts, &timezone)
+                        .map_err(|e| {
+                            CoreError::ReadFileSliceError(format!(
+                                "Failed to check instant range for '{ts}': {e}"
+                            ))
+                        })?;
+                    mask_builder.append_value(in_range);
+                }
+            }
+            let mask = mask_builder.finish();
+
+            let filtered_batch =
+                arrow::compute::filter_record_batch(&batch, &mask).map_err(|e| {
+                    CoreError::ReadFileSliceError(format!(
+                        "Failed to filter base file batch by instant range: {e}"
+                    ))
+                })?;
+            filtered.push(filtered_batch);
+        }
+
+        Ok(filtered)
     }
 
     // =========================================================================

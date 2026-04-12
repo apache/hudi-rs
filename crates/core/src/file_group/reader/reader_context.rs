@@ -101,6 +101,50 @@ impl ReaderContext {
         &self.record_context.record_key_field
     }
 
+    /// Return ALL record key field names for schema computation.
+    ///
+    /// Mirrors Java's `getMandatoryFieldsForMerging()` (lines 250-258):
+    /// ```java
+    /// if (cfg.populateMetaFields()) {
+    ///     requiredFields.add(HoodieRecord.RECORD_KEY_METADATA_FIELD);
+    /// } else {
+    ///     requiredFields.addAll(Arrays.asList(cfg.getRecordKeyFields().get()));
+    /// }
+    /// ```
+    ///
+    /// When `populateMetaFields` is true, returns `["_hoodie_record_key"]`.
+    /// When false (virtual keys), returns ALL configured record key fields
+    /// (supports composite keys like `["pk1", "pk2"]`).
+    ///
+    /// This differs from `record_key_field()` which returns only the first
+    /// field (used for per-record key extraction in the buffer).
+    pub fn record_key_fields(&self) -> Vec<String> {
+        let populate = self
+            .table_config
+            .get(HudiTableConfig::PopulatesMetaFields.as_ref())
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        if populate {
+            vec![crate::metadata::meta_field::MetaField::RecordKey
+                .as_ref()
+                .to_string()]
+        } else {
+            self.table_config
+                .get(HudiTableConfig::RecordKeyFields.as_ref())
+                .map(|fields| {
+                    fields
+                        .split(',')
+                        .map(|f| f.trim().to_string())
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![crate::metadata::meta_field::MetaField::RecordKey
+                        .as_ref()
+                        .to_string()]
+                })
+        }
+    }
+
     /// Convenience accessor — mirrors Java's ordering field names used by
     /// the merge pipeline.
     pub fn ordering_field_names(&self) -> &[String] {

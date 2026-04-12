@@ -42,7 +42,6 @@ use crate::file_group::reader::buffer::record_buffer::FileGroupRecordBuffer;
 use crate::file_group::reader::buffer::row_extraction::records_to_batch;
 use crate::file_group::reader::buffer::{BufferType, HoodieFileGroupRecordBuffer};
 use crate::file_group::reader::buffered_record::{BufferedRecord, BufferedRecords, DeleteRecord};
-use crate::file_group::reader::delete_context::DeleteContext;
 use crate::file_group::reader::read_stats::HoodieReadStats;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::reader::record_context::RecordContext;
@@ -108,16 +107,19 @@ impl KeyBasedFileGroupRecordBuffer {
         // readerContext.getRecordContext() returning the same instance).
         let record_context = reader_context.get_record_context().clone();
 
-        // Create DeleteContext from table properties and table schema (Phase 1).
-        // Mirrors Java's `new DeleteContext(properties, tableSchema)` in
-        // FileGroupReaderSchemaHandler, then enriched with reader schema
-        // in FileGroupRecordBuffer via `set_reader_schema`.
-        let delete_context =
-            if let Some(table_schema) = &reader_context.schema_handler.table_schema {
-                DeleteContext::new(&reader_context.table_config, table_schema)
-            } else {
-                DeleteContext::from_props(&reader_context.table_config)
-            };
+        // Get the canonical DeleteContext from the schema handler (single source
+        // of truth). Mirrors Java's `readerContext.getSchemaHandler().getDeleteContext()`.
+        //
+        // The schema handler creates the DeleteContext during
+        // `prepare_required_schema()` and stores it. HoodieFileGroupReader
+        // propagates the prepared schema_handler onto reader_context before
+        // the buffer is created, so `reader_context.schema_handler.delete_context()`
+        // always returns the canonical instance.
+        let delete_context = reader_context
+            .schema_handler
+            .delete_context()
+            .cloned()
+            .expect("DeleteContext must be set on schema_handler by prepare_required_schema()");
 
         let mut base = FileGroupRecordBuffer::new(
             merge_mode,
@@ -441,6 +443,7 @@ mod tests {
     use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlockContent};
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader::buffered_record::OrderingValue;
+    use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
     use crate::file_group::record_batches::RecordBatches;
     use arrow_array::{Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -513,6 +516,22 @@ mod tests {
             "ts".to_string(),
         );
         ctx.rebuild_record_context(String::new());
+        // Prepare the schema handler so it creates and stores a DeleteContext
+        // (required by KeyBasedFileGroupRecordBuffer::new).
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(create_test_schema())
+            .with_data_schema(create_test_schema());
+        let key_field = ctx.record_key_field().to_string();
+        let ordering = ctx.record_context.ordering_field_names.clone();
+        handler.prepare_required_schema(
+            true,
+            &[key_field],
+            &ordering,
+            &ctx.table_config,
+            false,
+            merge_mode,
+        );
+        ctx.schema_handler = handler;
         let ctx = Arc::new(ctx);
         let read_stats = HoodieReadStats::default();
         KeyBasedFileGroupRecordBuffer::new(
@@ -1230,6 +1249,21 @@ mod tests {
             delete_marker_value.to_string(),
         );
         ctx.rebuild_record_context(String::new());
+        // Prepare the schema handler so it creates and stores a DeleteContext.
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(create_test_schema())
+            .with_data_schema(create_test_schema());
+        let key_field = ctx.record_key_field().to_string();
+        let ordering = ctx.record_context.ordering_field_names.clone();
+        handler.prepare_required_schema(
+            true,
+            &[key_field],
+            &ordering,
+            &ctx.table_config,
+            false,
+            merge_mode,
+        );
+        ctx.schema_handler = handler;
         let ctx = Arc::new(ctx);
         let read_stats = HoodieReadStats::default();
         KeyBasedFileGroupRecordBuffer::new(ctx, merge_mode.to_string(), &read_stats).unwrap()

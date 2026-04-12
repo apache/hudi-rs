@@ -29,8 +29,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct InstantRange {
     timezone: String,
-    start_timestamp: Option<String>,
-    end_timestamp: Option<String>,
+    start_instant: Option<String>,
+    end_instant: Option<String>,
     start_inclusive: bool,
     end_inclusive: bool,
 }
@@ -38,48 +38,48 @@ pub struct InstantRange {
 impl InstantRange {
     pub fn new(
         timezone: String,
-        start_timestamp: Option<String>,
-        end_timestamp: Option<String>,
+        start_instant: Option<String>,
+        end_instant: Option<String>,
         start_inclusive: bool,
         end_inclusive: bool,
     ) -> Self {
         Self {
             timezone,
-            start_timestamp,
-            end_timestamp,
+            start_instant,
+            end_instant,
             start_inclusive,
             end_inclusive,
         }
     }
 
     /// Create a new [InstantRange] with a closed end timestamp range.
-    pub fn up_to(end_timestamp: &str, timezone: &str) -> Self {
+    pub fn up_to(end_instant: &str, timezone: &str) -> Self {
         Self::new(
             timezone.to_string(),
             None,
-            Some(end_timestamp.to_string()),
+            Some(end_instant.to_string()),
             false,
             true,
         )
     }
 
     /// Create a new [InstantRange] with an open timestamp range.
-    pub fn within(start_timestamp: &str, end_timestamp: &str, timezone: &str) -> Self {
+    pub fn within(start_instant: &str, end_instant: &str, timezone: &str) -> Self {
         Self::new(
             timezone.to_string(),
-            Some(start_timestamp.to_string()),
-            Some(end_timestamp.to_string()),
+            Some(start_instant.to_string()),
+            Some(end_instant.to_string()),
             false,
             false,
         )
     }
 
     /// Create a new [InstantRange] with an open start and closed end timestamp range.
-    pub fn within_open_closed(start_timestamp: &str, end_timestamp: &str, timezone: &str) -> Self {
+    pub fn within_open_closed(start_instant: &str, end_instant: &str, timezone: &str) -> Self {
         Self::new(
             timezone.to_string(),
-            Some(start_timestamp.to_string()),
-            Some(end_timestamp.to_string()),
+            Some(start_instant.to_string()),
+            Some(end_instant.to_string()),
             false,
             true,
         )
@@ -89,15 +89,15 @@ impl InstantRange {
         &self.timezone
     }
 
-    pub fn start_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
-        self.start_timestamp
+    pub fn start_instant(&self) -> Result<Option<DateTime<Utc>>> {
+        self.start_instant
             .as_deref()
             .map(|timestamp| Instant::parse_datetime(timestamp, &self.timezone))
             .transpose()
     }
 
-    pub fn end_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
-        self.end_timestamp
+    pub fn end_instant(&self) -> Result<Option<DateTime<Utc>>> {
+        self.end_instant
             .as_deref()
             .map(|timestamp| Instant::parse_datetime(timestamp, &self.timezone))
             .transpose()
@@ -105,7 +105,7 @@ impl InstantRange {
 
     pub fn is_in_range(&self, timestamp: &str, timezone: &str) -> Result<bool> {
         let t = Instant::parse_datetime(timestamp, timezone)?;
-        if let Some(start) = self.start_timestamp()? {
+        if let Some(start) = self.start_instant()? {
             if self.start_inclusive {
                 if t < start {
                     return Ok(false);
@@ -115,7 +115,7 @@ impl InstantRange {
             }
         }
 
-        if let Some(end) = self.end_timestamp()? {
+        if let Some(end) = self.end_instant()? {
             if self.end_inclusive {
                 if t > end {
                     return Ok(false);
@@ -385,8 +385,8 @@ mod tests {
         );
 
         assert_eq!(range.timezone(), "UTC");
-        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
-        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert_eq!(range.start_instant.as_deref(), Some("20240101000000000"));
+        assert_eq!(range.end_instant.as_deref(), Some("20241231235959999"));
         assert!(range.start_inclusive);
         assert!(!range.end_inclusive);
     }
@@ -396,8 +396,8 @@ mod tests {
         let range = InstantRange::up_to("20241231235959999", "UTC");
 
         assert_eq!(range.timezone(), "UTC");
-        assert!(range.start_timestamp.is_none());
-        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert!(range.start_instant.is_none());
+        assert_eq!(range.end_instant.as_deref(), Some("20241231235959999"));
         assert!(!range.start_inclusive);
         assert!(range.end_inclusive);
     }
@@ -407,8 +407,8 @@ mod tests {
         let range = InstantRange::within("20240101000000000", "20241231235959999", "UTC");
 
         assert_eq!(range.timezone(), "UTC");
-        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
-        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert_eq!(range.start_instant.as_deref(), Some("20240101000000000"));
+        assert_eq!(range.end_instant.as_deref(), Some("20241231235959999"));
         assert!(!range.start_inclusive);
         assert!(!range.end_inclusive);
     }
@@ -419,8 +419,8 @@ mod tests {
             InstantRange::within_open_closed("20240101000000000", "20241231235959999", "UTC");
 
         assert_eq!(range.timezone(), "UTC");
-        assert_eq!(range.start_timestamp.as_deref(), Some("20240101000000000"));
-        assert_eq!(range.end_timestamp.as_deref(), Some("20241231235959999"));
+        assert_eq!(range.start_instant.as_deref(), Some("20240101000000000"));
+        assert_eq!(range.end_instant.as_deref(), Some("20241231235959999"));
         assert!(!range.start_inclusive);
         assert!(range.end_inclusive);
     }

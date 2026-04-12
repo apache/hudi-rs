@@ -378,7 +378,25 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_test_reader_context() -> Arc<ReaderContext> {
-        Arc::new(ReaderContext::empty())
+        let mut ctx = ReaderContext::empty();
+        // Prepare schema handler with DeleteContext for buffer construction.
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, false),
+        ]));
+        let mut handler =
+            crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler::new()
+                .with_table_schema(schema.clone())
+                .with_data_schema(schema);
+        handler.prepare_required_schema(
+            true,
+            &["_hoodie_record_key".to_string()],
+            &[],
+            &ctx.table_config,
+            false,
+            "COMMIT_TIME_ORDERING",
+        );
+        ctx.schema_handler = handler;
+        Arc::new(ctx)
     }
 
     fn make_test_buffer() -> Box<dyn HoodieFileGroupRecordBuffer> {

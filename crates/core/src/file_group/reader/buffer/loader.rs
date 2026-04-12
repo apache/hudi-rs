@@ -135,11 +135,37 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         );
 
         // STEP: Instantiate buffer (strategy selection)
-        let record_buffer = Box::new(KeyBasedFileGroupRecordBuffer::new(
-            reader_context.clone(),
-            merge_mode,
-            read_stats,
-        )?);
+        // Mirrors Java's DefaultFileGroupRecordBufferLoader.getRecordBuffer() lines 67-80.
+        let is_skip_merge = reader_context
+            .hoodie_reader_config
+            .get("hoodie.datasource.merge.type")
+            .map(|v| v.eq_ignore_ascii_case("skip_merge"))
+            .unwrap_or(false);
+
+        let record_buffer: Box<dyn HoodieFileGroupRecordBuffer> = if is_skip_merge {
+            return Err(crate::error::CoreError::Unsupported(
+                "UnmergedFileGroupRecordBuffer (skip_merge mode) is not yet implemented"
+                    .to_string(),
+            ));
+        } else if reader_parameters.sort_output {
+            return Err(crate::error::CoreError::Unsupported(
+                "SortedKeyBasedFileGroupRecordBuffer (sort_output mode) is not yet implemented"
+                    .to_string(),
+            ));
+        } else if reader_parameters.use_record_position
+            && input_split.base_file_path.is_some()
+        {
+            return Err(crate::error::CoreError::Unsupported(
+                "PositionBasedFileGroupRecordBuffer (position-based merge) is not yet implemented"
+                    .to_string(),
+            ));
+        } else {
+            Box::new(KeyBasedFileGroupRecordBuffer::new(
+                reader_context.clone(),
+                merge_mode,
+                read_stats,
+            )?)
+        };
 
         // STEP: scanLogFiles — build and run HoodieMergedLogRecordReader
         let (populated_buffer, valid_block_instants, stats) = scan_log_files(

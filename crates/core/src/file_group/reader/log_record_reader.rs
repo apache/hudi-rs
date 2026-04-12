@@ -968,6 +968,7 @@ mod tests {
     use crate::config::table::HudiTableConfig;
     use crate::file_group::reader::buffer::key_based::KeyBasedFileGroupRecordBuffer;
     use crate::file_group::reader::read_stats::HoodieReadStats;
+    use crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
     use crate::file_group::record_batches::RecordBatches;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1019,6 +1020,21 @@ mod tests {
             "ts".to_string(),
         );
         ctx.rebuild_record_context(String::new());
+        // Prepare schema handler with DeleteContext so buffer construction succeeds.
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(test_schema())
+            .with_data_schema(test_schema());
+        let key_field = ctx.record_key_field().to_string();
+        let ordering = ctx.record_context.ordering_field_names.clone();
+        handler.prepare_required_schema(
+            true,
+            &[key_field],
+            &ordering,
+            &ctx.table_config,
+            false,
+            "COMMIT_TIME_ORDERING",
+        );
+        ctx.schema_handler = handler;
         let ctx = std::sync::Arc::new(ctx);
         let stats = HoodieReadStats::default();
         Box::new(KeyBasedFileGroupRecordBuffer::new(
