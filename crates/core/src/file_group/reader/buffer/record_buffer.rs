@@ -93,10 +93,11 @@ impl FileGroupRecordBuffer {
         record_merge_mode: String,
         buffered_record_merger: Box<dyn BufferedRecordMerger>,
         update_processor: Box<dyn UpdateProcessor>,
+        reader_schema: Option<SchemaRef>,
     ) -> Self {
         Self {
             records: HashMap::new(),
-            reader_schema: None,
+            reader_schema,
             record_merge_mode,
             buffered_record_merger,
             delete_context: None,

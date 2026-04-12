@@ -22,26 +22,63 @@
 //! Provides schema comparison utilities for checking projection equivalence
 //! between Arrow schemas.
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Fields, SchemaRef};
 
-/// Check if two schemas are projection-equivalent: same field names in same order.
+/// Check if two schemas are projection-equivalent.
 ///
-/// Mirrors Java's `AvroSchemaUtils.areSchemasProjectionEquivalent()`.
+/// Mirrors Java's `AvroSchemaUtils.areSchemasProjectionEquivalent()` which
+/// delegates to `AvroSchemaComparatorForRecordProjection`.
 ///
-/// In the Arrow representation this compares field names at the top level of
-/// two record schemas.  The Java implementation also recurses into nested Avro
-/// types (arrays, maps, enums, fixed, logical types) — that depth is not yet
-/// needed on the Rust read path because Arrow schemas always represent records
-/// and the comparison is used only to decide whether a projection converter is
-/// required.
+/// The comparison recurses through nested types (Struct, List, Map, etc.):
+/// - **Record/Struct fields**: matched pairwise by case-insensitive name, then
+///   types are compared recursively.
+/// - **List / LargeList**: element types compared recursively.
+/// - **Map**: entry struct (key + value) compared recursively.
+/// - **All other types** (primitives, FixedSizeBinary, Decimal, Dictionary,
+///   etc.): standard [`DataType`] equality which already checks parameters
+///   such as precision, scale, and fixed-size width.
+///
+/// Nullable flag on fields is intentionally ignored — Java unwraps nullable
+/// unions before comparing, which produces the same effect.
 pub fn are_schemas_projection_equivalent(a: &SchemaRef, b: &SchemaRef) -> bool {
-    if a.fields().len() != b.fields().len() {
+    record_fields_equivalent(a.fields(), b.fields())
+}
+
+/// Compare two sets of record fields for projection equivalence.
+///
+/// Fields are compared pairwise in order.  Two fields match when their names
+/// are equal (case-insensitive, mirroring Java's
+/// `AvroSchemaComparatorForRecordProjection.validateField`) and their data
+/// types are recursively projection-equivalent.
+fn record_fields_equivalent(a: &Fields, b: &Fields) -> bool {
+    if a.len() != b.len() {
         return false;
     }
-    a.fields()
-        .iter()
-        .zip(b.fields().iter())
-        .all(|(fa, fb)| fa.name() == fb.name())
+    a.iter().zip(b.iter()).all(|(fa, fb)| {
+        fa.name().eq_ignore_ascii_case(fb.name())
+            && types_equivalent(fa.data_type(), fb.data_type())
+    })
+}
+
+/// Recursively compare two Arrow [`DataType`]s for projection equivalence.
+fn types_equivalent(a: &DataType, b: &DataType) -> bool {
+    match (a, b) {
+        // Struct (record): recurse into fields with case-insensitive name check.
+        (DataType::Struct(fa), DataType::Struct(fb)) => record_fields_equivalent(fa, fb),
+        // List / LargeList: recurse on element type.
+        (DataType::List(ea), DataType::List(eb))
+        | (DataType::LargeList(ea), DataType::LargeList(eb)) => {
+            types_equivalent(ea.data_type(), eb.data_type())
+        }
+        // Map: compare keys_sorted flag and recurse on the entry struct
+        // (which contains key and value fields).
+        (DataType::Map(ea, sa), DataType::Map(eb, sb)) => {
+            sa == sb && types_equivalent(ea.data_type(), eb.data_type())
+        }
+        // All other types (primitives, FixedSizeBinary, Decimal, Dictionary, etc.):
+        // standard DataType equality already compares all parameters.
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]
@@ -123,8 +160,7 @@ mod tests {
     }
 
     /// Java: testAreSchemasProjectionEquivalentDifferentElementTypeInArray
-    /// Same field name but different list element types.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Same field name but different list element types → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_different_element_type_in_array() {
         let s1 = make_schema(&[(
@@ -135,8 +171,7 @@ mod tests {
             "arr",
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
         )]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
     }
 
     /// Java: testAreSchemasProjectionEquivalentMapSchemas
@@ -180,8 +215,7 @@ mod tests {
     }
 
     /// Java: testAreSchemasProjectionEquivalentDifferentMapValueTypes
-    /// Same field name but different map value types.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Same field name but different map value types → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_different_map_value_types() {
         let s1 = make_schema(&[(
@@ -218,14 +252,13 @@ mod tests {
                 false,
             ),
         )]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
     }
 
     /// Java: testAreSchemasProjectionEquivalentNullableSchemaComparison
-    /// One field nullable, the other not — same field name.
-    /// NOTE: Rust only compares field names, so this returns true (Java unwraps
-    /// nullable unions and then compares, also returning true).
+    /// One field nullable, the other not — same field name and type → equivalent.
+    /// Java unwraps nullable unions before comparing; Arrow nullable is a field
+    /// property that we intentionally ignore, producing the same result.
     #[test]
     fn test_are_schemas_projection_equivalent_nullable_schema_comparison() {
         let s1 = make_schema(&[("f", DataType::Int32)]);
@@ -235,8 +268,7 @@ mod tests {
     }
 
     /// Java: testAreSchemasProjectionEquivalentListVsString
-    /// Same field name but List type vs String type.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Same field name but List type vs String type → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_list_vs_string() {
         let s1 = make_schema(&[(
@@ -244,14 +276,12 @@ mod tests {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         )]);
         let s2 = make_schema(&[("f", DataType::Utf8)]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
-        assert!(are_schemas_projection_equivalent(&s2, &s1));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s2, &s1));
     }
 
     /// Java: testAreSchemasProjectionEquivalentMapVsString
-    /// Same field name but Map type vs String type.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Same field name but Map type vs String type → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_map_vs_string() {
         let s1 = make_schema(&[(
@@ -272,9 +302,8 @@ mod tests {
             ),
         )]);
         let s2 = make_schema(&[("f", DataType::Utf8)]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
-        assert!(are_schemas_projection_equivalent(&s2, &s1));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s2, &s1));
     }
 
     /// Java: testAreSchemasProjectionEquivalentEqualFixedSchemas
@@ -286,14 +315,12 @@ mod tests {
     }
 
     /// Java: testAreSchemasProjectionEquivalentDifferentFixedSize
-    /// Same field name but different FixedSizeBinary sizes.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Same field name but different FixedSizeBinary sizes → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_different_fixed_size() {
         let s1 = make_schema(&[("f", DataType::FixedSizeBinary(8))]);
         let s2 = make_schema(&[("f", DataType::FixedSizeBinary(4))]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
     }
 
     /// Java: testAreSchemasProjectionEquivalentEnums
@@ -307,7 +334,8 @@ mod tests {
     }
 
     /// Java: testAreSchemasProjectionEquivalentDifferentEnumSymbols
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Different Dictionary index types model incompatible enum encodings → not
+    /// equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_different_enum_symbols() {
         let s1 = make_schema(&[(
@@ -318,14 +346,13 @@ mod tests {
             "e",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
         )]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
     }
 
     /// Java: testAreSchemasProjectionEquivalentEnumSymbolSubset
-    /// Avro allows the first enum to be a subset of the second's symbols.
-    /// In Arrow there is no direct analog; we test with the same field name.
-    /// NOTE: Rust only compares field names, so this returns true.
+    /// Avro allows the first enum to be a prefix-subset of the second's symbols.
+    /// Arrow Dictionary types do not carry symbol lists, so two identical
+    /// Dictionary types are always equivalent in both directions.
     #[test]
     fn test_are_schemas_projection_equivalent_enum_symbol_subset() {
         let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
@@ -344,25 +371,22 @@ mod tests {
     }
 
     /// Java: testAreSchemasProjectionEquivalentDifferentPrecision
-    /// Same field name but different Decimal precision.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Same field name but different Decimal precision → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_different_precision() {
         let s1 = make_schema(&[("d", DataType::Decimal128(12, 2))]);
         let s2 = make_schema(&[("d", DataType::Decimal128(13, 2))]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
     }
 
     /// Java: testAreSchemasProjectionEquivalentLogicalVsNoLogicalType
-    /// Decimal field vs plain Binary field — same field name.
-    /// NOTE: Rust only compares field names, so this returns true (Java returns false).
+    /// Decimal field vs plain Binary field — same field name but different types
+    /// → not equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_logical_vs_no_logical_type() {
         let s1 = make_schema(&[("d", DataType::Decimal128(10, 2))]);
         let s2 = make_schema(&[("d", DataType::Binary)]);
-        // Name-only comparison: same field name → equivalent.
-        assert!(are_schemas_projection_equivalent(&s1, &s2));
+        assert!(!are_schemas_projection_equivalent(&s1, &s2));
     }
 
     /// Java: testAreSchemasProjectionEquivalentSameReferenceSchema
@@ -391,6 +415,13 @@ mod tests {
         let s1 = make_simple_schema(&["a"]);
         let s2 = make_simple_schema(&["b"]);
         assert!(!are_schemas_projection_equivalent(&s1, &s2));
+    }
+
+    #[test]
+    fn test_are_schemas_projection_equivalent_case_insensitive_field_names() {
+        let s1 = make_schema(&[("Field_A", DataType::Int32)]);
+        let s2 = make_schema(&[("field_a", DataType::Int32)]);
+        assert!(are_schemas_projection_equivalent(&s1, &s2));
     }
 
     #[test]

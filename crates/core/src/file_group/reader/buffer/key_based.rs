@@ -107,6 +107,11 @@ impl KeyBasedFileGroupRecordBuffer {
         // readerContext.getRecordContext() returning the same instance).
         let record_context = reader_context.get_record_context().clone();
 
+        // Extract reader_schema from schema_handler.required_schema at
+        // construction time. Mirrors Java's FileGroupRecordBuffer constructor:
+        //   this.readerSchema = readerContext.getSchemaHandler().getRequiredSchema()
+        let reader_schema = reader_context.schema_handler.required_schema.clone();
+
         // Get the canonical DeleteContext from the schema handler (single source
         // of truth). Mirrors Java's `readerContext.getSchemaHandler().getDeleteContext()`.
         //
@@ -121,10 +126,20 @@ impl KeyBasedFileGroupRecordBuffer {
             .cloned()
             .expect("DeleteContext must be set on schema_handler by prepare_required_schema()");
 
+        // Enrich DeleteContext with reader schema at construction time.
+        // Mirrors Java's: deleteContext = readerContext.getSchemaHandler()
+        //     .getDeleteContext().withReaderSchema(this.readerSchema)
+        let delete_context = if let Some(ref schema) = reader_schema {
+            delete_context.with_reader_schema(schema.clone())
+        } else {
+            delete_context
+        };
+
         let mut base = FileGroupRecordBuffer::new(
             merge_mode,
             merger,
             update_processor,
+            reader_schema,
         );
         base.delete_context = Some(delete_context);
 
