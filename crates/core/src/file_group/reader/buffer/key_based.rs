@@ -454,7 +454,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HudiConfigs;
     use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlockContent};
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader::buffered_record::OrderingValue;
@@ -490,20 +489,6 @@ mod tests {
             Field::new("counter", DataType::Int32, false),
             Field::new("ts", DataType::Int64, false),
         ]))
-    }
-
-    /// Create a single-row RecordBatch (test record).
-    fn create_test_record(key: &str, counter: i32, ts: i64) -> RecordBatch {
-        let schema = create_test_schema();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![key])),
-                Arc::new(Int32Array::from(vec![counter])),
-                Arc::new(Int64Array::from(vec![ts])),
-            ],
-        )
-        .unwrap()
     }
 
     /// Create a multi-row RecordBatch from a list of (key, counter, ts).
@@ -591,53 +576,91 @@ mod tests {
     // Part B: Tests matching Java's TestKeyBasedFileGroupRecordBuffer
     // =========================================================================
 
+    /// Build a KeyBasedFileGroupRecordBuffer with a custom delete marker.
+    /// Mirrors Java's `buildKeyBasedFileGroupRecordBuffer(..., deleteMarkerKeyValue)`.
+    fn build_key_based_buffer_with_delete_marker(
+        merge_mode: &str,
+        delete_key: &str,
+        delete_marker_value: &str,
+    ) -> KeyBasedFileGroupRecordBuffer {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::PrecombineField.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.datasource.write.payload.delete.field".to_string(),
+            delete_key.to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.datasource.write.payload.delete.marker".to_string(),
+            delete_marker_value.to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        // Prepare the schema handler so it creates and stores a DeleteContext.
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(create_test_schema())
+            .with_data_schema(create_test_schema());
+        let key_field = ctx.record_key_field().to_string();
+        let ordering = ctx.record_context.ordering_field_names.clone();
+        handler.prepare_required_schema(
+            true,
+            &[key_field],
+            &ordering,
+            &ctx.table_config,
+            false,
+            merge_mode,
+        );
+        ctx.schema_handler = handler;
+        let ctx = Arc::new(ctx);
+        let read_stats = HoodieReadStats::default();
+        KeyBasedFileGroupRecordBuffer::new(ctx, merge_mode.to_string(), &read_stats).unwrap()
+    }
+
     /// Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrdering
     ///
-    /// Given: COMMIT_TIME_ORDERING, base=[record1(k=1,c=1,ts=1), record2(k=2,c=1,ts=1), record3(k=3,c=1,ts=1)]
-    /// When:  DataBlock1=[record1_update(k=1,c=2,ts=1), record2_update(k=2,c=1,ts=2), record2_earlier(k=2,c=1,ts=0)]
-    ///        DataBlock2=[record2_earlier(k=2,c=1,ts=0), record3_update(k=3,c=1,ts=2), record3_delete(k=3,c=3,ts=1)]
-    /// Then:  In commit-time mode, last writer wins.
-    ///        After DataBlock1: map has k=1→(c=2,ts=1), k=2→(c=1,ts=0) [earlier overwrites update]
-    ///        After DataBlock2: map has k=2→(c=1,ts=0), k=3→(c=3,ts=1) [delete marker]
-    ///        Final merge with base: record1 merged with log, record2 merged with log, record3 is delete
-    ///        Expected: 2 records output (record1 updated, record2 with earlier_update)
+    /// COMMIT_TIME_ORDERING with custom delete marker (counter=3).
+    /// Last writer always wins. Record with counter=3 detected as delete.
+    /// Expected: 2 output rows (key=3 deleted by custom marker).
     #[test]
     fn test_read_with_commit_time_ordering() {
-        let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
+        let mut buffer = build_key_based_buffer_with_delete_marker(
+            "COMMIT_TIME_ORDERING",
+            "counter",
+            "3",
+        );
 
-        // Process DataBlock1
+        // DataBlock1: testRecord1UpdateWithSameTime, testRecord2Update, testRecord2EarlierUpdate
         let block1 = create_test_batch(&[
-            ("1", 2, 1), // record1 update (same time)
-            ("2", 1, 2), // record2 update
-            ("2", 1, 0), // record2 earlier update (overwrites in commit-time)
+            ("1", 2, 1), // record1UpdateWithSameTime
+            ("2", 1, 2), // record2Update
+            ("2", 1, 0), // record2EarlierUpdate (overwrites in commit-time)
         ]);
-        buffer.process_data_block(&mut make_data_block(block1, "instant1")).unwrap();
+        buffer
+            .process_data_block(&mut make_data_block(block1, "instant1"))
+            .unwrap();
 
-        // Process DataBlock2
+        // DataBlock2: testRecord2EarlierUpdate, testRecord3Update, testRecord3DeleteByFieldValue
         let block2 = create_test_batch(&[
-            ("2", 1, 0), // record2 earlier update again
-            ("3", 1, 2), // record3 update
-            ("3", 3, 1), // record3 delete by field value (counter=3)
+            ("2", 1, 0), // record2EarlierUpdate (same value, overwrites)
+            ("3", 1, 2), // record3Update
+            ("3", 3, 1), // record3DeleteByFieldValue (counter=3 → delete, overwrites)
         ]);
-        buffer.process_data_block(&mut make_data_block(block2, "instant2")).unwrap();
+        buffer
+            .process_data_block(&mut make_data_block(block2, "instant2"))
+            .unwrap();
 
-        // Set base file
         let base = create_test_batch(&[("1", 1, 1), ("2", 1, 1), ("3", 1, 1)]);
         buffer.set_base_file_iterator(vec![base]);
 
-        // Merge and collect
         let result = Box::new(buffer).merge_and_collect().unwrap();
         let records = extract_records(&result);
 
-        // In commit-time: last write wins for all keys.
-        // k=1: log has (c=2,ts=1), k=2: log has (c=1,ts=0), k=3: log has (c=3,ts=1)
-        // k=3 with counter=3 is a "delete" in Java's test, but we don't have that
-        // detection yet — it will appear as a regular record. For now verify the
-        // per-key last-writer-wins semantics.
-        assert_eq!(result.num_rows(), 3);
-        assert_eq!(records[0], ("1".to_string(), 2, 1)); // updated
-        assert_eq!(records[1], ("2".to_string(), 1, 0)); // earlier_update (last write)
-        assert_eq!(records[2], ("3".to_string(), 3, 1)); // last write for key 3
+        // Java: assertEquals(Arrays.asList(testRecord1UpdateWithSameTime,
+        //       testRecord2EarlierUpdate), actualRecords);
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(records[0], ("1".to_string(), 2, 1)); // record1UpdateWithSameTime
+        assert_eq!(records[1], ("2".to_string(), 1, 0)); // record2EarlierUpdate (last write)
     }
 
     /// Java: TestKeyBasedFileGroupRecordBuffer.readWithEventTimeOrdering
@@ -919,68 +942,73 @@ mod tests {
         assert!(!buffer.contains_log_record("k2"));
     }
 
-    // =========================================================================
-    // Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrderingWithRecords
-    // =========================================================================
-
-    /// Java: readWithCommitTimeOrderingWithRecords
+    /// Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrderingWithRecords
     ///
-    /// Given: COMMIT_TIME_ORDERING
-    ///        Base file: records 1-6 (keys "1" through "6")
-    ///        Log block 1: updates for keys 1,2,3,4 (updates with new counters)
-    ///        Log block 2: deletes for keys 5,6 + insert for key 7
-    /// When:  process_data_block for updates, insert delete records, set base, merge
-    /// Then:  4 updates (keys 1-4 with log values), 2 deletes (keys 5,6 absent),
-    ///        1 insert (key 7 from log only)
-    ///        Total output: 5 rows (keys 1,2,3,4,7)
+    /// COMMIT_TIME_ORDERING with pre-built records including deletes.
+    /// In commit-time mode, log always wins over base.
+    /// Expected: 5 output rows (keys 5,6 deleted).
     #[test]
     fn test_read_with_commit_time_ordering_with_records() {
-        let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
+        let mut buffer = build_key_based_buffer_with_delete_marker(
+            "COMMIT_TIME_ORDERING",
+            "counter",
+            "3",
+        );
 
-        // Log: updates for keys 1,2,3,4
+        // Data records (log updates)
         let updates = create_test_batch(&[
-            ("1", 2, 2), // record1 update
-            ("2", 2, 2), // record2 update
-            ("3", 2, 2), // record3 update
-            ("4", 2, 2), // record4 update (earlier ts doesn't matter in commit-time)
+            ("1", 2, 1), // record1UpdateWithSameTime
+            ("2", 1, 2), // record2Update
+            ("3", 1, 2), // record3Update
+            ("4", 1, 0), // record4EarlierUpdate
+            ("7", 1, 5), // record7 (log-only insert)
         ]);
-        buffer.process_data_block(&mut make_data_block(updates, "instant2")).unwrap();
+        buffer
+            .process_data_block(&mut make_data_block(updates, "instant2"))
+            .unwrap();
 
-        // Log: deletes for keys 5,6
-        buffer.base.records.insert(
-            "5".to_string(),
-            BufferedRecord::new_delete("5".to_string(), None),
-        );
-        buffer.base.records.insert(
-            "6".to_string(),
-            BufferedRecord::new_delete("6".to_string(), None),
-        );
+        // Delete records with default ordering (0) for commit-time mode
+        // In Java: convertToHoodieRecordsListForDeletes(..., true) → ordering=0 (default)
+        let delete_5 = DeleteRecord {
+            record_key: "5".to_string(),
+            partition_path: String::new(),
+            ordering_value: Some(OrderingValue::Long(0)),
+        };
+        buffer.process_next_deleted_record(delete_5, "5");
 
-        // Log: insert new key 7
-        let insert = create_test_batch(&[("7", 1, 5)]);
-        buffer.process_data_block(&mut make_data_block(insert, "instant2")).unwrap();
+        let delete_6 = DeleteRecord {
+            record_key: "6".to_string(),
+            partition_path: String::new(),
+            ordering_value: Some(OrderingValue::Long(0)),
+        };
+        buffer.process_next_deleted_record(delete_6, "6");
 
-        // Base file: records 1-6
+        // Base file: testRecord1-6
         let base = create_test_batch(&[
             ("1", 1, 1),
             ("2", 1, 1),
             ("3", 1, 1),
-            ("4", 1, 1),
+            ("4", 2, 1), // testRecord4 (counter=2)
             ("5", 1, 1),
-            ("6", 1, 1),
+            ("6", 1, 5), // testRecord6 (ts=5)
         ]);
         buffer.set_base_file_iterator(vec![base]);
 
         let result = Box::new(buffer).merge_and_collect().unwrap();
         let records = extract_records(&result);
 
-        // 4 updates + 1 insert = 5 rows; 2 deletes absent
-        assert_eq!(result.num_rows(), 5, "Expected 5 rows: 4 updates + 1 insert, 2 deletes absent");
-        assert_eq!(records[0], ("1".to_string(), 2, 2)); // updated
-        assert_eq!(records[1], ("2".to_string(), 2, 2)); // updated
-        assert_eq!(records[2], ("3".to_string(), 2, 2)); // updated
-        assert_eq!(records[3], ("4".to_string(), 2, 2)); // updated
-        assert_eq!(records[4], ("7".to_string(), 1, 5)); // insert
+        // Commit-time: log always wins over base
+        // key=1-4: log data wins → updated values
+        // key=5,6: log delete wins → DELETED
+        // key=7: log-only → INSERT
+        // Java: assertEquals(Stream.of(testRecord1UpdateWithSameTime, testRecord2Update,
+        //       testRecord3Update, testRecord4EarlierUpdate, testRecord7), actualRecords);
+        assert_eq!(result.num_rows(), 5);
+        assert_eq!(records[0], ("1".to_string(), 2, 1));
+        assert_eq!(records[1], ("2".to_string(), 1, 2));
+        assert_eq!(records[2], ("3".to_string(), 1, 2));
+        assert_eq!(records[3], ("4".to_string(), 1, 0));
+        assert_eq!(records[4], ("7".to_string(), 1, 5));
     }
 
     // =========================================================================
@@ -1238,164 +1266,4 @@ mod tests {
         assert_eq!(records[1], ("C".to_string(), 9, 99)); // base passthrough
     }
 
-    // =========================================================================
-    // Exact ports from Java TestKeyBasedFileGroupRecordBuffer
-    // (with custom delete marker support)
-    // =========================================================================
-
-    /// Build a KeyBasedFileGroupRecordBuffer with a custom delete marker.
-    /// Mirrors Java's `buildKeyBasedFileGroupRecordBuffer(..., deleteMarkerKeyValue)`.
-    fn build_key_based_buffer_with_delete_marker(
-        merge_mode: &str,
-        delete_key: &str,
-        delete_marker_value: &str,
-    ) -> KeyBasedFileGroupRecordBuffer {
-        let mut ctx = ReaderContext::empty();
-        ctx.table_config.insert(
-            HudiTableConfig::PrecombineField.as_ref().to_string(),
-            "ts".to_string(),
-        );
-        ctx.table_config.insert(
-            "hoodie.datasource.write.payload.delete.field".to_string(),
-            delete_key.to_string(),
-        );
-        ctx.table_config.insert(
-            "hoodie.datasource.write.payload.delete.marker".to_string(),
-            delete_marker_value.to_string(),
-        );
-        ctx.rebuild_record_context(String::new());
-        // Prepare the schema handler so it creates and stores a DeleteContext.
-        let mut handler = FileGroupReaderSchemaHandler::new()
-            .with_table_schema(create_test_schema())
-            .with_data_schema(create_test_schema());
-        let key_field = ctx.record_key_field().to_string();
-        let ordering = ctx.record_context.ordering_field_names.clone();
-        handler.prepare_required_schema(
-            true,
-            &[key_field],
-            &ordering,
-            &ctx.table_config,
-            false,
-            merge_mode,
-        );
-        ctx.schema_handler = handler;
-        let ctx = Arc::new(ctx);
-        let read_stats = HoodieReadStats::default();
-        KeyBasedFileGroupRecordBuffer::new(ctx, merge_mode.to_string(), &read_stats).unwrap()
-    }
-
-    /// Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrdering
-    ///
-    /// COMMIT_TIME_ORDERING with custom delete marker (counter=3).
-    /// Last writer always wins. Record with counter=3 detected as delete.
-    /// Expected: 2 output rows (key=3 deleted by custom marker).
-    #[test]
-    fn test_java_read_with_commit_time_ordering() {
-        let mut buffer = build_key_based_buffer_with_delete_marker(
-            "COMMIT_TIME_ORDERING",
-            "counter",
-            "3",
-        );
-
-        // DataBlock1: testRecord1UpdateWithSameTime, testRecord2Update, testRecord2EarlierUpdate
-        let block1 = create_test_batch(&[
-            ("1", 2, 1), // record1UpdateWithSameTime
-            ("2", 1, 2), // record2Update
-            ("2", 1, 0), // record2EarlierUpdate (overwrites in commit-time)
-        ]);
-        buffer
-            .process_data_block(&mut make_data_block(block1, "instant1"))
-            .unwrap();
-
-        // DataBlock2: testRecord2EarlierUpdate, testRecord3Update, testRecord3DeleteByFieldValue
-        let block2 = create_test_batch(&[
-            ("2", 1, 0), // record2EarlierUpdate (same value, overwrites)
-            ("3", 1, 2), // record3Update
-            ("3", 3, 1), // record3DeleteByFieldValue (counter=3 → delete, overwrites)
-        ]);
-        buffer
-            .process_data_block(&mut make_data_block(block2, "instant2"))
-            .unwrap();
-
-        let base = create_test_batch(&[("1", 1, 1), ("2", 1, 1), ("3", 1, 1)]);
-        buffer.set_base_file_iterator(vec![base]);
-
-        let result = Box::new(buffer).merge_and_collect().unwrap();
-        let records = extract_records(&result);
-
-        // Java: assertEquals(Arrays.asList(testRecord1UpdateWithSameTime,
-        //       testRecord2EarlierUpdate), actualRecords);
-        assert_eq!(result.num_rows(), 2);
-        assert_eq!(records[0], ("1".to_string(), 2, 1)); // record1UpdateWithSameTime
-        assert_eq!(records[1], ("2".to_string(), 1, 0)); // record2EarlierUpdate (last write)
-    }
-
-    /// Java: TestKeyBasedFileGroupRecordBuffer.readWithCommitTimeOrderingWithRecords
-    ///
-    /// COMMIT_TIME_ORDERING with pre-built records including deletes.
-    /// In commit-time mode, log always wins over base.
-    /// Expected: 5 output rows (keys 5,6 deleted).
-    #[test]
-    fn test_java_read_with_commit_time_ordering_with_records() {
-        let mut buffer = build_key_based_buffer_with_delete_marker(
-            "COMMIT_TIME_ORDERING",
-            "counter",
-            "3",
-        );
-
-        // Data records (log updates)
-        let updates = create_test_batch(&[
-            ("1", 2, 1), // record1UpdateWithSameTime
-            ("2", 1, 2), // record2Update
-            ("3", 1, 2), // record3Update
-            ("4", 1, 0), // record4EarlierUpdate
-            ("7", 1, 5), // record7 (log-only insert)
-        ]);
-        buffer
-            .process_data_block(&mut make_data_block(updates, "instant2"))
-            .unwrap();
-
-        // Delete records with default ordering (0) for commit-time mode
-        // In Java: convertToHoodieRecordsListForDeletes(..., true) → ordering=0 (default)
-        let delete_5 = DeleteRecord {
-            record_key: "5".to_string(),
-            partition_path: String::new(),
-            ordering_value: Some(OrderingValue::Long(0)),
-        };
-        buffer.process_next_deleted_record(delete_5, "5");
-
-        let delete_6 = DeleteRecord {
-            record_key: "6".to_string(),
-            partition_path: String::new(),
-            ordering_value: Some(OrderingValue::Long(0)),
-        };
-        buffer.process_next_deleted_record(delete_6, "6");
-
-        // Base file: testRecord1-6
-        let base = create_test_batch(&[
-            ("1", 1, 1),
-            ("2", 1, 1),
-            ("3", 1, 1),
-            ("4", 2, 1), // testRecord4 (counter=2)
-            ("5", 1, 1),
-            ("6", 1, 5), // testRecord6 (ts=5)
-        ]);
-        buffer.set_base_file_iterator(vec![base]);
-
-        let result = Box::new(buffer).merge_and_collect().unwrap();
-        let records = extract_records(&result);
-
-        // Commit-time: log always wins over base
-        // key=1-4: log data wins → updated values
-        // key=5,6: log delete wins → DELETED
-        // key=7: log-only → INSERT
-        // Java: assertEquals(Stream.of(testRecord1UpdateWithSameTime, testRecord2Update,
-        //       testRecord3Update, testRecord4EarlierUpdate, testRecord7), actualRecords);
-        assert_eq!(result.num_rows(), 5);
-        assert_eq!(records[0], ("1".to_string(), 2, 1));
-        assert_eq!(records[1], ("2".to_string(), 1, 2));
-        assert_eq!(records[2], ("3".to_string(), 1, 2));
-        assert_eq!(records[3], ("4".to_string(), 1, 0));
-        assert_eq!(records[4], ("7".to_string(), 1, 5));
-    }
 }

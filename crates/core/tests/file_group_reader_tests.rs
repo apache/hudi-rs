@@ -1015,6 +1015,7 @@ fn test_component_required_schema_is_pruned_not_full() {
         &["_hoodie_record_key".to_string()],
         &[], // no ordering fields for COMMIT_TIME_ORDERING
         &props,
+        false,
         "COMMIT_TIME_ORDERING",
     );
 
@@ -1092,6 +1093,7 @@ fn test_component_cow_required_equals_requested() {
         &["_hoodie_record_key".to_string()],
         &[],
         &std::collections::HashMap::new(),
+        false,
         "COMMIT_TIME_ORDERING",
     );
 
