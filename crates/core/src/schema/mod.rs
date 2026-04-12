@@ -22,6 +22,7 @@ use crate::schema::resolver::sanitize_avro_schema_str;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::Value;
 
+pub mod avro_schema_utils;
 pub mod delete;
 pub mod resolver;
 

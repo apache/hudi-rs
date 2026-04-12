@@ -25,6 +25,7 @@
 
 use crate::file_group::reader::delete_context::DeleteContext;
 use crate::file_group::reader::output_converter::{OutputConverter, ProjectionConverter};
+use crate::schema::avro_schema_utils::are_schemas_projection_equivalent;
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::sync::Arc;
 
@@ -313,25 +314,12 @@ impl FileGroupReaderSchemaHandler {
 
         // If schemas are projection-equivalent (same fields in same order),
         // no converter is needed.
-        if schemas_projection_equivalent(required, requested) {
+        if are_schemas_projection_equivalent(required, requested) {
             return None;
         }
 
         Some(Box::new(ProjectionConverter::new(requested)))
     }
-}
-
-/// Check if two schemas are projection-equivalent: same field names in same order.
-///
-/// Mirrors Java's `AvroSchemaUtils.areSchemasProjectionEquivalent()`.
-fn schemas_projection_equivalent(a: &SchemaRef, b: &SchemaRef) -> bool {
-    if a.fields().len() != b.fields().len() {
-        return false;
-    }
-    a.fields()
-        .iter()
-        .zip(b.fields().iter())
-        .all(|(fa, fb)| fa.name() == fb.name())
 }
 
 #[cfg(test)]
