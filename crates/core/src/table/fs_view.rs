@@ -332,10 +332,7 @@ mod tests {
 
     use hudi_test::SampleTable;
 
-    async fn partition_counts_as_of(
-        hudi_table: &Table,
-        timestamp: &str,
-    ) -> BTreeMap<String, usize> {
+    async fn file_slices_as_of(hudi_table: &Table, timestamp: &str) -> Vec<FileSlice> {
         let fs_view = &hudi_table.file_system_view;
         let timeline_view = hudi_table
             .timeline
@@ -345,7 +342,7 @@ mod tests {
         let partition_pruner = PartitionPruner::empty();
         let file_pruner = FilePruner::empty();
         let table_schema = hudi_table.get_schema().await.unwrap();
-        let file_slices = fs_view
+        fs_view
             .get_file_slices(
                 &partition_pruner,
                 &file_pruner,
@@ -354,7 +351,14 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn partition_counts_as_of(
+        hudi_table: &Table,
+        timestamp: &str,
+    ) -> BTreeMap<String, usize> {
+        let file_slices = file_slices_as_of(hudi_table, timestamp).await;
 
         let mut partition_counts = BTreeMap::new();
         for file_slice in file_slices {
@@ -415,25 +419,13 @@ mod tests {
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 0);
 
-        let timeline_view = hudi_table
-            .timeline
-            .create_view_as_of(&latest_timestamp)
-            .await
-            .unwrap();
-        let partition_pruner = PartitionPruner::empty();
-        let file_pruner = FilePruner::empty();
-        let table_schema = hudi_table.get_schema().await.unwrap();
-
-        let file_slices = fs_view
-            .get_file_slices(
-                &partition_pruner,
-                &file_pruner,
-                &table_schema,
-                &timeline_view,
-                None,
-            )
-            .await
-            .unwrap();
+        let partition_counts = partition_counts_as_of(&hudi_table, &latest_timestamp).await;
+        assert_eq!(
+            partition_counts.values().sum::<usize>(),
+            1,
+            "Latest snapshot should have one surviving file slice after replacecommit pruning"
+        );
+        let file_slices = file_slices_as_of(&hudi_table, &latest_timestamp).await;
 
         assert_eq!(fs_view.partition_to_file_groups.len(), 3);
         assert_eq!(file_slices.len(), 1);
