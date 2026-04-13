@@ -22,7 +22,7 @@
 //! organized by table version (v6, v8+) and query type.
 
 use arrow::compute::concat_batches;
-use arrow::record_batch::RecordBatch;
+use arrow_array::RecordBatch;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
@@ -586,7 +586,6 @@ mod v8_tables {
     /// Streaming query tests for v8 tables
     mod streaming_queries {
         use super::*;
-        use futures::StreamExt;
         use hudi_core::table::ReadOptions;
 
         #[tokio::test]
@@ -790,7 +789,7 @@ mod v8_tables {
 /// Test helper module for v9 tables (1.1 spec)
 mod v9_tables {
     use super::*;
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Int64Array, StringArray};
 
     fn txn_rows(records: &[RecordBatch]) -> Vec<(String, String, i64)> {
         let mut rows = Vec::new();
@@ -1231,7 +1230,6 @@ mod v9_tables {
 
     mod streaming_queries {
         use super::*;
-        use futures::StreamExt;
         use hudi_core::table::ReadOptions;
 
         #[tokio::test]
@@ -1240,12 +1238,8 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new();
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-
-            let mut batches = Vec::new();
-            while let Some(result) = stream.next().await {
-                batches.push(result?);
-            }
+            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let batches = collect_stream_batches(stream).await?;
 
             assert!(!batches.is_empty(), "Should produce at least one batch");
 
@@ -1267,12 +1261,9 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new().with_batch_size(1);
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-
-            let mut total_rows = 0usize;
-            while let Some(result) = stream.next().await {
-                total_rows += result?.num_rows();
-            }
+            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let batches = collect_stream_batches(stream).await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
             assert_eq!(total_rows, 3, "Total rows should match expected count");
             Ok(())
@@ -1284,12 +1275,8 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new().with_filters([("region", "=", "us")]);
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-
-            let mut batches = Vec::new();
-            while let Some(result) = stream.next().await {
-                batches.push(result?);
-            }
+            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let batches = collect_stream_batches(stream).await?;
 
             assert!(
                 !batches.is_empty(),
@@ -1309,12 +1296,8 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new().with_filters([("region", "=", "latam")]);
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-
-            let mut batches = Vec::new();
-            while let Some(result) = stream.next().await {
-                batches.push(result?);
-            }
+            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let batches = collect_stream_batches(stream).await?;
 
             assert!(
                 batches.is_empty(),
@@ -1336,14 +1319,11 @@ mod v9_tables {
 
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
-            let mut stream = hudi_table
+            let stream = hudi_table
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
-
-            let mut total_rows = 0usize;
-            while let Some(result) = stream.next().await {
-                total_rows += result?.num_rows();
-            }
+            let batches = collect_stream_batches(stream).await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
             assert!(total_rows > 0, "Should read at least one row");
             Ok(())
@@ -1358,14 +1338,11 @@ mod v9_tables {
             let file_slice = &file_slices[0];
 
             let options = ReadOptions::new().with_batch_size(1);
-            let mut stream = hudi_table
+            let stream = hudi_table
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
-
-            let mut total_rows = 0usize;
-            while let Some(result) = stream.next().await {
-                total_rows += result?.num_rows();
-            }
+            let batches = collect_stream_batches(stream).await?;
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
             assert!(total_rows > 0, "Should read at least one row");
             Ok(())
@@ -1387,18 +1364,15 @@ mod v9_tables {
             );
 
             let options = ReadOptions::new();
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-            let err = loop {
-                match stream.next().await {
-                    Some(Ok(_)) => continue,
-                    Some(Err(err)) => break err,
-                    None => panic!("Expected MOR streaming read with decimal log records to fail"),
-                }
+            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let err = match collect_stream_batches(stream).await {
+                Ok(_) => panic!("Expected MOR streaming read with decimal log records to fail"),
+                Err(err) => err,
             };
-            assert_eq!(
-                err.to_string(),
-                "Schema error: type Decimal128(15, 2) not supported",
-                "Unexpected error for MOR log-file streaming path"
+            let err_message = err.to_string();
+            assert!(
+                err_message.contains("Decimal128(15, 2) not supported"),
+                "Unexpected error for MOR log-file streaming path: {err_message}"
             );
             Ok(())
         }
@@ -1409,12 +1383,8 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), true).await?;
 
             let options = ReadOptions::new();
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
-
-            let mut batches = Vec::new();
-            while let Some(result) = stream.next().await {
-                batches.push(result?);
-            }
+            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let batches = collect_stream_batches(stream).await?;
 
             assert!(!batches.is_empty(), "Should produce batches from MOR table");
             let rows = txn_rows(&batches);
@@ -1432,7 +1402,6 @@ mod v9_tables {
 /// These tests verify the streaming versions of snapshot and file slice reads.
 mod streaming_queries {
     use super::*;
-    use arrow::record_batch::RecordBatch;
     use futures::StreamExt;
     use hudi_core::table::ReadOptions;
 
