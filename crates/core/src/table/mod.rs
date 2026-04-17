@@ -120,7 +120,7 @@ use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
@@ -283,20 +283,11 @@ impl Table {
             )]));
         }
 
-        let partition_fields: HashSet<String> = {
-            let fields: Vec<String> = self.hudi_configs.get_or_default(PartitionFields).into();
-            fields.into_iter().collect()
-        };
+        let partition_field_names: Vec<String> =
+            self.hudi_configs.get_or_default(PartitionFields).into();
 
         let schema = self.get_schema().await?;
-        let partition_fields: Vec<Arc<Field>> = schema
-            .fields()
-            .iter()
-            .filter(|field| partition_fields.contains(field.name()))
-            .cloned()
-            .collect();
-
-        Ok(Schema::new(partition_fields))
+        Ok(project_partition_schema(&schema, &partition_field_names))
     }
 
     /// Get the [Timeline] of the table.
@@ -814,6 +805,25 @@ impl Table {
     }
 }
 
+/// Build the partition [Schema] in the order declared by `partition_field_names`.
+///
+/// Fields whose names are not present in `table_schema` are skipped. This is critical
+/// for partition pruning correctness: the resulting schema order must match the
+/// on-disk partition path segment order (which follows the `hoodie.table.partition.fields`
+/// config), not the arbitrary column order of the underlying Parquet schema.
+fn project_partition_schema(table_schema: &Schema, partition_field_names: &[String]) -> Schema {
+    let fields: Vec<Arc<Field>> = partition_field_names
+        .iter()
+        .filter_map(|name| {
+            table_schema
+                .field_with_name(name)
+                .ok()
+                .map(|f| Arc::new(f.clone()))
+        })
+        .collect();
+    Schema::new(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1024,64 @@ mod tests {
         assert!(schema.is_ok());
         let schema = schema.unwrap();
         assert_arrow_field_names_eq!(schema, [MetaField::PartitionPath.as_ref()]);
+    }
+
+    #[test]
+    fn project_partition_schema_preserves_config_order() {
+        use arrow::datatypes::{DataType, Field};
+        let table_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("integration_id", DataType::Utf8, false),
+            Field::new("resource_type", DataType::Utf8, false),
+            Field::new("org", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]);
+        let partition_field_names = vec![
+            "org".to_string(),
+            "resource_type".to_string(),
+            "integration_id".to_string(),
+        ];
+
+        let projected = project_partition_schema(&table_schema, &partition_field_names);
+
+        assert_eq!(projected.fields().len(), 3);
+        assert_eq!(projected.field(0).name(), "org");
+        assert_eq!(projected.field(1).name(), "resource_type");
+        assert_eq!(projected.field(2).name(), "integration_id");
+    }
+
+    #[test]
+    fn project_partition_schema_skips_fields_missing_from_table_schema() {
+        use arrow::datatypes::{DataType, Field};
+        let table_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("org", DataType::Utf8, false),
+        ]);
+        let partition_field_names = vec!["org".to_string(), "not_in_schema".to_string()];
+
+        let projected = project_partition_schema(&table_schema, &partition_field_names);
+
+        assert_eq!(projected.fields().len(), 1);
+        assert_eq!(projected.field(0).name(), "org");
+    }
+
+    #[test]
+    fn project_partition_schema_empty_config_returns_empty_schema() {
+        use arrow::datatypes::{DataType, Field};
+        let table_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let projected = project_partition_schema(&table_schema, &[]);
+        assert_eq!(projected.fields().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_partition_schema_uses_config_order_not_table_schema_order() {
+        // V6ComplexkeygenHivestyle declares PARTITIONED BY (byteField, shortField).
+        // The returned partition schema must follow the partition.fields config order,
+        // which also matches the on-disk partition path order: byteField=.../shortField=...
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let schema = hudi_table.get_partition_schema().await.unwrap();
+        assert_arrow_field_names_eq!(schema, ["byteField", "shortField"]);
     }
 
     #[tokio::test]
