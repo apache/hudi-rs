@@ -102,6 +102,7 @@ use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::error::CoreError;
 use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -287,7 +288,7 @@ impl Table {
             self.hudi_configs.get_or_default(PartitionFields).into();
 
         let schema = self.get_schema().await?;
-        Ok(project_partition_schema(&schema, &partition_field_names))
+        project_partition_schema(&schema, &partition_field_names)
     }
 
     /// Get the [Timeline] of the table.
@@ -807,21 +808,31 @@ impl Table {
 
 /// Build the partition [Schema] in the order declared by `partition_field_names`.
 ///
-/// Fields whose names are not present in `table_schema` are skipped. This is critical
-/// for partition pruning correctness: the resulting schema order must match the
-/// on-disk partition path segment order (which follows the `hoodie.table.partition.fields`
-/// config), not the arbitrary column order of the underlying Parquet schema.
-fn project_partition_schema(table_schema: &Schema, partition_field_names: &[String]) -> Schema {
+/// The resulting schema order must match the on-disk partition path segment order
+/// (which follows the `hoodie.table.partition.fields` config), not the arbitrary
+/// column order of the underlying Parquet schema. Returns an error if any declared
+/// partition field is not present in `table_schema`: silently dropping such a field
+/// would make the schema and on-disk path lengths disagree, which `parse_segments`
+/// rejects and `should_include` then treats as fail-open (full-table scan).
+fn project_partition_schema(
+    table_schema: &Schema,
+    partition_field_names: &[String],
+) -> Result<Schema> {
     let fields: Vec<Arc<Field>> = partition_field_names
         .iter()
-        .filter_map(|name| {
+        .map(|name| {
             table_schema
                 .field_with_name(name)
-                .ok()
                 .map(|f| Arc::new(f.clone()))
+                .map_err(|_| {
+                    CoreError::Schema(format!(
+                        "Partition field `{name}` declared in \
+                         `hoodie.table.partition.fields` is not present in the table schema"
+                    ))
+                })
         })
-        .collect();
-    Schema::new(fields)
+        .collect::<Result<_>>()?;
+    Ok(Schema::new(fields))
 }
 
 #[cfg(test)]
@@ -1042,7 +1053,7 @@ mod tests {
             "integration_id".to_string(),
         ];
 
-        let projected = project_partition_schema(&table_schema, &partition_field_names);
+        let projected = project_partition_schema(&table_schema, &partition_field_names).unwrap();
 
         assert_eq!(projected.fields().len(), 3);
         assert_eq!(projected.field(0).name(), "org");
@@ -1051,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn project_partition_schema_skips_fields_missing_from_table_schema() {
+    fn project_partition_schema_errors_when_field_missing_from_table_schema() {
         use arrow::datatypes::{DataType, Field};
         let table_schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1059,17 +1070,17 @@ mod tests {
         ]);
         let partition_field_names = vec!["org".to_string(), "not_in_schema".to_string()];
 
-        let projected = project_partition_schema(&table_schema, &partition_field_names);
+        let err = project_partition_schema(&table_schema, &partition_field_names).unwrap_err();
 
-        assert_eq!(projected.fields().len(), 1);
-        assert_eq!(projected.field(0).name(), "org");
+        assert!(matches!(err, CoreError::Schema(_)));
+        assert!(err.to_string().contains("not_in_schema"));
     }
 
     #[test]
     fn project_partition_schema_empty_config_returns_empty_schema() {
         use arrow::datatypes::{DataType, Field};
         let table_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
-        let projected = project_partition_schema(&table_schema, &[]);
+        let projected = project_partition_schema(&table_schema, &[]).unwrap();
         assert_eq!(projected.fields().len(), 0);
     }
 
