@@ -19,13 +19,13 @@
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
-use crate::error::CoreError::InvalidPartitionPath;
+use crate::error::CoreError::{self, InvalidPartitionPath};
 use crate::expr::filter::{Filter, SchemableFilter};
 use crate::keygen::KeyGeneratorFilterTransformer;
 use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
 
 use arrow_array::{ArrayRef, Scalar};
-use arrow_schema::Schema;
+use arrow_schema::{Field, Schema};
 
 use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType, PartitionFields};
 use crate::keygen::is_timestamp_based_keygen;
@@ -35,6 +35,35 @@ use std::sync::Arc;
 
 pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
 pub const EMPTY_PARTITION_PATH: &str = "";
+
+/// Build the partition [Schema] in the order declared by `partition_field_names`.
+///
+/// The resulting schema order must match the on-disk partition path segment order
+/// (which follows the `hoodie.table.partition.fields` config), not the arbitrary
+/// column order of the underlying Parquet schema. Returns an error if any declared
+/// partition field is not present in `table_schema`: silently dropping such a field
+/// would make the schema and on-disk path lengths disagree, which `parse_segments`
+/// rejects and `should_include` then treats as fail-open (full-table scan).
+pub(crate) fn project_partition_schema(
+    table_schema: &Schema,
+    partition_field_names: &[String],
+) -> Result<Schema> {
+    let fields: Vec<Arc<Field>> = partition_field_names
+        .iter()
+        .map(|name| {
+            table_schema
+                .field_with_name(name)
+                .map(|f| Arc::new(f.clone()))
+                .map_err(|_| {
+                    CoreError::Schema(format!(
+                        "Partition field `{name}` declared in \
+                         `hoodie.table.partition.fields` is not present in the table schema"
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+    Ok(Schema::new(fields))
+}
 
 pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
     let has_partition_fields = {
@@ -267,6 +296,51 @@ mod tests {
             (IsPartitionPathUrlencoded, is_url_encoded.to_string()),
         ])
     }
+
+    #[test]
+    fn project_partition_schema_preserves_config_order() {
+        let table_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("integration_id", DataType::Utf8, false),
+            Field::new("resource_type", DataType::Utf8, false),
+            Field::new("org", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]);
+        let partition_field_names = vec![
+            "org".to_string(),
+            "resource_type".to_string(),
+            "integration_id".to_string(),
+        ];
+
+        let projected = project_partition_schema(&table_schema, &partition_field_names).unwrap();
+
+        assert_eq!(projected.fields().len(), 3);
+        assert_eq!(projected.field(0).name(), "org");
+        assert_eq!(projected.field(1).name(), "resource_type");
+        assert_eq!(projected.field(2).name(), "integration_id");
+    }
+
+    #[test]
+    fn project_partition_schema_errors_when_field_missing_from_table_schema() {
+        let table_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("org", DataType::Utf8, false),
+        ]);
+        let partition_field_names = vec!["org".to_string(), "not_in_schema".to_string()];
+
+        let err = project_partition_schema(&table_schema, &partition_field_names).unwrap_err();
+
+        assert!(matches!(err, CoreError::Schema(_)));
+        assert!(err.to_string().contains("not_in_schema"));
+    }
+
+    #[test]
+    fn project_partition_schema_empty_config_returns_empty_schema() {
+        let table_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let projected = project_partition_schema(&table_schema, &[]).unwrap();
+        assert_eq!(projected.fields().len(), 0);
+    }
+
     #[test]
     fn test_partition_pruner_new() {
         let schema = create_test_schema();

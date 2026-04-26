@@ -102,7 +102,6 @@ use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
-use crate::error::CoreError;
 use crate::expr::filter::{Filter, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -115,7 +114,7 @@ use crate::schema::resolver::{
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
-use crate::table::partition::PartitionPruner;
+use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
@@ -806,35 +805,6 @@ impl Table {
     }
 }
 
-/// Build the partition [Schema] in the order declared by `partition_field_names`.
-///
-/// The resulting schema order must match the on-disk partition path segment order
-/// (which follows the `hoodie.table.partition.fields` config), not the arbitrary
-/// column order of the underlying Parquet schema. Returns an error if any declared
-/// partition field is not present in `table_schema`: silently dropping such a field
-/// would make the schema and on-disk path lengths disagree, which `parse_segments`
-/// rejects and `should_include` then treats as fail-open (full-table scan).
-fn project_partition_schema(
-    table_schema: &Schema,
-    partition_field_names: &[String],
-) -> Result<Schema> {
-    let fields: Vec<Arc<Field>> = partition_field_names
-        .iter()
-        .map(|name| {
-            table_schema
-                .field_with_name(name)
-                .map(|f| Arc::new(f.clone()))
-                .map_err(|_| {
-                    CoreError::Schema(format!(
-                        "Partition field `{name}` declared in \
-                         `hoodie.table.partition.fields` is not present in the table schema"
-                    ))
-                })
-        })
-        .collect::<Result<_>>()?;
-    Ok(Schema::new(fields))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,53 +1005,6 @@ mod tests {
         assert!(schema.is_ok());
         let schema = schema.unwrap();
         assert_arrow_field_names_eq!(schema, [MetaField::PartitionPath.as_ref()]);
-    }
-
-    #[test]
-    fn project_partition_schema_preserves_config_order() {
-        use arrow::datatypes::{DataType, Field};
-        let table_schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("integration_id", DataType::Utf8, false),
-            Field::new("resource_type", DataType::Utf8, false),
-            Field::new("org", DataType::Utf8, false),
-            Field::new("payload", DataType::Utf8, false),
-        ]);
-        let partition_field_names = vec![
-            "org".to_string(),
-            "resource_type".to_string(),
-            "integration_id".to_string(),
-        ];
-
-        let projected = project_partition_schema(&table_schema, &partition_field_names).unwrap();
-
-        assert_eq!(projected.fields().len(), 3);
-        assert_eq!(projected.field(0).name(), "org");
-        assert_eq!(projected.field(1).name(), "resource_type");
-        assert_eq!(projected.field(2).name(), "integration_id");
-    }
-
-    #[test]
-    fn project_partition_schema_errors_when_field_missing_from_table_schema() {
-        use arrow::datatypes::{DataType, Field};
-        let table_schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("org", DataType::Utf8, false),
-        ]);
-        let partition_field_names = vec!["org".to_string(), "not_in_schema".to_string()];
-
-        let err = project_partition_schema(&table_schema, &partition_field_names).unwrap_err();
-
-        assert!(matches!(err, CoreError::Schema(_)));
-        assert!(err.to_string().contains("not_in_schema"));
-    }
-
-    #[test]
-    fn project_partition_schema_empty_config_returns_empty_schema() {
-        use arrow::datatypes::{DataType, Field};
-        let table_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
-        let projected = project_partition_schema(&table_schema, &[]).unwrap();
-        assert_eq!(projected.fields().len(), 0);
     }
 
     #[tokio::test]
