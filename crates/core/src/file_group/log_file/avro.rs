@@ -63,6 +63,10 @@ impl<R: Read> Iterator for AvroDataBlockContentReader<R> {
 
         let result = from_avro_datum(&self.writer_schema, &mut record_reader, None);
 
+        // Drain any bytes not consumed by from_avro_datum so the underlying reader's
+        // position is always at the start of the next record's 4-byte length prefix.
+        std::io::copy(&mut record_reader, &mut std::io::sink()).ok();
+
         Some(result)
     }
 }
@@ -88,5 +92,38 @@ mod tests {
         let result = avro_reader.next();
         assert!(result.is_some());
         assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn test_drain_leftover_bytes_between_records() {
+        use apache_avro::to_avro_datum;
+        use apache_avro::types::Value;
+
+        let schema = AvroSchema::parse_str(r#"{"type":"string"}"#).unwrap();
+
+        let hello = to_avro_datum(&schema, Value::String("hello".into())).unwrap();
+        let world = to_avro_datum(&schema, Value::String("world".into())).unwrap();
+
+        let mut data: Vec<u8> = Vec::new();
+        // First record: content_length is 3 bytes larger than actual datum —
+        // simulates a writer that pads/over-reports the length.
+        let padded_len = hello.len() as u32 + 3;
+        data.extend_from_slice(&padded_len.to_be_bytes());
+        data.extend_from_slice(&hello);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // padding bytes
+        // Second record: exact length
+        data.extend_from_slice(&(world.len() as u32).to_be_bytes());
+        data.extend_from_slice(&world);
+
+        let mut reader = AvroDataBlockContentReader::new(Cursor::new(data), &schema, 2);
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Value::String("world".into())
+        );
+        assert!(reader.next().is_none());
     }
 }

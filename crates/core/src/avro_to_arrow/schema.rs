@@ -77,12 +77,20 @@ fn schema_to_field_with_props(
             None,
         )?)),
         AvroSchema::Map(value_schema) => {
+            // AVRO maps have string keys and typed values.  Arrow represents this as
+            // Map(Struct([key: Utf8 (non-null), value: <value_type> (nullable)]), unsorted).
+            let key_field = Field::new("key", DataType::Utf8, false);
             let value_field =
-                schema_to_field_with_props(&value_schema.types, Some("value"), false, None)?;
-            DataType::Dictionary(
-                Box::new(DataType::Utf8),
-                Box::new(value_field.data_type().clone()),
-            )
+                schema_to_field_with_props(&value_schema.types, Some("value"), true, None)?;
+            let entries_field = Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    key_field,
+                    value_field,
+                ])),
+                false,
+            ));
+            DataType::Map(entries_field, false)
         }
         AvroSchema::Union(us) => {
             // If there are only two variants and one of them is null, set the other type as the field data type
@@ -143,9 +151,9 @@ fn schema_to_field_with_props(
         AvroSchema::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
         AvroSchema::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
         AvroSchema::TimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        AvroSchema::LocalTimestampMillis => todo!(),
-        AvroSchema::LocalTimestampMicros => todo!(),
-        AvroSchema::LocalTimestampNanos => todo!(),
+        AvroSchema::LocalTimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+        AvroSchema::LocalTimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
+        AvroSchema::LocalTimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
         AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
     };
 
@@ -214,7 +222,7 @@ fn default_field_name(dt: &DataType) -> &str {
         DataType::Struct(_) => "struct",
         DataType::Union(_, _) => "union",
         DataType::Dictionary(_, _) => "map",
-        DataType::Map(_, _) => unimplemented!("Map support not implemented"),
+        DataType::Map(_, _) => "map",
         DataType::RunEndEncoded(_, _) => {
             unimplemented!("RunEndEncoded support not implemented")
         }
@@ -269,6 +277,62 @@ fn external_props(schema: &AvroSchema) -> HashMap<String, String> {
         _ => {}
     }
     props
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::TimeUnit;
+
+    fn record_schema(field_type_json: &str) -> apache_avro::Schema {
+        let json = format!(
+            r#"{{"type":"record","name":"R","fields":[{{"name":"f","type":{field_type_json}}}]}}"#
+        );
+        apache_avro::Schema::parse_str(&json).unwrap()
+    }
+
+    fn field_type(avro_schema_json: &str) -> DataType {
+        let avro = record_schema(avro_schema_json);
+        let arrow = to_arrow_schema(&avro).unwrap();
+        arrow.field(0).data_type().clone()
+    }
+
+    #[test]
+    fn test_local_timestamp_millis() {
+        let dt = field_type(r#"{"type":"long","logicalType":"local-timestamp-millis"}"#);
+        assert_eq!(dt, DataType::Timestamp(TimeUnit::Millisecond, None));
+    }
+
+    #[test]
+    fn test_local_timestamp_micros() {
+        let dt = field_type(r#"{"type":"long","logicalType":"local-timestamp-micros"}"#);
+        assert_eq!(dt, DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+
+    #[test]
+    fn test_map_to_arrow_map_type() {
+        let dt = field_type(r#"{"type":"map","values":"int"}"#);
+        match &dt {
+            DataType::Map(entries_field, false) => {
+                // Must use "key_value" to match the name Parquet maps produce,
+                // so that base-Parquet and AVRO-log batches can be concatenated.
+                assert_eq!(entries_field.name(), "key_value");
+                match entries_field.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name(), "key");
+                        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+                        assert!(!fields[0].is_nullable());
+                        assert_eq!(fields[1].name(), "value");
+                        assert_eq!(fields[1].data_type(), &DataType::Int32);
+                        assert!(fields[1].is_nullable());
+                    }
+                    other => panic!("expected Struct entries, got {other:?}"),
+                }
+            }
+            other => panic!("expected DataType::Map, got {other:?}"),
+        }
+    }
 }
 
 /// Returns the fully qualified name for a field

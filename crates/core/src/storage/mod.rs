@@ -281,6 +281,15 @@ impl Storage {
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let schema = builder.schema().clone();
+
+        let all_cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        log::debug!(
+            "Parquet full read (non-streaming) for '{relative_path}': \
+             reading all {n} cols: [{cols}]",
+            n = all_cols.len(),
+            cols = all_cols.join(", "),
+        );
+
         let mut stream = builder.build()?;
         let mut batches = Vec::new();
 
@@ -292,6 +301,28 @@ impl Storage {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }
 
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
+    /// Same as [get_parquet_file_data] but applies column projection from `options`.
+    /// Delegates to [get_parquet_file_stream] so the "Parquet column projection" log fires.
+    pub async fn get_parquet_file_data_with_options(
+        &self,
+        relative_path: &str,
+        options: ParquetReadOptions,
+    ) -> Result<RecordBatch> {
+        let file_stream = self
+            .get_parquet_file_stream(relative_path, options)
+            .await?;
+        let schema = file_stream.schema().clone();
+        let mut pinned = Box::pin(file_stream.into_stream());
+        let mut batches = Vec::new();
+        while let Some(r) = pinned.next().await {
+            batches.push(r?);
+        }
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
         Ok(concat_batches(&schema, &batches)?)
     }
 
@@ -317,12 +348,37 @@ impl Storage {
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
 
         if let Some(batch_size) = options.batch_size {
+            log::debug!(
+                "Parquet reader: batch_size={batch_size} for '{relative_path}'"
+            );
             builder = builder.with_batch_size(batch_size);
         }
 
         // Handle projection: convert column names to indices using builder's schema
         if let Some(ref column_names) = options.projection {
             let arrow_schema = builder.schema();
+            let file_cols: Vec<&str> = arrow_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            let pruned_cols: Vec<&str> = file_cols
+                .iter()
+                .copied()
+                .filter(|&c| !column_names.iter().any(|n| n == c))
+                .collect();
+            log::debug!(
+                "Parquet column projection for '{relative_path}': \
+                 file schema [{file_schema}] ({n_file} cols), \
+                 projecting [{proj}] ({n_proj} cols), \
+                 pruning [{pruned}] ({n_pruned} cols)",
+                file_schema = file_cols.join(", "),
+                n_file = file_cols.len(),
+                proj = column_names.join(", "),
+                n_proj = column_names.len(),
+                pruned = pruned_cols.join(", "),
+                n_pruned = pruned_cols.len(),
+            );
             let projection: Vec<usize> = column_names
                 .iter()
                 .map(|name| {
@@ -345,9 +401,38 @@ impl Storage {
                 projection.iter().copied(),
             );
             builder = builder.with_projection(projection_mask);
+        } else {
+            let arrow_schema = builder.schema();
+            let all_cols: Vec<&str> = arrow_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            log::debug!(
+                "Parquet column projection for '{relative_path}': no projection, \
+                 reading all {n} cols: [{cols}]",
+                n = all_cols.len(),
+                cols = all_cols.join(", "),
+            );
         }
 
-        let schema = builder.schema().clone();
+        // builder.schema() always returns the full file schema regardless of projection.
+        // Build the projected schema explicitly so callers that consume the stream
+        // (e.g. get_parquet_file_data_with_options) can use the correct column count.
+        // IMPORTANT: preserve the parquet file's column order (not the caller's order),
+        // because the stream yields columns in file order after projection.
+        let schema = if let Some(ref column_names) = options.projection {
+            let full_schema = builder.schema();
+            let projected_fields: Vec<arrow_schema::FieldRef> = full_schema
+                .fields()
+                .iter()
+                .filter(|f| column_names.iter().any(|n| n == f.name()))
+                .cloned()
+                .collect();
+            Arc::new(arrow_schema::Schema::new(projected_fields))
+        } else {
+            builder.schema().clone()
+        };
         let stream = builder.build()?;
 
         Ok(ParquetFileStream {

@@ -115,11 +115,113 @@ impl FileGroupReader {
         &self,
         relative_path: &str,
     ) -> Result<RecordBatch> {
-        let records: RecordBatch = self
-            .storage
-            .get_parquet_file_data(relative_path)
-            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
-            .await?;
+        log::debug!("FileGroupReader: reading base file '{relative_path}' (non-streaming)");
+
+        // If the caller supplied output columns, extend them with the fields
+        // required for a correct MOR merge before projecting the parquet read.
+        let output_columns: Option<String> = self
+            .hudi_configs
+            .try_get(HudiReadConfig::OutputColumns)
+            .map(|v| v.into());
+
+        let records: RecordBatch = if let Some(ref cols_str) = output_columns {
+            let mut projection: Vec<String> = cols_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            // Always required for RecordMerger dedup / sort.
+            let merge_cols = [
+                MetaField::RecordKey.as_ref(),
+                MetaField::CommitSeqno.as_ref(),
+            ];
+            for col in &merge_cols {
+                if !projection.iter().any(|c| c == col) {
+                    projection.push(col.to_string());
+                }
+            }
+
+            // Ordering field (e.g. "ts") is needed for EVENT_TIME_ORDERING.
+            let ordering_field: Option<String> = self
+                .hudi_configs
+                .try_get(HudiTableConfig::PrecombineField)
+                .map(|v| v.into());
+            if let Some(ref of) = ordering_field {
+                if !projection.iter().any(|c| c == of) {
+                    projection.push(of.clone());
+                }
+            }
+
+            // _hoodie_commit_time is required by RecordMerger (create_commit_time_ordering_converter)
+            // whenever meta fields are present, regardless of time-travel mode.
+            let populates_meta_fields: bool = self
+                .hudi_configs
+                .get_or_default(HudiTableConfig::PopulatesMetaFields)
+                .into();
+            if populates_meta_fields {
+                let ct = MetaField::CommitTime.as_ref().to_string();
+                if !projection.iter().any(|c| c == &ct) {
+                    projection.push(ct);
+                }
+            }
+
+            log::debug!(
+                "FileGroupReader: projecting {n} cols for '{relative_path}': [{cols}]",
+                n = projection.len(),
+                cols = projection.join(", "),
+            );
+
+            self.storage
+                .get_parquet_file_data_with_options(
+                    relative_path,
+                    ParquetReadOptions::new().with_projection(projection),
+                )
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+                })
+                .await?
+        } else {
+            self.storage
+                .get_parquet_file_data(relative_path)
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+                })
+                .await?
+        };
+
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        if populates_meta_fields {
+            let start_ts = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupStartTimestamp)
+                .map(|v| -> String { v.into() });
+            match start_ts {
+                Some(ref start) => {
+                    let end_ts = self
+                        .hudi_configs
+                        .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                        .map(|v| -> String { v.into() });
+                    log::debug!(
+                        "FileGroupReader: commit time filter for '{relative_path}': \
+                         _hoodie_commit_time > '{start}'{}",
+                        end_ts
+                            .as_deref()
+                            .map(|e| format!(" AND _hoodie_commit_time <= '{e}'"))
+                            .unwrap_or_default(),
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "FileGroupReader: no commit time filter for '{relative_path}' \
+                         (snapshot/time-travel query)"
+                    );
+                }
+            }
+        }
 
         apply_commit_time_filter(&self.hudi_configs, records)
     }
@@ -190,8 +292,25 @@ impl FileGroupReader {
         let base_file_only = log_file_paths.is_empty() || use_read_optimized;
 
         if base_file_only {
+            if log_file_paths.is_empty() {
+                log::debug!(
+                    "FileGroupReader: COW/base-only read for '{base_file_path}' (no log files)"
+                );
+            } else {
+                log::debug!(
+                    "FileGroupReader: read-optimized mode for '{base_file_path}' \
+                     (skipping {} log file(s))",
+                    log_file_paths.len()
+                );
+            }
             self.read_file_slice_by_base_file_path(base_file_path).await
         } else {
+            log::debug!(
+                "FileGroupReader: MOR merge for '{base_file_path}' \
+                 with {} log file(s): [{}]",
+                log_file_paths.len(),
+                log_file_paths.join(", "),
+            );
             let instant_range = self.create_instant_range_for_log_file_scan();
             let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
@@ -211,6 +330,42 @@ impl FileGroupReader {
                 .read_file_slice_by_base_file_path(base_file_path)
                 .await?;
             let schema = base_batch.schema();
+
+            // When column projection is active, the base batch may have fewer columns
+            // than the log batches (which are always read in full from the log scanner).
+            // Project each log data batch down to the base schema so concat_batches
+            // receives uniformly-schemaed inputs.
+            let log_batches = if let Some(first) = log_batches.data_batches.first() {
+                if first.num_columns() > schema.fields().len() {
+                    let indices: Vec<usize> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            first
+                                .schema()
+                                .index_of(f.name())
+                                .map_err(CoreError::ArrowError)
+                        })
+                        .collect::<Result<_>>()?;
+                    let mut projected = RecordBatches::new_with_capacity(
+                        log_batches.num_data_batches(),
+                        log_batches.num_delete_batches(),
+                    );
+                    for batch in &log_batches.data_batches {
+                        projected
+                            .push_data_batch(batch.project(&indices).map_err(CoreError::ArrowError)?);
+                    }
+                    for (batch, ts) in log_batches.delete_batches {
+                        projected.push_delete_batch(batch, ts);
+                    }
+                    projected
+                } else {
+                    log_batches
+                }
+            } else {
+                log_batches
+            };
+
             let num_data_batches = log_batches.num_data_batches() + 1;
             let num_delete_batches = log_batches.num_delete_batches();
             let mut all_batches =
@@ -359,12 +514,77 @@ impl FileGroupReader {
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
+        log::debug!(
+            "FileGroupReader: reading '{}' | batch_size={batch_size}{}",
+            relative_path,
+            if options.batch_size.is_some() { " (from ReadOptions)" } else { " (default)" },
+        );
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
         // Add projection pushdown using column names (converted to indices internally
         // by get_parquet_file_stream using the same schema the projection is applied to)
         if let Some(ref projection_names) = options.projection {
+            log::debug!(
+                "FileGroupReader: column projection for '{}': [{}]",
+                relative_path,
+                projection_names.join(", "),
+            );
             parquet_options = parquet_options.with_projection(projection_names.clone());
+        } else {
+            log::debug!(
+                "FileGroupReader: no column projection for '{}' — all columns will be read",
+                relative_path,
+            );
+        }
+
+        // Log commit time filter (evaluated once here; applied per batch inside the stream)
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        if populates_meta_fields {
+            let start_ts = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupStartTimestamp)
+                .map(|v| -> String { v.into() });
+            match start_ts {
+                Some(ref start) => {
+                    let end_ts = self
+                        .hudi_configs
+                        .try_get(HudiReadConfig::FileGroupEndTimestamp)
+                        .map(|v| -> String { v.into() });
+                    log::debug!(
+                        "FileGroupReader: commit time filter for '{}': \
+                         _hoodie_commit_time > '{}'{}",
+                        relative_path,
+                        start,
+                        end_ts
+                            .as_deref()
+                            .map(|e| format!(" AND _hoodie_commit_time <= '{e}'"))
+                            .unwrap_or_default(),
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "FileGroupReader: no commit time filter for '{}' \
+                         (snapshot/time-travel query)",
+                        relative_path,
+                    );
+                }
+            }
+        } else {
+            log::debug!(
+                "FileGroupReader: commit time filter skipped for '{}' \
+                 (PopulatesMetaFields=false)",
+                relative_path,
+            );
+        }
+
+        if options.row_predicate.is_some() {
+            log::debug!(
+                "FileGroupReader: user row predicate active for '{}'",
+                relative_path,
+            );
         }
 
         let hudi_configs = self.hudi_configs.clone();

@@ -154,10 +154,12 @@ impl FileSystemView {
         as_of_timestamp: &str,
     ) -> Vec<FileGroup> {
         if file_pruner.is_empty() {
+            log::debug!("FilePruner: no data-column filters, skipping stats pruning");
             return file_groups;
         }
 
-        let mut retained = Vec::with_capacity(file_groups.len());
+        let total = file_groups.len();
+        let mut retained = Vec::with_capacity(total);
 
         for mut fg in file_groups {
             if let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) {
@@ -194,10 +196,18 @@ impl FileSystemView {
                     }
                 };
 
+                log::debug!(
+                    "FilePruner: evaluating '{}' | {} row(s), {} column stat(s) loaded",
+                    relative_path,
+                    stats.num_rows.unwrap_or(0),
+                    stats.columns.len(),
+                );
+
                 if file_pruner.should_include(&stats) {
+                    log::debug!("FilePruner: including '{relative_path}'");
                     retained.push(fg);
                 } else {
-                    log::debug!("Pruned file {relative_path} based on column stats");
+                    log::debug!("FilePruner: pruned '{relative_path}' based on column stats");
                 }
             } else {
                 // No file slice as of timestamp, include the file group
@@ -206,6 +216,10 @@ impl FileSystemView {
             }
         }
 
+        log::debug!(
+            "FilePruner: retained {}/{total} file group(s) after stats pruning",
+            retained.len(),
+        );
         retained
     }
 

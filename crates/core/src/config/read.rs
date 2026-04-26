@@ -67,6 +67,11 @@ pub enum HudiReadConfig {
     /// Target number of rows per batch for streaming reads.
     /// This controls the batch size when using streaming APIs.
     StreamBatchSize,
+
+    /// Comma-separated output column names requested by the caller.
+    /// hudi-rs will extend this with merge-required fields (record key,
+    /// ordering field, commit-seqno meta) before applying parquet projection.
+    OutputColumns,
 }
 
 impl AsRef<str> for HudiReadConfig {
@@ -78,6 +83,7 @@ impl AsRef<str> for HudiReadConfig {
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
+            Self::OutputColumns => "hoodie.read.output.columns",
         }
     }
 }
@@ -134,6 +140,9 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::OutputColumns => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
         }
     }
 }
