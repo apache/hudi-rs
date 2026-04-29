@@ -45,12 +45,12 @@ devel = [
     "pytest==9.0.3",
     "coverage==7.10.7",
     "ruff==0.14.13",
-    "mypy==1.19.1",
+    "mypy==1.20.2",
     "pre-commit",
 ]
 lint = [
     "ruff==0.14.13",
-    "mypy==1.19.1",
+    "mypy==1.20.2",
 ]
 datafusion = [
     "datafusion==52.3.0",
