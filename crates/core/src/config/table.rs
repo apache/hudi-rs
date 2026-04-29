@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
-use strum_macros::{AsRefStr, EnumIter};
+use strum_macros::{AsRefStr, EnumIter, IntoStaticStr};
 
 use crate::config::Result;
 use crate::config::error::ConfigError;
@@ -42,7 +42,7 @@ use crate::merge::RecordMergeStrategyValue;
 /// let options = [(BaseFileFormat, "parquet")];
 /// HudiTable::new_with_options("/tmp/hudi_data", options);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter, IntoStaticStr)]
 pub enum HudiTableConfig {
     /// Base file format
     ///

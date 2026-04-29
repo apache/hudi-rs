@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 
-use strum_macros::EnumIter;
+use strum_macros::{EnumIter, IntoStaticStr};
 
 use crate::config::Result;
 use crate::config::error::ConfigError::{NotFound, ParseBool, ParseInt};
@@ -44,7 +44,7 @@ use crate::config::{ConfigParser, HudiConfigValue};
 /// ```
 ///
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter, IntoStaticStr)]
 pub enum HudiReadConfig {
     /// Start timestamp (exclusive) for [FileGroup] to filter records.
     FileGroupStartTimestamp,
