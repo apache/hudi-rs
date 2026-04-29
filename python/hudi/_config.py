@@ -14,28 +14,36 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
+"""Hudi config enums reflected from the Rust core at import time.
 
+The `enum.Enum` members are constructed from `hudi._internal._config_keys()`,
+so the variant names and key strings have a single source of truth in Rust.
+"""
 
-from hudi._config import HudiReadConfig, HudiTableConfig
-from hudi._internal import (
-    HudiDataFusionDataSource,
-    HudiFileGroupReader,
-    HudiFileSlice,
-    HudiInstant,
-    HudiTable,
-    HudiTimeline,
-)
-from hudi._internal import __version__ as __version__
-from hudi.table.builder import HudiTableBuilder
+from enum import Enum
 
-__all__ = [
-    "HudiDataFusionDataSource",
-    "HudiFileGroupReader",
-    "HudiFileSlice",
-    "HudiInstant",
-    "HudiReadConfig",
-    "HudiTable",
-    "HudiTableBuilder",
+from hudi._internal import _config_keys
+
+_keys = _config_keys()
+
+HudiTableConfig = Enum(
     "HudiTableConfig",
-    "HudiTimeline",
-]
+    _keys["HudiTableConfig"],
+    type=str,
+    module=__name__,
+    qualname="HudiTableConfig",
+)
+HudiTableConfig.__doc__ = (
+    "Configurations for Hudi tables, most of them are persisted in `hoodie.properties`."
+)
+
+HudiReadConfig = Enum(
+    "HudiReadConfig",
+    _keys["HudiReadConfig"],
+    type=str,
+    module=__name__,
+    qualname="HudiReadConfig",
+)
+HudiReadConfig.__doc__ = "Configurations for reading Hudi tables."
+
+__all__ = ["HudiReadConfig", "HudiTableConfig"]

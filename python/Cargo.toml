@@ -35,6 +35,7 @@ doc = false
 [dependencies]
 hudi = { path = "../crates/hudi"}
 hudi-test = { path = "../crates/test", optional = true }
+strum = { workspace = true }
 # arrow
 arrow = { workspace = true, features = ["pyarrow"] }
 

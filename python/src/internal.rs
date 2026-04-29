@@ -26,6 +26,8 @@ use tokio::runtime::Runtime;
 
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
+use hudi::config::read::HudiReadConfig;
+use hudi::config::table::HudiTableConfig;
 use hudi::error::CoreError;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
@@ -670,6 +672,59 @@ pub fn build_hudi_table(
         .map_err(PythonError::from)
     })?;
     Ok(HudiTable { inner })
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pyfunction]
+pub fn _config_keys() -> HashMap<String, Vec<(String, String)>> {
+    fn collect<E>() -> Vec<(String, String)>
+    where
+        E: ::strum::IntoEnumIterator + AsRef<str>,
+        for<'a> &'a E: Into<&'static str>,
+    {
+        E::iter()
+            .map(|v| {
+                let pascal: &'static str = (&v).into();
+                (pascal_to_screaming_snake(pascal), v.as_ref().to_string())
+            })
+            .collect()
+    }
+
+    let mut out = HashMap::new();
+    out.insert("HudiTableConfig".to_string(), collect::<HudiTableConfig>());
+    out.insert("HudiReadConfig".to_string(), collect::<HudiReadConfig>());
+    out
+}
+
+fn pascal_to_screaming_snake(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 4);
+    let chars: Vec<char> = input.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        let is_boundary = i > 0
+            && ch.is_uppercase()
+            && (chars[i - 1].is_lowercase()
+                || (i + 1 < chars.len() && chars[i + 1].is_lowercase()));
+        if is_boundary {
+            out.push('_');
+        }
+        for upper_ch in ch.to_uppercase() {
+            out.push(upper_ch);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pascal_to_screaming_snake;
+
+    #[test]
+    fn pascal_to_screaming_snake_basic() {
+        assert_eq!(pascal_to_screaming_snake("BaseFileFormat"), "BASE_FILE_FORMAT");
+        assert_eq!(pascal_to_screaming_snake("TableName"), "TABLE_NAME");
+        assert_eq!(pascal_to_screaming_snake("URLEncoded"), "URL_ENCODED");
+        assert_eq!(pascal_to_screaming_snake("A"), "A");
+    }
 }
 
 #[cfg(not(tarpaulin_include))]

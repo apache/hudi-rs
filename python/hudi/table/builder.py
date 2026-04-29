@@ -15,9 +15,17 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from enum import Enum
+from typing import Dict, Optional, Union
 
+from hudi._config import HudiReadConfig, HudiTableConfig
 from hudi._internal import HudiTable, build_hudi_table
+
+ConfigKey = Union[str, HudiTableConfig, HudiReadConfig]
+
+
+def _coerce_key(k: ConfigKey) -> str:
+    return k.value if isinstance(k, Enum) else k
 
 
 @dataclass
@@ -57,18 +65,18 @@ class HudiTableBuilder:
         target_attr = getattr(self, f"{category}_options") if category else self.options
         target_attr.update(options)
 
-    def with_hudi_option(self, k: str, v: str) -> "HudiTableBuilder":
+    def with_hudi_option(self, k: ConfigKey, v: str) -> "HudiTableBuilder":
         """
         Adds a Hudi option to the builder.
 
         Parameters:
-            k (str): The key of the option.
+            k (Union[str, HudiTableConfig, HudiReadConfig]): The key, as a string or enum member.
             v (str): The value of the option.
 
         Returns:
             HudiTableBuilder: The builder instance.
         """
-        self._add_options({k: v}, "hudi")
+        self._add_options({_coerce_key(k): v}, "hudi")
         return self
 
     def with_hudi_options(self, hudi_options: Dict[str, str]) -> "HudiTableBuilder":
@@ -113,18 +121,18 @@ class HudiTableBuilder:
         self._add_options(storage_options, "storage")
         return self
 
-    def with_option(self, k: str, v: str) -> "HudiTableBuilder":
+    def with_option(self, k: ConfigKey, v: str) -> "HudiTableBuilder":
         """
         Adds a generic option to the builder.
 
         Parameters:
-            k (str): The key of the option.
+            k (Union[str, HudiTableConfig, HudiReadConfig]): The key, as a string or enum member.
             v (str): The value of the option.
 
         Returns:
             HudiTableBuilder: The builder instance.
         """
-        self._add_options({k: v})
+        self._add_options({_coerce_key(k): v})
         return self
 
     def with_options(self, options: Dict[str, str]) -> "HudiTableBuilder":
