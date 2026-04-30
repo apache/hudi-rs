@@ -107,13 +107,17 @@ To run read-optimized (RO) query on Merge-on-Read (MOR) tables, set `hoodie.read
 #### Python
 
 ```python
+from hudi import HudiReadConfig, HudiTableBuilder
+
 hudi_table = (
     HudiTableBuilder
     .from_base_uri("/tmp/trips_table")
-    .with_option("hoodie.read.use.read_optimized.mode", "true")
+    .with_option(HudiReadConfig.USE_READ_OPTIMIZED_MODE, "true")
     .build()
 )
 ```
+
+`HudiReadConfig` and `HudiTableConfig` enum members are accepted by `with_hudi_option` and `with_option`. For the bulk variants `with_hudi_options` / `with_options`, pass string keys (or `member.value`) until they are updated to coerce enum keys.
 
 #### Rust
 
