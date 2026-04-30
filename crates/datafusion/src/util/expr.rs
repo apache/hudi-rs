@@ -123,7 +123,7 @@ fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
     Some(filter)
 }
 
-/// Converts a NOT expression (`Expr::Not`) into a `PartitionFilter`.
+/// Converts a NOT expression (`Expr::Not`) into a [`HudiFilter`].
 fn not_expr_to_filter(not_expr: &Expr) -> Option<HudiFilter> {
     match not_expr {
         Expr::BinaryExpr(binary_expr) => {

@@ -115,7 +115,6 @@ use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
-use crate::table::read_options::PartitionFilter;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use crate::util::collection::split_into_chunks;
@@ -156,8 +155,8 @@ impl Clone for Table {
     }
 }
 
-/// Parse partition filter tuples from `ReadOptions::filters` into [`Filter`]s.
-fn parse_filters(filters: &[PartitionFilter]) -> Result<Vec<Filter>> {
+/// Parse `ReadOptions::filters` tuples into [`Filter`]s.
+fn parse_filters(filters: &[(String, String, String)]) -> Result<Vec<Filter>> {
     from_str_tuples(
         filters
             .iter()

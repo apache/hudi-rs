@@ -18,10 +18,6 @@
  */
 //! Read options shared by all read APIs (eager and streaming).
 
-/// A partition filter tuple: (field_name, operator, value).
-/// Example: ("city", "=", "san_francisco")
-pub type PartitionFilter = (String, String, String);
-
 /// Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 ///
 /// Fields are interpreted by the calling method:
@@ -30,15 +26,12 @@ pub type PartitionFilter = (String, String, String);
 ///   latest respectively when unset).
 /// - All APIs honor `filters`, `projection`, and `batch_size` where applicable.
 ///
-/// `filters` are used both as pruning hints (file/partition selection before reading)
-/// and as a row-level mask after reading, so callers get only the rows that match.
-///
 /// # Example
 ///
 /// ```ignore
 /// use hudi::table::ReadOptions;
 ///
-/// // Snapshot read with a partition filter
+/// // Snapshot read with a column filter on the partition column
 /// let options = ReadOptions::new()
 ///     .with_filters([("city", "=", "san_francisco")])
 ///     .with_projection(["id", "name", "city"]);
@@ -53,9 +46,16 @@ pub type PartitionFilter = (String, String, String);
 /// ```
 #[derive(Debug, Default)]
 pub struct ReadOptions {
-    /// Partition filters. Each filter is a tuple of (field, operator, value).
-    /// Used for partition + file-level pruning AND as a row-level mask during reads.
-    pub filters: Vec<PartitionFilter>,
+    /// Column filters. Each filter is a tuple of `(field, operator, value)` where
+    /// `field` is any column name (partition or data).
+    ///
+    /// Filters drive both **pruning** and **row-level filtering**:
+    /// - When the field is a **partition column**, the filter prunes whole partitions.
+    /// - When the field is a **data column**, the filter prunes whole files via column
+    ///   statistics (min/max) when available.
+    /// - All filters are also applied as a row-level mask after reading, so callers
+    ///   only get rows that match.
+    pub filters: Vec<(String, String, String)>,
 
     /// Column names to project (select). If None, all columns are read.
     pub projection: Option<Vec<String>>,
