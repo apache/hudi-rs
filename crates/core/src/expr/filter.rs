@@ -103,6 +103,33 @@ where
         .collect()
 }
 
+/// Evaluate a slice of [`Filter`]s against a [`RecordBatch`] and return a row-level mask
+/// where `true` indicates the row should be retained.
+///
+/// Filters whose field is not present in the batch are skipped (this happens, e.g., when
+/// the filter targets a partition column already pruned upstream and not included in the
+/// projected batch). All other filters are evaluated as row-level predicates and ANDed
+/// together.
+pub fn filters_to_row_mask(
+    filters: &[Filter],
+    batch: &arrow_array::RecordBatch,
+) -> Result<BooleanArray> {
+    let num_rows = batch.num_rows();
+    let mut mask: Option<BooleanArray> = None;
+    for filter in filters {
+        let Some(column) = batch.column_by_name(&filter.field_name) else {
+            continue;
+        };
+        let schemable = SchemableFilter::try_from((filter.clone(), batch.schema().as_ref()))?;
+        let column_mask = schemable.apply_comparison(column)?;
+        mask = Some(match mask {
+            Some(prev) => boolean::and(&prev, &column_mask)?,
+            None => column_mask,
+        });
+    }
+    Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; num_rows])))
+}
+
 pub struct FilterField {
     pub name: String,
 }
@@ -276,14 +303,71 @@ impl SchemableFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn create_test_schema() -> Schema {
         Schema::new(vec![
             Field::new("string_col", DataType::Utf8, false),
             Field::new("int_col", DataType::Int64, false),
         ])
+    }
+
+    #[test]
+    fn test_filters_to_row_mask_combines_filters_with_and() -> Result<()> {
+        let schema = Arc::new(create_test_schema());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "a"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let filters = vec![
+            Filter::try_from(("string_col", "=", "a"))?,
+            Filter::try_from(("int_col", ">", "1"))?,
+        ];
+        let mask = filters_to_row_mask(&filters, &batch)?;
+        assert_eq!(mask, BooleanArray::from(vec![false, false, true]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_filters_to_row_mask_skips_missing_columns() -> Result<()> {
+        let schema = Arc::new(create_test_schema());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let filters = vec![
+            Filter::try_from(("not_in_batch", "=", "x"))?,
+            Filter::try_from(("string_col", "=", "a"))?,
+        ];
+        let mask = filters_to_row_mask(&filters, &batch)?;
+        assert_eq!(mask, BooleanArray::from(vec![true, false]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_filters_to_row_mask_empty_returns_all_true() -> Result<()> {
+        let schema = Arc::new(create_test_schema());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mask = filters_to_row_mask(&[], &batch)?;
+        assert_eq!(mask, BooleanArray::from(vec![true, true]));
+        Ok(())
     }
 
     #[test]

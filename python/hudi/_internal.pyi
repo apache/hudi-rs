@@ -88,42 +88,35 @@ class HudiFileGroupReader:
         """
         ...
     def read_file_slice_by_base_file_path(
-        self, relative_path: str
+        self,
+        relative_path: str,
+        options: Optional[HudiReadOptions] = None,
     ) -> "pyarrow.RecordBatch":
         """
-        Reads the data from the base file at the given relative path.
+        Read the data from the base file at the given relative path.
 
-        Parameters:
-            relative_path (str): The relative path to the base file.
-
-        Returns:
-            pyarrow.RecordBatch: A record batch read from the base file.
+        ``options.filters`` and ``options.row_predicate`` are applied as row-level
+        filters; ``options.projection`` selects columns. Other fields are ignored.
         """
         ...
-    def read_file_slice(self, file_slice: HudiFileSlice) -> "pyarrow.RecordBatch":
+    def read_file_slice(
+        self,
+        file_slice: HudiFileSlice,
+        options: Optional[HudiReadOptions] = None,
+    ) -> "pyarrow.RecordBatch":
         """
-        Reads the data from the given file slice.
-
-        Parameters:
-            file_slice (HudiFileSlice): The file slice to read from.
-
-        Returns:
-            pyarrow.RecordBatch: A record batch read from the file slice.
+        Read the data from the given file slice (base + log files merged).
         """
         ...
 
     def read_file_slice_from_paths(
-        self, base_file_path: str, log_file_paths: List[str]
+        self,
+        base_file_path: str,
+        log_file_paths: List[str],
+        options: Optional[HudiReadOptions] = None,
     ) -> "pyarrow.RecordBatch":
         """
-        Read a file slice from a base file and a list of log files.
-
-        Args:
-            base_file_path (str): The relative path to the base file.
-            log_file_paths (List[str]): A list of relative paths to log files.
-
-        Returns:
-            pyarrow.RecordBatch: The merged record batch from base file and log files.
+        Read a file slice from a base file path and a list of log file paths.
         """
         ...
 

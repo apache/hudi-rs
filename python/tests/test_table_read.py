@@ -199,3 +199,26 @@ def test_convert_filters_valid(v8_trips_table):
         assert len(file_slices) == exp, (
             f"Filter {f} expected {exp} slices, got {len(file_slices)}"
         )
+
+
+def test_read_snapshot_filters_apply_as_row_predicate(v8_trips_table):
+    """Filters on a non-partition column drop rows during reading.
+
+    'rider' is a non-partition column. Filtering on it does not prune any files
+    (since stats may not exclude the file), but rows must still be filtered.
+    """
+    table = HudiTable(v8_trips_table)
+    options = HudiReadOptions(filters=[("rider", "=", "rider-A")])
+    batches = table.read_snapshot(options)
+    t = pa.Table.from_batches(batches)
+    assert t.num_rows == 1
+    assert t.column("rider").to_pylist() == ["rider-A"]
+
+
+def test_read_snapshot_stream_filters_apply_as_row_predicate(v8_trips_table):
+    table = HudiTable(v8_trips_table)
+    options = HudiReadOptions(filters=[("rider", "=", "rider-A")])
+    batches = list(table.read_snapshot_stream(options))
+    t = pa.Table.from_batches(batches)
+    assert t.num_rows == 1
+    assert t.column("rider").to_pylist() == ["rider-A"]

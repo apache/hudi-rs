@@ -23,6 +23,7 @@ use cxx::{CxxString, CxxVector};
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
+use hudi::table::ReadOptions;
 
 #[cxx::bridge]
 mod ffi {
@@ -102,7 +103,10 @@ impl HudiFileGroupReader {
 
         let record_batch = self
             .rt
-            .block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
+            .block_on(
+                self.inner
+                    .read_file_slice_by_base_file_path(relative_path, &ReadOptions::new()),
+            )
             .map_err(|e| format!("Failed to read file batch: {e}"))?;
         let schema = record_batch.schema();
 
@@ -118,7 +122,10 @@ impl HudiFileGroupReader {
     ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let record_batch = self
             .rt
-            .block_on(self.inner.read_file_slice(&file_slice.inner))
+            .block_on(
+                self.inner
+                    .read_file_slice(&file_slice.inner, &ReadOptions::new()),
+            )
             .map_err(|e| format!("Failed to read file slice: {e}"))?;
         let schema = record_batch.schema();
 

@@ -597,23 +597,26 @@ impl Table {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filters(&options.filters)?;
-        self.read_snapshot_internal(&timestamp, &filters).await
+        self.read_snapshot_internal(&timestamp, options).await
     }
 
     async fn read_snapshot_internal(
         &self,
         timestamp: &str,
-        filters: &[Filter],
+        options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let file_slices = self.get_file_slices_internal(timestamp, filters).await?;
+        let filters = parse_filters(&options.filters)?;
+        let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
         let fg_reader = self.create_file_group_reader_with_options([(
             HudiReadConfig::FileGroupEndTimestamp,
             timestamp,
         )])?;
-        let batches =
-            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
-                .await?;
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, options)),
+        )
+        .await?;
         Ok(batches)
     }
 
@@ -642,9 +645,12 @@ impl Table {
             (HudiReadConfig::FileGroupEndTimestamp, end),
         ])?;
 
-        let batches =
-            futures::future::try_join_all(file_slices.iter().map(|f| fg_reader.read_file_slice(f)))
-                .await?;
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, options)),
+        )
+        .await?;
         Ok(batches)
     }
 
@@ -792,11 +798,7 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         };
 
-        let filters: Vec<Filter> = options
-            .filters
-            .iter()
-            .map(|(f, o, v)| Filter::try_from((f.as_str(), o.as_str(), v.as_str())))
-            .collect::<Result<Vec<_>>>()?;
+        let filters = parse_filters(&options.filters)?;
         let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
 
         if file_slices.is_empty() {
@@ -808,17 +810,21 @@ impl Table {
             timestamp,
         )])?;
 
-        // Extract options to pass to each file slice read.
+        // Extract per-batch options. Keep `filters` so they apply at row-level too —
+        // the upstream pruning already used them at file/partition level; applying at
+        // row-level closes the gap for non-partition column filters.
         let batch_size = options.batch_size;
         let projection = options.projection.clone();
+        let row_filters = options.filters.clone();
         let row_predicate = options.row_predicate.clone();
 
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();
             let projection = projection.clone();
+            let row_filters = row_filters.clone();
             let row_predicate = row_predicate.clone();
             let options = ReadOptions {
-                filters: vec![],
+                filters: row_filters,
                 projection,
                 row_predicate,
                 batch_size,
@@ -1348,6 +1354,7 @@ mod tests {
             .unwrap()
             .read_file_slice_by_base_file_path(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+                &ReadOptions::new(),
             )
             .await
             .unwrap();

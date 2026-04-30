@@ -221,20 +221,33 @@ impl HudiFileGroupReader {
         Ok(HudiFileGroupReader { inner })
     }
 
+    #[pyo3(signature = (relative_path, options=None))]
     fn read_file_slice_by_base_file_path(
         &self,
         relative_path: &str,
+        options: Option<HudiReadOptions>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
+        let read_options = options.unwrap_or_default().to_inner();
         py.detach(|| {
-            rt().block_on(self.inner.read_file_slice_by_base_file_path(relative_path))
-                .map_err(PythonError::from)
+            rt().block_on(
+                self.inner
+                    .read_file_slice_by_base_file_path(relative_path, &read_options),
+            )
+            .map_err(PythonError::from)
         })?
         .to_pyarrow(py)
         .map(|b| b.unbind())
     }
 
-    fn read_file_slice(&self, file_slice: &HudiFileSlice, py: Python) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (file_slice, options=None))]
+    fn read_file_slice(
+        &self,
+        file_slice: &HudiFileSlice,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<Py<PyAny>> {
+        let read_options = options.unwrap_or_default().to_inner();
         let mut file_group = FileGroup::new_with_base_file_name(
             &file_slice.base_file_name,
             &file_slice.partition_path,
@@ -255,24 +268,28 @@ impl HudiFileGroupReader {
             })
             .map_err(PythonError::from)?;
         py.detach(|| {
-            rt().block_on(self.inner.read_file_slice(file_slice))
+            rt().block_on(self.inner.read_file_slice(file_slice, &read_options))
                 .map_err(PythonError::from)
         })?
         .to_pyarrow(py)
         .map(|b| b.unbind())
     }
 
+    #[pyo3(signature = (base_file_path, log_file_paths, options=None))]
     fn read_file_slice_from_paths(
         &self,
         base_file_path: &str,
         log_file_paths: Vec<String>,
+        options: Option<HudiReadOptions>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
+        let read_options = options.unwrap_or_default().to_inner();
         py.detach(|| {
-            rt().block_on(
-                self.inner
-                    .read_file_slice_from_paths(base_file_path, log_file_paths),
-            )
+            rt().block_on(self.inner.read_file_slice_from_paths(
+                base_file_path,
+                log_file_paths,
+                &read_options,
+            ))
             .map_err(PythonError::from)
         })?
         .to_pyarrow(py)

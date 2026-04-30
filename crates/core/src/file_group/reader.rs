@@ -23,7 +23,7 @@ use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
-use crate::expr::filter::{Filter, SchemableFilter};
+use crate::expr::filter::{Filter, SchemableFilter, filters_to_row_mask, from_str_tuples};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
@@ -106,21 +106,28 @@ impl FileGroupReader {
 
     /// Reads the data from the base file at the given relative path.
     ///
-    /// # Arguments
-    /// * `relative_path` - The relative path to the base file.
-    ///
-    /// # Returns
-    /// A record batch read from the base file.
+    /// `options.filters` and `options.row_predicate` are applied as row-level filters;
+    /// `options.projection` is applied to the resulting columns. Other fields
+    /// (`as_of_timestamp`, `start_timestamp`, `end_timestamp`, `batch_size`) are not
+    /// meaningful for eager reads and are ignored.
     pub async fn read_file_slice_by_base_file_path(
         &self,
         relative_path: &str,
+        options: &ReadOptions,
     ) -> Result<RecordBatch> {
+        let batch = self.read_base_file_eager(relative_path).await?;
+        apply_eager_options(options, batch)
+    }
+
+    /// Internal: read base file + apply commit-time filter, no [`ReadOptions`] applied.
+    /// Used by both the public eager method and the merge path so options aren't
+    /// applied prematurely before merging with log files.
+    async fn read_base_file_eager(&self, relative_path: &str) -> Result<RecordBatch> {
         let records: RecordBatch = self
             .storage
             .get_parquet_file_data(relative_path)
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
             .await?;
-
         apply_commit_time_filter(&self.hudi_configs, records)
     }
 
@@ -142,12 +149,12 @@ impl FileGroupReader {
 
     /// Reads the data from the given file slice.
     ///
-    /// # Arguments
-    /// * `file_slice` - The file slice to read.
-    ///
-    /// # Returns
-    /// A record batch read from the file slice.
-    pub async fn read_file_slice(&self, file_slice: &FileSlice) -> Result<RecordBatch> {
+    /// See [`Self::read_file_slice_by_base_file_path`] for how `options` is applied.
+    pub async fn read_file_slice(
+        &self,
+        file_slice: &FileSlice,
+        options: &ReadOptions,
+    ) -> Result<RecordBatch> {
         let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths = if file_slice.has_log_file() {
             file_slice
@@ -158,22 +165,19 @@ impl FileGroupReader {
         } else {
             vec![]
         };
-        self.read_file_slice_from_paths(&base_file_path, log_file_paths)
+        self.read_file_slice_from_paths(&base_file_path, log_file_paths, options)
             .await
     }
 
     /// Reads a file slice from a base file and a list of log files.
     ///
-    /// # Arguments
-    /// * `base_file_path` - The relative path to the base file.
-    /// * `log_file_paths` - An iterator of relative paths to log files.
-    ///
-    /// # Returns
-    /// A record batch read from the base file merged with log files.
+    /// `options` filters / row predicate / projection are applied to the merged result.
+    /// See [`Self::read_file_slice_by_base_file_path`] for details.
     pub async fn read_file_slice_from_paths<I, S>(
         &self,
         base_file_path: &str,
         log_file_paths: I,
+        options: &ReadOptions,
     ) -> Result<RecordBatch>
     where
         I: IntoIterator<Item = S>,
@@ -189,8 +193,8 @@ impl FileGroupReader {
             .into();
         let base_file_only = log_file_paths.is_empty() || use_read_optimized;
 
-        if base_file_only {
-            self.read_file_slice_by_base_file_path(base_file_path).await
+        let merged = if base_file_only {
+            self.read_base_file_eager(base_file_path).await?
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan();
             let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
@@ -207,9 +211,7 @@ impl FileGroupReader {
                 }
             };
 
-            let base_batch = self
-                .read_file_slice_by_base_file_path(base_file_path)
-                .await?;
+            let base_batch = self.read_base_file_eager(base_file_path).await?;
             let schema = base_batch.schema();
             let num_data_batches = log_batches.num_data_batches() + 1;
             let num_delete_batches = log_batches.num_delete_batches();
@@ -219,8 +221,10 @@ impl FileGroupReader {
             all_batches.extend(log_batches);
 
             let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)
-        }
+            merger.merge_record_batches(all_batches)?
+        };
+
+        apply_eager_options(options, merged)
     }
 
     // =========================================================================
@@ -324,7 +328,7 @@ impl FileGroupReader {
         } else {
             // Fallback: collect + merge, then yield as single-item stream
             let batch = self
-                .read_file_slice_from_paths(base_file_path, log_file_paths)
+                .read_file_slice_from_paths(base_file_path, log_file_paths, options)
                 .await?;
             Ok(Box::pin(futures::stream::once(async { Ok(batch) })))
         }
@@ -335,7 +339,9 @@ impl FileGroupReader {
     /// Supports the following [ReadOptions]:
     /// - `batch_size`: Controls the number of rows per batch
     /// - `projection`: Pushes column selection to the parquet reader level
-    /// - `row_predicate`: Filters rows after reading each batch
+    /// - `filters`: Applied as a row-level mask after reading each batch (in addition to
+    ///   any pruning that already happened upstream)
+    /// - `row_predicate`: Additional row-level filter applied after `filters`
     async fn read_base_file_stream(
         &self,
         relative_path: &str,
@@ -356,6 +362,9 @@ impl FileGroupReader {
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
+        let filters = Arc::new(from_str_tuples(options.filters.iter().map(|(f, o, v)| {
+            (f.as_str(), o.as_str(), v.as_str())
+        }))?);
         let row_predicate = options.row_predicate.clone();
 
         let parquet_stream = self
@@ -364,9 +373,10 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
-        // Apply filtering: commit time filter first, then row predicate
+        // Apply filtering: commit time → structured filters → row predicate.
         let stream = parquet_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
+            let filters = filters.clone();
             let row_predicate = row_predicate.clone();
             async move {
                 match result {
@@ -374,25 +384,32 @@ impl FileGroupReader {
                         "Failed to read batch: {e:?}"
                     )))),
                     Ok(batch) => {
-                        // Apply commit time filter
-                        let filtered = match apply_commit_time_filter(&hudi_configs, batch) {
+                        // 1. Apply commit time filter
+                        let batch = match apply_commit_time_filter(&hudi_configs, batch) {
                             Err(e) => return Some(Err(e)),
                             Ok(b) if b.num_rows() == 0 => return None,
                             Ok(b) => b,
                         };
 
-                        // Apply row predicate if present
-                        let final_batch = if let Some(ref predicate) = row_predicate {
-                            match apply_row_predicate(predicate.as_ref(), filtered) {
+                        // 2. Apply structured filters as row mask
+                        let batch = match apply_filter_mask(&filters, batch) {
+                            Err(e) => return Some(Err(e)),
+                            Ok(b) if b.num_rows() == 0 => return None,
+                            Ok(b) => b,
+                        };
+
+                        // 3. Apply row predicate (escape hatch)
+                        let batch = if let Some(ref predicate) = row_predicate {
+                            match apply_row_predicate(predicate.as_ref(), batch) {
                                 Err(e) => return Some(Err(e)),
                                 Ok(b) if b.num_rows() == 0 => return None,
                                 Ok(b) => b,
                             }
                         } else {
-                            filtered
+                            batch
                         };
 
-                        Some(Ok(final_batch))
+                        Some(Ok(batch))
                     }
                 }
             }
@@ -556,6 +573,41 @@ fn create_commit_time_filter_mask(
     Ok(Some(mask))
 }
 
+/// Apply structured filters, row predicate, and projection to an eager [`RecordBatch`].
+fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<RecordBatch> {
+    // 1. Structured filters as row mask
+    let filters = from_str_tuples(
+        options
+            .filters
+            .iter()
+            .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
+    )?;
+    let batch = apply_filter_mask(&filters, batch)?;
+
+    // 2. Row predicate (escape hatch)
+    let batch = if let Some(predicate) = &options.row_predicate {
+        apply_row_predicate(predicate.as_ref(), batch)?
+    } else {
+        batch
+    };
+
+    // 3. Projection (post-read; eager doesn't push to parquet level)
+    if let Some(cols) = &options.projection {
+        let indices: Vec<usize> = cols
+            .iter()
+            .map(|name| {
+                batch.schema().index_of(name).map_err(|e| {
+                    ReadFileSliceError(format!("Projection column not found: {e:?}"))
+                })
+            })
+            .collect::<Result<_>>()?;
+        return batch
+            .project(&indices)
+            .map_err(|e| ReadFileSliceError(format!("Projection failed: {e:?}")));
+    }
+    Ok(batch)
+}
+
 /// Apply commit time filtering to a record batch.
 fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> Result<RecordBatch> {
     match create_commit_time_filter_mask(hudi_configs, &batch)? {
@@ -563,6 +615,19 @@ fn apply_commit_time_filter(hudi_configs: &HudiConfigs, batch: RecordBatch) -> R
             .map_err(|e| ReadFileSliceError(format!("Failed to filter records: {e:?}"))),
         None => Ok(batch),
     }
+}
+
+/// Apply structured filters as a row mask on the batch.
+///
+/// Filters whose field is not present in the batch (e.g., partition columns already
+/// pruned upstream) are skipped — see [`crate::expr::filter::filters_to_row_mask`].
+fn apply_filter_mask(filters: &[Filter], batch: RecordBatch) -> Result<RecordBatch> {
+    if filters.is_empty() {
+        return Ok(batch);
+    }
+    let mask = filters_to_row_mask(filters, &batch)?;
+    filter_record_batch(&batch, &mask)
+        .map_err(|e| ReadFileSliceError(format!("Failed to apply filter mask: {e:?}")))
 }
 
 /// Apply a row predicate to filter records in a batch.
@@ -757,8 +822,7 @@ mod tests {
         let log_file_paths: Vec<&str> = vec![];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths)
-            .await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
 
         match result {
             Ok(batch) => {
@@ -788,8 +852,7 @@ mod tests {
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths)
-            .await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
 
         // In read-optimized mode, log files should be ignored
         // This should behave the same as read_file_slice_by_base_file_path
@@ -819,8 +882,7 @@ mod tests {
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths)
-            .await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
 
         // The actual file reading might fail due to missing test data, which is expected
         match result {
@@ -850,8 +912,7 @@ mod tests {
         let log_file_paths: Vec<&str> = vec![];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths)
-            .await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
 
         assert!(result.is_err(), "Should return error for non-existent file");
 
@@ -876,7 +937,7 @@ mod tests {
         let file_slice = FileSlice::new(base_file, String::new()); // empty partition path
 
         // Call read_file_slice
-        let result = reader.read_file_slice(&file_slice).await;
+        let result = reader.read_file_slice(&file_slice, &ReadOptions::new()).await;
 
         match result {
             Ok(batch) => {
