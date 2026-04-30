@@ -106,8 +106,8 @@ impl FileGroupReader {
 
     /// Reads the data from the base file at the given relative path.
     ///
-    /// `options.filters` and `options.row_predicate` are applied as row-level filters;
-    /// `options.projection` is applied to the resulting columns. Other fields
+    /// `options.filters` are applied as a row-level mask after reading;
+    /// `options.projection` selects columns. Other fields
     /// (`as_of_timestamp`, `start_timestamp`, `end_timestamp`, `batch_size`) are not
     /// meaningful for eager reads and are ignored.
     pub async fn read_file_slice_by_base_file_path(
@@ -171,7 +171,7 @@ impl FileGroupReader {
 
     /// Reads a file slice from a base file and a list of log files.
     ///
-    /// `options` filters / row predicate / projection are applied to the merged result.
+    /// `options` filters and projection are applied to the merged result.
     /// See [`Self::read_file_slice_by_base_file_path`] for details.
     pub async fn read_file_slice_from_paths<I, S>(
         &self,
@@ -243,11 +243,6 @@ impl FileGroupReader {
     /// For MOR tables with log files, this falls back to the collect-and-merge approach
     /// and yields the merged result as a single batch. This limitation exists because
     /// streaming merge of base files with log files is not yet implemented.
-    ///
-    /// # Limitations
-    ///
-    /// - The `projection` and `row_predicate` fields in [ReadOptions] are not yet
-    ///   implemented for streaming reads. Only `batch_size` is currently supported.
     ///
     /// # Arguments
     /// * `file_slice` - The file slice to read.
@@ -341,7 +336,6 @@ impl FileGroupReader {
     /// - `projection`: Pushes column selection to the parquet reader level
     /// - `filters`: Applied as a row-level mask after reading each batch (in addition to
     ///   any pruning that already happened upstream)
-    /// - `row_predicate`: Additional row-level filter applied after `filters`
     async fn read_base_file_stream(
         &self,
         relative_path: &str,
@@ -362,10 +356,12 @@ impl FileGroupReader {
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
-        let filters = Arc::new(from_str_tuples(options.filters.iter().map(|(f, o, v)| {
-            (f.as_str(), o.as_str(), v.as_str())
-        }))?);
-        let row_predicate = options.row_predicate.clone();
+        let filters = Arc::new(from_str_tuples(
+            options
+                .filters
+                .iter()
+                .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
+        )?);
 
         let parquet_stream = self
             .storage
@@ -373,42 +369,26 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
-        // Apply filtering: commit time → structured filters → row predicate.
+        // Apply filtering: commit time → structured filters as row mask.
         let stream = parquet_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
-            let row_predicate = row_predicate.clone();
             async move {
                 match result {
                     Err(e) => Some(Err(ReadFileSliceError(format!(
                         "Failed to read batch: {e:?}"
                     )))),
                     Ok(batch) => {
-                        // 1. Apply commit time filter
                         let batch = match apply_commit_time_filter(&hudi_configs, batch) {
                             Err(e) => return Some(Err(e)),
                             Ok(b) if b.num_rows() == 0 => return None,
                             Ok(b) => b,
                         };
-
-                        // 2. Apply structured filters as row mask
                         let batch = match apply_filter_mask(&filters, batch) {
                             Err(e) => return Some(Err(e)),
                             Ok(b) if b.num_rows() == 0 => return None,
                             Ok(b) => b,
                         };
-
-                        // 3. Apply row predicate (escape hatch)
-                        let batch = if let Some(ref predicate) = row_predicate {
-                            match apply_row_predicate(predicate.as_ref(), batch) {
-                                Err(e) => return Some(Err(e)),
-                                Ok(b) if b.num_rows() == 0 => return None,
-                                Ok(b) => b,
-                            }
-                        } else {
-                            batch
-                        };
-
                         Some(Ok(batch))
                     }
                 }
@@ -573,9 +553,8 @@ fn create_commit_time_filter_mask(
     Ok(Some(mask))
 }
 
-/// Apply structured filters, row predicate, and projection to an eager [`RecordBatch`].
+/// Apply structured filters and projection to an eager [`RecordBatch`].
 fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<RecordBatch> {
-    // 1. Structured filters as row mask
     let filters = from_str_tuples(
         options
             .filters
@@ -584,23 +563,15 @@ fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<Reco
     )?;
     let batch = apply_filter_mask(&filters, batch)?;
 
-    // 2. Row predicate (escape hatch)
-    let batch = if let Some(predicate) = &options.row_predicate {
-        apply_row_predicate(predicate.as_ref(), batch)?
-    } else {
-        batch
-    };
-
-    // 3. Projection (post-read; eager doesn't push to parquet level)
     if let Some(cols) = &options.projection {
-        let indices: Vec<usize> = cols
-            .iter()
-            .map(|name| {
-                batch.schema().index_of(name).map_err(|e| {
-                    ReadFileSliceError(format!("Projection column not found: {e:?}"))
+        let indices: Vec<usize> =
+            cols.iter()
+                .map(|name| {
+                    batch.schema().index_of(name).map_err(|e| {
+                        ReadFileSliceError(format!("Projection column not found: {e:?}"))
+                    })
                 })
-            })
-            .collect::<Result<_>>()?;
+                .collect::<Result<_>>()?;
         return batch
             .project(&indices)
             .map_err(|e| ReadFileSliceError(format!("Projection failed: {e:?}")));
@@ -628,16 +599,6 @@ fn apply_filter_mask(filters: &[Filter], batch: RecordBatch) -> Result<RecordBat
     let mask = filters_to_row_mask(filters, &batch)?;
     filter_record_batch(&batch, &mask)
         .map_err(|e| ReadFileSliceError(format!("Failed to apply filter mask: {e:?}")))
-}
-
-/// Apply a row predicate to filter records in a batch.
-fn apply_row_predicate(
-    predicate: &(dyn Fn(&RecordBatch) -> Result<BooleanArray> + Send + Sync),
-    batch: RecordBatch,
-) -> Result<RecordBatch> {
-    let mask = predicate(&batch)?;
-    filter_record_batch(&batch, &mask)
-        .map_err(|e| ReadFileSliceError(format!("Failed to apply row predicate: {e:?}")))
 }
 
 #[cfg(test)]
@@ -822,7 +783,8 @@ mod tests {
         let log_file_paths: Vec<&str> = vec![];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new())
+            .await;
 
         match result {
             Ok(batch) => {
@@ -852,7 +814,8 @@ mod tests {
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new())
+            .await;
 
         // In read-optimized mode, log files should be ignored
         // This should behave the same as read_file_slice_by_base_file_path
@@ -882,7 +845,8 @@ mod tests {
         let log_file_paths = vec![TEST_SAMPLE_LOG_FILE.to_string()];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new())
+            .await;
 
         // The actual file reading might fail due to missing test data, which is expected
         match result {
@@ -912,7 +876,8 @@ mod tests {
         let log_file_paths: Vec<&str> = vec![];
 
         let result = reader
-            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new()).await;
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &ReadOptions::new())
+            .await;
 
         assert!(result.is_err(), "Should return error for non-existent file");
 
@@ -937,7 +902,9 @@ mod tests {
         let file_slice = FileSlice::new(base_file, String::new()); // empty partition path
 
         // Call read_file_slice
-        let result = reader.read_file_slice(&file_slice, &ReadOptions::new()).await;
+        let result = reader
+            .read_file_slice(&file_slice, &ReadOptions::new())
+            .await;
 
         match result {
             Ok(batch) => {
@@ -1156,7 +1123,6 @@ mod tests {
         let options = ReadOptions {
             filters: vec![],
             projection: None,
-            row_predicate: None,
             batch_size: Some(1),
             as_of_timestamp: None,
             start_timestamp: None,

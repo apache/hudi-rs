@@ -1627,23 +1627,13 @@ mod streaming_queries {
     }
 
     #[tokio::test]
-    async fn test_read_snapshot_stream_with_row_predicate() -> Result<()> {
-        use arrow::array::BooleanArray;
-
+    async fn test_read_snapshot_stream_with_non_partition_filter() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
 
-        // Filter rows where isActive = true (Carol and Diana)
-        let options = ReadOptions::new().with_row_predicate(|batch: &RecordBatch| {
-            let col = batch
-                .column_by_name("isActive")
-                .ok_or_else(|| hudi_core::error::CoreError::Schema("isActive not found".into()))?;
-            let arr = col
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| hudi_core::error::CoreError::Schema("Not boolean".into()))?;
-            Ok(arr.clone())
-        });
+        // Filter on a non-partition column. The filter applies as a row mask
+        // during reading even though file pruning can't use it.
+        let options = ReadOptions::new().with_filters([("isActive", "=", "true")]);
 
         let stream = hudi_table.read_snapshot_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
@@ -1660,8 +1650,8 @@ mod streaming_queries {
     }
 
     #[tokio::test]
-    async fn test_read_snapshot_stream_with_projection_and_row_predicate() -> Result<()> {
-        use arrow::array::{BooleanArray, Int32Array};
+    async fn test_read_snapshot_stream_with_projection_and_filter() -> Result<()> {
+        use arrow::array::Int32Array;
 
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
@@ -1669,16 +1659,7 @@ mod streaming_queries {
         // Project only id and isActive, filter where isActive = true
         let options = ReadOptions::new()
             .with_projection(["id", "isActive"])
-            .with_row_predicate(|batch: &RecordBatch| {
-                let col = batch.column_by_name("isActive").ok_or_else(|| {
-                    hudi_core::error::CoreError::Schema("isActive not found".into())
-                })?;
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| hudi_core::error::CoreError::Schema("Not boolean".into()))?;
-                Ok(arr.clone())
-            });
+            .with_filters([("isActive", "=", "true")]);
 
         let stream = hudi_table.read_snapshot_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;

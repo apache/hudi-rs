@@ -18,15 +18,6 @@
  */
 //! Read options shared by all read APIs (eager and streaming).
 
-use std::sync::Arc;
-
-use arrow_array::{BooleanArray, RecordBatch};
-
-/// A row-level predicate function for filtering records.
-///
-/// Uses `Arc` instead of `Box` to allow cloning for async streaming contexts.
-pub type RowPredicate = Arc<dyn Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync>;
-
 /// A partition filter tuple: (field_name, operator, value).
 /// Example: ("city", "=", "san_francisco")
 pub type PartitionFilter = (String, String, String);
@@ -37,8 +28,10 @@ pub type PartitionFilter = (String, String, String);
 /// - Snapshot APIs use `as_of_timestamp` (defaulting to the latest commit when unset).
 /// - Incremental APIs use `start_timestamp` and `end_timestamp` (defaulting to earliest and
 ///   latest respectively when unset).
-/// - All APIs honor `filters`, `projection`, `batch_size`, and `row_predicate` where
-///   applicable.
+/// - All APIs honor `filters`, `projection`, and `batch_size` where applicable.
+///
+/// `filters` are used both as pruning hints (file/partition selection before reading)
+/// and as a row-level mask after reading, so callers get only the rows that match.
 ///
 /// # Example
 ///
@@ -58,16 +51,14 @@ pub type PartitionFilter = (String, String, String);
 ///     .with_start_timestamp("20240101000000000")
 ///     .with_end_timestamp("20240201000000000");
 /// ```
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ReadOptions {
     /// Partition filters. Each filter is a tuple of (field, operator, value).
+    /// Used for partition + file-level pruning AND as a row-level mask during reads.
     pub filters: Vec<PartitionFilter>,
 
     /// Column names to project (select). If None, all columns are read.
     pub projection: Option<Vec<String>>,
-
-    /// Row-level filter predicate. Applied after reading each batch.
-    pub row_predicate: Option<RowPredicate>,
 
     /// Target number of rows per batch.
     pub batch_size: Option<usize>,
@@ -113,18 +104,6 @@ impl ReadOptions {
         self
     }
 
-    /// Sets the row-level predicate for filtering records.
-    ///
-    /// The predicate function receives each `RecordBatch` and returns a `BooleanArray`
-    /// mask indicating which rows to keep. Rows where the mask is `true` are retained.
-    pub fn with_row_predicate<F>(mut self, predicate: F) -> Self
-    where
-        F: Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync + 'static,
-    {
-        self.row_predicate = Some(Arc::new(predicate));
-        self
-    }
-
     /// Sets the target batch size (rows per batch).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = Some(size);
@@ -150,23 +129,6 @@ impl ReadOptions {
     }
 }
 
-impl std::fmt::Debug for ReadOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReadOptions")
-            .field("filters", &self.filters)
-            .field("projection", &self.projection)
-            .field(
-                "row_predicate",
-                &self.row_predicate.as_ref().map(|_| "<predicate>"),
-            )
-            .field("batch_size", &self.batch_size)
-            .field("as_of_timestamp", &self.as_of_timestamp)
-            .field("start_timestamp", &self.start_timestamp)
-            .field("end_timestamp", &self.end_timestamp)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,14 +145,6 @@ mod tests {
                 "col3".to_string()
             ])
         );
-    }
-
-    #[test]
-    fn test_with_row_predicate() {
-        let options = ReadOptions::new()
-            .with_row_predicate(|batch| Ok(BooleanArray::from(vec![true; batch.num_rows()])));
-
-        assert!(options.row_predicate.is_some());
     }
 
     #[test]

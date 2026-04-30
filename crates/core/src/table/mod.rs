@@ -770,7 +770,6 @@ impl Table {
     ///
     /// # Limitations
     ///
-    /// - The `row_predicate` field in [ReadOptions] is not yet implemented for streaming reads.
     /// - For MOR tables with log files, streaming falls back to the collect-and-merge approach.
     ///
     /// # Example
@@ -816,17 +815,14 @@ impl Table {
         let batch_size = options.batch_size;
         let projection = options.projection.clone();
         let row_filters = options.filters.clone();
-        let row_predicate = options.row_predicate.clone();
 
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();
             let projection = projection.clone();
             let row_filters = row_filters.clone();
-            let row_predicate = row_predicate.clone();
             let options = ReadOptions {
                 filters: row_filters,
                 projection,
-                row_predicate,
                 batch_size,
                 as_of_timestamp: None,
                 start_timestamp: None,
