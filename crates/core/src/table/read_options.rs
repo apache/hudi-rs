@@ -79,7 +79,11 @@ impl ReadOptions {
         Self::default()
     }
 
-    /// Sets partition filters.
+    /// Sets column filters.
+    ///
+    /// Filters may target any column — partition or data. Depending on the column and
+    /// available metadata they drive partition pruning, file-level stats pruning, and
+    /// row-level filtering. See the field docs on [`ReadOptions::filters`].
     pub fn with_filters<I, S1, S2, S3>(mut self, filters: I) -> Self
     where
         I: IntoIterator<Item = (S1, S2, S3)>,

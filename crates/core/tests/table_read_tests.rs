@@ -1756,6 +1756,30 @@ mod streaming_queries {
     }
 
     #[tokio::test]
+    async fn test_filter_on_unknown_column_errors() -> Result<()> {
+        // A typo on a filter column should error rather than silently no-op.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")]);
+
+        let snapshot_err = hudi_table.read_snapshot(&options).await.unwrap_err();
+        assert!(
+            snapshot_err.to_string().contains("rider_idd"),
+            "snapshot error should mention the bad column, got: {snapshot_err}"
+        );
+
+        let incremental_err = hudi_table
+            .read_incremental_records(&options)
+            .await
+            .unwrap_err();
+        assert!(
+            incremental_err.to_string().contains("rider_idd"),
+            "incremental error should mention the bad column, got: {incremental_err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_read_snapshot_stream_projection_invalid_column() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;

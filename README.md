@@ -64,7 +64,7 @@ Hudi integration in the data ecosystems for a diverse range of users and project
 
 ### Snapshot Query
 
-Snapshot query reads the latest version of the data from the table. The table API also accepts partition filters.
+Snapshot query reads the latest version of the data from the table. The table API also accepts column filters that drive partition + file pruning and row-level filtering.
 
 #### Python
 
@@ -134,7 +134,7 @@ let hudi_table =
 
 ### Time-Travel Query
 
-Time-travel query reads the data at a specific timestamp from the table. The table API also accepts partition filters.
+Time-travel query reads the data at a specific timestamp from the table. The table API also accepts column filters that drive partition + file pruning and row-level filtering.
 
 #### Python
 
@@ -187,7 +187,7 @@ batches = hudi_table.read_incremental_records(
 # read the records after t1 (end defaults to the latest commit)
 batches = hudi_table.read_incremental_records(HudiReadOptions(start_timestamp=t1))
 
-# with partition filters applied to the changed records
+# with column filters applied to the changed records
 batches = hudi_table.read_incremental_records(
     HudiReadOptions(
         start_timestamp=t1,
@@ -208,7 +208,7 @@ let batches = hudi_table.read_incremental_records(&options).await?;
 let options = ReadOptions::new().with_start_timestamp(t1);
 let batches = hudi_table.read_incremental_records(&options).await?;
 
-// with partition filters applied to the changed records
+// with column filters applied to the changed records
 let options = ReadOptions::new()
     .with_start_timestamp(t1)
     .with_end_timestamp(t2)
@@ -339,9 +339,9 @@ Create a Hudi table instance using its constructor or the `TableBuilder` API.
 
 All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct with these fields:
 
-- `filters` — partition filters (`(field, op, value)` tuples)
-- `projection` — column projection (streaming only)
-- `batch_size` — rows per batch (streaming only)
+- `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning, and row-level filtering.
+- `projection` — columns to return. Streaming pushes the projection down to the parquet reader; eager reads project after merging.
+- `batch_size` — rows per batch (streaming only; eager reads return one batch).
 - `as_of_timestamp` — snapshot/time-travel timestamp (defaults to latest commit)
 - `start_timestamp`, `end_timestamp` — incremental range (defaults to earliest…latest)
 

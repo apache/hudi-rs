@@ -33,7 +33,10 @@ class HudiReadOptions:
     earliest and latest respectively).
 
     Attributes:
-        filters (List[Tuple[str, str, str]]): Partition filters to apply.
+        filters (List[Tuple[str, str, str]]): Column filters as ``(field, op, value)`` tuples.
+            ``field`` may be any column (partition or data). Filters drive partition pruning
+            when the column is a partition column, file-level stats pruning when it is a
+            data column with statistics, and row-level filtering after reading.
         projection (Optional[List[str]]): Column names to read. If None, all columns are read.
         batch_size (Optional[int]): Target number of rows per batch (streaming only).
         as_of_timestamp (Optional[str]): Timestamp for snapshot/time-travel queries.
@@ -332,7 +335,7 @@ class HudiTable:
         Get the file slices in the table at a snapshot moment.
 
         Reads at ``options.as_of_timestamp`` if set, otherwise the latest commit.
-        ``options.filters`` are applied as partition filters.
+        ``options.filters`` drive pruning (partition + file-level) and row-level filtering.
         """
         ...
     def get_file_slices_splits(
@@ -389,7 +392,7 @@ class HudiTable:
 
         Reads the change range (``options.start_timestamp``, ``options.end_timestamp``].
         Records updated multiple times have their latest state within the range
-        returned. ``options.filters`` are applied as partition filters.
+        returned. ``options.filters`` drive pruning and row-level filtering.
         """
         ...
     def compute_table_stats(self) -> Optional[Tuple[int, int]]:

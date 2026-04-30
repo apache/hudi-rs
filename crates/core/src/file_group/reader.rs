@@ -348,14 +348,27 @@ impl FileGroupReader {
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
-        // If projection is set, ensure all columns referenced by `filters` are also
-        // read so the row-level filter mask can evaluate them. We project down to
-        // the user's requested columns AFTER filtering.
+        // If projection is set, ensure all data-column filter fields are also read so
+        // the row-level mask can evaluate them. We project down to the user's
+        // requested columns AFTER filtering.
+        //
+        // Partition column filter fields are intentionally excluded from this
+        // widening: partition pruning has already filtered file groups upstream, and
+        // when `hoodie.datasource.write.drop.partition.columns` is enabled the
+        // partition columns aren't present in parquet at all (widening would cause
+        // a column-not-found error from the parquet reader).
+        let partition_columns: Vec<String> = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into();
         let final_projection = options.projection.clone();
         let read_projection = match (&options.projection, options.filters.as_slice()) {
             (Some(proj), filters) if !filters.is_empty() => {
                 let mut combined: Vec<String> = proj.clone();
                 for (field, _, _) in filters {
+                    if partition_columns.iter().any(|p| p == field) {
+                        continue;
+                    }
                     if !combined.iter().any(|c| c == field) {
                         combined.push(field.clone());
                     }

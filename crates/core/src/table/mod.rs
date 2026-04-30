@@ -164,6 +164,38 @@ fn parse_filters(filters: &[(String, String, String)]) -> Result<Vec<Filter>> {
     )
 }
 
+/// Validate that every filter targets a column present in the table or partition schema.
+///
+/// Pass `None` for `table_schema` when only partition columns are reachable (e.g., the
+/// incremental path that loads file groups from commit metadata without reading the
+/// data schema). A filter on an unknown column would otherwise silently no-op once the
+/// row mask runs against a batch that doesn't contain it; failing fast here makes typos
+/// like `("rder_id", "=", "x")` surface as an error.
+fn validate_filter_fields(
+    filters: &[Filter],
+    table_schema: Option<&Schema>,
+    partition_schema: &Schema,
+) -> Result<()> {
+    use std::collections::HashSet;
+    let mut valid: HashSet<&str> = partition_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    if let Some(schema) = table_schema {
+        valid.extend(schema.fields().iter().map(|f| f.name().as_str()));
+    }
+    for filter in filters {
+        if !valid.contains(filter.field_name.as_str()) {
+            return Err(crate::error::CoreError::Schema(format!(
+                "Filter field '{}' not found in table schema",
+                filter.field_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Table {
     /// Get or initialize the cached metadata table instance.
     ///
@@ -461,11 +493,11 @@ impl Table {
         let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
 
         let partition_schema = self.get_partition_schema().await?;
+        let table_schema = self.get_schema().await?;
+        validate_filter_fields(filters, Some(&table_schema), &partition_schema)?;
+
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
-
-        // Get table schema for file pruning
-        let table_schema = self.get_schema().await?;
 
         // Create file pruner with filters on non-partition columns
         let file_pruner = FilePruner::new(filters, &table_schema, &partition_schema)?;
@@ -548,13 +580,25 @@ impl Table {
             .get_file_groups_between(Some(start_timestamp), Some(end_timestamp), estimator)
             .await?;
 
-        let partition_schema = self.get_partition_schema().await?;
-        let partition_pruner =
-            PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+        // Skip schema fetch and pruner construction when there are no filters.
+        let partition_pruner = if filters.is_empty() {
+            None
+        } else {
+            let partition_schema = self.get_partition_schema().await?;
+            let table_schema = self.get_schema().await?;
+            validate_filter_fields(filters, Some(&table_schema), &partition_schema)?;
+            Some(PartitionPruner::new(
+                filters,
+                &partition_schema,
+                self.hudi_configs.as_ref(),
+            )?)
+        };
 
         let mut file_slices: Vec<FileSlice> = Vec::new();
         for file_group in file_groups {
-            if !partition_pruner.should_include(&file_group.partition_path) {
+            if let Some(ref pruner) = partition_pruner
+                && !pruner.should_include(&file_group.partition_path)
+            {
                 continue;
             }
             if let Some(file_slice) = file_group.get_file_slice_as_of(end_timestamp) {
