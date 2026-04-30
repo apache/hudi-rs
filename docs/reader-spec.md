@@ -87,17 +87,22 @@ Snapshot and per-file-slice reads have both an **eager** form that returns all b
 
 | API                                    | `as_of_timestamp` | `start_timestamp` / `end_timestamp` | `filters` | `projection` | `batch_size` |
 |----------------------------------------|:-----------------:|:-----------------------------------:|:---------:|:------------:|:------------:|
-| `read_snapshot`                        | yes               | ignored                             | yes       | yes          | ignored      |
-| `read_snapshot_stream`                 | yes               | ignored                             | yes       | yes          | yes          |
-| `get_file_slices`                      | yes               | ignored                             | yes       | n/a          | n/a          |
-| `get_file_slices_splits`               | yes               | ignored                             | yes       | n/a          | n/a          |
-| `read_incremental_records`             | ignored           | yes                                 | yes       | yes          | ignored      |
-| `get_file_slices_between`              | ignored           | yes                                 | yes       | n/a          | n/a          |
-| `get_file_slices_splits_between`       | ignored           | yes                                 | yes       | n/a          | n/a          |
-| `read_file_slice` / `read_file_slice_by_base_file_path` / `read_file_slice_from_paths` | ignored | ignored | yes | yes | ignored |
-| `read_file_slice_stream` / `read_file_slice_from_paths_stream` | ignored (on `FileGroupReader`); used to pin commit (on `Table`) | ignored | yes | yes | yes |
+| `Table::read_snapshot`                 | yes               | ignored                             | yes       | yes          | ignored      |
+| `Table::read_snapshot_stream`          | yes               | ignored                             | yes       | yes          | yes          |
+| `Table::get_file_slices`               | yes               | ignored                             | yes       | n/a          | n/a          |
+| `Table::get_file_slices_splits`        | yes               | ignored                             | yes       | n/a          | n/a          |
+| `Table::read_incremental_records`      | ignored           | yes                                 | yes       | yes          | ignored      |
+| `Table::get_file_slices_between`       | ignored           | yes                                 | yes       | n/a          | n/a          |
+| `Table::get_file_slices_splits_between`| ignored           | yes                                 | yes       | n/a          | n/a          |
+| `Table::read_file_slice_stream`        | yes †             | ignored                             | yes       | yes          | yes          |
+| `FileGroupReader::read_file_slice`     | ignored           | ignored                             | yes       | yes          | ignored      |
+| `FileGroupReader::read_file_slice_by_base_file_path` | ignored | ignored                       | yes       | yes          | ignored      |
+| `FileGroupReader::read_file_slice_from_paths` | ignored    | ignored                            | yes       | yes          | ignored      |
+| `FileGroupReader::read_file_slice_stream` / `read_file_slice_from_paths_stream` | ignored | ignored | yes | yes | yes |
 
 "ignored" means the field is accepted (the type is the same everywhere) but does not affect the result of that call.
+
+† `Table::read_file_slice_stream` honors `as_of_timestamp`: it normalizes the timestamp via the same code path as `read_snapshot` and configures the file-group reader's commit-time filter (`hoodie.read.file_group.end_timestamp`), so reading a slice through the table API is consistent with `read_snapshot` / `read_snapshot_stream` at that timestamp. The slice itself is still not re-selected — callers must pass a `FileSlice` that exists at or before that timestamp (typically obtained from `get_file_slices(options)` with the matching `as_of_timestamp`). Direct `FileGroupReader::*` methods do not auto-configure commit-time bounds; they apply only what the reader was constructed with.
 
 Accepted timestamp formats are listed in [§8 Behavioral notes](#timestamp-formats).
 
@@ -124,15 +129,17 @@ For `IN` / `NOT IN`, the value string is split on commas and trimmed. Examples: 
 
 The filter `field` may be any column name — partition or data:
 
-- **Partition column.** The filter prunes whole partitions before reading.
-- **Data column with statistics.** When the column has min/max stats in the metadata table, the filter prunes whole files via column-stats pruning.
+- **Partition column.** The filter prunes whole partitions before reading. Applies on every read path that consumes filters.
+- **Data column with statistics.** When the column has min/max stats in the metadata table, the filter prunes whole files via column-stats pruning. **Snapshot and time-travel reads only** — `get_file_slices` / `read_snapshot` / `read_snapshot_stream`. Incremental file-slice planning (`get_file_slices_between`, `read_incremental_records`) does not apply file-level stats pruning; data-column filters there only drive the row-level mask.
 - **Any column.** All filters are applied as a row-level mask after reading; only matching rows are returned.
 
-A filter referencing an unknown column (not in the table or partition schema) is rejected at the entry point with a schema error — typos like `("rder_id", "=", "x")` fail loud rather than silently no-op.
+A filter referencing an unknown column is rejected with a schema error — typos like `("rder_id", "=", "x")` fail loud rather than silently no-op. `Table` / `HudiTable` paths validate against the loaded table + partition schemas before any I/O. `FileGroupReader` paths validate strictly against the read batch schema on the first batch (so a tiny amount of I/O may happen before the error surfaces) — at this level there is no upstream partition pruning, so a filter on a column not in the batch can never apply and is rejected. Either way, the error reaches the caller before any rows are returned.
+
+When called via `Table` on a table where partition columns are dropped from data files (`hoodie.datasource.write.drop.partition.columns = true`), filters on partition columns are stripped before reaching `FileGroupReader` — the partition pruner has already used them, and they would otherwise trigger the strict batch-schema check.
 
 ### Pruning vs row mask
 
-Pruning (partition + file-level) is **best effort**: hudi-rs uses it to skip data when it can prove a partition or file cannot match, but it does not need to be tight. The **row-level mask** is exact: any row in the result satisfies every filter.
+Pruning (partition + file-level stats) is **best effort**: hudi-rs uses it to skip data when it can prove a partition or file cannot match, but it does not need to be tight. The **row-level mask** is exact: any row in the result satisfies every filter.
 
 ### Value parsing
 
@@ -362,7 +369,9 @@ Read-only attributes: `file_id`, `partition_path`, `creation_instant_time`, `bas
 
 ### Snapshot atomicity
 
-A snapshot read is pinned to a single completed commit timestamp (resolved at the start of the call) and reads only file slices visible at or before that timestamp. Concurrent writes are not visible mid-read.
+A snapshot read is pinned to a single completed commit timestamp and only sees file slices visible at or before that timestamp; mid-read concurrent writes are not visible.
+
+The timeline is loaded once when the `Table` (or `HudiTable`) is constructed, and that snapshot of the timeline is reused for every subsequent read on that instance. Commits that land *after* table construction are not picked up by later reads — to observe them, construct a new `Table`. When `as_of_timestamp` is unset, the "latest commit" used by snapshot reads is the latest commit visible to the cached timeline, not the latest commit in storage at call time.
 
 ### Incremental semantics
 
@@ -372,7 +381,7 @@ A snapshot read is pinned to a single completed commit timestamp (resolved at th
 
 Partition pruning and file-level statistics pruning are best-effort optimizations. The row-level mask is applied after reading and is the authority on which rows are returned. A non-prunable filter (e.g., on a non-partition, non-stats column) still produces correct results, just with less I/O elimination.
 
-A filter on a column that ends up missing from the read batch (most often: a partition column on a table that drops partition columns from data files) is silently skipped at row-mask time — pruning has already done its job.
+A filter on a column that ends up missing from the read batch (most often: a partition column on a table that drops partition columns from data files) is stripped by the table-level read paths before it reaches `FileGroupReader` — partition pruning has already used it, and the row-mask layer rejects unknown columns strictly. Direct callers of `FileGroupReader::*` methods are responsible for not passing such filters; they will surface as a schema error.
 
 ### MOR streaming fallback
 
@@ -392,9 +401,9 @@ Streaming pushes the projection down to the parquet reader; eager reads project 
 
 - Hudi timeline format (highest precedence): `yyyyMMddHHmmssSSS` or `yyyyMMddHHmmss`.
 - Unix epoch in seconds, milliseconds, microseconds, or nanoseconds.
-- ISO 8601 variants: `yyyy-MM-dd'T'HH:mm:ss[.SSS][+00:00|Z]`, `yyyy-MM-dd'T'HH:mm:ss`, `yyyy-MM-dd`.
+- RFC 3339 with timezone offset: e.g. `2024-03-15T14:25:30Z`, `2024-03-15T14:25:30+00:00`, `2024-03-15T14:25:30.123Z`.
 
-Timestamps are normalized into the table's timeline timezone (`hoodie.table.timeline.timezone`).
+A timezone offset (`Z` or `±HH:MM`) is required for RFC 3339 inputs — naive `T`-separated strings and date-only strings are rejected. Epoch and timeline-format inputs do not need a timezone. All inputs are normalized into the table's timeline timezone (`hoodie.table.timeline.timezone`).
 
 ### Empty tables
 
@@ -406,7 +415,11 @@ Reads against a table with no completed commits return:
 
 ### Errors
 
-A filter on a column that is not in the table or partition schema is rejected with a schema error before any I/O. An unparseable filter value (e.g., `"abc"` against `Int64`) is rejected at filter evaluation. I/O failures (missing files, permission errors, malformed parquet) surface as read errors.
+A filter on a column that is not in the table or partition schema is rejected with a schema error before any rows are returned. `Table` / `HudiTable` paths do this validation up front against the loaded table + partition schemas, before any data I/O. `FileGroupReader` paths run validation strictly against the read batch schema on the first batch — for streaming, that means the first batch is read before the error surfaces; for eager paths, after the base file (or merge) is read.
+
+When `hoodie.datasource.write.drop.partition.columns = true`, partition columns aren't present in parquet, so a filter on a partition column can't apply at row level. The `Table` / `HudiTable` paths handle this transparently: partition pruning still uses the filter, and the filter is stripped before reaching `FileGroupReader`. Direct `FileGroupReader::*` callers must not pass filters on dropped partition columns — those would surface as a schema error from the strict batch-schema check.
+
+An unparseable filter value (e.g. `"abc"` against an `Int64` column) is rejected at filter evaluation. I/O failures (missing files, permission errors, malformed parquet) surface as read errors.
 
 ## 9. Stability
 

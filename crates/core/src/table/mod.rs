@@ -654,10 +654,11 @@ impl Table {
             HudiReadConfig::FileGroupEndTimestamp,
             timestamp,
         )])?;
+        let fg_options = self.options_for_file_group(options);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, options)),
+                .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
         Ok(batches)
@@ -687,14 +688,45 @@ impl Table {
             (HudiReadConfig::FileGroupStartTimestamp, start),
             (HudiReadConfig::FileGroupEndTimestamp, end),
         ])?;
+        let fg_options = self.options_for_file_group(options);
 
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
-                .map(|f| fg_reader.read_file_slice(f, options)),
+                .map(|f| fg_reader.read_file_slice(f, &fg_options)),
         )
         .await?;
         Ok(batches)
+    }
+
+    /// Build the [`ReadOptions`] passed to `FileGroupReader` for a per-slice read,
+    /// stripping filters that target a partition column dropped from data files.
+    ///
+    /// `FileGroupReader` validates filter columns strictly against the read batch
+    /// schema; when `hoodie.datasource.write.drop.partition.columns` is enabled,
+    /// partition columns aren't in parquet, so a partition filter would surface as
+    /// an error there. The partition pruner has already used those filters at
+    /// table level, so dropping them here is safe and avoids the false-positive.
+    fn options_for_file_group(&self, options: &ReadOptions) -> ReadOptions {
+        let drops: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        if !drops || options.filters.is_empty() {
+            return options.clone();
+        }
+        let partition_columns: Vec<String> = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into();
+        let mut applicable = options.clone();
+        applicable.filters = options
+            .filters
+            .iter()
+            .filter(|(field, _, _)| !partition_columns.iter().any(|p| p == field))
+            .cloned()
+            .collect();
+        applicable
     }
 
     /// Resolve the snapshot timestamp from `options`: explicit `as_of_timestamp` if set,
@@ -794,8 +826,11 @@ impl Table {
             HudiReadConfig::FileGroupEndTimestamp,
             timestamp.as_str(),
         )])?;
+        let fg_options = self.options_for_file_group(options);
 
-        fg_reader.read_file_slice_stream(file_slice, options).await
+        fg_reader
+            .read_file_slice_stream(file_slice, &fg_options)
+            .await
     }
 
     /// Reads the table snapshot as a stream of record batches.
@@ -854,10 +889,12 @@ impl Table {
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
-        // row-level closes the gap for non-partition column filters.
-        let batch_size = options.batch_size;
-        let projection = options.projection.clone();
-        let row_filters = options.filters.clone();
+        // row-level closes the gap for non-partition column filters. Strip filters
+        // on dropped partition columns so they don't trigger FGR validation errors.
+        let fg_options_template = self.options_for_file_group(options);
+        let batch_size = fg_options_template.batch_size;
+        let projection = fg_options_template.projection.clone();
+        let row_filters = fg_options_template.filters.clone();
 
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();

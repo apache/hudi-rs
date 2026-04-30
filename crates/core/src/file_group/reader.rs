@@ -116,17 +116,7 @@ impl FileGroupReader {
         options: &ReadOptions,
     ) -> Result<RecordBatch> {
         let batch = self.read_base_file_eager(relative_path).await?;
-        apply_eager_options(options, batch, &self.partition_columns())
-    }
-
-    /// Configured partition column names from `hoodie.table.partition.fields`.
-    /// Used for filter-field validation: filters targeting these are allowed even
-    /// when the column is missing from a batch (e.g., when partition columns are
-    /// dropped from data files via `hoodie.datasource.write.drop.partition.columns`).
-    fn partition_columns(&self) -> Vec<String> {
-        self.hudi_configs
-            .get_or_default(HudiTableConfig::PartitionFields)
-            .into()
+        apply_eager_options(options, batch)
     }
 
     /// Internal: read base file + apply commit-time filter, no [`ReadOptions`] applied.
@@ -234,7 +224,7 @@ impl FileGroupReader {
             merger.merge_record_batches(all_batches)?
         };
 
-        apply_eager_options(options, merged, &self.partition_columns())
+        apply_eager_options(options, merged)
     }
 
     // =========================================================================
@@ -408,7 +398,6 @@ impl FileGroupReader {
                 .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
         )?);
         let final_projection = Arc::new(final_projection);
-        let partition_columns = Arc::new(self.partition_columns());
         // Validate once on first batch so typoed filter columns surface as errors
         // rather than silent no-ops in `filters_to_row_mask`.
         let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -424,7 +413,6 @@ impl FileGroupReader {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
             let final_projection = final_projection.clone();
-            let partition_columns = partition_columns.clone();
             let validated = validated.clone();
             async move {
                 match result {
@@ -436,7 +424,6 @@ impl FileGroupReader {
                             if let Err(e) = validate_filter_fields_against_batch(
                                 &filters,
                                 batch.schema().as_ref(),
-                                &partition_columns,
                             ) {
                                 return Some(Err(e));
                             }
@@ -624,41 +611,39 @@ fn create_commit_time_filter_mask(
 
 /// Apply structured filters and projection to an eager [`RecordBatch`].
 ///
-/// `partition_columns` lists configured partition fields; filters targeting these are
-/// allowed even when the column isn't present in `batch` (it may have been dropped
-/// from parquet and already accounted for by upstream partition pruning). Any other
-/// missing column is treated as a typo and surfaced as an error.
-fn apply_eager_options(
-    options: &ReadOptions,
-    batch: RecordBatch,
-    partition_columns: &[String],
-) -> Result<RecordBatch> {
+/// All `options.filters` must target columns present in the batch — at file-group
+/// level no upstream partition pruning has happened, so a filter on a column that
+/// isn't in the batch can never apply and is rejected with a schema error. Callers
+/// going through `Table` strip filters on dropped partition columns before reaching
+/// here; direct `FileGroupReader` callers must not pass such filters.
+fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<RecordBatch> {
     let filters = from_str_tuples(
         options
             .filters
             .iter()
             .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
     )?;
-    validate_filter_fields_against_batch(&filters, batch.schema().as_ref(), partition_columns)?;
+    validate_filter_fields_against_batch(&filters, batch.schema().as_ref())?;
     let batch = apply_filter_mask(&filters, batch)?;
     project_to(&options.projection, batch)
 }
 
-/// Error if any filter targets a column that is neither in `batch_schema` nor a known
-/// partition column. Catches typoed filter fields that would otherwise become silent
-/// no-ops in [`filters_to_row_mask`].
+/// Error if any filter targets a column that is not in `batch_schema`.
+///
+/// At the file-group reader level there is no upstream partition pruning, so a
+/// filter on a column not present in the batch can never apply. Surfacing this as
+/// an error prevents typoed columns from becoming silent no-ops via
+/// [`filters_to_row_mask`].
 fn validate_filter_fields_against_batch(
     filters: &[Filter],
     batch_schema: &arrow_schema::Schema,
-    partition_columns: &[String],
 ) -> Result<()> {
     use std::collections::HashSet;
-    let mut valid: HashSet<&str> = batch_schema
+    let valid: HashSet<&str> = batch_schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    valid.extend(partition_columns.iter().map(String::as_str));
     for filter in filters {
         if !valid.contains(filter.field_name.as_str()) {
             return Err(CoreError::Schema(format!(

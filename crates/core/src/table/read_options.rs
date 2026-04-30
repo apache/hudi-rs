@@ -44,7 +44,7 @@
 ///     .with_start_timestamp("20240101000000000")
 ///     .with_end_timestamp("20240201000000000");
 /// ```
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ReadOptions {
     /// Column filters. Each filter is a tuple of `(field, operator, value)` where
     /// `field` is any column name (partition or data).
