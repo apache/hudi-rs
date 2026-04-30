@@ -317,7 +317,9 @@ mod v6_tables {
         async fn test_empty_table() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_incremental_records("0", None).await?;
+                let records = hudi_table
+                    .read_incremental_records("0", None, empty_filters())
+                    .await?;
                 assert!(records.is_empty())
             }
             Ok(())
@@ -340,7 +342,7 @@ mod v6_tables {
 
                 // read records changed from the beginning to the 1st commit
                 let records = hudi_table
-                    .read_incremental_records("19700101000000", Some(first_commit))
+                    .read_incremental_records("19700101000000", Some(first_commit), empty_filters())
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -353,7 +355,7 @@ mod v6_tables {
 
                 // read records changed from the 1st to the 2nd commit
                 let records = hudi_table
-                    .read_incremental_records(first_commit, Some(second_commit))
+                    .read_incremental_records(first_commit, Some(second_commit), empty_filters())
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -366,7 +368,7 @@ mod v6_tables {
 
                 // read records changed from the 2nd to the 3rd commit
                 let records = hudi_table
-                    .read_incremental_records(second_commit, Some(third_commit))
+                    .read_incremental_records(second_commit, Some(third_commit), empty_filters())
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -379,7 +381,7 @@ mod v6_tables {
 
                 // read records changed from the 1st commit
                 let records = hudi_table
-                    .read_incremental_records(first_commit, None)
+                    .read_incremental_records(first_commit, None, empty_filters())
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -392,7 +394,7 @@ mod v6_tables {
 
                 // read records changed from the 3rd commit
                 let records = hudi_table
-                    .read_incremental_records(third_commit, None)
+                    .read_incremental_records(third_commit, None, empty_filters())
                     .await?;
                 assert!(
                     records.is_empty(),
@@ -1101,7 +1103,7 @@ mod v9_tables {
             let third_commit = commit_timestamps[2];
 
             let records = hudi_table
-                .read_incremental_records("19700101000000000", Some(first_commit))
+                .read_incremental_records("19700101000000000", Some(first_commit), empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1118,7 +1120,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(first_commit, Some(second_commit))
+                .read_incremental_records(first_commit, Some(second_commit), empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1131,7 +1133,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(second_commit, Some(third_commit))
+                .read_incremental_records(second_commit, Some(third_commit), empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1145,7 +1147,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(first_commit, None)
+                .read_incremental_records(first_commit, None, empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1159,7 +1161,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(third_commit, None)
+                .read_incremental_records(third_commit, None, empty_filters())
                 .await?;
             assert!(
                 records.is_empty(),
@@ -1183,7 +1185,7 @@ mod v9_tables {
             let second_commit = &deltacommits[1].timestamp;
 
             let records = hudi_table
-                .read_incremental_records("19700101000000000", Some(first_commit))
+                .read_incremental_records("19700101000000000", Some(first_commit), empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1197,7 +1199,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(first_commit, Some(second_commit))
+                .read_incremental_records(first_commit, Some(second_commit), empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1207,7 +1209,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(first_commit, None)
+                .read_incremental_records(first_commit, None, empty_filters())
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1217,7 +1219,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(second_commit, None)
+                .read_incremental_records(second_commit, None, empty_filters())
                 .await?;
             assert!(
                 records.is_empty(),

@@ -362,11 +362,13 @@ class HudiTable:
         ...
     def get_file_slices_between(
         self,
-        start_timestamp: Optional[str],
-        end_timestamp: Optional[str],
+        start_timestamp: Optional[str] = None,
+        end_timestamp: Optional[str] = None,
+        filters: Optional[List[Tuple[str, str, str]]] = None,
     ) -> List[HudiFileSlice]:
         """
-        Retrieves all changed file slices in the Hudi table between the given timestamps.
+        Retrieves all changed file slices in the Hudi table between the given timestamps,
+        optionally filtered by partition filters.
         """
         ...
     def create_file_group_reader_with_options(
@@ -400,14 +402,19 @@ class HudiTable:
         """
         ...
     def read_incremental_records(
-        self, start_timestamp: str, end_timestamp: Optional[str]
+        self,
+        start_timestamp: str,
+        end_timestamp: Optional[str] = None,
+        filters: Optional[List[Tuple[str, str, str]]] = None,
     ) -> List["pyarrow.RecordBatch"]:
         """
-        Reads incremental records from the Hudi table between the given timestamps.
+        Reads incremental records from the Hudi table between the given timestamps,
+        optionally filtered by partition filters.
 
         Parameters:
             start_timestamp (str): The start timestamp (exclusive).
-            end_timestamp (Optional[str]): The end timestamp (inclusive).
+            end_timestamp (Optional[str]): The end timestamp (inclusive). Defaults to the latest commit.
+            filters (Optional[List[Tuple[str, str, str]]]): Optional partition filters.
 
         Returns:
             List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
@@ -428,14 +435,17 @@ class HudiTable:
         num_splits: int,
         start_timestamp: Optional[str] = None,
         end_timestamp: Optional[str] = None,
+        filters: Optional[List[Tuple[str, str, str]]] = None,
     ) -> List[List[HudiFileSlice]]:
         """
-        Retrieves file slices changed between the given timestamps in 'num_splits' splits.
+        Retrieves file slices changed between the given timestamps in 'num_splits' splits,
+        optionally filtered by partition filters.
 
         Parameters:
             num_splits (int): The number of parts to split the file slices into.
             start_timestamp (Optional[str]): The start timestamp (exclusive).
             end_timestamp (Optional[str]): The end timestamp (inclusive). Defaults to the latest commit.
+            filters (Optional[List[Tuple[str, str, str]]]): Optional partition filters.
 
         Returns:
             List[List[HudiFileSlice]]: A list of file slice groups for parallel reads.

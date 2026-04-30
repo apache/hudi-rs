@@ -617,19 +617,21 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (start_timestamp=None, end_timestamp=None))]
+    #[pyo3(signature = (start_timestamp=None, end_timestamp=None, filters=None))]
     fn get_file_slices_between(
         &self,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
+        filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
         py.detach(|| {
             let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices_between(start_timestamp, end_timestamp),
-                )
+                .block_on(self.inner.get_file_slices_between(
+                    start_timestamp,
+                    end_timestamp,
+                    filters.unwrap_or_default(),
+                ))
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(HudiFileSlice::from).collect())
         })
@@ -679,18 +681,20 @@ impl HudiTable {
         .map(|b| b.unbind())
     }
 
-    #[pyo3(signature = (start_timestamp, end_timestamp=None))]
+    #[pyo3(signature = (start_timestamp, end_timestamp=None, filters=None))]
     fn read_incremental_records(
         &self,
         start_timestamp: &str,
         end_timestamp: Option<&str>,
+        filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
         py.detach(|| {
-            rt().block_on(
-                self.inner
-                    .read_incremental_records(start_timestamp, end_timestamp),
-            )
+            rt().block_on(self.inner.read_incremental_records(
+                start_timestamp,
+                end_timestamp,
+                filters.unwrap_or_default(),
+            ))
             .map_err(PythonError::from)
         })?
         .to_pyarrow(py)
@@ -702,12 +706,13 @@ impl HudiTable {
         self.inner.base_url().to_string()
     }
 
-    #[pyo3(signature = (num_splits, start_timestamp=None, end_timestamp=None))]
+    #[pyo3(signature = (num_splits, start_timestamp=None, end_timestamp=None, filters=None))]
     fn get_file_slices_splits_between(
         &self,
         num_splits: usize,
         start_timestamp: Option<&str>,
         end_timestamp: Option<&str>,
+        filters: Option<Vec<(String, String, String)>>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
         py.detach(|| {
@@ -716,6 +721,7 @@ impl HudiTable {
                     num_splits,
                     start_timestamp,
                     end_timestamp,
+                    filters.unwrap_or_default(),
                 ))
                 .map_err(PythonError::from)?;
             Ok(file_slices

@@ -177,16 +177,26 @@ batches = hudi_table.read_incremental_records(t1, t2)
 
 # read the records after t1
 batches = hudi_table.read_incremental_records(t1)
+
+# with partition filters applied to the changed records
+batches = hudi_table.read_incremental_records(t1, t2, filters=[("city", "=", "san_francisco")])
 ```
 
 #### Rust
 
 ```rust
+use hudi_core::config::util::empty_filters;
+
 // read the records between t1 (exclusive) and t2 (inclusive)
-let batches = hudi_table.read_incremental_records(t1, Some(t2)).await?;
+let batches = hudi_table.read_incremental_records(t1, Some(t2), empty_filters()).await?;
 
 // read the records after t1
-let batches = hudi_table.read_incremental_records(t1, None).await?;
+let batches = hudi_table.read_incremental_records(t1, None, empty_filters()).await?;
+
+// with partition filters applied to the changed records
+let batches = hudi_table
+    .read_incremental_records(t1, Some(t2), [("city", "=", "san_francisco")])
+    .await?;
 ```
 
 *Incremental queries support the same timestamp formats as time-travel queries.*

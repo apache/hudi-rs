@@ -45,3 +45,59 @@ def test_table_incremental_read_returns_correct_data():
     assert t.num_rows == 1
     assert t.column("txn_id").to_pylist() == ["TXN-001"]
     assert t.column("txn_type").to_pylist() == ["reversal"]
+
+
+def test_incremental_read_with_partition_filter():
+    table_path = get_test_table_path("v9_txns_simple_nometa", "cow")
+    table = HudiTable(table_path)
+    commits = table.get_timeline().get_completed_commits()
+    insert_ts = commits[0].timestamp
+    update_ts = commits[1].timestamp
+
+    # TXN-001 lives in region 'us'; filtering to 'us' keeps it.
+    batches = table.read_incremental_records(
+        insert_ts, update_ts, filters=[("region", "=", "us")]
+    )
+    t = pa.Table.from_batches(batches)
+    assert t.num_rows == 1
+    assert t.column("txn_id").to_pylist() == ["TXN-001"]
+
+    # Filtering to a non-matching region prunes the change away.
+    batches = table.read_incremental_records(
+        insert_ts, update_ts, filters=[("region", "=", "eu")]
+    )
+    assert sum(b.num_rows for b in batches) == 0
+
+
+def test_get_file_slices_between_with_partition_filter():
+    table_path = get_test_table_path("v9_txns_simple_nometa", "cow")
+    table = HudiTable(table_path)
+    commits = table.get_timeline().get_completed_commits()
+    insert_ts = commits[0].timestamp
+    update_ts = commits[1].timestamp
+
+    slices_us = table.get_file_slices_between(
+        insert_ts, update_ts, filters=[("region", "=", "us")]
+    )
+    assert len(slices_us) == 1
+    assert "region=us" in slices_us[0].base_file_relative_path()
+
+    slices_eu = table.get_file_slices_between(
+        insert_ts, update_ts, filters=[("region", "=", "eu")]
+    )
+    assert len(slices_eu) == 0
+
+
+def test_get_file_slices_splits_between_with_partition_filter():
+    table_path = get_test_table_path("v9_txns_simple_nometa", "cow")
+    table = HudiTable(table_path)
+    commits = table.get_timeline().get_completed_commits()
+    insert_ts = commits[0].timestamp
+    update_ts = commits[1].timestamp
+
+    splits = table.get_file_slices_splits_between(
+        2, insert_ts, update_ts, filters=[("region", "=", "us")]
+    )
+    flattened = [s for split in splits for s in split]
+    assert len(flattened) == 1
+    assert "region=us" in flattened[0].base_file_relative_path()
