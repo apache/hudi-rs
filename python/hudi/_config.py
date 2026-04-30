@@ -14,10 +14,13 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
+# mypy: ignore-errors
 """Hudi config enums reflected from the Rust core at import time.
 
 The `enum.Enum` members are constructed from `hudi._internal._config_keys()`,
 so the variant names and key strings have a single source of truth in Rust.
+mypy is disabled for this module because its strict-mode Enum analyzer
+requires literal members and cannot follow the dynamic construction below.
 """
 
 from enum import Enum
@@ -26,7 +29,7 @@ from hudi._internal import _config_keys
 
 _keys = _config_keys()
 
-HudiTableConfig = Enum(  # type: ignore[misc]
+HudiTableConfig = Enum(
     "HudiTableConfig",
     _keys["HudiTableConfig"],
     type=str,
@@ -37,7 +40,7 @@ HudiTableConfig.__doc__ = (
     "Configurations for Hudi tables, most of them are persisted in `hoodie.properties`."
 )
 
-HudiReadConfig = Enum(  # type: ignore[misc]
+HudiReadConfig = Enum(
     "HudiReadConfig",
     _keys["HudiReadConfig"],
     type=str,
