@@ -218,6 +218,69 @@ let batches = hudi_table.read_incremental_records(&options).await?;
 
 *Incremental queries support the same timestamp formats as time-travel queries.*
 
+### Streaming Read
+
+Streaming reads yield `RecordBatch`es one at a time without loading the full result into memory.
+The same `ReadOptions` knobs apply, plus `batch_size` and `projection`.
+
+#### Python
+
+```python
+options = HudiReadOptions(
+    filters=[("city", "=", "san_francisco")],
+    projection=["rider", "city", "ts", "fare"],
+    batch_size=4096,
+)
+for batch in hudi_table.read_snapshot_stream(options):
+    print(batch.num_rows)
+```
+
+#### Rust
+
+```rust
+use futures::StreamExt;
+
+let options = ReadOptions::new()
+    .with_filters([("city", "=", "san_francisco")])
+    .with_projection(["rider", "city", "ts", "fare"])
+    .with_batch_size(4096);
+let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+while let Some(batch) = stream.next().await {
+    let batch = batch?;
+    println!("{}", batch.num_rows());
+}
+```
+
+### Parallel Read Planning
+
+Engines that distribute reads (e.g. DataFusion, Ray Data, Spark) use the splits APIs to
+chunk file slices into roughly equal groups for worker tasks. Combine with `compute_table_stats()`
+for size-based planning.
+
+#### Python
+
+```python
+# Plan: split snapshot into 8 parallel reads
+splits = hudi_table.get_file_slices_splits(8)
+stats = hudi_table.compute_table_stats()  # (estimated_rows, byte_size) or None
+
+# Each worker reads its slice group
+reader = hudi_table.create_file_group_reader_with_options()
+for split in splits:
+    for file_slice in split:
+        batch = reader.read_file_slice(file_slice)
+        # ... process batch
+```
+
+#### Rust
+
+```rust
+// Same flow with options applied (filters, time travel)
+let options = ReadOptions::new().with_filters([("city", "=", "san_francisco")]);
+let splits = hudi_table.get_file_slices_splits(8, &options).await?;
+let stats = hudi_table.compute_table_stats().await; // Option<(rows, byte_size)>
+```
+
 ### File Group Reading (Experimental)
 
 File group reading allows you to read data from a specific file slice. This is useful when integrating with query
