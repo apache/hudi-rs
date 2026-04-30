@@ -714,21 +714,24 @@ fn pascal_to_screaming_snake(input: &str) -> String {
     out
 }
 
+#[cfg(not(tarpaulin_include))]
+pub fn rt() -> &'static Runtime {
+    static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
+    TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::pascal_to_screaming_snake;
 
     #[test]
     fn pascal_to_screaming_snake_basic() {
-        assert_eq!(pascal_to_screaming_snake("BaseFileFormat"), "BASE_FILE_FORMAT");
+        assert_eq!(
+            pascal_to_screaming_snake("BaseFileFormat"),
+            "BASE_FILE_FORMAT"
+        );
         assert_eq!(pascal_to_screaming_snake("TableName"), "TABLE_NAME");
         assert_eq!(pascal_to_screaming_snake("URLEncoded"), "URL_ENCODED");
         assert_eq!(pascal_to_screaming_snake("A"), "A");
     }
-}
-
-#[cfg(not(tarpaulin_include))]
-pub fn rt() -> &'static Runtime {
-    static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
-    TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
 }

@@ -21,6 +21,7 @@ import pyarrow  # type: ignore
 
 __version__: str
 
+def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
 @dataclass(init=False)
 class HudiFileGroupReader:
     """

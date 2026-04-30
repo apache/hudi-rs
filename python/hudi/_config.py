@@ -26,7 +26,7 @@ from hudi._internal import _config_keys
 
 _keys = _config_keys()
 
-HudiTableConfig = Enum(
+HudiTableConfig = Enum(  # type: ignore[misc]
     "HudiTableConfig",
     _keys["HudiTableConfig"],
     type=str,
@@ -37,7 +37,7 @@ HudiTableConfig.__doc__ = (
     "Configurations for Hudi tables, most of them are persisted in `hoodie.properties`."
 )
 
-HudiReadConfig = Enum(
+HudiReadConfig = Enum(  # type: ignore[misc]
     "HudiReadConfig",
     _keys["HudiReadConfig"],
     type=str,

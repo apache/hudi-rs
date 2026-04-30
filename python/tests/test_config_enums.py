@@ -27,8 +27,7 @@ def test_internal_config_keys_returns_both_enums():
     read_entries = keys["HudiReadConfig"]
 
     assert all(
-        isinstance(name, str) and isinstance(key, str)
-        for name, key in table_entries
+        isinstance(name, str) and isinstance(key, str) for name, key in table_entries
     )
     assert all(key.startswith("hoodie.") for _, key in table_entries)
     assert all(key.startswith("hoodie.") for _, key in read_entries)
