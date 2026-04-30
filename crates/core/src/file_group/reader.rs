@@ -116,7 +116,17 @@ impl FileGroupReader {
         options: &ReadOptions,
     ) -> Result<RecordBatch> {
         let batch = self.read_base_file_eager(relative_path).await?;
-        apply_eager_options(options, batch)
+        apply_eager_options(options, batch, &self.partition_columns())
+    }
+
+    /// Configured partition column names from `hoodie.table.partition.fields`.
+    /// Used for filter-field validation: filters targeting these are allowed even
+    /// when the column is missing from a batch (e.g., when partition columns are
+    /// dropped from data files via `hoodie.datasource.write.drop.partition.columns`).
+    fn partition_columns(&self) -> Vec<String> {
+        self.hudi_configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into()
     }
 
     /// Internal: read base file + apply commit-time filter, no [`ReadOptions`] applied.
@@ -224,7 +234,7 @@ impl FileGroupReader {
             merger.merge_record_batches(all_batches)?
         };
 
-        apply_eager_options(options, merged)
+        apply_eager_options(options, merged, &self.partition_columns())
     }
 
     // =========================================================================
@@ -348,25 +358,33 @@ impl FileGroupReader {
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
-        // If projection is set, ensure all data-column filter fields are also read so
-        // the row-level mask can evaluate them. We project down to the user's
-        // requested columns AFTER filtering.
+        // If projection is set, ensure all filter fields are also read so the
+        // row-level mask can evaluate them. We project down to the user's requested
+        // columns AFTER filtering.
         //
-        // Partition column filter fields are intentionally excluded from this
-        // widening: partition pruning has already filtered file groups upstream, and
-        // when `hoodie.datasource.write.drop.partition.columns` is enabled the
-        // partition columns aren't present in parquet at all (widening would cause
-        // a column-not-found error from the parquet reader).
-        let partition_columns: Vec<String> = self
+        // We only exclude partition column filter fields from widening when
+        // `hoodie.datasource.write.drop.partition.columns` is enabled — otherwise
+        // partition columns are still present in parquet (e.g. with timestamp-based
+        // keygen, the source data column is also configured as a partition field).
+        // Excluding them unconditionally would silently drop legitimate row filters
+        // on those columns.
+        let drops_partition_columns: bool = self
             .hudi_configs
-            .get_or_default(HudiTableConfig::PartitionFields)
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
             .into();
+        let dropped_partition_columns: Vec<String> = if drops_partition_columns {
+            self.hudi_configs
+                .get_or_default(HudiTableConfig::PartitionFields)
+                .into()
+        } else {
+            Vec::new()
+        };
         let final_projection = options.projection.clone();
         let read_projection = match (&options.projection, options.filters.as_slice()) {
             (Some(proj), filters) if !filters.is_empty() => {
                 let mut combined: Vec<String> = proj.clone();
                 for (field, _, _) in filters {
-                    if partition_columns.iter().any(|p| p == field) {
+                    if dropped_partition_columns.iter().any(|p| p == field) {
                         continue;
                     }
                     if !combined.iter().any(|c| c == field) {
@@ -390,6 +408,10 @@ impl FileGroupReader {
                 .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
         )?);
         let final_projection = Arc::new(final_projection);
+        let partition_columns = Arc::new(self.partition_columns());
+        // Validate once on first batch so typoed filter columns surface as errors
+        // rather than silent no-ops in `filters_to_row_mask`.
+        let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let parquet_stream = self
             .storage
@@ -402,12 +424,24 @@ impl FileGroupReader {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
             let final_projection = final_projection.clone();
+            let partition_columns = partition_columns.clone();
+            let validated = validated.clone();
             async move {
                 match result {
                     Err(e) => Some(Err(ReadFileSliceError(format!(
                         "Failed to read batch: {e:?}"
                     )))),
                     Ok(batch) => {
+                        if !validated.load(std::sync::atomic::Ordering::Relaxed) {
+                            if let Err(e) = validate_filter_fields_against_batch(
+                                &filters,
+                                batch.schema().as_ref(),
+                                &partition_columns,
+                            ) {
+                                return Some(Err(e));
+                            }
+                            validated.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let batch = match apply_commit_time_filter(&hudi_configs, batch) {
                             Err(e) => return Some(Err(e)),
                             Ok(b) if b.num_rows() == 0 => return None,
@@ -589,15 +623,51 @@ fn create_commit_time_filter_mask(
 }
 
 /// Apply structured filters and projection to an eager [`RecordBatch`].
-fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<RecordBatch> {
+///
+/// `partition_columns` lists configured partition fields; filters targeting these are
+/// allowed even when the column isn't present in `batch` (it may have been dropped
+/// from parquet and already accounted for by upstream partition pruning). Any other
+/// missing column is treated as a typo and surfaced as an error.
+fn apply_eager_options(
+    options: &ReadOptions,
+    batch: RecordBatch,
+    partition_columns: &[String],
+) -> Result<RecordBatch> {
     let filters = from_str_tuples(
         options
             .filters
             .iter()
             .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
     )?;
+    validate_filter_fields_against_batch(&filters, batch.schema().as_ref(), partition_columns)?;
     let batch = apply_filter_mask(&filters, batch)?;
     project_to(&options.projection, batch)
+}
+
+/// Error if any filter targets a column that is neither in `batch_schema` nor a known
+/// partition column. Catches typoed filter fields that would otherwise become silent
+/// no-ops in [`filters_to_row_mask`].
+fn validate_filter_fields_against_batch(
+    filters: &[Filter],
+    batch_schema: &arrow_schema::Schema,
+    partition_columns: &[String],
+) -> Result<()> {
+    use std::collections::HashSet;
+    let mut valid: HashSet<&str> = batch_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    valid.extend(partition_columns.iter().map(String::as_str));
+    for filter in filters {
+        if !valid.contains(filter.field_name.as_str()) {
+            return Err(CoreError::Schema(format!(
+                "Filter field '{}' not found in schema",
+                filter.field_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Project a [`RecordBatch`] to the given column names. Returns the input unchanged

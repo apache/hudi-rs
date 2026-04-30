@@ -1780,6 +1780,79 @@ mod streaming_queries {
     }
 
     #[tokio::test]
+    async fn test_file_group_reader_filter_on_unknown_column_errors() -> Result<()> {
+        // FileGroupReader-direct reads bypass table-level filter validation; the
+        // reader must reject typoed filter fields itself rather than silently
+        // skipping them in `filters_to_row_mask`.
+        use hudi_core::file_group::reader::FileGroupReader;
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let file_slice = hudi_table.get_file_slices(&ReadOptions::new()).await?[0].clone();
+        let reader =
+            FileGroupReader::new_with_options(base_url.path(), std::iter::empty::<(&str, &str)>())
+                .await?;
+        let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")]);
+
+        let eager_err = reader
+            .read_file_slice(&file_slice, &options)
+            .await
+            .unwrap_err();
+        assert!(
+            eager_err.to_string().contains("rider_idd"),
+            "eager error should mention the bad column, got: {eager_err}"
+        );
+
+        // Streaming validates lazily on the first batch.
+        let stream = reader.read_file_slice_stream(&file_slice, &options).await?;
+        let mut stream_err = None;
+        let mut s = stream;
+        while let Some(result) = s.next().await {
+            if let Err(e) = result {
+                stream_err = Some(e);
+                break;
+            }
+        }
+        let stream_err = stream_err.expect("streaming must surface the typo as an error");
+        assert!(
+            stream_err.to_string().contains("rider_idd"),
+            "stream error should mention the bad column, got: {stream_err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_normalizes_as_of_timestamp() -> Result<()> {
+        // Cross-validate single-slice streaming time-travel against eager
+        // read_snapshot using the same `as_of_timestamp`. Pre-fix,
+        // `read_file_slice_stream` did not run `format_timestamp`, so passing an
+        // ISO/epoch form (which `read_snapshot` accepts) could pass an
+        // unformatted value through to the file-group reader.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let first_commit = hudi_table
+            .get_timeline()
+            .get_completed_commits(false)
+            .await?
+            .first()
+            .map(|i| i.timestamp.to_string())
+            .expect("table must have at least one commit");
+        let options = ReadOptions::new().with_as_of_timestamp(&first_commit);
+        let file_slice = hudi_table.get_file_slices(&options).await?[0].clone();
+
+        let eager = hudi_table.read_snapshot(&options).await?;
+        let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
+
+        let stream = hudi_table
+            .read_file_slice_stream(&file_slice, &options)
+            .await?;
+        let stream_batches = collect_stream_batches(stream).await?;
+        let stream_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(eager_rows, stream_rows);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_read_snapshot_stream_projection_invalid_column() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;

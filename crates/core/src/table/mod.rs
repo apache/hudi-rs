@@ -785,19 +785,14 @@ impl Table {
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use futures::stream;
 
-        let timestamp = options
-            .as_of_timestamp
-            .as_deref()
-            .or_else(|| self.timeline.get_latest_commit_timestamp_as_option());
-
-        let Some(timestamp) = timestamp else {
+        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             // No commit timestamp means empty table - return empty stream (consistent with read_snapshot)
             return Ok(Box::pin(stream::empty()));
         };
 
         let fg_reader = self.create_file_group_reader_with_options([(
             HudiReadConfig::FileGroupEndTimestamp,
-            timestamp,
+            timestamp.as_str(),
         )])?;
 
         fg_reader.read_file_slice_stream(file_slice, options).await

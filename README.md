@@ -62,6 +62,8 @@ Hudi integration in the data ecosystems for a diverse range of users and project
 > These examples expect a Hudi table exists at `/tmp/trips_table`, created using
 > the [quick start guide](https://hudi.apache.org/docs/quick-start-guide).
 
+For the full reader API reference (`ReadOptions`, filter expressions, behavioral guarantees), see [docs/reader-spec.md](docs/reader-spec.md).
+
 ### Snapshot Query
 
 Snapshot query reads the latest version of the data from the table. The table API also accepts column filters that drive partition + file pruning and row-level filtering.
