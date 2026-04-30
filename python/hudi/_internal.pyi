@@ -17,11 +17,47 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import pyarrow  # type: ignore
+import pyarrow
 
 __version__: str
 
 def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
+
+@dataclass(init=False)
+class HudiReadOptions:
+    """
+    Options for streaming reads.
+
+    Attributes:
+        filters (List[Tuple[str, str, str]]): Partition filters to apply.
+        projection (Optional[List[str]]): Column names to read. If None, all columns are read.
+        batch_size (Optional[int]): Target number of rows per batch.
+        as_of_timestamp (Optional[str]): Timestamp for time travel queries.
+    """
+
+    filters: List[Tuple[str, str, str]]
+    projection: Optional[List[str]]
+    batch_size: Optional[int]
+    as_of_timestamp: Optional[str]
+
+    def __init__(
+        self,
+        filters: Optional[List[Tuple[str, str, str]]] = None,
+        projection: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+        as_of_timestamp: Optional[str] = None,
+    ): ...
+
+@dataclass(init=False)
+class HudiRecordBatchStream:
+    """
+    A stream of record batches yielded one at a time.
+
+    Iterating consumes the stream. The stream is single-use.
+    """
+
+    def __iter__(self) -> "HudiRecordBatchStream": ...
+    def __next__(self) -> "pyarrow.RecordBatch": ...
 
 @dataclass(init=False)
 class HudiFileGroupReader:
@@ -78,6 +114,31 @@ class HudiFileGroupReader:
 
         Returns:
             pyarrow.RecordBatch: The merged record batch from base file and log files.
+        """
+        ...
+
+    def read_file_slice_stream(
+        self,
+        file_slice: HudiFileSlice,
+        options: Optional[HudiReadOptions] = None,
+    ) -> HudiRecordBatchStream:
+        """
+        Reads a file slice as a stream of record batches.
+
+        For COW tables or read-optimized mode, this yields batches as they are read
+        without loading all data into memory. For MOR tables with log files, this
+        currently falls back to a single merged batch.
+        """
+        ...
+
+    def read_file_slice_from_paths_stream(
+        self,
+        base_file_path: str,
+        log_file_paths: List[str],
+        options: Optional[HudiReadOptions] = None,
+    ) -> HudiRecordBatchStream:
+        """
+        Reads a file slice from explicit paths as a stream of record batches.
         """
         ...
 
@@ -350,6 +411,62 @@ class HudiTable:
 
         Returns:
             List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
+        """
+        ...
+
+    @property
+    def base_url(self) -> str:
+        """
+        Get the base URL of the Hudi table.
+
+        Returns:
+            str: The base URL of the table.
+        """
+        ...
+    def get_file_slices_splits_between(
+        self,
+        num_splits: int,
+        start_timestamp: Optional[str] = None,
+        end_timestamp: Optional[str] = None,
+    ) -> List[List[HudiFileSlice]]:
+        """
+        Retrieves file slices changed between the given timestamps in 'num_splits' splits.
+
+        Parameters:
+            num_splits (int): The number of parts to split the file slices into.
+            start_timestamp (Optional[str]): The start timestamp (exclusive).
+            end_timestamp (Optional[str]): The end timestamp (inclusive). Defaults to the latest commit.
+
+        Returns:
+            List[List[HudiFileSlice]]: A list of file slice groups for parallel reads.
+        """
+        ...
+    def compute_table_stats(self) -> Optional[Tuple[int, int]]:
+        """
+        Computes estimated table-level statistics from the metadata table for scan planning.
+
+        Returns:
+            Optional[Tuple[int, int]]: A tuple of (estimated_num_rows, estimated_total_byte_size),
+            or None if the metadata table is not enabled or statistics cannot be computed.
+        """
+        ...
+    def read_snapshot_stream(
+        self, options: Optional[HudiReadOptions] = None
+    ) -> HudiRecordBatchStream:
+        """
+        Reads the table snapshot as a stream of record batches.
+
+        Yields record batches as they are read from the underlying file slices,
+        without loading all data into memory.
+        """
+        ...
+    def read_file_slice_stream(
+        self,
+        file_slice: HudiFileSlice,
+        options: Optional[HudiReadOptions] = None,
+    ) -> HudiRecordBatchStream:
+        """
+        Reads a single file slice as a stream of record batches.
         """
         ...
 

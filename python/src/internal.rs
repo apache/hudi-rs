@@ -18,21 +18,27 @@
  */
 
 use arrow::pyarrow::ToPyArrow;
+use arrow::record_batch::RecordBatch;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::convert::From;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
 use hudi::config::read::HudiReadConfig;
 use hudi::config::table::HudiTableConfig;
 use hudi::error::CoreError;
+use hudi::error::Result as HudiResult;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
+use hudi::table::ReadOptions;
 use hudi::table::Table;
 use hudi::table::builder::TableBuilder;
 use hudi::timeline::Timeline;
@@ -41,6 +47,8 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::{PyErr, PyResult, Python, create_exception, pyclass, pyfunction, pymethods};
 use std::error::Error;
+
+type RecordBatchBoxStream = BoxStream<'static, HudiResult<RecordBatch>>;
 
 create_exception!(_internal, HudiCoreError, PyException);
 
@@ -68,6 +76,101 @@ impl From<PythonError> for PyErr {
             PythonError::HudiCore(err) => convert_to_py_err(err),
             #[cfg(feature = "datafusion")]
             PythonError::DataFusionCore(err) => convert_to_py_err(err),
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug, Default)]
+#[pyclass]
+pub struct HudiReadOptions {
+    #[pyo3(get)]
+    filters: Vec<(String, String, String)>,
+    #[pyo3(get)]
+    projection: Option<Vec<String>>,
+    #[pyo3(get)]
+    batch_size: Option<usize>,
+    #[pyo3(get)]
+    as_of_timestamp: Option<String>,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiReadOptions {
+    #[new]
+    #[pyo3(signature = (filters=None, projection=None, batch_size=None, as_of_timestamp=None))]
+    fn new(
+        filters: Option<Vec<(String, String, String)>>,
+        projection: Option<Vec<String>>,
+        batch_size: Option<usize>,
+        as_of_timestamp: Option<String>,
+    ) -> Self {
+        Self {
+            filters: filters.unwrap_or_default(),
+            projection,
+            batch_size,
+            as_of_timestamp,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "HudiReadOptions(filters={:?}, projection={:?}, batch_size={:?}, as_of_timestamp={:?})",
+            self.filters, self.projection, self.batch_size, self.as_of_timestamp
+        )
+    }
+}
+
+impl HudiReadOptions {
+    fn to_inner(&self) -> ReadOptions {
+        let mut options = ReadOptions::new().with_filters(self.filters.clone());
+        if let Some(projection) = &self.projection {
+            options = options.with_projection(projection.clone());
+        }
+        if let Some(batch_size) = self.batch_size {
+            options = options.with_batch_size(batch_size);
+        }
+        if let Some(timestamp) = &self.as_of_timestamp {
+            options = options.with_as_of_timestamp(timestamp.clone());
+        }
+        options
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pyclass]
+pub struct HudiRecordBatchStream {
+    inner: Arc<Mutex<RecordBatchBoxStream>>,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiRecordBatchStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: PyRef<'_, Self>, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        let stream = slf.inner.clone();
+        let result = py.detach(|| {
+            rt().block_on(async move {
+                let mut stream = stream.lock().await;
+                stream.next().await
+            })
+        });
+
+        match result {
+            Some(Ok(batch)) => Ok(Some(batch.to_pyarrow(py)?.unbind())),
+            Some(Err(e)) => Err(PythonError::from(e).into()),
+            None => Ok(None),
+        }
+    }
+}
+
+impl HudiRecordBatchStream {
+    fn from_stream(stream: RecordBatchBoxStream) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(stream)),
         }
     }
 }
@@ -155,6 +258,57 @@ impl HudiFileGroupReader {
         })?
         .to_pyarrow(py)
         .map(|b| b.unbind())
+    }
+
+    #[pyo3(signature = (file_slice, options=None))]
+    fn read_file_slice_stream(
+        &self,
+        file_slice: &HudiFileSlice,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<HudiRecordBatchStream> {
+        let read_options = options.unwrap_or_default().to_inner();
+        let mut file_group = FileGroup::new_with_base_file_name(
+            &file_slice.base_file_name,
+            &file_slice.partition_path,
+        )
+        .map_err(PythonError::from)?;
+        file_group
+            .add_log_files_from_names(&file_slice.log_file_names)
+            .map_err(PythonError::from)?;
+        let inner_reader = self.inner.clone();
+        let stream = py.detach(|| {
+            rt().block_on(async move {
+                let (_, fs) = file_group.file_slices.iter().next().ok_or_else(|| {
+                    CoreError::FileGroup(format!(
+                        "Failed to get file slice from file group: {file_group:?}"
+                    ))
+                })?;
+                inner_reader.read_file_slice_stream(fs, &read_options).await
+            })
+            .map_err(PythonError::from)
+        })?;
+        Ok(HudiRecordBatchStream::from_stream(stream))
+    }
+
+    #[pyo3(signature = (base_file_path, log_file_paths, options=None))]
+    fn read_file_slice_from_paths_stream(
+        &self,
+        base_file_path: &str,
+        log_file_paths: Vec<String>,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<HudiRecordBatchStream> {
+        let read_options = options.unwrap_or_default().to_inner();
+        let stream = py.detach(|| {
+            rt().block_on(self.inner.read_file_slice_from_paths_stream(
+                base_file_path,
+                log_file_paths,
+                &read_options,
+            ))
+            .map_err(PythonError::from)
+        })?;
+        Ok(HudiRecordBatchStream::from_stream(stream))
     }
 }
 
@@ -541,6 +695,83 @@ impl HudiTable {
         })?
         .to_pyarrow(py)
         .map(|b| b.unbind())
+    }
+
+    #[getter]
+    fn base_url(&self) -> String {
+        self.inner.base_url().to_string()
+    }
+
+    #[pyo3(signature = (num_splits, start_timestamp=None, end_timestamp=None))]
+    fn get_file_slices_splits_between(
+        &self,
+        num_splits: usize,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+        py: Python,
+    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(self.inner.get_file_slices_splits_between(
+                    num_splits,
+                    start_timestamp,
+                    end_timestamp,
+                ))
+                .map_err(PythonError::from)?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
+                .collect())
+        })
+    }
+
+    fn compute_table_stats(&self, py: Python) -> Option<(u64, u64)> {
+        py.detach(|| rt().block_on(self.inner.compute_table_stats()))
+    }
+
+    #[pyo3(signature = (options=None))]
+    fn read_snapshot_stream(
+        &self,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<HudiRecordBatchStream> {
+        let read_options = options.unwrap_or_default().to_inner();
+        let stream = py.detach(|| {
+            rt().block_on(self.inner.read_snapshot_stream(&read_options))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiRecordBatchStream::from_stream(stream))
+    }
+
+    #[pyo3(signature = (file_slice, options=None))]
+    fn read_file_slice_stream(
+        &self,
+        file_slice: &HudiFileSlice,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<HudiRecordBatchStream> {
+        let read_options = options.unwrap_or_default().to_inner();
+        let mut file_group = FileGroup::new_with_base_file_name(
+            &file_slice.base_file_name,
+            &file_slice.partition_path,
+        )
+        .map_err(PythonError::from)?;
+        file_group
+            .add_log_files_from_names(&file_slice.log_file_names)
+            .map_err(PythonError::from)?;
+        let table = self.inner.clone();
+        let stream = py.detach(|| {
+            rt().block_on(async move {
+                let (_, fs) = file_group.file_slices.iter().next().ok_or_else(|| {
+                    CoreError::FileGroup(format!(
+                        "Failed to get file slice from file group: {file_group:?}"
+                    ))
+                })?;
+                table.read_file_slice_stream(fs, &read_options).await
+            })
+            .map_err(PythonError::from)
+        })?;
+        Ok(HudiRecordBatchStream::from_stream(stream))
     }
 }
 
