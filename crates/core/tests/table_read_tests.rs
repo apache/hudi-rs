@@ -1689,6 +1689,73 @@ mod streaming_queries {
     }
 
     #[tokio::test]
+    async fn test_read_snapshot_stream_filter_column_not_in_projection() -> Result<()> {
+        use arrow::array::Int32Array;
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // Filter on `isActive` but project only `id` (filter column NOT projected).
+        // The filter must still apply at row level — implementation augments the
+        // read projection internally with filter columns, then projects down.
+        let options = ReadOptions::new()
+            .with_projection(["id"])
+            .with_filters([("isActive", "=", "true")]);
+
+        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let batches = collect_stream_batches(stream).await?;
+
+        let schema = &batches[0].schema();
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("isActive").is_err());
+
+        let records = concat_batches(schema, &batches)?;
+        assert_eq!(
+            records.num_rows(),
+            2,
+            "filter must drop rows even when filter column is not projected"
+        );
+
+        let ids = records
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let id_values: Vec<i32> = ids.iter().flatten().collect();
+        assert!(id_values.contains(&3) && id_values.contains(&4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_snapshot_stream_with_as_of_timestamp() -> Result<()> {
+        // Cross-validate streaming time-travel against the eager API: with the
+        // same `as_of_timestamp`, both must return the same row count. (Before
+        // the fix, streaming silently used the latest commit and could diverge.)
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let first_commit = hudi_table
+            .get_timeline()
+            .get_completed_commits(false)
+            .await?
+            .first()
+            .map(|i| i.timestamp.to_string())
+            .expect("table must have at least one commit");
+        let options = ReadOptions::new().with_as_of_timestamp(&first_commit);
+
+        let eager = hudi_table.read_snapshot(&options).await?;
+        let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
+
+        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream_batches = collect_stream_batches(stream).await?;
+        let stream_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(eager_rows, stream_rows);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_read_snapshot_stream_projection_invalid_column() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;

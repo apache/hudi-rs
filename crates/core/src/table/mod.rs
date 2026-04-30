@@ -512,7 +512,7 @@ impl Table {
     /// # Notes
     /// * Useful for incremental queries.
     pub async fn get_file_slices_between(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        let Some((start, end)) = self.resolve_incremental_range(options) else {
+        let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
         let filters = parse_filters(&options.filters)?;
@@ -630,7 +630,7 @@ impl Table {
         &self,
         options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let Some((start, end)) = self.resolve_incremental_range(options) else {
+        let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
         let filters = parse_filters(&options.filters)?;
@@ -668,20 +668,25 @@ impl Table {
 
     /// Resolve the incremental change range `(start, end]` from `options`. `start`
     /// defaults to [`EARLIEST_START_TIMESTAMP`]; `end` defaults to the latest commit.
-    /// Returns `None` only when no `end_timestamp` is provided AND the table is empty.
-    fn resolve_incremental_range(&self, options: &ReadOptions) -> Option<(String, String)> {
+    ///
+    /// Returns `Ok(None)` only when no `end_timestamp` is provided AND the table has
+    /// no commits. Invalid timestamp strings propagate as `Err`.
+    fn resolve_incremental_range(&self, options: &ReadOptions) -> Result<Option<(String, String)>> {
         let timezone = self.timezone();
-        let end = options
+        let Some(end) = options
             .end_timestamp
             .as_deref()
-            .or_else(|| self.timeline.get_latest_commit_timestamp_as_option())?;
-        let end = format_timestamp(end, &timezone).ok()?;
+            .or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
+        else {
+            return Ok(None);
+        };
+        let end = format_timestamp(end, &timezone)?;
         let start = options
             .start_timestamp
             .as_deref()
             .unwrap_or(EARLIEST_START_TIMESTAMP);
-        let start = format_timestamp(start, &timezone).ok()?;
-        Some((start, end))
+        let start = format_timestamp(start, &timezone)?;
+        Ok(Some((start, end)))
     }
 
     /// Get the change-data-capture (CDC) records between the given timestamps.
@@ -792,12 +797,12 @@ impl Table {
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use futures::stream::{self, StreamExt};
 
-        let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
+        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Box::pin(stream::empty()));
         };
 
         let filters = parse_filters(&options.filters)?;
-        let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
+        let file_slices = self.get_file_slices_internal(&timestamp, &filters).await?;
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
@@ -805,7 +810,7 @@ impl Table {
 
         let fg_reader = self.create_file_group_reader_with_options([(
             HudiReadConfig::FileGroupEndTimestamp,
-            timestamp,
+            timestamp.as_str(),
         )])?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —

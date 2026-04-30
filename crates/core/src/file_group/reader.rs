@@ -348,10 +348,24 @@ impl FileGroupReader {
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
-        // Add projection pushdown using column names (converted to indices internally
-        // by get_parquet_file_stream using the same schema the projection is applied to)
-        if let Some(ref projection_names) = options.projection {
-            parquet_options = parquet_options.with_projection(projection_names.clone());
+        // If projection is set, ensure all columns referenced by `filters` are also
+        // read so the row-level filter mask can evaluate them. We project down to
+        // the user's requested columns AFTER filtering.
+        let final_projection = options.projection.clone();
+        let read_projection = match (&options.projection, options.filters.as_slice()) {
+            (Some(proj), filters) if !filters.is_empty() => {
+                let mut combined: Vec<String> = proj.clone();
+                for (field, _, _) in filters {
+                    if !combined.iter().any(|c| c == field) {
+                        combined.push(field.clone());
+                    }
+                }
+                Some(combined)
+            }
+            (proj, _) => proj.clone(),
+        };
+        if let Some(ref cols) = read_projection {
+            parquet_options = parquet_options.with_projection(cols.clone());
         }
 
         let hudi_configs = self.hudi_configs.clone();
@@ -362,6 +376,7 @@ impl FileGroupReader {
                 .iter()
                 .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
         )?);
+        let final_projection = Arc::new(final_projection);
 
         let parquet_stream = self
             .storage
@@ -369,10 +384,11 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
-        // Apply filtering: commit time → structured filters as row mask.
+        // Apply filtering: commit time → structured filters → final projection.
         let stream = parquet_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
+            let final_projection = final_projection.clone();
             async move {
                 match result {
                     Err(e) => Some(Err(ReadFileSliceError(format!(
@@ -387,6 +403,12 @@ impl FileGroupReader {
                         let batch = match apply_filter_mask(&filters, batch) {
                             Err(e) => return Some(Err(e)),
                             Ok(b) if b.num_rows() == 0 => return None,
+                            Ok(b) => b,
+                        };
+                        // Project down to the user's requested columns (no-op if we
+                        // didn't have to widen the read projection).
+                        let batch = match project_to(&final_projection, batch) {
+                            Err(e) => return Some(Err(e)),
                             Ok(b) => b,
                         };
                         Some(Ok(batch))
@@ -562,21 +584,27 @@ fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<Reco
             .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
     )?;
     let batch = apply_filter_mask(&filters, batch)?;
+    project_to(&options.projection, batch)
+}
 
-    if let Some(cols) = &options.projection {
-        let indices: Vec<usize> =
-            cols.iter()
-                .map(|name| {
-                    batch.schema().index_of(name).map_err(|e| {
-                        ReadFileSliceError(format!("Projection column not found: {e:?}"))
-                    })
-                })
-                .collect::<Result<_>>()?;
-        return batch
-            .project(&indices)
-            .map_err(|e| ReadFileSliceError(format!("Projection failed: {e:?}")));
-    }
-    Ok(batch)
+/// Project a [`RecordBatch`] to the given column names. Returns the input unchanged
+/// when `projection` is `None`.
+fn project_to(projection: &Option<Vec<String>>, batch: RecordBatch) -> Result<RecordBatch> {
+    let Some(cols) = projection else {
+        return Ok(batch);
+    };
+    let indices: Vec<usize> = cols
+        .iter()
+        .map(|name| {
+            batch
+                .schema()
+                .index_of(name)
+                .map_err(|e| ReadFileSliceError(format!("Projection column not found: {e:?}")))
+        })
+        .collect::<Result<_>>()?;
+    batch
+        .project(&indices)
+        .map_err(|e| ReadFileSliceError(format!("Projection failed: {e:?}")))
 }
 
 /// Apply commit time filtering to a record batch.

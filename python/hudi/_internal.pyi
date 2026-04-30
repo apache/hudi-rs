@@ -95,8 +95,8 @@ class HudiFileGroupReader:
         """
         Read the data from the base file at the given relative path.
 
-        ``options.filters`` and ``options.row_predicate`` are applied as row-level
-        filters; ``options.projection`` selects columns. Other fields are ignored.
+        ``options.filters`` are applied as a row-level mask after reading;
+        ``options.projection`` selects columns. Other fields are ignored.
         """
         ...
     def read_file_slice(
