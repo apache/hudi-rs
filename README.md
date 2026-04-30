@@ -69,11 +69,13 @@ Snapshot query reads the latest version of the data from the table. The table AP
 #### Python
 
 ```python
-from hudi import HudiTableBuilder
+from hudi import HudiReadOptions, HudiTableBuilder
 import pyarrow as pa
 
 hudi_table = HudiTableBuilder.from_base_uri("/tmp/trips_table").build()
-batches = hudi_table.read_snapshot(filters=[("city", "=", "san_francisco")])
+batches = hudi_table.read_snapshot(
+    HudiReadOptions(filters=[("city", "=", "san_francisco")])
+)
 
 # convert to PyArrow table
 arrow_table = pa.Table.from_batches(batches)
@@ -85,13 +87,15 @@ print(result)
 
 ```rust
 use hudi::error::Result;
+use hudi::table::ReadOptions;
 use hudi::table::builder::TableBuilder as HudiTableBuilder;
 use arrow::compute::concat_batches;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let hudi_table = HudiTableBuilder::from_base_uri("/tmp/trips_table").build().await?;
-    let batches = hudi_table.read_snapshot(&[("city", "=", "san_francisco")]).await?;
+    let options = ReadOptions::new().with_filters([("city", "=", "san_francisco")]);
+    let batches = hudi_table.read_snapshot(&options).await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let columns = vec!["rider", "city", "ts", "fare"];
     for col_name in columns {
@@ -135,18 +139,21 @@ Time-travel query reads the data at a specific timestamp from the table. The tab
 #### Python
 
 ```python
-batches = (
-    hudi_table
-    .read_snapshot_as_of("20241231123456789", filters=[("city", "=", "san_francisco")])
+batches = hudi_table.read_snapshot(
+    HudiReadOptions(
+        as_of_timestamp="20241231123456789",
+        filters=[("city", "=", "san_francisco")],
+    )
 )
 ```
 
 #### Rust
 
 ```rust
-let batches = 
-    hudi_table
-    .read_snapshot_as_of("20241231123456789", &[("city", "=", "san_francisco")]).await?;
+let options = ReadOptions::new()
+    .with_as_of_timestamp("20241231123456789")
+    .with_filters([("city", "=", "san_francisco")]);
+let batches = hudi_table.read_snapshot(&options).await?;
 ```
 
 <details>
@@ -173,30 +180,40 @@ Incremental query reads the changed data from the table for a given time range.
 
 ```python
 # read the records between t1 (exclusive) and t2 (inclusive)
-batches = hudi_table.read_incremental_records(t1, t2)
+batches = hudi_table.read_incremental_records(
+    HudiReadOptions(start_timestamp=t1, end_timestamp=t2)
+)
 
-# read the records after t1
-batches = hudi_table.read_incremental_records(t1)
+# read the records after t1 (end defaults to the latest commit)
+batches = hudi_table.read_incremental_records(HudiReadOptions(start_timestamp=t1))
 
 # with partition filters applied to the changed records
-batches = hudi_table.read_incremental_records(t1, t2, filters=[("city", "=", "san_francisco")])
+batches = hudi_table.read_incremental_records(
+    HudiReadOptions(
+        start_timestamp=t1,
+        end_timestamp=t2,
+        filters=[("city", "=", "san_francisco")],
+    )
+)
 ```
 
 #### Rust
 
 ```rust
-use hudi_core::config::util::empty_filters;
-
 // read the records between t1 (exclusive) and t2 (inclusive)
-let batches = hudi_table.read_incremental_records(t1, Some(t2), empty_filters()).await?;
+let options = ReadOptions::new().with_start_timestamp(t1).with_end_timestamp(t2);
+let batches = hudi_table.read_incremental_records(&options).await?;
 
-// read the records after t1
-let batches = hudi_table.read_incremental_records(t1, None, empty_filters()).await?;
+// read the records after t1 (end defaults to the latest commit)
+let options = ReadOptions::new().with_start_timestamp(t1);
+let batches = hudi_table.read_incremental_records(&options).await?;
 
 // with partition filters applied to the changed records
-let batches = hudi_table
-    .read_incremental_records(t1, Some(t2), [("city", "=", "san_francisco")])
-    .await?;
+let options = ReadOptions::new()
+    .with_start_timestamp(t1)
+    .with_end_timestamp(t2)
+    .with_filters([("city", "=", "san_francisco")]);
+let batches = hudi_table.read_incremental_records(&options).await?;
 ```
 
 *Incremental queries support the same timestamp formats as time-travel queries.*
@@ -254,14 +271,24 @@ Hudi-rs provides APIs to support integration with query engines. The sections be
 
 Create a Hudi table instance using its constructor or the `TableBuilder` API.
 
-| Stage           | API                                       | Description                                                                    |
-|-----------------|-------------------------------------------|--------------------------------------------------------------------------------|
-| Query planning  | `get_file_slices()`                       | For snapshot query, get a list of file slices.                                 |
-|                 | `get_file_slices_splits()`                | For snapshot query, get a list of file slices in splits.                       |
-|                 | `get_file_slices_as_of()`                 | For time-travel query, get a list of file slices at a given time.              |
-|                 | `get_file_slices_splits_as_of()`          | For time-travel query, get a list of file slices in splits at a given time.    |
-|                 | `get_file_slices_between()`               | For incremental query, get a list of changed file slices between a time range. |
-| Query execution | `create_file_group_reader_with_options()` | Create a file group reader instance with the table instance's configs.         |
+All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct with these fields:
+
+- `filters` — partition filters (`(field, op, value)` tuples)
+- `projection` — column projection (streaming only)
+- `batch_size` — rows per batch (streaming only)
+- `as_of_timestamp` — snapshot/time-travel timestamp (defaults to latest commit)
+- `start_timestamp`, `end_timestamp` — incremental range (defaults to earliest…latest)
+
+| Stage           | API                                       | Description                                                                                              |
+|-----------------|-------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| Query planning  | `get_file_slices(options)`                | Get a list of file slices for snapshot or time-travel queries (controlled via `as_of_timestamp`).        |
+|                 | `get_file_slices_splits(num_splits, options)` | Same as above but split into `num_splits` chunks for parallel reads.                                  |
+|                 | `get_file_slices_between(options)`        | Get the list of changed file slices for incremental queries (`start_timestamp`/`end_timestamp`).         |
+|                 | `get_file_slices_splits_between(num_splits, options)` | Same as above but split into `num_splits` chunks.                                            |
+|                 | `compute_table_stats()`                   | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
+| Query execution | `create_file_group_reader_with_options()` | Create a file group reader instance with the table instance's configs.                                   |
+|                 | `read_snapshot(options)` / `read_incremental_records(options)` | Eager record reads.                                                                  |
+|                 | `read_snapshot_stream(options)` / `read_file_slice_stream(slice, options)` | Streaming record reads.                                                |
 
 ### File Group API
 

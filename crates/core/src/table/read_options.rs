@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Read options for streaming reads.
+//! Read options shared by all read APIs (eager and streaming).
 
 use std::sync::Arc;
 
@@ -31,38 +31,37 @@ pub type RowPredicate = Arc<dyn Fn(&RecordBatch) -> crate::Result<BooleanArray> 
 /// Example: ("city", "=", "san_francisco")
 pub type PartitionFilter = (String, String, String);
 
-/// Options for reading file slices with streaming APIs.
+/// Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 ///
-/// This struct provides configuration for:
-/// - Partition filters (filtering partitions)
-/// - Column projection (which columns to read)
-/// - Row-level predicates (filtering rows)
-/// - Batch size control (rows per batch)
-/// - Time travel (as-of timestamp)
-///
-/// # Streaming Support
-///
-/// All options are supported in streaming APIs:
-/// - `batch_size` controls the number of rows per batch
-/// - `partition_filters` prunes partitions before reading
-/// - `projection` pushes column selection to the parquet reader level
-/// - `row_predicate` filters rows after reading each batch
-/// - `as_of_timestamp` enables time travel queries
+/// Fields are interpreted by the calling method:
+/// - Snapshot APIs use `as_of_timestamp` (defaulting to the latest commit when unset).
+/// - Incremental APIs use `start_timestamp` and `end_timestamp` (defaulting to earliest and
+///   latest respectively when unset).
+/// - All APIs honor `filters`, `projection`, `batch_size`, and `row_predicate` where
+///   applicable.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use hudi::table::ReadOptions;
 ///
+/// // Snapshot read with a partition filter
 /// let options = ReadOptions::new()
 ///     .with_filters([("city", "=", "san_francisco")])
-///     .with_projection(["id", "name", "city"])
-///     .with_batch_size(4096);
+///     .with_projection(["id", "name", "city"]);
+///
+/// // Time-travel snapshot
+/// let options = ReadOptions::new().with_as_of_timestamp("20240101000000000");
+///
+/// // Incremental read between two commits
+/// let options = ReadOptions::new()
+///     .with_start_timestamp("20240101000000000")
+///     .with_end_timestamp("20240201000000000");
 /// ```
 #[derive(Default)]
 pub struct ReadOptions {
     /// Partition filters. Each filter is a tuple of (field, operator, value).
-    pub partition_filters: Vec<PartitionFilter>,
+    pub filters: Vec<PartitionFilter>,
 
     /// Column names to project (select). If None, all columns are read.
     pub projection: Option<Vec<String>>,
@@ -73,8 +72,14 @@ pub struct ReadOptions {
     /// Target number of rows per batch.
     pub batch_size: Option<usize>,
 
-    /// Timestamp for time travel queries (as-of).
+    /// Timestamp for snapshot/time-travel queries.
     pub as_of_timestamp: Option<String>,
+
+    /// Lower-bound timestamp (exclusive) for incremental queries.
+    pub start_timestamp: Option<String>,
+
+    /// Upper-bound timestamp (inclusive) for incremental queries.
+    pub end_timestamp: Option<String>,
 }
 
 impl ReadOptions {
@@ -84,9 +89,6 @@ impl ReadOptions {
     }
 
     /// Sets partition filters.
-    ///
-    /// # Arguments
-    /// * `filters` - Partition filters as tuples of (field, operator, value)
     pub fn with_filters<I, S1, S2, S3>(mut self, filters: I) -> Self
     where
         I: IntoIterator<Item = (S1, S2, S3)>,
@@ -94,7 +96,7 @@ impl ReadOptions {
         S2: Into<String>,
         S3: Into<String>,
     {
-        self.partition_filters = filters
+        self.filters = filters
             .into_iter()
             .map(|(f, o, v)| (f.into(), o.into(), v.into()))
             .collect();
@@ -102,9 +104,6 @@ impl ReadOptions {
     }
 
     /// Sets the column projection (which columns to read).
-    ///
-    /// # Arguments
-    /// * `columns` - Column names to project
     pub fn with_projection<I, S>(mut self, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -118,9 +117,6 @@ impl ReadOptions {
     ///
     /// The predicate function receives each `RecordBatch` and returns a `BooleanArray`
     /// mask indicating which rows to keep. Rows where the mask is `true` are retained.
-    ///
-    /// # Arguments
-    /// * `predicate` - A function that takes a RecordBatch and returns a BooleanArray mask
     pub fn with_row_predicate<F>(mut self, predicate: F) -> Self
     where
         F: Fn(&RecordBatch) -> crate::Result<BooleanArray> + Send + Sync + 'static,
@@ -130,20 +126,26 @@ impl ReadOptions {
     }
 
     /// Sets the target batch size (rows per batch).
-    ///
-    /// # Arguments
-    /// * `size` - Target number of rows per batch
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = Some(size);
         self
     }
 
-    /// Sets the as-of timestamp for time travel queries.
-    ///
-    /// # Arguments
-    /// * `timestamp` - The timestamp to query as of
-    pub fn with_as_of_timestamp<S: Into<String>>(mut self, timestamp: S) -> Self {
-        self.as_of_timestamp = Some(timestamp.into());
+    /// Sets the as-of timestamp for snapshot/time-travel queries.
+    pub fn with_as_of_timestamp<S: AsRef<str>>(mut self, timestamp: S) -> Self {
+        self.as_of_timestamp = Some(timestamp.as_ref().to_string());
+        self
+    }
+
+    /// Sets the lower-bound timestamp (exclusive) for incremental queries.
+    pub fn with_start_timestamp<S: AsRef<str>>(mut self, timestamp: S) -> Self {
+        self.start_timestamp = Some(timestamp.as_ref().to_string());
+        self
+    }
+
+    /// Sets the upper-bound timestamp (inclusive) for incremental queries.
+    pub fn with_end_timestamp<S: AsRef<str>>(mut self, timestamp: S) -> Self {
+        self.end_timestamp = Some(timestamp.as_ref().to_string());
         self
     }
 }
@@ -151,7 +153,7 @@ impl ReadOptions {
 impl std::fmt::Debug for ReadOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadOptions")
-            .field("filters", &self.partition_filters)
+            .field("filters", &self.filters)
             .field("projection", &self.projection)
             .field(
                 "row_predicate",
@@ -159,6 +161,8 @@ impl std::fmt::Debug for ReadOptions {
             )
             .field("batch_size", &self.batch_size)
             .field("as_of_timestamp", &self.as_of_timestamp)
+            .field("start_timestamp", &self.start_timestamp)
+            .field("end_timestamp", &self.end_timestamp)
             .finish()
     }
 }
@@ -197,6 +201,19 @@ mod tests {
             options.as_of_timestamp,
             Some("20240101120000000".to_string())
         );
+    }
+
+    #[test]
+    fn test_with_start_and_end_timestamp() {
+        let options = ReadOptions::new()
+            .with_start_timestamp("20240101000000000")
+            .with_end_timestamp("20240201000000000");
+
+        assert_eq!(
+            options.start_timestamp,
+            Some("20240101000000000".to_string())
+        );
+        assert_eq!(options.end_timestamp, Some("20240201000000000".to_string()));
     }
 
     #[test]

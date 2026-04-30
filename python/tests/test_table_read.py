@@ -26,7 +26,7 @@ from itertools import chain
 
 import pyarrow as pa
 
-from hudi import HudiTable
+from hudi import HudiReadOptions, HudiTable
 
 
 def test_read_table_has_correct_schema(v8_trips_table):
@@ -123,7 +123,9 @@ def test_read_table_returns_correct_data(v8_trips_table):
 def test_read_table_for_partition(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    batches = table.read_snapshot([("city", "=", "san_francisco")])
+    batches = table.read_snapshot(
+        HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    )
     t = (
         pa.Table.from_batches(batches)
         .select(["ts", "uuid", "rider", "fare"])
@@ -148,7 +150,8 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
     all_commits = timeline.get_completed_commits()
     first_commit = all_commits[0].timestamp
 
-    file_slices_gen = table.get_file_slices_splits_as_of(2, first_commit)
+    options_at_first = HudiReadOptions(as_of_timestamp=first_commit)
+    file_slices_gen = table.get_file_slices_splits(2, options_at_first)
     all_slices = list(chain.from_iterable(file_slices_gen))
     assert len(all_slices) == 3
     partition_prefixes = sorted(
@@ -162,7 +165,7 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
 
     # get_completed_commits() returns compaction commits for MOR tables.
     # The sole compaction commit predates the final deltacommit (rider-G update).
-    batches = table.read_snapshot_as_of(first_commit)
+    batches = table.read_snapshot(options_at_first)
     t = (
         pa.Table.from_batches(batches)
         .select(["ts", "uuid", "rider", "fare"])
@@ -192,7 +195,7 @@ def test_convert_filters_valid(v8_trips_table):
     expected = [1, 1, 1, 2, 2]
 
     for f, exp in zip(filters, expected):
-        file_slices = table.get_file_slices(filters=[f])
+        file_slices = table.get_file_slices(HudiReadOptions(filters=[f]))
         assert len(file_slices) == exp, (
             f"Filter {f} expected {exp} slices, got {len(file_slices)}"
         )

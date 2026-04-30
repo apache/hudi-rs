@@ -19,7 +19,7 @@
 
 from itertools import chain
 
-from hudi import HudiTable
+from hudi import HudiReadOptions, HudiTable
 from hudi._internal import get_test_table_path
 
 
@@ -36,7 +36,9 @@ def test_get_file_slices_splits_between():
     commits = table.get_timeline().get_completed_commits()
     assert len(commits) >= 2
 
-    splits = table.get_file_slices_splits_between(2, commits[0].timestamp)
+    splits = table.get_file_slices_splits_between(
+        2, HudiReadOptions(start_timestamp=commits[0].timestamp)
+    )
     flattened = list(chain.from_iterable(splits))
     assert len(flattened) >= 1
 

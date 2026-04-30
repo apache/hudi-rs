@@ -26,19 +26,27 @@ def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
 @dataclass(init=False)
 class HudiReadOptions:
     """
-    Options for streaming reads.
+    Options shared by all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
+
+    Snapshot APIs use ``as_of_timestamp`` (defaulting to the latest commit when unset).
+    Incremental APIs use ``start_timestamp`` and ``end_timestamp`` (defaulting to
+    earliest and latest respectively).
 
     Attributes:
         filters (List[Tuple[str, str, str]]): Partition filters to apply.
         projection (Optional[List[str]]): Column names to read. If None, all columns are read.
-        batch_size (Optional[int]): Target number of rows per batch.
-        as_of_timestamp (Optional[str]): Timestamp for time travel queries.
+        batch_size (Optional[int]): Target number of rows per batch (streaming only).
+        as_of_timestamp (Optional[str]): Timestamp for snapshot/time-travel queries.
+        start_timestamp (Optional[str]): Lower-bound timestamp (exclusive) for incremental queries.
+        end_timestamp (Optional[str]): Upper-bound timestamp (inclusive) for incremental queries.
     """
 
     filters: List[Tuple[str, str, str]]
     projection: Optional[List[str]]
     batch_size: Optional[int]
     as_of_timestamp: Optional[str]
+    start_timestamp: Optional[str]
+    end_timestamp: Optional[str]
 
     def __init__(
         self,
@@ -46,6 +54,8 @@ class HudiReadOptions:
         projection: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
         as_of_timestamp: Optional[str] = None,
+        start_timestamp: Optional[str] = None,
+        end_timestamp: Optional[str] = None,
     ): ...
 
 @dataclass(init=False)
@@ -316,155 +326,93 @@ class HudiTable:
         Returns the timeline of the Hudi table.
         """
         ...
-    def get_file_slices_splits(
-        self, num_splits: int, filters: Optional[List[Tuple[str, str, str]]]
-    ) -> List[List[HudiFileSlice]]:
+    @property
+    def base_url(self) -> str:
         """
-        Retrieves all file slices in the Hudi table in 'num_splits' splits, optionally filtered by given filters.
-
-        Parameters:
-            num_splits (int): The number of parts to split the file slices into.
-            filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
-
-        Returns:
-            List[List[HudiFileSlice]]: A list of file slice groups, each group being a list of HudiFileSlice objects.
-        """
-        ...
-    def get_file_slices_splits_as_of(
-        self,
-        num_splits: int,
-        timestamp: str,
-        filters: Optional[List[Tuple[str, str, str]]],
-    ) -> List[List[HudiFileSlice]]:
-        """
-        Retrieves all file slices in the Hudi table as of a timestamp in 'num_splits' splits, optionally filtered by given filters.
+        Get the base URL of the Hudi table.
         """
         ...
     def get_file_slices(
-        self, filters: Optional[List[Tuple[str, str, str]]]
+        self, options: Optional[HudiReadOptions] = None
     ) -> List[HudiFileSlice]:
         """
-        Retrieves all file slices in the Hudi table, optionally filtered by the provided filters.
+        Get the file slices in the table at a snapshot moment.
 
-        Parameters:
-            filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
-
-        Returns:
-            List[HudiFileSlice]: A list of file slices matching the filters.
+        Reads at ``options.as_of_timestamp`` if set, otherwise the latest commit.
+        ``options.filters`` are applied as partition filters.
         """
         ...
-    def get_file_slices_as_of(
-        self, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
-    ) -> List[HudiFileSlice]:
+    def get_file_slices_splits(
+        self, num_splits: int, options: Optional[HudiReadOptions] = None
+    ) -> List[List[HudiFileSlice]]:
         """
-        Retrieves all file slices in the Hudi table as of a timestamp, optionally filtered by the provided filters.
+        Get file slices in ``num_splits`` splits at a snapshot moment.
+
+        See :meth:`get_file_slices` for how ``options`` is interpreted.
         """
         ...
     def get_file_slices_between(
-        self,
-        start_timestamp: Optional[str] = None,
-        end_timestamp: Optional[str] = None,
-        filters: Optional[List[Tuple[str, str, str]]] = None,
+        self, options: Optional[HudiReadOptions] = None
     ) -> List[HudiFileSlice]:
         """
-        Retrieves all changed file slices in the Hudi table between the given timestamps,
-        optionally filtered by partition filters.
+        Get the changed file slices between two timestamps.
+
+        Reads the change range (``options.start_timestamp``, ``options.end_timestamp``].
+        ``start_timestamp`` defaults to the earliest timestamp; ``end_timestamp``
+        defaults to the latest commit. ``options.filters`` are applied as partition
+        filters.
+        """
+        ...
+    def get_file_slices_splits_between(
+        self, num_splits: int, options: Optional[HudiReadOptions] = None
+    ) -> List[List[HudiFileSlice]]:
+        """
+        Get changed file slices in ``num_splits`` splits between two timestamps.
+
+        See :meth:`get_file_slices_between` for how ``options`` is interpreted.
         """
         ...
     def create_file_group_reader_with_options(
         self, options: Optional[Dict[str, str]] = None
     ) -> HudiFileGroupReader:
         """
-        Creates a HudiFileGroupReader for reading records from file groups in the Hudi table.
-
-        Returns:
-            HudiFileGroupReader: A reader object for reading file groups.
+        Create a HudiFileGroupReader for reading records from file groups in the Hudi table.
         """
         ...
     def read_snapshot(
-        self, filters: Optional[List[Tuple[str, str, str]]]
+        self, options: Optional[HudiReadOptions] = None
     ) -> List["pyarrow.RecordBatch"]:
         """
-        Reads the latest snapshot of the Hudi table, optionally filtered by the provided filters.
+        Read records at a snapshot moment.
 
-        Parameters:
-            filters (Optional[List[Tuple[str, str, str]]]): Optional filters for selecting file slices.
-
-        Returns:
-            List[pyarrow.RecordBatch]: A list of record batches from the snapshot of the table.
-        """
-        ...
-    def read_snapshot_as_of(
-        self, timestamp: str, filters: Optional[List[Tuple[str, str, str]]]
-    ) -> List["pyarrow.RecordBatch"]:
-        """
-        Reads the snapshot of the Hudi table as of a timestamp, optionally filtered by the provided filters.
+        Reads at ``options.as_of_timestamp`` if set, otherwise the latest commit.
         """
         ...
     def read_incremental_records(
-        self,
-        start_timestamp: str,
-        end_timestamp: Optional[str] = None,
-        filters: Optional[List[Tuple[str, str, str]]] = None,
+        self, options: Optional[HudiReadOptions] = None
     ) -> List["pyarrow.RecordBatch"]:
         """
-        Reads incremental records from the Hudi table between the given timestamps,
-        optionally filtered by partition filters.
+        Read records inserted or updated between two timestamps.
 
-        Parameters:
-            start_timestamp (str): The start timestamp (exclusive).
-            end_timestamp (Optional[str]): The end timestamp (inclusive). Defaults to the latest commit.
-            filters (Optional[List[Tuple[str, str, str]]]): Optional partition filters.
-
-        Returns:
-            List[pyarrow.RecordBatch]: A list of record batches containing incremental records.
-        """
-        ...
-
-    @property
-    def base_url(self) -> str:
-        """
-        Get the base URL of the Hudi table.
-
-        Returns:
-            str: The base URL of the table.
-        """
-        ...
-    def get_file_slices_splits_between(
-        self,
-        num_splits: int,
-        start_timestamp: Optional[str] = None,
-        end_timestamp: Optional[str] = None,
-        filters: Optional[List[Tuple[str, str, str]]] = None,
-    ) -> List[List[HudiFileSlice]]:
-        """
-        Retrieves file slices changed between the given timestamps in 'num_splits' splits,
-        optionally filtered by partition filters.
-
-        Parameters:
-            num_splits (int): The number of parts to split the file slices into.
-            start_timestamp (Optional[str]): The start timestamp (exclusive).
-            end_timestamp (Optional[str]): The end timestamp (inclusive). Defaults to the latest commit.
-            filters (Optional[List[Tuple[str, str, str]]]): Optional partition filters.
-
-        Returns:
-            List[List[HudiFileSlice]]: A list of file slice groups for parallel reads.
+        Reads the change range (``options.start_timestamp``, ``options.end_timestamp``].
+        Records updated multiple times have their latest state within the range
+        returned. ``options.filters`` are applied as partition filters.
         """
         ...
     def compute_table_stats(self) -> Optional[Tuple[int, int]]:
         """
-        Computes estimated table-level statistics from the metadata table for scan planning.
+        Compute estimated table-level statistics from the metadata table.
 
         Returns:
-            Optional[Tuple[int, int]]: A tuple of (estimated_num_rows, estimated_total_byte_size),
-            or None if the metadata table is not enabled or statistics cannot be computed.
+            Optional[Tuple[int, int]]: ``(estimated_num_rows, estimated_total_byte_size)``,
+            or ``None`` if the metadata table is not enabled or statistics cannot be computed.
         """
         ...
     def read_snapshot_stream(
         self, options: Optional[HudiReadOptions] = None
     ) -> HudiRecordBatchStream:
         """
-        Reads the table snapshot as a stream of record batches.
+        Read the table snapshot as a stream of record batches.
 
         Yields record batches as they are read from the underlying file slices,
         without loading all data into memory.
@@ -476,7 +424,7 @@ class HudiTable:
         options: Optional[HudiReadOptions] = None,
     ) -> HudiRecordBatchStream:
         """
-        Reads a single file slice as a stream of record batches.
+        Read a single file slice as a stream of record batches.
         """
         ...
 

@@ -1093,11 +1093,13 @@ mod tests {
 
         // Use very small batch size
         let options = ReadOptions {
-            partition_filters: vec![],
+            filters: vec![],
             projection: None,
             row_predicate: None,
             batch_size: Some(1),
             as_of_timestamp: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         let result = reader.read_file_slice_stream(&file_slice, &options).await;

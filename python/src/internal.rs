@@ -92,31 +92,44 @@ pub struct HudiReadOptions {
     batch_size: Option<usize>,
     #[pyo3(get)]
     as_of_timestamp: Option<String>,
+    #[pyo3(get)]
+    start_timestamp: Option<String>,
+    #[pyo3(get)]
+    end_timestamp: Option<String>,
 }
 
 #[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiReadOptions {
     #[new]
-    #[pyo3(signature = (filters=None, projection=None, batch_size=None, as_of_timestamp=None))]
+    #[pyo3(signature = (filters=None, projection=None, batch_size=None, as_of_timestamp=None, start_timestamp=None, end_timestamp=None))]
     fn new(
         filters: Option<Vec<(String, String, String)>>,
         projection: Option<Vec<String>>,
         batch_size: Option<usize>,
         as_of_timestamp: Option<String>,
+        start_timestamp: Option<String>,
+        end_timestamp: Option<String>,
     ) -> Self {
         Self {
             filters: filters.unwrap_or_default(),
             projection,
             batch_size,
             as_of_timestamp,
+            start_timestamp,
+            end_timestamp,
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "HudiReadOptions(filters={:?}, projection={:?}, batch_size={:?}, as_of_timestamp={:?})",
-            self.filters, self.projection, self.batch_size, self.as_of_timestamp
+            "HudiReadOptions(filters={:?}, projection={:?}, batch_size={:?}, as_of_timestamp={:?}, start_timestamp={:?}, end_timestamp={:?})",
+            self.filters,
+            self.projection,
+            self.batch_size,
+            self.as_of_timestamp,
+            self.start_timestamp,
+            self.end_timestamp
         )
     }
 }
@@ -131,7 +144,13 @@ impl HudiReadOptions {
             options = options.with_batch_size(batch_size);
         }
         if let Some(timestamp) = &self.as_of_timestamp {
-            options = options.with_as_of_timestamp(timestamp.clone());
+            options = options.with_as_of_timestamp(timestamp);
+        }
+        if let Some(timestamp) = &self.start_timestamp {
+            options = options.with_start_timestamp(timestamp);
+        }
+        if let Some(timestamp) = &self.end_timestamp {
+            options = options.with_end_timestamp(timestamp);
         }
         options
     }
@@ -541,19 +560,32 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (num_splits, filters=None))]
+    #[pyo3(signature = (options=None))]
+    fn get_file_slices(
+        &self,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<Vec<HudiFileSlice>> {
+        let read_options = options.unwrap_or_default().to_inner();
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(self.inner.get_file_slices(&read_options))
+                .map_err(PythonError::from)?;
+            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (num_splits, options=None))]
     fn get_file_slices_splits(
         &self,
         num_splits: usize,
-        filters: Option<Vec<(String, String, String)>>,
+        options: Option<HudiReadOptions>,
         py: Python,
     ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        let read_options = options.unwrap_or_default().to_inner();
         py.detach(|| {
             let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices_splits(num_splits, filters.unwrap_or_default()),
-                )
+                .block_on(self.inner.get_file_slices_splits(num_splits, &read_options))
                 .map_err(PythonError::from)?;
             Ok(file_slices
                 .iter()
@@ -562,78 +594,40 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (num_splits, timestamp, filters=None))]
-    fn get_file_slices_splits_as_of(
-        &self,
-        num_splits: usize,
-        timestamp: &str,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(self.inner.get_file_slices_splits_as_of(
-                    num_splits,
-                    timestamp,
-                    filters.unwrap_or_default(),
-                ))
-                .map_err(PythonError::from)?;
-            Ok(file_slices
-                .iter()
-                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
-                .collect())
-        })
-    }
-
-    #[pyo3(signature = (filters=None))]
-    fn get_file_slices(
-        &self,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Vec<HudiFileSlice>> {
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(self.inner.get_file_slices(filters.unwrap_or_default()))
-                .map_err(PythonError::from)?;
-            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
-        })
-    }
-
-    #[pyo3(signature = (timestamp, filters=None))]
-    fn get_file_slices_as_of(
-        &self,
-        timestamp: &str,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Vec<HudiFileSlice>> {
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices_as_of(timestamp, filters.unwrap_or_default()),
-                )
-                .map_err(PythonError::from)?;
-            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
-        })
-    }
-
-    #[pyo3(signature = (start_timestamp=None, end_timestamp=None, filters=None))]
+    #[pyo3(signature = (options=None))]
     fn get_file_slices_between(
         &self,
-        start_timestamp: Option<&str>,
-        end_timestamp: Option<&str>,
-        filters: Option<Vec<(String, String, String)>>,
+        options: Option<HudiReadOptions>,
         py: Python,
     ) -> PyResult<Vec<HudiFileSlice>> {
+        let read_options = options.unwrap_or_default().to_inner();
         py.detach(|| {
             let file_slices = rt()
-                .block_on(self.inner.get_file_slices_between(
-                    start_timestamp,
-                    end_timestamp,
-                    filters.unwrap_or_default(),
-                ))
+                .block_on(self.inner.get_file_slices_between(&read_options))
                 .map_err(PythonError::from)?;
             Ok(file_slices.iter().map(HudiFileSlice::from).collect())
+        })
+    }
+
+    #[pyo3(signature = (num_splits, options=None))]
+    fn get_file_slices_splits_between(
+        &self,
+        num_splits: usize,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
+        let read_options = options.unwrap_or_default().to_inner();
+        py.detach(|| {
+            let file_slices = rt()
+                .block_on(
+                    self.inner
+                        .get_file_slices_splits_between(num_splits, &read_options),
+                )
+                .map_err(PythonError::from)?;
+            Ok(file_slices
+                .iter()
+                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
+                .collect())
         })
     }
 
@@ -649,53 +643,27 @@ impl HudiTable {
         Ok(HudiFileGroupReader { inner: fg_reader })
     }
 
-    #[pyo3(signature = (filters=None))]
-    fn read_snapshot(
-        &self,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (options=None))]
+    fn read_snapshot(&self, options: Option<HudiReadOptions>, py: Python) -> PyResult<Py<PyAny>> {
+        let read_options = options.unwrap_or_default().to_inner();
         py.detach(|| {
-            rt().block_on(self.inner.read_snapshot(filters.unwrap_or_default()))
+            rt().block_on(self.inner.read_snapshot(&read_options))
                 .map_err(PythonError::from)
         })?
         .to_pyarrow(py)
         .map(|b| b.unbind())
     }
 
-    #[pyo3(signature = (timestamp, filters=None))]
-    fn read_snapshot_as_of(
-        &self,
-        timestamp: &str,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        py.detach(|| {
-            rt().block_on(
-                self.inner
-                    .read_snapshot_as_of(timestamp, filters.unwrap_or_default()),
-            )
-            .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-
-    #[pyo3(signature = (start_timestamp, end_timestamp=None, filters=None))]
+    #[pyo3(signature = (options=None))]
     fn read_incremental_records(
         &self,
-        start_timestamp: &str,
-        end_timestamp: Option<&str>,
-        filters: Option<Vec<(String, String, String)>>,
+        options: Option<HudiReadOptions>,
         py: Python,
     ) -> PyResult<Py<PyAny>> {
+        let read_options = options.unwrap_or_default().to_inner();
         py.detach(|| {
-            rt().block_on(self.inner.read_incremental_records(
-                start_timestamp,
-                end_timestamp,
-                filters.unwrap_or_default(),
-            ))
-            .map_err(PythonError::from)
+            rt().block_on(self.inner.read_incremental_records(&read_options))
+                .map_err(PythonError::from)
         })?
         .to_pyarrow(py)
         .map(|b| b.unbind())
@@ -704,31 +672,6 @@ impl HudiTable {
     #[getter]
     fn base_url(&self) -> String {
         self.inner.base_url().to_string()
-    }
-
-    #[pyo3(signature = (num_splits, start_timestamp=None, end_timestamp=None, filters=None))]
-    fn get_file_slices_splits_between(
-        &self,
-        num_splits: usize,
-        start_timestamp: Option<&str>,
-        end_timestamp: Option<&str>,
-        filters: Option<Vec<(String, String, String)>>,
-        py: Python,
-    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(self.inner.get_file_slices_splits_between(
-                    num_splits,
-                    start_timestamp,
-                    end_timestamp,
-                    filters.unwrap_or_default(),
-                ))
-                .map_err(PythonError::from)?;
-            Ok(file_slices
-                .iter()
-                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
-                .collect())
-        })
     }
 
     fn compute_table_stats(&self, py: Python) -> Option<(u64, u64)> {

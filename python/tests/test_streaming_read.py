@@ -79,7 +79,9 @@ def test_read_snapshot_stream_is_single_use(v8_trips_table):
 
 def test_read_file_slice_stream_table(v8_trips_table):
     table = HudiTable(v8_trips_table)
-    file_slices = table.get_file_slices([("city", "=", "san_francisco")])
+    file_slices = table.get_file_slices(
+        HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    )
     assert len(file_slices) == 1
 
     stream = table.read_file_slice_stream(file_slices[0])
@@ -91,7 +93,9 @@ def test_read_file_slice_stream_table(v8_trips_table):
 
 def test_read_file_slice_stream_file_group_reader(v8_trips_table):
     table = HudiTable(v8_trips_table)
-    file_slices = table.get_file_slices([("city", "=", "san_francisco")])
+    file_slices = table.get_file_slices(
+        HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    )
     reader = HudiFileGroupReader(v8_trips_table)
 
     batches = list(reader.read_file_slice_stream(file_slices[0]))
@@ -101,7 +105,9 @@ def test_read_file_slice_stream_file_group_reader(v8_trips_table):
 
 def test_read_file_slice_from_paths_stream(v8_trips_table):
     table = HudiTable(v8_trips_table)
-    file_slices = table.get_file_slices([("city", "=", "san_francisco")])
+    file_slices = table.get_file_slices(
+        HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    )
     reader = HudiFileGroupReader(v8_trips_table)
     base_path = file_slices[0].base_file_relative_path()
 
