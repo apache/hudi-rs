@@ -22,8 +22,8 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use apache_avro::schema::AvroSchema;
 use apache_avro::Writer as AvroWriter;
+use apache_avro::schema::AvroSchema;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Utc;
@@ -32,11 +32,13 @@ use object_store::path::Path;
 use parquet::arrow::ArrowWriter;
 
 use crate::Result;
-use crate::config::table::HudiTableConfig::{RecordMergeStrategy, TableVersion, TimelineLayoutVersion, TimelinePath};
+use crate::config::table::HudiTableConfig::{
+    RecordMergeStrategy, TableVersion, TimelineLayoutVersion, TimelinePath,
+};
 use crate::error::CoreError;
+use crate::merge::RecordMergeStrategyValue;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
-use crate::merge::RecordMergeStrategyValue;
 use crate::storage::error::StorageError;
 use crate::storage::util::join_url_segments;
 use crate::table::Table;
@@ -46,6 +48,7 @@ use crate::timeline::instant::Instant;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BulkInsertResult {
     pub instant: String,
+    pub commit_relative_path: String,
     pub base_file_path: String,
     pub num_rows: usize,
 }
@@ -60,7 +63,9 @@ static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
 impl BulkInsertWriter {
     pub fn new(table: &Table) -> Self {
-        Self { table: table.clone() }
+        Self {
+            table: table.clone(),
+        }
     }
 
     pub async fn write(&self, batch: RecordBatch) -> Result<BulkInsertResult> {
@@ -94,8 +99,9 @@ impl BulkInsertWriter {
             batch.num_rows() as i64,
             file_size,
         );
+        let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
         if let Err(error) = self
-            .write_commit_file(&instant, &timeline_dir, &commit_metadata)
+            .write_commit_file(&commit_relative_path, &commit_metadata)
             .await
         {
             let _ = self.delete_file(&base_file_path).await;
@@ -104,6 +110,7 @@ impl BulkInsertWriter {
 
         Ok(BulkInsertResult {
             instant: request_instant,
+            commit_relative_path,
             base_file_path,
             num_rows: batch.num_rows(),
         })
@@ -153,11 +160,7 @@ impl BulkInsertWriter {
 
     fn timeline_dir(&self) -> String {
         if self.is_layout_two() {
-            let timeline_path: String = self
-                .table
-                .hudi_configs
-                .get_or_default(TimelinePath)
-                .into();
+            let timeline_path: String = self.table.hudi_configs.get_or_default(TimelinePath).into();
             format!("{HUDI_METADATA_DIR}/{timeline_path}")
         } else {
             HUDI_METADATA_DIR.to_string()
@@ -204,7 +207,11 @@ impl BulkInsertWriter {
         let storage = self.table.file_system_view.storage.clone();
         let object_url = join_url_segments(&storage.base_url, &[relative_path])?;
         let object_path = Path::from_url_path(object_url.path()).map_err(StorageError::from)?;
-        storage.object_store.delete(&object_path).await.map_err(StorageError::from)?;
+        storage
+            .object_store
+            .delete(&object_path)
+            .await
+            .map_err(StorageError::from)?;
         Ok(())
     }
 
@@ -259,8 +266,7 @@ impl BulkInsertWriter {
 
     async fn write_commit_file(
         &self,
-        instant: &Instant,
-        timeline_dir: &str,
+        commit_relative_path: &str,
         metadata: &HoodieCommitMetadata,
     ) -> Result<()> {
         let bytes = if self.is_layout_two() {
@@ -270,11 +276,11 @@ impl BulkInsertWriter {
             writer.flush()?;
             writer.into_inner()?
         } else {
-            serde_json::to_vec(metadata)
-                .map_err(|e| CoreError::CommitMetadata(format!("Failed to serialize commit metadata: {e}")))?
+            serde_json::to_vec(metadata).map_err(|e| {
+                CoreError::CommitMetadata(format!("Failed to serialize commit metadata: {e}"))
+            })?
         };
 
-        let relative_path = instant.relative_path_with_base(timeline_dir)?;
-        self.put_file(&relative_path, bytes).await
+        self.put_file(commit_relative_path, bytes).await
     }
 }
