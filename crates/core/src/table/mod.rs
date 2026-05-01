@@ -93,6 +93,7 @@ pub mod file_pruner;
 pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
+pub mod writer;
 mod validation;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
@@ -120,6 +121,7 @@ use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
+use crate::table::writer::{BulkInsertResult, BulkInsertWriter};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
@@ -1232,6 +1234,14 @@ impl Table {
             });
 
         Ok(Box::pin(combined_stream))
+    }
+
+    /// Bulk insert a record batch into an append-only table.
+    ///
+    /// This delegates to the bulk insert writer and is intentionally narrow:
+    /// it only supports append-only tables and writes a fresh base file.
+    pub async fn bulk_insert(&self, batch: RecordBatch) -> Result<BulkInsertResult> {
+        BulkInsertWriter::new(self).write(batch).await
     }
 
     /// Compute estimated table-level statistics for scan planning.
