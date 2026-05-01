@@ -372,11 +372,13 @@ impl TableProvider for HudiDataSource {
             .collect();
         let pushdown_filters = exprs_to_filters(&partition_filters);
         let read_options = ReadOptions::new().with_filters(pushdown_filters);
-        let file_slices = self
+        let flat_slices = self
             .table
-            .get_file_slices_splits(input_partitions, &read_options)
+            .get_file_slices(&read_options)
             .await
             .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
+        let file_slices =
+            hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
         let base_url = self.table.base_url();
         let mut parquet_file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         for file_slice_vec in file_slices {

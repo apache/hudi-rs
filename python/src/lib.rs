@@ -32,12 +32,13 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     use internal::{
-        HudiFileGroupReader, HudiFileSlice, HudiInstant, HudiReadOptions, HudiRecordBatchStream,
-        HudiTable, HudiTimeline,
+        HudiFileGroupReader, HudiFileSlice, HudiInstant, HudiQueryType, HudiReadOptions,
+        HudiRecordBatchStream, HudiTable, HudiTimeline,
     };
     m.add_class::<HudiFileGroupReader>()?;
     m.add_class::<HudiFileSlice>()?;
     m.add_class::<HudiInstant>()?;
+    m.add_class::<HudiQueryType>()?;
     m.add_class::<HudiReadOptions>()?;
     m.add_class::<HudiRecordBatchStream>()?;
     m.add_class::<HudiTable>()?;

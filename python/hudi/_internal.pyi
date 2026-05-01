@@ -15,6 +15,7 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import pyarrow
@@ -23,42 +24,54 @@ __version__: str
 
 def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
 
+class HudiQueryType(Enum):
+    """Selects the read semantic on :class:`HudiReadOptions`."""
+
+    Snapshot = ...
+    Incremental = ...
+
 @dataclass(init=False)
 class HudiReadOptions:
     """
-    Options shared by all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
+    Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 
-    Snapshot APIs use ``as_of_timestamp`` (defaulting to the latest commit when unset).
-    Incremental APIs use ``start_timestamp`` and ``end_timestamp`` (defaulting to
-    earliest and latest respectively).
+    ``query_type`` selects the read semantic; the timestamp fields are interpreted by
+    the chosen type. Snapshot uses ``as_of_timestamp`` (defaulting to latest commit);
+    Incremental uses ``start_timestamp`` and ``end_timestamp`` (defaulting to earliest
+    and latest respectively). ``hudi_options`` carries ad-hoc Hudi configs that
+    override table-level defaults for this single read (e.g.
+    ``hoodie.read.use.read_optimized.mode``).
 
     Attributes:
+        query_type (HudiQueryType): Defaults to Snapshot.
         filters (List[Tuple[str, str, str]]): Column filters as ``(field, op, value)`` tuples.
-            ``field`` may be any column (partition or data). Filters drive partition pruning
-            when the column is a partition column, file-level stats pruning when it is a
-            data column with statistics, and row-level filtering after reading.
         projection (Optional[List[str]]): Column names to read. If None, all columns are read.
         batch_size (Optional[int]): Target number of rows per batch (streaming only).
-        as_of_timestamp (Optional[str]): Timestamp for snapshot/time-travel queries.
-        start_timestamp (Optional[str]): Lower-bound timestamp (exclusive) for incremental queries.
-        end_timestamp (Optional[str]): Upper-bound timestamp (inclusive) for incremental queries.
+        as_of_timestamp (Optional[str]): Snapshot/time-travel timestamp.
+        start_timestamp (Optional[str]): Lower-bound (exclusive) for incremental queries.
+        end_timestamp (Optional[str]): Upper-bound (inclusive) for incremental queries.
+        hudi_options (Dict[str, str]): Per-read Hudi configs.
     """
 
+    query_type: HudiQueryType
     filters: List[Tuple[str, str, str]]
     projection: Optional[List[str]]
     batch_size: Optional[int]
     as_of_timestamp: Optional[str]
     start_timestamp: Optional[str]
     end_timestamp: Optional[str]
+    hudi_options: Dict[str, str]
 
     def __init__(
         self,
+        query_type: Optional[HudiQueryType] = None,
         filters: Optional[List[Tuple[str, str, str]]] = None,
         projection: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
         as_of_timestamp: Optional[str] = None,
         start_timestamp: Optional[str] = None,
         end_timestamp: Optional[str] = None,
+        hudi_options: Optional[Dict[str, str]] = None,
     ): ...
 
 @dataclass(init=False)
@@ -326,36 +339,6 @@ class HudiTable:
         ``options.filters`` drive pruning (partition + file-level) and row-level filtering.
         """
         ...
-    def get_file_slices_splits(
-        self, num_splits: int, options: Optional[HudiReadOptions] = None
-    ) -> List[List[HudiFileSlice]]:
-        """
-        Get file slices in ``num_splits`` splits at a snapshot moment.
-
-        See :meth:`get_file_slices` for how ``options`` is interpreted.
-        """
-        ...
-    def get_file_slices_between(
-        self, options: Optional[HudiReadOptions] = None
-    ) -> List[HudiFileSlice]:
-        """
-        Get the changed file slices between two timestamps.
-
-        Reads the change range (``options.start_timestamp``, ``options.end_timestamp``].
-        ``start_timestamp`` defaults to the earliest timestamp; ``end_timestamp``
-        defaults to the latest commit. ``options.filters`` are applied as partition
-        filters.
-        """
-        ...
-    def get_file_slices_splits_between(
-        self, num_splits: int, options: Optional[HudiReadOptions] = None
-    ) -> List[List[HudiFileSlice]]:
-        """
-        Get changed file slices in ``num_splits`` splits between two timestamps.
-
-        See :meth:`get_file_slices_between` for how ``options`` is interpreted.
-        """
-        ...
     def create_file_group_reader_with_options(
         self, options: Optional[Dict[str, str]] = None
     ) -> HudiFileGroupReader:
@@ -363,24 +346,27 @@ class HudiTable:
         Create a HudiFileGroupReader for reading records from file groups in the Hudi table.
         """
         ...
+    def read(
+        self, options: Optional[HudiReadOptions] = None
+    ) -> List["pyarrow.RecordBatch"]:
+        """
+        Read records, dispatching on ``options.query_type``.
+        """
+        ...
     def read_snapshot(
         self, options: Optional[HudiReadOptions] = None
     ) -> List["pyarrow.RecordBatch"]:
         """
-        Read records at a snapshot moment.
-
-        Reads at ``options.as_of_timestamp`` if set, otherwise the latest commit.
+        Read snapshot records. Shortcut for :meth:`read` with
+        ``query_type = HudiQueryType.Snapshot``.
         """
         ...
     def read_incremental_records(
         self, options: Optional[HudiReadOptions] = None
     ) -> List["pyarrow.RecordBatch"]:
         """
-        Read records inserted or updated between two timestamps.
-
-        Reads the change range (``options.start_timestamp``, ``options.end_timestamp``].
-        Records updated multiple times have their latest state within the range
-        returned. ``options.filters`` drive pruning and row-level filtering.
+        Read incremental records. Shortcut for :meth:`read` with
+        ``query_type = HudiQueryType.Incremental``.
         """
         ...
     def compute_table_stats(self) -> Optional[Tuple[int, int]]:
@@ -392,14 +378,20 @@ class HudiTable:
             or ``None`` if the metadata table is not enabled or statistics cannot be computed.
         """
         ...
+    def read_stream(
+        self, options: Optional[HudiReadOptions] = None
+    ) -> HudiRecordBatchStream:
+        """
+        Streaming read; dispatches on ``options.query_type``. Incremental streaming
+        is not yet supported and raises ``HudiCoreError``.
+        """
+        ...
     def read_snapshot_stream(
         self, options: Optional[HudiReadOptions] = None
     ) -> HudiRecordBatchStream:
         """
-        Read the table snapshot as a stream of record batches.
-
-        Yields record batches as they are read from the underlying file slices,
-        without loading all data into memory.
+        Snapshot streaming shortcut. Equivalent to :meth:`read_stream` with
+        ``query_type = HudiQueryType.Snapshot``.
         """
         ...
 

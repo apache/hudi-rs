@@ -18,18 +18,36 @@
  */
 //! Read options shared by all read APIs (eager and streaming).
 
+use std::collections::HashMap;
+
+/// The query type a read targets. Drives dispatch in [`crate::table::Table::read`],
+/// [`crate::table::Table::read_stream`], and [`crate::table::Table::get_file_slices`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueryType {
+    /// Latest table state at one commit (the latest by default; an explicit
+    /// `as_of_timestamp` for time-travel).
+    #[default]
+    Snapshot,
+    /// Records changed in the half-open range (`start_timestamp`, `end_timestamp`].
+    Incremental,
+}
+
 /// Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 ///
-/// Fields are interpreted by the calling method:
-/// - Snapshot APIs use `as_of_timestamp` (defaulting to the latest commit when unset).
-/// - Incremental APIs use `start_timestamp` and `end_timestamp` (defaulting to earliest and
-///   latest respectively when unset).
-/// - All APIs honor `filters`, `projection`, and `batch_size` where applicable.
+/// `query_type` selects the read semantic; the timestamp fields are interpreted by
+/// the chosen type:
+/// - `Snapshot` uses `as_of_timestamp` (defaulting to the latest commit when unset).
+/// - `Incremental` uses `start_timestamp` and `end_timestamp` (defaulting to earliest
+///   and latest respectively when unset).
+///
+/// All query types honor `filters`, `projection`, and `batch_size` where applicable.
+/// `hudi_options` carries ad-hoc Hudi configs that override the table-level defaults
+/// for this single read (for example, `hoodie.read.use.read_optimized.mode`).
 ///
 /// # Example
 ///
 /// ```ignore
-/// use hudi::table::ReadOptions;
+/// use hudi::table::{ReadOptions, QueryType};
 ///
 /// // Snapshot read with a column filter on the partition column
 /// let options = ReadOptions::new()
@@ -41,11 +59,19 @@
 ///
 /// // Incremental read between two commits
 /// let options = ReadOptions::new()
+///     .with_query_type(QueryType::Incremental)
 ///     .with_start_timestamp("20240101000000000")
 ///     .with_end_timestamp("20240201000000000");
+///
+/// // Read-optimized snapshot (skip log files)
+/// let options = ReadOptions::new()
+///     .with_hudi_option("hoodie.read.use.read_optimized.mode", "true");
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct ReadOptions {
+    /// Selects the query semantic. Defaults to [`QueryType::Snapshot`].
+    pub query_type: QueryType,
+
     /// Column filters. Each filter is a tuple of `(field, operator, value)` where
     /// `field` is any column name (partition or data).
     ///
@@ -63,20 +89,32 @@ pub struct ReadOptions {
     /// Target number of rows per batch.
     pub batch_size: Option<usize>,
 
-    /// Timestamp for snapshot/time-travel queries.
+    /// Timestamp for snapshot/time-travel queries. Ignored for other query types.
     pub as_of_timestamp: Option<String>,
 
-    /// Lower-bound timestamp (exclusive) for incremental queries.
+    /// Lower-bound timestamp (exclusive) for incremental queries. Ignored otherwise.
     pub start_timestamp: Option<String>,
 
-    /// Upper-bound timestamp (inclusive) for incremental queries.
+    /// Upper-bound timestamp (inclusive) for incremental queries. Ignored otherwise.
     pub end_timestamp: Option<String>,
+
+    /// Per-read Hudi configs that override table-level defaults. Keys are
+    /// `hoodie.*` config names. Useful for one-off mode toggles like
+    /// `hoodie.read.use.read_optimized.mode = true` without mutating the table
+    /// instance.
+    pub hudi_options: HashMap<String, String>,
 }
 
 impl ReadOptions {
     /// Creates a new ReadOptions with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the query type.
+    pub fn with_query_type(mut self, query_type: QueryType) -> Self {
+        self.query_type = query_type;
+        self
     }
 
     /// Sets column filters.
@@ -131,6 +169,29 @@ impl ReadOptions {
         self.end_timestamp = Some(timestamp.as_ref().to_string());
         self
     }
+
+    /// Sets a single Hudi config that applies to this read only.
+    pub fn with_hudi_option<K, V>(mut self, key: K, value: V) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.hudi_options.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets a batch of Hudi configs that apply to this read only.
+    pub fn with_hudi_options<I, K, V>(mut self, opts: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (k, v) in opts {
+            self.hudi_options.insert(k.into(), v.into());
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +236,28 @@ mod tests {
     }
 
     #[test]
+    fn test_with_query_type() {
+        let snapshot = ReadOptions::new();
+        assert_eq!(snapshot.query_type, QueryType::Snapshot);
+
+        let incr = ReadOptions::new().with_query_type(QueryType::Incremental);
+        assert_eq!(incr.query_type, QueryType::Incremental);
+    }
+
+    #[test]
+    fn test_with_hudi_options() {
+        let options = ReadOptions::new()
+            .with_hudi_option("hoodie.read.use.read_optimized.mode", "true")
+            .with_hudi_options([("a", "1"), ("b", "2")]);
+        assert_eq!(
+            options.hudi_options.get("hoodie.read.use.read_optimized.mode"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(options.hudi_options.get("a"), Some(&"1".to_string()));
+        assert_eq!(options.hudi_options.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
     fn test_debug_format() {
         let options = ReadOptions::new()
             .with_filters([("city", "=", "sf")])
@@ -186,5 +269,6 @@ mod tests {
         assert!(debug_str.contains("filters"));
         assert!(debug_str.contains("projection"));
         assert!(debug_str.contains("batch_size"));
+        assert!(debug_str.contains("query_type"));
     }
 }

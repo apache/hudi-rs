@@ -22,8 +22,6 @@ UPDATE rider-J fare=0, DELETE rider-J, UPDATE rider-G fare=0.
 Final state: 6 rows (riders A, C, D, E, G, I).
 """
 
-from itertools import chain
-
 import pyarrow as pa
 
 from hudi import HudiReadOptions, HudiTable
@@ -82,9 +80,8 @@ def test_read_table_can_read_from_batches(v8_trips_table):
     assert t.num_rows > 0
     assert t.num_columns == 11
 
-    file_slices_gen = iter(table.get_file_slices_splits(2))
-    assert len(next(file_slices_gen)) == 2
-    assert len(next(file_slices_gen)) == 1
+    all_slices = table.get_file_slices()
+    assert len(all_slices) == 3
 
 
 def test_read_table_returns_correct_data(v8_trips_table):
@@ -151,8 +148,7 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
     first_commit = all_commits[0].timestamp
 
     options_at_first = HudiReadOptions(as_of_timestamp=first_commit)
-    file_slices_gen = table.get_file_slices_splits(2, options_at_first)
-    all_slices = list(chain.from_iterable(file_slices_gen))
+    all_slices = table.get_file_slices(options_at_first)
     assert len(all_slices) == 3
     partition_prefixes = sorted(
         f.base_file_relative_path().split("/")[0] for f in all_slices

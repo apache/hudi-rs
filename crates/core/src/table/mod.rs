@@ -66,9 +66,10 @@
 //! pub async fn test() {
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let file_slices = hudi_table
-//!             .get_file_slices_splits(2, &ReadOptions::new())
+//!     let flat_slices = hudi_table
+//!             .get_file_slices(&ReadOptions::new())
 //!             .await.unwrap();
+//!     let file_slices = hudi_core::util::collection::split_into_chunks(flat_slices, 2);
 //!     // define every parquet task reader how many slice
 //!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
 //!         for file_slice_vec in file_slices {
@@ -93,10 +94,11 @@ pub mod partition;
 mod read_options;
 mod validation;
 
-pub use read_options::ReadOptions;
+pub use read_options::{QueryType, ReadOptions};
 
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::error::CoreError;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
@@ -117,7 +119,6 @@ use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
-use crate::util::collection::split_into_chunks;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::HashMap;
@@ -415,16 +416,28 @@ impl Table {
         &self.timeline
     }
 
-    /// Get the [FileSlice]s in the table at a snapshot moment.
+    /// Get the [FileSlice]s the read targets, dispatching on `options.query_type`.
     ///
-    /// Reads at `options.as_of_timestamp` if set, otherwise the latest commit.
-    /// `options.filters` are applied as partition filters.
+    /// - [`QueryType::Snapshot`]: returns slices visible at `options.as_of_timestamp`,
+    ///   defaulting to the latest commit.
+    /// - [`QueryType::Incremental`]: returns slices changed in
+    ///   (`options.start_timestamp`, `options.end_timestamp`], defaulting to earliest
+    ///   and latest respectively.
     ///
+    /// `options.filters` are applied as partition filters in both cases.
     /// Returns an empty vector when the table has no commits.
     ///
-    /// # Notes
-    /// * Useful for snapshot and time-travel queries.
+    /// To bucket the result for parallel reads, use
+    /// [`crate::util::collection::split_into_chunks`] or your engine's preferred
+    /// partitioning policy.
     pub async fn get_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
+        match options.query_type {
+            QueryType::Snapshot => self.get_snapshot_file_slices(options).await,
+            QueryType::Incremental => self.get_incremental_file_slices(options).await,
+        }
+    }
+
+    async fn get_snapshot_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
@@ -432,16 +445,16 @@ impl Table {
         self.get_file_slices_internal(&timestamp, &filters).await
     }
 
-    /// Get the [FileSlice]s in `num_splits` splits at a snapshot moment.
-    ///
-    /// See [`Table::get_file_slices`] for how `options` is interpreted.
-    pub async fn get_file_slices_splits(
+    async fn get_incremental_file_slices(
         &self,
-        num_splits: usize,
         options: &ReadOptions,
-    ) -> Result<Vec<Vec<FileSlice>>> {
-        let file_slices = self.get_file_slices(options).await?;
-        Ok(split_into_chunks(file_slices, num_splits))
+    ) -> Result<Vec<FileSlice>> {
+        let Some((start, end)) = self.resolve_incremental_range(options)? else {
+            return Ok(Vec::new());
+        };
+        let filters = parse_filter_tuples(&options.filters)?;
+        self.get_file_slices_between_internal(&start, &end, &filters)
+            .await
     }
 
     async fn get_file_slices_internal(
@@ -490,37 +503,6 @@ impl Table {
                 estimator,
             )
             .await
-    }
-
-    /// Get the changed [FileSlice]s between two timestamps.
-    ///
-    /// Reads the change range (`options.start_timestamp`, `options.end_timestamp`].
-    /// `start_timestamp` defaults to the earliest timestamp; `end_timestamp` defaults
-    /// to the latest commit. `options.filters` are applied as partition filters.
-    ///
-    /// Returns an empty vector when the table has no commits.
-    ///
-    /// # Notes
-    /// * Useful for incremental queries.
-    pub async fn get_file_slices_between(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        let Some((start, end)) = self.resolve_incremental_range(options)? else {
-            return Ok(Vec::new());
-        };
-        let filters = parse_filter_tuples(&options.filters)?;
-        self.get_file_slices_between_internal(&start, &end, &filters)
-            .await
-    }
-
-    /// Get the changed [FileSlice]s in `num_splits` splits between two timestamps.
-    ///
-    /// See [`Table::get_file_slices_between`] for how `options` is interpreted.
-    pub async fn get_file_slices_splits_between(
-        &self,
-        num_splits: usize,
-        options: &ReadOptions,
-    ) -> Result<Vec<Vec<FileSlice>>> {
-        let file_slices = self.get_file_slices_between(options).await?;
-        Ok(split_into_chunks(file_slices, num_splits))
     }
 
     async fn get_file_slices_between_internal(
@@ -591,28 +573,55 @@ impl Table {
         )
     }
 
-    /// Read records at a snapshot moment.
+    /// Read records, dispatching on `options.query_type`.
     ///
-    /// Reads at `options.as_of_timestamp` if set, otherwise the latest commit.
-    /// `options.filters` are applied as partition filters.
+    /// - [`QueryType::Snapshot`] reads at `options.as_of_timestamp` or the latest commit.
+    /// - [`QueryType::Incremental`] reads the change range
+    ///   (`options.start_timestamp`, `options.end_timestamp`].
+    ///
+    /// `options.filters` are applied as partition filters; `options.hudi_options`
+    /// override table-level Hudi configs for this single read.
+    pub async fn read(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        match options.query_type {
+            QueryType::Snapshot => self.read_snapshot_inner(options).await,
+            QueryType::Incremental => self.read_incremental_inner(options).await,
+        }
+    }
+
+    /// Read snapshot records. Shortcut for [`Table::read`] with
+    /// `query_type = QueryType::Snapshot`. The query type on `options` is overridden.
     pub async fn read_snapshot(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        let mut opts = options.clone();
+        opts.query_type = QueryType::Snapshot;
+        self.read(&opts).await
+    }
+
+    /// Read incremental records. Shortcut for [`Table::read`] with
+    /// `query_type = QueryType::Incremental`. The query type on `options` is
+    /// overridden. Records updated multiple times in the range yield their latest
+    /// in-range state.
+    pub async fn read_incremental_records(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut opts = options.clone();
+        opts.query_type = QueryType::Incremental;
+        self.read(&opts).await
+    }
+
+    async fn read_snapshot_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
-        self.read_snapshot_internal(&timestamp, options).await
-    }
-
-    async fn read_snapshot_internal(
-        &self,
-        timestamp: &str,
-        options: &ReadOptions,
-    ) -> Result<Vec<RecordBatch>> {
         let filters = parse_filter_tuples(&options.filters)?;
-        let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
-        let fg_reader = self.create_file_group_reader_with_options([(
-            HudiReadConfig::FileGroupEndTimestamp,
-            timestamp,
-        )])?;
+        let file_slices = self.get_file_slices_internal(&timestamp, &filters).await?;
+        let fg_reader = self.create_file_group_reader_for_read(
+            options,
+            [(
+                HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                timestamp.clone(),
+            )],
+        )?;
         let fg_options = self.options_for_file_group(options);
         let batches = futures::future::try_join_all(
             file_slices
@@ -623,14 +632,7 @@ impl Table {
         Ok(batches)
     }
 
-    /// Read records inserted or updated between two timestamps.
-    ///
-    /// Reads the change range (`options.start_timestamp`, `options.end_timestamp`].
-    /// `start_timestamp` defaults to the earliest timestamp; `end_timestamp` defaults
-    /// to the latest commit. Records updated multiple times in the range have their
-    /// latest state within the range returned. `options.filters` are applied as
-    /// partition filters.
-    pub async fn read_incremental_records(
+    async fn read_incremental_inner(
         &self,
         options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
@@ -638,15 +640,23 @@ impl Table {
             return Ok(Vec::new());
         };
         let filters = parse_filter_tuples(&options.filters)?;
-
         let file_slices = self
             .get_file_slices_between_internal(&start, &end, &filters)
             .await?;
 
-        let fg_reader = self.create_file_group_reader_with_options([
-            (HudiReadConfig::FileGroupStartTimestamp, start),
-            (HudiReadConfig::FileGroupEndTimestamp, end),
-        ])?;
+        let fg_reader = self.create_file_group_reader_for_read(
+            options,
+            [
+                (
+                    HudiReadConfig::FileGroupStartTimestamp.as_ref().to_string(),
+                    start,
+                ),
+                (
+                    HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                    end,
+                ),
+            ],
+        )?;
         let fg_options = self.options_for_file_group(options);
 
         let batches = futures::future::try_join_all(
@@ -656,6 +666,25 @@ impl Table {
         )
         .await?;
         Ok(batches)
+    }
+
+    /// Build a `FileGroupReader` for one of the read paths. Merges `options.hudi_options`
+    /// with caller-supplied per-path overrides (e.g., `FileGroupStartTimestamp`); the
+    /// per-path overrides win on conflict so commit-time bounds the read path needs
+    /// can't be accidentally clobbered by a user-supplied `hudi_options` entry.
+    fn create_file_group_reader_for_read<I>(
+        &self,
+        options: &ReadOptions,
+        per_path_overrides: I,
+    ) -> Result<FileGroupReader>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut merged: HashMap<String, String> = options.hudi_options.clone();
+        for (k, v) in per_path_overrides {
+            merged.insert(k, v);
+        }
+        self.create_file_group_reader_with_options(merged)
     }
 
     /// Build the [`ReadOptions`] passed to `FileGroupReader` for a per-slice read,
@@ -741,22 +770,27 @@ impl Table {
     // Streaming Read APIs
     // =========================================================================
 
-    /// Reads the table snapshot as a stream of record batches.
+    /// Streaming read; dispatches on `options.query_type`.
     ///
-    /// This is the streaming version of [Table::read_snapshot]. Instead of returning
-    /// all batches at once, it returns a stream that yields record batches as they
-    /// are read from the underlying file slices.
+    /// Snapshot streams batches as they are read from each file slice. Incremental
+    /// streaming is not yet supported and returns an `Unsupported` error.
+    pub async fn read_stream(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        match options.query_type {
+            QueryType::Snapshot => self.read_snapshot_stream_inner(options).await,
+            QueryType::Incremental => Err(CoreError::Unsupported(
+                "Streaming for incremental queries is not yet supported".to_string(),
+            )),
+        }
+    }
+
+    /// Snapshot streaming shortcut. Equivalent to [`Table::read_stream`] with
+    /// `query_type = QueryType::Snapshot`. The query type on `options` is overridden.
     ///
-    /// # Arguments
-    /// * `options` - Read options including partition filters, batch size, and projection.
-    ///
-    /// # Returns
-    /// A stream of record batches from all file slices. Errors from individual file
-    /// slices are propagated through the stream.
-    ///
-    /// # Limitations
-    ///
-    /// - For MOR tables with log files, streaming falls back to the collect-and-merge approach.
+    /// For MOR tables with log files, streaming falls back to a collect-and-merge that
+    /// yields the merged result as a single batch.
     ///
     /// # Example
     /// ```ignore
@@ -767,13 +801,20 @@ impl Table {
     ///     .with_filters([("city", "=", "san_francisco")])
     ///     .with_batch_size(4096);
     /// let mut stream = table.read_snapshot_stream(&options).await?;
-    ///
     /// while let Some(result) = stream.next().await {
-    ///     let batch = result?;
-    ///     println!("Read {} rows", batch.num_rows());
+    ///     println!("Read {} rows", result?.num_rows());
     /// }
     /// ```
     pub async fn read_snapshot_stream(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        let mut opts = options.clone();
+        opts.query_type = QueryType::Snapshot;
+        self.read_stream(&opts).await
+    }
+
+    async fn read_snapshot_stream_inner(
         &self,
         options: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
@@ -790,10 +831,13 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.create_file_group_reader_with_options([(
-            HudiReadConfig::FileGroupEndTimestamp,
-            timestamp.as_str(),
-        )])?;
+        let fg_reader = self.create_file_group_reader_for_read(
+            options,
+            [(
+                HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                timestamp,
+            )],
+        )?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
@@ -809,12 +853,14 @@ impl Table {
             let projection = projection.clone();
             let row_filters = row_filters.clone();
             let options = ReadOptions {
+                query_type: QueryType::Snapshot,
                 filters: row_filters,
                 projection,
                 batch_size,
                 as_of_timestamp: None,
                 start_timestamp: None,
                 end_timestamp: None,
+                hudi_options: HashMap::new(),
             };
             async move {
                 fg_reader
@@ -1435,84 +1481,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_hudi_table_get_file_slices_splits() {
-        let base_url = SampleTable::V6Empty.url_to_cow();
-
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits(2, &ReadOptions::new())
-            .await
-            .unwrap();
-        assert!(file_slices_splits.is_empty());
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
-
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits(2, &ReadOptions::new())
-            .await
-            .unwrap();
-        assert_eq!(file_slices_splits.len(), 2);
-        assert_eq!(file_slices_splits[0].len(), 2);
-        assert_eq!(file_slices_splits[1].len(), 1);
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits_as_of_timestamps() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
+    async fn hudi_table_read_dispatches_on_query_type() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
 
-        // before replacecommit (insert overwrite table)
-        let second_latest_timestamp = "20250121000656060";
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits(
-                2,
-                &ReadOptions::new().with_as_of_timestamp(second_latest_timestamp),
+        // Default: Snapshot.
+        let snapshot = hudi_table.read(&ReadOptions::new()).await.unwrap();
+        assert!(!snapshot.is_empty());
+
+        // Explicit Incremental returns the same shape as the dedicated shortcut.
+        let incremental = hudi_table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(EARLIEST_START_TIMESTAMP),
             )
             .await
             .unwrap();
-        assert_eq!(file_slices_splits.len(), 2);
-        assert_eq!(file_slices_splits[0].len(), 2);
-        assert_eq!(file_slices_splits[1].len(), 1);
-        let file_slices = file_slices_splits
-            .iter()
-            .flatten()
-            .filter(|f| f.partition_path == "10")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            file_slices.len(),
-            1,
-            "Partition 10 should have 1 file slice"
+        assert!(!incremental.is_empty());
+
+        // Shortcuts override query_type set on the input options.
+        let forced_snapshot = hudi_table
+            .read_snapshot(
+                &ReadOptions::new().with_query_type(QueryType::Incremental),
+            )
+            .await
+            .unwrap();
+        assert!(!forced_snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hudi_table_read_stream_errors_on_incremental() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let result = hudi_table
+            .read_stream(&ReadOptions::new().with_query_type(QueryType::Incremental))
+            .await;
+        match result {
+            Ok(_) => panic!("incremental streaming must error"),
+            Err(e) => {
+                assert!(matches!(e, CoreError::Unsupported(_)));
+                assert!(e.to_string().contains("not yet supported"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_dispatches_on_query_type() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let snapshot_slices = hudi_table
+            .get_file_slices(&ReadOptions::new())
+            .await
+            .unwrap();
+        let incremental_slices = hudi_table
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(EARLIEST_START_TIMESTAMP),
+            )
+            .await
+            .unwrap();
+        assert!(!snapshot_slices.is_empty());
+        assert!(!incremental_slices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hudi_table_read_options_hudi_options_plumbed_to_reader() {
+        // Per-read hudi_options should override table-level configs without
+        // mutating the table. Here we set the per-read FileGroupStartTimestamp
+        // via hudi_options on a snapshot read; the read should still succeed.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let options = ReadOptions::new().with_hudi_option(
+            HudiReadConfig::FileGroupStartTimestamp.as_ref(),
+            "0",
         );
-        let file_slice = file_slices[0];
+        let batches = hudi_table.read(&options).await.unwrap();
+        assert!(!batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_as_of_replacecommit() {
+        // Insert-overwrite-table replacecommit: as_of before vs at the replacecommit
+        // returns different slice sets. Splitter behavior is covered by
+        // util::collection::split_into_chunks tests.
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        // before replacecommit
+        let second_latest_timestamp = "20250121000656060";
+        let file_slices = hudi_table
+            .get_file_slices(&ReadOptions::new().with_as_of_timestamp(second_latest_timestamp))
+            .await
+            .unwrap();
+        assert_eq!(file_slices.len(), 3);
+        let p10: Vec<_> = file_slices
+            .iter()
+            .filter(|f| f.partition_path == "10")
+            .collect();
+        assert_eq!(p10.len(), 1, "Partition 10 should have 1 file slice");
+        let file_slice = p10[0];
         assert_eq!(
             file_slice.base_file.file_name(),
             "92e64357-e4d1-4639-a9d3-c3535829d0aa-0_1-53-79_20250121000647668.parquet"
         );
-        assert_eq!(
-            file_slice.log_files.len(),
-            1,
-            "File slice should have 1 log file"
-        );
+        assert_eq!(file_slice.log_files.len(), 1);
         assert_eq!(
             file_slice.log_files.iter().next().unwrap().file_name(),
             ".92e64357-e4d1-4639-a9d3-c3535829d0aa-0_20250121000647668.log.1_0-73-101"
         );
 
-        // as of replacecommit (insert overwrite table)
+        // as of replacecommit
         let latest_timestamp = "20250121000702475";
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits(
-                2,
-                &ReadOptions::new().with_as_of_timestamp(latest_timestamp),
-            )
+        let file_slices = hudi_table
+            .get_file_slices(&ReadOptions::new().with_as_of_timestamp(latest_timestamp))
             .await
             .unwrap();
-        assert_eq!(file_slices_splits.len(), 1);
-        assert_eq!(file_slices_splits[0].len(), 1);
+        assert_eq!(file_slices.len(), 1);
     }
 
     #[tokio::test]
@@ -1580,12 +1667,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_hudi_table_get_file_slices_between_timestamps() {
+    async fn empty_hudi_table_get_file_slices_incremental() {
         let base_url = SampleTable::V6Empty.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let file_slices = hudi_table
-            .get_file_slices_between(
-                &ReadOptions::new().with_start_timestamp(EARLIEST_START_TIMESTAMP),
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(EARLIEST_START_TIMESTAMP),
             )
             .await
             .unwrap();
@@ -1593,11 +1682,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_get_file_slices_between_timestamps() {
+    async fn hudi_table_get_file_slices_incremental() {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let mut file_slices = hudi_table
-            .get_file_slices_between(&ReadOptions::new().with_end_timestamp("20250121000656060"))
+            .get_file_slices(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_end_timestamp("20250121000656060"),
+            )
             .await
             .unwrap();
         assert_eq!(file_slices.len(), 3);
@@ -1646,74 +1739,6 @@ mod tests {
         assert_eq!(m2.size, 440638);
         assert_eq!(m2.byte_size, 326525);
         assert_eq!(m2.num_records, 458);
-    }
-
-    #[tokio::test]
-    async fn empty_hudi_table_get_file_slices_splits_between() {
-        let base_url = SampleTable::V6Empty.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits_between(
-                2,
-                &ReadOptions::new().with_start_timestamp(EARLIEST_START_TIMESTAMP),
-            )
-            .await
-            .unwrap();
-        assert!(file_slices_splits.is_empty())
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits_between() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits_between(
-                2,
-                &ReadOptions::new().with_end_timestamp("20250121000656060"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(file_slices_splits.len(), 2);
-        let total_file_slices: usize = file_slices_splits.iter().map(|split| split.len()).sum();
-        assert_eq!(total_file_slices, 3);
-        assert_eq!(file_slices_splits[0].len(), 2);
-        assert_eq!(file_slices_splits[1].len(), 1);
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits_between_with_single_split() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits_between(
-                1,
-                &ReadOptions::new().with_end_timestamp("20250121000656060"),
-            )
-            .await
-            .unwrap();
-
-        // Should have 1 split with all 3 file slices
-        assert_eq!(file_slices_splits.len(), 1);
-        assert_eq!(file_slices_splits[0].len(), 3);
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_splits_between_with_many_splits() {
-        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices_splits = hudi_table
-            .get_file_slices_splits_between(
-                10,
-                &ReadOptions::new().with_end_timestamp("20250121000656060"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(file_slices_splits.len(), 3);
-        for split in &file_slices_splits {
-            assert_eq!(split.len(), 1);
-        }
     }
 
     #[tokio::test]

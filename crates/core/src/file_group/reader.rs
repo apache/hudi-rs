@@ -1168,14 +1168,7 @@ mod tests {
         let file_slice = FileSlice::new(base_file, String::new());
 
         // Use very small batch size
-        let options = ReadOptions {
-            filters: vec![],
-            projection: None,
-            batch_size: Some(1),
-            as_of_timestamp: None,
-            start_timestamp: None,
-            end_timestamp: None,
-        };
+        let options = ReadOptions::new().with_batch_size(1);
 
         let result = reader.read_file_slice_stream(&file_slice, &options).await;
 

@@ -24,7 +24,7 @@ return the updated TXN-001 row.
 
 import pyarrow as pa
 
-from hudi import HudiReadOptions, HudiTable
+from hudi import HudiQueryType, HudiReadOptions, HudiTable
 from hudi._internal import get_test_table_path
 
 
@@ -75,13 +75,14 @@ def test_incremental_read_with_partition_filter():
     assert sum(b.num_rows for b in batches) == 0
 
 
-def test_get_file_slices_between_with_partition_filter():
+def test_get_incremental_file_slices_with_partition_filter():
     table = HudiTable(get_test_table_path("v9_txns_simple_nometa", "cow"))
     commits = _commits(table)
     insert_ts, update_ts = commits[0].timestamp, commits[1].timestamp
 
-    slices_us = table.get_file_slices_between(
+    slices_us = table.get_file_slices(
         HudiReadOptions(
+            query_type=HudiQueryType.Incremental,
             start_timestamp=insert_ts,
             end_timestamp=update_ts,
             filters=[("region", "=", "us")],
@@ -90,29 +91,12 @@ def test_get_file_slices_between_with_partition_filter():
     assert len(slices_us) == 1
     assert "region=us" in slices_us[0].base_file_relative_path()
 
-    slices_eu = table.get_file_slices_between(
+    slices_eu = table.get_file_slices(
         HudiReadOptions(
+            query_type=HudiQueryType.Incremental,
             start_timestamp=insert_ts,
             end_timestamp=update_ts,
             filters=[("region", "=", "eu")],
         )
     )
     assert len(slices_eu) == 0
-
-
-def test_get_file_slices_splits_between_with_partition_filter():
-    table = HudiTable(get_test_table_path("v9_txns_simple_nometa", "cow"))
-    commits = _commits(table)
-    insert_ts, update_ts = commits[0].timestamp, commits[1].timestamp
-
-    splits = table.get_file_slices_splits_between(
-        2,
-        HudiReadOptions(
-            start_timestamp=insert_ts,
-            end_timestamp=update_ts,
-            filters=[("region", "=", "us")],
-        ),
-    )
-    flattened = [s for split in splits for s in split]
-    assert len(flattened) == 1
-    assert "region=us" in flattened[0].base_file_relative_path()

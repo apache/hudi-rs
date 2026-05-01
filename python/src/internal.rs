@@ -38,8 +38,7 @@ use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
-use hudi::table::ReadOptions;
-use hudi::table::Table;
+use hudi::table::{QueryType, ReadOptions, Table};
 use hudi::table::builder::TableBuilder;
 use hudi::timeline::Timeline;
 use hudi::timeline::instant::Instant;
@@ -80,10 +79,31 @@ impl From<PythonError> for PyErr {
     }
 }
 
+/// Python-side mirror of [`hudi::table::QueryType`].
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[pyclass(eq, eq_int)]
+pub enum HudiQueryType {
+    #[default]
+    Snapshot,
+    Incremental,
+}
+
+impl From<HudiQueryType> for QueryType {
+    fn from(q: HudiQueryType) -> Self {
+        match q {
+            HudiQueryType::Snapshot => QueryType::Snapshot,
+            HudiQueryType::Incremental => QueryType::Incremental,
+        }
+    }
+}
+
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug, Default)]
 #[pyclass]
 pub struct HudiReadOptions {
+    #[pyo3(get)]
+    query_type: HudiQueryType,
     #[pyo3(get)]
     filters: Vec<(String, String, String)>,
     #[pyo3(get)]
@@ -96,47 +116,58 @@ pub struct HudiReadOptions {
     start_timestamp: Option<String>,
     #[pyo3(get)]
     end_timestamp: Option<String>,
+    #[pyo3(get)]
+    hudi_options: HashMap<String, String>,
 }
 
 #[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiReadOptions {
     #[new]
-    #[pyo3(signature = (filters=None, projection=None, batch_size=None, as_of_timestamp=None, start_timestamp=None, end_timestamp=None))]
+    #[pyo3(signature = (query_type=None, filters=None, projection=None, batch_size=None, as_of_timestamp=None, start_timestamp=None, end_timestamp=None, hudi_options=None))]
     fn new(
+        query_type: Option<HudiQueryType>,
         filters: Option<Vec<(String, String, String)>>,
         projection: Option<Vec<String>>,
         batch_size: Option<usize>,
         as_of_timestamp: Option<String>,
         start_timestamp: Option<String>,
         end_timestamp: Option<String>,
+        hudi_options: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
+            query_type: query_type.unwrap_or_default(),
             filters: filters.unwrap_or_default(),
             projection,
             batch_size,
             as_of_timestamp,
             start_timestamp,
             end_timestamp,
+            hudi_options: hudi_options.unwrap_or_default(),
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "HudiReadOptions(filters={:?}, projection={:?}, batch_size={:?}, as_of_timestamp={:?}, start_timestamp={:?}, end_timestamp={:?})",
+            "HudiReadOptions(query_type={:?}, filters={:?}, projection={:?}, batch_size={:?}, as_of_timestamp={:?}, start_timestamp={:?}, end_timestamp={:?}, hudi_options={:?})",
+            self.query_type,
             self.filters,
             self.projection,
             self.batch_size,
             self.as_of_timestamp,
             self.start_timestamp,
-            self.end_timestamp
+            self.end_timestamp,
+            self.hudi_options,
         )
     }
 }
 
 impl HudiReadOptions {
     fn to_inner(&self) -> ReadOptions {
-        let mut options = ReadOptions::new().with_filters(self.filters.clone());
+        let mut options = ReadOptions::new()
+            .with_query_type(self.query_type.into())
+            .with_filters(self.filters.clone())
+            .with_hudi_options(self.hudi_options.clone());
         if let Some(projection) = &self.projection {
             options = options.with_projection(projection.clone());
         }
@@ -573,62 +604,6 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (num_splits, options=None))]
-    fn get_file_slices_splits(
-        &self,
-        num_splits: usize,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        let read_options = options.unwrap_or_default().to_inner();
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(self.inner.get_file_slices_splits(num_splits, &read_options))
-                .map_err(PythonError::from)?;
-            Ok(file_slices
-                .iter()
-                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
-                .collect())
-        })
-    }
-
-    #[pyo3(signature = (options=None))]
-    fn get_file_slices_between(
-        &self,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<Vec<HudiFileSlice>> {
-        let read_options = options.unwrap_or_default().to_inner();
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(self.inner.get_file_slices_between(&read_options))
-                .map_err(PythonError::from)?;
-            Ok(file_slices.iter().map(HudiFileSlice::from).collect())
-        })
-    }
-
-    #[pyo3(signature = (num_splits, options=None))]
-    fn get_file_slices_splits_between(
-        &self,
-        num_splits: usize,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<Vec<Vec<HudiFileSlice>>> {
-        let read_options = options.unwrap_or_default().to_inner();
-        py.detach(|| {
-            let file_slices = rt()
-                .block_on(
-                    self.inner
-                        .get_file_slices_splits_between(num_splits, &read_options),
-                )
-                .map_err(PythonError::from)?;
-            Ok(file_slices
-                .iter()
-                .map(|inner_vec| inner_vec.iter().map(HudiFileSlice::from).collect())
-                .collect())
-        })
-    }
-
     #[pyo3(signature = (options=None))]
     fn create_file_group_reader_with_options(
         &self,
@@ -639,6 +614,17 @@ impl HudiTable {
             .create_file_group_reader_with_options(options.unwrap_or_default())
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner: fg_reader })
+    }
+
+    #[pyo3(signature = (options=None))]
+    fn read(&self, options: Option<HudiReadOptions>, py: Python) -> PyResult<Py<PyAny>> {
+        let read_options = options.unwrap_or_default().to_inner();
+        py.detach(|| {
+            rt().block_on(self.inner.read(&read_options))
+                .map_err(PythonError::from)
+        })?
+        .to_pyarrow(py)
+        .map(|b| b.unbind())
     }
 
     #[pyo3(signature = (options=None))]
@@ -674,6 +660,20 @@ impl HudiTable {
 
     fn compute_table_stats(&self, py: Python) -> Option<(u64, u64)> {
         py.detach(|| rt().block_on(self.inner.compute_table_stats()))
+    }
+
+    #[pyo3(signature = (options=None))]
+    fn read_stream(
+        &self,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> PyResult<HudiRecordBatchStream> {
+        let read_options = options.unwrap_or_default().to_inner();
+        let stream = py.detach(|| {
+            rt().block_on(self.inner.read_stream(&read_options))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiRecordBatchStream::from_stream(stream))
     }
 
     #[pyo3(signature = (options=None))]

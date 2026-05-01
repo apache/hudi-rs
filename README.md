@@ -316,22 +316,22 @@ Create a Hudi table instance using its constructor or the `TableBuilder` API.
 
 All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct with these fields:
 
+- `query_type` — `Snapshot` (default) or `Incremental`. Drives dispatch in `read`, `read_stream`, and `get_file_slices`.
 - `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning, and row-level filtering.
 - `projection` — columns to return. Streaming pushes the projection down to the parquet reader; eager reads project after merging.
 - `batch_size` — rows per batch (streaming only; eager reads return one batch).
 - `as_of_timestamp` — snapshot/time-travel timestamp (defaults to latest commit)
 - `start_timestamp`, `end_timestamp` — incremental range (defaults to earliest…latest)
+- `hudi_options` — per-read Hudi configs that override table-level defaults (e.g. `hoodie.read.use.read_optimized.mode`)
 
-| Stage           | API                                       | Description                                                                                              |
-|-----------------|-------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| Query planning  | `get_file_slices(options)`                | Get a list of file slices for snapshot or time-travel queries (controlled via `as_of_timestamp`).        |
-|                 | `get_file_slices_splits(num_splits, options)` | Same as above but split into `num_splits` chunks for parallel reads.                                  |
-|                 | `get_file_slices_between(options)`        | Get the list of changed file slices for incremental queries (`start_timestamp`/`end_timestamp`).         |
-|                 | `get_file_slices_splits_between(num_splits, options)` | Same as above but split into `num_splits` chunks.                                            |
-|                 | `compute_table_stats()`                   | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
-| Query execution | `create_file_group_reader_with_options()` | Create a file group reader instance with the table instance's configs.                                   |
-|                 | `read_snapshot(options)` / `read_incremental_records(options)` | Eager record reads.                                                                  |
-|                 | `read_snapshot_stream(options)`                                | Streaming snapshot read. Per-slice streaming lives on `FileGroupReader`.             |
+| Stage           | API                                                              | Description                                                                                              |
+|-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi_core::util::collection::split_into_chunks` on the result. |
+|                 | `compute_table_stats()`                                          | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
+| Query execution | `create_file_group_reader_with_options()`                        | Create a file group reader instance with the table instance's configs.                                   |
+|                 | `read(options)` / `read_stream(options)`                         | Primary record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. |
+|                 | `read_snapshot(options)` / `read_incremental_records(options)`   | Shortcuts that override `query_type` accordingly.                                                        |
+|                 | `read_snapshot_stream(options)`                                  | Streaming snapshot shortcut. Per-slice streaming lives on `FileGroupReader`.                             |
 
 ### File Group API
 
