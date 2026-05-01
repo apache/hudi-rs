@@ -267,7 +267,7 @@ reader = HudiFileGroupReader(
     "/table/base/path", {"hoodie.read.file_group.start_timestamp": "0"})
 
 # Returns a PyArrow RecordBatch
-record_batch = reader.read_file_slice_by_base_file_path("relative/path.parquet")
+record_batch = reader.read_file_slice_from_paths("relative/path.parquet", [])
 ```
 
 #### Rust
@@ -282,7 +282,11 @@ let reader = FileGroupReader::new_with_options(
 
 // Returns an Arrow RecordBatch
 let record_batch = reader
-    .read_file_slice_by_base_file_path("relative/path.parquet", &ReadOptions::new())
+    .read_file_slice_from_paths(
+        "relative/path.parquet",
+        Vec::<&str>::new(),
+        &ReadOptions::new(),
+    )
     .await?;
 ```
 
@@ -298,7 +302,8 @@ auto reader = new_file_group_reader_with_options(
     "/table/base/path", {"hoodie.read.file_group.start_timestamp=0"});
 
 // Returns an ArrowArrayStream pointer
-ArrowArrayStream* stream_ptr = reader->read_file_slice_by_base_file_path("relative/path.parquet");
+std::vector<std::string> log_file_paths{};
+ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path.parquet", log_file_paths);
 ```
 
 ## Query Engine Integration
@@ -332,10 +337,10 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct 
 
 Create a Hudi file group reader instance using its constructor or the Hudi table API `create_file_group_reader_with_options()`.
 
-| Stage           | API                                   | Description                                                                                                                                                                        |
-|-----------------|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Query execution | `read_file_slice()`                   | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
-|                 | `read_file_slice_by_base_file_path()` | Read records from a given base file path; log files will be ignored                                                                                                                |
+| Stage           | API                              | Description                                                                                                                                                                        |
+|-----------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Query execution | `read_file_slice()`              | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
+|                 | `read_file_slice_from_paths()`   | Read records from an explicit base file path and a list of log file paths. Pass an empty log path list to read just the base file.                                                 |
 
 
 ### Apache DataFusion

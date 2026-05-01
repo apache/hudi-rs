@@ -23,7 +23,9 @@ use crate::config::table::HudiTableConfig;
 use crate::config::util::split_hudi_options_from_others;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
-use crate::expr::filter::{Filter, SchemableFilter, filters_to_row_mask, from_str_tuples};
+use crate::expr::filter::{
+    Filter, SchemableFilter, filters_to_row_mask, from_str_tuples, validate_fields_against_schema,
+};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
@@ -36,6 +38,7 @@ use crate::storage::{ParquetReadOptions, Storage};
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
+use crate::util::arrow::project_batch_by_names;
 use arrow::compute::and;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
@@ -104,24 +107,9 @@ impl FileGroupReader {
         })
     }
 
-    /// Reads the data from the base file at the given relative path.
-    ///
-    /// `options.filters` are applied as a row-level mask after reading;
-    /// `options.projection` selects columns. Other fields
-    /// (`as_of_timestamp`, `start_timestamp`, `end_timestamp`, `batch_size`) are not
-    /// meaningful for eager reads and are ignored.
-    pub async fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &str,
-        options: &ReadOptions,
-    ) -> Result<RecordBatch> {
-        let batch = self.read_base_file_eager(relative_path).await?;
-        apply_eager_options(options, batch)
-    }
-
     /// Internal: read base file + apply commit-time filter, no [`ReadOptions`] applied.
-    /// Used by both the public eager method and the merge path so options aren't
-    /// applied prematurely before merging with log files.
+    /// Used by the merge path so options aren't applied prematurely before merging
+    /// with log files.
     async fn read_base_file_eager(&self, relative_path: &str) -> Result<RecordBatch> {
         let records: RecordBatch = self
             .storage
@@ -149,7 +137,7 @@ impl FileGroupReader {
 
     /// Reads the data from the given file slice.
     ///
-    /// See [`Self::read_file_slice_by_base_file_path`] for how `options` is applied.
+    /// See [`Self::read_file_slice_from_paths`] for how `options` is applied.
     pub async fn read_file_slice(
         &self,
         file_slice: &FileSlice,
@@ -171,8 +159,10 @@ impl FileGroupReader {
 
     /// Reads a file slice from a base file and a list of log files.
     ///
-    /// `options` filters and projection are applied to the merged result.
-    /// See [`Self::read_file_slice_by_base_file_path`] for details.
+    /// `options.filters` are applied as a row-level mask after reading;
+    /// `options.projection` selects columns. Both apply to the merged result.
+    /// Other fields (`as_of_timestamp`, `start_timestamp`, `end_timestamp`, `batch_size`)
+    /// are not meaningful for eager reads and are ignored.
     pub async fn read_file_slice_from_paths<I, S>(
         &self,
         base_file_path: &str,
@@ -421,7 +411,7 @@ impl FileGroupReader {
                     )))),
                     Ok(batch) => {
                         if !validated.load(std::sync::atomic::Ordering::Relaxed) {
-                            if let Err(e) = validate_filter_fields_against_batch(
+                            if let Err(e) = validate_fields_against_schema(
                                 &filters,
                                 batch.schema().as_ref(),
                             ) {
@@ -441,7 +431,8 @@ impl FileGroupReader {
                         };
                         // Project down to the user's requested columns (no-op if we
                         // didn't have to widen the read projection).
-                        let batch = match project_to(&final_projection, batch) {
+                        let batch = match project_batch_by_names(batch, final_projection.as_deref())
+                        {
                             Err(e) => return Some(Err(e)),
                             Ok(b) => b,
                         };
@@ -623,56 +614,9 @@ fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<Reco
             .iter()
             .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
     )?;
-    validate_filter_fields_against_batch(&filters, batch.schema().as_ref())?;
+    validate_fields_against_schema(&filters, batch.schema().as_ref())?;
     let batch = apply_filter_mask(&filters, batch)?;
-    project_to(&options.projection, batch)
-}
-
-/// Error if any filter targets a column that is not in `batch_schema`.
-///
-/// At the file-group reader level there is no upstream partition pruning, so a
-/// filter on a column not present in the batch can never apply. Surfacing this as
-/// an error prevents typoed columns from becoming silent no-ops via
-/// [`filters_to_row_mask`].
-fn validate_filter_fields_against_batch(
-    filters: &[Filter],
-    batch_schema: &arrow_schema::Schema,
-) -> Result<()> {
-    use std::collections::HashSet;
-    let valid: HashSet<&str> = batch_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    for filter in filters {
-        if !valid.contains(filter.field_name.as_str()) {
-            return Err(CoreError::Schema(format!(
-                "Filter field '{}' not found in schema",
-                filter.field_name
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Project a [`RecordBatch`] to the given column names. Returns the input unchanged
-/// when `projection` is `None`.
-fn project_to(projection: &Option<Vec<String>>, batch: RecordBatch) -> Result<RecordBatch> {
-    let Some(cols) = projection else {
-        return Ok(batch);
-    };
-    let indices: Vec<usize> = cols
-        .iter()
-        .map(|name| {
-            batch
-                .schema()
-                .index_of(name)
-                .map_err(|e| ReadFileSliceError(format!("Projection column not found: {e:?}")))
-        })
-        .collect::<Result<_>>()?;
-    batch
-        .project(&indices)
-        .map_err(|e| ReadFileSliceError(format!("Projection failed: {e:?}")))
+    project_batch_by_names(batch, options.projection.as_deref())
 }
 
 /// Apply commit time filtering to a record batch.
@@ -914,7 +858,7 @@ mod tests {
             .await;
 
         // In read-optimized mode, log files should be ignored
-        // This should behave the same as read_file_slice_by_base_file_path
+        // This should behave the same as a base-file-only read
         match result {
             Ok(_) => {
                 // Test passes if we get a result - the method correctly ignored log files

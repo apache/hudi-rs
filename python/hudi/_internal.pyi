@@ -90,18 +90,6 @@ class HudiFileGroupReader:
             options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
         ...
-    def read_file_slice_by_base_file_path(
-        self,
-        relative_path: str,
-        options: Optional[HudiReadOptions] = None,
-    ) -> "pyarrow.RecordBatch":
-        """
-        Read the data from the base file at the given relative path.
-
-        ``options.filters`` are applied as a row-level mask after reading;
-        ``options.projection`` selects columns. Other fields are ignored.
-        """
-        ...
     def read_file_slice(
         self,
         file_slice: HudiFileSlice,

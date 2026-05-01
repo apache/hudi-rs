@@ -107,9 +107,9 @@ where
 /// where `true` indicates the row should be retained.
 ///
 /// This is a low-level primitive: filters whose field is not present in the batch are
-/// skipped silently. Callers that want strict-on-unknown-column behavior must validate
-/// filter fields against the batch schema before invoking this function (this is what
-/// the file-group reader paths do via `validate_filter_fields_against_batch`).
+/// skipped silently. Callers that want strict-on-unknown-column behavior must call
+/// [`validate_fields_against_schema`] before invoking this function (this is what
+/// the file-group reader paths do).
 ///
 /// All applicable filters are evaluated as row-level predicates and ANDed together.
 pub fn filters_to_row_mask(
@@ -130,6 +130,27 @@ pub fn filters_to_row_mask(
         });
     }
     Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; num_rows])))
+}
+
+/// Error if any [`Filter`] targets a column not present in `schema`.
+///
+/// This is the strict counterpart to [`filters_to_row_mask`], which silently skips
+/// missing columns. Use this when filters must apply to every column they name —
+/// e.g., at the file-group reader layer, where there is no upstream pruning and a
+/// filter on a missing column can never apply, so silently skipping it would let
+/// typoed columns become no-ops.
+pub fn validate_fields_against_schema(filters: &[Filter], schema: &Schema) -> Result<()> {
+    use std::collections::HashSet;
+    let valid: HashSet<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    for filter in filters {
+        if !valid.contains(filter.field_name.as_str()) {
+            return Err(CoreError::Schema(format!(
+                "Filter field '{}' not found in schema",
+                filter.field_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub struct FilterField {
@@ -353,6 +374,32 @@ mod tests {
         ];
         let mask = filters_to_row_mask(&filters, &batch)?;
         assert_eq!(mask, BooleanArray::from(vec![true, false]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_fields_against_schema() -> Result<()> {
+        let schema = create_test_schema();
+
+        // Empty filter list passes.
+        assert!(validate_fields_against_schema(&[], &schema).is_ok());
+
+        // All-known fields pass.
+        let valid = vec![
+            Filter::try_from(("string_col", "=", "x"))?,
+            Filter::try_from(("int_col", ">", "1"))?,
+        ];
+        assert!(validate_fields_against_schema(&valid, &schema).is_ok());
+
+        // Unknown field errors with a Schema error naming the bad column.
+        let invalid = vec![
+            Filter::try_from(("string_col", "=", "x"))?,
+            Filter::try_from(("typo_col", "=", "y"))?,
+        ];
+        let err = validate_fields_against_schema(&invalid, &schema).unwrap_err();
+        assert!(matches!(err, CoreError::Schema(_)));
+        assert!(err.to_string().contains("typo_col"));
+
         Ok(())
     }
 

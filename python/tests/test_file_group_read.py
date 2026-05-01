@@ -35,9 +35,7 @@ def test_file_group_api_read_file_slice(v8_trips_table):
         f for f in file_slices if "san_francisco" in f.base_file_relative_path()
     ][0]
 
-    batch = file_group_reader.read_file_slice_by_base_file_path(
-        sf_slice.base_file_relative_path()
-    )
+    batch = file_group_reader.read_file_slice(sf_slice)
 
     t = pa.Table.from_batches([batch]).select(["rider", "fare"]).sort_by("rider")
     rows = t.to_pylist()
@@ -65,7 +63,3 @@ def test_file_group_api_read_file_slice_from_paths(v8_trips_table):
 
     assert batch.num_rows == 4
     assert batch.num_columns > 0
-
-    batch_original = file_group_reader.read_file_slice_by_base_file_path(sf_path)
-    assert batch.num_rows == batch_original.num_rows
-    assert batch.num_columns == batch_original.num_columns

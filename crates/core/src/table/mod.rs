@@ -1428,8 +1428,9 @@ mod tests {
         let batches = hudi_table
             .create_file_group_reader_with_options(empty_options())
             .unwrap()
-            .read_file_slice_by_base_file_path(
+            .read_file_slice_from_paths(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+                Vec::<&str>::new(),
                 &ReadOptions::new(),
             )
             .await

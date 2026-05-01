@@ -74,8 +74,8 @@ def test_read_table_can_read_from_batches(v8_trips_table):
     file_slices = table.get_file_slices()
     file_slice_paths = [f.base_file_relative_path() for f in file_slices]
     batch = (
-        table.create_file_group_reader_with_options().read_file_slice_by_base_file_path(
-            file_slice_paths[0]
+        table.create_file_group_reader_with_options().read_file_slice_from_paths(
+            file_slice_paths[0], []
         )
     )
     t = pa.Table.from_batches([batch])

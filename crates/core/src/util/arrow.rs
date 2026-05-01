@@ -102,6 +102,28 @@ where
         .collect()
 }
 
+/// Project a [`RecordBatch`] to a subset of columns by name. Returns the batch
+/// unchanged when `projection` is `None`. Errors when any name is not present in
+/// the batch's schema.
+pub fn project_batch_by_names(
+    batch: RecordBatch,
+    projection: Option<&[String]>,
+) -> Result<RecordBatch> {
+    let Some(cols) = projection else {
+        return Ok(batch);
+    };
+    let indices: Vec<usize> = cols
+        .iter()
+        .map(|name| {
+            batch
+                .schema()
+                .index_of(name)
+                .map_err(|e| CoreError::Schema(format!("Projection column not found: {e:?}")))
+        })
+        .collect::<Result<_>>()?;
+    batch.project(&indices).map_err(CoreError::ArrowError)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +202,43 @@ mod tests {
 
         let result = lexsort_to_indices(&arrays, false);
         assert_eq!(result.values(), &[0, 2, 1]);
+    }
+
+    #[test]
+    fn test_project_batch_by_names() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.5, 2.5])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        // None returns input unchanged.
+        let same = project_batch_by_names(batch.clone(), None).unwrap();
+        assert_eq!(same.num_columns(), 3);
+        assert_eq!(same.schema().field(0).name(), "a");
+
+        // Subset projects in the requested order.
+        let cols = vec!["c".to_string(), "a".to_string()];
+        let projected = project_batch_by_names(batch.clone(), Some(&cols)).unwrap();
+        assert_eq!(projected.num_columns(), 2);
+        assert_eq!(projected.schema().field(0).name(), "c");
+        assert_eq!(projected.schema().field(1).name(), "a");
+
+        // Unknown column errors with a Schema error.
+        let bad = vec!["a".to_string(), "missing".to_string()];
+        let err = project_batch_by_names(batch, Some(&bad)).unwrap_err();
+        assert!(matches!(err, CoreError::Schema(_)));
+        assert!(err.to_string().contains("missing"));
     }
 }

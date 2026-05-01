@@ -221,25 +221,6 @@ impl HudiFileGroupReader {
         Ok(HudiFileGroupReader { inner })
     }
 
-    #[pyo3(signature = (relative_path, options=None))]
-    fn read_file_slice_by_base_file_path(
-        &self,
-        relative_path: &str,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        let read_options = options.unwrap_or_default().to_inner();
-        py.detach(|| {
-            rt().block_on(
-                self.inner
-                    .read_file_slice_by_base_file_path(relative_path, &read_options),
-            )
-            .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-
     #[pyo3(signature = (file_slice, options=None))]
     fn read_file_slice(
         &self,

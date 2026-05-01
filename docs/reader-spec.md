@@ -63,7 +63,7 @@ Which fields each API consumes:
 | `read_incremental_records`                                                           | —                 | yes                     | yes       | yes          | —            |
 | `get_file_slices_between` / `get_file_slices_splits_between`                         | —                 | yes                     | yes       | —            | —            |
 | `Table::read_file_slice_stream`                                                      | yes †             | —                       | yes       | yes          | yes          |
-| `FileGroupReader::read_file_slice` / `_by_base_file_path` / `_from_paths`            | —                 | —                       | yes       | yes          | —            |
+| `FileGroupReader::read_file_slice` / `_from_paths`                                   | —                 | —                       | yes       | yes          | —            |
 | `FileGroupReader::read_file_slice_stream` / `_from_paths_stream`                     | —                 | —                       | yes       | yes          | yes          |
 
 † `Table::read_file_slice_stream` honors `as_of_timestamp` by configuring the file-group reader's commit-time bound, matching `read_snapshot[_stream]`. The slice itself is **not** re-selected — callers must pass a `FileSlice` that exists at or before that timestamp. Direct `FileGroupReader::*` methods do not auto-configure commit-time bounds.
@@ -123,9 +123,8 @@ All public symbols are re-exported from the `hudi` crate.
 | Method                                                                  | Returns                                              |
 |-------------------------------------------------------------------------|------------------------------------------------------|
 | `FileGroupReader::new_with_options(base_uri, options)`                  | `Result<FileGroupReader>`                            |
-| `read_file_slice_by_base_file_path(relative_path, &ReadOptions)`        | `Result<RecordBatch>` (base file only)               |
 | `read_file_slice(&FileSlice, &ReadOptions)`                             | `Result<RecordBatch>` (base + merge logs)            |
-| `read_file_slice_from_paths(base_path, log_paths, &ReadOptions)`        | `Result<RecordBatch>`                                |
+| `read_file_slice_from_paths(base_path, log_paths, &ReadOptions)`        | `Result<RecordBatch>` (pass empty log_paths for base-only) |
 | `read_file_slice_stream(&FileSlice, &ReadOptions)`                      | `Result<BoxStream<'static, Result<RecordBatch>>>`    |
 | `read_file_slice_from_paths_stream(base_path, log_paths, &ReadOptions)` | `Result<BoxStream<'static, Result<RecordBatch>>>`    |
 | `is_metadata_table()`                                                   | `bool`                                               |
@@ -213,9 +212,8 @@ table = (
 | Method                                                                     | Returns                          |
 |----------------------------------------------------------------------------|----------------------------------|
 | `HudiFileGroupReader(base_uri, options=None)`                              | `HudiFileGroupReader`            |
-| `read_file_slice_by_base_file_path(relative_path, options=None)`           | `pyarrow.RecordBatch`            |
 | `read_file_slice(file_slice, options=None)`                                | `pyarrow.RecordBatch`            |
-| `read_file_slice_from_paths(base_path, log_paths, options=None)`           | `pyarrow.RecordBatch`            |
+| `read_file_slice_from_paths(base_path, log_paths, options=None)`           | `pyarrow.RecordBatch` (pass empty log_paths for base-only) |
 | `read_file_slice_stream(file_slice, options=None)`                         | `HudiRecordBatchStream`          |
 | `read_file_slice_from_paths_stream(base_path, log_paths, options=None)`    | `HudiRecordBatchStream`          |
 
