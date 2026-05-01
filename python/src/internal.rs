@@ -690,36 +690,6 @@ impl HudiTable {
         Ok(HudiRecordBatchStream::from_stream(stream))
     }
 
-    #[pyo3(signature = (file_slice, options=None))]
-    fn read_file_slice_stream(
-        &self,
-        file_slice: &HudiFileSlice,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<HudiRecordBatchStream> {
-        let read_options = options.unwrap_or_default().to_inner();
-        let mut file_group = FileGroup::new_with_base_file_name(
-            &file_slice.base_file_name,
-            &file_slice.partition_path,
-        )
-        .map_err(PythonError::from)?;
-        file_group
-            .add_log_files_from_names(&file_slice.log_file_names)
-            .map_err(PythonError::from)?;
-        let table = self.inner.clone();
-        let stream = py.detach(|| {
-            rt().block_on(async move {
-                let (_, fs) = file_group.file_slices.iter().next().ok_or_else(|| {
-                    CoreError::FileGroup(format!(
-                        "Failed to get file slice from file group: {file_group:?}"
-                    ))
-                })?;
-                table.read_file_slice_stream(fs, &read_options).await
-            })
-            .map_err(PythonError::from)
-        })?;
-        Ok(HudiRecordBatchStream::from_stream(stream))
-    }
 }
 
 #[cfg(not(tarpaulin_include))]

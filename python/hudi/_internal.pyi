@@ -402,15 +402,6 @@ class HudiTable:
         without loading all data into memory.
         """
         ...
-    def read_file_slice_stream(
-        self,
-        file_slice: HudiFileSlice,
-        options: Optional[HudiReadOptions] = None,
-    ) -> HudiRecordBatchStream:
-        """
-        Read a single file slice as a stream of record batches.
-        """
-        ...
 
 @dataclass(init=False)
 class HudiTimeline:

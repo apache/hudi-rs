@@ -331,7 +331,7 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct 
 |                 | `compute_table_stats()`                   | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
 | Query execution | `create_file_group_reader_with_options()` | Create a file group reader instance with the table instance's configs.                                   |
 |                 | `read_snapshot(options)` / `read_incremental_records(options)` | Eager record reads.                                                                  |
-|                 | `read_snapshot_stream(options)` / `read_file_slice_stream(slice, options)` | Streaming record reads.                                                |
+|                 | `read_snapshot_stream(options)`                                | Streaming snapshot read. Per-slice streaming lives on `FileGroupReader`.             |
 
 ### File Group API
 

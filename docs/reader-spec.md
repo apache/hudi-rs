@@ -62,11 +62,10 @@ Which fields each API consumes:
 | `get_file_slices` / `get_file_slices_splits`                                         | yes               | —                       | yes       | —            | —            |
 | `read_incremental_records`                                                           | —                 | yes                     | yes       | yes          | —            |
 | `get_file_slices_between` / `get_file_slices_splits_between`                         | —                 | yes                     | yes       | —            | —            |
-| `Table::read_file_slice_stream`                                                      | yes †             | —                       | yes       | yes          | yes          |
 | `FileGroupReader::read_file_slice` / `_from_paths`                                   | —                 | —                       | yes       | yes          | —            |
 | `FileGroupReader::read_file_slice_stream` / `_from_paths_stream`                     | —                 | —                       | yes       | yes          | yes          |
 
-† `Table::read_file_slice_stream` honors `as_of_timestamp` by configuring the file-group reader's commit-time bound, matching `read_snapshot[_stream]`. The slice itself is **not** re-selected — callers must pass a `FileSlice` that exists at or before that timestamp. Direct `FileGroupReader::*` methods do not auto-configure commit-time bounds.
+Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods.
 
 Timestamp formats are documented in [§6](#timestamps).
 
@@ -115,7 +114,6 @@ All public symbols are re-exported from the `hudi` crate.
 | `read_snapshot(&ReadOptions)`                                              | `Result<Vec<RecordBatch>>`                           |
 | `read_incremental_records(&ReadOptions)`                                   | `Result<Vec<RecordBatch>>`                           |
 | `read_snapshot_stream(&ReadOptions)`                                       | `Result<BoxStream<'static, Result<RecordBatch>>>`    |
-| `read_file_slice_stream(&FileSlice, &ReadOptions)`                         | `Result<BoxStream<'static, Result<RecordBatch>>>`    |
 | `compute_table_stats()`                                                    | `Option<(u64, u64)>` — `(rows, byte_size)`           |
 
 ### `FileGroupReader`
@@ -204,7 +202,7 @@ table = (
 | `get_file_slices_splits(num_splits, options=None)` / `get_file_slices_splits_between(num_splits, options=None)` | `List[List[HudiFileSlice]]`     |
 | `create_file_group_reader_with_options(options=None)`                                              | `HudiFileGroupReader`                    |
 | `read_snapshot(options=None)` / `read_incremental_records(options=None)`                           | `List[pyarrow.RecordBatch]`              |
-| `read_snapshot_stream(options=None)` / `read_file_slice_stream(file_slice, options=None)`          | `HudiRecordBatchStream`                  |
+| `read_snapshot_stream(options=None)`                                                               | `HudiRecordBatchStream`                  |
 | `compute_table_stats()`                                                                            | `Optional[Tuple[int, int]]`              |
 
 ### `HudiFileGroupReader`

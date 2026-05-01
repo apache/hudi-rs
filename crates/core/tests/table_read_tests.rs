@@ -720,11 +720,11 @@ mod v8_tables {
                 "Should have at least one file slice"
             );
 
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
-            let mut stream = hudi_table
-                .read_file_slice_stream(file_slice, &options)
-                .await?;
+            let mut stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
 
             // Collect all batches from stream
             let mut batches = Vec::new();
@@ -748,11 +748,11 @@ mod v8_tables {
             let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
             let file_slice = &file_slices[0];
 
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
             // Test with small batch size
             let options = ReadOptions::new().with_batch_size(1);
-            let mut stream = hudi_table
-                .read_file_slice_stream(file_slice, &options)
-                .await?;
+            let mut stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
 
             let mut batches = Vec::new();
             while let Some(result) = stream.next().await {
@@ -1356,11 +1356,11 @@ mod v9_tables {
                 "Should have at least one file slice"
             );
 
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
-            let stream = hudi_table
-                .read_file_slice_stream(file_slice, &options)
-                .await?;
+            let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
             let batches = collect_stream_batches(stream).await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1376,10 +1376,10 @@ mod v9_tables {
             let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
             let file_slice = &file_slices[0];
 
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new().with_batch_size(1);
-            let stream = hudi_table
-                .read_file_slice_stream(file_slice, &options)
-                .await?;
+            let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
             let batches = collect_stream_batches(stream).await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1539,11 +1539,11 @@ mod streaming_queries {
             "Should have at least one file slice"
         );
 
+        let fg_reader = hudi_table
+            .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
-        let stream = hudi_table
-            .read_file_slice_stream(file_slice, &options)
-            .await?;
+        let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1562,11 +1562,11 @@ mod streaming_queries {
         let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
         let file_slice = &file_slices[0];
 
+        let fg_reader = hudi_table
+            .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
         // Test with small batch size
         let options = ReadOptions::new().with_batch_size(1);
-        let stream = hudi_table
-            .read_file_slice_stream(file_slice, &options)
-            .await?;
+        let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1817,38 +1817,6 @@ mod streaming_queries {
             stream_err.to_string().contains("rider_idd"),
             "stream error should mention the bad column, got: {stream_err}"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_read_file_slice_stream_normalizes_as_of_timestamp() -> Result<()> {
-        // Cross-validate single-slice streaming time-travel against eager
-        // read_snapshot using the same `as_of_timestamp`. Pre-fix,
-        // `read_file_slice_stream` did not run `format_timestamp`, so passing an
-        // ISO/epoch form (which `read_snapshot` accepts) could pass an
-        // unformatted value through to the file-group reader.
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
-        let first_commit = hudi_table
-            .get_timeline()
-            .get_completed_commits(false)
-            .await?
-            .first()
-            .map(|i| i.timestamp.to_string())
-            .expect("table must have at least one commit");
-        let options = ReadOptions::new().with_as_of_timestamp(&first_commit);
-        let file_slice = hudi_table.get_file_slices(&options).await?[0].clone();
-
-        let eager = hudi_table.read_snapshot(&options).await?;
-        let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
-
-        let stream = hudi_table
-            .read_file_slice_stream(&file_slice, &options)
-            .await?;
-        let stream_batches = collect_stream_batches(stream).await?;
-        let stream_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
-
-        assert_eq!(eager_rows, stream_rows);
         Ok(())
     }
 

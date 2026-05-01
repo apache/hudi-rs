@@ -77,20 +77,6 @@ def test_read_snapshot_stream_is_single_use(v8_trips_table):
     assert list(stream) == []
 
 
-def test_read_file_slice_stream_table(v8_trips_table):
-    table = HudiTable(v8_trips_table)
-    file_slices = table.get_file_slices(
-        HudiReadOptions(filters=[("city", "=", "san_francisco")])
-    )
-    assert len(file_slices) == 1
-
-    stream = table.read_file_slice_stream(file_slices[0])
-    batches = list(stream)
-    assert len(batches) >= 1
-    t = pa.Table.from_batches(batches)
-    assert t.num_rows == 4
-
-
 def test_read_file_slice_stream_file_group_reader(v8_trips_table):
     table = HudiTable(v8_trips_table)
     file_slices = table.get_file_slices(

@@ -782,57 +782,6 @@ impl Table {
     // Streaming Read APIs
     // =========================================================================
 
-    /// Reads a file slice as a stream of record batches.
-    ///
-    /// This is the streaming version of reading a single file slice. It returns a stream
-    /// that yields record batches as they are read, without loading all data into memory.
-    ///
-    /// # Arguments
-    /// * `file_slice` - The file slice to read.
-    /// * `options` - Read options for configuring the read operation.
-    ///
-    /// # Returns
-    /// A stream of record batches.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use futures::StreamExt;
-    /// use hudi::table::ReadOptions;
-    ///
-    /// let file_slices = table.get_file_slices(&ReadOptions::new()).await?;
-    /// let options = ReadOptions::new().with_batch_size(4096);
-    ///
-    /// for file_slice in &file_slices {
-    ///     let mut stream = table.read_file_slice_stream(file_slice, &options).await?;
-    ///     while let Some(result) = stream.next().await {
-    ///         let batch = result?;
-    ///         // Process batch...
-    ///     }
-    /// }
-    /// ```
-    pub async fn read_file_slice_stream(
-        &self,
-        file_slice: &FileSlice,
-        options: &ReadOptions,
-    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        use futures::stream;
-
-        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
-            // No commit timestamp means empty table - return empty stream (consistent with read_snapshot)
-            return Ok(Box::pin(stream::empty()));
-        };
-
-        let fg_reader = self.create_file_group_reader_with_options([(
-            HudiReadConfig::FileGroupEndTimestamp,
-            timestamp.as_str(),
-        )])?;
-        let fg_options = self.options_for_file_group(options);
-
-        fg_reader
-            .read_file_slice_stream(file_slice, &fg_options)
-            .await
-    }
-
     /// Reads the table snapshot as a stream of record batches.
     ///
     /// This is the streaming version of [Table::read_snapshot]. Instead of returning
@@ -1000,7 +949,6 @@ mod tests {
     };
     use crate::config::util::empty_options;
     use crate::error::CoreError;
-    use crate::file_group::FileGroup;
     use crate::metadata::meta_field::MetaField;
     use crate::storage::Storage;
     use crate::storage::util::join_url_segments;
@@ -1483,42 +1431,6 @@ mod tests {
             .await
             .unwrap();
         assert!(snapshot_stream.next().await.is_none());
-
-        let file_group = FileGroup::new_with_base_file_name(
-            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
-            "",
-        )
-        .unwrap();
-        let file_slice = file_group
-            .get_file_slice_as_of("20240418173551906")
-            .unwrap()
-            .clone();
-        let mut file_slice_stream = hudi_table
-            .read_file_slice_stream(&file_slice, &ReadOptions::new())
-            .await
-            .unwrap();
-        assert!(file_slice_stream.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn hudi_table_read_file_slice_stream_reads_batches() {
-        use futures::TryStreamExt;
-
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let file_slices = hudi_table
-            .get_file_slices(&ReadOptions::new())
-            .await
-            .unwrap();
-        let file_slice = file_slices.first().unwrap().clone();
-        let options = ReadOptions::new().with_batch_size(2);
-
-        let stream = hudi_table
-            .read_file_slice_stream(&file_slice, &options)
-            .await
-            .unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-        assert!(!batches.is_empty());
     }
 
     #[tokio::test]
