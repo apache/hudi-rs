@@ -1821,6 +1821,35 @@ mod streaming_queries {
     }
 
     #[tokio::test]
+    async fn test_file_group_reader_stream_projection_widens_for_commit_time_filter() -> Result<()>
+    {
+        // Regression: when commit-time filtering is active (FileGroupStartTimestamp set
+        // and PopulatesMetaFields true), the streaming path must widen the parquet read
+        // projection to include `_hoodie_commit_time` even if the user's projection
+        // omits it. The widened column is dropped by the existing final-projection step
+        // so the user-visible schema still matches `options.projection`.
+        use hudi_core::file_group::reader::FileGroupReader;
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let file_slice = hudi_table.get_file_slices(&ReadOptions::new()).await?[0].clone();
+        let reader = FileGroupReader::new_with_options(
+            base_url.path(),
+            [(HudiReadConfig::FileGroupStartTimestamp.as_ref(), "0")],
+        )
+        .await?;
+        let options = ReadOptions::new().with_projection(["id"]);
+
+        let stream = reader.read_file_slice_stream(&file_slice, &options).await?;
+        let batches = collect_stream_batches(stream).await?;
+
+        assert!(!batches.is_empty(), "should produce at least one batch");
+        let schema = batches[0].schema();
+        assert_eq!(schema.fields().len(), 1, "projection should narrow to one column");
+        assert_eq!(schema.field(0).name(), "id");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_read_snapshot_stream_projection_invalid_column() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;

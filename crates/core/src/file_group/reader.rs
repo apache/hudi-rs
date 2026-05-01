@@ -338,9 +338,12 @@ impl FileGroupReader {
         let batch_size = options.batch_size.unwrap_or(default_batch_size);
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
-        // If projection is set, ensure all filter fields are also read so the
-        // row-level mask can evaluate them. We project down to the user's requested
-        // columns AFTER filtering.
+        // If projection is set, widen the parquet read to also include any columns
+        // we need post-read but the user didn't request:
+        //   - filter fields, so the row-level mask can evaluate them
+        //   - `_hoodie_commit_time`, when commit-time filtering is active
+        //     (PopulatesMetaFields + FileGroupStartTimestamp)
+        // The widened columns are dropped by the final projection step below.
         //
         // We only exclude partition column filter fields from widening when
         // `hoodie.datasource.write.drop.partition.columns` is enabled — otherwise
@@ -359,22 +362,36 @@ impl FileGroupReader {
         } else {
             Vec::new()
         };
-        let final_projection = options.projection.clone();
-        let read_projection = match (&options.projection, options.filters.as_slice()) {
-            (Some(proj), filters) if !filters.is_empty() => {
-                let mut combined: Vec<String> = proj.clone();
-                for (field, _, _) in filters {
-                    if dropped_partition_columns.iter().any(|p| p == field) {
-                        continue;
-                    }
-                    if !combined.iter().any(|c| c == field) {
-                        combined.push(field.clone());
-                    }
-                }
-                Some(combined)
-            }
-            (proj, _) => proj.clone(),
+        let needs_commit_time_col: bool = {
+            let populates_meta_fields: bool = self
+                .hudi_configs
+                .get_or_default(HudiTableConfig::PopulatesMetaFields)
+                .into();
+            let has_start_ts = self
+                .hudi_configs
+                .try_get(HudiReadConfig::FileGroupStartTimestamp)
+                .is_some();
+            populates_meta_fields && has_start_ts
         };
+        let final_projection = options.projection.clone();
+        let read_projection = options.projection.as_ref().map(|proj| {
+            let mut combined: Vec<String> = proj.clone();
+            for (field, _, _) in &options.filters {
+                if dropped_partition_columns.iter().any(|p| p == field) {
+                    continue;
+                }
+                if !combined.iter().any(|c| c == field) {
+                    combined.push(field.clone());
+                }
+            }
+            if needs_commit_time_col {
+                let commit_time = MetaField::CommitTime.as_ref().to_string();
+                if !combined.iter().any(|c| c == &commit_time) {
+                    combined.push(commit_time);
+                }
+            }
+            combined
+        });
         if let Some(ref cols) = read_projection {
             parquet_options = parquet_options.with_projection(cols.clone());
         }
