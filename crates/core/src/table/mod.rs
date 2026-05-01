@@ -100,7 +100,7 @@ use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
-use crate::expr::filter::{Filter, from_str_tuples};
+use crate::expr::filter::{Filter, parse_filter_tuples, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::keygen::is_timestamp_based_keygen;
@@ -153,47 +153,6 @@ impl Clone for Table {
             cached_estimator: self.cached_estimator.clone(),
         }
     }
-}
-
-/// Parse `ReadOptions::filters` tuples into [`Filter`]s.
-fn parse_filters(filters: &[(String, String, String)]) -> Result<Vec<Filter>> {
-    from_str_tuples(
-        filters
-            .iter()
-            .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
-    )
-}
-
-/// Validate that every filter targets a column present in the table or partition schema.
-///
-/// Pass `None` for `table_schema` when only partition columns are reachable (e.g., the
-/// incremental path that loads file groups from commit metadata without reading the
-/// data schema). A filter on an unknown column would otherwise silently no-op once the
-/// row mask runs against a batch that doesn't contain it; failing fast here makes typos
-/// like `("rder_id", "=", "x")` surface as an error.
-fn validate_filter_fields(
-    filters: &[Filter],
-    table_schema: Option<&Schema>,
-    partition_schema: &Schema,
-) -> Result<()> {
-    use std::collections::HashSet;
-    let mut valid: HashSet<&str> = partition_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    if let Some(schema) = table_schema {
-        valid.extend(schema.fields().iter().map(|f| f.name().as_str()));
-    }
-    for filter in filters {
-        if !valid.contains(filter.field_name.as_str()) {
-            return Err(crate::error::CoreError::Schema(format!(
-                "Filter field '{}' not found in table schema",
-                filter.field_name
-            )));
-        }
-    }
-    Ok(())
 }
 
 impl Table {
@@ -469,7 +428,7 @@ impl Table {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filters(&options.filters)?;
+        let filters = parse_filter_tuples(&options.filters)?;
         self.get_file_slices_internal(&timestamp, &filters).await
     }
 
@@ -494,7 +453,7 @@ impl Table {
 
         let partition_schema = self.get_partition_schema().await?;
         let table_schema = self.get_schema().await?;
-        validate_filter_fields(filters, Some(&table_schema), &partition_schema)?;
+        validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
 
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
@@ -547,7 +506,7 @@ impl Table {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filters(&options.filters)?;
+        let filters = parse_filter_tuples(&options.filters)?;
         self.get_file_slices_between_internal(&start, &end, &filters)
             .await
     }
@@ -586,7 +545,7 @@ impl Table {
         } else {
             let partition_schema = self.get_partition_schema().await?;
             let table_schema = self.get_schema().await?;
-            validate_filter_fields(filters, Some(&table_schema), &partition_schema)?;
+            validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
             Some(PartitionPruner::new(
                 filters,
                 &partition_schema,
@@ -648,7 +607,7 @@ impl Table {
         timestamp: &str,
         options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let filters = parse_filters(&options.filters)?;
+        let filters = parse_filter_tuples(&options.filters)?;
         let file_slices = self.get_file_slices_internal(timestamp, &filters).await?;
         let fg_reader = self.create_file_group_reader_with_options([(
             HudiReadConfig::FileGroupEndTimestamp,
@@ -678,7 +637,7 @@ impl Table {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filters(&options.filters)?;
+        let filters = parse_filter_tuples(&options.filters)?;
 
         let file_slices = self
             .get_file_slices_between_internal(&start, &end, &filters)
@@ -824,7 +783,7 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         };
 
-        let filters = parse_filters(&options.filters)?;
+        let filters = parse_filter_tuples(&options.filters)?;
         let file_slices = self.get_file_slices_internal(&timestamp, &filters).await?;
 
         if file_slices.is_empty() {

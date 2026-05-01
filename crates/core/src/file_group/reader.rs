@@ -24,7 +24,8 @@ use crate::config::util::split_hudi_options_from_others;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{
-    Filter, SchemableFilter, filters_to_row_mask, from_str_tuples, validate_fields_against_schema,
+    Filter, SchemableFilter, filters_to_row_mask, parse_filter_tuples,
+    validate_fields_against_schemas,
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
@@ -398,12 +399,7 @@ impl FileGroupReader {
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
-        let filters = Arc::new(from_str_tuples(
-            options
-                .filters
-                .iter()
-                .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
-        )?);
+        let filters = Arc::new(parse_filter_tuples(&options.filters)?);
         let final_projection = Arc::new(final_projection);
         // Validate once on first batch so typoed filter columns surface as errors
         // rather than silent no-ops in `filters_to_row_mask`.
@@ -428,9 +424,9 @@ impl FileGroupReader {
                     )))),
                     Ok(batch) => {
                         if !validated.load(std::sync::atomic::Ordering::Relaxed) {
-                            if let Err(e) = validate_fields_against_schema(
+                            if let Err(e) = validate_fields_against_schemas(
                                 &filters,
-                                batch.schema().as_ref(),
+                                [batch.schema().as_ref()],
                             ) {
                                 return Some(Err(e));
                             }
@@ -625,13 +621,8 @@ fn create_commit_time_filter_mask(
 /// going through `Table` strip filters on dropped partition columns before reaching
 /// here; direct `FileGroupReader` callers must not pass such filters.
 fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<RecordBatch> {
-    let filters = from_str_tuples(
-        options
-            .filters
-            .iter()
-            .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
-    )?;
-    validate_fields_against_schema(&filters, batch.schema().as_ref())?;
+    let filters = parse_filter_tuples(&options.filters)?;
+    validate_fields_against_schemas(&filters, [batch.schema().as_ref()])?;
     let batch = apply_filter_mask(&filters, batch)?;
     project_batch_by_names(batch, options.projection.as_deref())
 }

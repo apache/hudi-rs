@@ -103,12 +103,25 @@ where
         .collect()
 }
 
+/// Parse a borrowed slice of `(field, op, value)` tuples (typically from
+/// `ReadOptions::filters`) into a `Vec<Filter>`. Convenience wrapper around
+/// [`from_str_tuples`] that handles the `&[(String, String, String)]` shape
+/// without forcing callers to clone or write the same `.iter().map(...)`
+/// adapter at every site.
+pub fn parse_filter_tuples(filters: &[(String, String, String)]) -> Result<Vec<Filter>> {
+    from_str_tuples(
+        filters
+            .iter()
+            .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
+    )
+}
+
 /// Evaluate a slice of [`Filter`]s against a [`RecordBatch`] and return a row-level mask
 /// where `true` indicates the row should be retained.
 ///
 /// This is a low-level primitive: filters whose field is not present in the batch are
 /// skipped silently. Callers that want strict-on-unknown-column behavior must call
-/// [`validate_fields_against_schema`] before invoking this function (this is what
+/// [`validate_fields_against_schemas`] before invoking this function (this is what
 /// the file-group reader paths do).
 ///
 /// All applicable filters are evaluated as row-level predicates and ANDed together.
@@ -132,16 +145,23 @@ pub fn filters_to_row_mask(
     Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; num_rows])))
 }
 
-/// Error if any [`Filter`] targets a column not present in `schema`.
+/// Error if any [`Filter`] targets a column not present in any of the provided schemas.
 ///
 /// This is the strict counterpart to [`filters_to_row_mask`], which silently skips
-/// missing columns. Use this when filters must apply to every column they name —
-/// e.g., at the file-group reader layer, where there is no upstream pruning and a
-/// filter on a missing column can never apply, so silently skipping it would let
-/// typoed columns become no-ops.
-pub fn validate_fields_against_schema(filters: &[Filter], schema: &Schema) -> Result<()> {
+/// missing columns. Pass one schema for the file-group-reader case (validate against
+/// the read batch). Pass multiple — e.g. data schema + partition schema — at the
+/// table layer, where partition columns may be valid filter targets even when not
+/// physically present in the data schema. Failing fast prevents typos like
+/// `("rder_id", "=", "x")` from becoming silent no-ops.
+pub fn validate_fields_against_schemas<'a, I>(filters: &[Filter], schemas: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a Schema>,
+{
     use std::collections::HashSet;
-    let valid: HashSet<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let mut valid: HashSet<&str> = HashSet::new();
+    for schema in schemas {
+        valid.extend(schema.fields().iter().map(|f| f.name().as_str()));
+    }
     for filter in filters {
         if !valid.contains(filter.field_name.as_str()) {
             return Err(CoreError::Schema(format!(
@@ -378,28 +398,61 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_fields_against_schema() -> Result<()> {
+    fn test_validate_fields_against_schemas() -> Result<()> {
         let schema = create_test_schema();
 
-        // Empty filter list passes.
-        assert!(validate_fields_against_schema(&[], &schema).is_ok());
+        // Empty filter list passes (single-schema form).
+        assert!(validate_fields_against_schemas(&[], [&schema]).is_ok());
 
         // All-known fields pass.
         let valid = vec![
             Filter::try_from(("string_col", "=", "x"))?,
             Filter::try_from(("int_col", ">", "1"))?,
         ];
-        assert!(validate_fields_against_schema(&valid, &schema).is_ok());
+        assert!(validate_fields_against_schemas(&valid, [&schema]).is_ok());
 
         // Unknown field errors with a Schema error naming the bad column.
         let invalid = vec![
             Filter::try_from(("string_col", "=", "x"))?,
             Filter::try_from(("typo_col", "=", "y"))?,
         ];
-        let err = validate_fields_against_schema(&invalid, &schema).unwrap_err();
+        let err = validate_fields_against_schemas(&invalid, [&schema]).unwrap_err();
         assert!(matches!(err, CoreError::Schema(_)));
         assert!(err.to_string().contains("typo_col"));
 
+        // Multi-schema: a filter on a column present in only one of the schemas
+        // passes when the union is considered. This mirrors the Table-layer use case
+        // where partition fields may not be in the data schema but are still valid
+        // filter targets.
+        let partition_schema = Schema::new(vec![Field::new("city", DataType::Utf8, false)]);
+        let cross_schema_filters = vec![
+            Filter::try_from(("string_col", "=", "x"))?, // in data schema only
+            Filter::try_from(("city", "=", "sf"))?,      // in partition schema only
+        ];
+        assert!(
+            validate_fields_against_schemas(&cross_schema_filters, [&schema, &partition_schema])
+                .is_ok()
+        );
+
+        // A filter on a column missing from BOTH schemas still errors.
+        let still_invalid = vec![Filter::try_from(("nope", "=", "x"))?];
+        let err = validate_fields_against_schemas(&still_invalid, [&schema, &partition_schema])
+            .unwrap_err();
+        assert!(err.to_string().contains("nope"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_filter_tuples() -> Result<()> {
+        let owned: Vec<(String, String, String)> = vec![
+            ("city".to_string(), "=".to_string(), "sf".to_string()),
+            ("rider".to_string(), "!=".to_string(), "x".to_string()),
+        ];
+        let filters = parse_filter_tuples(&owned)?;
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].field_name, "city");
+        assert_eq!(filters[1].field_name, "rider");
         Ok(())
     }
 
