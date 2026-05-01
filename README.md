@@ -253,36 +253,6 @@ while let Some(batch) = stream.next().await {
 }
 ```
 
-### Parallel Read Planning
-
-Engines that distribute reads (e.g. DataFusion, Ray Data, Spark) use the splits APIs to
-chunk file slices into roughly equal groups for worker tasks. Combine with `compute_table_stats()`
-for size-based planning.
-
-#### Python
-
-```python
-# Plan: split snapshot into 8 parallel reads
-splits = hudi_table.get_file_slices_splits(8)
-stats = hudi_table.compute_table_stats()  # (estimated_rows, byte_size) or None
-
-# Each worker reads its slice group
-reader = hudi_table.create_file_group_reader_with_options()
-for split in splits:
-    for file_slice in split:
-        batch = reader.read_file_slice(file_slice)
-        # ... process batch
-```
-
-#### Rust
-
-```rust
-// Same flow with options applied (filters, time travel)
-let options = ReadOptions::new().with_filters([("city", "=", "san_francisco")]);
-let splits = hudi_table.get_file_slices_splits(8, &options).await?;
-let stats = hudi_table.compute_table_stats().await; // Option<(rows, byte_size)>
-```
-
 ### File Group Reading (Experimental)
 
 File group reading allows you to read data from a specific file slice. This is useful when integrating with query

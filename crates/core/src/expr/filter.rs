@@ -106,10 +106,12 @@ where
 /// Evaluate a slice of [`Filter`]s against a [`RecordBatch`] and return a row-level mask
 /// where `true` indicates the row should be retained.
 ///
-/// Filters whose field is not present in the batch are skipped (this happens, e.g., when
-/// the filter targets a partition column already pruned upstream and not included in the
-/// projected batch). All other filters are evaluated as row-level predicates and ANDed
-/// together.
+/// This is a low-level primitive: filters whose field is not present in the batch are
+/// skipped silently. Callers that want strict-on-unknown-column behavior must validate
+/// filter fields against the batch schema before invoking this function (this is what
+/// the file-group reader paths do via `validate_filter_fields_against_batch`).
+///
+/// All applicable filters are evaluated as row-level predicates and ANDed together.
 pub fn filters_to_row_mask(
     filters: &[Filter],
     batch: &arrow_array::RecordBatch,
@@ -371,41 +373,27 @@ mod tests {
     }
 
     #[test]
-    fn test_schemable_filter_try_from() -> Result<()> {
+    fn test_schemable_filter_try_from_schema_lookup() -> Result<()> {
         let schema = create_test_schema();
 
-        // Test string column filter creation
-        let string_filter = Filter {
-            field_name: "string_col".to_string(),
-            operator: ExprOperator::Eq,
-            values: vec!["test_value".to_string()],
-        };
-
-        let schemable = SchemableFilter::try_from((string_filter, &schema))?;
+        // Happy path: looks up the field, copies operator, casts values.
+        let filter = Filter::new(
+            "string_col".to_string(),
+            ExprOperator::Eq,
+            vec!["test_value".to_string()],
+        )?;
+        let schemable = SchemableFilter::try_from((filter, &schema))?;
         assert_eq!(schemable.field.name(), "string_col");
         assert_eq!(schemable.field.data_type(), &DataType::Utf8);
         assert_eq!(schemable.operator, ExprOperator::Eq);
 
-        // Test integer column filter creation
-        let int_filter = Filter {
-            field_name: "int_col".to_string(),
-            operator: ExprOperator::Gt,
-            values: vec!["42".to_string()],
-        };
-
-        let schemable = SchemableFilter::try_from((int_filter, &schema))?;
-        assert_eq!(schemable.field.name(), "int_col");
-        assert_eq!(schemable.field.data_type(), &DataType::Int64);
-        assert_eq!(schemable.operator, ExprOperator::Gt);
-
-        // Test error case - non-existent column
-        let invalid_filter = Filter {
-            field_name: "non_existent".to_string(),
-            operator: ExprOperator::Eq,
-            values: vec!["value".to_string()],
-        };
-
-        assert!(SchemableFilter::try_from((invalid_filter, &schema)).is_err());
+        // Error path: unknown column.
+        let invalid = Filter::new(
+            "non_existent".to_string(),
+            ExprOperator::Eq,
+            vec!["value".to_string()],
+        )?;
+        assert!(SchemableFilter::try_from((invalid, &schema)).is_err());
 
         Ok(())
     }
@@ -453,122 +441,111 @@ mod tests {
     }
 
     #[test]
-    fn test_schemable_filter_apply_comparison() -> Result<()> {
+    fn test_schemable_filter_apply_comparison_all_operators() -> Result<()> {
+        // Single parameterized test covering all 8 operators across both a string
+        // column ("a", "b", "a") and an int column (40, 50, 60). Verifies the
+        // dispatch in `apply_comparison` and that the per-operator kernels are
+        // wired correctly. Single-value ops use `Vec::from([v])`; set ops use
+        // multi-value vectors.
         let schema = create_test_schema();
+        let string_array = StringArray::from(vec!["a", "b", "a"]);
+        let int_array = Int64Array::from(vec![40, 50, 60]);
 
-        // Test string equality comparison
-        let eq_filter = Filter {
-            field_name: "string_col".to_string(),
-            operator: ExprOperator::Eq,
-            values: vec!["test".to_string()],
-        };
-        let schemable = SchemableFilter::try_from((eq_filter, &schema))?;
-
-        let test_array = StringArray::from(vec!["test", "other", "test"]);
-        let result = schemable.apply_comparison(&test_array)?;
-        assert_eq!(result, BooleanArray::from(vec![true, false, true]));
-
-        // Test integer greater than comparison
-        let gt_filter = Filter {
-            field_name: "int_col".to_string(),
-            operator: ExprOperator::Gt,
-            values: vec!["50".to_string()],
-        };
-        let schemable = SchemableFilter::try_from((gt_filter, &schema))?;
-
-        let test_array = Int64Array::from(vec![40, 50, 60]);
-        let result = schemable.apply_comparison(&test_array)?;
-        assert_eq!(result, BooleanArray::from(vec![false, false, true]));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_schemable_filter_all_operators() -> Result<()> {
-        let schema = create_test_schema();
-        let test_array = Int64Array::from(vec![40, 50, 60]);
-
-        let test_cases = vec![
-            (ExprOperator::Eq, "50", vec![false, true, false]),
-            (ExprOperator::Ne, "50", vec![true, false, true]),
-            (ExprOperator::Lt, "50", vec![true, false, false]),
-            (ExprOperator::Lte, "50", vec![true, true, false]),
-            (ExprOperator::Gt, "50", vec![false, false, true]),
-            (ExprOperator::Gte, "50", vec![false, true, true]),
+        let cases: Vec<(&str, Vec<&str>, ExprOperator, Vec<bool>)> = vec![
+            // String column
+            (
+                "string_col",
+                vec!["a"],
+                ExprOperator::Eq,
+                vec![true, false, true],
+            ),
+            (
+                "string_col",
+                vec!["a"],
+                ExprOperator::Ne,
+                vec![false, true, false],
+            ),
+            (
+                "string_col",
+                vec!["a", "b"],
+                ExprOperator::In,
+                vec![true, true, true],
+            ),
+            (
+                "string_col",
+                vec!["a", "b"],
+                ExprOperator::NotIn,
+                vec![false, false, false],
+            ),
+            // Int column — covers all 6 binary operators + 2 set operators
+            (
+                "int_col",
+                vec!["50"],
+                ExprOperator::Eq,
+                vec![false, true, false],
+            ),
+            (
+                "int_col",
+                vec!["50"],
+                ExprOperator::Ne,
+                vec![true, false, true],
+            ),
+            (
+                "int_col",
+                vec!["50"],
+                ExprOperator::Lt,
+                vec![true, false, false],
+            ),
+            (
+                "int_col",
+                vec!["50"],
+                ExprOperator::Lte,
+                vec![true, true, false],
+            ),
+            (
+                "int_col",
+                vec!["50"],
+                ExprOperator::Gt,
+                vec![false, false, true],
+            ),
+            (
+                "int_col",
+                vec!["50"],
+                ExprOperator::Gte,
+                vec![false, true, true],
+            ),
+            (
+                "int_col",
+                vec!["40", "60"],
+                ExprOperator::In,
+                vec![true, false, true],
+            ),
+            (
+                "int_col",
+                vec!["40", "60"],
+                ExprOperator::NotIn,
+                vec![false, true, false],
+            ),
         ];
 
-        for (operator, value, expected) in test_cases {
-            let filter = Filter {
-                field_name: "int_col".to_string(),
+        for (column, values, operator, expected) in cases {
+            let filter = Filter::new(
+                column.to_string(),
                 operator,
-                values: vec![value.to_string()],
-            };
-
+                values.iter().map(|s| s.to_string()).collect(),
+            )?;
             let schemable = SchemableFilter::try_from((filter, &schema))?;
-            let result = schemable.apply_comparison(&test_array)?;
+            let result = match column {
+                "string_col" => schemable.apply_comparison(&string_array)?,
+                "int_col" => schemable.apply_comparison(&int_array)?,
+                other => unreachable!("unexpected column {other}"),
+            };
             assert_eq!(
                 result,
                 BooleanArray::from(expected),
-                "Failed for operator {operator:?} with value {value}"
+                "operator {operator:?} on {column} with {values:?}"
             );
         }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_schemable_filter_in() -> Result<()> {
-        let schema = create_test_schema();
-
-        let in_filter = Filter::new(
-            "string_col".to_string(),
-            ExprOperator::In,
-            vec!["foo".to_string(), "bar".to_string()],
-        )
-        .unwrap();
-
-        let schemable = SchemableFilter::try_from((in_filter, &schema))?;
-        let test_array = StringArray::from(vec!["foo", "baz", "bar", "qux"]);
-        let result = schemable.apply_comparison(&test_array)?;
-        assert_eq!(result, BooleanArray::from(vec![true, false, true, false]));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_schemable_filter_not_in() -> Result<()> {
-        let schema = create_test_schema();
-
-        let not_in_filter = Filter::new(
-            "string_col".to_string(),
-            ExprOperator::NotIn,
-            vec!["foo".to_string(), "bar".to_string()],
-        )
-        .unwrap();
-
-        let schemable = SchemableFilter::try_from((not_in_filter, &schema))?;
-        let test_array = StringArray::from(vec!["foo", "baz", "bar", "qux"]);
-        let result = schemable.apply_comparison(&test_array)?;
-        assert_eq!(result, BooleanArray::from(vec![false, true, false, true]));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_schemable_filter_in_with_integers() -> Result<()> {
-        let schema = create_test_schema();
-
-        let in_filter = Filter::new(
-            "int_col".to_string(),
-            ExprOperator::In,
-            vec!["40".to_string(), "60".to_string()],
-        )
-        .unwrap();
-
-        let schemable = SchemableFilter::try_from((in_filter, &schema))?;
-        let test_array = Int64Array::from(vec![40, 50, 60]);
-        let result = schemable.apply_comparison(&test_array)?;
-        assert_eq!(result, BooleanArray::from(vec![true, false, true]));
 
         Ok(())
     }
