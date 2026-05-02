@@ -186,7 +186,11 @@ impl Storage {
         let name = meta.location.filename().ok_or_else(|| {
             InvalidPath(format!("Failed to get file name from: {:?}", meta.location))
         })?;
-        Ok(FileMetadata::new(name.to_string(), meta.size))
+        #[cfg(use_arrow_54)]
+        let size = meta.size as u64;
+        #[cfg(not(use_arrow_54))]
+        let size = meta.size;
+        Ok(FileMetadata::new(name.to_string(), size))
     }
 
     pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
@@ -194,6 +198,9 @@ impl Storage {
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
+        #[cfg(use_arrow_54)]
+        let reader = ParquetObjectReader::new(obj_store, meta);
+        #[cfg(not(use_arrow_54))]
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         Ok(builder.metadata().as_ref().clone())
@@ -248,7 +255,9 @@ impl Storage {
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
 
-        // read parquet
+        #[cfg(use_arrow_54)]
+        let reader = ParquetObjectReader::new(obj_store, meta);
+        #[cfg(not(use_arrow_54))]
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let schema = builder.schema().clone();
@@ -284,6 +293,9 @@ impl Storage {
         let obj_store = self.object_store.clone();
         let meta = obj_store.head(&obj_path).await?;
 
+        #[cfg(use_arrow_54)]
+        let reader = ParquetObjectReader::new(obj_store, meta);
+        #[cfg(not(use_arrow_54))]
         let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
 
@@ -378,7 +390,11 @@ impl Storage {
                 continue;
             }
 
-            file_metadata.push(FileMetadata::new(name.to_string(), obj_meta.size));
+            #[cfg(use_arrow_54)]
+            let size = obj_meta.size as u64;
+            #[cfg(not(use_arrow_54))]
+            let size = obj_meta.size;
+            file_metadata.push(FileMetadata::new(name.to_string(), size));
         }
         Ok(file_metadata)
     }

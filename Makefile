@@ -56,7 +56,7 @@ TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
 
 .PHONY: help
 help: ## Show this help message
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: setup-venv
 setup-venv: ## Setup the virtualenv
@@ -127,6 +127,14 @@ test: test-rust test-python ## Run tests on Rust and Python
 test-rust: ## Run tests on Rust
 	$(info --- Run Rust tests ---)
 	./build-wrapper.sh cargo test --no-fail-fast --all-targets --all-features --workspace
+
+.PHONY: test-rust-arrow54
+test-rust-arrow54: ## Run tests on Rust with arrow-54 feature
+	$(info --- Run Rust tests with arrow-54 ---)
+	./build-wrapper.sh cargo test -p hudi-core --no-fail-fast --lib --tests --no-default-features --features arrow-54
+
+.PHONY: test-arrow54
+test-arrow54: test-rust-arrow54 ## Run tests with arrow-54 feature (Rust only)
 
 .PHONY: test-python
 test-python: ## Run tests on Python

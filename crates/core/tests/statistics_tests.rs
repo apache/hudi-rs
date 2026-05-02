@@ -24,17 +24,17 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use arrow_array::{
+use hudi_core::arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
+use hudi_core::arrow_schema::{DataType, Field, Schema, TimeUnit};
+use hudi_core::parquet::arrow::ArrowWriter;
+use hudi_core::parquet::basic::Compression;
+use hudi_core::parquet::file::properties::WriterProperties;
+use hudi_core::parquet::file::reader::FileReader;
+use hudi_core::parquet::file::serialized_reader::SerializedFileReader;
 use tempfile::tempdir;
 
 use hudi_core::statistics::{StatisticsContainer, StatsGranularity};
@@ -44,7 +44,7 @@ fn write_parquet_file(batch: &RecordBatch, path: &std::path::Path) {
     let file = File::create(path).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+        .set_statistics_enabled(hudi_core::parquet::file::properties::EnabledStatistics::Page)
         .build();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     writer.write(batch).unwrap();
@@ -56,7 +56,7 @@ fn write_parquet_file_no_stats(batch: &RecordBatch, path: &std::path::Path) {
     let file = File::create(path).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+        .set_statistics_enabled(hudi_core::parquet::file::properties::EnabledStatistics::None)
         .build();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     writer.write(batch).unwrap();
@@ -68,7 +68,7 @@ fn write_parquet_file_multiple_row_groups(batches: &[RecordBatch], path: &std::p
     let file = File::create(path).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+        .set_statistics_enabled(hudi_core::parquet::file::properties::EnabledStatistics::Page)
         .set_max_row_group_size(3) // Force smaller row groups
         .build();
     let mut writer = ArrowWriter::try_new(file, batches[0].schema(), Some(props)).unwrap();
@@ -79,7 +79,9 @@ fn write_parquet_file_multiple_row_groups(batches: &[RecordBatch], path: &std::p
 }
 
 /// Helper to read Parquet metadata from a file.
-fn read_parquet_metadata(path: &std::path::Path) -> parquet::file::metadata::ParquetMetaData {
+fn read_parquet_metadata(
+    path: &std::path::Path,
+) -> hudi_core::parquet::file::metadata::ParquetMetaData {
     let file = File::open(path).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
     reader.metadata().clone()

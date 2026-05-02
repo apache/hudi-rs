@@ -28,23 +28,41 @@ homepage.workspace = true
 repository.workspace = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(tarpaulin_include)',
+    'cfg(use_arrow_54)',
+] }
 
 [dependencies]
-# arrow
-arrow = { workspace = true }
-arrow-arith = { workspace = true }
-arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-ipc = { workspace = true }
-arrow-json = { workspace = true }
-arrow-ord = { workspace = true }
-arrow-row = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
-object_store = { workspace = true }
-parquet = { workspace = true }
+# arrow (default version)
+arrow = { workspace = true, optional = true }
+arrow-arith = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
+arrow-cast = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-json = { workspace = true, optional = true }
+arrow-ord = { workspace = true, optional = true }
+arrow-row = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-select = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+
+# arrow-54 (for compatibility with projects using arrow 54)
+arrow_v54 = { workspace = true, optional = true }
+arrow-arith_v54 = { workspace = true, optional = true }
+arrow-array_v54 = { workspace = true, optional = true }
+arrow-buffer_v54 = { workspace = true, optional = true }
+arrow-cast_v54 = { workspace = true, optional = true }
+arrow-ipc_v54 = { workspace = true, optional = true }
+arrow-json_v54 = { workspace = true, optional = true }
+arrow-ord_v54 = { workspace = true, optional = true }
+arrow-row_v54 = { workspace = true, optional = true }
+arrow-schema_v54 = { workspace = true, optional = true }
+arrow-select_v54 = { workspace = true, optional = true }
+object_store_v54 = { workspace = true, optional = true }
+parquet_v54 = { workspace = true, optional = true }
 
 # avro
 apache-avro = { workspace = true }
@@ -88,7 +106,7 @@ datafusion-physical-expr = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 
 [dev-dependencies]
-hudi-test = { path = "../test" }
+hudi-test = { path = "../test", default-features = false }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 
@@ -96,6 +114,45 @@ tempfile = { workspace = true }
 result_large_err = "allow"
 
 [features]
+default = ["arrow-default"]
+
+# Arrow version features (mutually exclusive - only enable one)
+arrow-default = [
+    "dep:arrow",
+    "dep:arrow-arith",
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-cast",
+    "dep:arrow-ipc",
+    "dep:arrow-json",
+    "dep:arrow-ord",
+    "dep:arrow-row",
+    "dep:arrow-schema",
+    "dep:arrow-select",
+    "dep:object_store",
+    "dep:parquet",
+    "hudi-test/arrow-default",
+]
+
+# Arrow v54 (for projects that require arrow 54)
+# Usage: default-features = false, features = ["arrow-54"]
+arrow-54 = [
+    "dep:arrow_v54",
+    "dep:arrow-arith_v54",
+    "dep:arrow-array_v54",
+    "dep:arrow-buffer_v54",
+    "dep:arrow-cast_v54",
+    "dep:arrow-ipc_v54",
+    "dep:arrow-json_v54",
+    "dep:arrow-ord_v54",
+    "dep:arrow-row_v54",
+    "dep:arrow-schema_v54",
+    "dep:arrow-select_v54",
+    "dep:object_store_v54",
+    "dep:parquet_v54",
+    "hudi-test/arrow-54",
+]
+
 datafusion = [
     "dep:datafusion",
     "datafusion-expr",

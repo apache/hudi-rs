@@ -224,7 +224,9 @@ fn default_field_name(dt: &DataType) -> &str {
         | DataType::LargeListView(_) => {
             unimplemented!("View support not implemented")
         }
+        #[cfg(not(use_arrow_54))]
         DataType::Decimal32(_, _) => "decimal",
+        #[cfg(not(use_arrow_54))]
         DataType::Decimal64(_, _) => "decimal",
         DataType::Decimal128(_, _) => "decimal",
         DataType::Decimal256(_, _) => "decimal",

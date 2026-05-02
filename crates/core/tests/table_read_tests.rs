@@ -21,10 +21,10 @@
 //! This module contains tests for snapshot and time-travel queries,
 //! organized by table version (v6, v8+) and query type.
 
-use arrow::compute::concat_batches;
-use arrow_array::RecordBatch;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use hudi_core::arrow::compute::concat_batches;
+use hudi_core::arrow_array::RecordBatch;
 use hudi_core::config::read::HudiReadConfig;
 use hudi_core::error::Result;
 use hudi_core::table::{QueryType, ReadOptions, Table};
@@ -644,7 +644,7 @@ mod v8_tables {
                 .column_by_name("rider")
                 .unwrap()
                 .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
+                .downcast_ref::<hudi_core::arrow::array::StringArray>()
                 .unwrap();
             let target_rider = unfiltered_riders.value(0).to_string();
 
@@ -668,7 +668,7 @@ mod v8_tables {
                 .column_by_name("rider")
                 .unwrap()
                 .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
+                .downcast_ref::<hudi_core::arrow::array::StringArray>()
                 .unwrap();
             assert_eq!(riders.value(0), target_rider);
             Ok(())
@@ -891,7 +891,7 @@ mod v8_tables {
 /// Test helper module for v9 tables (1.1 spec)
 mod v9_tables {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use hudi_core::arrow_array::{Int64Array, StringArray};
 
     fn txn_rows(records: &[RecordBatch]) -> Vec<(String, String, i64)> {
         let mut rows = Vec::new();
@@ -1775,7 +1775,7 @@ mod streaming_queries {
 
     #[tokio::test]
     async fn test_read_snapshot_stream_with_projection_and_filter() -> Result<()> {
-        use arrow::array::Int32Array;
+        use hudi_core::arrow::array::Int32Array;
 
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
@@ -1814,7 +1814,7 @@ mod streaming_queries {
 
     #[tokio::test]
     async fn test_read_snapshot_stream_filter_column_not_in_projection() -> Result<()> {
-        use arrow::array::Int32Array;
+        use hudi_core::arrow::array::Int32Array;
 
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;

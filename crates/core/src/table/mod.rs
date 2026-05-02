@@ -38,7 +38,7 @@
 //! use hudi_core::table::Table;
 //!
 //! pub async fn test() {
-//!     use arrow_schema::Schema;
+//!     use hudi_core::arrow_schema::Schema;
 //!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
 //!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
 //!     let schema = hudi_table.get_schema().await.unwrap();

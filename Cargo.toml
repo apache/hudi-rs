@@ -36,7 +36,7 @@ homepage = "https://github.com/apache/hudi-rs"
 repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
-# arrow
+# arrow (default)
 arrow = { version = "57" }
 arrow-arith = { version = "57" }
 arrow-array = { version = "57" }
@@ -50,6 +50,21 @@ arrow-schema = { version = "57", features = ["serde"] }
 arrow-select = { version = "57" }
 object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
 parquet = { version = "57", features = ["async", "object_store"] }
+
+# arrow-54 (for compatibility with projects using arrow 54)
+arrow_v54 = { package = "arrow", version = "~54" }
+arrow-arith_v54 = { package = "arrow-arith", version = "~54" }
+arrow-array_v54 = { package = "arrow-array", version = "~54" }
+arrow-buffer_v54 = { package = "arrow-buffer", version = "~54" }
+arrow-cast_v54 = { package = "arrow-cast", version = "~54" }
+arrow-ipc_v54 = { package = "arrow-ipc", version = "~54" }
+arrow-json_v54 = { package = "arrow-json", version = "~54" }
+arrow-ord_v54 = { package = "arrow-ord", version = "~54" }
+arrow-row_v54 = { package = "arrow-row", version = "~54" }
+arrow-schema_v54 = { package = "arrow-schema", version = "~54", features = ["serde"] }
+arrow-select_v54 = { package = "arrow-select", version = "~54" }
+object_store_v54 = { package = "object_store", version = "~0.11", features = ["aws", "azure", "gcp"] }
+parquet_v54 = { package = "parquet", version = "~54", features = ["async", "object_store"] }
 
 # avro
 apache-avro = { version = "0.21", features = ["derive"] }

@@ -28,9 +28,13 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-# arrow
-arrow = { workspace = true }
-arrow-array = { workspace = true }
+# arrow (default version)
+arrow = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+
+# arrow-54 (for compatibility with projects using arrow 54)
+arrow_v54 = { workspace = true, optional = true }
+arrow-array_v54 = { workspace = true, optional = true }
 
 # datafusion (optional, for verification helpers)
 datafusion = { workspace = true, optional = true }
@@ -48,6 +52,20 @@ tokio = { workspace = true, optional = true }
 tempfile = { workspace = true }
 zip = { workspace = true }
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(use_arrow_54)'] }
+
 [features]
-default = []
+default = ["arrow-default"]
+
+arrow-default = [
+    "dep:arrow",
+    "dep:arrow-array",
+]
+
+arrow-54 = [
+    "dep:arrow_v54",
+    "dep:arrow-array_v54",
+]
+
 datafusion = ["dep:datafusion", "dep:hudi-datafusion", "dep:tokio"]

@@ -17,6 +17,12 @@
  * under the License.
  */
 
+// Arrow v54 re-exports (aliased to match the standard crate names)
+#[cfg(use_arrow_54)]
+extern crate arrow_array_v54 as arrow_array;
+#[cfg(use_arrow_54)]
+extern crate arrow_v54 as arrow;
+
 use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use std::fs;
 use std::io::Cursor;

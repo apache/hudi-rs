@@ -25,6 +25,7 @@ on:
   pull_request:
     branches:
       - main
+      - feature/**
 
 jobs:
   check-code:
