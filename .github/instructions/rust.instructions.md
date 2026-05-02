@@ -35,6 +35,11 @@ let file = File::open(&path).map_err(|e| HudiError::Io(e))?;
 - Flag blocking I/O (`std::fs`, `std::thread::sleep`) in async functions
 - Use `tokio::task::spawn_blocking` for CPU-intensive work
 
+## Style
+
+- Use inline format args (Rust 1.88+): `format!("{x}")`, not `format!("{}", x)` — expressions
+  like `path.display()` still require positional args
+
 ## API Design
 
 ### Builder Pattern

@@ -67,12 +67,16 @@ impl Filter {
 
 impl From<Filter> for (String, String, String) {
     fn from(filter: Filter) -> Self {
-        let value_str = filter
-            .values
-            .iter()
-            .map(|v| escape_in_value(v))
-            .collect::<Vec<_>>()
-            .join(",");
+        let value_str = if filter.operator.is_multi_value() {
+            filter
+                .values
+                .iter()
+                .map(|v| escape_in_value(v))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            filter.values.first().cloned().unwrap_or_default()
+        };
         (filter.field, filter.operator.to_string(), value_str)
     }
 }
@@ -761,6 +765,27 @@ mod tests {
         );
         let restored = Filter::try_from((tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str()))?;
         assert_eq!(restored.values, vec!["Smith, John", "back\\slash"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_roundtrip_scalar_with_special_chars() -> Result<()> {
+        // Scalar operators must not escape commas or backslashes because the
+        // parser does not unescape them for non-IN operators.
+        for op in [ExprOperator::Eq, ExprOperator::Ne, ExprOperator::Lt,
+                    ExprOperator::Lte, ExprOperator::Gt, ExprOperator::Gte] {
+            let original = Filter::new(
+                "city".to_string(),
+                op,
+                vec!["a,b\\c".to_string()],
+            )?;
+            let tuple: (String, String, String) = original.into();
+            assert_eq!(tuple.2, "a,b\\c", "operator {op:?} should not escape");
+            let restored = Filter::try_from((
+                tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str(),
+            ))?;
+            assert_eq!(restored.values, vec!["a,b\\c"], "operator {op:?} round-trip");
+        }
         Ok(())
     }
 }

@@ -16,7 +16,7 @@ applyTo: "python/**"
 #[pyfunction]
 fn read_table(path: &str) -> PyResult<PyObject> {
     let result = hudi_core::read_table(path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read table: {}", e)))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read table: {e}")))?;
     // ...
 }
 

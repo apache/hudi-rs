@@ -34,16 +34,9 @@ PR titles must follow [Conventional Commits](https://www.conventionalcommits.org
 - `fix(python): handle null partition values correctly`
 - `docs: update API documentation for HudiTable`
 
-## Copilot review behavior
-
-- Focus on the latest commits in updated PRs; don't re-raise issues already fixed.
-- Use the severity tags from [`AGENTS.md` → Code review](../AGENTS.md#code-review-rubric)
-  (🔴 / 🟠 / 🟡 / 💬).
-- For `crates/core` public-API changes, check `crates/datafusion`, `python/`, and `cpp/` for
-  downstream impact before approving.
-- Flag `.unwrap()` / `.expect()` / `panic!()` in non-test code as 🔴 Critical.
-- Flag blocking I/O in async functions as 🔴 Critical.
-- Flag hardcoded credentials or secrets as 🔴 Critical.
+For code review behavior, severity tags, and patterns to flag, see the path-scoped
+[`code-review.instructions.md`](./instructions/code-review.instructions.md) (loaded automatically
+for all files during review).
 
 For everything else — build commands, coding conventions, testing, security expectations — see
 [`AGENTS.md`](../AGENTS.md).
