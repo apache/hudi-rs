@@ -17,15 +17,54 @@
 
 """Tests for HudiTable accessor and stats APIs."""
 
-from hudi import HudiQueryType, HudiReadOptions, HudiTable
+from hudi import HudiFileGroupReader, HudiQueryType, HudiReadOptions, HudiTable
 from hudi._internal import get_test_table_path
 
 
-def test_base_url_property(v8_trips_table):
+def test_table_metadata_getters(v8_trips_table):
+    """Table-level getters round-trip the values from hoodie.properties."""
     table = HudiTable(v8_trips_table)
     base_url = table.base_url
     assert base_url.startswith("file://")
     assert base_url.rstrip("/").endswith("v8_trips_8i3u1d")
+    assert table.table_name == "v8_trips_8i3u1d"
+    assert table.table_type == "MERGE_ON_READ"
+    assert table.is_mor is True
+    assert isinstance(table.timezone, str) and len(table.timezone) > 0
+    assert isinstance(table.storage_options(), dict)
+    assert isinstance(table.hudi_options(), dict)
+
+
+def test_file_slice_log_files_relative_paths(v8_trips_table):
+    """The log-files accessor must mirror log_file_names with the partition prefix attached."""
+    table = HudiTable(v8_trips_table)
+    # Pick any slice with log files (V8Trips8I3U1D has updates → log files exist).
+    slice_with_logs = next(
+        (s for s in table.get_file_slices() if s.log_file_names),
+        None,
+    )
+    assert slice_with_logs is not None, (
+        "MOR fixture should have at least one slice with log files"
+    )
+    relative_paths = slice_with_logs.log_files_relative_paths()
+    assert len(relative_paths) == len(slice_with_logs.log_file_names)
+    for path in relative_paths:
+        assert path.startswith(slice_with_logs.partition_path)
+
+
+def test_file_group_reader_with_options_constructor(v8_trips_table):
+    """HudiFileGroupReader must accept an options dict (PyO3-bound constructor)."""
+    reader = HudiFileGroupReader(
+        v8_trips_table,
+        {"hoodie.read.use.read_optimized.mode": "true"},
+    )
+    table = HudiTable(v8_trips_table)
+    sf_slices = table.get_file_slices(
+        HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    )
+    batch = reader.read_file_slice(sf_slices[0])
+    # Read-optimized skips log merging; the result is still a valid batch with the table schema.
+    assert batch.num_columns > 0
 
 
 def test_get_incremental_file_slices():

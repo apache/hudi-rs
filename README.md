@@ -162,14 +162,13 @@ let batches = hudi_table.read(&options).await?;
 The supported formats for the timestamp argument are:
 - Hudi Timeline format (highest matching precedence): `yyyyMMddHHmmssSSS` or `yyyyMMddHHmmss`.
 - Unix epoch time in seconds, milliseconds, microseconds, or nanoseconds.
-- ISO 8601 format including but not limited to:
+- RFC 3339 / ISO 8601 with timezone offset, including:
   - `yyyy-MM-dd'T'HH:mm:ss.SSS+00:00`
   - `yyyy-MM-dd'T'HH:mm:ss.SSSZ`
-  - `yyyy-MM-dd'T'HH:mm:ss.SSS`
   - `yyyy-MM-dd'T'HH:mm:ss+00:00`
   - `yyyy-MM-dd'T'HH:mm:ssZ`
-  - `yyyy-MM-dd'T'HH:mm:ss`
-  - `yyyy-MM-dd`
+
+Timestamp strings without a timezone offset (for example `yyyy-MM-dd'T'HH:mm:ss`) and date-only strings (for example `yyyy-MM-dd`) are not accepted.
 </details>
 
 ### Incremental Query
@@ -344,17 +343,19 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi::util::collection::split_into_chunks` on the result. |
 |                 | `compute_table_stats()`                                          | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
-| Query execution | `create_file_group_reader_with_options()`                        | Create a file group reader instance with the table instance's configs.                                   |
+| Query execution | `create_file_group_reader_with_options(read_options, extras)`    | Create a file group reader with the table's configs. Both args are optional; `read_options.hudi_options` overrides table-level defaults (excluding the four `Table`-owned read keys), and `extras` always wins. |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
 
 ### File Group API
 
 Create a Hudi file group reader instance using its constructor or the Hudi table API `create_file_group_reader_with_options()`.
 
-| Stage           | API                              | Description                                                                                                                                                                        |
-|-----------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Query execution | `read_file_slice()`              | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
-|                 | `read_file_slice_from_paths()`   | Read records from an explicit base file path and a list of log file paths. Pass an empty log path list to read just the base file.                                                 |
+| Stage           | API                                     | Description                                                                                                                                                                        |
+|-----------------|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Query execution | `read_file_slice()`                     | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
+|                 | `read_file_slice_from_paths()`          | Read records from an explicit base file path and a list of log file paths. Pass an empty log path list to read just the base file.                                                 |
+|                 | `read_file_slice_stream()`              | Streaming version of `read_file_slice()`. Yields true streaming batches when the slice is base-file-only or read-optimized; for MOR slices with log files, falls back to a single merged batch. |
+|                 | `read_file_slice_from_paths_stream()`   | Streaming version of `read_file_slice_from_paths()`.                                                                                                                               |
 
 
 ### Apache DataFusion

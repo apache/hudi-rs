@@ -611,6 +611,65 @@ mod v8_tables {
 
             Ok(())
         }
+
+        #[tokio::test]
+        async fn test_file_group_reader_read_file_slice_mor_applies_filters_and_projection_after_merge()
+        -> Result<()> {
+            // Direct FileGroupReader path on a MOR slice with log files. The
+            // reader merges base + log records first; only afterwards does
+            // `apply_eager_options` apply `filters` (as a row mask) and
+            // `projection` (column narrowing). Verifies the post-merge
+            // hand-off is wired correctly: schema narrows, rows are filtered,
+            // and the count matches the table-level read with the same options.
+            let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let all_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+            let mor_slice = all_slices
+                .iter()
+                .find(|fs| fs.has_log_file())
+                .expect("V8Trips8I3U1D MOR fixture should have at least one slice with log files");
+
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            // Sanity: read the merged slice unfiltered so we can pick a rider
+            // present in this slice and assert the filter actually narrows it.
+            let unfiltered = fg_reader
+                .read_file_slice(mor_slice, &ReadOptions::new())
+                .await?;
+            assert!(unfiltered.num_rows() > 0);
+            let unfiltered_riders = unfiltered
+                .column_by_name("rider")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let target_rider = unfiltered_riders.value(0).to_string();
+
+            let options = ReadOptions::new()
+                .with_filters([("rider", "=", target_rider.as_str())])
+                .with_projection(["rider", "fare"]);
+            let merged = fg_reader.read_file_slice(mor_slice, &options).await?;
+
+            // Schema narrowed to projection.
+            let field_names: Vec<_> = merged
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(field_names, vec!["rider", "fare"]);
+            // Filter applied post-merge: only the target rider's row survives,
+            // and there's exactly one row per rider in the merged result.
+            assert_eq!(merged.num_rows(), 1);
+            let riders = merged
+                .column_by_name("rider")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            assert_eq!(riders.value(0), target_rider);
+            Ok(())
+        }
     }
 
     /// Streaming query tests for v8 tables
@@ -1801,7 +1860,10 @@ mod streaming_queries {
 
     #[tokio::test]
     async fn test_filter_on_unknown_column_errors() -> Result<()> {
-        // A typo on a filter column should error rather than silently no-op.
+        // A typo on a filter column should error rather than silently no-op,
+        // across all three dispatch paths (eager snapshot, eager incremental,
+        // streaming snapshot). Streaming surfaces the error synchronously,
+        // before the stream is constructed, so callers don't have to poll.
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
         let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")]);
@@ -1820,6 +1882,14 @@ mod streaming_queries {
             incremental_err.to_string().contains("rider_idd"),
             "incremental error should mention the bad column, got: {incremental_err}"
         );
+
+        match hudi_table.read_stream(&options).await {
+            Ok(_) => panic!("read_stream must surface the typo synchronously"),
+            Err(e) => assert!(
+                e.to_string().contains("rider_idd"),
+                "stream error should mention the bad column, got: {e}"
+            ),
+        }
         Ok(())
     }
 

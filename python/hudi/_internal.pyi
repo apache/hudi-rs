@@ -154,6 +154,13 @@ class HudiFileGroupReader:
         """
         ...
 
+    @property
+    def is_metadata_table(self) -> bool:
+        """
+        Whether this reader targets a metadata table (base path ends with ``.hoodie/metadata``).
+        """
+        ...
+
 @dataclass(init=False)
 class HudiFileSlice:
     """
@@ -338,17 +345,30 @@ class HudiTable:
         self, options: Optional[HudiReadOptions] = None
     ) -> List[HudiFileSlice]:
         """
-        Get the file slices in the table at a snapshot moment.
+        Get the file slices the read targets, dispatching on ``options.query_type``.
 
-        Reads at ``options.as_of_timestamp`` if set, otherwise the latest commit.
-        ``options.filters`` drive pruning (partition + file-level) and row-level filtering.
+        - Snapshot: slices visible at ``options.as_of_timestamp`` (defaults to the
+          latest commit). ``options.filters`` drive partition + file-level stats
+          pruning.
+        - Incremental: slices changed in ``(options.start_timestamp,
+          options.end_timestamp]``. ``options.filters`` drive partition pruning only.
         """
         ...
     def create_file_group_reader_with_options(
-        self, options: Optional[Dict[str, str]] = None
+        self,
+        read_options: Optional[HudiReadOptions] = None,
+        extra_overrides: Optional[Dict[str, str]] = None,
     ) -> HudiFileGroupReader:
         """
-        Create a HudiFileGroupReader for reading records from file groups in the Hudi table.
+        Create a :class:`HudiFileGroupReader` using the table's Hudi configs.
+
+        Layering, last-writer-wins:
+
+        1. Table-level Hudi configs.
+        2. ``read_options.hudi_options`` when ``read_options`` is provided, **excluding**
+           the four keys the ``Table`` layer interprets directly (``query_type``,
+           ``as_of_timestamp``, ``start_timestamp``, ``end_timestamp``).
+        3. ``extra_overrides`` — caller-supplied per-path overrides; these always win.
         """
         ...
     def read(

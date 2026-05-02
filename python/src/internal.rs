@@ -457,6 +457,12 @@ impl HudiFileGroupReader {
         })?;
         Ok(HudiRecordBatchStream::from_stream(stream))
     }
+
+    /// Whether this reader targets a metadata table (its base path ends with `.hoodie/metadata`).
+    #[getter]
+    fn is_metadata_table(&self) -> bool {
+        self.inner.is_metadata_table()
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -703,14 +709,19 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (options=None))]
+    #[pyo3(signature = (read_options=None, extra_overrides=None))]
     fn create_file_group_reader_with_options(
         &self,
-        options: Option<HashMap<String, String>>,
+        read_options: Option<HudiReadOptions>,
+        extra_overrides: Option<HashMap<String, String>>,
     ) -> PyResult<HudiFileGroupReader> {
+        let read_options = read_options.map(|o| o.to_inner());
         let fg_reader = self
             .inner
-            .create_file_group_reader_with_options(None, options.unwrap_or_default())
+            .create_file_group_reader_with_options(
+                read_options.as_ref(),
+                extra_overrides.unwrap_or_default(),
+            )
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner: fg_reader })
     }

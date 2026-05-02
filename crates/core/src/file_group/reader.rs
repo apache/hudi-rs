@@ -730,6 +730,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_with_options_resolves_table_properties_from_storage() {
+        // The minimum-props fixture's hoodie.properties carries TableType,
+        // TableName, and TableVersion. With empty user options, the
+        // OptionResolver must read them off storage and seed hudi_configs —
+        // otherwise downstream commit-time / merge logic would fall back to
+        // defaults and silently misbehave on real tables.
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options())
+            .await
+            .unwrap();
+
+        let table_type: String = reader
+            .hudi_configs
+            .get(HudiTableConfig::TableType)
+            .unwrap()
+            .into();
+        assert_eq!(table_type, "COPY_ON_WRITE");
+        let table_name: String = reader
+            .hudi_configs
+            .get(HudiTableConfig::TableName)
+            .unwrap()
+            .into();
+        assert_eq!(table_name, "trips");
+        let table_version: isize = reader
+            .hudi_configs
+            .get(HudiTableConfig::TableVersion)
+            .unwrap()
+            .into();
+        assert_eq!(table_version, 6);
+    }
+
+    #[tokio::test]
     async fn test_new_with_options_invalid_base_uri_or_invalid_props() {
         let base_uri = get_non_existent_base_uri();
         let result = FileGroupReader::new_with_options(&base_uri, empty_options()).await;

@@ -126,23 +126,6 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
 
-/// Hudi config keys the `Table` layer interprets directly: it dispatches on
-/// `QueryType`, resolves `AsOfTimestamp` for snapshot reads, and resolves
-/// start/end timestamps for incremental reads. The resolved values are then
-/// injected as per-path overrides when constructing the `FileGroupReader`.
-///
-/// Because the `FileGroupReader` itself reads `StartTimestamp`/`EndTimestamp`
-/// to drive commit-time filtering, leaving any of these keys un-stripped from
-/// `ReadOptions::hudi_options` would silently change behavior — e.g. a stray
-/// `hoodie.read.start.timestamp` would activate commit-time filtering on a
-/// snapshot read. Strings must match `HudiReadConfig::*.as_ref()`.
-const TABLE_OWNED_READ_KEYS: &[&str] = &[
-    "hoodie.read.query.type",      // HudiReadConfig::QueryType
-    "hoodie.read.as.of.timestamp", // HudiReadConfig::AsOfTimestamp
-    "hoodie.read.start.timestamp", // HudiReadConfig::StartTimestamp
-    "hoodie.read.end.timestamp",   // HudiReadConfig::EndTimestamp
-];
-
 /// The main struct that provides table APIs for interacting with a Hudi table.
 #[derive(Debug)]
 pub struct Table {
@@ -436,12 +419,13 @@ impl Table {
     /// Get the [FileSlice]s the read targets, dispatching on `options.query_type`.
     ///
     /// - [`QueryType::Snapshot`]: returns slices visible at `options.as_of_timestamp`,
-    ///   defaulting to the latest commit.
+    ///   defaulting to the latest commit. `options.filters` drive both partition
+    ///   pruning and file-level stats pruning (when min/max stats are available).
     /// - [`QueryType::Incremental`]: returns slices changed in
     ///   (`options.start_timestamp`, `options.end_timestamp`], defaulting to earliest
-    ///   and latest respectively.
+    ///   and latest respectively. `options.filters` drive partition pruning only;
+    ///   data-column filters do not prune files at planning time.
     ///
-    /// `options.filters` are applied as partition filters in both cases.
     /// Returns an empty vector when the table has no commits.
     ///
     /// To bucket the result for parallel reads, use
@@ -568,14 +552,13 @@ impl Table {
     ///
     /// Layering, last-writer-wins:
     /// 1. Table-level Hudi configs (constant for this `Table` instance).
-    /// 2. `read_options.hudi_options` when `read_options` is `Some`, **excluding**
-    ///    [`TABLE_OWNED_READ_KEYS`] — those are interpreted by the `Table` layer's
-    ///    read paths and translated into the appropriate `extra_overrides`. Letting
-    ///    them through as-is would silently activate FG-reader-side commit-time
-    ///    filtering on, e.g., a snapshot read that happens to have a stray
-    ///    `hoodie.read.start.timestamp` in the bag.
-    /// 3. `extra_overrides` — caller-supplied per-path overrides (e.g. resolved
-    ///    `EndTimestamp` for the snapshot read path); these always win.
+    /// 2. `read_options.hudi_options` when `read_options` is `Some` — per-read overrides.
+    /// 3. `extra_overrides` — caller-supplied per-path overrides; always win.
+    ///
+    /// The `Table` read paths are responsible for stripping any mode-specific
+    /// keys from `read_options` that would change FG-reader behavior (notably
+    /// `StartTimestamp` for snapshot reads — see
+    /// [`Self::create_file_group_reader_for_snapshot`]).
     pub fn create_file_group_reader_with_options<I, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
@@ -592,9 +575,6 @@ impl Table {
         }
         if let Some(opts) = read_options {
             for (k, v) in &opts.hudi_options {
-                if TABLE_OWNED_READ_KEYS.contains(&k.as_str()) {
-                    continue;
-                }
                 overwriting_options.insert(k.clone(), v.clone());
             }
         }
@@ -613,8 +593,10 @@ impl Table {
     /// - [`QueryType::Incremental`] reads the change range
     ///   (`options.start_timestamp`, `options.end_timestamp`].
     ///
-    /// `options.filters` are applied as partition filters; `options.hudi_options`
-    /// override table-level Hudi configs for this single read.
+    /// `options.filters` drive partition pruning, file-level stats pruning (snapshot
+    /// only), and a row-level mask on every returned batch — see [`ReadOptions::filters`]
+    /// for the full breakdown. `options.hudi_options` override table-level Hudi configs
+    /// for this single read.
     pub async fn read(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
         match options.query_type()? {
             QueryType::Snapshot => self.read_snapshot_inner(options).await,
@@ -628,10 +610,7 @@ impl Table {
         };
         let filters = parse_filter_tuples(&options.filters)?;
         let file_slices = self.get_file_slices_inner(&timestamp, &filters).await?;
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(options),
-            [(HudiReadConfig::EndTimestamp, timestamp.clone())],
-        )?;
+        let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
         let fg_options = self.options_for_file_group(options);
         let batches = futures::future::try_join_all(
             file_slices
@@ -640,6 +619,27 @@ impl Table {
         )
         .await?;
         Ok(batches)
+    }
+
+    /// Build a `FileGroupReader` for a snapshot read.
+    ///
+    /// Strips `StartTimestamp` from `options.hudi_options` — that's an
+    /// incremental-only knob and would silently activate commit-time filtering
+    /// at the FG reader. The resolved snapshot bound is injected as
+    /// `EndTimestamp` (extras win on conflict, so any stray user-set
+    /// `EndTimestamp` is harmlessly overridden).
+    fn create_file_group_reader_for_snapshot(
+        &self,
+        options: &ReadOptions,
+        snapshot_timestamp: &str,
+    ) -> Result<FileGroupReader> {
+        let mut bag = options.hudi_options.clone();
+        bag.remove(HudiReadConfig::StartTimestamp.key_str());
+        bag.insert(
+            HudiReadConfig::EndTimestamp.key_str().to_string(),
+            snapshot_timestamp.to_string(),
+        );
+        self.create_file_group_reader_with_options(None, bag)
     }
 
     async fn read_incremental_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
@@ -787,10 +787,7 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(options),
-            [(HudiReadConfig::EndTimestamp, timestamp)],
-        )?;
+        let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
@@ -1481,18 +1478,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn table_owned_read_keys_match_hudi_read_config() {
-        // Sentinel: any future rename of HudiReadConfig keys must also update
-        // TABLE_OWNED_READ_KEYS, otherwise sanitization in
-        // create_file_group_reader_with_options silently breaks.
-        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::QueryType.as_ref()));
-        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::AsOfTimestamp.as_ref()));
-        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::StartTimestamp.as_ref()));
-        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::EndTimestamp.as_ref()));
-        assert_eq!(TABLE_OWNED_READ_KEYS.len(), 4);
-    }
-
     #[tokio::test]
     async fn hudi_table_get_file_slices_dispatches_on_query_type() {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
@@ -1512,6 +1497,31 @@ mod tests {
             .unwrap();
         assert!(!snapshot_slices.is_empty());
         assert!(!incremental_slices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_with_invalid_as_of_timestamp_errors() {
+        // `as_of_timestamp` is parsed via `format_timestamp` before any IO. A
+        // malformed value must surface as `TimestampParsingError` rather than
+        // silently being treated as "latest" or sliced into a no-op result.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let options = ReadOptions::new().with_as_of_timestamp("not-a-timestamp");
+
+        let snapshot_err = hudi_table.read(&options).await.unwrap_err();
+        assert!(
+            matches!(snapshot_err, CoreError::TimestampParsingError(_)),
+            "expected TimestampParsingError, got: {snapshot_err}"
+        );
+
+        let stream_result = hudi_table.read_stream(&options).await;
+        match stream_result {
+            Ok(_) => panic!("read_stream must propagate the parse error synchronously"),
+            Err(e) => assert!(
+                matches!(e, CoreError::TimestampParsingError(_)),
+                "expected TimestampParsingError on stream path, got: {e}"
+            ),
+        }
     }
 
     #[tokio::test]

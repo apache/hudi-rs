@@ -23,12 +23,12 @@ use CoreError::TimestampParsingError;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use std::str::FromStr;
 
-/// Parse various timestamp formats and convert to Hudi timeline format
+/// Parse various timestamp formats and convert to Hudi timeline format.
 ///
 /// Supported formats:
-/// - Hudi timeline format: `yyyyMMddHHmmSSSSS` or `yyyyMMddHHmmSS`
+/// - Hudi timeline format: `yyyyMMddHHmmssSSS` or `yyyyMMddHHmmss`
 /// - Epoch time (seconds, milliseconds, microseconds, nanoseconds)
-/// - RFC3339 format like `2024-03-15T14:25:30Z` or `2024-03-15T14:25:30+00:00` or `2024-03-15`
+/// - RFC3339 format like `2024-03-15T14:25:30Z` or `2024-03-15T14:25:30+00:00`
 ///
 /// # Arguments
 /// * `ts_str` - The timestamp str to parse

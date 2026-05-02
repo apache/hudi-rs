@@ -18,9 +18,11 @@
 """Streaming read tests using v8_trips_8i3u1d (MOR, partitioned by city)."""
 
 import pyarrow as pa
+import pytest
 
 from hudi import (
     HudiFileGroupReader,
+    HudiQueryType,
     HudiReadOptions,
     HudiRecordBatchStream,
     HudiTable,
@@ -34,22 +36,50 @@ def test_read_options_default():
     assert options.hudi_options == {}
 
 
-def test_read_options_with_values():
+def test_read_options_typed_accessors_round_trip():
+    """Every builder that writes into hudi_options must round-trip via its typed accessor."""
     options = (
         HudiReadOptions(filters=[("city", "=", "san_francisco")])
         .with_projection(["uuid", "rider"])
+        .with_query_type(HudiQueryType.Incremental)
         .with_batch_size(2048)
         .with_as_of_timestamp("20240101000000000")
+        .with_start_timestamp("20240101000000000")
+        .with_end_timestamp("20240301000000000")
     )
     assert options.filters == [("city", "=", "san_francisco")]
     assert options.projection == ["uuid", "rider"]
     # Builders insert into hudi_options under the matching HudiReadConfig keys.
     assert options.hudi_options["hoodie.read.stream.batch_size"] == "2048"
     assert options.hudi_options["hoodie.read.as.of.timestamp"] == "20240101000000000"
+    assert options.hudi_options["hoodie.read.start.timestamp"] == "20240101000000000"
+    assert options.hudi_options["hoodie.read.end.timestamp"] == "20240301000000000"
     # Typed accessors round-trip.
+    assert options.query_type() == HudiQueryType.Incremental
     assert options.batch_size() == 2048
     assert options.as_of_timestamp() == "20240101000000000"
+    assert options.start_timestamp() == "20240101000000000"
+    assert options.end_timestamp() == "20240301000000000"
     assert "HudiReadOptions" in repr(options)
+
+
+def test_read_options_query_type_bad_value_raises():
+    """A bogus value left in hudi_options under the query-type key surfaces as an error."""
+    bogus = HudiReadOptions(hudi_options={"hoodie.read.query.type": "bogus"})
+    with pytest.raises(Exception):
+        bogus.query_type()
+
+
+def test_read_options_bulk_setters():
+    """The plural builders (with_filters, with_hudi_options) chain identically to the singular ones."""
+    options = (
+        HudiReadOptions()
+        .with_filters([("city", "=", "x"), ("rider", "=", "rider-A")])
+        .with_hudi_options({"k1": "v1", "k2": "v2"})
+    )
+    assert options.filters == [("city", "=", "x"), ("rider", "=", "rider-A")]
+    assert options.hudi_options["k1"] == "v1"
+    assert options.hudi_options["k2"] == "v2"
 
 
 def test_read_snapshot_stream_yields_all_rows(v8_trips_table):

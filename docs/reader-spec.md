@@ -25,7 +25,7 @@ For tutorials and end-to-end examples, see the [README](../README.md). Covers Ru
 
 ## Contents
 
-1. [Read modes](#1-read-modes)
+1. [Query types](#1-query-types)
 2. [`ReadOptions`](#2-readoptions)
 3. [Filter expressions](#3-filter-expressions)
 4. [Rust API](#4-rust-api)
@@ -33,13 +33,16 @@ For tutorials and end-to-end examples, see the [README](../README.md). Covers Ru
 6. [Caller expectations](#6-caller-expectations)
 7. [Stability and out of scope](#7-stability-and-out-of-scope)
 
-## 1. Read modes
+## 1. Query types
+
+The two `QueryType` variants on `ReadOptions`:
 
 - **Snapshot** — latest table state at one commit (the latest by default; an explicit `as_of_timestamp` for time-travel).
 - **Incremental** — records changed in the half-open range (`start_timestamp`, `end_timestamp`].
-- **Per-file-slice** — read a single `FileSlice` the caller already selected (typically obtained from `get_file_slices` with the right options).
 
-Snapshot and per-file-slice reads each have an **eager** form returning all batches and a **streaming** form yielding batches as they're read. Incremental reads currently expose only the eager form.
+Snapshot reads have an **eager** form returning all batches and a **streaming** form yielding batches as they're read. Incremental reads currently expose only the eager form.
+
+Per-slice reads — reading a single `FileSlice` the caller already selected (typically obtained from `get_file_slices` with the right options) — are not a query type; they live on `FileGroupReader` and have both eager and streaming forms.
 
 ## 2. `ReadOptions`
 
@@ -205,7 +208,7 @@ table = (
 | `get_schema_in_avro_str()` / `get_schema_in_avro_str_with_meta_fields()`                           | `str`                                    |
 | `get_timeline()`                                                                                   | `HudiTimeline`                           |
 | `get_file_slices(options=None)`                                                                    | `List[HudiFileSlice]` (dispatches on `options.query_type`) |
-| `create_file_group_reader_with_options(options=None)`                                              | `HudiFileGroupReader`                    |
+| `create_file_group_reader_with_options(read_options=None, extra_overrides=None)`                   | `HudiFileGroupReader`                    |
 | `read(options=None)`                                                                               | `List[pyarrow.RecordBatch]` (dispatches on `query_type`) |
 | `read_stream(options=None)`                                                                        | `HudiRecordBatchStream` (errors on `Incremental`) |
 | `compute_table_stats()`                                                                            | `Optional[Tuple[int, int]]`              |
@@ -219,6 +222,7 @@ table = (
 | `read_file_slice_from_paths(base_path, log_paths, options=None)`           | `pyarrow.RecordBatch` (pass empty log_paths for base-only) |
 | `read_file_slice_stream(file_slice, options=None)`                         | `HudiRecordBatchStream`          |
 | `read_file_slice_from_paths_stream(base_path, log_paths, options=None)`    | `HudiRecordBatchStream`          |
+| property: `is_metadata_table`                                              | `bool`                           |
 
 ### `HudiReadOptions`
 
