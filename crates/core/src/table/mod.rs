@@ -442,7 +442,8 @@ impl Table {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
-        self.get_file_slices_inner(&timestamp, &options.filters).await
+        self.get_file_slices_inner(&timestamp, &options.filters)
+            .await
     }
 
     async fn get_incremental_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {

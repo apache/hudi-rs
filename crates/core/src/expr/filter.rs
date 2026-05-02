@@ -487,7 +487,7 @@ mod tests {
         Ok(())
     }
 
-#[test]
+    #[test]
     fn test_filters_to_row_mask_empty_returns_all_true() -> Result<()> {
         let schema = Arc::new(create_test_schema());
         let batch = RecordBatch::try_new(
@@ -772,19 +772,24 @@ mod tests {
     fn test_filter_roundtrip_scalar_with_special_chars() -> Result<()> {
         // Scalar operators must not escape commas or backslashes because the
         // parser does not unescape them for non-IN operators.
-        for op in [ExprOperator::Eq, ExprOperator::Ne, ExprOperator::Lt,
-                    ExprOperator::Lte, ExprOperator::Gt, ExprOperator::Gte] {
-            let original = Filter::new(
-                "city".to_string(),
-                op,
-                vec!["a,b\\c".to_string()],
-            )?;
+        for op in [
+            ExprOperator::Eq,
+            ExprOperator::Ne,
+            ExprOperator::Lt,
+            ExprOperator::Lte,
+            ExprOperator::Gt,
+            ExprOperator::Gte,
+        ] {
+            let original = Filter::new("city".to_string(), op, vec!["a,b\\c".to_string()])?;
             let tuple: (String, String, String) = original.into();
             assert_eq!(tuple.2, "a,b\\c", "operator {op:?} should not escape");
-            let restored = Filter::try_from((
-                tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str(),
-            ))?;
-            assert_eq!(restored.values, vec!["a,b\\c"], "operator {op:?} round-trip");
+            let restored =
+                Filter::try_from((tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str()))?;
+            assert_eq!(
+                restored.values,
+                vec!["a,b\\c"],
+                "operator {op:?} round-trip"
+            );
         }
         Ok(())
     }

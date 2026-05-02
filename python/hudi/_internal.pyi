@@ -71,9 +71,7 @@ class HudiReadOptions:
     def with_batch_size(self, size: int) -> "HudiReadOptions":
         """Target rows per batch for streaming reads. Raises ``HudiCoreError`` if ``size == 0``."""
         ...
-    def with_filters(
-        self, filters: List[Tuple[str, str, str]]
-    ) -> "HudiReadOptions":
+    def with_filters(self, filters: List[Tuple[str, str, str]]) -> "HudiReadOptions":
         """Set column filters as ``(field, op, value)`` tuples. Parses and cardinality-validates immediately; an unrecognized operator or empty ``IN`` / ``NOT IN`` value list raises ``HudiCoreError``."""
         ...
     def with_projection(self, columns: List[str]) -> "HudiReadOptions": ...
@@ -448,6 +446,7 @@ def build_hudi_table(
         HudiTable: An instance of hudi table.
     """
     ...
+
 @dataclass(init=False)
 class HudiDataFusionDataSource:
     def __init__(

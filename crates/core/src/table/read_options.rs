@@ -162,11 +162,13 @@ impl ReadOptions {
         S2: AsRef<str>,
         S3: AsRef<str>,
     {
-        self.filters = from_str_tuples(
-            filters
-                .into_iter()
-                .map(|(f, o, v)| (f.as_ref().to_string(), o.as_ref().to_string(), v.as_ref().to_string())),
-        )?;
+        self.filters = from_str_tuples(filters.into_iter().map(|(f, o, v)| {
+            (
+                f.as_ref().to_string(),
+                o.as_ref().to_string(),
+                v.as_ref().to_string(),
+            )
+        }))?;
         Ok(self)
     }
 
