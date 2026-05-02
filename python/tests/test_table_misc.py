@@ -84,8 +84,7 @@ def test_get_incremental_file_slices():
 def test_compute_table_stats(v8_trips_table):
     table = HudiTable(v8_trips_table)
     stats = table.compute_table_stats()
-    if stats is None:
-        return
+    assert stats is not None, "v8_trips fixture is MDT-enabled; stats must not be None"
     num_rows, byte_size = stats
     assert num_rows > 0
     assert byte_size > 0

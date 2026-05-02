@@ -786,8 +786,8 @@ impl Table {
     /// use hudi::table::ReadOptions;
     ///
     /// let options = ReadOptions::new()
-    ///     .with_filters([("city", "=", "san_francisco")])
-    ///     .with_batch_size(4096);
+    ///     .with_filters([("city", "=", "san_francisco")])?
+    ///     .with_batch_size(4096)?;
     /// let mut stream = table.read_stream(&options).await?;
     /// while let Some(result) = stream.next().await {
     ///     println!("Read {} rows", result?.num_rows());
