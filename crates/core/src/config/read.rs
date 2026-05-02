@@ -185,7 +185,13 @@ impl ConfigParser for HudiReadConfig {
                 .map(HudiConfigValue::Boolean),
             Self::StreamBatchSize => get_result
                 .and_then(|v| {
-                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
+                    let key = self.key();
+                    let parsed =
+                        usize::from_str(v).map_err(|e| ParseInt(key.clone(), v.to_string(), e))?;
+                    if parsed == 0 {
+                        return Err(InvalidValue(format!("{key}=0 (must be > 0)")));
+                    }
+                    Ok(parsed)
                 })
                 .map(HudiConfigValue::UInteger),
         }

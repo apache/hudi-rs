@@ -463,7 +463,12 @@ impl Table {
         let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
 
         let partition_schema = self.get_partition_schema().await?;
-        let table_schema = self.get_schema().await?;
+        // Validate against the meta-inclusive schema so filters on Hudi meta fields
+        // (e.g. `_hoodie_record_key`) are accepted — those columns are present in
+        // returned batches and the row-level mask applies them. The pruners are
+        // tolerant of meta-field filters: PartitionPruner ignores non-partition
+        // columns, and FilePruner skips columns without stats.
+        let table_schema = self.get_schema_with_meta_fields().await?;
         validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
 
         let partition_pruner =
@@ -524,7 +529,9 @@ impl Table {
             None
         } else {
             let partition_schema = self.get_partition_schema().await?;
-            let table_schema = self.get_schema().await?;
+            // See `get_file_slices_inner` for why validation uses the
+            // meta-inclusive schema.
+            let table_schema = self.get_schema_with_meta_fields().await?;
             validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
             Some(PartitionPruner::new(
                 filters,
@@ -553,12 +560,14 @@ impl Table {
     /// Layering, last-writer-wins:
     /// 1. Table-level Hudi configs (constant for this `Table` instance).
     /// 2. `read_options.hudi_options` when `read_options` is `Some` — per-read overrides.
+    ///    The four `Table`-owned read keys ([`HudiReadConfig::QueryType`],
+    ///    [`HudiReadConfig::AsOfTimestamp`], [`HudiReadConfig::StartTimestamp`],
+    ///    [`HudiReadConfig::EndTimestamp`]) are stripped here: the `Table` layer
+    ///    interprets them for dispatch and snapshot resolution, and a stale value
+    ///    (e.g. an incremental `StartTimestamp` left in the bag) would silently
+    ///    activate commit-time filtering at the FG reader.
     /// 3. `extra_overrides` — caller-supplied per-path overrides; always win.
-    ///
-    /// The `Table` read paths are responsible for stripping any mode-specific
-    /// keys from `read_options` that would change FG-reader behavior (notably
-    /// `StartTimestamp` for snapshot reads — see
-    /// [`Self::create_file_group_reader_for_snapshot`]).
+    ///    Use these to inject the resolved timestamps for the current read.
     pub fn create_file_group_reader_with_options<I, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
@@ -575,6 +584,9 @@ impl Table {
         }
         if let Some(opts) = read_options {
             for (k, v) in &opts.hudi_options {
+                if Self::TABLE_OWNED_READ_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
                 overwriting_options.insert(k.clone(), v.clone());
             }
         }
@@ -586,6 +598,17 @@ impl Table {
             overwriting_options,
         )
     }
+
+    /// Read-option keys the `Table` layer interprets directly. These are
+    /// excluded from the per-read overrides forwarded to the FG reader so a
+    /// stale value can't change physical-read behavior — see
+    /// [`Self::create_file_group_reader_with_options`].
+    const TABLE_OWNED_READ_KEYS: [&'static str; 4] = [
+        HudiReadConfig::QueryType.key_str(),
+        HudiReadConfig::AsOfTimestamp.key_str(),
+        HudiReadConfig::StartTimestamp.key_str(),
+        HudiReadConfig::EndTimestamp.key_str(),
+    ];
 
     /// Read records, dispatching on `options.query_type`.
     ///
@@ -621,25 +644,19 @@ impl Table {
         Ok(batches)
     }
 
-    /// Build a `FileGroupReader` for a snapshot read.
-    ///
-    /// Strips `StartTimestamp` from `options.hudi_options` — that's an
-    /// incremental-only knob and would silently activate commit-time filtering
-    /// at the FG reader. The resolved snapshot bound is injected as
-    /// `EndTimestamp` (extras win on conflict, so any stray user-set
-    /// `EndTimestamp` is harmlessly overridden).
+    /// Build a `FileGroupReader` for a snapshot read with the resolved snapshot
+    /// bound injected as `EndTimestamp`. The Table-owned read keys in
+    /// `options.hudi_options` (notably any stray incremental `StartTimestamp`)
+    /// are dropped by [`Self::create_file_group_reader_with_options`].
     fn create_file_group_reader_for_snapshot(
         &self,
         options: &ReadOptions,
         snapshot_timestamp: &str,
     ) -> Result<FileGroupReader> {
-        let mut bag = options.hudi_options.clone();
-        bag.remove(HudiReadConfig::StartTimestamp.key_str());
-        bag.insert(
-            HudiReadConfig::EndTimestamp.key_str().to_string(),
-            snapshot_timestamp.to_string(),
-        );
-        self.create_file_group_reader_with_options(None, bag)
+        self.create_file_group_reader_with_options(
+            Some(options),
+            [(HudiReadConfig::EndTimestamp, snapshot_timestamp.to_string())],
+        )
     }
 
     async fn read_incremental_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {

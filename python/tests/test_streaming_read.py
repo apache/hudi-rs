@@ -71,12 +71,26 @@ def test_read_options_query_type_bad_value_raises():
 
 
 def test_read_options_batch_size_bad_value_raises():
-    """A non-integer batch_size in hudi_options surfaces as an error rather than falling back to the default."""
+    """Bad batch_size values surface at the accessor: non-integer parses fail, and `0`
+    is rejected (a zero-row batch yields no batches at the parquet stream reader)."""
     bogus = HudiReadOptions(
         hudi_options={"hoodie.read.stream.batch_size": "not_a_number"}
     )
     with pytest.raises(Exception):
         bogus.batch_size()
+
+    zero = HudiReadOptions().with_batch_size(0)
+    with pytest.raises(Exception, match="must be > 0"):
+        zero.batch_size()
+
+
+def test_read_stream_batch_size_zero_raises(v8_trips_table):
+    """End-to-end: `with_batch_size(0)` surfaces as an error from `read_stream`
+    instead of silently yielding no batches."""
+    table = HudiTable(v8_trips_table)
+    options = HudiReadOptions().with_batch_size(0)
+    with pytest.raises(Exception, match="must be > 0"):
+        table.read_stream(options)
 
 
 def test_read_options_bulk_setters():

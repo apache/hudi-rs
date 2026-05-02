@@ -267,16 +267,20 @@ impl HudiReadOptions {
     }
 
     /// The target batch size (rows per batch) for streaming reads, if set.
-    /// Raises if the stored value is not a valid integer.
+    /// Raises if the stored value is not a valid integer or is `0` (a zero-row
+    /// batch yields no batches at the parquet stream reader).
     fn batch_size(&self) -> PyResult<Option<usize>> {
-        match self.hudi_options.get(HudiReadConfig::StreamBatchSize.as_ref()) {
-            Some(s) => s
-                .parse::<usize>()
-                .map(Some)
-                .map_err(|e| HudiCoreError::new_err(format!(
-                    "Invalid {}={s:?}: {e}",
-                    HudiReadConfig::StreamBatchSize.as_ref(),
-                ))),
+        let key = HudiReadConfig::StreamBatchSize.as_ref();
+        match self.hudi_options.get(key) {
+            Some(s) => {
+                let parsed = s
+                    .parse::<usize>()
+                    .map_err(|e| HudiCoreError::new_err(format!("Invalid {key}={s:?}: {e}")))?;
+                if parsed == 0 {
+                    return Err(HudiCoreError::new_err(format!("{key} must be > 0, got 0")));
+                }
+                Ok(Some(parsed))
+            }
             None => Ok(None),
         }
     }

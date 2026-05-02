@@ -2047,6 +2047,87 @@ mod streaming_queries {
         );
         Ok(())
     }
+
+    /// Regression: the public `create_file_group_reader_with_options` API must
+    /// strip the four `Table`-owned read keys from `read_options.hudi_options`
+    /// before forwarding them to the FG reader. Otherwise a stray
+    /// `StartTimestamp` activates commit-time filtering at the physical layer
+    /// and silently drops every row.
+    #[tokio::test]
+    async fn test_create_fg_reader_strips_table_owned_keys() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(!file_slices.is_empty());
+        let file_slice = &file_slices[0];
+
+        // Bag pre-populated with all four Table-owned keys, including a
+        // future-dated StartTimestamp that would zero out commit-time filtering.
+        let polluted = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_as_of_timestamp("19700101000000000")
+            .with_start_timestamp("99999999999999999")
+            .with_end_timestamp("19700101000000000");
+
+        let fg_reader = hudi_table.create_file_group_reader_with_options(
+            Some(&polluted),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
+        let batch = fg_reader
+            .read_file_slice(file_slice, &ReadOptions::new())
+            .await?;
+        assert!(
+            batch.num_rows() > 0,
+            "Table-owned keys must not leak into the FG reader; got 0 rows"
+        );
+        Ok(())
+    }
+
+    /// Regression: filters on Hudi meta fields (e.g. `_hoodie_record_key`) must
+    /// be accepted by the table-level validation. Returned batches include meta
+    /// fields, and the row-level mask applies the filter against them.
+    #[tokio::test]
+    async fn test_table_read_accepts_meta_field_filter() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // _hoodie_record_key is in the returned batch but not in the data
+        // schema. A typo'd column name should still error.
+        let options = ReadOptions::new().with_filters([(
+            hudi_core::metadata::meta_field::MetaField::RecordKey.as_ref(),
+            "!=",
+            "",
+        )]);
+        let batches = hudi_table.read(&options).await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "meta-field filter should match real keys");
+
+        let typo = ReadOptions::new().with_filters([("_hoodie_record_keyy", "!=", "")]);
+        let err = hudi_table.read(&typo).await.unwrap_err();
+        assert!(
+            err.to_string().contains("_hoodie_record_keyy"),
+            "typo'd filter should still fail validation; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Regression: `with_batch_size(0)` must surface as an error rather than
+    /// silently yielding zero rows from the parquet stream reader.
+    #[tokio::test]
+    async fn test_batch_size_zero_errors() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let opts = ReadOptions::new().with_batch_size(0);
+        match hudi_table.read_stream(&opts).await {
+            Ok(_) => panic!("expected validation error for batch_size=0"),
+            Err(err) => assert!(
+                err.to_string().contains("must be > 0"),
+                "expected validation error for batch_size=0, got: {err}"
+            ),
+        }
+        Ok(())
+    }
 }
 
 /// Test module for tables with metadata table (MDT) enabled.

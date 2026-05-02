@@ -224,14 +224,23 @@ impl ReadOptions {
     }
 
     /// The target batch size (rows per batch) for streaming reads, if set.
-    /// Errors if the stored string is not a valid `usize`.
+    /// Errors if the stored string is not a valid `usize` or if the value is `0`
+    /// (a zero-row batch yields no batches at the parquet stream reader and is
+    /// almost certainly a caller mistake).
     pub fn batch_size(&self) -> crate::Result<Option<usize>> {
-        let key = HudiReadConfig::StreamBatchSize;
-        match self.hudi_options.get(key.as_ref()) {
-            Some(s) => s
-                .parse::<usize>()
-                .map(Some)
-                .map_err(|e| ConfigError::ParseInt(key.as_ref().to_string(), s.clone(), e).into()),
+        let key = HudiReadConfig::StreamBatchSize.as_ref();
+        match self.hudi_options.get(key) {
+            Some(s) => {
+                let parsed = s
+                    .parse::<usize>()
+                    .map_err(|e| ConfigError::ParseInt(key.to_string(), s.clone(), e))?;
+                if parsed == 0 {
+                    return Err(
+                        ConfigError::InvalidValue(format!("{key} must be > 0, got 0")).into(),
+                    );
+                }
+                Ok(Some(parsed))
+            }
             None => Ok(None),
         }
     }
