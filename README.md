@@ -75,7 +75,7 @@ from hudi import HudiReadOptions, HudiTableBuilder
 import pyarrow as pa
 
 hudi_table = HudiTableBuilder.from_base_uri("/tmp/trips_table").build()
-batches = hudi_table.read_snapshot(
+batches = hudi_table.read(
     HudiReadOptions(filters=[("city", "=", "san_francisco")])
 )
 
@@ -97,7 +97,7 @@ use arrow::compute::concat_batches;
 async fn main() -> Result<()> {
     let hudi_table = HudiTableBuilder::from_base_uri("/tmp/trips_table").build().await?;
     let options = ReadOptions::new().with_filters([("city", "=", "san_francisco")]);
-    let batches = hudi_table.read_snapshot(&options).await?;
+    let batches = hudi_table.read(&options).await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let columns = vec!["rider", "city", "ts", "fare"];
     for col_name in columns {
@@ -141,7 +141,7 @@ Time-travel query reads the data at a specific timestamp from the table. The tab
 #### Python
 
 ```python
-batches = hudi_table.read_snapshot(
+batches = hudi_table.read(
     HudiReadOptions(
         as_of_timestamp="20241231123456789",
         filters=[("city", "=", "san_francisco")],
@@ -155,7 +155,7 @@ batches = hudi_table.read_snapshot(
 let options = ReadOptions::new()
     .with_as_of_timestamp("20241231123456789")
     .with_filters([("city", "=", "san_francisco")]);
-let batches = hudi_table.read_snapshot(&options).await?;
+let batches = hudi_table.read(&options).await?;
 ```
 
 <details>
@@ -181,17 +181,22 @@ Incremental query reads the changed data from the table for a given time range.
 #### Python
 
 ```python
+from hudi import HudiQueryType
+
 # read the records between t1 (exclusive) and t2 (inclusive)
-batches = hudi_table.read_incremental_records(
-    HudiReadOptions(start_timestamp=t1, end_timestamp=t2)
+batches = hudi_table.read(
+    HudiReadOptions(query_type=HudiQueryType.Incremental, start_timestamp=t1, end_timestamp=t2)
 )
 
 # read the records after t1 (end defaults to the latest commit)
-batches = hudi_table.read_incremental_records(HudiReadOptions(start_timestamp=t1))
+batches = hudi_table.read(
+    HudiReadOptions(query_type=HudiQueryType.Incremental, start_timestamp=t1)
+)
 
 # with column filters applied to the changed records
-batches = hudi_table.read_incremental_records(
+batches = hudi_table.read(
     HudiReadOptions(
+        query_type=HudiQueryType.Incremental,
         start_timestamp=t1,
         end_timestamp=t2,
         filters=[("city", "=", "san_francisco")],
@@ -202,20 +207,28 @@ batches = hudi_table.read_incremental_records(
 #### Rust
 
 ```rust
+use hudi::table::QueryType;
+
 // read the records between t1 (exclusive) and t2 (inclusive)
-let options = ReadOptions::new().with_start_timestamp(t1).with_end_timestamp(t2);
-let batches = hudi_table.read_incremental_records(&options).await?;
+let options = ReadOptions::new()
+    .with_query_type(QueryType::Incremental)
+    .with_start_timestamp(t1)
+    .with_end_timestamp(t2);
+let batches = hudi_table.read(&options).await?;
 
 // read the records after t1 (end defaults to the latest commit)
-let options = ReadOptions::new().with_start_timestamp(t1);
-let batches = hudi_table.read_incremental_records(&options).await?;
+let options = ReadOptions::new()
+    .with_query_type(QueryType::Incremental)
+    .with_start_timestamp(t1);
+let batches = hudi_table.read(&options).await?;
 
 // with column filters applied to the changed records
 let options = ReadOptions::new()
+    .with_query_type(QueryType::Incremental)
     .with_start_timestamp(t1)
     .with_end_timestamp(t2)
     .with_filters([("city", "=", "san_francisco")]);
-let batches = hudi_table.read_incremental_records(&options).await?;
+let batches = hudi_table.read(&options).await?;
 ```
 
 *Incremental queries support the same timestamp formats as time-travel queries.*
@@ -233,7 +246,7 @@ options = HudiReadOptions(
     projection=["rider", "city", "ts", "fare"],
     batch_size=4096,
 )
-for batch in hudi_table.read_snapshot_stream(options):
+for batch in hudi_table.read_stream(options):
     print(batch.num_rows)
 ```
 
@@ -246,7 +259,7 @@ let options = ReadOptions::new()
     .with_filters([("city", "=", "san_francisco")])
     .with_projection(["rider", "city", "ts", "fare"])
     .with_batch_size(4096);
-let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+let mut stream = hudi_table.read_stream(&options).await?;
 while let Some(batch) = stream.next().await {
     let batch = batch?;
     println!("{}", batch.num_rows());
@@ -329,9 +342,7 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct 
 | Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi_core::util::collection::split_into_chunks` on the result. |
 |                 | `compute_table_stats()`                                          | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
 | Query execution | `create_file_group_reader_with_options()`                        | Create a file group reader instance with the table instance's configs.                                   |
-|                 | `read(options)` / `read_stream(options)`                         | Primary record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. |
-|                 | `read_snapshot(options)` / `read_incremental_records(options)`   | Shortcuts that override `query_type` accordingly.                                                        |
-|                 | `read_snapshot_stream(options)`                                  | Streaming snapshot shortcut. Per-slice streaming lives on `FileGroupReader`.                             |
+|                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
 
 ### File Group API
 

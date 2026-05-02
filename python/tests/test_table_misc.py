@@ -60,9 +60,9 @@ def test_read_dispatches_on_query_type(v8_trips_table):
     snapshot_rows = sum(b.num_rows for b in table.read(HudiReadOptions()))
     assert snapshot_rows == 6
 
-    # Same as the snapshot shortcut.
-    snapshot_via_shortcut = sum(b.num_rows for b in table.read_snapshot())
-    assert snapshot_rows == snapshot_via_shortcut
+    # Calling read() with no options uses the default Snapshot behavior.
+    snapshot_via_default = sum(b.num_rows for b in table.read())
+    assert snapshot_rows == snapshot_via_default
 
 
 def test_read_stream_errors_on_incremental(v8_trips_table):

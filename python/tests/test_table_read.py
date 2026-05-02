@@ -87,7 +87,7 @@ def test_read_table_can_read_from_batches(v8_trips_table):
 def test_read_table_returns_correct_data(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    batches = table.read_snapshot()
+    batches = table.read()
     t = (
         pa.Table.from_batches(batches)
         .select(["ts", "uuid", "rider", "fare"])
@@ -120,7 +120,7 @@ def test_read_table_returns_correct_data(v8_trips_table):
 def test_read_table_for_partition(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    batches = table.read_snapshot(
+    batches = table.read(
         HudiReadOptions(filters=[("city", "=", "san_francisco")])
     )
     t = (
@@ -161,7 +161,7 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
 
     # get_completed_commits() returns compaction commits for MOR tables.
     # The sole compaction commit predates the final deltacommit (rider-G update).
-    batches = table.read_snapshot(options_at_first)
+    batches = table.read(options_at_first)
     t = (
         pa.Table.from_batches(batches)
         .select(["ts", "uuid", "rider", "fare"])
@@ -205,7 +205,7 @@ def test_read_snapshot_filters_apply_as_row_predicate(v8_trips_table):
     """
     table = HudiTable(v8_trips_table)
     options = HudiReadOptions(filters=[("rider", "=", "rider-A")])
-    batches = table.read_snapshot(options)
+    batches = table.read(options)
     t = pa.Table.from_batches(batches)
     assert t.num_rows == 1
     assert t.column("rider").to_pylist() == ["rider-A"]
@@ -214,7 +214,7 @@ def test_read_snapshot_filters_apply_as_row_predicate(v8_trips_table):
 def test_read_snapshot_stream_filters_apply_as_row_predicate(v8_trips_table):
     table = HudiTable(v8_trips_table)
     options = HudiReadOptions(filters=[("rider", "=", "rider-A")])
-    batches = list(table.read_snapshot_stream(options))
+    batches = list(table.read_stream(options))
     t = pa.Table.from_batches(batches)
     assert t.num_rows == 1
     assert t.column("rider").to_pylist() == ["rider-A"]

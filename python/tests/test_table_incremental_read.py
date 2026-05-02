@@ -38,10 +38,11 @@ def test_table_incremental_read_returns_correct_data():
     assert len(commits) >= 2
 
     options = HudiReadOptions(
+        query_type=HudiQueryType.Incremental,
         start_timestamp=commits[0].timestamp,
         end_timestamp=commits[1].timestamp,
     )
-    batches = table.read_incremental_records(options)
+    batches = table.read(options)
     t = pa.Table.from_batches(batches)
 
     assert t.num_rows == 1
@@ -56,22 +57,24 @@ def test_incremental_read_with_partition_filter():
 
     # TXN-001 lives in region 'us'; filtering to 'us' keeps it.
     options_us = HudiReadOptions(
+        query_type=HudiQueryType.Incremental,
         start_timestamp=insert_ts,
         end_timestamp=update_ts,
         filters=[("region", "=", "us")],
     )
-    batches = table.read_incremental_records(options_us)
+    batches = table.read(options_us)
     t = pa.Table.from_batches(batches)
     assert t.num_rows == 1
     assert t.column("txn_id").to_pylist() == ["TXN-001"]
 
     # Filtering to a non-matching region prunes the change away.
     options_eu = HudiReadOptions(
+        query_type=HudiQueryType.Incremental,
         start_timestamp=insert_ts,
         end_timestamp=update_ts,
         filters=[("region", "=", "eu")],
     )
-    batches = table.read_incremental_records(options_eu)
+    batches = table.read(options_eu)
     assert sum(b.num_rows for b in batches) == 0
 
 

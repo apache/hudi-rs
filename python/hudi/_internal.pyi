@@ -353,22 +353,6 @@ class HudiTable:
         Read records, dispatching on ``options.query_type``.
         """
         ...
-    def read_snapshot(
-        self, options: Optional[HudiReadOptions] = None
-    ) -> List["pyarrow.RecordBatch"]:
-        """
-        Read snapshot records. Shortcut for :meth:`read` with
-        ``query_type = HudiQueryType.Snapshot``.
-        """
-        ...
-    def read_incremental_records(
-        self, options: Optional[HudiReadOptions] = None
-    ) -> List["pyarrow.RecordBatch"]:
-        """
-        Read incremental records. Shortcut for :meth:`read` with
-        ``query_type = HudiQueryType.Incremental``.
-        """
-        ...
     def compute_table_stats(self) -> Optional[Tuple[int, int]]:
         """
         Compute estimated table-level statistics from the metadata table.
@@ -384,14 +368,6 @@ class HudiTable:
         """
         Streaming read; dispatches on ``options.query_type``. Incremental streaming
         is not yet supported and raises ``HudiCoreError``.
-        """
-        ...
-    def read_snapshot_stream(
-        self, options: Optional[HudiReadOptions] = None
-    ) -> HudiRecordBatchStream:
-        """
-        Snapshot streaming shortcut. Equivalent to :meth:`read_stream` with
-        ``query_type = HudiQueryType.Snapshot``.
         """
         ...
 

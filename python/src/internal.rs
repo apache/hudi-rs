@@ -627,32 +627,6 @@ impl HudiTable {
         .map(|b| b.unbind())
     }
 
-    #[pyo3(signature = (options=None))]
-    fn read_snapshot(&self, options: Option<HudiReadOptions>, py: Python) -> PyResult<Py<PyAny>> {
-        let read_options = options.unwrap_or_default().to_inner();
-        py.detach(|| {
-            rt().block_on(self.inner.read_snapshot(&read_options))
-                .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-
-    #[pyo3(signature = (options=None))]
-    fn read_incremental_records(
-        &self,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        let read_options = options.unwrap_or_default().to_inner();
-        py.detach(|| {
-            rt().block_on(self.inner.read_incremental_records(&read_options))
-                .map_err(PythonError::from)
-        })?
-        .to_pyarrow(py)
-        .map(|b| b.unbind())
-    }
-
     #[getter]
     fn base_url(&self) -> String {
         self.inner.base_url().to_string()
@@ -671,20 +645,6 @@ impl HudiTable {
         let read_options = options.unwrap_or_default().to_inner();
         let stream = py.detach(|| {
             rt().block_on(self.inner.read_stream(&read_options))
-                .map_err(PythonError::from)
-        })?;
-        Ok(HudiRecordBatchStream::from_stream(stream))
-    }
-
-    #[pyo3(signature = (options=None))]
-    fn read_snapshot_stream(
-        &self,
-        options: Option<HudiReadOptions>,
-        py: Python,
-    ) -> PyResult<HudiRecordBatchStream> {
-        let read_options = options.unwrap_or_default().to_inner();
-        let stream = py.detach(|| {
-            rt().block_on(self.inner.read_snapshot_stream(&read_options))
                 .map_err(PythonError::from)
         })?;
         Ok(HudiRecordBatchStream::from_stream(stream))

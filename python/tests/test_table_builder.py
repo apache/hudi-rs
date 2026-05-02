@@ -73,7 +73,7 @@ def test_with_multiple_options(builder, method, attr):
 def test_read_table_returns_correct_data(v8_trips_table):
     table = HudiTableBuilder.from_base_uri(v8_trips_table).build()
 
-    batches = table.read_snapshot()
+    batches = table.read()
     t = pa.Table.from_batches(batches).select(["rider", "fare"]).sort_by("rider")
     rows = t.to_pylist()
 

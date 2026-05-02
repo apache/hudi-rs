@@ -51,7 +51,7 @@ def test_read_options_with_values():
 
 def test_read_snapshot_stream_yields_all_rows(v8_trips_table):
     table = HudiTable(v8_trips_table)
-    stream = table.read_snapshot_stream()
+    stream = table.read_stream()
     assert isinstance(stream, HudiRecordBatchStream)
 
     batches = list(stream)
@@ -63,14 +63,14 @@ def test_read_snapshot_stream_yields_all_rows(v8_trips_table):
 def test_read_snapshot_stream_with_partition_filter(v8_trips_table):
     table = HudiTable(v8_trips_table)
     options = HudiReadOptions(filters=[("city", "=", "san_francisco")])
-    batches = list(table.read_snapshot_stream(options))
+    batches = list(table.read_stream(options))
     t = pa.Table.from_batches(batches)
     assert t.num_rows == 4
 
 
 def test_read_snapshot_stream_is_single_use(v8_trips_table):
     table = HudiTable(v8_trips_table)
-    stream = table.read_snapshot_stream()
+    stream = table.read_stream()
     first = list(stream)
     assert len(first) > 0
     # Re-iterating an exhausted stream yields nothing
@@ -105,6 +105,6 @@ def test_read_file_slice_from_paths_stream(v8_trips_table):
 def test_read_snapshot_stream_with_batch_size(v8_trips_table):
     table = HudiTable(v8_trips_table)
     options = HudiReadOptions(batch_size=1)
-    batches = list(table.read_snapshot_stream(options))
+    batches = list(table.read_stream(options))
     t = pa.Table.from_batches(batches)
     assert t.num_rows == 6

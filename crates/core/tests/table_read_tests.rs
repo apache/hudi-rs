@@ -27,7 +27,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
 use hudi_core::error::Result;
-use hudi_core::table::{ReadOptions, Table};
+use hudi_core::table::{QueryType, ReadOptions, Table};
 use hudi_test::{QuickstartTripsTable, SampleTable};
 
 async fn collect_stream_batches(
@@ -51,7 +51,7 @@ mod v6_tables {
         async fn test_empty_table() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+                let records = hudi_table.read(&ReadOptions::new()).await?;
                 assert!(records.is_empty());
             }
             Ok(())
@@ -61,7 +61,7 @@ mod v6_tables {
         async fn test_non_partitioned() -> Result<()> {
             for base_url in SampleTable::V6Nonpartitioned.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+                let records = hudi_table.read(&ReadOptions::new()).await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -95,7 +95,7 @@ mod v6_tables {
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
             let records = hudi_table
-                .read_snapshot(&ReadOptions::new().with_as_of_timestamp(latest_commit))
+                .read(&ReadOptions::new().with_as_of_timestamp(latest_commit))
                 .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
@@ -117,7 +117,7 @@ mod v6_tables {
         async fn test_non_partitioned_rollback() -> Result<()> {
             let base_url = SampleTable::V6NonpartitionedRollback.url_to_mor_parquet();
             let hudi_table = Table::new(base_url.path()).await?;
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -144,7 +144,7 @@ mod v6_tables {
                     ("shortField", "!=", "100"),
                 ];
                 let records = hudi_table
-                    .read_snapshot(&ReadOptions::new().with_filters(filters))
+                    .read(&ReadOptions::new().with_filters(filters))
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -159,7 +159,7 @@ mod v6_tables {
         async fn test_simple_keygen_hivestyle_no_metafields() -> Result<()> {
             for base_url in SampleTable::V6SimplekeygenHivestyleNoMetafields.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
-                let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+                let records = hudi_table.read(&ReadOptions::new()).await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
 
@@ -193,7 +193,7 @@ mod v6_tables {
                     .collect::<Vec<_>>();
                 let first_commit = commit_timestamps[0];
                 let records = hudi_table
-                    .read_snapshot(&ReadOptions::new().with_as_of_timestamp(first_commit))
+                    .read(&ReadOptions::new().with_as_of_timestamp(first_commit))
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -219,7 +219,7 @@ mod v6_tables {
             let updated_rider = "rider-D";
 
             // verify updated record as of the latest commit
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -242,7 +242,7 @@ mod v6_tables {
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
             let records = hudi_table
-                .read_snapshot(&ReadOptions::new().with_as_of_timestamp(first_commit))
+                .read(&ReadOptions::new().with_as_of_timestamp(first_commit))
                 .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
@@ -268,7 +268,7 @@ mod v6_tables {
             let deleted_riders = ["rider-A", "rider-C", "rider-D"];
 
             // verify deleted record as of the latest commit
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let riders = QuickstartTripsTable::uuid_rider_and_fare(&records)
@@ -290,7 +290,7 @@ mod v6_tables {
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
             let records = hudi_table
-                .read_snapshot(&ReadOptions::new().with_as_of_timestamp(first_commit))
+                .read(&ReadOptions::new().with_as_of_timestamp(first_commit))
                 .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
@@ -319,7 +319,7 @@ mod v6_tables {
             for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table
-                    .read_incremental_records(&ReadOptions::new().with_start_timestamp("0"))
+                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp("0"))
                     .await?;
                 assert!(records.is_empty())
             }
@@ -343,8 +343,7 @@ mod v6_tables {
 
                 // read records changed from the beginning to the 1st commit
                 let records = hudi_table
-                    .read_incremental_records(
-                        &ReadOptions::new()
+                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                             .with_start_timestamp("19700101000000")
                             .with_end_timestamp(first_commit),
                     )
@@ -360,8 +359,7 @@ mod v6_tables {
 
                 // read records changed from the 1st to the 2nd commit
                 let records = hudi_table
-                    .read_incremental_records(
-                        &ReadOptions::new()
+                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                             .with_start_timestamp(first_commit)
                             .with_end_timestamp(second_commit),
                     )
@@ -377,8 +375,7 @@ mod v6_tables {
 
                 // read records changed from the 2nd to the 3rd commit
                 let records = hudi_table
-                    .read_incremental_records(
-                        &ReadOptions::new()
+                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                             .with_start_timestamp(second_commit)
                             .with_end_timestamp(third_commit),
                     )
@@ -394,8 +391,7 @@ mod v6_tables {
 
                 // read records changed from the 1st commit
                 let records = hudi_table
-                    .read_incremental_records(
-                        &ReadOptions::new().with_start_timestamp(first_commit),
+                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(first_commit),
                     )
                     .await?;
                 let schema = &records[0].schema();
@@ -409,8 +405,7 @@ mod v6_tables {
 
                 // read records changed from the 3rd commit
                 let records = hudi_table
-                    .read_incremental_records(
-                        &ReadOptions::new().with_start_timestamp(third_commit),
+                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(third_commit),
                     )
                     .await?;
                 assert!(
@@ -434,7 +429,7 @@ mod v8_tables {
         async fn test_empty_table() -> Result<()> {
             let base_url = SampleTable::V8Empty.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             assert!(records.is_empty());
             Ok(())
         }
@@ -443,7 +438,7 @@ mod v8_tables {
         async fn test_non_partitioned() -> Result<()> {
             let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -465,7 +460,7 @@ mod v8_tables {
             let base_url = SampleTable::V8ComplexkeygenHivestyle.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
 
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -487,7 +482,7 @@ mod v8_tables {
             let base_url = SampleTable::V8SimplekeygenNonhivestyle.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
 
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -509,7 +504,7 @@ mod v8_tables {
             let base_url = SampleTable::V8SimplekeygenHivestyleNoMetafields.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
 
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
 
@@ -540,7 +535,7 @@ mod v8_tables {
             let deleted_riders = ["rider-F", "rider-J"];
 
             // verify deleted records are not present in latest snapshot
-            let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+            let records = hudi_table.read(&ReadOptions::new()).await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
             let uuid_rider_and_fare = QuickstartTripsTable::uuid_rider_and_fare(&records);
@@ -581,7 +576,7 @@ mod v8_tables {
                 .collect::<Vec<_>>();
             let first_commit = commit_timestamps[0];
             let records = hudi_table
-                .read_snapshot(&ReadOptions::new().with_as_of_timestamp(first_commit))
+                .read(&ReadOptions::new().with_as_of_timestamp(first_commit))
                 .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
@@ -612,7 +607,7 @@ mod v8_tables {
             let base_url = SampleTable::V8Empty.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
             let options = ReadOptions::new().with_projection(["txn_id", "txn_type", "txn_ts"]);
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+            let mut stream = hudi_table.read_stream(&options).await?;
 
             // Collect all batches from stream
             let mut batches = Vec::new();
@@ -628,7 +623,7 @@ mod v8_tables {
             let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
             let options = ReadOptions::new();
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+            let mut stream = hudi_table.read_stream(&options).await?;
 
             // Collect all batches from stream
             let mut batches = Vec::new();
@@ -662,7 +657,7 @@ mod v8_tables {
 
             // Request small batch size
             let options = ReadOptions::new().with_batch_size(1);
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+            let mut stream = hudi_table.read_stream(&options).await?;
 
             // Collect all batches from stream
             let mut batches = Vec::new();
@@ -688,7 +683,7 @@ mod v8_tables {
                 ("byteField", "<", "20"),
                 ("shortField", "!=", "100"),
             ]);
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+            let mut stream = hudi_table.read_stream(&options).await?;
 
             // Collect all batches from stream
             let mut batches = Vec::new();
@@ -772,7 +767,7 @@ mod v8_tables {
             let hudi_table = Table::new(base_url.path()).await?;
 
             let options = ReadOptions::new();
-            let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+            let mut stream = hudi_table.read_stream(&options).await?;
 
             let mut batches = Vec::new();
             while let Some(result) = stream.next().await {
@@ -845,7 +840,7 @@ mod v9_tables {
     }
 
     async fn read_txn_rows_from_snapshot(hudi_table: &Table) -> Result<Vec<(String, String, i64)>> {
-        let records = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+        let records = hudi_table.read(&ReadOptions::new()).await?;
         Ok(txn_rows(&records))
     }
 
@@ -854,7 +849,7 @@ mod v9_tables {
         timestamp: &str,
     ) -> Result<Vec<(String, String, i64)>> {
         let records = hudi_table
-            .read_snapshot(&ReadOptions::new().with_as_of_timestamp(timestamp))
+            .read(&ReadOptions::new().with_as_of_timestamp(timestamp))
             .await?;
         Ok(txn_rows(&records))
     }
@@ -1120,8 +1115,7 @@ mod v9_tables {
             let third_commit = commit_timestamps[2];
 
             let records = hudi_table
-                .read_incremental_records(
-                    &ReadOptions::new()
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                         .with_start_timestamp("19700101000000000")
                         .with_end_timestamp(first_commit),
                 )
@@ -1141,8 +1135,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(
-                    &ReadOptions::new()
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                         .with_start_timestamp(first_commit)
                         .with_end_timestamp(second_commit),
                 )
@@ -1158,8 +1151,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(
-                    &ReadOptions::new()
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                         .with_start_timestamp(second_commit)
                         .with_end_timestamp(third_commit),
                 )
@@ -1176,7 +1168,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(&ReadOptions::new().with_start_timestamp(first_commit))
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(first_commit))
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1190,7 +1182,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(&ReadOptions::new().with_start_timestamp(third_commit))
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(third_commit))
                 .await?;
             assert!(
                 records.is_empty(),
@@ -1214,8 +1206,7 @@ mod v9_tables {
             let second_commit = &deltacommits[1].timestamp;
 
             let records = hudi_table
-                .read_incremental_records(
-                    &ReadOptions::new()
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                         .with_start_timestamp("19700101000000000")
                         .with_end_timestamp(first_commit),
                 )
@@ -1232,8 +1223,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(
-                    &ReadOptions::new()
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
                         .with_start_timestamp(first_commit)
                         .with_end_timestamp(second_commit),
                 )
@@ -1246,7 +1236,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(&ReadOptions::new().with_start_timestamp(first_commit))
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(first_commit))
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1256,7 +1246,7 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read_incremental_records(&ReadOptions::new().with_start_timestamp(second_commit))
+                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(second_commit))
                 .await?;
             assert!(
                 records.is_empty(),
@@ -1277,7 +1267,7 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new();
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
             assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1300,7 +1290,7 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new().with_batch_size(1);
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1314,7 +1304,7 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new().with_filters([("region", "=", "us")]);
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
             assert!(
@@ -1335,7 +1325,7 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), false).await?;
 
             let options = ReadOptions::new().with_filters([("region", "=", "latam")]);
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
             assert!(
@@ -1403,7 +1393,7 @@ mod v9_tables {
             );
 
             let options = ReadOptions::new();
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let err = match collect_stream_batches(stream).await {
                 Ok(_) => panic!("Expected MOR streaming read with decimal log records to fail"),
                 Err(err) => err,
@@ -1422,7 +1412,7 @@ mod v9_tables {
             let hudi_table = open_table(base_url.path(), true).await?;
 
             let options = ReadOptions::new();
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
             assert!(!batches.is_empty(), "Should produce batches from MOR table");
@@ -1449,7 +1439,7 @@ mod streaming_queries {
         for base_url in SampleTable::V6Empty.urls() {
             let hudi_table = Table::new(base_url.path()).await?;
             let options = ReadOptions::new();
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
             assert!(batches.is_empty(), "Empty table should produce no batches");
         }
@@ -1461,7 +1451,7 @@ mod streaming_queries {
         for base_url in SampleTable::V6Nonpartitioned.urls() {
             let hudi_table = Table::new(base_url.path()).await?;
             let options = ReadOptions::new();
-            let stream = hudi_table.read_snapshot_stream(&options).await?;
+            let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
             assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1491,7 +1481,7 @@ mod streaming_queries {
 
         // Request small batch size
         let options = ReadOptions::new().with_batch_size(1);
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         // With batch_size=1 and 4 rows, we expect multiple batches, but the
@@ -1512,7 +1502,7 @@ mod streaming_queries {
             ("byteField", "<", "20"),
             ("shortField", "!=", "100"),
         ]);
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(
@@ -1581,7 +1571,7 @@ mod streaming_queries {
         let hudi_table = Table::new(base_url.path()).await?;
 
         let options = ReadOptions::new();
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce batches from MOR table");
@@ -1599,7 +1589,7 @@ mod streaming_queries {
 
         // Only request id and name columns (not isActive)
         let options = ReadOptions::new().with_projection(["id", "name"]);
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1635,7 +1625,7 @@ mod streaming_queries {
         // during reading even though file pruning can't use it.
         let options = ReadOptions::new().with_filters([("isActive", "=", "true")]);
 
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1661,7 +1651,7 @@ mod streaming_queries {
             .with_projection(["id", "isActive"])
             .with_filters([("isActive", "=", "true")]);
 
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1702,7 +1692,7 @@ mod streaming_queries {
             .with_projection(["id"])
             .with_filters([("isActive", "=", "true")]);
 
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         let schema = &batches[0].schema();
@@ -1744,10 +1734,10 @@ mod streaming_queries {
             .expect("table must have at least one commit");
         let options = ReadOptions::new().with_as_of_timestamp(&first_commit);
 
-        let eager = hudi_table.read_snapshot(&options).await?;
+        let eager = hudi_table.read(&options).await?;
         let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
 
-        let stream = hudi_table.read_snapshot_stream(&options).await?;
+        let stream = hudi_table.read_stream(&options).await?;
         let stream_batches = collect_stream_batches(stream).await?;
         let stream_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1762,14 +1752,14 @@ mod streaming_queries {
         let hudi_table = Table::new(base_url.path()).await?;
         let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")]);
 
-        let snapshot_err = hudi_table.read_snapshot(&options).await.unwrap_err();
+        let snapshot_err = hudi_table.read(&options).await.unwrap_err();
         assert!(
             snapshot_err.to_string().contains("rider_idd"),
             "snapshot error should mention the bad column, got: {snapshot_err}"
         );
 
         let incremental_err = hudi_table
-            .read_incremental_records(&options)
+            .read(&options.clone().with_query_type(QueryType::Incremental))
             .await
             .unwrap_err();
         assert!(
@@ -1856,7 +1846,7 @@ mod streaming_queries {
 
         // Request a non-existent column
         let options = ReadOptions::new().with_projection(["id", "nonexistent_column"]);
-        let mut stream = hudi_table.read_snapshot_stream(&options).await?;
+        let mut stream = hudi_table.read_stream(&options).await?;
 
         // Error occurs when polling the stream (lazy evaluation)
         let mut found_error = false;

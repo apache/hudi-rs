@@ -61,8 +61,6 @@ Which fields each API consumes:
 | API                                                              | `query_type` | `as_of_timestamp` | `start`/`end_timestamp` | `filters` | `projection` | `batch_size` | `hudi_options` |
 |------------------------------------------------------------------|:------------:|:-----------------:|:-----------------------:|:---------:|:------------:|:------------:|:--------------:|
 | `read` / `read_stream`                                           | yes          | when Snapshot     | when Incremental        | yes       | yes          | streaming    | yes            |
-| `read_snapshot` / `read_snapshot_stream` (shortcuts)             | overridden   | yes               | —                       | yes       | yes          | streaming    | yes            |
-| `read_incremental_records` (shortcut)                            | overridden   | —                 | yes                     | yes       | yes          | —            | yes            |
 | `get_file_slices`                                                | yes          | when Snapshot     | when Incremental        | yes       | —            | —            | —              |
 | `FileGroupReader::read_file_slice` / `_from_paths`               | —            | —                 | —                       | yes       | yes          | —            | —              |
 | `FileGroupReader::read_file_slice_stream` / `_from_paths_stream` | —            | —                 | —                       | yes       | yes          | yes          | —              |
@@ -70,7 +68,6 @@ Which fields each API consumes:
 Notes:
 
 - `read_stream` errors with `Unsupported` for `query_type = Incremental` — incremental streaming is not yet implemented.
-- The shortcut methods (`read_snapshot`, `read_incremental_records`, `read_snapshot_stream`) override `options.query_type` with the type implied by the method name.
 - `hudi_options` is a per-read override bag — common use is `("hoodie.read.use.read_optimized.mode", "true")` to skip log merging for one read without mutating the `Table`.
 - Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods.
 - For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi_core::util::collection::split_into_chunks` or your engine's preferred partitioning policy.
@@ -117,10 +114,7 @@ All public symbols are re-exported from the `hudi` crate.
 | `get_file_slices(&ReadOptions)`                                            | `Result<Vec<FileSlice>>` (dispatches on `query_type`) |
 | `create_file_group_reader_with_options(options)`                           | `Result<FileGroupReader>`                            |
 | `read(&ReadOptions)`                                                       | `Result<Vec<RecordBatch>>` (dispatches on `query_type`) |
-| `read_snapshot(&ReadOptions)`                                              | `Result<Vec<RecordBatch>>` — shortcut for `Snapshot` |
-| `read_incremental_records(&ReadOptions)`                                   | `Result<Vec<RecordBatch>>` — shortcut for `Incremental` |
 | `read_stream(&ReadOptions)`                                                | `Result<BoxStream<'static, Result<RecordBatch>>>` (errors on `Incremental`) |
-| `read_snapshot_stream(&ReadOptions)`                                       | `Result<BoxStream<'static, Result<RecordBatch>>>` — shortcut |
 | `compute_table_stats()`                                                    | `Option<(u64, u64)>` — `(rows, byte_size)`           |
 
 ### `FileGroupReader`
@@ -210,9 +204,7 @@ table = (
 | `get_file_slices(options=None)`                                                                    | `List[HudiFileSlice]` (dispatches on `options.query_type`) |
 | `create_file_group_reader_with_options(options=None)`                                              | `HudiFileGroupReader`                    |
 | `read(options=None)`                                                                               | `List[pyarrow.RecordBatch]` (dispatches on `query_type`) |
-| `read_snapshot(options=None)` / `read_incremental_records(options=None)`                           | `List[pyarrow.RecordBatch]` — shortcuts  |
 | `read_stream(options=None)`                                                                        | `HudiRecordBatchStream` (errors on `Incremental`) |
-| `read_snapshot_stream(options=None)`                                                               | `HudiRecordBatchStream` — shortcut       |
 | `compute_table_stats()`                                                                            | `Optional[Tuple[int, int]]`              |
 
 ### `HudiFileGroupReader`
@@ -290,7 +282,7 @@ A timezone offset (`Z` or `±HH:MM`) is required for RFC 3339 inputs — naive `
 
 ### Empty results
 
-A table with no completed commits yields empty `Vec` / `List` for eager reads and `get_file_slices*`, and an empty stream for `read_snapshot_stream`.
+A table with no completed commits yields empty `Vec` / `List` for eager reads and `get_file_slices`, and an empty stream for `read_stream`.
 
 ### Errors
 
