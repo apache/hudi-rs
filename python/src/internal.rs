@@ -30,6 +30,8 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
+use std::str::FromStr;
+
 use hudi::config::read::HudiReadConfig;
 use hudi::config::table::HudiTableConfig;
 use hudi::error::CoreError;
@@ -38,8 +40,8 @@ use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
-use hudi::table::{QueryType, ReadOptions, Table};
 use hudi::table::builder::TableBuilder;
+use hudi::table::{QueryType, ReadOptions, Table};
 use hudi::timeline::Timeline;
 use hudi::timeline::instant::Instant;
 use pyo3::exceptions::PyException;
@@ -98,6 +100,15 @@ impl From<HudiQueryType> for QueryType {
     }
 }
 
+impl From<QueryType> for HudiQueryType {
+    fn from(q: QueryType) -> Self {
+        match q {
+            QueryType::Snapshot => HudiQueryType::Snapshot,
+            QueryType::Incremental => HudiQueryType::Incremental,
+        }
+    }
+}
+
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug, Default)]
 #[pyclass]
@@ -113,62 +124,21 @@ pub struct HudiReadOptions {
 #[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiReadOptions {
-    /// Construct read options. Convenience kwargs (`query_type`, timestamps,
-    /// `batch_size`) flow into `hudi_options` under the matching `HudiReadConfig`
-    /// keys; `hudi_options` itself accepts arbitrary `hoodie.*` overrides.
+    /// Construct read options. Mirrors the Rust `ReadOptions` struct shape:
+    /// only the three stored fields are accepted directly. All other knobs
+    /// (`query_type`, timestamps, `batch_size`) are set via the chainable
+    /// `with_*` builders, matching the Rust API.
     #[new]
-    #[pyo3(signature = (
-        query_type=None,
-        filters=None,
-        projection=None,
-        batch_size=None,
-        as_of_timestamp=None,
-        start_timestamp=None,
-        end_timestamp=None,
-        hudi_options=None,
-    ))]
+    #[pyo3(signature = (filters=None, projection=None, hudi_options=None))]
     fn new(
-        query_type: Option<HudiQueryType>,
         filters: Option<Vec<(String, String, String)>>,
         projection: Option<Vec<String>>,
-        batch_size: Option<usize>,
-        as_of_timestamp: Option<String>,
-        start_timestamp: Option<String>,
-        end_timestamp: Option<String>,
         hudi_options: Option<HashMap<String, String>>,
     ) -> Self {
-        let mut bag: HashMap<String, String> = hudi_options.unwrap_or_default();
-        if let Some(qt) = query_type {
-            bag.insert(
-                HudiReadConfig::QueryType.as_ref().to_string(),
-                QueryType::from(qt).as_ref().to_string(),
-            );
-        }
-        if let Some(ts) = as_of_timestamp {
-            bag.insert(HudiReadConfig::AsOfTimestamp.as_ref().to_string(), ts);
-        }
-        if let Some(ts) = start_timestamp {
-            bag.insert(
-                HudiReadConfig::StartTimestamp.as_ref().to_string(),
-                ts,
-            );
-        }
-        if let Some(ts) = end_timestamp {
-            bag.insert(
-                HudiReadConfig::EndTimestamp.as_ref().to_string(),
-                ts,
-            );
-        }
-        if let Some(bs) = batch_size {
-            bag.insert(
-                HudiReadConfig::StreamBatchSize.as_ref().to_string(),
-                bs.to_string(),
-            );
-        }
         Self {
             filters: filters.unwrap_or_default(),
             projection,
-            hudi_options: bag,
+            hudi_options: hudi_options.unwrap_or_default(),
         }
     }
 
@@ -177,6 +147,130 @@ impl HudiReadOptions {
             "HudiReadOptions(filters={:?}, projection={:?}, hudi_options={:?})",
             self.filters, self.projection, self.hudi_options,
         )
+    }
+
+    // ---- typed builders (return a new instance for chaining) ----
+
+    /// Sets the query type. Stored under `hoodie.read.query.type`.
+    fn with_query_type(&self, query_type: HudiQueryType) -> Self {
+        let mut new = self.clone();
+        new.hudi_options.insert(
+            HudiReadConfig::QueryType.as_ref().to_string(),
+            QueryType::from(query_type).as_ref().to_string(),
+        );
+        new
+    }
+
+    /// Sets the as-of timestamp for snapshot/time-travel queries.
+    fn with_as_of_timestamp(&self, timestamp: &str) -> Self {
+        let mut new = self.clone();
+        new.hudi_options.insert(
+            HudiReadConfig::AsOfTimestamp.as_ref().to_string(),
+            timestamp.to_string(),
+        );
+        new
+    }
+
+    /// Sets the lower-bound timestamp (exclusive) for incremental queries.
+    fn with_start_timestamp(&self, timestamp: &str) -> Self {
+        let mut new = self.clone();
+        new.hudi_options.insert(
+            HudiReadConfig::StartTimestamp.as_ref().to_string(),
+            timestamp.to_string(),
+        );
+        new
+    }
+
+    /// Sets the upper-bound timestamp (inclusive) for incremental queries.
+    fn with_end_timestamp(&self, timestamp: &str) -> Self {
+        let mut new = self.clone();
+        new.hudi_options.insert(
+            HudiReadConfig::EndTimestamp.as_ref().to_string(),
+            timestamp.to_string(),
+        );
+        new
+    }
+
+    /// Sets the target batch size (rows per batch) for streaming reads.
+    fn with_batch_size(&self, size: usize) -> Self {
+        let mut new = self.clone();
+        new.hudi_options.insert(
+            HudiReadConfig::StreamBatchSize.as_ref().to_string(),
+            size.to_string(),
+        );
+        new
+    }
+
+    /// Sets column filters.
+    fn with_filters(&self, filters: Vec<(String, String, String)>) -> Self {
+        let mut new = self.clone();
+        new.filters = filters;
+        new
+    }
+
+    /// Sets the column projection (which columns to read).
+    fn with_projection(&self, columns: Vec<String>) -> Self {
+        let mut new = self.clone();
+        new.projection = Some(columns);
+        new
+    }
+
+    /// Sets a single Hudi config that applies to this read only.
+    fn with_hudi_option(&self, key: &str, value: &str) -> Self {
+        let mut new = self.clone();
+        new.hudi_options.insert(key.to_string(), value.to_string());
+        new
+    }
+
+    /// Sets a batch of Hudi configs that apply to this read only.
+    fn with_hudi_options(&self, opts: HashMap<String, String>) -> Self {
+        let mut new = self.clone();
+        for (k, v) in opts {
+            new.hudi_options.insert(k, v);
+        }
+        new
+    }
+
+    // ---- typed accessors (read from hudi_options) ----
+
+    /// The query type (defaults to `Snapshot` when unset). Raises on bad strings.
+    fn query_type(&self) -> PyResult<HudiQueryType> {
+        match self.hudi_options.get(HudiReadConfig::QueryType.as_ref()) {
+            Some(s) => {
+                let qt =
+                    QueryType::from_str(s).map_err(|e| HudiCoreError::new_err(e.to_string()))?;
+                Ok(HudiQueryType::from(qt))
+            }
+            None => Ok(HudiQueryType::default()),
+        }
+    }
+
+    /// The as-of timestamp for snapshot/time-travel queries, if set.
+    fn as_of_timestamp(&self) -> Option<String> {
+        self.hudi_options
+            .get(HudiReadConfig::AsOfTimestamp.as_ref())
+            .cloned()
+    }
+
+    /// The start timestamp (exclusive) for incremental queries, if set.
+    fn start_timestamp(&self) -> Option<String> {
+        self.hudi_options
+            .get(HudiReadConfig::StartTimestamp.as_ref())
+            .cloned()
+    }
+
+    /// The end timestamp (inclusive) for incremental queries, if set.
+    fn end_timestamp(&self) -> Option<String> {
+        self.hudi_options
+            .get(HudiReadConfig::EndTimestamp.as_ref())
+            .cloned()
+    }
+
+    /// The target batch size (rows per batch) for streaming reads, if set.
+    fn batch_size(&self) -> Option<usize> {
+        self.hudi_options
+            .get(HudiReadConfig::StreamBatchSize.as_ref())
+            .and_then(|s| s.parse::<usize>().ok())
     }
 }
 
@@ -654,7 +748,6 @@ impl HudiTable {
         })?;
         Ok(HudiRecordBatchStream::from_stream(stream))
     }
-
 }
 
 #[cfg(not(tarpaulin_include))]

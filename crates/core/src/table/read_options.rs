@@ -24,7 +24,7 @@ use std::str::FromStr;
 use crate::config::read::HudiReadConfig;
 pub use crate::config::read::QueryType;
 
-/// Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
+/// Options for all Hudi read APIs (snapshot, time-travel, incremental, etc).
 ///
 /// `filters` and `projection` are typed because they don't have a Hudi config equivalent.
 /// Every other knob — query type, timestamps, batch size, ad-hoc Hudi configs — is stored
@@ -65,11 +65,14 @@ pub struct ReadOptions {
     /// `field` is any column name (partition or data).
     ///
     /// Filters drive both **pruning** and **row-level filtering**:
-    /// - When the field is a **partition column**, the filter prunes whole partitions.
-    /// - When the field is a **data column**, the filter prunes whole files via column
-    ///   statistics (min/max) when available.
-    /// - All filters are also applied as a row-level mask after reading, so callers
-    ///   only get rows that match.
+    /// - When the field is a **partition column**, the filter prunes whole partitions
+    ///   for both snapshot and incremental queries.
+    /// - When the field is a **data column** with column statistics (min/max) in the
+    ///   metadata table, the filter prunes whole files **for snapshot queries only**.
+    ///   Incremental file planning currently does partition pruning only — data-column
+    ///   filters apply at the row-level mask but do not prune files.
+    /// - All filters are applied as a row-level mask after reading, so callers
+    ///   always get only rows that match regardless of the planning path.
     pub filters: Vec<(String, String, String)>,
 
     /// Column names to project (select). If None, all columns are read.
@@ -92,8 +95,10 @@ impl ReadOptions {
 
     /// Sets the query type. Stored as [`HudiReadConfig::QueryType`].
     pub fn with_query_type(mut self, query_type: QueryType) -> Self {
-        self.hudi_options
-            .insert(HudiReadConfig::QueryType.as_ref().to_string(), query_type.as_ref().to_string());
+        self.hudi_options.insert(
+            HudiReadConfig::QueryType.as_ref().to_string(),
+            query_type.as_ref().to_string(),
+        );
         self
     }
 
@@ -289,7 +294,9 @@ mod tests {
             .with_hudi_option("hoodie.read.use.read_optimized.mode", "true")
             .with_hudi_options([("a", "1"), ("b", "2")]);
         assert_eq!(
-            options.hudi_options.get("hoodie.read.use.read_optimized.mode"),
+            options
+                .hudi_options
+                .get("hoodie.read.use.read_optimized.mode"),
             Some(&"true".to_string())
         );
         assert_eq!(options.hudi_options.get("a"), Some(&"1".to_string()));
@@ -298,10 +305,8 @@ mod tests {
 
     #[test]
     fn test_query_type_from_str_invalid_errors() {
-        let opts = ReadOptions::new().with_hudi_option(
-            HudiReadConfig::QueryType.as_ref(),
-            "garbage",
-        );
+        let opts =
+            ReadOptions::new().with_hudi_option(HudiReadConfig::QueryType.as_ref(), "garbage");
         let err = opts.query_type().unwrap_err();
         assert!(err.to_string().contains("garbage"));
     }

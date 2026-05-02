@@ -37,10 +37,11 @@ def test_table_incremental_read_returns_correct_data():
     commits = _commits(table)
     assert len(commits) >= 2
 
-    options = HudiReadOptions(
-        query_type=HudiQueryType.Incremental,
-        start_timestamp=commits[0].timestamp,
-        end_timestamp=commits[1].timestamp,
+    options = (
+        HudiReadOptions()
+        .with_query_type(HudiQueryType.Incremental)
+        .with_start_timestamp(commits[0].timestamp)
+        .with_end_timestamp(commits[1].timestamp)
     )
     batches = table.read(options)
     t = pa.Table.from_batches(batches)
@@ -56,11 +57,11 @@ def test_incremental_read_with_partition_filter():
     insert_ts, update_ts = commits[0].timestamp, commits[1].timestamp
 
     # TXN-001 lives in region 'us'; filtering to 'us' keeps it.
-    options_us = HudiReadOptions(
-        query_type=HudiQueryType.Incremental,
-        start_timestamp=insert_ts,
-        end_timestamp=update_ts,
-        filters=[("region", "=", "us")],
+    options_us = (
+        HudiReadOptions(filters=[("region", "=", "us")])
+        .with_query_type(HudiQueryType.Incremental)
+        .with_start_timestamp(insert_ts)
+        .with_end_timestamp(update_ts)
     )
     batches = table.read(options_us)
     t = pa.Table.from_batches(batches)
@@ -68,11 +69,11 @@ def test_incremental_read_with_partition_filter():
     assert t.column("txn_id").to_pylist() == ["TXN-001"]
 
     # Filtering to a non-matching region prunes the change away.
-    options_eu = HudiReadOptions(
-        query_type=HudiQueryType.Incremental,
-        start_timestamp=insert_ts,
-        end_timestamp=update_ts,
-        filters=[("region", "=", "eu")],
+    options_eu = (
+        HudiReadOptions(filters=[("region", "=", "eu")])
+        .with_query_type(HudiQueryType.Incremental)
+        .with_start_timestamp(insert_ts)
+        .with_end_timestamp(update_ts)
     )
     batches = table.read(options_eu)
     assert sum(b.num_rows for b in batches) == 0
@@ -84,22 +85,18 @@ def test_get_incremental_file_slices_with_partition_filter():
     insert_ts, update_ts = commits[0].timestamp, commits[1].timestamp
 
     slices_us = table.get_file_slices(
-        HudiReadOptions(
-            query_type=HudiQueryType.Incremental,
-            start_timestamp=insert_ts,
-            end_timestamp=update_ts,
-            filters=[("region", "=", "us")],
-        )
+        HudiReadOptions(filters=[("region", "=", "us")])
+        .with_query_type(HudiQueryType.Incremental)
+        .with_start_timestamp(insert_ts)
+        .with_end_timestamp(update_ts)
     )
     assert len(slices_us) == 1
     assert "region=us" in slices_us[0].base_file_relative_path()
 
     slices_eu = table.get_file_slices(
-        HudiReadOptions(
-            query_type=HudiQueryType.Incremental,
-            start_timestamp=insert_ts,
-            end_timestamp=update_ts,
-            filters=[("region", "=", "eu")],
-        )
+        HudiReadOptions(filters=[("region", "=", "eu")])
+        .with_query_type(HudiQueryType.Incremental)
+        .with_start_timestamp(insert_ts)
+        .with_end_timestamp(update_ts)
     )
     assert len(slices_eu) == 0

@@ -225,19 +225,24 @@ table = (
 ```python
 from hudi import HudiQueryType, HudiReadOptions
 
-options = HudiReadOptions(
-    query_type=HudiQueryType.Snapshot,  # or HudiQueryType.Incremental
-    filters=[("city", "=", "san_francisco")],
-    projection=["rider", "city", "ts", "fare"],
-    batch_size=4096,
-    as_of_timestamp="20240101000000000",
-    start_timestamp="20240101000000000",
-    end_timestamp="20240201000000000",
-    hudi_options={"hoodie.read.use.read_optimized.mode": "true"},
+# Constructor takes only the three stored fields; everything else is set via builders.
+options = (
+    HudiReadOptions(
+        filters=[("city", "=", "san_francisco")],
+        projection=["rider", "city", "ts", "fare"],
+        hudi_options={"hoodie.read.use.read_optimized.mode": "true"},
+    )
+    .with_query_type(HudiQueryType.Snapshot)  # or HudiQueryType.Incremental
+    .with_batch_size(4096)
+    .with_as_of_timestamp("20240101000000000")
+    .with_start_timestamp("20240101000000000")
+    .with_end_timestamp("20240201000000000")
 )
 ```
 
-All fields optional; defaults match [§2](#2-readoptions).
+All builders return a new `HudiReadOptions` for chaining. Typed accessors
+(`query_type()`, `as_of_timestamp()`, `start_timestamp()`, `end_timestamp()`,
+`batch_size()`) read back from the bag. Defaults match [§2](#2-readoptions).
 
 ### `HudiRecordBatchStream`
 

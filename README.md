@@ -185,22 +185,25 @@ from hudi import HudiQueryType
 
 # read the records between t1 (exclusive) and t2 (inclusive)
 batches = hudi_table.read(
-    HudiReadOptions(query_type=HudiQueryType.Incremental, start_timestamp=t1, end_timestamp=t2)
+    HudiReadOptions()
+    .with_query_type(HudiQueryType.Incremental)
+    .with_start_timestamp(t1)
+    .with_end_timestamp(t2)
 )
 
 # read the records after t1 (end defaults to the latest commit)
 batches = hudi_table.read(
-    HudiReadOptions(query_type=HudiQueryType.Incremental, start_timestamp=t1)
+    HudiReadOptions()
+    .with_query_type(HudiQueryType.Incremental)
+    .with_start_timestamp(t1)
 )
 
 # with column filters applied to the changed records
 batches = hudi_table.read(
-    HudiReadOptions(
-        query_type=HudiQueryType.Incremental,
-        start_timestamp=t1,
-        end_timestamp=t2,
-        filters=[("city", "=", "san_francisco")],
-    )
+    HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    .with_query_type(HudiQueryType.Incremental)
+    .with_start_timestamp(t1)
+    .with_end_timestamp(t2)
 )
 ```
 
@@ -241,10 +244,12 @@ The same `ReadOptions` knobs apply, plus `batch_size` and `projection`.
 #### Python
 
 ```python
-options = HudiReadOptions(
-    filters=[("city", "=", "san_francisco")],
-    projection=["rider", "city", "ts", "fare"],
-    batch_size=4096,
+options = (
+    HudiReadOptions(
+        filters=[("city", "=", "san_francisco")],
+        projection=["rider", "city", "ts", "fare"],
+    )
+    .with_batch_size(4096)
 )
 for batch in hudi_table.read_stream(options):
     print(batch.num_rows)

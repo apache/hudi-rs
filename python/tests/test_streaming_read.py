@@ -35,17 +35,20 @@ def test_read_options_default():
 
 
 def test_read_options_with_values():
-    options = HudiReadOptions(
-        filters=[("city", "=", "san_francisco")],
-        projection=["uuid", "rider"],
-        batch_size=2048,
-        as_of_timestamp="20240101000000000",
+    options = (
+        HudiReadOptions(filters=[("city", "=", "san_francisco")])
+        .with_projection(["uuid", "rider"])
+        .with_batch_size(2048)
+        .with_as_of_timestamp("20240101000000000")
     )
     assert options.filters == [("city", "=", "san_francisco")]
     assert options.projection == ["uuid", "rider"]
-    # Convenience kwargs flow into hudi_options under the matching HudiReadConfig keys.
+    # Builders insert into hudi_options under the matching HudiReadConfig keys.
     assert options.hudi_options["hoodie.read.stream.batch_size"] == "2048"
     assert options.hudi_options["hoodie.read.as.of.timestamp"] == "20240101000000000"
+    # Typed accessors round-trip.
+    assert options.batch_size() == 2048
+    assert options.as_of_timestamp() == "20240101000000000"
     assert "HudiReadOptions" in repr(options)
 
 
@@ -104,7 +107,7 @@ def test_read_file_slice_from_paths_stream(v8_trips_table):
 
 def test_read_snapshot_stream_with_batch_size(v8_trips_table):
     table = HudiTable(v8_trips_table)
-    options = HudiReadOptions(batch_size=1)
+    options = HudiReadOptions().with_batch_size(1)
     batches = list(table.read_stream(options))
     t = pa.Table.from_batches(batches)
     assert t.num_rows == 6

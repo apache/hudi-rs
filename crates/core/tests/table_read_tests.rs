@@ -319,7 +319,11 @@ mod v6_tables {
             for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp("0"))
+                    .read(
+                        &ReadOptions::new()
+                            .with_query_type(QueryType::Incremental)
+                            .with_start_timestamp("0"),
+                    )
                     .await?;
                 assert!(records.is_empty())
             }
@@ -343,7 +347,9 @@ mod v6_tables {
 
                 // read records changed from the beginning to the 1st commit
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                    .read(
+                        &ReadOptions::new()
+                            .with_query_type(QueryType::Incremental)
                             .with_start_timestamp("19700101000000")
                             .with_end_timestamp(first_commit),
                     )
@@ -359,7 +365,9 @@ mod v6_tables {
 
                 // read records changed from the 1st to the 2nd commit
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                    .read(
+                        &ReadOptions::new()
+                            .with_query_type(QueryType::Incremental)
                             .with_start_timestamp(first_commit)
                             .with_end_timestamp(second_commit),
                     )
@@ -375,7 +383,9 @@ mod v6_tables {
 
                 // read records changed from the 2nd to the 3rd commit
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                    .read(
+                        &ReadOptions::new()
+                            .with_query_type(QueryType::Incremental)
                             .with_start_timestamp(second_commit)
                             .with_end_timestamp(third_commit),
                     )
@@ -391,7 +401,10 @@ mod v6_tables {
 
                 // read records changed from the 1st commit
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(first_commit),
+                    .read(
+                        &ReadOptions::new()
+                            .with_query_type(QueryType::Incremental)
+                            .with_start_timestamp(first_commit),
                     )
                     .await?;
                 let schema = &records[0].schema();
@@ -405,7 +418,10 @@ mod v6_tables {
 
                 // read records changed from the 3rd commit
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(third_commit),
+                    .read(
+                        &ReadOptions::new()
+                            .with_query_type(QueryType::Incremental)
+                            .with_start_timestamp(third_commit),
                     )
                     .await?;
                 assert!(
@@ -719,7 +735,9 @@ mod v8_tables {
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
-            let mut stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
+            let mut stream = fg_reader
+                .read_file_slice_stream(file_slice, &options)
+                .await?;
 
             // Collect all batches from stream
             let mut batches = Vec::new();
@@ -747,7 +765,9 @@ mod v8_tables {
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             // Test with small batch size
             let options = ReadOptions::new().with_batch_size(1);
-            let mut stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
+            let mut stream = fg_reader
+                .read_file_slice_stream(file_slice, &options)
+                .await?;
 
             let mut batches = Vec::new();
             while let Some(result) = stream.next().await {
@@ -1115,7 +1135,9 @@ mod v9_tables {
             let third_commit = commit_timestamps[2];
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
                         .with_start_timestamp("19700101000000000")
                         .with_end_timestamp(first_commit),
                 )
@@ -1135,7 +1157,9 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
                         .with_start_timestamp(first_commit)
                         .with_end_timestamp(second_commit),
                 )
@@ -1151,7 +1175,9 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
                         .with_start_timestamp(second_commit)
                         .with_end_timestamp(third_commit),
                 )
@@ -1168,7 +1194,11 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(first_commit))
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
+                        .with_start_timestamp(first_commit),
+                )
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1182,7 +1212,11 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(third_commit))
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
+                        .with_start_timestamp(third_commit),
+                )
                 .await?;
             assert!(
                 records.is_empty(),
@@ -1206,7 +1240,9 @@ mod v9_tables {
             let second_commit = &deltacommits[1].timestamp;
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
                         .with_start_timestamp("19700101000000000")
                         .with_end_timestamp(first_commit),
                 )
@@ -1223,7 +1259,9 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental)
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
                         .with_start_timestamp(first_commit)
                         .with_end_timestamp(second_commit),
                 )
@@ -1236,7 +1274,11 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(first_commit))
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
+                        .with_start_timestamp(first_commit),
+                )
                 .await?;
             let rows = txn_rows(&records);
             assert_eq!(
@@ -1246,7 +1288,11 @@ mod v9_tables {
             );
 
             let records = hudi_table
-                .read(&ReadOptions::new().with_query_type(QueryType::Incremental).with_start_timestamp(second_commit))
+                .read(
+                    &ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
+                        .with_start_timestamp(second_commit),
+                )
                 .await?;
             assert!(
                 records.is_empty(),
@@ -1350,7 +1396,9 @@ mod v9_tables {
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
-            let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
+            let stream = fg_reader
+                .read_file_slice_stream(file_slice, &options)
+                .await?;
             let batches = collect_stream_batches(stream).await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1369,7 +1417,9 @@ mod v9_tables {
             let fg_reader = hudi_table
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new().with_batch_size(1);
-            let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
+            let stream = fg_reader
+                .read_file_slice_stream(file_slice, &options)
+                .await?;
             let batches = collect_stream_batches(stream).await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1533,7 +1583,9 @@ mod streaming_queries {
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
-        let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
+        let stream = fg_reader
+            .read_file_slice_stream(file_slice, &options)
+            .await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce at least one batch");
@@ -1556,7 +1608,9 @@ mod streaming_queries {
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         // Test with small batch size
         let options = ReadOptions::new().with_batch_size(1);
-        let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
+        let stream = fg_reader
+            .read_file_slice_stream(file_slice, &options)
+            .await?;
         let batches = collect_stream_batches(stream).await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1834,7 +1888,11 @@ mod streaming_queries {
 
         assert!(!batches.is_empty(), "should produce at least one batch");
         let schema = batches[0].schema();
-        assert_eq!(schema.fields().len(), 1, "projection should narrow to one column");
+        assert_eq!(
+            schema.fields().len(),
+            1,
+            "projection should narrow to one column"
+        );
         assert_eq!(schema.field(0).name(), "id");
         Ok(())
     }
@@ -1866,6 +1924,56 @@ mod streaming_queries {
         assert!(
             found_error,
             "Should have encountered an error for non-existent column"
+        );
+        Ok(())
+    }
+
+    /// Regression: a stray `hoodie.read.start.timestamp` left in
+    /// `options.hudi_options` must NOT silently activate commit-time filtering on
+    /// a snapshot read. Snapshot dispatch + a future-dated start timestamp would
+    /// otherwise filter out every row at the FG-reader layer.
+    #[tokio::test]
+    async fn test_snapshot_ignores_stale_start_timestamp_in_options() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let baseline = hudi_table.read(&ReadOptions::new()).await?;
+        let baseline_rows: usize = baseline.iter().map(|b| b.num_rows()).sum();
+        assert!(baseline_rows > 0);
+
+        // Snapshot dispatch (default), but with a future-dated start_timestamp
+        // sitting in the bag — a stray incremental knob the user might have set
+        // before flipping to snapshot. Snapshot must ignore it.
+        let polluted = ReadOptions::new().with_start_timestamp("99999999999999999");
+        let result = hudi_table.read(&polluted).await?;
+        let result_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(
+            baseline_rows, result_rows,
+            "snapshot read must not honor an incremental-only start_timestamp"
+        );
+        Ok(())
+    }
+
+    /// Same regression for the streaming snapshot path.
+    #[tokio::test]
+    async fn test_snapshot_stream_ignores_stale_start_timestamp_in_options() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let baseline_stream = hudi_table.read_stream(&ReadOptions::new()).await?;
+        let baseline = collect_stream_batches(baseline_stream).await?;
+        let baseline_rows: usize = baseline.iter().map(|b| b.num_rows()).sum();
+        assert!(baseline_rows > 0);
+
+        let polluted = ReadOptions::new().with_start_timestamp("99999999999999999");
+        let polluted_stream = hudi_table.read_stream(&polluted).await?;
+        let result = collect_stream_batches(polluted_stream).await?;
+        let result_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(
+            baseline_rows, result_rows,
+            "snapshot stream must not honor an incremental-only start_timestamp"
         );
         Ok(())
     }

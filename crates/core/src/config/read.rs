@@ -157,12 +157,8 @@ impl ConfigParser for HudiReadConfig {
                 .and_then(QueryType::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
-            Self::StartTimestamp => {
-                get_result.map(|v| HudiConfigValue::String(v.to_string()))
-            }
-            Self::EndTimestamp => {
-                get_result.map(|v| HudiConfigValue::String(v.to_string()))
-            }
+            Self::StartTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::EndTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::InputPartitions => get_result
                 .and_then(|v| {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))

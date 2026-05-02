@@ -424,10 +424,9 @@ impl FileGroupReader {
                     )))),
                     Ok(batch) => {
                         if !validated.load(std::sync::atomic::Ordering::Relaxed) {
-                            if let Err(e) = validate_fields_against_schemas(
-                                &filters,
-                                [batch.schema().as_ref()],
-                            ) {
+                            if let Err(e) =
+                                validate_fields_against_schemas(&filters, [batch.schema().as_ref()])
+                            {
                                 return Some(Err(e));
                             }
                             validated.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -781,11 +780,9 @@ mod tests {
         assert_eq!(mask, None);
 
         // Test case 3: Filtering commit time > '2'
-        let reader = FileGroupReader::new_with_options(
-            &base_uri,
-            [(HudiReadConfig::StartTimestamp, "2")],
-        )
-        .await?;
+        let reader =
+            FileGroupReader::new_with_options(&base_uri, [(HudiReadConfig::StartTimestamp, "2")])
+                .await?;
         let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(
             mask,
@@ -794,11 +791,9 @@ mod tests {
         );
 
         // Test case 4: Filtering commit time <= '4'
-        let reader = FileGroupReader::new_with_options(
-            &base_uri,
-            [(HudiReadConfig::EndTimestamp, "4")],
-        )
-        .await?;
+        let reader =
+            FileGroupReader::new_with_options(&base_uri, [(HudiReadConfig::EndTimestamp, "4")])
+                .await?;
         let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
         assert_eq!(mask, None, "Commit time filtering should not be needed");
 

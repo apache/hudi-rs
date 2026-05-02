@@ -71,10 +71,8 @@ def test_read_table_can_read_from_batches(v8_trips_table):
 
     file_slices = table.get_file_slices()
     file_slice_paths = [f.base_file_relative_path() for f in file_slices]
-    batch = (
-        table.create_file_group_reader_with_options().read_file_slice_from_paths(
-            file_slice_paths[0], []
-        )
+    batch = table.create_file_group_reader_with_options().read_file_slice_from_paths(
+        file_slice_paths[0], []
     )
     t = pa.Table.from_batches([batch])
     assert t.num_rows > 0
@@ -120,9 +118,7 @@ def test_read_table_returns_correct_data(v8_trips_table):
 def test_read_table_for_partition(v8_trips_table):
     table = HudiTable(v8_trips_table)
 
-    batches = table.read(
-        HudiReadOptions(filters=[("city", "=", "san_francisco")])
-    )
+    batches = table.read(HudiReadOptions(filters=[("city", "=", "san_francisco")]))
     t = (
         pa.Table.from_batches(batches)
         .select(["ts", "uuid", "rider", "fare"])
@@ -147,7 +143,7 @@ def test_table_apis_as_of_timestamp(v8_trips_table):
     all_commits = timeline.get_completed_commits()
     first_commit = all_commits[0].timestamp
 
-    options_at_first = HudiReadOptions(as_of_timestamp=first_commit)
+    options_at_first = HudiReadOptions().with_as_of_timestamp(first_commit)
     all_slices = table.get_file_slices(options_at_first)
     assert len(all_slices) == 3
     partition_prefixes = sorted(

@@ -35,11 +35,12 @@ class HudiReadOptions:
     """
     Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 
-    Stored attributes are ``filters``, ``projection``, and ``hudi_options``. The
-    constructor's convenience kwargs (``query_type``, ``as_of_timestamp``,
-    ``start_timestamp``, ``end_timestamp``, ``batch_size``) are translated into
-    ``hudi_options`` under the matching ``HudiReadConfig`` keys, so ``hudi_options``
-    is the single source of truth for per-read Hudi configs.
+    Mirrors the Rust ``ReadOptions`` struct shape: only three stored attributes —
+    ``filters``, ``projection``, ``hudi_options``. All other knobs (query type,
+    timestamps, batch size) are set via the chainable ``with_*`` builders, which
+    insert into ``hudi_options`` under the matching ``HudiReadConfig`` key.
+    Typed accessors (``query_type()``, ``as_of_timestamp()``, etc.) read back
+    from the bag.
 
     Attributes:
         filters (List[Tuple[str, str, str]]): Column filters as ``(field, op, value)`` tuples.
@@ -53,15 +54,30 @@ class HudiReadOptions:
 
     def __init__(
         self,
-        query_type: Optional[HudiQueryType] = None,
         filters: Optional[List[Tuple[str, str, str]]] = None,
         projection: Optional[List[str]] = None,
-        batch_size: Optional[int] = None,
-        as_of_timestamp: Optional[str] = None,
-        start_timestamp: Optional[str] = None,
-        end_timestamp: Optional[str] = None,
         hudi_options: Optional[Dict[str, str]] = None,
     ): ...
+
+    # Builders return a new HudiReadOptions for chaining.
+    def with_query_type(self, query_type: HudiQueryType) -> "HudiReadOptions": ...
+    def with_as_of_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
+    def with_start_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
+    def with_end_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
+    def with_batch_size(self, size: int) -> "HudiReadOptions": ...
+    def with_filters(
+        self, filters: List[Tuple[str, str, str]]
+    ) -> "HudiReadOptions": ...
+    def with_projection(self, columns: List[str]) -> "HudiReadOptions": ...
+    def with_hudi_option(self, key: str, value: str) -> "HudiReadOptions": ...
+    def with_hudi_options(self, opts: Dict[str, str]) -> "HudiReadOptions": ...
+
+    # Typed accessors read from hudi_options.
+    def query_type(self) -> HudiQueryType: ...
+    def as_of_timestamp(self) -> Optional[str]: ...
+    def start_timestamp(self) -> Optional[str]: ...
+    def end_timestamp(self) -> Optional[str]: ...
+    def batch_size(self) -> Optional[int]: ...
 
 @dataclass(init=False)
 class HudiRecordBatchStream:
@@ -392,7 +408,6 @@ def build_hudi_table(
         HudiTable: An instance of hudi table.
     """
     ...
-
 @dataclass(init=False)
 class HudiDataFusionDataSource:
     def __init__(

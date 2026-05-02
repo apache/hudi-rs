@@ -35,10 +35,9 @@ def test_get_incremental_file_slices():
     assert len(commits) >= 2
 
     slices = table.get_file_slices(
-        HudiReadOptions(
-            query_type=HudiQueryType.Incremental,
-            start_timestamp=commits[0].timestamp,
-        )
+        HudiReadOptions()
+        .with_query_type(HudiQueryType.Incremental)
+        .with_start_timestamp(commits[0].timestamp)
     )
     assert len(slices) >= 1
 
@@ -70,14 +69,14 @@ def test_read_stream_errors_on_incremental(v8_trips_table):
 
     table = HudiTable(v8_trips_table)
     with pytest.raises(Exception, match="not yet supported"):
-        table.read_stream(HudiReadOptions(query_type=HudiQueryType.Incremental))
+        table.read_stream(HudiReadOptions().with_query_type(HudiQueryType.Incremental))
 
 
 def test_read_options_hudi_options_plumbed_to_reader(v8_trips_table):
     """Per-read hudi_options should affect file-group reader behavior."""
     table = HudiTable(v8_trips_table)
-    options = HudiReadOptions(
-        hudi_options={"hoodie.read.use.read_optimized.mode": "true"}
+    options = HudiReadOptions().with_hudi_option(
+        "hoodie.read.use.read_optimized.mode", "true"
     )
     # Read-optimized snapshot just skips log merging — should still produce
     # valid batches; on this MOR table with deltacommits the row count differs

@@ -98,10 +98,10 @@ pub use read_options::{QueryType, ReadOptions};
 
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::error::CoreError;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
+use crate::error::CoreError;
 use crate::expr::filter::{Filter, parse_filter_tuples, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
@@ -125,6 +125,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
+
+/// Hudi config keys the `Table` layer interprets directly: it dispatches on
+/// `QueryType`, resolves `AsOfTimestamp` for snapshot reads, and resolves
+/// start/end timestamps for incremental reads. The resolved values are then
+/// injected as per-path overrides when constructing the `FileGroupReader`.
+///
+/// Because the `FileGroupReader` itself reads `StartTimestamp`/`EndTimestamp`
+/// to drive commit-time filtering, leaving any of these keys un-stripped from
+/// `ReadOptions::hudi_options` would silently change behavior — e.g. a stray
+/// `hoodie.read.start.timestamp` would activate commit-time filtering on a
+/// snapshot read. Strings must match `HudiReadConfig::*.as_ref()`.
+const TABLE_OWNED_READ_KEYS: &[&str] = &[
+    "hoodie.read.query.type",      // HudiReadConfig::QueryType
+    "hoodie.read.as.of.timestamp", // HudiReadConfig::AsOfTimestamp
+    "hoodie.read.start.timestamp", // HudiReadConfig::StartTimestamp
+    "hoodie.read.end.timestamp",   // HudiReadConfig::EndTimestamp
+];
 
 /// The main struct that provides table APIs for interacting with a Hudi table.
 #[derive(Debug)]
@@ -445,10 +462,7 @@ impl Table {
         self.get_file_slices_inner(&timestamp, &filters).await
     }
 
-    async fn get_incremental_file_slices(
-        &self,
-        options: &ReadOptions,
-    ) -> Result<Vec<FileSlice>> {
+    async fn get_incremental_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
@@ -554,11 +568,14 @@ impl Table {
     ///
     /// Layering, last-writer-wins:
     /// 1. Table-level Hudi configs (constant for this `Table` instance).
-    /// 2. `read_options.hudi_options` when `read_options` is `Some` — per-read overrides.
+    /// 2. `read_options.hudi_options` when `read_options` is `Some`, **excluding**
+    ///    [`TABLE_OWNED_READ_KEYS`] — those are interpreted by the `Table` layer's
+    ///    read paths and translated into the appropriate `extra_overrides`. Letting
+    ///    them through as-is would silently activate FG-reader-side commit-time
+    ///    filtering on, e.g., a snapshot read that happens to have a stray
+    ///    `hoodie.read.start.timestamp` in the bag.
     /// 3. `extra_overrides` — caller-supplied per-path overrides (e.g. resolved
-    ///    `EndTimestamp` for the snapshot read path); these always win so the read
-    ///    path's own commit-time bounds can't be clobbered by a user-supplied
-    ///    entry in `read_options.hudi_options`.
+    ///    `EndTimestamp` for the snapshot read path); these always win.
     pub fn create_file_group_reader_with_options<I, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
@@ -575,6 +592,9 @@ impl Table {
         }
         if let Some(opts) = read_options {
             for (k, v) in &opts.hudi_options {
+                if TABLE_OWNED_READ_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
                 overwriting_options.insert(k.clone(), v.clone());
             }
         }
@@ -622,10 +642,7 @@ impl Table {
         Ok(batches)
     }
 
-    async fn read_incremental_inner(
-        &self,
-        options: &ReadOptions,
-    ) -> Result<Vec<RecordBatch>> {
+    async fn read_incremental_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
@@ -709,7 +726,9 @@ impl Table {
             return Ok(None);
         };
         let end = format_timestamp(end, &timezone)?;
-        let start = options.start_timestamp().unwrap_or(EARLIEST_START_TIMESTAMP);
+        let start = options
+            .start_timestamp()
+            .unwrap_or(EARLIEST_START_TIMESTAMP);
         let start = format_timestamp(start, &timezone)?;
         Ok(Some((start, end)))
     }
@@ -1370,10 +1389,7 @@ mod tests {
             .unwrap();
         assert!(incremental_batches.is_empty());
 
-        let mut snapshot_stream = hudi_table
-            .read_stream(&ReadOptions::new())
-            .await
-            .unwrap();
+        let mut snapshot_stream = hudi_table.read_stream(&ReadOptions::new()).await.unwrap();
         assert!(snapshot_stream.next().await.is_none());
     }
 
@@ -1443,9 +1459,7 @@ mod tests {
 
         // Shortcuts override query_type set on the input options.
         let forced_snapshot = hudi_table
-            .read(
-                &ReadOptions::new().with_query_type(QueryType::Incremental),
-            )
+            .read(&ReadOptions::new().with_query_type(QueryType::Incremental))
             .await
             .unwrap();
         assert!(!forced_snapshot.is_empty());
@@ -1465,6 +1479,18 @@ mod tests {
                 assert!(e.to_string().contains("not yet supported"));
             }
         }
+    }
+
+    #[test]
+    fn table_owned_read_keys_match_hudi_read_config() {
+        // Sentinel: any future rename of HudiReadConfig keys must also update
+        // TABLE_OWNED_READ_KEYS, otherwise sanitization in
+        // create_file_group_reader_with_options silently breaks.
+        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::QueryType.as_ref()));
+        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::AsOfTimestamp.as_ref()));
+        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::StartTimestamp.as_ref()));
+        assert!(TABLE_OWNED_READ_KEYS.contains(&HudiReadConfig::EndTimestamp.as_ref()));
+        assert_eq!(TABLE_OWNED_READ_KEYS.len(), 4);
     }
 
     #[tokio::test]
@@ -1495,10 +1521,8 @@ mod tests {
         // via hudi_options on a snapshot read; the read should still succeed.
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let options = ReadOptions::new().with_hudi_option(
-            HudiReadConfig::StartTimestamp.as_ref(),
-            "0",
-        );
+        let options =
+            ReadOptions::new().with_hudi_option(HudiReadConfig::StartTimestamp.as_ref(), "0");
         let batches = hudi_table.read(&options).await.unwrap();
         assert!(!batches.is_empty());
     }
