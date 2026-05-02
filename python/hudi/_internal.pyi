@@ -384,7 +384,6 @@ def build_hudi_table(
         HudiTable: An instance of hudi table.
     """
     ...
-
 @dataclass(init=False)
 class HudiDataFusionDataSource:
     def __init__(
