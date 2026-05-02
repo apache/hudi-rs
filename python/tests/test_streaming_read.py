@@ -31,8 +31,7 @@ def test_read_options_default():
     options = HudiReadOptions()
     assert options.filters == []
     assert options.projection is None
-    assert options.batch_size is None
-    assert options.as_of_timestamp is None
+    assert options.hudi_options == {}
 
 
 def test_read_options_with_values():
@@ -44,8 +43,9 @@ def test_read_options_with_values():
     )
     assert options.filters == [("city", "=", "san_francisco")]
     assert options.projection == ["uuid", "rider"]
-    assert options.batch_size == 2048
-    assert options.as_of_timestamp == "20240101000000000"
+    # Convenience kwargs flow into hudi_options under the matching HudiReadConfig keys.
+    assert options.hudi_options["hoodie.read.stream.batch_size"] == "2048"
+    assert options.hudi_options["hoodie.read.as.of.instant"] == "20240101000000000"
     assert "HudiReadOptions" in repr(options)
 
 

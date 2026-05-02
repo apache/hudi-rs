@@ -103,19 +103,9 @@ impl From<HudiQueryType> for QueryType {
 #[pyclass]
 pub struct HudiReadOptions {
     #[pyo3(get)]
-    query_type: HudiQueryType,
-    #[pyo3(get)]
     filters: Vec<(String, String, String)>,
     #[pyo3(get)]
     projection: Option<Vec<String>>,
-    #[pyo3(get)]
-    batch_size: Option<usize>,
-    #[pyo3(get)]
-    as_of_timestamp: Option<String>,
-    #[pyo3(get)]
-    start_timestamp: Option<String>,
-    #[pyo3(get)]
-    end_timestamp: Option<String>,
     #[pyo3(get)]
     hudi_options: HashMap<String, String>,
 }
@@ -123,8 +113,20 @@ pub struct HudiReadOptions {
 #[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiReadOptions {
+    /// Construct read options. Convenience kwargs (`query_type`, timestamps,
+    /// `batch_size`) flow into `hudi_options` under the matching `HudiReadConfig`
+    /// keys; `hudi_options` itself accepts arbitrary `hoodie.*` overrides.
     #[new]
-    #[pyo3(signature = (query_type=None, filters=None, projection=None, batch_size=None, as_of_timestamp=None, start_timestamp=None, end_timestamp=None, hudi_options=None))]
+    #[pyo3(signature = (
+        query_type=None,
+        filters=None,
+        projection=None,
+        batch_size=None,
+        as_of_timestamp=None,
+        start_timestamp=None,
+        end_timestamp=None,
+        hudi_options=None,
+    ))]
     fn new(
         query_type: Option<HudiQueryType>,
         filters: Option<Vec<(String, String, String)>>,
@@ -135,29 +137,45 @@ impl HudiReadOptions {
         end_timestamp: Option<String>,
         hudi_options: Option<HashMap<String, String>>,
     ) -> Self {
+        let mut bag: HashMap<String, String> = hudi_options.unwrap_or_default();
+        if let Some(qt) = query_type {
+            bag.insert(
+                HudiReadConfig::QueryType.as_ref().to_string(),
+                QueryType::from(qt).as_str().to_string(),
+            );
+        }
+        if let Some(ts) = as_of_timestamp {
+            bag.insert(HudiReadConfig::AsOfTimestamp.as_ref().to_string(), ts);
+        }
+        if let Some(ts) = start_timestamp {
+            bag.insert(
+                HudiReadConfig::FileGroupStartTimestamp.as_ref().to_string(),
+                ts,
+            );
+        }
+        if let Some(ts) = end_timestamp {
+            bag.insert(
+                HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                ts,
+            );
+        }
+        if let Some(bs) = batch_size {
+            bag.insert(
+                HudiReadConfig::StreamBatchSize.as_ref().to_string(),
+                bs.to_string(),
+            );
+        }
         Self {
-            query_type: query_type.unwrap_or_default(),
             filters: filters.unwrap_or_default(),
             projection,
-            batch_size,
-            as_of_timestamp,
-            start_timestamp,
-            end_timestamp,
-            hudi_options: hudi_options.unwrap_or_default(),
+            hudi_options: bag,
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "HudiReadOptions(query_type={:?}, filters={:?}, projection={:?}, batch_size={:?}, as_of_timestamp={:?}, start_timestamp={:?}, end_timestamp={:?}, hudi_options={:?})",
-            self.query_type,
-            self.filters,
-            self.projection,
-            self.batch_size,
-            self.as_of_timestamp,
-            self.start_timestamp,
-            self.end_timestamp,
-            self.hudi_options,
+            "HudiReadOptions(filters={:?}, projection={:?}, hudi_options={:?})",
+            self.filters, self.projection, self.hudi_options,
         )
     }
 }
@@ -165,23 +183,10 @@ impl HudiReadOptions {
 impl HudiReadOptions {
     fn to_inner(&self) -> ReadOptions {
         let mut options = ReadOptions::new()
-            .with_query_type(self.query_type.into())
             .with_filters(self.filters.clone())
             .with_hudi_options(self.hudi_options.clone());
         if let Some(projection) = &self.projection {
             options = options.with_projection(projection.clone());
-        }
-        if let Some(batch_size) = self.batch_size {
-            options = options.with_batch_size(batch_size);
-        }
-        if let Some(timestamp) = &self.as_of_timestamp {
-            options = options.with_as_of_timestamp(timestamp);
-        }
-        if let Some(timestamp) = &self.start_timestamp {
-            options = options.with_start_timestamp(timestamp);
-        }
-        if let Some(timestamp) = &self.end_timestamp {
-            options = options.with_end_timestamp(timestamp);
         }
         options
     }

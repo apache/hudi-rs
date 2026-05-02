@@ -46,6 +46,13 @@ use crate::config::{ConfigParser, HudiConfigValue};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter, IntoStaticStr)]
 pub enum HudiReadConfig {
+    /// Selects the read semantic. Accepted values: `snapshot` (default), `incremental`.
+    /// See [`crate::table::QueryType`].
+    QueryType,
+
+    /// Snapshot/time-travel timestamp. Reads return the table state at this commit.
+    AsOfTimestamp,
+
     /// Start timestamp (exclusive) for [FileGroup] to filter records.
     FileGroupStartTimestamp,
 
@@ -72,6 +79,8 @@ pub enum HudiReadConfig {
 impl AsRef<str> for HudiReadConfig {
     fn as_ref(&self) -> &str {
         match self {
+            Self::QueryType => "hoodie.read.query.type",
+            Self::AsOfTimestamp => "hoodie.read.as.of.instant",
             Self::FileGroupStartTimestamp => "hoodie.read.file_group.start_timestamp",
             Self::FileGroupEndTimestamp => "hoodie.read.file_group.end_timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
@@ -93,6 +102,7 @@ impl ConfigParser for HudiReadConfig {
 
     fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
+            HudiReadConfig::QueryType => Some(HudiConfigValue::String("snapshot".to_string())),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
@@ -108,6 +118,8 @@ impl ConfigParser for HudiReadConfig {
             .ok_or(NotFound(self.key()));
 
         match self {
+            Self::QueryType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::FileGroupStartTimestamp => {
                 get_result.map(|v| HudiConfigValue::String(v.to_string()))
             }

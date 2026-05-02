@@ -431,7 +431,7 @@ impl Table {
     /// [`crate::util::collection::split_into_chunks`] or your engine's preferred
     /// partitioning policy.
     pub async fn get_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        match options.query_type {
+        match options.query_type()? {
             QueryType::Snapshot => self.get_snapshot_file_slices(options).await,
             QueryType::Incremental => self.get_incremental_file_slices(options).await,
         }
@@ -582,7 +582,7 @@ impl Table {
     /// `options.filters` are applied as partition filters; `options.hudi_options`
     /// override table-level Hudi configs for this single read.
     pub async fn read(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        match options.query_type {
+        match options.query_type()? {
             QueryType::Snapshot => self.read_snapshot_inner(options).await,
             QueryType::Incremental => self.read_incremental_inner(options).await,
         }
@@ -700,7 +700,7 @@ impl Table {
     /// otherwise the table's latest commit. Returns `None` only when the table has no
     /// commits and no explicit timestamp was given.
     fn resolve_snapshot_timestamp(&self, options: &ReadOptions) -> Result<Option<String>> {
-        if let Some(ts) = options.as_of_timestamp.as_deref() {
+        if let Some(ts) = options.as_of_timestamp() {
             return Ok(Some(format_timestamp(ts, &self.timezone())?));
         }
         Ok(self
@@ -717,32 +717,15 @@ impl Table {
     fn resolve_incremental_range(&self, options: &ReadOptions) -> Result<Option<(String, String)>> {
         let timezone = self.timezone();
         let Some(end) = options
-            .end_timestamp
-            .as_deref()
+            .end_timestamp()
             .or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
         else {
             return Ok(None);
         };
         let end = format_timestamp(end, &timezone)?;
-        let start = options
-            .start_timestamp
-            .as_deref()
-            .unwrap_or(EARLIEST_START_TIMESTAMP);
+        let start = options.start_timestamp().unwrap_or(EARLIEST_START_TIMESTAMP);
         let start = format_timestamp(start, &timezone)?;
         Ok(Some((start, end)))
-    }
-
-    /// Get the change-data-capture (CDC) records between the given timestamps.
-    ///
-    /// The CDC records should reflect the records that were inserted, updated, and deleted
-    /// between the timestamps.
-    #[allow(dead_code)]
-    async fn read_incremental_changes(
-        &self,
-        _start_timestamp: &str,
-        _end_timestamp: Option<&str>,
-    ) -> Result<Vec<RecordBatch>> {
-        todo!("read_incremental_changes")
     }
 
     // =========================================================================
@@ -774,7 +757,7 @@ impl Table {
         &self,
         options: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        match options.query_type {
+        match options.query_type()? {
             QueryType::Snapshot => self.read_snapshot_stream_inner(options).await,
             QueryType::Incremental => Err(CoreError::Unsupported(
                 "Streaming for incremental queries is not yet supported".to_string(),
@@ -812,23 +795,26 @@ impl Table {
         // row-level closes the gap for non-partition column filters. Strip filters
         // on dropped partition columns so they don't trigger FGR validation errors.
         let fg_options_template = self.options_for_file_group(options);
-        let batch_size = fg_options_template.batch_size;
         let projection = fg_options_template.projection.clone();
         let row_filters = fg_options_template.filters.clone();
+        // Carry batch_size in hudi_options if set; everything else (timestamps,
+        // query_type) is irrelevant to the per-slice FG-reader read.
+        let mut per_slice_hudi_options: HashMap<String, String> = HashMap::new();
+        if let Some(bs) = fg_options_template.batch_size() {
+            per_slice_hudi_options.insert(
+                HudiReadConfig::StreamBatchSize.as_ref().to_string(),
+                bs.to_string(),
+            );
+        }
 
         let streams_iter = file_slices.into_iter().map(move |file_slice| {
             let fg_reader = fg_reader.clone();
             let projection = projection.clone();
             let row_filters = row_filters.clone();
             let options = ReadOptions {
-                query_type: QueryType::Snapshot,
                 filters: row_filters,
                 projection,
-                batch_size,
-                as_of_timestamp: None,
-                start_timestamp: None,
-                end_timestamp: None,
-                hudi_options: HashMap::new(),
+                hudi_options: per_slice_hudi_options.clone(),
             };
             async move {
                 fg_reader

@@ -35,31 +35,20 @@ class HudiReadOptions:
     """
     Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 
-    ``query_type`` selects the read semantic; the timestamp fields are interpreted by
-    the chosen type. Snapshot uses ``as_of_timestamp`` (defaulting to latest commit);
-    Incremental uses ``start_timestamp`` and ``end_timestamp`` (defaulting to earliest
-    and latest respectively). ``hudi_options`` carries ad-hoc Hudi configs that
-    override table-level defaults for this single read (e.g.
-    ``hoodie.read.use.read_optimized.mode``).
+    Stored attributes are ``filters``, ``projection``, and ``hudi_options``. The
+    constructor's convenience kwargs (``query_type``, ``as_of_timestamp``,
+    ``start_timestamp``, ``end_timestamp``, ``batch_size``) are translated into
+    ``hudi_options`` under the matching ``HudiReadConfig`` keys, so ``hudi_options``
+    is the single source of truth for per-read Hudi configs.
 
     Attributes:
-        query_type (HudiQueryType): Defaults to Snapshot.
         filters (List[Tuple[str, str, str]]): Column filters as ``(field, op, value)`` tuples.
         projection (Optional[List[str]]): Column names to read. If None, all columns are read.
-        batch_size (Optional[int]): Target number of rows per batch (streaming only).
-        as_of_timestamp (Optional[str]): Snapshot/time-travel timestamp.
-        start_timestamp (Optional[str]): Lower-bound (exclusive) for incremental queries.
-        end_timestamp (Optional[str]): Upper-bound (inclusive) for incremental queries.
-        hudi_options (Dict[str, str]): Per-read Hudi configs.
+        hudi_options (Dict[str, str]): Per-read Hudi configs (``hoodie.*``).
     """
 
-    query_type: HudiQueryType
     filters: List[Tuple[str, str, str]]
     projection: Optional[List[str]]
-    batch_size: Optional[int]
-    as_of_timestamp: Optional[str]
-    start_timestamp: Optional[str]
-    end_timestamp: Optional[str]
     hudi_options: Dict[str, str]
 
     def __init__(
