@@ -23,6 +23,8 @@ header:
   paths-ignore:
     - 'LICENSE'
     - 'NOTICE'
+    - 'AGENTS.md'
+    - 'CLAUDE.md'
     - '**/data/**'
     - '.github/PULL_REQUEST_TEMPLATE.md'
     - '.github/copilot-instructions.md'
