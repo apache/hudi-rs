@@ -96,7 +96,7 @@ use arrow::compute::concat_batches;
 #[tokio::main]
 async fn main() -> Result<()> {
     let hudi_table = HudiTableBuilder::from_base_uri("/tmp/trips_table").build().await?;
-    let options = ReadOptions::new().with_filters([("city", "=", "san_francisco")]);
+    let options = ReadOptions::new().with_filters([("city", "=", "san_francisco")])?;
     let batches = hudi_table.read(&options).await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let columns = vec!["rider", "city", "ts", "fare"];
@@ -152,7 +152,7 @@ batches = hudi_table.read(
 ```rust
 let options = ReadOptions::new()
     .with_as_of_timestamp("20241231123456789")
-    .with_filters([("city", "=", "san_francisco")]);
+    .with_filters([("city", "=", "san_francisco")])?;
 let batches = hudi_table.read(&options).await?;
 ```
 
@@ -227,7 +227,7 @@ let options = ReadOptions::new()
     .with_query_type(QueryType::Incremental)
     .with_start_timestamp(t1)
     .with_end_timestamp(t2)
-    .with_filters([("city", "=", "san_francisco")]);
+    .with_filters([("city", "=", "san_francisco")])?;
 let batches = hudi_table.read(&options).await?;
 ```
 
@@ -258,9 +258,9 @@ for batch in hudi_table.read_stream(options):
 use futures::StreamExt;
 
 let options = ReadOptions::new()
-    .with_filters([("city", "=", "san_francisco")])
+    .with_filters([("city", "=", "san_francisco")])?
     .with_projection(["rider", "city", "ts", "fare"])
-    .with_batch_size(4096);
+    .with_batch_size(4096)?;
 let mut stream = hudi_table.read_stream(&options).await?;
 while let Some(batch) = stream.next().await {
     let batch = batch?;

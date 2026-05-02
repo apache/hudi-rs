@@ -248,6 +248,24 @@ mod v6_tests {
     }
 
     #[tokio::test]
+    async fn test_datafusion_read_hudi_table_with_partition_column_filter() {
+        let test_table = V6SimplekeygenNonhivestyle;
+        let ctx = register_table_direct(&test_table, [(InputPartitions, "2")])
+            .await
+            .unwrap();
+
+        let sql = format!(
+            "SELECT id FROM {} WHERE byteField = 20 ORDER BY id",
+            test_table.as_ref()
+        );
+        let df = ctx.sql(&sql).await.unwrap();
+        let rb = df.collect().await.unwrap();
+        let rb = rb.first().unwrap();
+
+        assert_eq!(get_i32_column(rb, "id"), &[2]);
+    }
+
+    #[tokio::test]
     async fn test_datafusion_read_hudi_table_with_replacecommits_with_partition_filter_pushdown() {
         for (test_table, use_sql, planned_input_partitions) in
             &[(V6SimplekeygenNonhivestyleOverwritetable, true, 1)]
