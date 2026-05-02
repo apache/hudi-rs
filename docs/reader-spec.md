@@ -73,7 +73,7 @@ Notes:
 - `read_stream` errors with `Unsupported` for `query_type = Incremental` — incremental streaming is not yet implemented.
 - The `hudi_options` bag is a per-read override layer — set arbitrary `hoodie.*` configs (e.g. `hoodie.read.use.read_optimized.mode = true`) without mutating the `Table`.
 - Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods.
-- For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi_core::util::collection::split_into_chunks` or your engine's preferred partitioning policy.
+- For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi::util::collection::split_into_chunks` or your engine's preferred partitioning policy.
 
 Timestamp formats are documented in [§6](#timestamps).
 
@@ -115,7 +115,7 @@ All public symbols are re-exported from the `hudi` crate.
 | `get_partition_schema()`                                                   | `Result<Schema>`                                     |
 | `get_timeline()`                                                           | `&Timeline`                                          |
 | `get_file_slices(&ReadOptions)`                                            | `Result<Vec<FileSlice>>` (dispatches on `query_type`) |
-| `create_file_group_reader_with_options(options)`                           | `Result<FileGroupReader>`                            |
+| `create_file_group_reader_with_options(read_options, extra_overrides)`     | `Result<FileGroupReader>`                            |
 | `read(&ReadOptions)`                                                       | `Result<Vec<RecordBatch>>` (dispatches on `query_type`) |
 | `read_stream(&ReadOptions)`                                                | `Result<BoxStream<'static, Result<RecordBatch>>>` (errors on `Incremental`) |
 | `compute_table_stats()`                                                    | `Option<(u64, u64)>` — `(rows, byte_size)`           |

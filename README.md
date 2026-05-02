@@ -142,10 +142,8 @@ Time-travel query reads the data at a specific timestamp from the table. The tab
 
 ```python
 batches = hudi_table.read(
-    HudiReadOptions(
-        as_of_timestamp="20241231123456789",
-        filters=[("city", "=", "san_francisco")],
-    )
+    HudiReadOptions(filters=[("city", "=", "san_francisco")])
+    .with_as_of_timestamp("20241231123456789")
 )
 ```
 
@@ -332,19 +330,19 @@ Hudi-rs provides APIs to support integration with query engines. The sections be
 
 Create a Hudi table instance using its constructor or the `TableBuilder` API.
 
-All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) struct with these fields:
+All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. It stores three fields — `filters`, `projection`, and `hudi_options` — and exposes chainable `with_*` builders for the rest. The available knobs:
 
-- `query_type` — `Snapshot` (default) or `Incremental`. Drives dispatch in `read`, `read_stream`, and `get_file_slices`.
-- `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning, and row-level filtering.
+- `query_type` (`with_query_type`) — `Snapshot` (default) or `Incremental`. Drives dispatch in `read`, `read_stream`, and `get_file_slices`.
+- `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning (snapshot only), and row-level filtering.
 - `projection` — columns to return. Streaming pushes the projection down to the parquet reader; eager reads project after merging.
-- `batch_size` — rows per batch (streaming only; eager reads return one batch).
-- `as_of_timestamp` — snapshot/time-travel timestamp (defaults to latest commit)
-- `start_timestamp`, `end_timestamp` — incremental range (defaults to earliest…latest)
-- `hudi_options` — per-read Hudi configs that override table-level defaults (e.g. `hoodie.read.use.read_optimized.mode`)
+- `batch_size` (`with_batch_size`) — rows per batch (streaming only; eager reads return one batch per file slice).
+- `as_of_timestamp` (`with_as_of_timestamp`) — snapshot/time-travel timestamp (defaults to latest commit).
+- `start_timestamp` / `end_timestamp` (`with_start_timestamp` / `with_end_timestamp`) — incremental range (defaults to earliest…latest).
+- `hudi_options` — per-read Hudi configs that override table-level defaults (e.g. `hoodie.read.use.read_optimized.mode`).
 
 | Stage           | API                                                              | Description                                                                                              |
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi_core::util::collection::split_into_chunks` on the result. |
+| Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi::util::collection::split_into_chunks` on the result. |
 |                 | `compute_table_stats()`                                          | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
 | Query execution | `create_file_group_reader_with_options()`                        | Create a file group reader instance with the table instance's configs.                                   |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |

@@ -266,12 +266,12 @@ class HudiTable:
         """
         ...
     @property
-    def is_mor(self) -> str:
+    def is_mor(self) -> bool:
         """
         Get whether the table is an MOR table.
 
         Returns:
-            str: True if the table is a MOR table, False otherwise.
+            bool: True if the table is a MOR table, False otherwise.
         """
         ...
     @property
