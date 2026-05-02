@@ -22,11 +22,44 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 
-use strum_macros::{EnumIter, IntoStaticStr};
+use strum_macros::{AsRefStr, EnumIter, IntoStaticStr};
 
 use crate::config::Result;
-use crate::config::error::ConfigError::{NotFound, ParseBool, ParseInt};
+use crate::config::error::ConfigError;
+use crate::config::error::ConfigError::{InvalidValue, NotFound, ParseBool, ParseInt};
 use crate::config::{ConfigParser, HudiConfigValue};
+
+/// Config value for [`HudiReadConfig::QueryType`]. Canonical strings are
+/// `snapshot` and `incremental`; [`FromStr`] accepts case-insensitive forms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, AsRefStr)]
+pub enum QueryType {
+    /// Latest table state at one commit (the latest by default; an explicit
+    /// `as_of_timestamp` for time-travel).
+    #[default]
+    #[strum(serialize = "snapshot")]
+    Snapshot,
+    /// Records changed in the half-open range (`start_timestamp`, `end_timestamp`].
+    #[strum(serialize = "incremental")]
+    Incremental,
+}
+
+impl Display for QueryType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
+    }
+}
+
+impl FromStr for QueryType {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "snapshot" => Ok(Self::Snapshot),
+            "incremental" => Ok(Self::Incremental),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
 
 /// Configurations for reading Hudi tables.
 ///
@@ -102,7 +135,9 @@ impl ConfigParser for HudiReadConfig {
 
     fn default_value(&self) -> Option<HudiConfigValue> {
         match self {
-            HudiReadConfig::QueryType => Some(HudiConfigValue::String("snapshot".to_string())),
+            HudiReadConfig::QueryType => Some(HudiConfigValue::String(
+                QueryType::default().as_ref().to_string(),
+            )),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
@@ -118,7 +153,9 @@ impl ConfigParser for HudiReadConfig {
             .ok_or(NotFound(self.key()));
 
         match self {
-            Self::QueryType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::QueryType => get_result
+                .and_then(QueryType::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::StartTimestamp => {
                 get_result.map(|v| HudiConfigValue::String(v.to_string()))

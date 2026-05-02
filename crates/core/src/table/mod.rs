@@ -550,10 +550,19 @@ impl Table {
         Ok(file_slices)
     }
 
-    /// Create a [FileGroupReader] using the [Table]'s Hudi configs, and overwriting options.
+    /// Create a [FileGroupReader] using the [Table]'s Hudi configs.
+    ///
+    /// Layering, last-writer-wins:
+    /// 1. Table-level Hudi configs (constant for this `Table` instance).
+    /// 2. `read_options.hudi_options` when `read_options` is `Some` — per-read overrides.
+    /// 3. `extra_overrides` — caller-supplied per-path overrides (e.g. resolved
+    ///    `EndTimestamp` for the snapshot read path); these always win so the read
+    ///    path's own commit-time bounds can't be clobbered by a user-supplied
+    ///    entry in `read_options.hudi_options`.
     pub fn create_file_group_reader_with_options<I, K, V>(
         &self,
-        options: I,
+        read_options: Option<&ReadOptions>,
+        extra_overrides: I,
     ) -> Result<FileGroupReader>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -564,7 +573,12 @@ impl Table {
         for (k, v) in self.storage_options.iter() {
             overwriting_options.insert(k.clone(), v.clone());
         }
-        for (k, v) in options {
+        if let Some(opts) = read_options {
+            for (k, v) in &opts.hudi_options {
+                overwriting_options.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in extra_overrides {
             overwriting_options.insert(k.as_ref().to_string(), v.into());
         }
         FileGroupReader::new_with_configs_and_overwriting_options(
@@ -594,12 +608,9 @@ impl Table {
         };
         let filters = parse_filter_tuples(&options.filters)?;
         let file_slices = self.get_file_slices_inner(&timestamp, &filters).await?;
-        let fg_reader = self.create_file_group_reader_for_read(
-            options,
-            [(
-                HudiReadConfig::EndTimestamp.as_ref().to_string(),
-                timestamp.clone(),
-            )],
+        let fg_reader = self.create_file_group_reader_with_options(
+            Some(options),
+            [(HudiReadConfig::EndTimestamp, timestamp.clone())],
         )?;
         let fg_options = self.options_for_file_group(options);
         let batches = futures::future::try_join_all(
@@ -623,17 +634,11 @@ impl Table {
             .get_file_slices_between_inner(&start, &end, &filters)
             .await?;
 
-        let fg_reader = self.create_file_group_reader_for_read(
-            options,
+        let fg_reader = self.create_file_group_reader_with_options(
+            Some(options),
             [
-                (
-                    HudiReadConfig::StartTimestamp.as_ref().to_string(),
-                    start,
-                ),
-                (
-                    HudiReadConfig::EndTimestamp.as_ref().to_string(),
-                    end,
-                ),
+                (HudiReadConfig::StartTimestamp, start),
+                (HudiReadConfig::EndTimestamp, end),
             ],
         )?;
         let fg_options = self.options_for_file_group(options);
@@ -645,25 +650,6 @@ impl Table {
         )
         .await?;
         Ok(batches)
-    }
-
-    /// Build a `FileGroupReader` for one of the read paths. Merges `options.hudi_options`
-    /// with caller-supplied per-path overrides (e.g., `StartTimestamp`); the
-    /// per-path overrides win on conflict so commit-time bounds the read path needs
-    /// can't be accidentally clobbered by a user-supplied `hudi_options` entry.
-    fn create_file_group_reader_for_read<I>(
-        &self,
-        options: &ReadOptions,
-        per_path_overrides: I,
-    ) -> Result<FileGroupReader>
-    where
-        I: IntoIterator<Item = (String, String)>,
-    {
-        let mut merged: HashMap<String, String> = options.hudi_options.clone();
-        for (k, v) in per_path_overrides {
-            merged.insert(k, v);
-        }
-        self.create_file_group_reader_with_options(merged)
     }
 
     /// Build the [`ReadOptions`] passed to `FileGroupReader` for a per-slice read,
@@ -782,12 +768,9 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.create_file_group_reader_for_read(
-            options,
-            [(
-                HudiReadConfig::EndTimestamp.as_ref().to_string(),
-                timestamp,
-            )],
+        let fg_reader = self.create_file_group_reader_with_options(
+            Some(options),
+            [(HudiReadConfig::EndTimestamp, timestamp)],
         )?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
@@ -1333,7 +1316,7 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
-            .create_file_group_reader_with_options(empty_options())
+            .create_file_group_reader_with_options(None, empty_options())
             .unwrap()
             .read_file_slice_from_paths(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",

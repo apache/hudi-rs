@@ -141,7 +141,7 @@ impl HudiReadOptions {
         if let Some(qt) = query_type {
             bag.insert(
                 HudiReadConfig::QueryType.as_ref().to_string(),
-                QueryType::from(qt).as_str().to_string(),
+                QueryType::from(qt).as_ref().to_string(),
             );
         }
         if let Some(ts) = as_of_timestamp {
@@ -616,7 +616,7 @@ impl HudiTable {
     ) -> PyResult<HudiFileGroupReader> {
         let fg_reader = self
             .inner
-            .create_file_group_reader_with_options(options.unwrap_or_default())
+            .create_file_group_reader_with_options(None, options.unwrap_or_default())
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner: fg_reader })
     }

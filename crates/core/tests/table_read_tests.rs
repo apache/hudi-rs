@@ -716,7 +716,7 @@ mod v8_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let mut stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
@@ -744,7 +744,7 @@ mod v8_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             // Test with small batch size
             let options = ReadOptions::new().with_batch_size(1);
             let mut stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
@@ -1347,7 +1347,7 @@ mod v9_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
@@ -1367,7 +1367,7 @@ mod v9_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new().with_batch_size(1);
             let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
             let batches = collect_stream_batches(stream).await?;
@@ -1530,7 +1530,7 @@ mod streaming_queries {
         );
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
         let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;
@@ -1553,7 +1553,7 @@ mod streaming_queries {
         let file_slice = &file_slices[0];
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         // Test with small batch size
         let options = ReadOptions::new().with_batch_size(1);
         let stream = fg_reader.read_file_slice_stream(file_slice, &options).await?;

@@ -22,51 +22,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::config::read::HudiReadConfig;
-
-/// The query type a read targets. Drives dispatch in [`crate::table::Table::read`],
-/// [`crate::table::Table::read_stream`], and [`crate::table::Table::get_file_slices`].
-///
-/// Stored in [`ReadOptions::hudi_options`] under [`HudiReadConfig::QueryType`]
-/// (`hoodie.read.query.type`); the string form is `"snapshot"` / `"incremental"`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum QueryType {
-    /// Latest table state at one commit (the latest by default; an explicit
-    /// `as_of_timestamp` for time-travel).
-    #[default]
-    Snapshot,
-    /// Records changed in the half-open range (`start_timestamp`, `end_timestamp`].
-    Incremental,
-}
-
-impl QueryType {
-    /// String form used as the [`HudiReadConfig::QueryType`] value.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            QueryType::Snapshot => "snapshot",
-            QueryType::Incremental => "incremental",
-        }
-    }
-}
-
-impl std::fmt::Display for QueryType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for QueryType {
-    type Err = crate::error::CoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "snapshot" => Ok(QueryType::Snapshot),
-            "incremental" => Ok(QueryType::Incremental),
-            other => Err(crate::error::CoreError::Schema(format!(
-                "Unknown query type '{other}'; expected 'snapshot' or 'incremental'"
-            ))),
-        }
-    }
-}
+pub use crate::config::read::QueryType;
 
 /// Options for all Hudi read APIs (snapshot, time-travel, incremental, eager and streaming).
 ///
@@ -137,7 +93,7 @@ impl ReadOptions {
     /// Sets the query type. Stored as [`HudiReadConfig::QueryType`].
     pub fn with_query_type(mut self, query_type: QueryType) -> Self {
         self.hudi_options
-            .insert(HudiReadConfig::QueryType.as_ref().to_string(), query_type.as_str().to_string());
+            .insert(HudiReadConfig::QueryType.as_ref().to_string(), query_type.as_ref().to_string());
         self
     }
 
@@ -235,7 +191,7 @@ impl ReadOptions {
     /// the stored string is not a recognized variant.
     pub fn query_type(&self) -> crate::Result<QueryType> {
         match self.hudi_options.get(HudiReadConfig::QueryType.as_ref()) {
-            Some(s) => QueryType::from_str(s),
+            Some(s) => Ok(QueryType::from_str(s)?),
             None => Ok(QueryType::default()),
         }
     }
@@ -347,7 +303,7 @@ mod tests {
             "garbage",
         );
         let err = opts.query_type().unwrap_err();
-        assert!(err.to_string().contains("Unknown query type 'garbage'"));
+        assert!(err.to_string().contains("garbage"));
     }
 
     #[test]
