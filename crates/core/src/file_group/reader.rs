@@ -20,12 +20,10 @@ use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig;
-use crate::config::util::split_hudi_options_from_others;
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{
-    Filter, SchemableFilter, filters_to_row_mask, parse_filter_tuples,
-    validate_fields_against_schemas,
+    Filter, SchemableFilter, filters_to_row_mask, validate_fields_against_schemas,
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
@@ -57,25 +55,25 @@ pub struct FileGroupReader {
 }
 
 impl FileGroupReader {
-    /// Creates a new reader with the given Hudi configurations and overwriting options.
+    /// Creates a new reader from base Hudi configs plus pre-split per-call
+    /// overrides — Hudi configs and storage options live in separate maps so
+    /// callers can't accidentally cross the streams.
     ///
-    /// # Notes
-    /// This API does **not** use [`OptionResolver`] that loads table properties from storage to resolve options.
-    pub(crate) fn new_with_configs_and_overwriting_options<I, K, V>(
+    /// `extra_hudi_opts` extends `hudi_configs` (last-writer-wins). `storage_opts`
+    /// is the full storage option set for this reader (table-level + any overrides
+    /// the caller has already merged in).
+    ///
+    /// This API does **not** use [`OptionResolver`] that loads table properties
+    /// from storage to resolve options — callers supply final configs.
+    pub(crate) fn new_with_overrides(
         hudi_configs: Arc<HudiConfigs>,
-        overwriting_options: I,
-    ) -> Result<Self>
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let (hudi_opts, others) = split_hudi_options_from_others(overwriting_options);
-
+        extra_hudi_opts: HashMap<String, String>,
+        storage_opts: HashMap<String, String>,
+    ) -> Result<Self> {
         let mut final_opts = hudi_configs.as_options();
-        final_opts.extend(hudi_opts);
+        final_opts.extend(extra_hudi_opts);
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
-        let storage = Storage::new(Arc::new(others), hudi_configs.clone())?;
+        let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
 
         Ok(Self {
             hudi_configs,
@@ -377,12 +375,13 @@ impl FileGroupReader {
         let final_projection = options.projection.clone();
         let read_projection = options.projection.as_ref().map(|proj| {
             let mut combined: Vec<String> = proj.clone();
-            for (field, _, _) in &options.filters {
+            for filter in &options.filters {
+                let field = filter.field.as_str();
                 if dropped_partition_columns.iter().any(|p| p == field) {
                     continue;
                 }
                 if !combined.iter().any(|c| c == field) {
-                    combined.push(field.clone());
+                    combined.push(field.to_string());
                 }
             }
             if needs_commit_time_col {
@@ -399,7 +398,7 @@ impl FileGroupReader {
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
-        let filters = Arc::new(parse_filter_tuples(&options.filters)?);
+        let filters = Arc::new(options.filters.clone());
         let final_projection = Arc::new(final_projection);
         // Validate once on first batch so typoed filter columns surface as errors
         // rather than silent no-ops in `filters_to_row_mask`.
@@ -620,9 +619,8 @@ fn create_commit_time_filter_mask(
 /// going through `Table` strip filters on dropped partition columns before reaching
 /// here; direct `FileGroupReader` callers must not pass such filters.
 fn apply_eager_options(options: &ReadOptions, batch: RecordBatch) -> Result<RecordBatch> {
-    let filters = parse_filter_tuples(&options.filters)?;
-    validate_fields_against_schemas(&filters, [batch.schema().as_ref()])?;
-    let batch = apply_filter_mask(&filters, batch)?;
+    validate_fields_against_schemas(&options.filters, [batch.schema().as_ref()])?;
+    let batch = apply_filter_mask(&options.filters, batch)?;
     project_batch_by_names(batch, options.projection.as_deref())
 }
 
@@ -1010,16 +1008,18 @@ mod tests {
     /// Helper to create a FileGroupReader without using block_on (safe for async tests).
     fn create_test_reader(base_uri: &str) -> Result<FileGroupReader> {
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
-        FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
+        FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())
     }
 
     /// Helper to create a FileGroupReader with read-optimized mode.
     fn create_test_reader_read_optimized(base_uri: &str) -> Result<FileGroupReader> {
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
-        FileGroupReader::new_with_configs_and_overwriting_options(
-            hudi_configs,
-            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-        )
+        let mut hudi_opts = HashMap::new();
+        hudi_opts.insert(
+            HudiReadConfig::UseReadOptimizedMode.as_ref().to_string(),
+            "true".to_string(),
+        );
+        FileGroupReader::new_with_overrides(hudi_configs, hudi_opts, HashMap::new())
     }
 
     #[tokio::test]
@@ -1195,7 +1195,7 @@ mod tests {
         let file_slice = FileSlice::new(base_file, String::new());
 
         // Use very small batch size
-        let options = ReadOptions::new().with_batch_size(1);
+        let options = ReadOptions::new().with_batch_size(1)?;
 
         let result = reader.read_file_slice_stream(&file_slice, &options).await;
 
@@ -1259,13 +1259,16 @@ mod tests {
     /// Helper to create a FileGroupReader with commit time filtering options.
     fn create_test_reader_with_commit_time_filter(base_uri: &str) -> Result<FileGroupReader> {
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
-        FileGroupReader::new_with_configs_and_overwriting_options(
-            hudi_configs,
-            [
-                (HudiReadConfig::StartTimestamp.as_ref(), "2"),
-                (HudiReadConfig::EndTimestamp.as_ref(), "4"),
-            ],
-        )
+        let mut hudi_opts = HashMap::new();
+        hudi_opts.insert(
+            HudiReadConfig::StartTimestamp.as_ref().to_string(),
+            "2".to_string(),
+        );
+        hudi_opts.insert(
+            HudiReadConfig::EndTimestamp.as_ref().to_string(),
+            "4".to_string(),
+        );
+        FileGroupReader::new_with_overrides(hudi_configs, hudi_opts, HashMap::new())
     }
 
     #[tokio::test]
@@ -1336,7 +1339,7 @@ mod tests {
             HudiTableConfig::BasePath,
             metadata_table_uri.as_str(),
         )]));
-        FileGroupReader::new_with_configs_and_overwriting_options(hudi_configs, empty_options())
+        FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())
     }
 
     #[tokio::test]

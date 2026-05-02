@@ -261,6 +261,7 @@ impl Table {
         let fg_reader = self.create_file_group_reader_with_options(
             None,
             [(HudiReadConfig::EndTimestamp, timestamp)],
+            std::iter::empty::<(&str, &str)>(),
         )?;
 
         fg_reader

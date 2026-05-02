@@ -89,7 +89,9 @@ A filter is a `(field, operator, value)` tuple of strings.
 | `=` `!=` `<` `<=` `>` `>=`          | 1           |
 | `IN` `NOT IN`                       | ≥1          |
 
-For `IN` / `NOT IN`, the value string is split on commas and trimmed: `("city", "IN", "sf,la,nyc")`.
+For `IN` / `NOT IN`, the value string is split on unescaped commas and trimmed: `("city", "IN", "sf,la,nyc")`. `\,` is a literal comma and `\\` is a literal backslash, so values that contain commas survive: `("name", "IN", "Smith\\, John,Jane")` parses to `["Smith, John", "Jane"]`.
+
+`with_filters` parses and cardinality-validates upfront; an unrecognized operator or empty `IN` / `NOT IN` value list errors at the builder rather than at read time.
 
 The `field` may be any column. Filters drive three things:
 
@@ -118,7 +120,7 @@ All public symbols are re-exported from the `hudi` crate.
 | `get_partition_schema()`                                                   | `Result<Schema>`                                     |
 | `get_timeline()`                                                           | `&Timeline`                                          |
 | `get_file_slices(&ReadOptions)`                                            | `Result<Vec<FileSlice>>` (dispatches on `query_type`) |
-| `create_file_group_reader_with_options(read_options, extra_overrides)`     | `Result<FileGroupReader>`                            |
+| `create_file_group_reader_with_options(read_options, extra_hudi_overrides, extra_storage_overrides)` | `Result<FileGroupReader>`                            |
 | `read(&ReadOptions)`                                                       | `Result<Vec<RecordBatch>>` (dispatches on `query_type`) |
 | `read_stream(&ReadOptions)`                                                | `Result<BoxStream<'static, Result<RecordBatch>>>` (errors on `Incremental`) |
 | `compute_table_stats()`                                                    | `Option<(u64, u64)>` — `(rows, byte_size)`           |
@@ -136,17 +138,21 @@ All public symbols are re-exported from the `hudi` crate.
 
 ### `ReadOptions` builder
 
+`with_filters` and `with_batch_size` validate eagerly and return `Result<Self>`; the others are infallible. Chains intermix with `?` propagation:
+
 ```rust
-ReadOptions::new()
+let options = ReadOptions::new()
     .with_query_type(QueryType::Snapshot)
-    .with_filters([("city", "=", "san_francisco")])
+    .with_filters([("city", "=", "san_francisco")])?
     .with_projection(["rider", "city", "ts", "fare"])
-    .with_batch_size(4096)
+    .with_batch_size(4096)?
     .with_as_of_timestamp("20240101000000000")
     .with_start_timestamp("20240101000000000")
     .with_end_timestamp("20240201000000000")
     .with_hudi_option("hoodie.read.use.read_optimized.mode", "true");
 ```
+
+`with_batch_size(0)` errors at the builder (a zero-row batch yields no batches at the parquet stream reader). `with_filters` parses + cardinality-validates upfront; an unrecognized operator or empty `IN` / `NOT IN` value list errors here rather than at read time.
 
 ### `TableBuilder`
 
@@ -166,7 +172,7 @@ Available pairs: `with_hudi_option` / `with_hudi_options`, `with_storage_option`
 
 | Item                                                                                                          | Notes                                                  |
 |---------------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
-| `Filter { field_name, operator, values }`, `Filter::new(...)`, `Filter::negate()`                             | One column predicate; cardinality-validated.           |
+| `Filter { field, operator, values }`, `Filter::new(...)`, `Filter::negate()`                                  | One column predicate; cardinality-validated.           |
 | `from_str_tuples(tuples)`                                                                                     | Parse `(&str, &str, &str)` tuples into `Vec<Filter>`.  |
 | `enum ExprOperator { Eq, Ne, Lt, Lte, Gt, Gte, In, NotIn }`                                                   | Comparison operators.                                  |
 | `col(name).eq / ne / lt / lte / gt / gte / in_list / not_in_list`                                             | DSL for building filters.                              |
@@ -208,7 +214,7 @@ table = (
 | `get_schema_in_avro_str()` / `get_schema_in_avro_str_with_meta_fields()`                           | `str`                                    |
 | `get_timeline()`                                                                                   | `HudiTimeline`                           |
 | `get_file_slices(options=None)`                                                                    | `List[HudiFileSlice]` (dispatches on `options.query_type`) |
-| `create_file_group_reader_with_options(read_options=None, extra_overrides=None)`                   | `HudiFileGroupReader`                    |
+| `create_file_group_reader_with_options(read_options=None, extra_hudi_overrides=None, extra_storage_overrides=None)` | `HudiFileGroupReader`                    |
 | `read(options=None)`                                                                               | `List[pyarrow.RecordBatch]` (dispatches on `query_type`) |
 | `read_stream(options=None)`                                                                        | `HudiRecordBatchStream` (errors on `Incremental`) |
 | `compute_table_stats()`                                                                            | `Optional[Tuple[int, int]]`              |
@@ -247,6 +253,8 @@ options = (
 All builders return a new `HudiReadOptions` for chaining. Typed accessors
 (`query_type()`, `as_of_timestamp()`, `start_timestamp()`, `end_timestamp()`,
 `batch_size()`) read back from the bag. Defaults match [§2](#2-readoptions).
+
+`with_batch_size(0)` raises immediately, and `with_filters` parses + cardinality-validates upfront — an unrecognized operator or empty `IN` / `NOT IN` value list raises here rather than at read time. The constructor's `filters` argument has the same eager validation.
 
 ### `HudiRecordBatchStream`
 

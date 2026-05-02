@@ -62,7 +62,7 @@ use log::{debug, warn};
 /// * `exprs` - A slice of DataFusion expressions to convert
 ///
 /// # Returns
-/// A vector of filter tuples `(field_name, operator, value)`. All returned filters
+/// A vector of filter tuples `(field, operator, value)`. All returned filters
 /// are implicitly AND-ed together.
 pub fn exprs_to_filters(exprs: &[Expr]) -> Vec<(String, String, String)> {
     exprs
@@ -246,14 +246,14 @@ mod tests {
         assert_eq!(result.len(), 1);
 
         let expected_filter = HudiFilter {
-            field_name: schema.field(0).name().to_string(),
+            field: schema.field(0).name().to_string(),
             operator: ExprOperator::Eq,
             values: vec!["42".to_string()],
         };
         assert_eq!(
             result[0],
             (
-                expected_filter.field_name,
+                expected_filter.field,
                 expected_filter.operator.to_string(),
                 expected_filter.values.join(",")
             )
@@ -278,14 +278,14 @@ mod tests {
         assert_eq!(result.len(), 1);
 
         let expected_filter = HudiFilter {
-            field_name: schema.field(0).name().to_string(),
+            field: schema.field(0).name().to_string(),
             operator: ExprOperator::Ne,
             values: vec!["42".to_string()],
         };
         assert_eq!(
             result[0],
             (
-                expected_filter.field_name,
+                expected_filter.field,
                 expected_filter.operator.to_string(),
                 expected_filter.values.join(",")
             )
@@ -299,7 +299,7 @@ mod tests {
             (
                 col("int32_col").eq(lit(42i32)),
                 Some(HudiFilter {
-                    field_name: String::from("int32_col"),
+                    field: String::from("int32_col"),
                     operator: ExprOperator::Eq,
                     values: vec![String::from("42")],
                 }),
@@ -307,7 +307,7 @@ mod tests {
             (
                 col("int64_col").gt_eq(lit(100i64)),
                 Some(HudiFilter {
-                    field_name: String::from("int64_col"),
+                    field: String::from("int64_col"),
                     operator: ExprOperator::Gte,
                     values: vec![String::from("100")],
                 }),
@@ -315,7 +315,7 @@ mod tests {
             (
                 col("float64_col").lt(lit(32.666)),
                 Some(HudiFilter {
-                    field_name: String::from("float64_col"),
+                    field: String::from("float64_col"),
                     operator: ExprOperator::Lt,
                     values: vec!["32.666".to_string()],
                 }),
@@ -323,7 +323,7 @@ mod tests {
             (
                 col("string_col").not_eq(lit("test")),
                 Some(HudiFilter {
-                    field_name: String::from("string_col"),
+                    field: String::from("string_col"),
                     operator: ExprOperator::Ne,
                     values: vec![String::from("test")],
                 }),
@@ -343,7 +343,7 @@ mod tests {
             assert_eq!(
                 result,
                 &(
-                    expected_filter.field_name.clone(),
+                    expected_filter.field.clone(),
                     expected_filter.operator.to_string(),
                     expected_filter.values.join(",").clone()
                 )
@@ -377,14 +377,14 @@ mod tests {
             assert_eq!(result.len(), 1);
 
             let expected_filter = HudiFilter {
-                field_name: schema.field(0).name().to_string(),
+                field: schema.field(0).name().to_string(),
                 operator: expected_op,
                 values: vec![String::from("42")],
             };
             assert_eq!(
                 result[0],
                 (
-                    expected_filter.field_name,
+                    expected_filter.field,
                     expected_filter.operator.to_string(),
                     expected_filter.values.join(",")
                 )

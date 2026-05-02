@@ -29,27 +29,27 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct Filter {
-    pub field_name: String,
+    pub field: String,
     pub operator: ExprOperator,
     pub values: Vec<String>,
 }
 
 impl Filter {
-    pub fn new(field_name: String, operator: ExprOperator, values: Vec<String>) -> Result<Self> {
+    pub fn new(field: String, operator: ExprOperator, values: Vec<String>) -> Result<Self> {
         if operator.is_multi_value() {
             if values.is_empty() {
                 return Err(CoreError::Schema(format!(
-                    "{operator} operator requires at least one value for field '{field_name}'"
+                    "{operator} operator requires at least one value for field '{field}'"
                 )));
             }
         } else if values.len() != 1 {
             return Err(CoreError::Schema(format!(
-                "Operator {operator} requires exactly one value for field '{field_name}', got {}",
+                "Operator {operator} requires exactly one value for field '{field}', got {}",
                 values.len()
             )));
         }
         Ok(Self {
-            field_name,
+            field,
             operator,
             values,
         })
@@ -67,8 +67,13 @@ impl Filter {
 
 impl From<Filter> for (String, String, String) {
     fn from(filter: Filter) -> Self {
-        let value_str = filter.values.join(",");
-        (filter.field_name, filter.operator.to_string(), value_str)
+        let value_str = filter
+            .values
+            .iter()
+            .map(|v| escape_in_value(v))
+            .collect::<Vec<_>>()
+            .join(",");
+        (filter.field, filter.operator.to_string(), value_str)
     }
 }
 
@@ -76,20 +81,72 @@ impl TryFrom<(&str, &str, &str)> for Filter {
     type Error = CoreError;
 
     fn try_from(binary_expr_tuple: (&str, &str, &str)) -> Result<Self, Self::Error> {
-        let (field_name, operator_str, field_value) = binary_expr_tuple;
-        let field_name = field_name.to_string();
+        let (field, operator_str, field_value) = binary_expr_tuple;
+        let field = field.to_string();
         let operator = ExprOperator::from_str(operator_str)?;
         let values = if operator.is_multi_value() {
-            field_value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+            split_in_values(field_value)
         } else {
             vec![field_value.to_string()]
         };
-        Filter::new(field_name, operator, values)
+        Filter::new(field, operator, values)
     }
+}
+
+/// Split a multi-value (`IN` / `NOT IN`) value string on unescaped commas, then
+/// trim each segment. `\,` is a literal comma; `\\` is a literal backslash; any
+/// other backslash is preserved as-is so callers that don't use escapes are not
+/// surprised. Empty segments after trimming are dropped — the cardinality check
+/// in [`Filter::new`] enforces at least one value.
+///
+/// Symmetric with [`escape_in_value`] used by `From<Filter> for (String, String, String)`,
+/// so a round-trip preserves values that contain commas or backslashes.
+fn split_in_values(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some(&',') => {
+                    chars.next();
+                    current.push(',');
+                }
+                Some(&'\\') => {
+                    chars.next();
+                    current.push('\\');
+                }
+                _ => current.push('\\'),
+            }
+        } else if c == ',' {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                out.push(trimmed);
+            }
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        out.push(trimmed);
+    }
+    out
+}
+
+/// Escape backslash and comma so a value can survive a round trip through the
+/// `(String, String, String)` tuple form used for `IN` / `NOT IN`.
+fn escape_in_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ',' => out.push_str("\\,"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn from_str_tuples<I, S>(tuples: I) -> Result<Vec<Filter>>
@@ -101,19 +158,6 @@ where
         .into_iter()
         .map(|t| Filter::try_from((t.0.as_ref(), t.1.as_ref(), t.2.as_ref())))
         .collect()
-}
-
-/// Parse a borrowed slice of `(field, op, value)` tuples (typically from
-/// `ReadOptions::filters`) into a `Vec<Filter>`. Convenience wrapper around
-/// [`from_str_tuples`] that handles the `&[(String, String, String)]` shape
-/// without forcing callers to clone or write the same `.iter().map(...)`
-/// adapter at every site.
-pub fn parse_filter_tuples(filters: &[(String, String, String)]) -> Result<Vec<Filter>> {
-    from_str_tuples(
-        filters
-            .iter()
-            .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str())),
-    )
 }
 
 /// Evaluate a slice of [`Filter`]s against a [`RecordBatch`] and return a row-level mask
@@ -132,7 +176,7 @@ pub fn filters_to_row_mask(
     let num_rows = batch.num_rows();
     let mut mask: Option<BooleanArray> = None;
     for filter in filters {
-        let Some(column) = batch.column_by_name(&filter.field_name) else {
+        let Some(column) = batch.column_by_name(&filter.field) else {
             continue;
         };
         let schemable = SchemableFilter::try_from((filter.clone(), batch.schema().as_ref()))?;
@@ -163,10 +207,10 @@ where
         valid.extend(schema.fields().iter().map(|f| f.name().as_str()));
     }
     for filter in filters {
-        if !valid.contains(filter.field_name.as_str()) {
+        if !valid.contains(filter.field.as_str()) {
             return Err(CoreError::Schema(format!(
                 "Filter field '{}' not found in schema",
-                filter.field_name
+                filter.field
             )));
         }
     }
@@ -188,7 +232,7 @@ impl FilterField {
 
     pub fn eq(&self, value: impl Into<String>) -> Filter {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::Eq,
             values: vec![value.into()],
         }
@@ -196,7 +240,7 @@ impl FilterField {
 
     pub fn ne(&self, value: impl Into<String>) -> Filter {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::Ne,
             values: vec![value.into()],
         }
@@ -204,7 +248,7 @@ impl FilterField {
 
     pub fn lt(&self, value: impl Into<String>) -> Filter {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::Lt,
             values: vec![value.into()],
         }
@@ -212,7 +256,7 @@ impl FilterField {
 
     pub fn lte(&self, value: impl Into<String>) -> Filter {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::Lte,
             values: vec![value.into()],
         }
@@ -220,7 +264,7 @@ impl FilterField {
 
     pub fn gt(&self, value: impl Into<String>) -> Filter {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::Gt,
             values: vec![value.into()],
         }
@@ -228,7 +272,7 @@ impl FilterField {
 
     pub fn gte(&self, value: impl Into<String>) -> Filter {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::Gte,
             values: vec![value.into()],
         }
@@ -240,7 +284,7 @@ impl FilterField {
         S: Into<String>,
     {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::In,
             values: values.into_iter().map(|v| v.into()).collect(),
         }
@@ -252,7 +296,7 @@ impl FilterField {
         S: Into<String>,
     {
         Filter {
-            field_name: self.name.clone(),
+            field: self.name.clone(),
             operator: ExprOperator::NotIn,
             values: values.into_iter().map(|v| v.into()).collect(),
         }
@@ -274,25 +318,21 @@ impl TryFrom<(Filter, &Schema)> for SchemableFilter {
     type Error = CoreError;
 
     fn try_from((filter, schema): (Filter, &Schema)) -> Result<Self, Self::Error> {
-        let field_name = filter.field_name.clone();
-        let field: &Field = schema.field_with_name(&field_name).map_err(|e| {
+        let field_name = filter.field.as_str();
+        let arrow_field = schema.field_with_name(field_name).map_err(|e| {
             CoreError::Schema(format!("Field {field_name} not found in schema: {e:?}"))
         })?;
-
-        let operator = filter.operator;
 
         let values: Result<Vec<_>> = filter
             .values
             .iter()
-            .map(|v| Self::cast_value(&[v.as_str()], field.data_type()))
+            .map(|v| Self::cast_value(&[v.as_str()], arrow_field.data_type()))
             .collect();
-        let values = values?;
 
-        let field = field.clone();
         Ok(SchemableFilter {
-            field,
-            operator,
-            values,
+            field: arrow_field.clone(),
+            operator: filter.operator,
+            values: values?,
         })
     }
 }
@@ -443,20 +483,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parse_filter_tuples() -> Result<()> {
-        let owned: Vec<(String, String, String)> = vec![
-            ("city".to_string(), "=".to_string(), "sf".to_string()),
-            ("rider".to_string(), "!=".to_string(), "x".to_string()),
-        ];
-        let filters = parse_filter_tuples(&owned)?;
-        assert_eq!(filters.len(), 2);
-        assert_eq!(filters[0].field_name, "city");
-        assert_eq!(filters[1].field_name, "rider");
-        Ok(())
-    }
-
-    #[test]
+#[test]
     fn test_filters_to_row_mask_empty_returns_all_true() -> Result<()> {
         let schema = Arc::new(create_test_schema());
         let batch = RecordBatch::try_new(
@@ -671,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_filter_roundtrip_in_operator() -> Result<()> {
-        // Round-trip: Filter -> (String, String, String) -> Filter
+        // Round-trip plain values (no escape needed).
         let original = Filter::new(
             "col".to_string(),
             ExprOperator::In,
@@ -689,6 +716,51 @@ mod tests {
         assert_eq!(restored.operator, ExprOperator::In);
         assert_eq!(restored.values, vec!["a", "b"]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_in_value_comma_escape_parses_literal_comma() -> Result<()> {
+        // `\,` is a literal comma; `,` is a separator.
+        let filter = Filter::try_from(("name", "IN", "Smith\\, John,Jane"))?;
+        assert_eq!(filter.operator, ExprOperator::In);
+        assert_eq!(filter.values, vec!["Smith, John", "Jane"]);
+
+        // `\\` is a literal backslash; non-special escapes are preserved as `\`.
+        let filter = Filter::try_from(("name", "IN", "a\\\\b,c\\d"))?;
+        assert_eq!(filter.values, vec!["a\\b", "c\\d"]);
+
+        // Trailing escape with no following char is preserved as a literal `\`.
+        let filter = Filter::try_from(("name", "IN", "x\\"))?;
+        assert_eq!(filter.values, vec!["x\\"]);
+
+        // Empty segments after trim are dropped; a fully empty value still errors via cardinality.
+        let filter = Filter::try_from(("name", "IN", "a,,b"))?;
+        assert_eq!(filter.values, vec!["a", "b"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_roundtrip_in_value_with_special_chars() -> Result<()> {
+        // Filter values containing commas and backslashes must round-trip
+        // through the (String, String, String) tuple form.
+        let original = Filter::new(
+            "name".to_string(),
+            ExprOperator::In,
+            vec!["Smith, John".to_string(), "back\\slash".to_string()],
+        )?;
+        let tuple: (String, String, String) = original.into();
+        assert_eq!(
+            tuple,
+            (
+                "name".to_string(),
+                "IN".to_string(),
+                "Smith\\, John,back\\\\slash".to_string()
+            )
+        );
+        let restored = Filter::try_from((tuple.0.as_str(), tuple.1.as_str(), tuple.2.as_str()))?;
+        assert_eq!(restored.values, vec!["Smith, John", "back\\slash"]);
         Ok(())
     }
 }

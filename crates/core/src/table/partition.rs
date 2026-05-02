@@ -451,7 +451,7 @@ mod tests {
     fn test_partition_filter_try_from_valid() {
         let schema = create_test_schema();
         let filter = Filter {
-            field_name: "date".to_string(),
+            field: "date".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["2023-01-01".to_string()],
         };
@@ -472,7 +472,7 @@ mod tests {
     fn test_partition_filter_try_from_invalid_field() {
         let schema = create_test_schema();
         let filter = Filter {
-            field_name: "invalid_field".to_string(),
+            field: "invalid_field".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["2023-01-01".to_string()],
         };
@@ -490,7 +490,7 @@ mod tests {
     fn test_partition_filter_try_from_invalid_value() {
         let schema = create_test_schema();
         let filter = Filter {
-            field_name: "count".to_string(),
+            field: "count".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["not_a_number".to_string()],
         };
@@ -535,7 +535,7 @@ mod tests {
         ]);
 
         let user_filter = Filter {
-            field_name: "ts_str".to_string(),
+            field: "ts_str".to_string(),
             operator: ExprOperator::Gte,
             values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
@@ -548,7 +548,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, MetaField::PartitionPath.as_ref());
+        assert_eq!(transformed[0].field, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].operator, ExprOperator::Gte);
         assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
 
@@ -566,7 +566,7 @@ mod tests {
 
         // 2024-01-25 00:00:00 UTC = 1706140800 seconds
         let user_filter = Filter {
-            field_name: "event_time".to_string(),
+            field: "event_time".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["1706140800".to_string()],
         };
@@ -579,7 +579,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, MetaField::PartitionPath.as_ref());
+        assert_eq!(transformed[0].field, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].values[0], "2024/01/25");
 
         // v8 detection via keygenerator.type=TIMESTAMP (no keygenerator.class)
@@ -596,7 +596,7 @@ mod tests {
         ]);
 
         let user_filter = Filter {
-            field_name: "ts_str".to_string(),
+            field: "ts_str".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
@@ -626,7 +626,7 @@ mod tests {
         let partition_schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
 
         let user_filter = Filter {
-            field_name: "region".to_string(),
+            field: "region".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["us-west".to_string()],
         };
@@ -639,7 +639,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, user_filter.field_name);
+        assert_eq!(transformed[0].field, user_filter.field);
         assert_eq!(transformed[0].values[0], user_filter.values[0]);
     }
 
@@ -668,7 +668,7 @@ mod tests {
         )]);
 
         let user_filter = Filter {
-            field_name: "ts".to_string(),
+            field: "ts".to_string(),
             operator: ExprOperator::Gte,
             values: vec!["2024-01-15T00:00:00Z".to_string()],
         };
@@ -703,7 +703,7 @@ mod tests {
         ]);
 
         let user_filter = Filter {
-            field_name: "ts".to_string(),
+            field: "ts".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["2024-01-15T00:00:00Z".to_string()],
         };

@@ -102,7 +102,7 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
 use crate::error::CoreError;
-use crate::expr::filter::{Filter, parse_filter_tuples, validate_fields_against_schemas};
+use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::keygen::is_timestamp_based_keygen;
@@ -442,16 +442,14 @@ impl Table {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filter_tuples(&options.filters)?;
-        self.get_file_slices_inner(&timestamp, &filters).await
+        self.get_file_slices_inner(&timestamp, &options.filters).await
     }
 
     async fn get_incremental_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filter_tuples(&options.filters)?;
-        self.get_file_slices_between_inner(&start, &end, &filters)
+        self.get_file_slices_between_inner(&start, &end, &options.filters)
             .await
     }
 
@@ -557,46 +555,63 @@ impl Table {
 
     /// Create a [FileGroupReader] using the [Table]'s Hudi configs.
     ///
-    /// Layering, last-writer-wins:
+    /// Two override channels keep Hudi configs and storage credentials cleanly
+    /// separated — a `hoodie.*` key can't be misclassified as storage, and a
+    /// stray storage option can't be silently picked up as a Hudi config.
+    ///
+    /// **Hudi configs** (last-writer-wins):
     /// 1. Table-level Hudi configs (constant for this `Table` instance).
-    /// 2. `read_options.hudi_options` when `read_options` is `Some` — per-read overrides.
-    ///    The four `Table`-owned read keys ([`HudiReadConfig::QueryType`],
+    /// 2. `read_options.hudi_options` when `read_options` is `Some`. The four
+    ///    `Table`-owned read keys ([`HudiReadConfig::QueryType`],
     ///    [`HudiReadConfig::AsOfTimestamp`], [`HudiReadConfig::StartTimestamp`],
     ///    [`HudiReadConfig::EndTimestamp`]) are stripped here: the `Table` layer
     ///    interprets them for dispatch and snapshot resolution, and a stale value
     ///    (e.g. an incremental `StartTimestamp` left in the bag) would silently
     ///    activate commit-time filtering at the FG reader.
-    /// 3. `extra_overrides` — caller-supplied per-path overrides; always win.
-    ///    Use these to inject the resolved timestamps for the current read.
-    pub fn create_file_group_reader_with_options<I, K, V>(
+    /// 3. `extra_hudi_overrides` — caller-supplied resolved Hudi configs;
+    ///    always win. Use these to inject the resolved timestamps for the
+    ///    current read.
+    ///
+    /// **Storage options** (last-writer-wins):
+    /// 1. Table-level storage options (cloud credentials, endpoints, etc).
+    /// 2. `extra_storage_overrides` — caller-supplied per-path storage overrides.
+    pub fn create_file_group_reader_with_options<H, S, K1, V1, K2, V2>(
         &self,
         read_options: Option<&ReadOptions>,
-        extra_overrides: I,
+        extra_hudi_overrides: H,
+        extra_storage_overrides: S,
     ) -> Result<FileGroupReader>
     where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
+        H: IntoIterator<Item = (K1, V1)>,
+        K1: AsRef<str>,
+        V1: Into<String>,
+        S: IntoIterator<Item = (K2, V2)>,
+        K2: AsRef<str>,
+        V2: Into<String>,
     {
-        let mut overwriting_options = HashMap::with_capacity(self.storage_options.len());
-        for (k, v) in self.storage_options.iter() {
-            overwriting_options.insert(k.clone(), v.clone());
-        }
+        let mut hudi_opts: HashMap<String, String> = HashMap::new();
         if let Some(opts) = read_options {
             for (k, v) in &opts.hudi_options {
                 if Self::TABLE_OWNED_READ_KEYS.contains(&k.as_str()) {
                     continue;
                 }
-                overwriting_options.insert(k.clone(), v.clone());
+                hudi_opts.insert(k.clone(), v.clone());
             }
         }
-        for (k, v) in extra_overrides {
-            overwriting_options.insert(k.as_ref().to_string(), v.into());
+        for (k, v) in extra_hudi_overrides {
+            hudi_opts.insert(k.as_ref().to_string(), v.into());
         }
-        FileGroupReader::new_with_configs_and_overwriting_options(
-            self.hudi_configs.clone(),
-            overwriting_options,
-        )
+
+        let mut storage_opts: HashMap<String, String> =
+            HashMap::with_capacity(self.storage_options.len());
+        for (k, v) in self.storage_options.iter() {
+            storage_opts.insert(k.clone(), v.clone());
+        }
+        for (k, v) in extra_storage_overrides {
+            storage_opts.insert(k.as_ref().to_string(), v.into());
+        }
+
+        FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
     }
 
     /// Read-option keys the `Table` layer interprets directly. These are
@@ -631,8 +646,9 @@ impl Table {
         let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filter_tuples(&options.filters)?;
-        let file_slices = self.get_file_slices_inner(&timestamp, &filters).await?;
+        let file_slices = self
+            .get_file_slices_inner(&timestamp, &options.filters)
+            .await?;
         let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
         let fg_options = self.options_for_file_group(options);
         let batches = futures::future::try_join_all(
@@ -656,6 +672,7 @@ impl Table {
         self.create_file_group_reader_with_options(
             Some(options),
             [(HudiReadConfig::EndTimestamp, snapshot_timestamp.to_string())],
+            std::iter::empty::<(&str, &str)>(),
         )
     }
 
@@ -663,9 +680,8 @@ impl Table {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
         };
-        let filters = parse_filter_tuples(&options.filters)?;
         let file_slices = self
-            .get_file_slices_between_inner(&start, &end, &filters)
+            .get_file_slices_between_inner(&start, &end, &options.filters)
             .await?;
 
         let fg_reader = self.create_file_group_reader_with_options(
@@ -674,6 +690,7 @@ impl Table {
                 (HudiReadConfig::StartTimestamp, start),
                 (HudiReadConfig::EndTimestamp, end),
             ],
+            std::iter::empty::<(&str, &str)>(),
         )?;
         let fg_options = self.options_for_file_group(options);
 
@@ -710,7 +727,7 @@ impl Table {
         applicable.filters = options
             .filters
             .iter()
-            .filter(|(field, _, _)| !partition_columns.iter().any(|p| p == field))
+            .filter(|filter| !partition_columns.iter().any(|p| p == &filter.field))
             .cloned()
             .collect();
         applicable
@@ -797,8 +814,9 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         };
 
-        let filters = parse_filter_tuples(&options.filters)?;
-        let file_slices = self.get_file_slices_inner(&timestamp, &filters).await?;
+        let file_slices = self
+            .get_file_slices_inner(&timestamp, &options.filters)
+            .await?;
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
@@ -960,7 +978,7 @@ mod tests {
     ) -> Result<Vec<String>> {
         let mut file_paths = Vec::new();
         let base_url = table.base_url();
-        let options = ReadOptions::new().with_filters(filters.iter().copied());
+        let options = ReadOptions::new().with_filters(filters.iter().copied())?;
         for f in table.get_file_slices(&options).await? {
             let relative_path = f.base_file_relative_path()?;
             let file_url = join_url_segments(&base_url, &[relative_path.as_str()])?;
@@ -1349,7 +1367,7 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
-            .create_file_group_reader_with_options(None, empty_options())
+            .create_file_group_reader_with_options(None, empty_options(), empty_options())
             .unwrap()
             .read_file_slice_from_paths(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
@@ -1408,32 +1426,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hudi_table_read_snapshot_stream_returns_batches_with_options() {
+    async fn hudi_table_read_snapshot_stream_returns_batches_with_options() -> Result<()> {
         use futures::TryStreamExt;
 
         let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let options = ReadOptions::new()
-            .with_filters([("byteField", ">=", "10")])
+            .with_filters([("byteField", ">=", "10")])?
             .with_projection(["id"])
-            .with_batch_size(2);
+            .with_batch_size(2)?;
 
         let stream = hudi_table.read_stream(&options).await.unwrap();
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
         assert!(!batches.is_empty());
         assert!(batches[0].column_by_name("id").is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hudi_table_read_snapshot_stream_returns_empty_when_no_file_slices_match_filters() {
+    async fn hudi_table_read_snapshot_stream_returns_empty_when_no_file_slices_match_filters()
+    -> Result<()> {
         use futures::StreamExt;
 
         let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
-        let options = ReadOptions::new().with_filters([("byteField", "=", "999")]);
+        let options = ReadOptions::new().with_filters([("byteField", "=", "999")])?;
 
         let mut stream = hudi_table.read_stream(&options).await.unwrap();
         assert!(stream.next().await.is_none());
+        Ok(())
     }
 
     #[tokio::test]

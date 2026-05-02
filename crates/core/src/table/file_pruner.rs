@@ -64,7 +64,7 @@ impl FilePruner {
         // Only keep filters on non-partition columns that exist in the table schema
         let and_filters: Vec<SchemableFilter> = and_filters
             .iter()
-            .filter(|filter| !partition_columns.contains(filter.field_name.as_str()))
+            .filter(|filter| !partition_columns.contains(filter.field.as_str()))
             .filter_map(|filter| SchemableFilter::try_from((filter.clone(), table_schema)).ok())
             .collect();
 

@@ -144,7 +144,7 @@ mod v6_tables {
                     ("shortField", "!=", "100"),
                 ];
                 let records = hudi_table
-                    .read(&ReadOptions::new().with_filters(filters))
+                    .read(&ReadOptions::new().with_filters(filters)?)
                     .await?;
                 let schema = &records[0].schema();
                 let records = concat_batches(schema, &records)?;
@@ -630,7 +630,11 @@ mod v8_tables {
                 .expect("V8Trips8I3U1D MOR fixture should have at least one slice with log files");
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
             // Sanity: read the merged slice unfiltered so we can pick a rider
             // present in this slice and assert the filter actually narrows it.
             let unfiltered = fg_reader
@@ -646,7 +650,7 @@ mod v8_tables {
             let target_rider = unfiltered_riders.value(0).to_string();
 
             let options = ReadOptions::new()
-                .with_filters([("rider", "=", target_rider.as_str())])
+                .with_filters([("rider", "=", target_rider.as_str())])?
                 .with_projection(["rider", "fare"]);
             let merged = fg_reader.read_file_slice(mor_slice, &options).await?;
 
@@ -731,7 +735,7 @@ mod v8_tables {
             let hudi_table = Table::new(base_url.path()).await?;
 
             // Request small batch size
-            let options = ReadOptions::new().with_batch_size(1);
+            let options = ReadOptions::new().with_batch_size(1)?;
             let mut stream = hudi_table.read_stream(&options).await?;
 
             // Collect all batches from stream
@@ -757,7 +761,7 @@ mod v8_tables {
                 ("byteField", ">=", "10"),
                 ("byteField", "<", "20"),
                 ("shortField", "!=", "100"),
-            ]);
+            ])?;
             let mut stream = hudi_table.read_stream(&options).await?;
 
             // Collect all batches from stream
@@ -791,7 +795,11 @@ mod v8_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let mut stream = fg_reader
@@ -821,9 +829,13 @@ mod v8_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
             // Test with small batch size
-            let options = ReadOptions::new().with_batch_size(1);
+            let options = ReadOptions::new().with_batch_size(1)?;
             let mut stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
@@ -1394,7 +1406,7 @@ mod v9_tables {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
             let hudi_table = open_table(base_url.path(), false).await?;
 
-            let options = ReadOptions::new().with_batch_size(1);
+            let options = ReadOptions::new().with_batch_size(1)?;
             let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1408,7 +1420,7 @@ mod v9_tables {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
             let hudi_table = open_table(base_url.path(), false).await?;
 
-            let options = ReadOptions::new().with_filters([("region", "=", "us")]);
+            let options = ReadOptions::new().with_filters([("region", "=", "us")])?;
             let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
@@ -1429,7 +1441,7 @@ mod v9_tables {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
             let hudi_table = open_table(base_url.path(), false).await?;
 
-            let options = ReadOptions::new().with_filters([("region", "=", "latam")]);
+            let options = ReadOptions::new().with_filters([("region", "=", "latam")])?;
             let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
@@ -1452,7 +1464,11 @@ mod v9_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let stream = fg_reader
@@ -1474,8 +1490,12 @@ mod v9_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
-            let options = ReadOptions::new().with_batch_size(1);
+                .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
+            let options = ReadOptions::new().with_batch_size(1)?;
             let stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
@@ -1589,7 +1609,7 @@ mod streaming_queries {
         let hudi_table = Table::new(base_url.path()).await?;
 
         // Request small batch size
-        let options = ReadOptions::new().with_batch_size(1);
+        let options = ReadOptions::new().with_batch_size(1)?;
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
@@ -1610,7 +1630,7 @@ mod streaming_queries {
             ("byteField", ">=", "10"),
             ("byteField", "<", "20"),
             ("shortField", "!=", "100"),
-        ]);
+        ])?;
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
@@ -1639,7 +1659,11 @@ mod streaming_queries {
         );
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
         let stream = fg_reader
@@ -1664,9 +1688,13 @@ mod streaming_queries {
         let file_slice = &file_slices[0];
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(
+                    None,
+                    std::iter::empty::<(&str, &str)>(),
+                    std::iter::empty::<(&str, &str)>(),
+                )?;
         // Test with small batch size
-        let options = ReadOptions::new().with_batch_size(1);
+        let options = ReadOptions::new().with_batch_size(1)?;
         let stream = fg_reader
             .read_file_slice_stream(file_slice, &options)
             .await?;
@@ -1736,7 +1764,7 @@ mod streaming_queries {
 
         // Filter on a non-partition column. The filter applies as a row mask
         // during reading even though file pruning can't use it.
-        let options = ReadOptions::new().with_filters([("isActive", "=", "true")]);
+        let options = ReadOptions::new().with_filters([("isActive", "=", "true")])?;
 
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
@@ -1762,7 +1790,7 @@ mod streaming_queries {
         // Project only id and isActive, filter where isActive = true
         let options = ReadOptions::new()
             .with_projection(["id", "isActive"])
-            .with_filters([("isActive", "=", "true")]);
+            .with_filters([("isActive", "=", "true")])?;
 
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
@@ -1803,7 +1831,7 @@ mod streaming_queries {
         // read projection internally with filter columns, then projects down.
         let options = ReadOptions::new()
             .with_projection(["id"])
-            .with_filters([("isActive", "=", "true")]);
+            .with_filters([("isActive", "=", "true")])?;
 
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
@@ -1866,7 +1894,7 @@ mod streaming_queries {
         // before the stream is constructed, so callers don't have to poll.
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
-        let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")]);
+        let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")])?;
 
         let snapshot_err = hudi_table.read(&options).await.unwrap_err();
         assert!(
@@ -1905,7 +1933,7 @@ mod streaming_queries {
         let reader =
             FileGroupReader::new_with_options(base_url.path(), std::iter::empty::<(&str, &str)>())
                 .await?;
-        let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")]);
+        let options = ReadOptions::new().with_filters([("rider_idd", "=", "x")])?;
 
         let eager_err = reader
             .read_file_slice(&file_slice, &options)
@@ -2072,6 +2100,7 @@ mod streaming_queries {
         let fg_reader = hudi_table.create_file_group_reader_with_options(
             Some(&polluted),
             std::iter::empty::<(&str, &str)>(),
+            std::iter::empty::<(&str, &str)>(),
         )?;
         let batch = fg_reader
             .read_file_slice(file_slice, &ReadOptions::new())
@@ -2097,12 +2126,12 @@ mod streaming_queries {
             hudi_core::metadata::meta_field::MetaField::RecordKey.as_ref(),
             "!=",
             "",
-        )]);
+        )])?;
         let batches = hudi_table.read(&options).await?;
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert!(total_rows > 0, "meta-field filter should match real keys");
 
-        let typo = ReadOptions::new().with_filters([("_hoodie_record_keyy", "!=", "")]);
+        let typo = ReadOptions::new().with_filters([("_hoodie_record_keyy", "!=", "")])?;
         let err = hudi_table.read(&typo).await.unwrap_err();
         assert!(
             err.to_string().contains("_hoodie_record_keyy"),
@@ -2111,21 +2140,16 @@ mod streaming_queries {
         Ok(())
     }
 
-    /// Regression: `with_batch_size(0)` must surface as an error rather than
-    /// silently yielding zero rows from the parquet stream reader.
+    /// Regression: `with_batch_size(0)` must error at the builder so callers
+    /// catch the misuse synchronously, not when the parquet stream reader
+    /// silently yields zero rows.
     #[tokio::test]
     async fn test_batch_size_zero_errors() -> Result<()> {
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
-
-        let opts = ReadOptions::new().with_batch_size(0);
-        match hudi_table.read_stream(&opts).await {
-            Ok(_) => panic!("expected validation error for batch_size=0"),
-            Err(err) => assert!(
-                err.to_string().contains("must be > 0"),
-                "expected validation error for batch_size=0, got: {err}"
-            ),
-        }
+        let err = ReadOptions::new().with_batch_size(0).unwrap_err();
+        assert!(
+            err.to_string().contains("must be > 0"),
+            "expected validation error for batch_size=0, got: {err}"
+        );
         Ok(())
     }
 }

@@ -71,26 +71,27 @@ def test_read_options_query_type_bad_value_raises():
 
 
 def test_read_options_batch_size_bad_value_raises():
-    """Bad batch_size values surface at the accessor: non-integer parses fail, and `0`
-    is rejected (a zero-row batch yields no batches at the parquet stream reader)."""
+    """Bad batch_size values: non-integers stuck in the bag surface at the accessor,
+    and `with_batch_size(0)` is rejected at the builder so callers catch the misuse
+    synchronously rather than at read time."""
     bogus = HudiReadOptions(
         hudi_options={"hoodie.read.stream.batch_size": "not_a_number"}
     )
     with pytest.raises(Exception):
         bogus.batch_size()
 
-    zero = HudiReadOptions().with_batch_size(0)
     with pytest.raises(Exception, match="must be > 0"):
-        zero.batch_size()
+        HudiReadOptions().with_batch_size(0)
 
 
-def test_read_stream_batch_size_zero_raises(v8_trips_table):
-    """End-to-end: `with_batch_size(0)` surfaces as an error from `read_stream`
-    instead of silently yielding no batches."""
-    table = HudiTable(v8_trips_table)
-    options = HudiReadOptions().with_batch_size(0)
-    with pytest.raises(Exception, match="must be > 0"):
-        table.read_stream(options)
+def test_read_options_with_filters_validates_at_build_time():
+    """`with_filters` parses + cardinality-validates upfront, so a bad operator or
+    empty IN value list raises here rather than at read time."""
+    with pytest.raises(Exception):
+        HudiReadOptions().with_filters([("col", "BAD_OP", "x")])
+
+    with pytest.raises(Exception, match="at least one value"):
+        HudiReadOptions().with_filters([("col", "IN", "")])
 
 
 def test_read_options_bulk_setters():

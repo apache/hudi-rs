@@ -24,6 +24,7 @@ use std::str::FromStr;
 use crate::config::error::ConfigError;
 use crate::config::read::HudiReadConfig;
 pub use crate::config::read::QueryType;
+use crate::expr::filter::{Filter, from_str_tuples};
 
 /// Options for all Hudi read APIs (snapshot, time-travel, incremental, etc).
 ///
@@ -43,9 +44,9 @@ pub use crate::config::read::QueryType;
 /// use hudi::table::{ReadOptions, QueryType};
 ///
 /// let options = ReadOptions::new()
-///     .with_filters([("city", "=", "san_francisco")])
+///     .with_filters([("city", "=", "san_francisco")])?
 ///     .with_projection(["id", "name", "city"])
-///     .with_batch_size(4096);
+///     .with_batch_size(4096)?;
 ///
 /// // Time-travel snapshot
 /// let options = ReadOptions::new().with_as_of_timestamp("20240101000000000");
@@ -62,7 +63,7 @@ pub use crate::config::read::QueryType;
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct ReadOptions {
-    /// Column filters. Each filter is a tuple of `(field, operator, value)` where
+    /// Column filters, parsed and cardinality-validated at construction.
     /// `field` is any column name (partition or data).
     ///
     /// Filters drive both **pruning** and **row-level filtering**:
@@ -74,7 +75,7 @@ pub struct ReadOptions {
     ///   filters apply at the row-level mask but do not prune files.
     /// - All filters are applied as a row-level mask after reading, so callers
     ///   always get only rows that match regardless of the planning path.
-    pub filters: Vec<(String, String, String)>,
+    pub filters: Vec<Filter>,
 
     /// Column names to project (select). If None, all columns are read.
     pub projection: Option<Vec<String>>,
@@ -134,28 +135,39 @@ impl ReadOptions {
     }
 
     /// Sets the target batch size (rows per batch).
-    /// Stored as [`HudiReadConfig::StreamBatchSize`].
-    pub fn with_batch_size(mut self, size: usize) -> Self {
+    /// Stored as [`HudiReadConfig::StreamBatchSize`]. Errors if `size == 0`
+    /// — a zero-row batch yields no batches at the parquet stream reader and
+    /// is almost certainly a caller mistake.
+    pub fn with_batch_size(mut self, size: usize) -> crate::Result<Self> {
+        if size == 0 {
+            let key = HudiReadConfig::StreamBatchSize.as_ref();
+            return Err(ConfigError::InvalidValue(format!("{key} must be > 0, got 0")).into());
+        }
         self.hudi_options.insert(
             HudiReadConfig::StreamBatchSize.as_ref().to_string(),
             size.to_string(),
         );
-        self
+        Ok(self)
     }
 
-    /// Sets column filters.
-    pub fn with_filters<I, S1, S2, S3>(mut self, filters: I) -> Self
+    /// Sets column filters from `(field, op, value)` tuples. Parses and
+    /// validates operator + cardinality at build time; an unrecognized
+    /// operator or empty `IN`/`NOT IN` value list errors here rather than
+    /// at read time. Schema-level validation (column existence, value
+    /// castability) still happens at read time when the schema is known.
+    pub fn with_filters<I, S1, S2, S3>(mut self, filters: I) -> crate::Result<Self>
     where
         I: IntoIterator<Item = (S1, S2, S3)>,
-        S1: Into<String>,
-        S2: Into<String>,
-        S3: Into<String>,
+        S1: AsRef<str>,
+        S2: AsRef<str>,
+        S3: AsRef<str>,
     {
-        self.filters = filters
-            .into_iter()
-            .map(|(f, o, v)| (f.into(), o.into(), v.into()))
-            .collect();
-        self
+        self.filters = from_str_tuples(
+            filters
+                .into_iter()
+                .map(|(f, o, v)| (f.as_ref().to_string(), o.as_ref().to_string(), v.as_ref().to_string())),
+        )?;
+        Ok(self)
     }
 
     /// Sets the column projection (which columns to read).
@@ -297,7 +309,7 @@ mod tests {
         let opts = ReadOptions::new();
         assert_eq!(opts.batch_size()?, None);
 
-        let opts = ReadOptions::new().with_batch_size(2048);
+        let opts = ReadOptions::new().with_batch_size(2048)?;
         assert_eq!(opts.batch_size()?, Some(2048));
         assert_eq!(
             opts.hudi_options
@@ -306,11 +318,31 @@ mod tests {
             Some("2048")
         );
 
+        // Builder rejects 0 immediately rather than deferring to read time.
+        let err = ReadOptions::new().with_batch_size(0).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"));
+
+        // Out-of-band insertion via the bag still surfaces at the accessor.
         let opts = ReadOptions::new()
             .with_hudi_option(HudiReadConfig::StreamBatchSize.as_ref(), "not_a_number");
         let err = opts.batch_size().unwrap_err();
         assert!(err.to_string().contains("not_a_number"));
         Ok(())
+    }
+
+    #[test]
+    fn test_with_filters_validates_at_build_time() {
+        // Bad operator surfaces at build, not at read.
+        let err = ReadOptions::new()
+            .with_filters([("col", "BAD_OP", "x")])
+            .unwrap_err();
+        assert!(err.to_string().contains("BAD_OP"));
+
+        // Empty IN value list (after split + trim) errors via cardinality check.
+        let err = ReadOptions::new()
+            .with_filters([("col", "IN", "")])
+            .unwrap_err();
+        assert!(err.to_string().contains("at least one value"));
     }
 
     #[test]
@@ -337,16 +369,17 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_format() {
+    fn test_debug_format() -> crate::Result<()> {
         let options = ReadOptions::new()
-            .with_filters([("city", "=", "sf")])
+            .with_filters([("city", "=", "sf")])?
             .with_projection(["id"])
-            .with_batch_size(1000);
+            .with_batch_size(1000)?;
 
         let debug_str = format!("{options:?}");
         assert!(debug_str.contains("ReadOptions"));
         assert!(debug_str.contains("filters"));
         assert!(debug_str.contains("projection"));
         assert!(debug_str.contains("hudi_options"));
+        Ok(())
     }
 }

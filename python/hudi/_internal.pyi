@@ -15,20 +15,24 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Tuple
 
-import pyarrow
+import pyarrow  # type: ignore[import-untyped]
 
 __version__: str
 
 def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
 
-class HudiQueryType(Enum):
+class HudiQueryType:
     """Selects the read semantic on :class:`HudiReadOptions`."""
 
-    Snapshot = ...
-    Incremental = ...
+    Snapshot: ClassVar["HudiQueryType"]
+    Incremental: ClassVar["HudiQueryType"]
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> str: ...
 
 @dataclass(init=False)
 class HudiReadOptions:
@@ -64,10 +68,14 @@ class HudiReadOptions:
     def with_as_of_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
     def with_start_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
     def with_end_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
-    def with_batch_size(self, size: int) -> "HudiReadOptions": ...
+    def with_batch_size(self, size: int) -> "HudiReadOptions":
+        """Target rows per batch for streaming reads. Raises ``HudiCoreError`` if ``size == 0``."""
+        ...
     def with_filters(
         self, filters: List[Tuple[str, str, str]]
-    ) -> "HudiReadOptions": ...
+    ) -> "HudiReadOptions":
+        """Set column filters as ``(field, op, value)`` tuples. Parses and cardinality-validates immediately; an unrecognized operator or empty ``IN`` / ``NOT IN`` value list raises ``HudiCoreError``."""
+        ...
     def with_projection(self, columns: List[str]) -> "HudiReadOptions": ...
     def with_hudi_option(self, key: str, value: str) -> "HudiReadOptions": ...
     def with_hudi_options(self, opts: Dict[str, str]) -> "HudiReadOptions": ...
@@ -359,18 +367,28 @@ class HudiTable:
     def create_file_group_reader_with_options(
         self,
         read_options: Optional[HudiReadOptions] = None,
-        extra_overrides: Optional[Dict[str, str]] = None,
+        extra_hudi_overrides: Optional[Dict[str, str]] = None,
+        extra_storage_overrides: Optional[Dict[str, str]] = None,
     ) -> HudiFileGroupReader:
         """
         Create a :class:`HudiFileGroupReader` using the table's Hudi configs.
 
-        Layering, last-writer-wins:
+        Two override channels keep Hudi configs and storage credentials cleanly
+        separated — a ``hoodie.*`` key can't be misclassified as storage, and a
+        stray storage option can't be silently picked up as a Hudi config.
+
+        **Hudi configs** (last-writer-wins):
 
         1. Table-level Hudi configs.
         2. ``read_options.hudi_options`` when ``read_options`` is provided, **excluding**
            the four keys the ``Table`` layer interprets directly (``query_type``,
            ``as_of_timestamp``, ``start_timestamp``, ``end_timestamp``).
-        3. ``extra_overrides`` — caller-supplied per-path overrides; these always win.
+        3. ``extra_hudi_overrides`` — caller-supplied resolved Hudi configs; always win.
+
+        **Storage options** (last-writer-wins):
+
+        1. Table-level storage options (cloud credentials, endpoints, etc).
+        2. ``extra_storage_overrides`` — caller-supplied per-path storage overrides.
         """
         ...
     def read(

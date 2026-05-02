@@ -502,18 +502,18 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
     }
 
     fn transform_filter(&self, filter: &Filter) -> Result<Vec<Filter>> {
-        if filter.field_name != self.source_field {
+        if filter.field != self.source_field {
             return Ok(vec![filter.clone()]);
         }
 
-        let field_name = MetaField::PartitionPath.as_ref().to_string();
+        let field = MetaField::PartitionPath.as_ref().to_string();
 
         match filter.operator {
             ExprOperator::Eq | ExprOperator::Ne => {
                 let dt = self.parse_timestamp(&filter.values[0])?;
                 let path = self.format_partition_path(&dt);
                 Ok(vec![Filter {
-                    field_name,
+                    field,
                     operator: filter.operator,
                     values: vec![path],
                 }])
@@ -528,7 +528,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                     })
                     .collect();
                 Ok(vec![Filter {
-                    field_name,
+                    field,
                     operator: filter.operator,
                     values: paths?,
                 }])
@@ -547,7 +547,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                     other => other,
                 };
                 Ok(vec![Filter {
-                    field_name,
+                    field,
                     operator: op,
                     values: vec![path],
                 }])
@@ -882,13 +882,13 @@ mod tests {
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
 
         let filter = Filter {
-            field_name: "ts_str".to_string(),
+            field: "ts_str".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, "_hoodie_partition_path");
+        assert_eq!(transformed[0].field, "_hoodie_partition_path");
         assert_eq!(transformed[0].operator, ExprOperator::Eq);
         assert_eq!(
             transformed[0].values[0],
@@ -901,7 +901,7 @@ mod tests {
                 .unwrap();
         // 2024-01-25 00:00:00 UTC = 1706140800 seconds
         let filter = Filter {
-            field_name: "event_timestamp".to_string(),
+            field: "event_timestamp".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["1706140800".to_string()],
         };
@@ -913,7 +913,7 @@ mod tests {
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
         let filter = Filter {
-            field_name: "ts_str".to_string(),
+            field: "ts_str".to_string(),
             operator: ExprOperator::Ne,
             values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
@@ -936,13 +936,13 @@ mod tests {
             (ExprOperator::Lte, ExprOperator::Lte),
         ] {
             let filter = Filter {
-                field_name: "event_timestamp".to_string(),
+                field: "event_timestamp".to_string(),
                 operator: input_op,
                 values: vec!["1706140800".to_string()],
             };
             let transformed = keygen.transform_filter(&filter).unwrap();
             assert_eq!(transformed.len(), 1, "Expected 1 filter for {input_op:?}");
-            assert_eq!(transformed[0].field_name, "_hoodie_partition_path");
+            assert_eq!(transformed[0].field, "_hoodie_partition_path");
             assert_eq!(transformed[0].values[0], "2024/01/25");
             assert_eq!(
                 transformed[0].operator, expected_op,
@@ -954,20 +954,20 @@ mod tests {
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
         let filter = Filter {
-            field_name: "other_field".to_string(),
+            field: "other_field".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["value".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].field_name, "other_field");
+        assert_eq!(transformed[0].field, "other_field");
 
         // Invalid timestamp value produces error, not panic
         let unix_keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_unix_timestamp())
                 .unwrap();
         let filter = Filter {
-            field_name: "event_timestamp".to_string(),
+            field: "event_timestamp".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["not_a_number".to_string()],
         };
@@ -1025,7 +1025,7 @@ mod tests {
 
         // Range ops should return empty (skip pruning)
         let filter = Filter {
-            field_name: "ts".to_string(),
+            field: "ts".to_string(),
             operator: ExprOperator::Gte,
             values: vec!["1706140800".to_string()],
         };
@@ -1033,7 +1033,7 @@ mod tests {
 
         // But Eq still works
         let filter = Filter {
-            field_name: "ts".to_string(),
+            field: "ts".to_string(),
             operator: ExprOperator::Eq,
             values: vec!["1706140800".to_string()],
         };

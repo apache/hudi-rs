@@ -30,7 +30,6 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
-use std::str::FromStr;
 
 use hudi::config::read::HudiReadConfig;
 use hudi::config::table::HudiTableConfig;
@@ -81,31 +80,41 @@ impl From<PythonError> for PyErr {
     }
 }
 
-/// Python-side mirror of [`hudi::table::QueryType`].
+/// Python wrapper around [`hudi::table::QueryType`].
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[pyclass(eq, eq_int)]
-pub enum HudiQueryType {
-    #[default]
-    Snapshot,
-    Incremental,
+#[pyclass(eq)]
+pub struct HudiQueryType {
+    inner: QueryType,
 }
 
-impl From<HudiQueryType> for QueryType {
-    fn from(q: HudiQueryType) -> Self {
-        match q {
-            HudiQueryType::Snapshot => QueryType::Snapshot,
-            HudiQueryType::Incremental => QueryType::Incremental,
-        }
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiQueryType {
+    #[classattr]
+    #[pyo3(name = "Snapshot")]
+    fn snapshot() -> Self {
+        QueryType::Snapshot.into()
     }
-}
 
-impl From<QueryType> for HudiQueryType {
-    fn from(q: QueryType) -> Self {
-        match q {
-            QueryType::Snapshot => HudiQueryType::Snapshot,
-            QueryType::Incremental => HudiQueryType::Incremental,
-        }
+    #[classattr]
+    #[pyo3(name = "Incremental")]
+    fn incremental() -> Self {
+        QueryType::Incremental.into()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("HudiQueryType.{}", self.name())
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        format!("{:?}", self.inner)
+    }
+
+    #[getter]
+    fn value(&self) -> String {
+        self.inner.as_ref().to_string()
     }
 }
 
@@ -113,12 +122,13 @@ impl From<QueryType> for HudiQueryType {
 #[derive(Clone, Debug, Default)]
 #[pyclass]
 pub struct HudiReadOptions {
-    #[pyo3(get)]
-    filters: Vec<(String, String, String)>,
-    #[pyo3(get)]
-    projection: Option<Vec<String>>,
-    #[pyo3(get)]
-    hudi_options: HashMap<String, String>,
+    inner: ReadOptions,
+}
+
+impl From<QueryType> for HudiQueryType {
+    fn from(inner: QueryType) -> Self {
+        Self { inner }
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -128,173 +138,171 @@ impl HudiReadOptions {
     /// only the three stored fields are accepted directly. All other knobs
     /// (`query_type`, timestamps, `batch_size`) are set via the chainable
     /// `with_*` builders, matching the Rust API.
+    ///
+    /// `filters` are parsed and cardinality-validated here; an unrecognized
+    /// operator or empty `IN`/`NOT IN` value list raises immediately.
     #[new]
     #[pyo3(signature = (filters=None, projection=None, hudi_options=None))]
     fn new(
         filters: Option<Vec<(String, String, String)>>,
         projection: Option<Vec<String>>,
         hudi_options: Option<HashMap<String, String>>,
-    ) -> Self {
-        Self {
-            filters: filters.unwrap_or_default(),
-            projection,
-            hudi_options: hudi_options.unwrap_or_default(),
+    ) -> PyResult<Self> {
+        let mut inner = ReadOptions::new()
+            .with_filters(filters.unwrap_or_default())
+            .map_err(PythonError::from)?
+            .with_hudi_options(hudi_options.unwrap_or_default());
+        if let Some(projection) = projection {
+            inner = inner.with_projection(projection);
         }
+        Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {
         format!(
             "HudiReadOptions(filters={:?}, projection={:?}, hudi_options={:?})",
-            self.filters, self.projection, self.hudi_options,
+            self.filters(),
+            self.inner.projection,
+            self.inner.hudi_options,
         )
+    }
+
+    #[getter]
+    fn filters(&self) -> Vec<(String, String, String)> {
+        self.inner
+            .filters
+            .iter()
+            .cloned()
+            .map(|f| f.into())
+            .collect()
+    }
+
+    #[getter]
+    fn projection(&self) -> Option<Vec<String>> {
+        self.inner.projection.clone()
+    }
+
+    #[getter]
+    fn hudi_options(&self) -> HashMap<String, String> {
+        self.inner.hudi_options.clone()
     }
 
     // ---- typed builders (return a new instance for chaining) ----
 
     /// Sets the query type. Stored under `hoodie.read.query.type`.
-    fn with_query_type(&self, query_type: HudiQueryType) -> Self {
-        let mut new = self.clone();
-        new.hudi_options.insert(
-            HudiReadConfig::QueryType.as_ref().to_string(),
-            QueryType::from(query_type).as_ref().to_string(),
-        );
-        new
+    fn with_query_type(&self, query_type: &HudiQueryType) -> Self {
+        Self {
+            inner: self.inner.clone().with_query_type(query_type.inner),
+        }
     }
 
     /// Sets the as-of timestamp for snapshot/time-travel queries.
     fn with_as_of_timestamp(&self, timestamp: &str) -> Self {
-        let mut new = self.clone();
-        new.hudi_options.insert(
-            HudiReadConfig::AsOfTimestamp.as_ref().to_string(),
-            timestamp.to_string(),
-        );
-        new
+        Self {
+            inner: self.inner.clone().with_as_of_timestamp(timestamp),
+        }
     }
 
     /// Sets the lower-bound timestamp (exclusive) for incremental queries.
     fn with_start_timestamp(&self, timestamp: &str) -> Self {
-        let mut new = self.clone();
-        new.hudi_options.insert(
-            HudiReadConfig::StartTimestamp.as_ref().to_string(),
-            timestamp.to_string(),
-        );
-        new
+        Self {
+            inner: self.inner.clone().with_start_timestamp(timestamp),
+        }
     }
 
     /// Sets the upper-bound timestamp (inclusive) for incremental queries.
     fn with_end_timestamp(&self, timestamp: &str) -> Self {
-        let mut new = self.clone();
-        new.hudi_options.insert(
-            HudiReadConfig::EndTimestamp.as_ref().to_string(),
-            timestamp.to_string(),
-        );
-        new
+        Self {
+            inner: self.inner.clone().with_end_timestamp(timestamp),
+        }
     }
 
     /// Sets the target batch size (rows per batch) for streaming reads.
-    fn with_batch_size(&self, size: usize) -> Self {
-        let mut new = self.clone();
-        new.hudi_options.insert(
-            HudiReadConfig::StreamBatchSize.as_ref().to_string(),
-            size.to_string(),
-        );
-        new
+    /// Raises if `size == 0` — the parquet stream reader yields no batches
+    /// for a zero-row target, so this is almost certainly a caller mistake.
+    fn with_batch_size(&self, size: usize) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .with_batch_size(size)
+                .map_err(PythonError::from)?,
+        })
     }
 
-    /// Sets column filters.
-    fn with_filters(&self, filters: Vec<(String, String, String)>) -> Self {
-        let mut new = self.clone();
-        new.filters = filters;
-        new
+    /// Sets column filters. Parses and cardinality-validates here; an
+    /// unrecognized operator or empty `IN`/`NOT IN` value list raises.
+    fn with_filters(&self, filters: Vec<(String, String, String)>) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone()
+                .with_filters(filters)
+                .map_err(PythonError::from)?,
+        })
     }
 
     /// Sets the column projection (which columns to read).
     fn with_projection(&self, columns: Vec<String>) -> Self {
-        let mut new = self.clone();
-        new.projection = Some(columns);
-        new
+        Self {
+            inner: self.inner.clone().with_projection(columns),
+        }
     }
 
     /// Sets a single Hudi config that applies to this read only.
     fn with_hudi_option(&self, key: &str, value: &str) -> Self {
-        let mut new = self.clone();
-        new.hudi_options.insert(key.to_string(), value.to_string());
-        new
+        Self {
+            inner: self.inner.clone().with_hudi_option(key, value),
+        }
     }
 
     /// Sets a batch of Hudi configs that apply to this read only.
     fn with_hudi_options(&self, opts: HashMap<String, String>) -> Self {
-        let mut new = self.clone();
-        for (k, v) in opts {
-            new.hudi_options.insert(k, v);
+        Self {
+            inner: self.inner.clone().with_hudi_options(opts),
         }
-        new
     }
 
     // ---- typed accessors (read from hudi_options) ----
 
     /// The query type (defaults to `Snapshot` when unset). Raises on bad strings.
     fn query_type(&self) -> PyResult<HudiQueryType> {
-        match self.hudi_options.get(HudiReadConfig::QueryType.as_ref()) {
-            Some(s) => {
-                let qt =
-                    QueryType::from_str(s).map_err(|e| HudiCoreError::new_err(e.to_string()))?;
-                Ok(HudiQueryType::from(qt))
-            }
-            None => Ok(HudiQueryType::default()),
-        }
+        self.inner
+            .query_type()
+            .map(HudiQueryType::from)
+            .map_err(PythonError::from)
+            .map_err(PyErr::from)
     }
 
     /// The as-of timestamp for snapshot/time-travel queries, if set.
     fn as_of_timestamp(&self) -> Option<String> {
-        self.hudi_options
-            .get(HudiReadConfig::AsOfTimestamp.as_ref())
-            .cloned()
+        self.inner.as_of_timestamp().map(String::from)
     }
 
     /// The start timestamp (exclusive) for incremental queries, if set.
     fn start_timestamp(&self) -> Option<String> {
-        self.hudi_options
-            .get(HudiReadConfig::StartTimestamp.as_ref())
-            .cloned()
+        self.inner.start_timestamp().map(String::from)
     }
 
     /// The end timestamp (inclusive) for incremental queries, if set.
     fn end_timestamp(&self) -> Option<String> {
-        self.hudi_options
-            .get(HudiReadConfig::EndTimestamp.as_ref())
-            .cloned()
+        self.inner.end_timestamp().map(String::from)
     }
 
     /// The target batch size (rows per batch) for streaming reads, if set.
     /// Raises if the stored value is not a valid integer or is `0` (a zero-row
     /// batch yields no batches at the parquet stream reader).
     fn batch_size(&self) -> PyResult<Option<usize>> {
-        let key = HudiReadConfig::StreamBatchSize.as_ref();
-        match self.hudi_options.get(key) {
-            Some(s) => {
-                let parsed = s
-                    .parse::<usize>()
-                    .map_err(|e| HudiCoreError::new_err(format!("Invalid {key}={s:?}: {e}")))?;
-                if parsed == 0 {
-                    return Err(HudiCoreError::new_err(format!("{key} must be > 0, got 0")));
-                }
-                Ok(Some(parsed))
-            }
-            None => Ok(None),
-        }
+        self.inner
+            .batch_size()
+            .map_err(PythonError::from)
+            .map_err(PyErr::from)
     }
 }
 
 impl HudiReadOptions {
     fn to_inner(&self) -> ReadOptions {
-        let mut options = ReadOptions::new()
-            .with_filters(self.filters.clone())
-            .with_hudi_options(self.hudi_options.clone());
-        if let Some(projection) = &self.projection {
-            options = options.with_projection(projection.clone());
-        }
-        options
+        self.inner.clone()
     }
 }
 
@@ -721,18 +729,20 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (read_options=None, extra_overrides=None))]
+    #[pyo3(signature = (read_options=None, extra_hudi_overrides=None, extra_storage_overrides=None))]
     fn create_file_group_reader_with_options(
         &self,
         read_options: Option<HudiReadOptions>,
-        extra_overrides: Option<HashMap<String, String>>,
+        extra_hudi_overrides: Option<HashMap<String, String>>,
+        extra_storage_overrides: Option<HashMap<String, String>>,
     ) -> PyResult<HudiFileGroupReader> {
         let read_options = read_options.map(|o| o.to_inner());
         let fg_reader = self
             .inner
             .create_file_group_reader_with_options(
                 read_options.as_ref(),
-                extra_overrides.unwrap_or_default(),
+                extra_hudi_overrides.unwrap_or_default(),
+                extra_storage_overrides.unwrap_or_default(),
             )
             .map_err(PythonError::from)?;
         Ok(HudiFileGroupReader { inner: fg_reader })
