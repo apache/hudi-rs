@@ -70,6 +70,15 @@ def test_read_options_query_type_bad_value_raises():
         bogus.query_type()
 
 
+def test_read_options_batch_size_bad_value_raises():
+    """A non-integer batch_size in hudi_options surfaces as an error rather than falling back to the default."""
+    bogus = HudiReadOptions(
+        hudi_options={"hoodie.read.stream.batch_size": "not_a_number"}
+    )
+    with pytest.raises(Exception):
+        bogus.batch_size()
+
+
 def test_read_options_bulk_setters():
     """The plural builders (with_filters, with_hudi_options) chain identically to the singular ones."""
     options = (

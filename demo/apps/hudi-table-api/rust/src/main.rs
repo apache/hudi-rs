@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         "s3://hudi-demo/mor/parquet/v6_complexkeygen_hivestyle",
     ] {
         let hudi_table = HudiTableBuilder::from_base_uri(url).build().await?;
-        let batches = hudi_table.read_snapshot(&ReadOptions::new()).await?;
+        let batches = hudi_table.read(&ReadOptions::new()).await?;
 
         let batch = concat_batches(&batches[0].schema(), &batches)?;
         assert_eq!(

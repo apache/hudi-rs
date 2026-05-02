@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use crate::config::error::ConfigError;
 use crate::config::read::HudiReadConfig;
 pub use crate::config::read::QueryType;
 
@@ -223,10 +224,16 @@ impl ReadOptions {
     }
 
     /// The target batch size (rows per batch) for streaming reads, if set.
-    pub fn batch_size(&self) -> Option<usize> {
-        self.hudi_options
-            .get(HudiReadConfig::StreamBatchSize.as_ref())
-            .and_then(|s| s.parse::<usize>().ok())
+    /// Errors if the stored string is not a valid `usize`.
+    pub fn batch_size(&self) -> crate::Result<Option<usize>> {
+        let key = HudiReadConfig::StreamBatchSize;
+        match self.hudi_options.get(key.as_ref()) {
+            Some(s) => s
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|e| ConfigError::ParseInt(key.as_ref().to_string(), s.clone(), e).into()),
+            None => Ok(None),
+        }
     }
 }
 
@@ -277,15 +284,24 @@ mod tests {
     }
 
     #[test]
-    fn test_with_batch_size_round_trip() {
+    fn test_with_batch_size_round_trip() -> crate::Result<()> {
+        let opts = ReadOptions::new();
+        assert_eq!(opts.batch_size()?, None);
+
         let opts = ReadOptions::new().with_batch_size(2048);
-        assert_eq!(opts.batch_size(), Some(2048));
+        assert_eq!(opts.batch_size()?, Some(2048));
         assert_eq!(
             opts.hudi_options
                 .get(HudiReadConfig::StreamBatchSize.as_ref())
                 .map(String::as_str),
             Some("2048")
         );
+
+        let opts = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::StreamBatchSize.as_ref(), "not_a_number");
+        let err = opts.batch_size().unwrap_err();
+        assert!(err.to_string().contains("not_a_number"));
+        Ok(())
     }
 
     #[test]

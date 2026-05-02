@@ -336,7 +336,7 @@ impl FileGroupReader {
             .hudi_configs
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
-        let batch_size = options.batch_size().unwrap_or(default_batch_size);
+        let batch_size = options.batch_size()?.unwrap_or(default_batch_size);
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
         // If projection is set, widen the parquet read to also include any columns

@@ -267,10 +267,18 @@ impl HudiReadOptions {
     }
 
     /// The target batch size (rows per batch) for streaming reads, if set.
-    fn batch_size(&self) -> Option<usize> {
-        self.hudi_options
-            .get(HudiReadConfig::StreamBatchSize.as_ref())
-            .and_then(|s| s.parse::<usize>().ok())
+    /// Raises if the stored value is not a valid integer.
+    fn batch_size(&self) -> PyResult<Option<usize>> {
+        match self.hudi_options.get(HudiReadConfig::StreamBatchSize.as_ref()) {
+            Some(s) => s
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|e| HudiCoreError::new_err(format!(
+                    "Invalid {}={s:?}: {e}",
+                    HudiReadConfig::StreamBatchSize.as_ref(),
+                ))),
+            None => Ok(None),
+        }
     }
 }
 

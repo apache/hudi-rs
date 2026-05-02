@@ -799,7 +799,7 @@ impl Table {
         // Carry batch_size in hudi_options if set; everything else (timestamps,
         // query_type) is irrelevant to the per-slice FG-reader read.
         let mut per_slice_hudi_options: HashMap<String, String> = HashMap::new();
-        if let Some(bs) = fg_options_template.batch_size() {
+        if let Some(bs) = fg_options_template.batch_size()? {
             per_slice_hudi_options.insert(
                 HudiReadConfig::StreamBatchSize.as_ref().to_string(),
                 bs.to_string(),

@@ -24,7 +24,7 @@ for url in [
     "s3://hudi-demo/mor/parquet/v6_complexkeygen_hivestyle",
 ]:
     hudi_table = HudiTableBuilder.from_base_uri(url).build()
-    batches = hudi_table.read_snapshot()
+    batches = hudi_table.read()
 
     arrow_table = pa.Table.from_batches(batches)
     assert arrow_table.schema.names == [
