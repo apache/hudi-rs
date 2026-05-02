@@ -1,64 +1,49 @@
-# GitHub Copilot Instructions for Apache Hudi-rs
+# GitHub Copilot Instructions — Apache Hudi-rs
 
-## Project Overview
+GitHub Copilot loads **both** this file and [`AGENTS.md`](../AGENTS.md) at the root of the repo;
+they are concatenated, not alternatives. Treat `AGENTS.md` as the source of truth for project
+overview, build commands, coding conventions, testing, PR rules, and the review rubric — this file
+adds Copilot-specific notes only.
 
-Apache Hudi-rs is the native Rust implementation of Apache Hudi, providing Python and C++ API bindings. The project focuses on standardizing core Apache Hudi APIs and broadening Hudi integration in the data ecosystem.
+Path-scoped rules under [`./instructions/`](./instructions) are loaded automatically when files
+match their `applyTo` glob and remain authoritative for those files.
 
-### Key Dependencies & Ecosystem
+## Quick orientation
 
-- **Apache Arrow**: In-memory columnar format (via `arrow-rs` crate)
-- **Apache DataFusion**: Query execution engine integration
-- **Apache Parquet**: Columnar storage format
-- **PyO3**: Python bindings
-- **CXX**: C++ FFI bindings
-- **Tokio**: Async runtime
+- Native Rust implementation of Apache Hudi with Python (PyO3) and C++ (`cxx`) bindings.
+- Workspace: `crates/{core,datafusion,hudi,test}`, plus `python/`, `cpp/`, `benchmark/tpch/`.
+- Toolchain: Rust edition `2024` / MSRV `1.88`; Python `>=3.10`; managed via `uv` and `maturin`.
+- Pre-PR check: `make format check test`.
 
-## Commit Conventions
+## Path-scoped rules (loaded by `applyTo` frontmatter)
 
-This project uses [Conventional Commits](https://www.conventionalcommits.org). PR titles must follow this format:
+| Glob              | File                                                                                       | Topic                                                              |
+| ----------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| `**/*.rs`         | [`instructions/rust.instructions.md`](./instructions/rust.instructions.md)                 | Rust error handling, async, performance, API design, doc comments  |
+| `python/**`       | [`instructions/python.instructions.md`](./instructions/python.instructions.md)             | PyO3 patterns, GIL management, PyArrow conversion, Python tests    |
+| `**/*` (review)   | [`instructions/code-review.instructions.md`](./instructions/code-review.instructions.md)   | Review rubric, severity tags, multi-round behavior, cross-file impact |
 
-```
-<type>(<scope>): <description>
-```
+## PR title format
 
-Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`
+PR titles must follow [Conventional Commits](https://www.conventionalcommits.org)
+(`<type>(<scope>): <description>`). Allowed types per
+[`.commitlintrc.yaml`](../.commitlintrc.yaml):
+`build chore ci docs feat fix perf refactor revert style test`. Examples:
 
-Examples:
 - `feat(core): add support for MOR table reads`
 - `fix(python): handle null partition values correctly`
 - `docs: update API documentation for HudiTable`
 
-## Development Setup
+## Copilot review behavior
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for full details.
+- Focus on the latest commits in updated PRs; don't re-raise issues already fixed.
+- Use the severity tags from [`AGENTS.md` → Code review](../AGENTS.md#code-review-rubric)
+  (🔴 / 🟠 / 🟡 / 💬).
+- For `crates/core` public-API changes, check `crates/datafusion`, `python/`, and `cpp/` for
+  downstream impact before approving.
+- Flag `.unwrap()` / `.expect()` / `panic!()` in non-test code as 🔴 Critical.
+- Flag blocking I/O in async functions as 🔴 Critical.
+- Flag hardcoded credentials or secrets as 🔴 Critical.
 
-### Prerequisites
-
-- Rust (see `rust-toolchain.toml`)
-- [uv](https://docs.astral.sh/uv/) - Python package manager
-- Python (see `python/pyproject.toml` for version)
-
-### Quick Start
-
-```bash
-# Setup Python virtual environment
-make setup-venv
-source .venv/bin/activate
-
-# Install for development (builds Rust + Python bindings)
-make develop
-
-# Format and lint
-make format check
-
-# Run all tests
-make test
-```
-
-## Testing
-
-- Unit tests in the same file as the code (`#[cfg(test)]` module)
-- Integration tests in dedicated test modules or test crate
-- Test both success and error paths
-- Use descriptive test names: `test_<function>_<scenario>_<expected_behavior>`
-- Use `#[tokio::test]` for async tests
+For everything else — build commands, coding conventions, testing, security expectations — see
+[`AGENTS.md`](../AGENTS.md).
