@@ -259,7 +259,7 @@ impl Table {
 
         let file_slice = file_slices.into_iter().next().unwrap();
         let fg_reader = self.create_file_group_reader_with_options([(
-            HudiReadConfig::FileGroupEndTimestamp,
+            HudiReadConfig::EndTimestamp,
             timestamp,
         )])?;
 

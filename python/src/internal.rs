@@ -149,13 +149,13 @@ impl HudiReadOptions {
         }
         if let Some(ts) = start_timestamp {
             bag.insert(
-                HudiReadConfig::FileGroupStartTimestamp.as_ref().to_string(),
+                HudiReadConfig::StartTimestamp.as_ref().to_string(),
                 ts,
             );
         }
         if let Some(ts) = end_timestamp {
             bag.insert(
-                HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                HudiReadConfig::EndTimestamp.as_ref().to_string(),
                 ts,
             );
         }

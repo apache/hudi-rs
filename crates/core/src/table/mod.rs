@@ -597,7 +597,7 @@ impl Table {
         let fg_reader = self.create_file_group_reader_for_read(
             options,
             [(
-                HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                HudiReadConfig::EndTimestamp.as_ref().to_string(),
                 timestamp.clone(),
             )],
         )?;
@@ -627,11 +627,11 @@ impl Table {
             options,
             [
                 (
-                    HudiReadConfig::FileGroupStartTimestamp.as_ref().to_string(),
+                    HudiReadConfig::StartTimestamp.as_ref().to_string(),
                     start,
                 ),
                 (
-                    HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                    HudiReadConfig::EndTimestamp.as_ref().to_string(),
                     end,
                 ),
             ],
@@ -648,7 +648,7 @@ impl Table {
     }
 
     /// Build a `FileGroupReader` for one of the read paths. Merges `options.hudi_options`
-    /// with caller-supplied per-path overrides (e.g., `FileGroupStartTimestamp`); the
+    /// with caller-supplied per-path overrides (e.g., `StartTimestamp`); the
     /// per-path overrides win on conflict so commit-time bounds the read path needs
     /// can't be accidentally clobbered by a user-supplied `hudi_options` entry.
     fn create_file_group_reader_for_read<I>(
@@ -785,7 +785,7 @@ impl Table {
         let fg_reader = self.create_file_group_reader_for_read(
             options,
             [(
-                HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+                HudiReadConfig::EndTimestamp.as_ref().to_string(),
                 timestamp,
             )],
         )?;
@@ -1508,12 +1508,12 @@ mod tests {
     #[tokio::test]
     async fn hudi_table_read_options_hudi_options_plumbed_to_reader() {
         // Per-read hudi_options should override table-level configs without
-        // mutating the table. Here we set the per-read FileGroupStartTimestamp
+        // mutating the table. Here we set the per-read StartTimestamp
         // via hudi_options on a snapshot read; the read should still succeed.
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let options = ReadOptions::new().with_hudi_option(
-            HudiReadConfig::FileGroupStartTimestamp.as_ref(),
+            HudiReadConfig::StartTimestamp.as_ref(),
             "0",
         );
         let batches = hudi_table.read(&options).await.unwrap();

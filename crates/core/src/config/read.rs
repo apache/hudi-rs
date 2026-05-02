@@ -54,10 +54,10 @@ pub enum HudiReadConfig {
     AsOfTimestamp,
 
     /// Start timestamp (exclusive) for [FileGroup] to filter records.
-    FileGroupStartTimestamp,
+    StartTimestamp,
 
     /// End timestamp (inclusive) for [FileGroup] to filter records.
-    FileGroupEndTimestamp,
+    EndTimestamp,
 
     /// Number of input partitions to read the data in parallel.
     ///
@@ -80,9 +80,9 @@ impl AsRef<str> for HudiReadConfig {
     fn as_ref(&self) -> &str {
         match self {
             Self::QueryType => "hoodie.read.query.type",
-            Self::AsOfTimestamp => "hoodie.read.as.of.instant",
-            Self::FileGroupStartTimestamp => "hoodie.read.file_group.start_timestamp",
-            Self::FileGroupEndTimestamp => "hoodie.read.file_group.end_timestamp",
+            Self::AsOfTimestamp => "hoodie.read.as.of.timestamp",
+            Self::StartTimestamp => "hoodie.read.start.timestamp",
+            Self::EndTimestamp => "hoodie.read.end.timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
@@ -120,10 +120,10 @@ impl ConfigParser for HudiReadConfig {
         match self {
             Self::QueryType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
-            Self::FileGroupStartTimestamp => {
+            Self::StartTimestamp => {
                 get_result.map(|v| HudiConfigValue::String(v.to_string()))
             }
-            Self::FileGroupEndTimestamp => {
+            Self::EndTimestamp => {
                 get_result.map(|v| HudiConfigValue::String(v.to_string()))
             }
             Self::InputPartitions => get_result

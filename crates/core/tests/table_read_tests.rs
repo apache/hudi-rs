@@ -1813,7 +1813,7 @@ mod streaming_queries {
     #[tokio::test]
     async fn test_file_group_reader_stream_projection_widens_for_commit_time_filter() -> Result<()>
     {
-        // Regression: when commit-time filtering is active (FileGroupStartTimestamp set
+        // Regression: when commit-time filtering is active (StartTimestamp set
         // and PopulatesMetaFields true), the streaming path must widen the parquet read
         // projection to include `_hoodie_commit_time` even if the user's projection
         // omits it. The widened column is dropped by the existing final-projection step
@@ -1824,7 +1824,7 @@ mod streaming_queries {
         let file_slice = hudi_table.get_file_slices(&ReadOptions::new()).await?[0].clone();
         let reader = FileGroupReader::new_with_options(
             base_url.path(),
-            [(HudiReadConfig::FileGroupStartTimestamp.as_ref(), "0")],
+            [(HudiReadConfig::StartTimestamp.as_ref(), "0")],
         )
         .await?;
         let options = ReadOptions::new().with_projection(["id"]);

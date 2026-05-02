@@ -127,11 +127,11 @@ impl FileGroupReader {
             .into();
         let start_timestamp = self
             .hudi_configs
-            .try_get(HudiReadConfig::FileGroupStartTimestamp)
+            .try_get(HudiReadConfig::StartTimestamp)
             .map(|v| -> String { v.into() });
         let end_timestamp = self
             .hudi_configs
-            .try_get(HudiReadConfig::FileGroupEndTimestamp)
+            .try_get(HudiReadConfig::EndTimestamp)
             .map(|v| -> String { v.into() });
         InstantRange::new(timezone, start_timestamp, end_timestamp, false, true)
     }
@@ -343,7 +343,7 @@ impl FileGroupReader {
         // we need post-read but the user didn't request:
         //   - filter fields, so the row-level mask can evaluate them
         //   - `_hoodie_commit_time`, when commit-time filtering is active
-        //     (PopulatesMetaFields + FileGroupStartTimestamp)
+        //     (PopulatesMetaFields + StartTimestamp)
         // The widened columns are dropped by the final projection step below.
         //
         // We only exclude partition column filter fields from widening when
@@ -370,7 +370,7 @@ impl FileGroupReader {
                 .into();
             let has_start_ts = self
                 .hudi_configs
-                .try_get(HudiReadConfig::FileGroupStartTimestamp)
+                .try_get(HudiReadConfig::StartTimestamp)
                 .is_some();
             populates_meta_fields && has_start_ts
         };
@@ -573,7 +573,7 @@ fn create_commit_time_filter_mask(
     }
 
     let start_ts = hudi_configs
-        .try_get(HudiReadConfig::FileGroupStartTimestamp)
+        .try_get(HudiReadConfig::StartTimestamp)
         .map(|v| -> String { v.into() });
     if start_ts.is_none() {
         // If start timestamp is not provided, the query is snapshot or time-travel
@@ -589,7 +589,7 @@ fn create_commit_time_filter_mask(
     }
 
     if let Some(end) = hudi_configs
-        .try_get(HudiReadConfig::FileGroupEndTimestamp)
+        .try_get(HudiReadConfig::EndTimestamp)
         .map(|v| -> String { v.into() })
     {
         let filter = Filter::try_from((MetaField::CommitTime.as_ref(), "<=", end.as_str()))?;
@@ -768,7 +768,7 @@ mod tests {
             &base_uri,
             [
                 (HudiTableConfig::PopulatesMetaFields.as_ref(), "false"),
-                (HudiReadConfig::FileGroupStartTimestamp.as_ref(), "2"),
+                (HudiReadConfig::StartTimestamp.as_ref(), "2"),
             ],
         )
         .await?;
@@ -783,7 +783,7 @@ mod tests {
         // Test case 3: Filtering commit time > '2'
         let reader = FileGroupReader::new_with_options(
             &base_uri,
-            [(HudiReadConfig::FileGroupStartTimestamp, "2")],
+            [(HudiReadConfig::StartTimestamp, "2")],
         )
         .await?;
         let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
@@ -796,7 +796,7 @@ mod tests {
         // Test case 4: Filtering commit time <= '4'
         let reader = FileGroupReader::new_with_options(
             &base_uri,
-            [(HudiReadConfig::FileGroupEndTimestamp, "4")],
+            [(HudiReadConfig::EndTimestamp, "4")],
         )
         .await?;
         let mask = create_commit_time_filter_mask(&reader.hudi_configs, &records)?;
@@ -806,8 +806,8 @@ mod tests {
         let reader = FileGroupReader::new_with_options(
             &base_uri,
             [
-                (HudiReadConfig::FileGroupStartTimestamp, "2"),
-                (HudiReadConfig::FileGroupEndTimestamp, "4"),
+                (HudiReadConfig::StartTimestamp, "2"),
+                (HudiReadConfig::EndTimestamp, "4"),
             ],
         )
         .await?;
@@ -1235,8 +1235,8 @@ mod tests {
         FileGroupReader::new_with_configs_and_overwriting_options(
             hudi_configs,
             [
-                (HudiReadConfig::FileGroupStartTimestamp.as_ref(), "2"),
-                (HudiReadConfig::FileGroupEndTimestamp.as_ref(), "4"),
+                (HudiReadConfig::StartTimestamp.as_ref(), "2"),
+                (HudiReadConfig::EndTimestamp.as_ref(), "4"),
             ],
         )
     }

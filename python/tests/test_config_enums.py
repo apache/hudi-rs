@@ -37,10 +37,7 @@ def test_internal_config_keys_returns_both_enums():
     assert table_dict["TABLE_NAME"] == "hoodie.table.name"
     assert table_dict["BASE_FILE_FORMAT"] == "hoodie.table.base.file.format"
     assert read_dict["INPUT_PARTITIONS"] == "hoodie.read.input.partitions"
-    assert (
-        read_dict["FILE_GROUP_START_TIMESTAMP"]
-        == "hoodie.read.file_group.start_timestamp"
-    )
+    assert read_dict["START_TIMESTAMP"] == "hoodie.read.start.timestamp"
 
 
 def test_config_enums_are_real_python_enums():

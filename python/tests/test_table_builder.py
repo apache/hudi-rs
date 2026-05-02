@@ -94,14 +94,14 @@ def test_read_table_returns_correct_data(v8_trips_table):
     "hudi_options,storage_options,options",
     [
         (
-            {"hoodie.read.file_group.start_timestamp": "resolved value"},
-            {"hoodie.read.file_group.start_timestamp": "not taking"},
-            {"hoodie.read.file_group.start_timestamp": "lower precedence"},
+            {"hoodie.read.start.timestamp": "resolved value"},
+            {"hoodie.read.start.timestamp": "not taking"},
+            {"hoodie.read.start.timestamp": "lower precedence"},
         ),
         (
             {},
-            {"hoodie.read.file_group.start_timestamp": "not taking"},
-            {"hoodie.read.file_group.start_timestamp": "resolved value"},
+            {"hoodie.read.start.timestamp": "not taking"},
+            {"hoodie.read.start.timestamp": "resolved value"},
         ),
     ],
 )
@@ -115,7 +115,7 @@ def test_setting_table_options(v8_trips_table, hudi_options, storage_options, op
     )
 
     assert (
-        table.hudi_options().get("hoodie.read.file_group.start_timestamp")
+        table.hudi_options().get("hoodie.read.start.timestamp")
         == "resolved value"
     )
 
@@ -150,14 +150,8 @@ def test_enum_values_match_expected_strings():
         HudiReadConfig.USE_READ_OPTIMIZED_MODE.value
         == "hoodie.read.use.read_optimized.mode"
     )
-    assert (
-        HudiReadConfig.FILE_GROUP_START_TIMESTAMP.value
-        == "hoodie.read.file_group.start_timestamp"
-    )
-    assert (
-        HudiReadConfig.FILE_GROUP_END_TIMESTAMP.value
-        == "hoodie.read.file_group.end_timestamp"
-    )
+    assert HudiReadConfig.START_TIMESTAMP.value == "hoodie.read.start.timestamp"
+    assert HudiReadConfig.END_TIMESTAMP.value == "hoodie.read.end.timestamp"
 
 
 def test_mixed_string_and_enum_usage(builder):

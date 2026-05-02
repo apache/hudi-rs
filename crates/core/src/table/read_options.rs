@@ -152,20 +152,20 @@ impl ReadOptions {
     }
 
     /// Sets the lower-bound timestamp (exclusive) for incremental queries.
-    /// Stored as [`HudiReadConfig::FileGroupStartTimestamp`].
+    /// Stored as [`HudiReadConfig::StartTimestamp`].
     pub fn with_start_timestamp<S: AsRef<str>>(mut self, timestamp: S) -> Self {
         self.hudi_options.insert(
-            HudiReadConfig::FileGroupStartTimestamp.as_ref().to_string(),
+            HudiReadConfig::StartTimestamp.as_ref().to_string(),
             timestamp.as_ref().to_string(),
         );
         self
     }
 
     /// Sets the upper-bound timestamp (inclusive) for incremental queries.
-    /// Stored as [`HudiReadConfig::FileGroupEndTimestamp`].
+    /// Stored as [`HudiReadConfig::EndTimestamp`].
     pub fn with_end_timestamp<S: AsRef<str>>(mut self, timestamp: S) -> Self {
         self.hudi_options.insert(
-            HudiReadConfig::FileGroupEndTimestamp.as_ref().to_string(),
+            HudiReadConfig::EndTimestamp.as_ref().to_string(),
             timestamp.as_ref().to_string(),
         );
         self
@@ -250,14 +250,14 @@ impl ReadOptions {
     /// The start timestamp (exclusive) for incremental queries, if set.
     pub fn start_timestamp(&self) -> Option<&str> {
         self.hudi_options
-            .get(HudiReadConfig::FileGroupStartTimestamp.as_ref())
+            .get(HudiReadConfig::StartTimestamp.as_ref())
             .map(|s| s.as_str())
     }
 
     /// The end timestamp (inclusive) for incremental queries, if set.
     pub fn end_timestamp(&self) -> Option<&str> {
         self.hudi_options
-            .get(HudiReadConfig::FileGroupEndTimestamp.as_ref())
+            .get(HudiReadConfig::EndTimestamp.as_ref())
             .map(|s| s.as_str())
     }
 

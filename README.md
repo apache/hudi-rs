@@ -277,7 +277,7 @@ engines, where the plan provides file paths.
 from hudi import HudiFileGroupReader
 
 reader = HudiFileGroupReader(
-    "/table/base/path", {"hoodie.read.file_group.start_timestamp": "0"})
+    "/table/base/path", {"hoodie.read.start.timestamp": "0"})
 
 # Returns a PyArrow RecordBatch
 record_batch = reader.read_file_slice_from_paths("relative/path.parquet", [])
@@ -291,7 +291,7 @@ use hudi::table::ReadOptions;
 
 // Inside an async context
 let reader = FileGroupReader::new_with_options(
-    "/table/base/path", [("hoodie.read.file_group.start_timestamp", "0")]).await?;
+    "/table/base/path", [("hoodie.read.start.timestamp", "0")]).await?;
 
 // Returns an Arrow RecordBatch
 let record_batch = reader
@@ -312,7 +312,7 @@ let record_batch = reader
 
 // Functions may throw rust::Error on failure
 auto reader = new_file_group_reader_with_options(
-    "/table/base/path", {"hoodie.read.file_group.start_timestamp=0"});
+    "/table/base/path", {"hoodie.read.start.timestamp=0"});
 
 // Returns an ArrowArrayStream pointer
 std::vector<std::string> log_file_paths{};

@@ -54,9 +54,9 @@ Snapshot and per-file-slice reads each have an **eager** form returning all batc
 | Convenience builder        | Stored under `hudi_options` key                | Default at use time                       |
 |----------------------------|------------------------------------------------|-------------------------------------------|
 | `with_query_type(QueryType)` | `hoodie.read.query.type`                     | `snapshot`                                |
-| `with_as_of_timestamp(ts)`   | `hoodie.read.as.of.instant`                  | latest commit (Snapshot only)             |
-| `with_start_timestamp(ts)`   | `hoodie.read.file_group.start_timestamp`     | `19700101000000000` (Incremental only)    |
-| `with_end_timestamp(ts)`     | `hoodie.read.file_group.end_timestamp`       | latest commit (Incremental only)          |
+| `with_as_of_timestamp(ts)`   | `hoodie.read.as.of.timestamp`                | latest commit (Snapshot only)             |
+| `with_start_timestamp(ts)`   | `hoodie.read.start.timestamp`                | `19700101000000000` (Incremental only)    |
+| `with_end_timestamp(ts)`     | `hoodie.read.end.timestamp`                  | latest commit (Incremental only)          |
 | `with_batch_size(n)`         | `hoodie.read.stream.batch_size`              | `1024` (streaming only)                   |
 
 Which knobs each API consumes:
