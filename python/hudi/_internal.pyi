@@ -22,6 +22,7 @@ import pyarrow  # type: ignore
 __version__: str
 
 def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
+
 @dataclass(init=False)
 class HudiFileGroupReader:
     """
@@ -384,6 +385,7 @@ def build_hudi_table(
         HudiTable: An instance of hudi table.
     """
     ...
+
 @dataclass(init=False)
 class HudiDataFusionDataSource:
     def __init__(
