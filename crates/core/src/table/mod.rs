@@ -581,6 +581,11 @@ impl Table {
     /// `read_options.hudi_options` override table-level Hudi configs
     /// (last-writer-wins). `extra_storage_overrides` override table-level
     /// storage options (cloud credentials, endpoints, etc).
+    ///
+    /// When `read_options` is `Some`, timestamps are resolved into the
+    /// `StartTimestamp` / `EndTimestamp` that [`FileGroupReader`] needs for
+    /// log-scan bounds and commit-time filtering — the same normalization
+    /// that [`Table::read`] performs internally.
     pub fn create_file_group_reader_with_options<S, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
@@ -591,9 +596,10 @@ impl Table {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let hudi_opts: HashMap<String, String> = read_options
-            .map(|opts| opts.hudi_options.clone())
-            .unwrap_or_default();
+        let hudi_opts: HashMap<String, String> = match read_options {
+            Some(opts) => self.prepare_reader_options(opts)?.hudi_options,
+            None => HashMap::new(),
+        };
 
         let mut storage_opts: HashMap<String, String> =
             HashMap::with_capacity(self.storage_options.len());
@@ -605,6 +611,33 @@ impl Table {
         }
 
         FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
+    }
+
+    /// Convert caller-facing [`ReadOptions`] into the form that
+    /// [`FileGroupReader`] expects: `AsOfTimestamp` resolved to
+    /// `EndTimestamp` for snapshots; `StartTimestamp` / `EndTimestamp`
+    /// defaults filled for incremental queries.
+    fn prepare_reader_options(&self, options: &ReadOptions) -> Result<ReadOptions> {
+        let options = options.with_sanitized_timestamps();
+        match options.query_type()? {
+            QueryType::Snapshot => {
+                if let Some(ts) = self.resolve_snapshot_timestamp(&options)? {
+                    Ok(options.clone().with_end_timestamp(&ts))
+                } else {
+                    Ok(options)
+                }
+            }
+            QueryType::Incremental => {
+                if let Some((start, end)) = self.resolve_incremental_range(&options)? {
+                    Ok(options
+                        .clone()
+                        .with_start_timestamp(&start)
+                        .with_end_timestamp(&end))
+                } else {
+                    Ok(options)
+                }
+            }
+        }
     }
 
     /// Read records, dispatching on `options.query_type`.
@@ -633,7 +666,10 @@ impl Table {
         let file_slices = self
             .get_file_slices_inner(&timestamp, &options.filters, base_file_only)
             .await?;
-        let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
+        let fg_reader = self.create_file_group_reader_with_options(
+            Some(options),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
         let fg_options = self.options_for_file_group(options);
         let batches = futures::future::try_join_all(
             file_slices
@@ -644,15 +680,6 @@ impl Table {
         Ok(batches)
     }
 
-    fn create_file_group_reader_for_snapshot(
-        &self,
-        options: &ReadOptions,
-        snapshot_timestamp: &str,
-    ) -> Result<FileGroupReader> {
-        let opts = options.clone().with_end_timestamp(snapshot_timestamp);
-        self.create_file_group_reader_with_options(Some(&opts), std::iter::empty::<(&str, &str)>())
-    }
-
     async fn read_incremental_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
         let Some((start, end)) = self.resolve_incremental_range(options)? else {
             return Ok(Vec::new());
@@ -661,13 +688,8 @@ impl Table {
         let file_slices = self
             .get_file_slices_between_inner(&start, &end, &options.filters, base_file_only)
             .await?;
-
-        let fg_opts = options
-            .clone()
-            .with_start_timestamp(&start)
-            .with_end_timestamp(&end);
         let fg_reader = self.create_file_group_reader_with_options(
-            Some(&fg_opts),
+            Some(options),
             std::iter::empty::<(&str, &str)>(),
         )?;
         let fg_options = self.options_for_file_group(options);
@@ -802,7 +824,10 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
+        let fg_reader = self.create_file_group_reader_with_options(
+            Some(options),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at

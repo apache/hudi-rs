@@ -2083,6 +2083,152 @@ mod streaming_queries {
     }
 }
 
+/// Regression tests: manual `get_file_slices` + `create_file_group_reader_with_options`
+/// + `read_file_slice` must produce the same results as `table.read()`.
+///
+/// Before the fix, `create_file_group_reader_with_options` passed caller options
+/// directly to `FileGroupReader` without resolving `AsOfTimestamp` → `EndTimestamp`
+/// (snapshot) or filling default `StartTimestamp` / `EndTimestamp` (incremental).
+/// For MOR non-read-optimized time-travel, log files could be read without the
+/// intended upper bound.
+mod manual_reader_matches_table_read {
+    use super::*;
+    use arrow::compute::concat_batches;
+
+    async fn read_via_manual_reader(
+        table: &Table,
+        options: &ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let file_slices = table.get_file_slices(options).await?;
+        let fg_reader = table.create_file_group_reader_with_options(
+            Some(options),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, options)),
+        )
+        .await?;
+        Ok(batches)
+    }
+
+    #[tokio::test]
+    async fn test_mor_time_travel_manual_reader_matches_table_read() -> Result<()> {
+        let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let first_commit = hudi_table
+            .timeline
+            .completed_commits
+            .iter()
+            .map(|i| i.timestamp.as_str())
+            .next()
+            .expect("V6Trips8I1U should have at least one commit");
+
+        let options = ReadOptions::new().with_as_of_timestamp(first_commit);
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_schema = &expected[0].schema();
+        let expected_batch = concat_batches(expected_schema, &expected)?;
+        let actual_schema = &actual[0].schema();
+        let actual_batch = concat_batches(actual_schema, &actual)?;
+
+        assert_eq!(
+            expected_batch.num_rows(),
+            actual_batch.num_rows(),
+            "MOR time-travel: manual reader should return same row count as table.read()"
+        );
+
+        let mut expected_riders = QuickstartTripsTable::uuid_rider_and_fare(&expected_batch);
+        let mut actual_riders = QuickstartTripsTable::uuid_rider_and_fare(&actual_batch);
+        expected_riders.sort_unstable_by_key(|(uuid, _, _)| uuid.clone());
+        actual_riders.sort_unstable_by_key(|(uuid, _, _)| uuid.clone());
+        assert_eq!(
+            expected_riders, actual_riders,
+            "MOR time-travel: manual reader data should match table.read() data"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_incremental_with_explicit_range_manual_reader_matches_table_read() -> Result<()> {
+        let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let deltacommits: Vec<_> = hudi_table
+            .timeline
+            .get_completed_deltacommits(false)
+            .await?;
+        assert!(deltacommits.len() >= 2);
+        let first_commit = &deltacommits[0].timestamp;
+        let second_commit = &deltacommits[1].timestamp;
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp("19700101000000000")
+            .with_end_timestamp(first_commit.as_str());
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            expected_rows, actual_rows,
+            "incremental (explicit range up to first commit): row counts must match"
+        );
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(first_commit.as_str())
+            .with_end_timestamp(second_commit.as_str());
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            expected_rows, actual_rows,
+            "incremental (first..second commit): row counts must match"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_incremental_with_start_only_manual_reader_matches_table_read() -> Result<()> {
+        let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let deltacommits: Vec<_> = hudi_table
+            .timeline
+            .get_completed_deltacommits(false)
+            .await?;
+        let first_commit = &deltacommits[0].timestamp;
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(first_commit.as_str());
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            expected_rows, actual_rows,
+            "incremental (start only, end defaults to latest): row counts must match"
+        );
+
+        Ok(())
+    }
+}
+
 /// Test module for tables with metadata table (MDT) enabled.
 /// These tests verify MDT-accelerated file listing and partition normalization.
 mod mdt_enabled_tables {
