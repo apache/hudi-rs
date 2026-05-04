@@ -435,21 +435,23 @@ impl Table {
     /// [`crate::util::collection::split_into_chunks`] or your engine's preferred
     /// partitioning policy.
     pub async fn get_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        let options = options.with_sanitized_timestamps();
-        let base_file_only = self.is_base_file_only(&options)?;
-        match options.query_type()? {
+        let prepared = self.prepare_reader_options(options)?;
+        let base_file_only = self.is_base_file_only(&prepared)?;
+        match prepared.query_type()? {
             QueryType::Snapshot => {
-                let Some(timestamp) = self.resolve_snapshot_timestamp(&options)? else {
+                let Some(timestamp) = prepared.end_timestamp() else {
                     return Ok(Vec::new());
                 };
-                self.get_file_slices_inner(&timestamp, &options.filters, base_file_only)
+                self.get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
                     .await
             }
             QueryType::Incremental => {
-                let Some((start, end)) = self.resolve_incremental_range(&options)? else {
+                let (Some(start), Some(end)) =
+                    (prepared.start_timestamp(), prepared.end_timestamp())
+                else {
                     return Ok(Vec::new());
                 };
-                self.get_file_slices_between_inner(&start, &end, &options.filters, base_file_only)
+                self.get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
                     .await
             }
         }
@@ -600,17 +602,7 @@ impl Table {
             Some(opts) => self.prepare_reader_options(opts)?.hudi_options,
             None => HashMap::new(),
         };
-
-        let mut storage_opts: HashMap<String, String> =
-            HashMap::with_capacity(self.storage_options.len());
-        for (k, v) in self.storage_options.iter() {
-            storage_opts.insert(k.clone(), v.clone());
-        }
-        for (k, v) in extra_storage_overrides {
-            storage_opts.insert(k.as_ref().to_string(), v.into());
-        }
-
-        FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
+        self.build_file_group_reader(hudi_opts, extra_storage_overrides)
     }
 
     /// Convert caller-facing [`ReadOptions`] into the form that
@@ -640,6 +632,28 @@ impl Table {
         }
     }
 
+    /// Build a [`FileGroupReader`] from already-resolved hudi options.
+    fn build_file_group_reader<S, K, V>(
+        &self,
+        hudi_opts: HashMap<String, String>,
+        extra_storage_overrides: S,
+    ) -> Result<FileGroupReader>
+    where
+        S: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut storage_opts: HashMap<String, String> =
+            HashMap::with_capacity(self.storage_options.len());
+        for (k, v) in self.storage_options.iter() {
+            storage_opts.insert(k.clone(), v.clone());
+        }
+        for (k, v) in extra_storage_overrides {
+            storage_opts.insert(k.as_ref().to_string(), v.into());
+        }
+        FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
+    }
+
     /// Read records, dispatching on `options.query_type`.
     ///
     /// - [`QueryType::Snapshot`] reads at `options.as_of_timestamp` or the latest commit.
@@ -651,26 +665,26 @@ impl Table {
     /// for the full breakdown. `options.hudi_options` override table-level Hudi configs
     /// for this single read.
     pub async fn read(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        let options = options.with_sanitized_timestamps();
-        match options.query_type()? {
-            QueryType::Snapshot => self.read_snapshot_inner(&options).await,
-            QueryType::Incremental => self.read_incremental_inner(&options).await,
+        let prepared = self.prepare_reader_options(options)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => self.read_snapshot_inner(&prepared).await,
+            QueryType::Incremental => self.read_incremental_inner(&prepared).await,
         }
     }
 
-    async fn read_snapshot_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
+    async fn read_snapshot_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        let Some(timestamp) = prepared.end_timestamp() else {
             return Ok(Vec::new());
         };
-        let base_file_only = self.is_base_file_only(options)?;
+        let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_inner(&timestamp, &options.filters, base_file_only)
+            .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(options),
+        let fg_reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
-        let fg_options = self.options_for_file_group(options);
+        let fg_options = self.options_for_file_group(prepared);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
@@ -680,19 +694,20 @@ impl Table {
         Ok(batches)
     }
 
-    async fn read_incremental_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        let Some((start, end)) = self.resolve_incremental_range(options)? else {
+    async fn read_incremental_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        let (Some(start), Some(end)) = (prepared.start_timestamp(), prepared.end_timestamp())
+        else {
             return Ok(Vec::new());
         };
-        let base_file_only = self.is_base_file_only(options)?;
+        let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_between_inner(&start, &end, &options.filters, base_file_only)
+            .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(options),
+        let fg_reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
-        let fg_options = self.options_for_file_group(options);
+        let fg_options = self.options_for_file_group(prepared);
 
         let batches = futures::future::try_join_all(
             file_slices
@@ -796,9 +811,9 @@ impl Table {
         &self,
         options: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        let options = options.with_sanitized_timestamps();
-        match options.query_type()? {
-            QueryType::Snapshot => self.read_snapshot_stream_inner(&options).await,
+        let prepared = self.prepare_reader_options(options)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => self.read_snapshot_stream_inner(&prepared).await,
             QueryType::Incremental => Err(CoreError::Unsupported(
                 "Streaming for incremental queries is not yet supported".to_string(),
             )),
@@ -807,25 +822,25 @@ impl Table {
 
     async fn read_snapshot_stream_inner(
         &self,
-        options: &ReadOptions,
+        prepared: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use futures::stream::{self, StreamExt};
 
-        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
+        let Some(timestamp) = prepared.end_timestamp() else {
             return Ok(Box::pin(stream::empty()));
         };
 
-        let base_file_only = self.is_base_file_only(options)?;
+        let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_inner(&timestamp, &options.filters, base_file_only)
+            .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(options),
+        let fg_reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
 
@@ -833,7 +848,7 @@ impl Table {
         // the upstream pruning already used them at file/partition level; applying at
         // row-level closes the gap for non-partition column filters. Strip filters
         // on dropped partition columns so they don't trigger FGR validation errors.
-        let fg_options_template = self.options_for_file_group(options);
+        let fg_options_template = self.options_for_file_group(prepared);
         let projection = fg_options_template.projection.clone();
         let row_filters = fg_options_template.filters.clone();
         // Carry batch_size in hudi_options if set; everything else (timestamps,
