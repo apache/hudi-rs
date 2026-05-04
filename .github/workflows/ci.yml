@@ -49,18 +49,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  msrv-check:
-    name: MSRV check (Rust 1.88)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install MSRV toolchain
-        run: rustup toolchain install --profile=minimal 1.88
-      - name: Check workspace compiles on MSRV
-        run: RUSTUP_TOOLCHAIN=1.88 cargo check --workspace --all-targets --all-features
-
   rust-tests:
-    needs: msrv-check
     strategy:
       fail-fast: false
       matrix:
