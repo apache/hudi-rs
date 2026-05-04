@@ -51,10 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

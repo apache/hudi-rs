@@ -3,7 +3,7 @@
 ## Project
 
 Native Rust implementation of [Apache Hudi](https://hudi.apache.org) with Python (PyO3) and C++
-([`cxx`](https://cxx.rs)) bindings. Apache 2.0. Rust workspace, edition `2024`, MSRV `1.94`.
+([`cxx`](https://cxx.rs)) bindings. Apache 2.0. Rust workspace, edition `2024`, MSRV `1.88`.
 Python `>=3.10`. Key traits: async-first (tokio), Arrow-native, `object_store` for all I/O,
 timeline-based MVCC.
 
