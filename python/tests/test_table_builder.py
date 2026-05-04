@@ -18,7 +18,7 @@
 import pyarrow as pa
 import pytest
 
-from hudi import HudiReadConfig, HudiTableBuilder, HudiTableConfig
+from hudi import HudiPlanConfig, HudiReadConfig, HudiTableBuilder, HudiTableConfig
 
 
 @pytest.fixture
@@ -94,14 +94,14 @@ def test_read_table_returns_correct_data(v8_trips_table):
     "hudi_options,storage_options,options",
     [
         (
-            {"hoodie.read.start.timestamp": "resolved value"},
-            {"hoodie.read.start.timestamp": "not taking"},
-            {"hoodie.read.start.timestamp": "lower precedence"},
+            {"hoodie.custom.test.key": "resolved value"},
+            {"hoodie.custom.test.key": "not taking"},
+            {"hoodie.custom.test.key": "lower precedence"},
         ),
         (
             {},
-            {"hoodie.read.start.timestamp": "not taking"},
-            {"hoodie.read.start.timestamp": "resolved value"},
+            {"hoodie.custom.test.key": "not taking"},
+            {"hoodie.custom.test.key": "resolved value"},
         ),
     ],
 )
@@ -114,7 +114,7 @@ def test_setting_table_options(v8_trips_table, hudi_options, storage_options, op
         .build()
     )
 
-    assert table.hudi_options().get("hoodie.read.start.timestamp") == "resolved value"
+    assert table.hudi_options().get("hoodie.custom.test.key") == "resolved value"
 
 
 def test_with_hudi_option_enum(builder):
@@ -131,8 +131,8 @@ def test_with_option_enum(builder):
     builder.with_option(HudiTableConfig.BASE_FILE_FORMAT, "parquet")
     assert builder.options["hoodie.table.base.file.format"] == "parquet"
 
-    builder.with_option(HudiReadConfig.LISTING_PARALLELISM, "10")
-    assert builder.options["hoodie.read.listing.parallelism"] == "10"
+    builder.with_option(HudiPlanConfig.LISTING_PARALLELISM, "10")
+    assert builder.options["hoodie.plan.listing.parallelism"] == "10"
 
 
 def test_enum_values_match_expected_strings():
@@ -142,7 +142,7 @@ def test_enum_values_match_expected_strings():
     assert HudiTableConfig.BASE_FILE_FORMAT.value == "hoodie.table.base.file.format"
 
     assert HudiReadConfig.INPUT_PARTITIONS.value == "hoodie.read.input.partitions"
-    assert HudiReadConfig.LISTING_PARALLELISM.value == "hoodie.read.listing.parallelism"
+    assert HudiPlanConfig.LISTING_PARALLELISM.value == "hoodie.plan.listing.parallelism"
     assert (
         HudiReadConfig.USE_READ_OPTIMIZED_MODE.value
         == "hoodie.read.use.read_optimized.mode"

@@ -108,30 +108,24 @@ async fn main() -> Result<()> {
 }
 ```
 
-To run read-optimized (RO) query on Merge-on-Read (MOR) tables, set `hoodie.read.use.read_optimized.mode` when creating the table.
+To run read-optimized (RO) query on Merge-on-Read (MOR) tables, set `hoodie.read.use.read_optimized.mode` in `ReadOptions`.
 
 #### Python
 
 ```python
-from hudi import HudiReadConfig, HudiTableBuilder
+from hudi import HudiReadOptions
 
-hudi_table = (
-    HudiTableBuilder
-    .from_base_uri("/tmp/trips_table")
-    .with_option(HudiReadConfig.USE_READ_OPTIMIZED_MODE, "true")
-    .build()
+batches = hudi_table.read(
+    HudiReadOptions(hudi_options={"hoodie.read.use.read_optimized.mode": "true"})
 )
 ```
-
-`HudiReadConfig` and `HudiTableConfig` enum members are accepted by `with_hudi_option` and `with_option`. For the bulk variants `with_hudi_options` / `with_options`, pass string keys (or `member.value`) until they are updated to coerce enum keys.
 
 #### Rust
 
 ```rust
-let hudi_table = 
-    HudiTableBuilder::from_base_uri("/tmp/trips_table")
-    .with_option("hoodie.read.use.read_optimized.mode", "true")
-    .build().await?;
+let options = ReadOptions::new()
+    .with_hudi_option("hoodie.read.use.read_optimized.mode", "true");
+let batches = hudi_table.read(&options).await?;
 ```
 
 ### Time-Travel Query
@@ -337,13 +331,13 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 - `batch_size` (`with_batch_size`) — rows per batch (streaming only; eager reads return one batch per file slice).
 - `as_of_timestamp` (`with_as_of_timestamp`) — snapshot/time-travel timestamp (defaults to latest commit).
 - `start_timestamp` / `end_timestamp` (`with_start_timestamp` / `with_end_timestamp`) — incremental range (defaults to earliest…latest).
-- `hudi_options` — per-read Hudi configs that override table-level defaults (e.g. `hoodie.read.use.read_optimized.mode`).
+- `hudi_options` — per-read Hudi configs (e.g. `hoodie.read.use.read_optimized.mode`). Read configs are not stored in the table; they flow exclusively through `ReadOptions`.
 
 | Stage           | API                                                              | Description                                                                                              |
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi::util::collection::split_into_chunks` on the result. |
-|                 | `compute_table_stats()`                                          | Estimated `(num_rows, byte_size)` for scan planning. Returns `None` when the metadata table is disabled. |
-| Query execution | `create_file_group_reader_with_options(read_options, extras)`    | Create a file group reader with the table's configs. Both args are optional; `read_options.hudi_options` overrides table-level defaults (excluding the four `Table`-owned read keys), and `extras` always wins. |
+|                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning. Snapshot (default) uses the metadata table; incremental aggregates from changed file slices. Returns `None` when stats cannot be computed. |
+| Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. Both args are optional. Timestamps are resolved automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same options used for `get_file_slices`. |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
 
 ### File Group API

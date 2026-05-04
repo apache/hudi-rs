@@ -82,11 +82,7 @@ mod v6_tables {
         #[tokio::test]
         async fn test_non_partitioned_read_optimized() -> Result<()> {
             let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
-            let hudi_table = Table::new_with_options(
-                base_url.path(),
-                [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-            )
-            .await?;
+            let hudi_table = Table::new(base_url.path()).await?;
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
@@ -95,7 +91,11 @@ mod v6_tables {
                 .collect::<Vec<_>>();
             let latest_commit = commit_timestamps.last().unwrap();
             let records = hudi_table
-                .read(&ReadOptions::new().with_as_of_timestamp(latest_commit))
+                .read(
+                    &ReadOptions::new()
+                        .with_as_of_timestamp(latest_commit)
+                        .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true"),
+                )
                 .await?;
             let schema = &records[0].schema();
             let records = concat_batches(schema, &records)?;
@@ -109,6 +109,46 @@ mod v6_tables {
                     (3, "Carol", true),
                     (4, "Diana", true), // this was inserted in a base file and should be read out
                 ]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_optimized_file_slices_have_no_log_files() -> Result<()> {
+            let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let ro_opts = ReadOptions::new()
+                .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+            let file_slices = hudi_table.get_file_slices(&ro_opts).await?;
+            assert!(!file_slices.is_empty());
+            for fs in &file_slices {
+                assert!(
+                    fs.log_files.is_empty(),
+                    "RO mode should strip log files from file slices"
+                );
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_read_optimized_via_read_options() -> Result<()> {
+            let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+            let hudi_table = Table::new(base_url.path()).await?;
+            let ro_options = ReadOptions::new()
+                .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+            let file_slices = hudi_table.get_file_slices(&ro_options).await?;
+            assert!(!file_slices.is_empty());
+            for fs in &file_slices {
+                assert!(
+                    fs.log_files.is_empty(),
+                    "RO via ReadOptions should strip log files"
+                );
+            }
+
+            let default_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+            assert!(
+                default_slices.iter().any(|fs| fs.has_log_file()),
+                "Without RO, MOR slices should have log files"
             );
             Ok(())
         }
@@ -629,11 +669,8 @@ mod v8_tables {
                 .find(|fs| fs.has_log_file())
                 .expect("V8Trips8I3U1D MOR fixture should have at least one slice with log files");
 
-            let fg_reader = hudi_table.create_file_group_reader_with_options(
-                None,
-                std::iter::empty::<(&str, &str)>(),
-                std::iter::empty::<(&str, &str)>(),
-            )?;
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             // Sanity: read the merged slice unfiltered so we can pick a rider
             // present in this slice and assert the filter actually narrows it.
             let unfiltered = fg_reader
@@ -793,11 +830,8 @@ mod v8_tables {
                 "Should have at least one file slice"
             );
 
-            let fg_reader = hudi_table.create_file_group_reader_with_options(
-                None,
-                std::iter::empty::<(&str, &str)>(),
-                std::iter::empty::<(&str, &str)>(),
-            )?;
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let mut stream = fg_reader
@@ -826,11 +860,8 @@ mod v8_tables {
             let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
             let file_slice = &file_slices[0];
 
-            let fg_reader = hudi_table.create_file_group_reader_with_options(
-                None,
-                std::iter::empty::<(&str, &str)>(),
-                std::iter::empty::<(&str, &str)>(),
-            )?;
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             // Test with small batch size
             let options = ReadOptions::new().with_batch_size(1)?;
             let mut stream = fg_reader
@@ -927,8 +958,19 @@ mod v9_tables {
         rows
     }
 
+    fn read_optimized_options() -> ReadOptions {
+        ReadOptions::new().with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")
+    }
+
     async fn read_txn_rows_from_snapshot(hudi_table: &Table) -> Result<Vec<(String, String, i64)>> {
         let records = hudi_table.read(&ReadOptions::new()).await?;
+        Ok(txn_rows(&records))
+    }
+
+    async fn read_txn_rows_from_snapshot_ro(
+        hudi_table: &Table,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let records = hudi_table.read(&read_optimized_options()).await?;
         Ok(txn_rows(&records))
     }
 
@@ -942,16 +984,8 @@ mod v9_tables {
         Ok(txn_rows(&records))
     }
 
-    async fn open_table(path: &str, use_read_optimized: bool) -> Result<Table> {
-        if use_read_optimized {
-            Table::new_with_options(
-                path,
-                [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
-            )
-            .await
-        } else {
-            Table::new(path).await
-        }
+    async fn open_table(path: &str) -> Result<Table> {
+        Table::new(path).await
     }
 
     mod snapshot_queries {
@@ -960,7 +994,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_timebasedkeygen_epochmillis_cow_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TimebasedkeygenEpochmillis.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
             assert_eq!(
@@ -980,7 +1014,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_timebasedkeygen_nonhivestyle_cow_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TimebasedkeygenNonhivestyle.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
             assert_eq!(
@@ -999,7 +1033,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_timebasedkeygen_unixtimestamp_cow_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TimebasedkeygenUnixtimestamp.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
             assert_eq!(
@@ -1019,7 +1053,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_txns_simple_overwrite_cow_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
             assert_eq!(
@@ -1036,9 +1070,9 @@ mod v9_tables {
         #[tokio::test]
         async fn test_timebasedkeygen_nonhivestyle_mor_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TimebasedkeygenNonhivestyle.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), true).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
-            let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
+            let rows = read_txn_rows_from_snapshot_ro(&hudi_table).await?;
             assert_eq!(
                 rows,
                 vec![
@@ -1057,9 +1091,9 @@ mod v9_tables {
         #[tokio::test]
         async fn test_txns_simple_overwrite_mor_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), true).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
-            let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
+            let rows = read_txn_rows_from_snapshot_ro(&hudi_table).await?;
             assert_eq!(
                 rows,
                 vec![
@@ -1074,7 +1108,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_nonpartitioned_rollback_mor_snapshot() -> Result<()> {
             let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let rows = read_txn_rows_from_snapshot(&hudi_table).await?;
             assert_eq!(
@@ -1096,7 +1130,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_txns_simple_overwrite_cow_time_travel() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let commits = hudi_table.timeline.get_completed_commits(false).await?;
             let replace_commits = hudi_table
@@ -1146,7 +1180,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_nonpartitioned_rollback_mor_time_travel() -> Result<()> {
             let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let deltacommits = hudi_table
                 .timeline
@@ -1189,7 +1223,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_txns_simple_overwrite_cow_incremental() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let commit_timestamps = hudi_table
                 .timeline
@@ -1297,7 +1331,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_nonpartitioned_rollback_mor_incremental() -> Result<()> {
             let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let deltacommits = hudi_table
                 .timeline
@@ -1378,7 +1412,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_snapshot_stream_basic() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let options = ReadOptions::new();
             let stream = hudi_table.read_stream(&options).await?;
@@ -1401,7 +1435,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_snapshot_stream_with_batch_size() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let options = ReadOptions::new().with_batch_size(1)?;
             let stream = hudi_table.read_stream(&options).await?;
@@ -1415,7 +1449,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_snapshot_stream_with_partition_filters() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let options = ReadOptions::new().with_filters([("region", "=", "us")])?;
             let stream = hudi_table.read_stream(&options).await?;
@@ -1436,7 +1470,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_snapshot_stream_with_non_matching_partition_filter() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let options = ReadOptions::new().with_filters([("region", "=", "latam")])?;
             let stream = hudi_table.read_stream(&options).await?;
@@ -1452,7 +1486,7 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_file_slice_stream_basic() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
             assert!(
@@ -1460,11 +1494,8 @@ mod v9_tables {
                 "Should have at least one file slice"
             );
 
-            let fg_reader = hudi_table.create_file_group_reader_with_options(
-                None,
-                std::iter::empty::<(&str, &str)>(),
-                std::iter::empty::<(&str, &str)>(),
-            )?;
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let stream = fg_reader
@@ -1480,16 +1511,13 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_file_slice_stream_with_batch_size() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
             let file_slice = &file_slices[0];
 
-            let fg_reader = hudi_table.create_file_group_reader_with_options(
-                None,
-                std::iter::empty::<(&str, &str)>(),
-                std::iter::empty::<(&str, &str)>(),
-            )?;
+            let fg_reader = hudi_table
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new().with_batch_size(1)?;
             let stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
@@ -1506,7 +1534,7 @@ mod v9_tables {
             // Test MOR table with log files in snapshot mode (non read-optimized)
             // so streaming falls back to collect+merge.
             let base_url = SampleTable::V9TimebasedkeygenNonhivestyle.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), false).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
             let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
             assert!(
@@ -1533,9 +1561,9 @@ mod v9_tables {
         #[tokio::test]
         async fn test_read_snapshot_stream_mor_read_optimized() -> Result<()> {
             let base_url = SampleTable::V9TimebasedkeygenNonhivestyle.url_to_mor_avro();
-            let hudi_table = open_table(base_url.path(), true).await?;
+            let hudi_table = open_table(base_url.path()).await?;
 
-            let options = ReadOptions::new();
+            let options = read_optimized_options();
             let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
 
@@ -1653,11 +1681,8 @@ mod streaming_queries {
             "Should have at least one file slice"
         );
 
-        let fg_reader = hudi_table.create_file_group_reader_with_options(
-            None,
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
+        let fg_reader = hudi_table
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
         let stream = fg_reader
@@ -1681,11 +1706,8 @@ mod streaming_queries {
         let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
         let file_slice = &file_slices[0];
 
-        let fg_reader = hudi_table.create_file_group_reader_with_options(
-            None,
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
+        let fg_reader = hudi_table
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         // Test with small batch size
         let options = ReadOptions::new().with_batch_size(1)?;
         let stream = fg_reader
@@ -2019,92 +2041,6 @@ mod streaming_queries {
         Ok(())
     }
 
-    /// Regression: a stray `hoodie.read.start.timestamp` left in
-    /// `options.hudi_options` must NOT silently activate commit-time filtering on
-    /// a snapshot read. Snapshot dispatch + a future-dated start timestamp would
-    /// otherwise filter out every row at the FG-reader layer.
-    #[tokio::test]
-    async fn test_snapshot_ignores_stale_start_timestamp_in_options() -> Result<()> {
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
-
-        let baseline = hudi_table.read(&ReadOptions::new()).await?;
-        let baseline_rows: usize = baseline.iter().map(|b| b.num_rows()).sum();
-        assert!(baseline_rows > 0);
-
-        // Snapshot dispatch (default), but with a future-dated start_timestamp
-        // sitting in the bag — a stray incremental knob the user might have set
-        // before flipping to snapshot. Snapshot must ignore it.
-        let polluted = ReadOptions::new().with_start_timestamp("99999999999999999");
-        let result = hudi_table.read(&polluted).await?;
-        let result_rows: usize = result.iter().map(|b| b.num_rows()).sum();
-
-        assert_eq!(
-            baseline_rows, result_rows,
-            "snapshot read must not honor an incremental-only start_timestamp"
-        );
-        Ok(())
-    }
-
-    /// Same regression for the streaming snapshot path.
-    #[tokio::test]
-    async fn test_snapshot_stream_ignores_stale_start_timestamp_in_options() -> Result<()> {
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
-
-        let baseline_stream = hudi_table.read_stream(&ReadOptions::new()).await?;
-        let baseline = collect_stream_batches(baseline_stream).await?;
-        let baseline_rows: usize = baseline.iter().map(|b| b.num_rows()).sum();
-        assert!(baseline_rows > 0);
-
-        let polluted = ReadOptions::new().with_start_timestamp("99999999999999999");
-        let polluted_stream = hudi_table.read_stream(&polluted).await?;
-        let result = collect_stream_batches(polluted_stream).await?;
-        let result_rows: usize = result.iter().map(|b| b.num_rows()).sum();
-
-        assert_eq!(
-            baseline_rows, result_rows,
-            "snapshot stream must not honor an incremental-only start_timestamp"
-        );
-        Ok(())
-    }
-
-    /// Regression: the public `create_file_group_reader_with_options` API must
-    /// strip the four `Table`-owned read keys from `read_options.hudi_options`
-    /// before forwarding them to the FG reader. Otherwise a stray
-    /// `StartTimestamp` activates commit-time filtering at the physical layer
-    /// and silently drops every row.
-    #[tokio::test]
-    async fn test_create_fg_reader_strips_table_owned_keys() -> Result<()> {
-        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
-        let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
-        assert!(!file_slices.is_empty());
-        let file_slice = &file_slices[0];
-
-        // Bag pre-populated with all four Table-owned keys, including a
-        // future-dated StartTimestamp that would zero out commit-time filtering.
-        let polluted = ReadOptions::new()
-            .with_query_type(QueryType::Incremental)
-            .with_as_of_timestamp("19700101000000000")
-            .with_start_timestamp("99999999999999999")
-            .with_end_timestamp("19700101000000000");
-
-        let fg_reader = hudi_table.create_file_group_reader_with_options(
-            Some(&polluted),
-            std::iter::empty::<(&str, &str)>(),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
-        let batch = fg_reader
-            .read_file_slice(file_slice, &ReadOptions::new())
-            .await?;
-        assert!(
-            batch.num_rows() > 0,
-            "Table-owned keys must not leak into the FG reader; got 0 rows"
-        );
-        Ok(())
-    }
-
     /// Regression: filters on Hudi meta fields (e.g. `_hoodie_record_key`) must
     /// be accepted by the table-level validation. Returned batches include meta
     /// fields, and the row-level mask applies the filter against them.
@@ -2143,6 +2079,152 @@ mod streaming_queries {
             err.to_string().contains("must be > 0"),
             "expected validation error for batch_size=0, got: {err}"
         );
+        Ok(())
+    }
+}
+
+/// Regression tests: manual `get_file_slices` + `create_file_group_reader_with_options`
+/// + `read_file_slice` must produce the same results as `table.read()`.
+///
+/// Before the fix, `create_file_group_reader_with_options` passed caller options
+/// directly to `FileGroupReader` without resolving `AsOfTimestamp` → `EndTimestamp`
+/// (snapshot) or filling default `StartTimestamp` / `EndTimestamp` (incremental).
+/// For MOR non-read-optimized time-travel, log files could be read without the
+/// intended upper bound.
+mod manual_reader_matches_table_read {
+    use super::*;
+    use arrow::compute::concat_batches;
+
+    async fn read_via_manual_reader(
+        table: &Table,
+        options: &ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let file_slices = table.get_file_slices(options).await?;
+        let fg_reader = table.create_file_group_reader_with_options(
+            Some(options),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
+        let batches = futures::future::try_join_all(
+            file_slices
+                .iter()
+                .map(|f| fg_reader.read_file_slice(f, options)),
+        )
+        .await?;
+        Ok(batches)
+    }
+
+    #[tokio::test]
+    async fn test_mor_time_travel_manual_reader_matches_table_read() -> Result<()> {
+        let base_url = QuickstartTripsTable::V6Trips8I1U.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let first_commit = hudi_table
+            .timeline
+            .completed_commits
+            .iter()
+            .map(|i| i.timestamp.as_str())
+            .next()
+            .expect("V6Trips8I1U should have at least one commit");
+
+        let options = ReadOptions::new().with_as_of_timestamp(first_commit);
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_schema = &expected[0].schema();
+        let expected_batch = concat_batches(expected_schema, &expected)?;
+        let actual_schema = &actual[0].schema();
+        let actual_batch = concat_batches(actual_schema, &actual)?;
+
+        assert_eq!(
+            expected_batch.num_rows(),
+            actual_batch.num_rows(),
+            "MOR time-travel: manual reader should return same row count as table.read()"
+        );
+
+        let mut expected_riders = QuickstartTripsTable::uuid_rider_and_fare(&expected_batch);
+        let mut actual_riders = QuickstartTripsTable::uuid_rider_and_fare(&actual_batch);
+        expected_riders.sort_unstable_by_key(|(uuid, _, _)| uuid.clone());
+        actual_riders.sort_unstable_by_key(|(uuid, _, _)| uuid.clone());
+        assert_eq!(
+            expected_riders, actual_riders,
+            "MOR time-travel: manual reader data should match table.read() data"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_incremental_with_explicit_range_manual_reader_matches_table_read() -> Result<()> {
+        let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let deltacommits: Vec<_> = hudi_table
+            .timeline
+            .get_completed_deltacommits(false)
+            .await?;
+        assert!(deltacommits.len() >= 2);
+        let first_commit = &deltacommits[0].timestamp;
+        let second_commit = &deltacommits[1].timestamp;
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp("19700101000000000")
+            .with_end_timestamp(first_commit.as_str());
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            expected_rows, actual_rows,
+            "incremental (explicit range up to first commit): row counts must match"
+        );
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(first_commit.as_str())
+            .with_end_timestamp(second_commit.as_str());
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            expected_rows, actual_rows,
+            "incremental (first..second commit): row counts must match"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_incremental_with_start_only_manual_reader_matches_table_read() -> Result<()> {
+        let base_url = SampleTable::V9NonpartitionedRollback.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let deltacommits: Vec<_> = hudi_table
+            .timeline
+            .get_completed_deltacommits(false)
+            .await?;
+        let first_commit = &deltacommits[0].timestamp;
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(first_commit.as_str());
+
+        let expected = hudi_table.read(&options).await?;
+        let actual = read_via_manual_reader(&hudi_table, &options).await?;
+
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            expected_rows, actual_rows,
+            "incremental (start only, end defaults to latest): row counts must match"
+        );
+
         Ok(())
     }
 }

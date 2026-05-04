@@ -66,14 +66,11 @@ impl FromStr for QueryType {
 /// **Example**
 ///
 /// ```rust
-/// use hudi_core::config::read::HudiReadConfig::InputPartitions;
-/// use hudi_core::table::Table as HudiTable;
+/// use hudi_core::config::read::HudiReadConfig;
+/// use hudi_core::table::ReadOptions;
 ///
-/// # #[tokio::main]
-/// # async fn main() {
-/// let options = [(InputPartitions, "2")];
-/// HudiTable::new_with_options("/tmp/hudi_data", options).await;
-/// # }
+/// let options = ReadOptions::new()
+///     .with_hudi_option(HudiReadConfig::StreamBatchSize.as_ref(), "2048");
 /// ```
 ///
 
@@ -97,9 +94,6 @@ pub enum HudiReadConfig {
     /// For processing 100 files, [InputPartitions] being 5 will produce 5 partitions, with each partition having 20 files.
     InputPartitions,
 
-    /// Parallelism for listing files on storage.
-    ListingParallelism,
-
     /// When set to true, only base files will be read for optimized reads.
     /// This is only applicable to Merge-On-Read (MOR) tables.
     UseReadOptimizedMode,
@@ -120,7 +114,6 @@ impl HudiReadConfig {
             Self::StartTimestamp => "hoodie.read.start.timestamp",
             Self::EndTimestamp => "hoodie.read.end.timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
-            Self::ListingParallelism => "hoodie.read.listing.parallelism",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
         }
@@ -148,7 +141,6 @@ impl ConfigParser for HudiReadConfig {
                 QueryType::default().as_ref().to_string(),
             )),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
-            HudiReadConfig::ListingParallelism => Some(HudiConfigValue::UInteger(10usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             _ => None,
@@ -169,11 +161,6 @@ impl ConfigParser for HudiReadConfig {
             Self::StartTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::EndTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::InputPartitions => get_result
-                .and_then(|v| {
-                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
-                })
-                .map(HudiConfigValue::UInteger),
-            Self::ListingParallelism => get_result
                 .and_then(|v| {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
@@ -202,8 +189,8 @@ impl ConfigParser for HudiReadConfig {
 mod tests {
     use super::*;
     use crate::config::read::HudiReadConfig::{
-        AsOfTimestamp, EndTimestamp, InputPartitions, ListingParallelism,
-        QueryType as QueryTypeKey, StartTimestamp, StreamBatchSize, UseReadOptimizedMode,
+        AsOfTimestamp, EndTimestamp, InputPartitions, QueryType as QueryTypeKey, StartTimestamp,
+        StreamBatchSize, UseReadOptimizedMode,
     };
 
     #[test]
@@ -214,7 +201,6 @@ mod tests {
             (StartTimestamp.as_ref().to_string(), "20240102".to_string()),
             (EndTimestamp.as_ref().to_string(), "20240103".to_string()),
             (InputPartitions.as_ref().to_string(), "100".to_string()),
-            (ListingParallelism.as_ref().to_string(), "100".to_string()),
             (
                 UseReadOptimizedMode.as_ref().to_string(),
                 "true".to_string(),
@@ -231,8 +217,6 @@ mod tests {
         assert_eq!(actual, "20240103");
         let actual: usize = InputPartitions.parse_value(&options).unwrap().into();
         assert_eq!(actual, 100);
-        let actual: usize = ListingParallelism.parse_value(&options).unwrap().into();
-        assert_eq!(actual, 100);
         let actual: bool = UseReadOptimizedMode.parse_value(&options).unwrap().into();
         assert!(actual);
         let actual: usize = StreamBatchSize.parse_value(&options).unwrap().into();
@@ -244,7 +228,6 @@ mod tests {
         let options = HashMap::from([
             (QueryTypeKey.as_ref().to_string(), "bogus".to_string()),
             (InputPartitions.as_ref().to_string(), "foo".to_string()),
-            (ListingParallelism.as_ref().to_string(), "_100".to_string()),
             (UseReadOptimizedMode.as_ref().to_string(), "1".to_string()),
             (StreamBatchSize.as_ref().to_string(), "abc".to_string()),
         ]);
@@ -260,12 +243,6 @@ mod tests {
         ));
         let actual: usize = InputPartitions.parse_value_or_default(&options).into();
         assert_eq!(actual, 0);
-        assert!(matches!(
-            ListingParallelism.parse_value(&options).unwrap_err(),
-            ParseInt(_, _, _)
-        ));
-        let actual: usize = ListingParallelism.parse_value_or_default(&options).into();
-        assert_eq!(actual, 10);
         assert!(matches!(
             UseReadOptimizedMode.parse_value(&options).unwrap_err(),
             ParseBool(_, _, _)

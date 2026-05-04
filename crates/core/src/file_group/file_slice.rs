@@ -20,6 +20,7 @@ use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
+use crate::statistics::StatisticsContainer;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::PathBuf;
@@ -31,6 +32,11 @@ pub struct FileSlice {
     pub base_file: BaseFile,
     pub log_files: BTreeSet<LogFile>,
     pub partition_path: String,
+    /// Column statistics from the base file's Parquet footer.
+    ///
+    /// Populated when data-column filters trigger footer-based pruning
+    /// on COW tables or MOR read-optimized mode. `None` otherwise.
+    pub base_file_column_stats: Option<StatisticsContainer>,
 }
 
 impl Display for FileSlice {
@@ -57,6 +63,7 @@ impl FileSlice {
             base_file,
             log_files: BTreeSet::new(),
             partition_path,
+            base_file_column_stats: None,
         }
     }
 
@@ -108,11 +115,36 @@ impl FileSlice {
     pub fn creation_instant_time(&self) -> &str {
         &self.base_file.commit_timestamp
     }
+
+    /// Total on-disk size of the file slice (base file + all log files), in bytes.
+    ///
+    /// Use this for I/O cost estimation and split sizing (e.g., balancing
+    /// parallel read splits by storage volume). For estimated in-memory size
+    /// and record count for query planning, use [`Table::compute_table_stats`]
+    /// instead — it returns values derived from the base file only.
+    ///
+    /// Files whose `file_metadata` is `None` contribute 0 to the sum.
+    #[inline]
+    pub fn total_size_bytes(&self) -> u64 {
+        let base = self
+            .base_file
+            .file_metadata
+            .as_ref()
+            .map(|m| m.size)
+            .unwrap_or(0);
+        let logs: u64 = self
+            .log_files
+            .iter()
+            .filter_map(|lf| lf.file_metadata.as_ref().map(|m| m.size))
+            .sum();
+        base + logs
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::file_metadata::FileMetadata;
     use crate::table::partition::EMPTY_PARTITION_PATH;
     use std::str::FromStr;
 
@@ -144,12 +176,14 @@ mod tests {
             base_file: base.clone(),
             log_files: log_set1,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
         };
 
         let slice2 = FileSlice {
             base_file: base,
             log_files: log_set2,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
         };
 
         slice1.merge(&slice2)?;
@@ -182,6 +216,7 @@ mod tests {
             )?,
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
         };
 
         let slice2 = FileSlice {
@@ -190,6 +225,7 @@ mod tests {
             )?,
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
         };
 
         // Should return error for different base files
@@ -207,17 +243,94 @@ mod tests {
             base_file: base.clone(),
             log_files: BTreeSet::new(),
             partition_path: "path/to/partition1".to_string(),
+            base_file_column_stats: None,
         };
 
         let slice2 = FileSlice {
             base_file: base,
             log_files: BTreeSet::new(),
             partition_path: "path/to/partition2".to_string(),
+            base_file_column_stats: None,
         };
 
         // Should return error for different partition paths
         assert!(slice1.merge(&slice2).is_err());
 
         Ok(())
+    }
+
+    fn make_base_file_with_metadata(size: u64) -> BaseFile {
+        let mut bf = BaseFile::from_str(
+            "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
+        )
+        .unwrap();
+        bf.file_metadata = Some(FileMetadata::new("base.parquet", size));
+        bf
+    }
+
+    fn make_log_file_with_metadata(version: u32, size: Option<u64>) -> LogFile {
+        let name = format!(
+            ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.{version}_0-51-115"
+        );
+        let mut lf = LogFile::from_str(&name).unwrap();
+        lf.file_metadata = size.map(|s| FileMetadata::new(&name, s));
+        lf
+    }
+
+    #[test]
+    fn test_total_size_bytes_base_only() {
+        let slice = FileSlice {
+            base_file: make_base_file_with_metadata(1000),
+            log_files: BTreeSet::new(),
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
+        };
+        assert_eq!(slice.total_size_bytes(), 1000);
+    }
+
+    #[test]
+    fn test_total_size_bytes_with_log_files() {
+        let mut logs = BTreeSet::new();
+        logs.insert(make_log_file_with_metadata(1, Some(200)));
+        logs.insert(make_log_file_with_metadata(2, Some(300)));
+        let slice = FileSlice {
+            base_file: make_base_file_with_metadata(1000),
+            log_files: logs,
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
+        };
+        assert_eq!(slice.total_size_bytes(), 1500);
+    }
+
+    #[test]
+    fn test_total_size_bytes_mixed_metadata() {
+        let mut logs = BTreeSet::new();
+        logs.insert(make_log_file_with_metadata(1, Some(200)));
+        logs.insert(make_log_file_with_metadata(2, None));
+        let slice = FileSlice {
+            base_file: make_base_file_with_metadata(1000),
+            log_files: logs,
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
+        };
+        assert_eq!(slice.total_size_bytes(), 1200);
+    }
+
+    #[test]
+    fn test_total_size_bytes_no_metadata() {
+        let mut logs = BTreeSet::new();
+        logs.insert(make_log_file_with_metadata(1, None));
+        let mut bf = BaseFile::from_str(
+            "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
+        )
+        .unwrap();
+        bf.file_metadata = None;
+        let slice = FileSlice {
+            base_file: bf,
+            log_files: logs,
+            partition_path: EMPTY_PARTITION_PATH.to_string(),
+            base_file_column_stats: None,
+        };
+        assert_eq!(slice.total_size_bytes(), 0);
     }
 }

@@ -225,6 +225,10 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 {
                     continue;
                 }
+                if file_size > 0 {
+                    log_file.file_metadata =
+                        Some(FileMetadata::new(file_name.to_string(), file_size));
+                }
                 file_id_to_log_files
                     .entry(log_file.file_id.clone())
                     .or_default()

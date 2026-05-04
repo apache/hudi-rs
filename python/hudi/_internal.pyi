@@ -183,6 +183,7 @@ class HudiFileSlice:
         base_file_size (int): The on-disk size of the base file in bytes.
         base_file_byte_size (int): The in-memory size of the base file in bytes.
         log_file_names (List[str]): The names of the ordered log files.
+        log_file_sizes (List[int]): On-disk sizes of the log files, parallel to ``log_file_names``.
         num_records (int): The number of records in the file slice.
     """
 
@@ -193,8 +194,33 @@ class HudiFileSlice:
     base_file_size: int
     base_file_byte_size: int
     log_file_names: List[str]
+    log_file_sizes: List[int]
     num_records: int
 
+    def total_size_bytes(self) -> int:
+        """Total on-disk size (base + log files) in bytes.
+
+        Use for I/O cost estimation and split sizing. For estimated in-memory
+        size and record count for query planning, use
+        :meth:`HudiTable.compute_table_stats` instead.
+        """
+        ...
+    def has_log_files(self) -> bool:
+        """True if this slice has at least one log file."""
+        ...
+    def base_file_column_stats(
+        self,
+    ) -> Optional[
+        Dict[str, Tuple[Optional["pyarrow.Array"], Optional["pyarrow.Array"]]]
+    ]:
+        """Column statistics (min, max) from the base file Parquet footer.
+
+        Returns a dict mapping column names to ``(min_array, max_array)``
+        tuples, where each is a single-element PyArrow array or ``None``.
+        Only populated when data-column filters trigger footer-based
+        pruning on COW tables or MOR read-optimized mode.
+        """
+        ...
     def base_file_relative_path(self) -> str:
         """
         Returns the relative path of the base file for this file slice.
@@ -356,37 +382,31 @@ class HudiTable:
         Get the file slices the read targets, dispatching on ``options.query_type``.
 
         - Snapshot: slices visible at ``options.as_of_timestamp`` (defaults to the
-          latest commit). ``options.filters`` drive partition + file-level stats
-          pruning.
+          latest commit). ``options.filters`` drive partition pruning; file-level
+          stats pruning applies only for COW tables or MOR read-optimized mode.
+          When footer stats are loaded for pruning, exact ``num_records``,
+          ``byte_size``, and column stats are attached to the returned slices.
         - Incremental: slices changed in ``(options.start_timestamp,
           options.end_timestamp]``. ``options.filters`` drive partition pruning only.
+        - When ``UseReadOptimizedMode`` is enabled (via options or table config),
+          log files are stripped from all returned slices.
         """
         ...
     def create_file_group_reader_with_options(
         self,
         read_options: Optional[HudiReadOptions] = None,
-        extra_hudi_overrides: Optional[Dict[str, str]] = None,
         extra_storage_overrides: Optional[Dict[str, str]] = None,
     ) -> HudiFileGroupReader:
         """
         Create a :class:`HudiFileGroupReader` using the table's Hudi configs.
 
-        Two override channels keep Hudi configs and storage credentials cleanly
-        separated — a ``hoodie.*`` key can't be misclassified as storage, and a
-        stray storage option can't be silently picked up as a Hudi config.
+        ``read_options.hudi_options`` override table-level Hudi configs
+        (last-writer-wins). ``extra_storage_overrides`` override table-level
+        storage options (cloud credentials, endpoints, etc).
 
-        **Hudi configs** (last-writer-wins):
-
-        1. Table-level Hudi configs.
-        2. ``read_options.hudi_options`` when ``read_options`` is provided, **excluding**
-           the four keys the ``Table`` layer interprets directly (``query_type``,
-           ``as_of_timestamp``, ``start_timestamp``, ``end_timestamp``).
-        3. ``extra_hudi_overrides`` — caller-supplied resolved Hudi configs; always win.
-
-        **Storage options** (last-writer-wins):
-
-        1. Table-level storage options (cloud credentials, endpoints, etc).
-        2. ``extra_storage_overrides`` — caller-supplied per-path storage overrides.
+        Timestamps are resolved automatically (e.g. ``AsOfTimestamp`` →
+        ``EndTimestamp``), so callers can pass the same options used for
+        :meth:`get_file_slices`.
         """
         ...
     def read(
@@ -396,13 +416,15 @@ class HudiTable:
         Read records, dispatching on ``options.query_type``.
         """
         ...
-    def compute_table_stats(self) -> Optional[Tuple[int, int]]:
-        """
-        Compute estimated table-level statistics from the metadata table.
+    def compute_table_stats(
+        self,
+        options: Optional[HudiReadOptions] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """Compute estimated (rows, bytes) for snapshot queries.
 
-        Returns:
-            Optional[Tuple[int, int]]: ``(estimated_num_rows, estimated_total_byte_size)``,
-            or ``None`` if the metadata table is not enabled or statistics cannot be computed.
+        Returns snapshot stats derived from the metadata table (MDT).
+        Returns ``None`` when the MDT is not enabled, statistics cannot
+        be computed, or the query type is incremental.
         """
         ...
     def read_stream(

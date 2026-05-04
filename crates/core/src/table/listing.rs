@@ -18,7 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::read::HudiReadConfig::ListingParallelism;
+use crate::config::plan::HudiPlanConfig::ListingParallelism;
 use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
@@ -164,7 +164,7 @@ impl FileLister {
     }
 
     async fn list_relevant_partition_paths(&self) -> Result<Vec<String>> {
-        if !is_table_partitioned(&self.hudi_configs) {
+        if !is_table_partitioned(&self.hudi_configs)? {
             return Ok(vec![EMPTY_PARTITION_PATH.to_string()]);
         }
 
@@ -200,7 +200,7 @@ impl FileLister {
         completion_time_view: &V,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<DashMap<String, Vec<FileGroup>>> {
-        if !is_table_partitioned(&self.hudi_configs) {
+        if !is_table_partitioned(&self.hudi_configs)? {
             let file_groups = self
                 .list_file_groups_for_partition(
                     EMPTY_PARTITION_PATH,

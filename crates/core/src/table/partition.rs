@@ -65,14 +65,14 @@ pub(crate) fn project_partition_schema(
     Ok(Schema::new(fields))
 }
 
-pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
+pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> Result<bool> {
     let has_partition_fields = {
         let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
         !partition_fields.is_empty()
     };
 
     let uses_non_partitioned_key_gen = hudi_configs
-        .try_get(KeyGeneratorClass)
+        .try_get(KeyGeneratorClass)?
         .map(|key_gen| {
             let key_gen_str: String = key_gen.into();
             key_gen_str == "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
@@ -80,7 +80,7 @@ pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
         .unwrap_or(false);
 
     let uses_non_partitioned_type = hudi_configs
-        .try_get(KeyGeneratorType)
+        .try_get(KeyGeneratorType)?
         .map(|v| {
             let s: String = v.into();
             let upper = s.to_uppercase();
@@ -88,7 +88,7 @@ pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> bool {
         })
         .unwrap_or(false);
 
-    has_partition_fields && !uses_non_partitioned_key_gen && !uses_non_partitioned_type
+    Ok(has_partition_fields && !uses_non_partitioned_key_gen && !uses_non_partitioned_type)
 }
 
 /// A partition pruner that filters partitions based on the partition path and its filters.
@@ -123,7 +123,7 @@ impl PartitionPruner {
         let is_url_encoded: bool = hudi_configs
             .get_or_default(HudiTableConfig::IsPartitionPathUrlencoded)
             .into();
-        let is_partitioned = is_table_partitioned(hudi_configs);
+        let is_partitioned = is_table_partitioned(hudi_configs)?;
         Ok(PartitionPruner {
             schema,
             is_hive_style,
@@ -181,7 +181,7 @@ impl PartitionPruner {
         _partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
     ) -> Result<Vec<Filter>> {
-        if is_timestamp_based_keygen(hudi_configs) {
+        if is_timestamp_based_keygen(hudi_configs)? {
             match TimestampBasedKeyGenerator::from_configs(hudi_configs) {
                 Ok(transformer) => {
                     return Self::apply_transformer_to_filters(filters, &transformer);

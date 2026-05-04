@@ -91,10 +91,9 @@ pub mod file_pruner;
 pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
-mod read_options;
 mod validation;
 
-pub use read_options::{QueryType, ReadOptions};
+pub use crate::config::read_options::{QueryType, ReadOptions};
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -323,6 +322,10 @@ impl Table {
         self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
 
+    fn is_base_file_only(&self, options: &ReadOptions) -> crate::Result<bool> {
+        Ok(!self.is_mor() || options.is_read_optimized()?)
+    }
+
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -396,7 +399,7 @@ impl Table {
 
         // Timestamp-based keygen: the source field is transformed into partition path
         // strings, so use a single _hoodie_partition_path field.
-        if is_timestamp_based_keygen(&self.hudi_configs) {
+        if is_timestamp_based_keygen(&self.hudi_configs)? {
             return Ok(Schema::new(vec![Field::new(
                 MetaField::PartitionPath.as_ref(),
                 arrow_schema::DataType::Utf8,
@@ -432,32 +435,33 @@ impl Table {
     /// [`crate::util::collection::split_into_chunks`] or your engine's preferred
     /// partitioning policy.
     pub async fn get_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        match options.query_type()? {
-            QueryType::Snapshot => self.get_snapshot_file_slices(options).await,
-            QueryType::Incremental => self.get_incremental_file_slices(options).await,
+        let prepared = self.prepare_reader_options(options)?;
+        let base_file_only = self.is_base_file_only(&prepared)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => {
+                let Some(timestamp) = prepared.end_timestamp() else {
+                    return Ok(Vec::new());
+                };
+                self.get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
+                    .await
+            }
+            QueryType::Incremental => {
+                let (Some(start), Some(end)) =
+                    (prepared.start_timestamp(), prepared.end_timestamp())
+                else {
+                    return Ok(Vec::new());
+                };
+                self.get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
+                    .await
+            }
         }
-    }
-
-    async fn get_snapshot_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
-            return Ok(Vec::new());
-        };
-        self.get_file_slices_inner(&timestamp, &options.filters)
-            .await
-    }
-
-    async fn get_incremental_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
-        let Some((start, end)) = self.resolve_incremental_range(options)? else {
-            return Ok(Vec::new());
-        };
-        self.get_file_slices_between_inner(&start, &end, &options.filters)
-            .await
     }
 
     async fn get_file_slices_inner(
         &self,
         timestamp: &str,
         filters: &[Filter],
+        base_file_only: bool,
     ) -> Result<Vec<FileSlice>> {
         let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
 
@@ -473,8 +477,14 @@ impl Table {
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
 
-        // Create file pruner with filters on non-partition columns
-        let file_pruner = FilePruner::new(filters, &table_schema, &partition_schema)?;
+        // File-level stats pruning using base file Parquet footers is only safe
+        // when log files cannot introduce records that contradict the base file's
+        // min/max stats — i.e., COW tables or MOR read-optimized mode.
+        let file_pruner = if base_file_only {
+            FilePruner::new(filters, &table_schema, &partition_schema)?
+        } else {
+            FilePruner::empty()
+        };
 
         // Use cached metadata table instance if enabled
         let metadata_table = if self.is_metadata_table_enabled() {
@@ -495,7 +505,8 @@ impl Table {
         // and fallback storage listing.
         let estimator = self.get_or_init_estimator(timestamp).await;
 
-        self.file_system_view
+        let mut file_slices = self
+            .file_system_view
             .get_file_slices(
                 &partition_pruner,
                 &file_pruner,
@@ -504,7 +515,14 @@ impl Table {
                 metadata_table,
                 estimator,
             )
-            .await
+            .await?;
+
+        if base_file_only {
+            for fs in &mut file_slices {
+                fs.log_files.clear();
+            }
+        }
+        Ok(file_slices)
     }
 
     async fn get_file_slices_between_inner(
@@ -512,6 +530,7 @@ impl Table {
         start_timestamp: &str,
         end_timestamp: &str,
         filters: &[Filter],
+        base_file_only: bool,
     ) -> Result<Vec<FileSlice>> {
         // Seed the cached estimator from a sample base file at or before
         // end_timestamp so the file group builder can populate FileMetadata
@@ -551,58 +570,79 @@ impl Table {
             }
         }
 
+        if base_file_only {
+            for fs in &mut file_slices {
+                fs.log_files.clear();
+            }
+        }
         Ok(file_slices)
     }
 
     /// Create a [FileGroupReader] using the [Table]'s Hudi configs.
     ///
-    /// Two override channels keep Hudi configs and storage credentials cleanly
-    /// separated — a `hoodie.*` key can't be misclassified as storage, and a
-    /// stray storage option can't be silently picked up as a Hudi config.
+    /// `read_options.hudi_options` override table-level Hudi configs
+    /// (last-writer-wins). `extra_storage_overrides` override table-level
+    /// storage options (cloud credentials, endpoints, etc).
     ///
-    /// **Hudi configs** (last-writer-wins):
-    /// 1. Table-level Hudi configs (constant for this `Table` instance).
-    /// 2. `read_options.hudi_options` when `read_options` is `Some`. The four
-    ///    `Table`-owned read keys ([`HudiReadConfig::QueryType`],
-    ///    [`HudiReadConfig::AsOfTimestamp`], [`HudiReadConfig::StartTimestamp`],
-    ///    [`HudiReadConfig::EndTimestamp`]) are stripped here: the `Table` layer
-    ///    interprets them for dispatch and snapshot resolution, and a stale value
-    ///    (e.g. an incremental `StartTimestamp` left in the bag) would silently
-    ///    activate commit-time filtering at the FG reader.
-    /// 3. `extra_hudi_overrides` — caller-supplied resolved Hudi configs;
-    ///    always win. Use these to inject the resolved timestamps for the
-    ///    current read.
-    ///
-    /// **Storage options** (last-writer-wins):
-    /// 1. Table-level storage options (cloud credentials, endpoints, etc).
-    /// 2. `extra_storage_overrides` — caller-supplied per-path storage overrides.
-    pub fn create_file_group_reader_with_options<H, S, K1, V1, K2, V2>(
+    /// When `read_options` is `Some`, timestamps are resolved into the
+    /// `StartTimestamp` / `EndTimestamp` that [`FileGroupReader`] needs for
+    /// log-scan bounds and commit-time filtering — the same normalization
+    /// that [`Table::read`] performs internally.
+    pub fn create_file_group_reader_with_options<S, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
-        extra_hudi_overrides: H,
         extra_storage_overrides: S,
     ) -> Result<FileGroupReader>
     where
-        H: IntoIterator<Item = (K1, V1)>,
-        K1: AsRef<str>,
-        V1: Into<String>,
-        S: IntoIterator<Item = (K2, V2)>,
-        K2: AsRef<str>,
-        V2: Into<String>,
+        S: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
     {
-        let mut hudi_opts: HashMap<String, String> = HashMap::new();
-        if let Some(opts) = read_options {
-            for (k, v) in &opts.hudi_options {
-                if Self::TABLE_OWNED_READ_KEYS.contains(&k.as_str()) {
-                    continue;
+        let hudi_opts: HashMap<String, String> = match read_options {
+            Some(opts) => self.prepare_reader_options(opts)?.hudi_options,
+            None => HashMap::new(),
+        };
+        self.build_file_group_reader(hudi_opts, extra_storage_overrides)
+    }
+
+    /// Convert caller-facing [`ReadOptions`] into the form that
+    /// [`FileGroupReader`] expects: `AsOfTimestamp` resolved to
+    /// `EndTimestamp` for snapshots; `StartTimestamp` / `EndTimestamp`
+    /// defaults filled for incremental queries.
+    fn prepare_reader_options(&self, options: &ReadOptions) -> Result<ReadOptions> {
+        let options = options.with_sanitized_timestamps();
+        match options.query_type()? {
+            QueryType::Snapshot => {
+                if let Some(ts) = self.resolve_snapshot_timestamp(&options)? {
+                    Ok(options.clone().with_end_timestamp(&ts))
+                } else {
+                    Ok(options)
                 }
-                hudi_opts.insert(k.clone(), v.clone());
+            }
+            QueryType::Incremental => {
+                if let Some((start, end)) = self.resolve_incremental_range(&options)? {
+                    Ok(options
+                        .clone()
+                        .with_start_timestamp(&start)
+                        .with_end_timestamp(&end))
+                } else {
+                    Ok(options)
+                }
             }
         }
-        for (k, v) in extra_hudi_overrides {
-            hudi_opts.insert(k.as_ref().to_string(), v.into());
-        }
+    }
 
+    /// Build a [`FileGroupReader`] from already-resolved hudi options.
+    fn build_file_group_reader<S, K, V>(
+        &self,
+        hudi_opts: HashMap<String, String>,
+        extra_storage_overrides: S,
+    ) -> Result<FileGroupReader>
+    where
+        S: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
         let mut storage_opts: HashMap<String, String> =
             HashMap::with_capacity(self.storage_options.len());
         for (k, v) in self.storage_options.iter() {
@@ -611,20 +651,8 @@ impl Table {
         for (k, v) in extra_storage_overrides {
             storage_opts.insert(k.as_ref().to_string(), v.into());
         }
-
         FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
     }
-
-    /// Read-option keys the `Table` layer interprets directly. These are
-    /// excluded from the per-read overrides forwarded to the FG reader so a
-    /// stale value can't change physical-read behavior — see
-    /// [`Self::create_file_group_reader_with_options`].
-    const TABLE_OWNED_READ_KEYS: [&'static str; 4] = [
-        HudiReadConfig::QueryType.key_str(),
-        HudiReadConfig::AsOfTimestamp.key_str(),
-        HudiReadConfig::StartTimestamp.key_str(),
-        HudiReadConfig::EndTimestamp.key_str(),
-    ];
 
     /// Read records, dispatching on `options.query_type`.
     ///
@@ -637,21 +665,26 @@ impl Table {
     /// for the full breakdown. `options.hudi_options` override table-level Hudi configs
     /// for this single read.
     pub async fn read(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        match options.query_type()? {
-            QueryType::Snapshot => self.read_snapshot_inner(options).await,
-            QueryType::Incremental => self.read_incremental_inner(options).await,
+        let prepared = self.prepare_reader_options(options)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => self.read_snapshot_inner(&prepared).await,
+            QueryType::Incremental => self.read_incremental_inner(&prepared).await,
         }
     }
 
-    async fn read_snapshot_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
+    async fn read_snapshot_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        let Some(timestamp) = prepared.end_timestamp() else {
             return Ok(Vec::new());
         };
+        let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_inner(&timestamp, &options.filters)
+            .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
-        let fg_options = self.options_for_file_group(options);
+        let fg_reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
+        let fg_options = self.options_for_file_group(prepared);
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
@@ -661,39 +694,20 @@ impl Table {
         Ok(batches)
     }
 
-    /// Build a `FileGroupReader` for a snapshot read with the resolved snapshot
-    /// bound injected as `EndTimestamp`. The Table-owned read keys in
-    /// `options.hudi_options` (notably any stray incremental `StartTimestamp`)
-    /// are dropped by [`Self::create_file_group_reader_with_options`].
-    fn create_file_group_reader_for_snapshot(
-        &self,
-        options: &ReadOptions,
-        snapshot_timestamp: &str,
-    ) -> Result<FileGroupReader> {
-        self.create_file_group_reader_with_options(
-            Some(options),
-            [(HudiReadConfig::EndTimestamp, snapshot_timestamp.to_string())],
-            std::iter::empty::<(&str, &str)>(),
-        )
-    }
-
-    async fn read_incremental_inner(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
-        let Some((start, end)) = self.resolve_incremental_range(options)? else {
+    async fn read_incremental_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
+        let (Some(start), Some(end)) = (prepared.start_timestamp(), prepared.end_timestamp())
+        else {
             return Ok(Vec::new());
         };
+        let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_between_inner(&start, &end, &options.filters)
+            .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
-
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(options),
-            [
-                (HudiReadConfig::StartTimestamp, start),
-                (HudiReadConfig::EndTimestamp, end),
-            ],
+        let fg_reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
-        let fg_options = self.options_for_file_group(options);
+        let fg_options = self.options_for_file_group(prepared);
 
         let batches = futures::future::try_join_all(
             file_slices
@@ -797,8 +811,9 @@ impl Table {
         &self,
         options: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        match options.query_type()? {
-            QueryType::Snapshot => self.read_snapshot_stream_inner(options).await,
+        let prepared = self.prepare_reader_options(options)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => self.read_snapshot_stream_inner(&prepared).await,
             QueryType::Incremental => Err(CoreError::Unsupported(
                 "Streaming for incremental queries is not yet supported".to_string(),
             )),
@@ -807,29 +822,33 @@ impl Table {
 
     async fn read_snapshot_stream_inner(
         &self,
-        options: &ReadOptions,
+        prepared: &ReadOptions,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use futures::stream::{self, StreamExt};
 
-        let Some(timestamp) = self.resolve_snapshot_timestamp(options)? else {
+        let Some(timestamp) = prepared.end_timestamp() else {
             return Ok(Box::pin(stream::empty()));
         };
 
+        let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_inner(&timestamp, &options.filters)
+            .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.create_file_group_reader_for_snapshot(options, &timestamp)?;
+        let fg_reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
         // row-level closes the gap for non-partition column filters. Strip filters
         // on dropped partition columns so they don't trigger FGR validation errors.
-        let fg_options_template = self.options_for_file_group(options);
+        let fg_options_template = self.options_for_file_group(prepared);
         let projection = fg_options_template.projection.clone();
         let row_filters = fg_options_template.filters.clone();
         // Carry batch_size in hudi_options if set; everything else (timestamps,
@@ -869,27 +888,26 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
-    /// Compute estimated table-level statistics from the metadata table for scan planning.
+    /// Compute estimated table-level statistics for scan planning.
     ///
-    /// Returns `(estimated_num_rows, estimated_total_byte_size)` where byte size is the
-    /// estimated uncompressed in-memory size.
-    ///
-    /// The approach:
-    /// 1. Read MDT files partition to get all active base files with on-disk sizes
-    /// 2. For Parquet tables, read ONE sampled footer to derive a compression ratio
-    /// 3. Infer total rows and byte size for all base files
-    ///
-    /// Only base files are counted (log files are excluded).
-    ///
-    /// TODO: support including log files in the estimation for MOR tables for scan planning.
-    ///
-    /// Returns `None` if metadata table is not enabled or if statistics cannot be computed.
-    pub async fn compute_table_stats(&self) -> Option<(u64, u64)> {
+    /// Returns `(estimated_num_rows, estimated_total_byte_size)` derived from
+    /// the metadata table for snapshot queries. Returns `None` if the metadata
+    /// table is not enabled, statistics cannot be computed, or the query type
+    /// is incremental (commit metadata does not reliably carry base file sizes
+    /// for all commit types).
+    pub async fn compute_table_stats(&self, options: Option<&ReadOptions>) -> Option<(u64, u64)> {
+        if let Some(opts) = options {
+            match opts.query_type() {
+                Ok(QueryType::Incremental) => return None,
+                Ok(QueryType::Snapshot) => {}
+                Err(_) => return None,
+            }
+        }
+
         if !self.is_metadata_table_enabled() {
             return None;
         }
 
-        // Step 1: Get MDT files partition records (cached on the MDT instance).
         let partition_schema = self.get_partition_schema().await.ok()?;
         let hudi_configs = self.hudi_configs.as_ref();
         let partition_pruner = PartitionPruner::new(&[], &partition_schema, hudi_configs).ok()?;
@@ -899,7 +917,6 @@ impl Table {
             .await
             .ok()?;
 
-        // Only count base files (exclude log files which start with '.').
         let base_file_format = self.file_system_view.base_file_format();
         let base_file_suffix = format!(".{}", base_file_format.as_ref());
         let total_on_disk_size = records
@@ -914,14 +931,10 @@ impl Table {
             return None;
         }
 
-        // Step 2: Use the cached estimator (seeded from the latest commit's sample).
-        // Return None if estimator is not available (non-Parquet, no sample, or read failed).
         let latest_ts = self.timeline.get_latest_commit_timestamp().ok()?;
         let estimator = self.get_or_init_estimator(&latest_ts).await?;
         let (estimated_total_byte_size, estimated_total_rows) =
             estimator.estimate(total_on_disk_size);
-        // Estimator math is non-negative by construction (u64 size * f64 ratio).
-        // `i64 -> u64` via `max(0) as u64` defends against any future change.
         Some((
             estimated_total_rows.max(0) as u64,
             estimated_total_byte_size.max(0) as u64,
@@ -953,6 +966,22 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::PathBuf;
     use std::{env, panic};
+
+    /// Test helper that loads resolved `HudiConfigs` from a test data directory
+    /// without constructing a full `Table`. Useful for testing config parsing
+    /// with intentionally invalid values that would prevent table construction.
+    async fn get_test_configs(table_dir_name: &str) -> Arc<HudiConfigs> {
+        let base_url = Url::from_file_path(
+            canonicalize(PathBuf::from("tests").join("data").join(table_dir_name)).unwrap(),
+        )
+        .unwrap();
+        let mut resolver = crate::table::builder::OptionResolver::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        );
+        resolver.resolve_options().await.unwrap();
+        Arc::new(HudiConfigs::new(resolver.hudi_options.iter()))
+    }
 
     /// Test helper to create a new `Table` instance without validating the configuration.
     ///
@@ -1176,8 +1205,7 @@ mod tests {
     #[tokio::test]
     #[serial(env_vars)]
     async fn validate_invalid_table_props() {
-        let table = get_test_table_without_validation("table_props_invalid").await;
-        let configs = table.hudi_configs;
+        let configs = get_test_configs("table_props_invalid").await;
         assert!(
             configs.validate(BaseFileFormat).is_err(),
             "required config is missing"
@@ -1229,8 +1257,7 @@ mod tests {
     #[tokio::test]
     #[serial(env_vars)]
     async fn get_invalid_table_props() {
-        let table = get_test_table_without_validation("table_props_invalid").await;
-        let configs = table.hudi_configs;
+        let configs = get_test_configs("table_props_invalid").await;
         assert!(configs.get(BaseFileFormat).is_err());
         assert!(configs.get(Checksum).is_err());
         assert!(configs.get(DatabaseName).is_err());
@@ -1252,8 +1279,7 @@ mod tests {
     #[tokio::test]
     #[serial(env_vars)]
     async fn get_default_for_invalid_table_props() {
-        let table = get_test_table_without_validation("table_props_invalid").await;
-        let configs = table.hudi_configs;
+        let configs = get_test_configs("table_props_invalid").await;
         let actual: String = configs.get_or_default(BaseFileFormat).into();
         assert_eq!(actual, "parquet");
         assert!(panic::catch_unwind(|| configs.get_or_default(Checksum)).is_err());
@@ -1368,7 +1394,7 @@ mod tests {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
-            .create_file_group_reader_with_options(None, empty_options(), empty_options())
+            .create_file_group_reader_with_options(None, empty_options())
             .unwrap()
             .read_file_slice_from_paths(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
@@ -1891,7 +1917,7 @@ mod tests {
         let table = Table::new(&table_path).await.unwrap();
         assert!(table.is_metadata_table_enabled());
 
-        let stats = table.compute_table_stats().await;
+        let stats = table.compute_table_stats(None).await;
         assert!(
             stats.is_some(),
             "Stats should be Some for MDT-enabled table"
@@ -1907,7 +1933,7 @@ mod tests {
         let table = Table::new(base_url.path()).await.unwrap();
         assert!(table.is_metadata_table_enabled());
 
-        let stats = table.compute_table_stats().await;
+        let stats = table.compute_table_stats(None).await;
         assert!(stats.is_some(), "Stats should be Some for sample MDT table");
         let (rows, bytes) = stats.unwrap();
         assert!(rows > 0);
@@ -1927,7 +1953,7 @@ mod tests {
         .await
         .unwrap();
         assert!(table.is_metadata_table_enabled());
-        assert!(table.compute_table_stats().await.is_none());
+        assert!(table.compute_table_stats(None).await.is_none());
     }
 
     #[tokio::test]
@@ -1936,8 +1962,22 @@ mod tests {
         let table = Table::new(base_url.path()).await.unwrap();
         assert!(!table.is_metadata_table_enabled());
 
-        let stats = table.compute_table_stats().await;
+        let stats = table.compute_table_stats(None).await;
         assert!(stats.is_none(), "Stats should be None for non-MDT table");
+    }
+
+    #[tokio::test]
+    async fn test_compute_table_stats_returns_none_for_incremental() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_mor_parquet();
+        let table = Table::new(base_url.path()).await.unwrap();
+
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_end_timestamp("20250121000656060");
+        assert!(
+            table.compute_table_stats(Some(&options)).await.is_none(),
+            "Incremental stats should be None"
+        );
     }
 
     #[tokio::test]
@@ -1955,7 +1995,7 @@ mod tests {
         assert!(!file_slices.is_empty());
 
         // compute_table_stats works on cloned table
-        let stats = cloned.compute_table_stats().await;
+        let stats = cloned.compute_table_stats(None).await;
         assert!(stats.is_some());
         let (rows, bytes) = stats.unwrap();
         assert!(rows > 0);

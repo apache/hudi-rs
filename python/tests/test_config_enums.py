@@ -21,7 +21,7 @@ def test_internal_config_keys_returns_both_enums():
     from hudi._internal import _config_keys
 
     keys = _config_keys()
-    assert set(keys.keys()) == {"HudiTableConfig", "HudiReadConfig"}
+    assert set(keys.keys()) == {"HudiTableConfig", "HudiReadConfig", "HudiPlanConfig"}
 
     table_entries = keys["HudiTableConfig"]
     read_entries = keys["HudiReadConfig"]
@@ -29,25 +29,31 @@ def test_internal_config_keys_returns_both_enums():
     assert all(
         isinstance(name, str) and isinstance(key, str) for name, key in table_entries
     )
+    plan_entries = keys["HudiPlanConfig"]
+
     assert all(key.startswith("hoodie.") for _, key in table_entries)
     assert all(key.startswith("hoodie.") for _, key in read_entries)
+    assert all(key.startswith("hoodie.") for _, key in plan_entries)
 
     table_dict = dict(table_entries)
     read_dict = dict(read_entries)
+    plan_dict = dict(plan_entries)
     assert table_dict["TABLE_NAME"] == "hoodie.table.name"
     assert table_dict["BASE_FILE_FORMAT"] == "hoodie.table.base.file.format"
     assert read_dict["INPUT_PARTITIONS"] == "hoodie.read.input.partitions"
     assert read_dict["START_TIMESTAMP"] == "hoodie.read.start.timestamp"
+    assert plan_dict["LISTING_PARALLELISM"] == "hoodie.plan.listing.parallelism"
 
 
 def test_config_enums_are_real_python_enums():
     """The exported enums are real Python `Enum` classes built from Rust at import."""
     from enum import Enum
 
-    from hudi import HudiReadConfig, HudiTableConfig
+    from hudi import HudiPlanConfig, HudiReadConfig, HudiTableConfig
 
     assert issubclass(HudiTableConfig, Enum)
     assert issubclass(HudiReadConfig, Enum)
+    assert issubclass(HudiPlanConfig, Enum)
     assert isinstance(HudiTableConfig.TABLE_NAME, HudiTableConfig)
 
     # str mixin
@@ -65,3 +71,5 @@ def test_config_enums_are_real_python_enums():
     # Population non-empty (defends against silent regression)
     assert len(HudiTableConfig) >= 20
     assert len(HudiReadConfig) >= 5
+    assert len(HudiPlanConfig) >= 1
+    assert HudiPlanConfig.LISTING_PARALLELISM == "hoodie.plan.listing.parallelism"

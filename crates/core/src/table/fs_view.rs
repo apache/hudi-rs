@@ -201,23 +201,24 @@ impl FileSystemView {
                     continue;
                 }
 
-                // Load column stats from Parquet footer
-                let stats = match self
+                let (file_metadata, col_stats) = match self
                     .storage
-                    .get_parquet_column_stats(&relative_path, table_schema)
+                    .get_file_metadata_and_stats(&relative_path, table_schema)
                     .await
                 {
-                    Ok(s) => s,
+                    Ok(result) => result,
                     Err(e) => {
                         log::warn!(
-                            "Failed to load column stats for {relative_path}: {e}. Including file."
+                            "Failed to load file stats for {relative_path}: {e}. Including file."
                         );
                         retained.push(fg);
                         continue;
                     }
                 };
 
-                if file_pruner.should_include(&stats) {
+                if file_pruner.should_include(&col_stats) {
+                    fsl.base_file.file_metadata = Some(file_metadata);
+                    fsl.base_file_column_stats = Some(col_stats);
                     retained.push(fg);
                 } else {
                     log::debug!("Pruned file {relative_path} based on column stats");

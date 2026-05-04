@@ -18,10 +18,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, Union
 
-from hudi._config import HudiReadConfig, HudiTableConfig
+from hudi._config import HudiPlanConfig, HudiReadConfig, HudiTableConfig
 from hudi._internal import HudiTable, build_hudi_table
 
-ConfigKey = Union[str, HudiTableConfig, HudiReadConfig]
+ConfigKey = Union[str, HudiTableConfig, HudiReadConfig, HudiPlanConfig]
 
 
 def _coerce_key(k: ConfigKey) -> str:

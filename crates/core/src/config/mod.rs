@@ -30,9 +30,13 @@ use url::Url;
 
 pub mod error;
 pub mod internal;
+pub mod plan;
 pub mod read;
+pub mod read_options;
 pub mod table;
 pub mod util;
+
+pub use read_options::{QueryType, ReadOptions};
 
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
@@ -216,15 +220,16 @@ impl HudiConfigs {
         parser.parse_value_or_default(&self.raw_options)
     }
 
-    /// Get value or default value. If the config has no default value, this will return [None].
+    /// Get value if present, or default if absent. Returns `Err` on parse failures
+    /// (e.g. `"yes"` for a bool config) instead of silently falling back to the default.
     pub fn try_get(
         &self,
         parser: impl ConfigParser<Output = HudiConfigValue>,
-    ) -> Option<HudiConfigValue> {
-        let res = parser.parse_value(&self.raw_options);
-        match res {
-            Ok(v) => Some(v),
-            Err(_) => parser.default_value(),
+    ) -> Result<Option<HudiConfigValue>> {
+        match parser.parse_value(&self.raw_options) {
+            Ok(v) => Ok(Some(v)),
+            Err(NotFound(_)) => Ok(parser.default_value()),
+            Err(e) => Err(e),
         }
     }
 }

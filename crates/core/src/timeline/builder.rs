@@ -81,7 +81,7 @@ impl TimelineBuilder {
 
         let layout_version: isize = self
             .hudi_configs
-            .try_get(TimelineLayoutVersion)
+            .try_get(TimelineLayoutVersion)?
             .map(|v| v.into())
             .unwrap_or_else(|| if table_version >= 8 { 2isize } else { 1isize });
 

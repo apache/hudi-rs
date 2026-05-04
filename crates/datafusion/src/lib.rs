@@ -94,6 +94,8 @@ pub struct HudiDataSource {
     partition_schema: Schema,
     /// Cached table-level statistics for join ordering and broadcast decisions.
     cached_stats: Option<Statistics>,
+    /// Number of input partitions for scan planning, extracted from read options.
+    input_partitions: usize,
 }
 
 impl std::fmt::Debug for HudiDataSource {
@@ -124,7 +126,23 @@ impl HudiDataSource {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let table = HudiTable::new_with_options(base_uri, options)
+        let all_options: Vec<(String, String)> = options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+            .collect();
+        let input_partitions: usize = match all_options
+            .iter()
+            .find(|(k, _)| k == InputPartitions.as_ref())
+        {
+            Some((_, v)) => v.parse().map_err(|_| {
+                Execution(format!(
+                    "Invalid value '{v}' for {}: expected a non-negative integer",
+                    InputPartitions.as_ref()
+                ))
+            })?,
+            None => 0,
+        };
+        let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
 
@@ -161,7 +179,7 @@ impl HudiDataSource {
         // Uses MDT files partition for base-file sizes and, for Parquet tables, one
         // sampled footer to infer row counts and byte sizes without loading all file groups.
         // Falls back to None if statistics cannot be derived.
-        let cached_stats = match table.compute_table_stats().await {
+        let cached_stats = match table.compute_table_stats(None).await {
             Some((num_rows, total_byte_size)) => {
                 let num_fields = schema.fields().len();
                 // Saturate on 32-bit targets where `u64` cannot fit into `usize`;
@@ -185,14 +203,12 @@ impl HudiDataSource {
             schema,
             partition_schema,
             cached_stats,
+            input_partitions,
         })
     }
 
     fn get_input_partitions(&self) -> usize {
-        self.table
-            .hudi_configs
-            .get_or_default(InputPartitions)
-            .into()
+        self.input_partitions
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -337,22 +353,6 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
-        // Only support COW tables, or MOR tables with read-optimized mode enabled.
-        if self.table.is_mor() {
-            let use_read_optimized: bool = self
-                .table
-                .hudi_configs
-                .get_or_default(UseReadOptimizedMode)
-                .into();
-            if !use_read_optimized {
-                return Err(Execution(
-                    "MOR table is not supported without read-optimized mode. \
-                     Set hoodie.read.use.read_optimized.mode=true to read only base files."
-                        .to_string(),
-                ));
-            }
-        }
-
         // Resolve input partitions: use Hudi config if set, otherwise fall back
         // to DataFusion's target_partitions (defaults to number of CPU cores).
         let input_partitions = match self.get_input_partitions() {
@@ -373,7 +373,8 @@ impl TableProvider for HudiDataSource {
         let pushdown_filters = exprs_to_filters(&partition_filters);
         let read_options = ReadOptions::new()
             .with_filters(pushdown_filters)
-            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?;
+            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?
+            .with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
         let flat_slices = self
             .table
             .get_file_slices(&read_options)

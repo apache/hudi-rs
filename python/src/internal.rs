@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 #[cfg(feature = "datafusion")]
 use datafusion::error::DataFusionError;
 
+use hudi::config::plan::HudiPlanConfig;
 use hudi::config::read::HudiReadConfig;
 use hudi::config::table::HudiTableConfig;
 use hudi::error::CoreError;
@@ -504,7 +505,10 @@ pub struct HudiFileSlice {
     #[pyo3(get)]
     log_file_names: Vec<String>,
     #[pyo3(get)]
+    log_file_sizes: Vec<u64>,
+    #[pyo3(get)]
     num_records: i64,
+    column_stats: Option<hudi::statistics::StatisticsContainer>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -524,6 +528,45 @@ impl HudiFileSlice {
             .map_err(PythonError::from)?;
         Ok(path)
     }
+    /// Total on-disk size (base + log files) in bytes.
+    /// Use for I/O cost estimation and split sizing.
+    fn total_size_bytes(&self) -> u64 {
+        self.base_file_size + self.log_file_sizes.iter().sum::<u64>()
+    }
+
+    fn has_log_files(&self) -> bool {
+        !self.log_file_names.is_empty()
+    }
+
+    /// Column statistics (min, max) from the base file Parquet footer.
+    ///
+    /// Returns a dict mapping column names to (min_array, max_array) tuples,
+    /// where each is a single-element PyArrow array or None.
+    /// Only populated when data-column filters trigger footer-based pruning
+    /// on COW tables or MOR read-optimized mode.
+    fn base_file_column_stats(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        use pyo3::types::PyDict;
+
+        let Some(stats) = &self.column_stats else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        for (name, col_stats) in &stats.columns {
+            let min_val = col_stats
+                .min_value
+                .as_ref()
+                .map(|arr| arr.to_data().to_pyarrow(py).map(|b| b.unbind()))
+                .transpose()?;
+            let max_val = col_stats
+                .max_value
+                .as_ref()
+                .map(|arr| arr.to_data().to_pyarrow(py).map(|b| b.unbind()))
+                .transpose()?;
+            dict.set_item(name, (min_val, max_val))?;
+        }
+        Ok(Some(dict.into()))
+    }
+
     fn log_files_relative_paths(&self) -> PyResult<Vec<String>> {
         let mut paths = Vec::<String>::new();
         for name in self.log_file_names.iter() {
@@ -555,7 +598,13 @@ impl From<&FileSlice> for HudiFileSlice {
         let base_file_size = file_metadata.size;
         let base_file_byte_size = file_metadata.byte_size;
         let log_file_names = f.log_files.iter().map(|l| l.file_name()).collect();
+        let log_file_sizes = f
+            .log_files
+            .iter()
+            .map(|lf| lf.file_metadata.as_ref().map(|m| m.size).unwrap_or(0))
+            .collect();
         let num_records = file_metadata.num_records;
+        let column_stats = f.base_file_column_stats.clone();
         HudiFileSlice {
             file_id,
             partition_path,
@@ -564,7 +613,9 @@ impl From<&FileSlice> for HudiFileSlice {
             base_file_size,
             base_file_byte_size,
             log_file_names,
+            log_file_sizes,
             num_records,
+            column_stats,
         }
     }
 }
@@ -729,11 +780,10 @@ impl HudiTable {
         })
     }
 
-    #[pyo3(signature = (read_options=None, extra_hudi_overrides=None, extra_storage_overrides=None))]
+    #[pyo3(signature = (read_options=None, extra_storage_overrides=None))]
     fn create_file_group_reader_with_options(
         &self,
         read_options: Option<HudiReadOptions>,
-        extra_hudi_overrides: Option<HashMap<String, String>>,
         extra_storage_overrides: Option<HashMap<String, String>>,
     ) -> PyResult<HudiFileGroupReader> {
         let read_options = read_options.map(|o| o.to_inner());
@@ -741,7 +791,6 @@ impl HudiTable {
             .inner
             .create_file_group_reader_with_options(
                 read_options.as_ref(),
-                extra_hudi_overrides.unwrap_or_default(),
                 extra_storage_overrides.unwrap_or_default(),
             )
             .map_err(PythonError::from)?;
@@ -764,8 +813,14 @@ impl HudiTable {
         self.inner.base_url().to_string()
     }
 
-    fn compute_table_stats(&self, py: Python) -> Option<(u64, u64)> {
-        py.detach(|| rt().block_on(self.inner.compute_table_stats()))
+    #[pyo3(signature = (options=None))]
+    fn compute_table_stats(
+        &self,
+        options: Option<HudiReadOptions>,
+        py: Python,
+    ) -> Option<(u64, u64)> {
+        let read_options = options.map(|o| o.to_inner());
+        py.detach(|| rt().block_on(self.inner.compute_table_stats(read_options.as_ref())))
     }
 
     #[pyo3(signature = (options=None))]
@@ -932,6 +987,7 @@ pub fn _config_keys() -> HashMap<String, Vec<(String, String)>> {
     let mut out = HashMap::new();
     out.insert("HudiTableConfig".to_string(), collect::<HudiTableConfig>());
     out.insert("HudiReadConfig".to_string(), collect::<HudiReadConfig>());
+    out.insert("HudiPlanConfig".to_string(), collect::<HudiPlanConfig>());
     out
 }
 

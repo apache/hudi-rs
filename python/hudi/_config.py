@@ -49,4 +49,13 @@ HudiReadConfig = Enum(
 )
 HudiReadConfig.__doc__ = "Configurations for reading Hudi tables."
 
-__all__ = ["HudiReadConfig", "HudiTableConfig"]
+HudiPlanConfig = Enum(
+    "HudiPlanConfig",
+    _keys["HudiPlanConfig"],
+    type=str,
+    module=__name__,
+    qualname="HudiPlanConfig",
+)
+HudiPlanConfig.__doc__ = "Configurations for query planning in Hudi."
+
+__all__ = ["HudiPlanConfig", "HudiReadConfig", "HudiTableConfig"]

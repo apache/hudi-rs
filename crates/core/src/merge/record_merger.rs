@@ -64,7 +64,7 @@ impl RecordMerger {
             )));
         }
 
-        let precombine_field = hudi_configs.try_get(PrecombineField);
+        let precombine_field = hudi_configs.try_get(PrecombineField)?;
         if precombine_field.is_none()
             && merge_strategy == RecordMergeStrategyValue::OverwriteWithLatest
         {

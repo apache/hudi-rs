@@ -21,6 +21,9 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use strum::IntoEnumIterator;
+
+use crate::config::HudiConfigs;
 use crate::config::error::ConfigError;
 use crate::config::read::HudiReadConfig;
 pub use crate::config::read::QueryType;
@@ -237,10 +240,62 @@ impl ReadOptions {
             .map(|s| s.as_str())
     }
 
+    /// Return a copy with timestamps irrelevant to the resolved query type stripped.
+    ///
+    /// Snapshot keeps only `as_of_timestamp`; incremental keeps only
+    /// `start_timestamp` / `end_timestamp`.
+    pub(crate) fn with_sanitized_timestamps(&self) -> Self {
+        let mut opts = self.clone();
+        match opts.query_type().unwrap_or_default() {
+            QueryType::Snapshot => {
+                opts.hudi_options
+                    .remove(HudiReadConfig::StartTimestamp.as_ref());
+                opts.hudi_options
+                    .remove(HudiReadConfig::EndTimestamp.as_ref());
+            }
+            QueryType::Incremental => {
+                opts.hudi_options
+                    .remove(HudiReadConfig::AsOfTimestamp.as_ref());
+            }
+        }
+        opts
+    }
+
+    /// Whether read-optimized mode is enabled (base files only, skip log merging).
+    pub fn is_read_optimized(&self) -> crate::Result<bool> {
+        let key = HudiReadConfig::UseReadOptimizedMode.as_ref();
+        match self.hudi_options.get(key) {
+            Some(s) => {
+                let parsed = s
+                    .parse::<bool>()
+                    .map_err(|e| ConfigError::ParseBool(key.to_string(), s.clone(), e))?;
+                Ok(parsed)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// The target batch size (rows per batch) for streaming reads, if set.
     /// Errors if the stored string is not a valid `usize` or if the value is `0`
     /// (a zero-row batch yields no batches at the parquet stream reader and is
     /// almost certainly a caller mistake).
+    /// Fill in defaults from the given configs for keys not already set.
+    ///
+    /// Values already present in this `ReadOptions` take precedence.
+    pub fn with_defaults_from(&self, configs: &HudiConfigs) -> crate::Result<Self> {
+        let mut resolved = self.clone();
+        for key in HudiReadConfig::iter() {
+            let key_str = key.key_str();
+            if !resolved.hudi_options.contains_key(key_str) {
+                if let Some(val) = configs.try_get(key)? {
+                    let s: String = val.into();
+                    resolved.hudi_options.insert(key_str.to_string(), s);
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
     pub fn batch_size(&self) -> crate::Result<Option<usize>> {
         let key = HudiReadConfig::StreamBatchSize.as_ref();
         match self.hudi_options.get(key) {
@@ -360,6 +415,30 @@ mod tests {
         );
         assert_eq!(options.hudi_options.get("a"), Some(&"1".to_string()));
         assert_eq!(options.hudi_options.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_is_read_optimized_round_trip() -> crate::Result<()> {
+        assert!(!ReadOptions::new().is_read_optimized()?);
+
+        let opts = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+        assert!(opts.is_read_optimized()?);
+
+        let opts = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "false");
+        assert!(!opts.is_read_optimized()?);
+
+        for invalid in ["1", "yes", "on", "TRUE_ISH"] {
+            let opts = ReadOptions::new()
+                .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), invalid);
+            let err = opts.is_read_optimized().unwrap_err();
+            assert!(
+                err.to_string().contains(invalid),
+                "expected error to mention '{invalid}'"
+            );
+        }
+        Ok(())
     }
 
     #[test]

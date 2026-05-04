@@ -105,7 +105,12 @@ impl TableBuilder {
 
         option_resolver.resolve_options().await?;
 
-        let hudi_configs = Arc::from(HudiConfigs::new(option_resolver.hudi_options.iter()));
+        let hudi_configs = Arc::from(HudiConfigs::new(
+            option_resolver
+                .hudi_options
+                .iter()
+                .filter(|(k, _)| !k.starts_with("hoodie.read.")),
+        ));
 
         let storage_options = Arc::from(self.option_resolver.storage_options.clone());
 

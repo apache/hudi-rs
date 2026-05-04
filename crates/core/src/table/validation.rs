@@ -18,7 +18,7 @@
  */
 use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig::SkipConfigValidation;
-use crate::config::read::HudiReadConfig;
+use crate::config::plan::HudiPlanConfig;
 use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig;
 use crate::config::table::HudiTableConfig::{
@@ -39,7 +39,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
         hudi_configs.validate(conf)?
     }
 
-    for conf in HudiReadConfig::iter() {
+    for conf in HudiPlanConfig::iter() {
         hudi_configs.validate(conf)?
     }
 

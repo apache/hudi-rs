@@ -29,7 +29,6 @@ use std::collections::HashMap;
 use arrow_schema::Schema;
 
 use crate::Result;
-use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::{
     MetadataTableEnabled, MetadataTablePartitions, PartitionFields, TableVersion,
 };
@@ -37,6 +36,7 @@ use crate::error::CoreError;
 use crate::expr::filter::from_str_tuples;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::storage::util::join_url_segments;
+use crate::table::ReadOptions;
 use crate::table::Table;
 use crate::table::file_pruner::FilePruner;
 use crate::table::partition::PartitionPruner;
@@ -258,9 +258,9 @@ impl Table {
         }
 
         let file_slice = file_slices.into_iter().next().unwrap();
+        let opts = ReadOptions::new().with_end_timestamp(timestamp);
         let fg_reader = self.create_file_group_reader_with_options(
-            None,
-            [(HudiReadConfig::EndTimestamp, timestamp)],
+            Some(&opts),
             std::iter::empty::<(&str, &str)>(),
         )?;
 

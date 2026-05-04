@@ -38,3 +38,4 @@ uv.lock
 *.profraw
 cobertura.xml
 /cov-reports/
+docs/plans/*.md

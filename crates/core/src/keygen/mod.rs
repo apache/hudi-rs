@@ -29,9 +29,9 @@ use crate::expr::filter::Filter;
 /// Returns true if the table uses a timestamp-based key generator,
 /// checking both `hoodie.table.keygenerator.class` and
 /// `hoodie.table.keygenerator.type`.
-pub fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> bool {
-    let by_class: bool = hudi_configs
-        .try_get(KeyGeneratorClass)
+pub fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> Result<bool> {
+    let by_class = hudi_configs
+        .try_get(KeyGeneratorClass)?
         .map(|v| {
             let s: String = v.into();
             s.contains("TimestampBasedKeyGenerator")
@@ -39,17 +39,17 @@ pub fn is_timestamp_based_keygen(hudi_configs: &HudiConfigs) -> bool {
         .unwrap_or(false);
 
     if by_class {
-        return true;
+        return Ok(true);
     }
 
-    hudi_configs
-        .try_get(KeyGeneratorType)
+    Ok(hudi_configs
+        .try_get(KeyGeneratorType)?
         .map(|v| {
             let s: String = v.into();
             let upper = s.to_uppercase();
             upper == "TIMESTAMP" || upper == "TIMESTAMP_AVRO"
         })
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 /// Trait for key generators that can transform user filters on data columns

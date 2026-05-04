@@ -156,18 +156,17 @@ impl TimelineSelector {
             .into()
     }
 
-    fn get_timeline_layout_version_from_configs(hudi_configs: &HudiConfigs) -> isize {
-        // Try to get layout version from config, otherwise infer from table version
-        if let Some(layout_version) = hudi_configs.try_get(HudiTableConfig::TimelineLayoutVersion) {
-            layout_version.into()
+    fn get_timeline_layout_version_from_configs(hudi_configs: &HudiConfigs) -> Result<isize> {
+        if let Some(layout_version) =
+            hudi_configs.try_get(HudiTableConfig::TimelineLayoutVersion)?
+        {
+            Ok(layout_version.into())
         } else {
-            // Apply same default logic as TimelineBuilder:
-            // v8+ tables default to layout 2, earlier versions default to layout 1
             let table_version: isize = hudi_configs
-                .try_get(HudiTableConfig::TableVersion)
+                .try_get(HudiTableConfig::TableVersion)?
                 .map(|v| v.into())
-                .unwrap_or(6); // Conservative default if table version is somehow missing
-            if table_version >= 8 { 2 } else { 1 }
+                .unwrap_or(6);
+            Ok(if table_version >= 8 { 2 } else { 1 })
         }
     }
 
@@ -184,7 +183,8 @@ impl TimelineSelector {
         end: Option<&str>,
     ) -> Result<Self> {
         let timezone = Self::get_timezone_from_configs(&hudi_configs);
-        let timeline_layout_version = Self::get_timeline_layout_version_from_configs(&hudi_configs);
+        let timeline_layout_version =
+            Self::get_timeline_layout_version_from_configs(&hudi_configs)?;
         let start_datetime = Self::parse_datetime(&timezone, start)?;
         let end_datetime = Self::parse_datetime(&timezone, end)?;
         Ok(Self {

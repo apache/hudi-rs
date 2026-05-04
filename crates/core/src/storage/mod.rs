@@ -39,6 +39,7 @@ use url::Url;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
 use crate::statistics::StatisticsContainer;
+
 use crate::storage::error::StorageError::{Creation, InvalidPath};
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
@@ -135,7 +136,10 @@ impl Storage {
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
-        let base_url = match hudi_configs.try_get(HudiTableConfig::BasePath) {
+        let base_url = match hudi_configs
+            .try_get(HudiTableConfig::BasePath)
+            .map_err(|e| Creation(format!("{e}")))?
+        {
             Some(v) => v.to_url()?,
             None => {
                 return Err(Creation(format!(
@@ -189,7 +193,26 @@ impl Storage {
         Ok(FileMetadata::new(name.to_string(), meta.size))
     }
 
-    pub async fn get_parquet_file_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
+    /// Get the Arrow schema from a base file.
+    ///
+    /// Currently supports Parquet only; other formats (e.g., Lance) can be added.
+    pub async fn get_file_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
+        let parquet_meta = self.get_parquet_file_metadata(relative_path).await?;
+        Ok(parquet_to_arrow_schema(
+            parquet_meta.file_metadata().schema_descr(),
+            None,
+        )?)
+    }
+
+    /// Read a Parquet file's footer and return the raw metadata.
+    ///
+    /// Internal API for callers that need raw row group details (estimator
+    /// sampling). Most callers should use [`Self::get_file_schema`] or
+    /// [`Self::get_file_metadata_and_stats`] instead.
+    pub(crate) async fn get_parquet_file_metadata(
+        &self,
+        relative_path: &str,
+    ) -> Result<ParquetMetaData> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
@@ -199,32 +222,52 @@ impl Storage {
         Ok(builder.metadata().as_ref().clone())
     }
 
-    pub async fn get_parquet_file_schema(
-        &self,
-        relative_path: &str,
-    ) -> Result<arrow_schema::Schema> {
-        let parquet_meta = self.get_parquet_file_metadata(relative_path).await?;
-        Ok(parquet_to_arrow_schema(
-            parquet_meta.file_metadata().schema_descr(),
-            None,
-        )?)
-    }
-
-    /// Get column statistics for a Parquet file.
+    /// Get file metadata and column statistics from a base file.
     ///
-    /// # Arguments
-    /// * `relative_path` - Relative path to the Parquet file
-    /// * `schema` - Arrow schema to use for extracting statistics
-    pub async fn get_parquet_column_stats(
+    /// Reads the Parquet footer in a single HEAD + range request and returns:
+    /// - [`FileMetadata`]: `size` (on-disk from HEAD), `byte_size` (uncompressed
+    ///   from row groups), `num_records` (exact from footer).
+    /// - [`StatisticsContainer`]: per-column min/max from row group stats.
+    ///
+    /// Currently supports Parquet only; other base file formats can be added.
+    pub async fn get_file_metadata_and_stats(
         &self,
         relative_path: &str,
-        schema: &arrow_schema::Schema,
-    ) -> Result<StatisticsContainer> {
-        let parquet_meta = self.get_parquet_file_metadata(relative_path).await?;
-        Ok(StatisticsContainer::from_parquet_metadata(
-            &parquet_meta,
-            schema,
-        ))
+        table_schema: &arrow_schema::Schema,
+    ) -> Result<(FileMetadata, StatisticsContainer)> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let meta = obj_store.head(&obj_path).await?;
+        let file_size = meta.size as u64;
+        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        let parquet_meta = builder.metadata().as_ref();
+
+        let name = std::path::Path::new(relative_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(relative_path)
+            .to_string();
+
+        let num_records = parquet_meta.file_metadata().num_rows().max(0);
+        let byte_size: i64 = parquet_meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.total_byte_size())
+            .sum::<i64>()
+            .max(0);
+
+        let file_metadata = FileMetadata {
+            name,
+            size: file_size,
+            byte_size,
+            num_records,
+        };
+
+        let col_stats = StatisticsContainer::from_parquet_metadata(parquet_meta, table_schema);
+
+        Ok((file_metadata, col_stats))
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
