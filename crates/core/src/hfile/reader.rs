@@ -190,32 +190,31 @@ impl HFileReader {
 
     /// Check if the file uses MVCC timestamps (not supported).
     fn check_mvcc_support(&self) -> Result<()> {
-        if let Some(version_bytes) = self.file_info.get(FILE_INFO_KEY_VALUE_VERSION) {
-            if version_bytes.len() >= 4 {
-                let version = i32::from_be_bytes([
-                    version_bytes[0],
-                    version_bytes[1],
-                    version_bytes[2],
-                    version_bytes[3],
+        if let Some(version_bytes) = self.file_info.get(FILE_INFO_KEY_VALUE_VERSION)
+            && version_bytes.len() >= 4
+        {
+            let version = i32::from_be_bytes([
+                version_bytes[0],
+                version_bytes[1],
+                version_bytes[2],
+                version_bytes[3],
+            ]);
+            if version == KEY_VALUE_VERSION_WITH_MVCC_TS
+                && let Some(ts_bytes) = self.file_info.get(FILE_INFO_MAX_MVCC_TS)
+                && ts_bytes.len() >= 8
+            {
+                let max_ts = i64::from_be_bytes([
+                    ts_bytes[0],
+                    ts_bytes[1],
+                    ts_bytes[2],
+                    ts_bytes[3],
+                    ts_bytes[4],
+                    ts_bytes[5],
+                    ts_bytes[6],
+                    ts_bytes[7],
                 ]);
-                if version == KEY_VALUE_VERSION_WITH_MVCC_TS {
-                    if let Some(ts_bytes) = self.file_info.get(FILE_INFO_MAX_MVCC_TS) {
-                        if ts_bytes.len() >= 8 {
-                            let max_ts = i64::from_be_bytes([
-                                ts_bytes[0],
-                                ts_bytes[1],
-                                ts_bytes[2],
-                                ts_bytes[3],
-                                ts_bytes[4],
-                                ts_bytes[5],
-                                ts_bytes[6],
-                                ts_bytes[7],
-                            ]);
-                            if max_ts > 0 {
-                                return Err(HFileError::UnsupportedMvccTimestamp);
-                            }
-                        }
-                    }
+                if max_ts > 0 {
+                    return Err(HFileError::UnsupportedMvccTimestamp);
                 }
             }
         }
@@ -608,12 +607,11 @@ impl HFileReader {
             std::cmp::Ordering::Greater => {
                 // Current key > lookup key: backward seek
                 // Check if we're at the first key of a block and lookup >= fake first key
-                if let Some(entry) = &self.current_block_entry {
-                    if self.is_at_first_key_of_block()
-                        && compare_keys(&entry.first_key, lookup_key) != std::cmp::Ordering::Greater
-                    {
-                        return Ok(SeekResult::BeforeBlockFirstKey);
-                    }
+                if let Some(entry) = &self.current_block_entry
+                    && self.is_at_first_key_of_block()
+                    && compare_keys(&entry.first_key, lookup_key) != std::cmp::Ordering::Greater
+                {
+                    return Ok(SeekResult::BeforeBlockFirstKey);
                 }
 
                 // Check if before file's first key
@@ -643,13 +641,13 @@ impl HFileReader {
                 }
             } else {
                 // Last block - check against last key
-                if let Some(last_key) = &self.last_key {
-                    if compare_keys(last_key, lookup_key) == std::cmp::Ordering::Less {
-                        self.cursor.eof = true;
-                        self.current_block = None;
-                        self.current_block_entry = None;
-                        return Ok(SeekResult::Eof);
-                    }
+                if let Some(last_key) = &self.last_key
+                    && compare_keys(last_key, lookup_key) == std::cmp::Ordering::Less
+                {
+                    self.cursor.eof = true;
+                    self.current_block = None;
+                    self.current_block_entry = None;
+                    return Ok(SeekResult::Eof);
                 }
             }
         }

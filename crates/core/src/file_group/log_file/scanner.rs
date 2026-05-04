@@ -252,10 +252,10 @@ impl LogFileScanner {
         let mut total_records = 0;
         for blocks in &collected.all_blocks {
             for block in blocks {
-                if block.block_type == BlockType::HfileData {
-                    if let Some(records) = block.content.as_hfile_records() {
-                        total_records += records.len();
-                    }
+                if block.block_type == BlockType::HfileData
+                    && let Some(records) = block.content.as_hfile_records()
+                {
+                    total_records += records.len();
                 }
             }
         }

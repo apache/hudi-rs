@@ -374,18 +374,13 @@ impl FromStr for BaseFileFormatValue {
 }
 
 /// Config value for [HudiTableConfig::TimelineTimezone].
-#[derive(Clone, Debug, PartialEq, AsRefStr)]
+#[derive(Clone, Debug, PartialEq, AsRefStr, Default)]
 pub enum TimelineTimezoneValue {
     #[strum(serialize = "utc")]
+    #[default]
     UTC,
     #[strum(serialize = "local")]
     Local,
-}
-
-impl Default for TimelineTimezoneValue {
-    fn default() -> Self {
-        Self::UTC
-    }
 }
 
 impl FromStr for TimelineTimezoneValue {

@@ -291,20 +291,20 @@ impl TimelineSelector {
         };
 
         let dt = Instant::parse_datetime(timestamp, &self.timezone)?;
-        if let Some(start) = self.start_datetime {
-            if dt < start {
-                return Err(CoreError::Timeline(format!(
-                    "Instant not created for due to timestamp before start datetime: {file_name}"
-                )));
-            }
+        if let Some(start) = self.start_datetime
+            && dt < start
+        {
+            return Err(CoreError::Timeline(format!(
+                "Instant not created for due to timestamp before start datetime: {file_name}"
+            )));
         }
 
-        if let Some(end) = self.end_datetime {
-            if dt >= end {
-                return Err(CoreError::Timeline(format!(
-                    "Instant not created for due to timestamp after or at end datetime: {file_name}"
-                )));
-            }
+        if let Some(end) = self.end_datetime
+            && dt >= end
+        {
+            return Err(CoreError::Timeline(format!(
+                "Instant not created for due to timestamp after or at end datetime: {file_name}"
+            )));
         }
 
         Ok(Instant {

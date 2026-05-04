@@ -134,26 +134,26 @@ impl FilesPartitionMerger {
 
         // Process base records, filtering by key
         for record in base_records {
-            if let Some(key_str) = record.key_as_str() {
-                if key_set.contains(key_str) {
-                    let decoded = self.decode_record(record)?;
-                    merged.insert(decoded.key.clone(), decoded);
-                }
+            if let Some(key_str) = record.key_as_str()
+                && key_set.contains(key_str)
+            {
+                let decoded = self.decode_record(record)?;
+                merged.insert(decoded.key.clone(), decoded);
             }
         }
 
         // Process log records, filtering by key
         for record in log_records {
-            if let Some(key_str) = record.key_as_str() {
-                if key_set.contains(key_str) {
-                    let decoded = self.decode_record(record)?;
-                    match merged.get_mut(&decoded.key) {
-                        Some(existing) => {
-                            self.merge_files_partition_records(existing, &decoded);
-                        }
-                        None => {
-                            merged.insert(decoded.key.clone(), decoded);
-                        }
+            if let Some(key_str) = record.key_as_str()
+                && key_set.contains(key_str)
+            {
+                let decoded = self.decode_record(record)?;
+                match merged.get_mut(&decoded.key) {
+                    Some(existing) => {
+                        self.merge_files_partition_records(existing, &decoded);
+                    }
+                    None => {
+                        merged.insert(decoded.key.clone(), decoded);
                     }
                 }
             }

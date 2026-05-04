@@ -287,11 +287,11 @@ pub fn decode_files_partition_record_with_schema(
     let mut files = extract_filesystem_metadata(&avro_value);
 
     // Normalize "." -> "" in AllPartitions files map
-    if record_type == MetadataRecordType::AllPartitions {
-        if let Some(mut file_info) = files.remove(FilesPartitionRecord::NON_PARTITIONED_NAME) {
-            file_info.name = String::new();
-            files.insert(String::new(), file_info);
-        }
+    if record_type == MetadataRecordType::AllPartitions
+        && let Some(mut file_info) = files.remove(FilesPartitionRecord::NON_PARTITIONED_NAME)
+    {
+        file_info.name = String::new();
+        files.insert(String::new(), file_info);
     }
 
     Ok(FilesPartitionRecord {

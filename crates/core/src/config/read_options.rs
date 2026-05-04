@@ -286,11 +286,11 @@ impl ReadOptions {
         let mut resolved = self.clone();
         for key in HudiReadConfig::iter() {
             let key_str = key.key_str();
-            if !resolved.hudi_options.contains_key(key_str) {
-                if let Some(val) = configs.try_get(key)? {
-                    let s: String = val.into();
-                    resolved.hudi_options.insert(key_str.to_string(), s);
-                }
+            if !resolved.hudi_options.contains_key(key_str)
+                && let Some(val) = configs.try_get(key)?
+            {
+                let s: String = val.into();
+                resolved.hudi_options.insert(key_str.to_string(), s);
             }
         }
         Ok(resolved)
