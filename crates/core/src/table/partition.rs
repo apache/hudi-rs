@@ -632,7 +632,7 @@ mod tests {
         };
 
         let transformed = PartitionPruner::transform_filters_for_keygen(
-            &[user_filter.clone()],
+            std::slice::from_ref(&user_filter),
             &partition_schema,
             &configs,
         )

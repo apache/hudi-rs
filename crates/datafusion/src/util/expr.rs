@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_convert_binary_expr_extensive() {
         // list of test cases with different operators and data types
-        let test_cases = vec![
+        let test_cases = [
             (
                 col("int32_col").eq(lit(42i32)),
                 Some(HudiFilter {

@@ -145,13 +145,13 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
         file_group.add_base_file(base_file)?;
 
         // Log files are only present in MOR write stats (the `baseFile` branch).
-        if write_stat.base_file.is_some() {
-            if let Some(log_file_names) = &write_stat.log_files {
-                for log_file_name in log_file_names {
-                    let mut log_file = LogFile::from_str(log_file_name)?;
-                    log_file.set_completion_time(completion_time_view);
-                    file_group.add_log_file(log_file)?;
-                }
+        if write_stat.base_file.is_some()
+            && let Some(log_file_names) = &write_stat.log_files
+        {
+            for log_file_name in log_file_names {
+                let mut log_file = LogFile::from_str(log_file_name)?;
+                log_file.set_completion_time(completion_time_view);
+                file_group.add_log_file(log_file)?;
             }
         }
 

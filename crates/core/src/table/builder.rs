@@ -277,12 +277,11 @@ impl OptionResolver {
         if let Ok(bytes) = storage
             .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
             .await
+            && let Ok(global_configs) = parse_data_for_options(&bytes, " \t=")
         {
-            if let Ok(global_configs) = parse_data_for_options(&bytes, " \t=") {
-                for (key, value) in global_configs {
-                    if key.starts_with("hoodie.") && !options.contains_key(&key) {
-                        options.insert(key.to_string(), value.to_string());
-                    }
+            for (key, value) in global_configs {
+                if key.starts_with("hoodie.") && !options.contains_key(&key) {
+                    options.insert(key.to_string(), value.to_string());
                 }
             }
         }

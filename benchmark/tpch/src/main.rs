@@ -668,7 +668,7 @@ fn compute_stats(timings: &[f64]) -> Option<TimingStats> {
     let min = sorted[0];
     let max = sorted[sorted.len() - 1];
     let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
-    let median = if sorted.len() % 2 == 0 {
+    let median = if sorted.len().is_multiple_of(2) {
         let mid = sorted.len() / 2;
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
@@ -915,10 +915,10 @@ fn parse_spark_timings(reader: Box<dyn BufRead>) -> Vec<QueryResult> {
     let mut all_timings: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
 
     for line in reader.lines().map_while(|l| l.ok()) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let (Some(q), Some(ms)) = (v["query"].as_u64(), v["elapsed_ms"].as_f64()) {
-                all_timings.entry(q as usize).or_default().push(ms);
-            }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+            && let (Some(q), Some(ms)) = (v["query"].as_u64(), v["elapsed_ms"].as_f64())
+        {
+            all_timings.entry(q as usize).or_default().push(ms);
         }
     }
 

@@ -141,10 +141,10 @@ async fn resolve_schema_from_base_file(
     })?;
 
     // Try to get the base file path from either 'path' or 'baseFile' field
-    if let Some(path) = &first_stat.path {
-        if path.ends_with(".parquet") {
-            return Ok(storage.get_file_schema(path).await?);
-        }
+    if let Some(path) = &first_stat.path
+        && path.ends_with(".parquet")
+    {
+        return Ok(storage.get_file_schema(path).await?);
     }
 
     // Handle deltacommit case with baseFile
