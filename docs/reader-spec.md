@@ -62,7 +62,7 @@ Per-slice reads — reading a single `FileSlice` the caller already selected (ty
 | `with_end_timestamp(ts)`     | `hoodie.read.end.timestamp`                  | latest commit (Incremental only)          |
 | `with_batch_size(n)`         | `hoodie.read.stream.batch_size`              | `1024` (streaming only)                   |
 
-Timestamp sanitization: at the dispatch point (`read`, `read_stream`, `get_file_slices`), timestamps irrelevant to the resolved query type are stripped before forwarding to inner methods. Snapshot discards `start_timestamp` / `end_timestamp`; incremental discards `as_of_timestamp`. Callers may set all three for convenience; only the applicable ones take effect.
+Timestamp resolution: all four public entry points — `read`, `read_stream`, `get_file_slices`, and `create_file_group_reader_with_options` — go through a single `prepare_reader_options` step that (1) strips timestamps irrelevant to the query type (snapshot discards `start/end_timestamp`; incremental discards `as_of_timestamp`) and (2) resolves the remaining timestamps into the `EndTimestamp` / `StartTimestamp` that `FileGroupReader` needs for log-scan bounds and commit-time filtering. Callers may set all three for convenience; only the applicable ones take effect.
 
 Which knobs each API consumes:
 
@@ -70,6 +70,7 @@ Which knobs each API consumes:
 |------------------------------------------------------------------|:----------:|:-----:|:---------:|:-------:|:----------:|:----------:|:-------------------------:|
 | `read` / `read_stream`                                           | yes        | when Snapshot | when Incremental | yes | yes | streaming | yes |
 | `get_file_slices`                                                | yes        | when Snapshot | when Incremental | yes | — | — | — |
+| `create_file_group_reader_with_options`                          | yes        | when Snapshot | when Incremental | — | — | — | yes |
 | `FileGroupReader::read_file_slice` / `_from_paths`               | —          | — | — | yes | yes | — | — |
 | `FileGroupReader::read_file_slice_stream` / `_from_paths_stream` | —          | — | — | yes | yes | yes | — |
 
@@ -77,7 +78,7 @@ Notes:
 
 - `read_stream` errors with `Unsupported` for `query_type = Incremental` — incremental streaming is not yet implemented.
 - The `hudi_options` bag is a per-read override layer — set arbitrary `hoodie.read.*` configs (e.g. `hoodie.read.use.read_optimized.mode = true`) for this single read. Read configs (`hoodie.read.*`) are not stored in the `Table` instance; they flow exclusively through `ReadOptions`.
-- Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods.
+- Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods. The method resolves timestamps automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same `ReadOptions` used for `get_file_slices`.
 - For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi::util::collection::split_into_chunks` or your engine's preferred partitioning policy.
 
 Timestamp formats are documented in [§6](#timestamps).

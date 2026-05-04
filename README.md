@@ -337,7 +337,7 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi::util::collection::split_into_chunks` on the result. |
 |                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning. Snapshot (default) uses the metadata table; incremental aggregates from changed file slices. Returns `None` when stats cannot be computed. |
-| Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. Both args are optional; `read_options.hudi_options` supply per-read configs, and `extra_storage_overrides` override storage credentials. |
+| Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. Both args are optional. Timestamps are resolved automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same options used for `get_file_slices`. |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
 
 ### File Group API

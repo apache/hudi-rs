@@ -403,6 +403,10 @@ class HudiTable:
         ``read_options.hudi_options`` override table-level Hudi configs
         (last-writer-wins). ``extra_storage_overrides`` override table-level
         storage options (cloud credentials, endpoints, etc).
+
+        Timestamps are resolved automatically (e.g. ``AsOfTimestamp`` →
+        ``EndTimestamp``), so callers can pass the same options used for
+        :meth:`get_file_slices`.
         """
         ...
     def read(
