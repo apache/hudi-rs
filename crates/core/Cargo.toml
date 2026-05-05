@@ -81,6 +81,10 @@ prost = { workspace = true }
 # compression
 flate2 = { workspace = true }
 
+# lance
+lance = { version = "4.0.1", optional = true }
+lance-io = { version = "4.0.1", optional = true }
+
 # datafusion
 datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
@@ -103,3 +107,4 @@ datafusion = [
     "datafusion-common",
     "datafusion-physical-expr",
 ]
+lance = ["dep:lance", "dep:lance-io"]
