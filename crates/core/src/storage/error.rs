@@ -49,6 +49,10 @@ pub enum StorageError {
     #[error(transparent)]
     ParquetError(#[from] parquet::errors::ParquetError),
 
+    #[cfg(feature = "lance")]
+    #[error("Lance error: {0}")]
+    LanceError(#[from] lance_core::Error),
+
     #[error(transparent)]
     UrlParseError(#[from] url::ParseError),
 }

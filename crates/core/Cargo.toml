@@ -83,6 +83,9 @@ flate2 = { workspace = true }
 
 # lance (requires Rust 1.91+; the `lance` feature has a higher MSRV than the base crate)
 lance = { version = "4.0.1", optional = true }
+lance-core = { version = "4.0.1", optional = true }
+lance-encoding = { version = "4.0.1", optional = true }
+lance-file = { version = "4.0.1", optional = true }
 lance-io = { version = "4.0.1", optional = true }
 
 # datafusion
@@ -107,4 +110,4 @@ datafusion = [
     "datafusion-common",
     "datafusion-physical-expr",
 ]
-lance = ["dep:lance", "dep:lance-io"]
+lance = ["dep:lance", "dep:lance-core", "dep:lance-encoding", "dep:lance-file", "dep:lance-io"]

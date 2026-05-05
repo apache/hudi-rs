@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#[cfg(feature = "lance")]
+pub mod lance;
 pub mod parquet;
 pub mod reader;
 

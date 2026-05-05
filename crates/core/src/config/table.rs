@@ -377,6 +377,8 @@ pub enum BaseFileFormatValue {
     /// HFile format - only valid for metadata tables.
     #[strum(serialize = "hfile")]
     HFile,
+    #[strum(serialize = "lance")]
+    Lance,
 }
 
 impl BaseFileFormatValue {
@@ -393,6 +395,8 @@ impl BaseFileFormatValue {
             Some(Self::Parquet)
         } else if Self::ends_with_ignore_ascii_case(path, ".hfile") {
             Some(Self::HFile)
+        } else if Self::ends_with_ignore_ascii_case(path, ".lance") {
+            Some(Self::Lance)
         } else {
             None
         }
@@ -403,6 +407,7 @@ impl BaseFileFormatValue {
         let suffix = match self {
             Self::Parquet => ".parquet",
             Self::HFile => ".hfile",
+            Self::Lance => ".lance",
         };
         Self::ends_with_ignore_ascii_case(path, suffix)
     }
@@ -446,6 +451,7 @@ impl FromStr for BaseFileFormatValue {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
             "hfile" => Ok(Self::HFile),
+            "lance" => Ok(Self::Lance),
             "orc" => Err(UnsupportedValue(s.to_string())),
             v => Err(InvalidValue(v.to_string())),
         }
