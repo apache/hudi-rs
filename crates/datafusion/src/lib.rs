@@ -49,12 +49,16 @@ use log::warn;
 
 use crate::hudi_exec::HudiScanExec;
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
+use hudi_core::config::read::HudiReadConfig::{
+    FileSliceReadConcurrency, InputPartitions, UseReadOptimizedMode,
+};
 use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
 use hudi_core::config::util::empty_options;
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
+
+const DEFAULT_FILE_SLICE_READ_CONCURRENCY: usize = 4;
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -101,6 +105,8 @@ pub struct HudiDataSource {
     input_partitions: usize,
     /// Read-optimized mode requested when constructing the provider.
     read_optimized_mode: bool,
+    /// Maximum number of file-slice streams polled concurrently within a scan partition.
+    file_slice_read_concurrency: usize,
     /// Explicit base file format from table config, if present.
     base_file_format: Option<BaseFileFormatValue>,
 }
@@ -160,6 +166,27 @@ impl HudiDataSource {
                 ))
             })?,
             None => false,
+        };
+        let file_slice_read_concurrency: usize = match all_options
+            .iter()
+            .find(|(k, _)| k == FileSliceReadConcurrency.as_ref())
+        {
+            Some((_, v)) => {
+                let parsed = v.parse().map_err(|_| {
+                    Execution(format!(
+                        "Invalid value '{v}' for {}: expected a positive integer",
+                        FileSliceReadConcurrency.as_ref()
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(Execution(format!(
+                        "Invalid value '0' for {}: expected a positive integer",
+                        FileSliceReadConcurrency.as_ref()
+                    )));
+                }
+                parsed
+            }
+            None => DEFAULT_FILE_SLICE_READ_CONCURRENCY,
         };
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
@@ -228,12 +255,18 @@ impl HudiDataSource {
             cached_stats,
             input_partitions,
             read_optimized_mode,
+            file_slice_read_concurrency,
             base_file_format,
         })
     }
 
     fn get_input_partitions(&self) -> usize {
         self.input_partitions
+    }
+
+    #[cfg(test)]
+    fn get_file_slice_read_concurrency(&self) -> usize {
+        self.file_slice_read_concurrency
     }
 
     /// Parquet COW and Parquet MOR read-optimized use ParquetSource for
@@ -504,6 +537,7 @@ impl HudiDataSource {
             file_slices,
             file_group_reader,
             hudi_read_options,
+            self.file_slice_read_concurrency,
             self.schema.clone(),
             projection.cloned(),
             limit,
@@ -704,8 +738,40 @@ mod tests {
                 .unwrap();
         let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
         assert_eq!(hudi.get_input_partitions(), 0);
+        assert_eq!(
+            hudi.get_file_slice_read_concurrency(),
+            DEFAULT_FILE_SLICE_READ_CONCURRENCY
+        );
         assert_eq!(hudi.table_type(), TableType::Base);
         assert_eq!(hudi.statistics(), None);
+    }
+
+    #[tokio::test]
+    async fn test_new_with_options_sets_file_slice_read_concurrency() {
+        let hudi = HudiDataSource::new_with_options(
+            V6Nonpartitioned.path_to_cow().as_str(),
+            [(FileSliceReadConcurrency.as_ref(), "2")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hudi.get_file_slice_read_concurrency(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_new_with_options_rejects_invalid_file_slice_read_concurrency() {
+        for invalid in ["0", "abc"] {
+            let result = HudiDataSource::new_with_options(
+                V6Nonpartitioned.path_to_cow().as_str(),
+                [(FileSliceReadConcurrency.as_ref(), invalid)],
+            )
+            .await;
+
+            assert!(result.is_err());
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(FileSliceReadConcurrency.as_ref()));
+            assert!(error.contains(invalid));
+        }
     }
 
     #[tokio::test]

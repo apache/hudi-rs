@@ -51,6 +51,7 @@ pub struct HudiScanExec {
     file_slice_partitions: Vec<Vec<FileSlice>>,
     file_group_reader: Arc<FileGroupReader>,
     read_options: ReadOptions,
+    file_slice_read_concurrency: usize,
     #[allow(dead_code)]
     schema: SchemaRef,
     projected_schema: SchemaRef,
@@ -64,6 +65,7 @@ impl HudiScanExec {
         file_slice_partitions: Vec<Vec<FileSlice>>,
         file_group_reader: Arc<FileGroupReader>,
         read_options: ReadOptions,
+        file_slice_read_concurrency: usize,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -93,6 +95,7 @@ impl HudiScanExec {
             file_slice_partitions: partitions,
             file_group_reader,
             read_options,
+            file_slice_read_concurrency: file_slice_read_concurrency.max(1),
             schema,
             projected_schema,
             projection,
@@ -109,9 +112,10 @@ impl DisplayAs for HudiScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "HudiScanExec: partitions={}, file_slices={}, projection={:?}, limit={:?}",
+                    "HudiScanExec: partitions={}, file_slices={}, file_slice_read_concurrency={}, projection={:?}, limit={:?}",
                     self.file_slice_partitions.len(),
                     total_slices,
+                    self.file_slice_read_concurrency,
                     self.projection,
                     self.limit,
                 )
@@ -180,9 +184,13 @@ impl ExecutionPlan for HudiScanExec {
 
         let reader = self.file_group_reader.clone();
         let options = self.read_options.clone();
+        let concurrency = self
+            .file_slice_read_concurrency
+            .min(file_slices.len())
+            .max(1);
 
         let stream = stream::iter(file_slices)
-            .then(move |file_slice| {
+            .map(move |file_slice| {
                 let reader = reader.clone();
                 let options = options.clone();
                 async move {
@@ -201,7 +209,8 @@ impl ExecutionPlan for HudiScanExec {
                     }))
                 }
             })
-            .try_flatten();
+            .buffered(concurrency)
+            .try_flatten_unordered(concurrency);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
