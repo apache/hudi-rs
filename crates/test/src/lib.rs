@@ -136,6 +136,7 @@ pub enum SampleTable {
     V9TxnsSimpleMeta,
     V9TxnsSimpleNometa,
     V9TxnsSimpleOverwrite,
+    V9LanceNonpartitioned,
 }
 
 impl SampleTable {
@@ -260,7 +261,8 @@ mod tests {
                     assert!(path.exists());
                 }
                 SampleTable::V9TimebasedkeygenEpochmillis
-                | SampleTable::V9TimebasedkeygenUnixtimestamp => {
+                | SampleTable::V9TimebasedkeygenUnixtimestamp
+                | SampleTable::V9LanceNonpartitioned => {
                     let path = t.zip_path("cow", None);
                     assert!(path.exists());
                 }
