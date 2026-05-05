@@ -52,11 +52,8 @@ pub struct HudiScanExec {
     file_group_reader: Arc<FileGroupReader>,
     read_options: ReadOptions,
     file_slice_read_concurrency: usize,
-    #[allow(dead_code)]
-    schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -68,7 +65,6 @@ impl HudiScanExec {
         file_slice_read_concurrency: usize,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
-        limit: Option<usize>,
     ) -> Self {
         let projected_schema = if let Some(ref proj) = projection {
             let fields: Vec<_> = proj.iter().map(|&i| schema.field(i).clone()).collect();
@@ -96,10 +92,8 @@ impl HudiScanExec {
             file_group_reader,
             read_options,
             file_slice_read_concurrency: file_slice_read_concurrency.max(1),
-            schema,
             projected_schema,
             projection,
-            limit,
             properties,
         }
     }
@@ -112,12 +106,11 @@ impl DisplayAs for HudiScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "HudiScanExec: partitions={}, file_slices={}, file_slice_read_concurrency={}, projection={:?}, limit={:?}",
+                    "HudiScanExec: partitions={}, file_slices={}, file_slice_read_concurrency={}, projection={:?}",
                     self.file_slice_partitions.len(),
                     total_slices,
                     self.file_slice_read_concurrency,
                     self.projection,
-                    self.limit,
                 )
             }
             _ => {
@@ -210,6 +203,7 @@ impl ExecutionPlan for HudiScanExec {
                 }
             })
             .buffered(concurrency)
+            // Scan output is unordered; SQL ordering is provided by explicit SortExec nodes.
             .try_flatten_unordered(concurrency);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(

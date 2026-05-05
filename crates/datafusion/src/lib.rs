@@ -291,6 +291,9 @@ impl HudiDataSource {
     }
 
     fn file_slices_are_parquet(file_slices: &[FileSlice]) -> Result<bool> {
+        if file_slices.is_empty() {
+            return Ok(false);
+        }
         for file_slice in file_slices {
             let relative_path = file_slice.base_file_relative_path().map_err(|e| {
                 Execution(format!(
@@ -510,7 +513,6 @@ impl HudiDataSource {
     async fn scan_hudi(
         &self,
         projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
         input_partitions: usize,
         flat_slices: Vec<FileSlice>,
         read_options: ReadOptions,
@@ -540,7 +542,6 @@ impl HudiDataSource {
             self.file_slice_read_concurrency,
             self.schema.clone(),
             projection.cloned(),
-            limit,
         )))
     }
 
@@ -601,14 +602,8 @@ impl TableProvider for HudiDataSource {
             self.scan_parquet(state, projection, filters, limit, flat_slices)
                 .await
         } else {
-            self.scan_hudi(
-                projection,
-                limit,
-                input_partitions,
-                flat_slices,
-                read_options,
-            )
-            .await
+            self.scan_hudi(projection, input_partitions, flat_slices, read_options)
+                .await
         }
     }
 
@@ -772,6 +767,11 @@ mod tests {
             assert!(error.contains(FileSliceReadConcurrency.as_ref()));
             assert!(error.contains(invalid));
         }
+    }
+
+    #[test]
+    fn test_file_slices_are_parquet_empty_is_false() {
+        assert!(!HudiDataSource::file_slices_are_parquet(&[]).unwrap());
     }
 
     #[tokio::test]

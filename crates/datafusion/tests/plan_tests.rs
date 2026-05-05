@@ -457,7 +457,7 @@ mod v8_tests {
 
 mod dispatch_tests {
     use super::*;
-    use hudi_test::SampleTable::V6Nonpartitioned;
+    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle};
 
     #[tokio::test]
     async fn test_parquet_cow_uses_data_source_exec() {
@@ -514,6 +514,46 @@ mod dispatch_tests {
             plan.contains("HudiScanExec"),
             "Parquet MOR snapshot should use HudiScanExec. Plan: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hudi_scan_exec_display_omits_limit() {
+        let base_url = V6Nonpartitioned.url_to_mor_parquet();
+        let ctx = register_uri_as_table("mor_snapshot", base_url.as_str(), empty_options())
+            .await
+            .unwrap();
+
+        let plan = explain_physical_plan(&ctx, "SELECT id FROM mor_snapshot LIMIT 1").await;
+
+        assert!(
+            plan.contains("HudiScanExec"),
+            "Parquet MOR snapshot should use HudiScanExec. Plan: {plan}"
+        );
+        assert!(
+            !plan.contains("limit="),
+            "HudiScanExec display should not advertise limit pushdown. Plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_pruned_scan_uses_hudi_scan_exec_and_returns_empty() {
+        let ctx = register_table_direct(&V6SimplekeygenNonhivestyle, empty_options())
+            .await
+            .unwrap();
+        let sql = format!(
+            "SELECT id FROM {} WHERE byteField = 99",
+            V6SimplekeygenNonhivestyle.as_ref()
+        );
+
+        let plan = explain_physical_plan(&ctx, &sql).await;
+        assert!(
+            plan.contains("HudiScanExec"),
+            "Empty unknown-format scan should use HudiScanExec. Plan: {plan}"
+        );
+
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 0);
     }
 }
 
