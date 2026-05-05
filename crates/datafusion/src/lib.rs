@@ -215,10 +215,11 @@ impl HudiDataSource {
         self.input_partitions
     }
 
-    /// Parquet COW and MOR read-optimized use ParquetSource for native
-    /// row-group/page pruning. All other cases use HudiScanExec.
+    /// Parquet COW and Parquet MOR read-optimized use ParquetSource for
+    /// native row-group/page pruning. Parquet MOR snapshot, Lance, and
+    /// all other cases use HudiScanExec.
     fn use_parquet_source(&self) -> bool {
-        matches!(self.base_file_format, BaseFileFormatValue::Parquet)
+        matches!(self.base_file_format, BaseFileFormatValue::Parquet) && !self.table.is_mor()
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -434,7 +435,7 @@ impl HudiDataSource {
 
         let file_group_reader = Arc::new(
             self.table
-                .create_file_group_reader_with_options(None::<&ReadOptions>, empty_options())
+                .create_file_group_reader_with_options(Some(&read_options), empty_options())
                 .map_err(|e| Execution(format!("Failed to create FileGroupReader: {e}")))?,
         );
 

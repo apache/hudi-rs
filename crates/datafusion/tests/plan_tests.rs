@@ -431,3 +431,76 @@ mod v8_tests {
         assert_eq!(get_bool_column(rb, "isActive"), &[false, true]);
     }
 }
+
+// ============================================================================
+// Lance Table Tests (requires `lance` feature)
+// ============================================================================
+
+#[cfg(feature = "lance")]
+mod lance_tests {
+    use super::*;
+    use hudi_test::SampleTable::V9LanceNonpartitioned;
+
+    #[tokio::test]
+    async fn test_datafusion_read_lance_cow_table() {
+        let test_table = V9LanceNonpartitioned;
+        let ctx = register_table_direct(&test_table, empty_options())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT * FROM {}", test_table.as_ref());
+        let df = ctx.sql(&sql).await.unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "Lance COW table should return rows");
+
+        let schema = batches[0].schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(field_names.contains(&"id"), "Schema should contain 'id'");
+        assert!(
+            field_names.contains(&"name"),
+            "Schema should contain 'name'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_lance_table_has_meta_fields() {
+        let test_table = V9LanceNonpartitioned;
+        let ctx = register_table_direct(&test_table, empty_options())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT * FROM {} LIMIT 1", test_table.as_ref());
+        let df = ctx.sql(&sql).await.unwrap();
+        let schema = df.schema();
+
+        assert!(
+            schema.field_with_name(None, "_hoodie_commit_time").is_ok(),
+            "Lance table schema should include _hoodie_commit_time meta field"
+        );
+        assert!(
+            schema.field_with_name(None, "_hoodie_record_key").is_ok(),
+            "Lance table schema should include _hoodie_record_key meta field"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_lance_uses_hudi_scan_exec() {
+        let test_table = V9LanceNonpartitioned;
+        let ctx = register_table_direct(&test_table, empty_options())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT id, name FROM {}", test_table.as_ref());
+        let explaining_df = ctx.sql(&sql).await.unwrap().explain(false, true).unwrap();
+        let explaining_rb = explaining_df.collect().await.unwrap();
+        let explaining_rb = explaining_rb.first().unwrap();
+        let plan = get_str_column(explaining_rb, "plan").join("");
+
+        assert!(
+            plan.contains("HudiScanExec"),
+            "Lance table should use HudiScanExec, not DataSourceExec. Plan: {plan}"
+        );
+    }
+}

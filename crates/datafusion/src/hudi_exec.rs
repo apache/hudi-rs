@@ -75,7 +75,13 @@ impl HudiScanExec {
             schema.clone()
         };
 
-        let n_partitions = file_slice_partitions.len().max(1);
+        let partitions = if file_slice_partitions.is_empty() {
+            vec![vec![]]
+        } else {
+            file_slice_partitions
+        };
+        let n_partitions = partitions.len();
+
         let properties = PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(projected_schema.clone()),
             Partitioning::UnknownPartitioning(n_partitions),
@@ -84,7 +90,7 @@ impl HudiScanExec {
         );
 
         Self {
-            file_slice_partitions,
+            file_slice_partitions: partitions,
             file_group_reader,
             read_options,
             schema,
@@ -163,28 +169,38 @@ impl ExecutionPlan for HudiScanExec {
             })?
             .clone();
 
+        let projected_schema = self.projected_schema.clone();
+
+        if file_slices.is_empty() {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                projected_schema,
+                futures::stream::empty(),
+            )));
+        }
+
         let reader = self.file_group_reader.clone();
         let options = self.read_options.clone();
-        let limit = self.limit;
-        let projected_schema = self.projected_schema.clone();
 
         let stream = stream::iter(file_slices)
             .then(move |file_slice| {
                 let reader = reader.clone();
                 let options = options.clone();
                 async move {
-                    reader
-                        .read_file_slice(&file_slice, &options)
+                    let inner_stream = reader
+                        .read_file_slice_stream(&file_slice, &options)
                         .await
                         .map_err(|e| {
-                            datafusion_common::DataFusionError::Execution(format!(
-                                "Failed to read file slice: {e}"
-                            ))
-                        })
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to read file slice: {e}"
+                        ))
+                    })?;
+                    Ok::<_, datafusion_common::DataFusionError>(inner_stream.map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to read batch: {e}"
+                        ))
+                    }))
                 }
             })
-            .take(limit.unwrap_or(usize::MAX))
-            .map_ok(|batch| futures::stream::once(async { Ok(batch) }))
             .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
