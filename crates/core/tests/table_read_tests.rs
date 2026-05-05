@@ -2229,6 +2229,112 @@ mod manual_reader_matches_table_read {
     }
 }
 
+#[cfg(feature = "lance")]
+mod lance_tables {
+    use super::*;
+    use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_v9_lance_nonpartitioned_cow_snapshot_applies_hudi_updates_deletes_and_inserts()
+    -> Result<()> {
+        let base_url = SampleTable::V9LanceNonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_projection(["id", "name", "score", "updated_at"]))
+            .await?;
+        let schema = batches[0].schema();
+        let batch = concat_batches(&schema, &batches)?;
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let updated_at = batch
+            .column_by_name("updated_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                ids.value(row_idx),
+                (
+                    names.value(row_idx).to_string(),
+                    scores.value(row_idx),
+                    updated_at.value(row_idx),
+                ),
+            );
+        }
+
+        let mut actual_ids = rows.keys().copied().collect::<Vec<_>>();
+        actual_ids.sort_unstable();
+        assert_eq!(actual_ids, vec![1, 2, 3, 5, 6, 7, 8, 9, 10]);
+        assert!(!rows.contains_key(&4), "deleted id 4 must be absent");
+        assert!(
+            (rows.get(&1).unwrap().1 - 0.96).abs() < 1e-9,
+            "id 1 should reflect the score update"
+        );
+        assert_eq!(rows.get(&1).unwrap().2, 1700100000000);
+        assert!(
+            (rows.get(&2).unwrap().1 - 0.93).abs() < 1e-9,
+            "id 2 should reflect the score update"
+        );
+        assert_eq!(rows.get(&2).unwrap().2, 1700100000001);
+        assert_eq!(rows.get(&9).unwrap().0, "feature-set-iota");
+        assert_eq!(rows.get(&10).unwrap().0, "feature-set-kappa");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonpartitioned_cow_read_uses_extension_fallback_without_format_config()
+    -> Result<()> {
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
+        let props_path = std::path::Path::new(&table_path).join(".hoodie/hoodie.properties");
+        let props = std::fs::read_to_string(&props_path).unwrap();
+        let props_without_format = props
+            .lines()
+            .filter(|line| !line.starts_with("hoodie.table.base.file.format="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&props_path, props_without_format).unwrap();
+
+        let hudi_table = Table::new(&table_path).await?;
+        let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(
+            file_slices.iter().any(|slice| slice
+                .base_file_relative_path()
+                .is_ok_and(|path| path.ends_with(".lance"))),
+            "table listing should discover .lance base files without an explicit format config"
+        );
+
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_projection(["id"]))
+            .await?;
+        let total_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(total_rows, 9);
+
+        Ok(())
+    }
+}
+
 /// Test module for tables with metadata table (MDT) enabled.
 /// These tests verify MDT-accelerated file listing and partition normalization.
 mod mdt_enabled_tables {

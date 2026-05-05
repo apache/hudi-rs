@@ -223,7 +223,18 @@ impl SampleTable {
 mod tests {
     use strum::IntoEnumIterator;
 
-    use crate::{QuickstartTripsTable, SampleTable};
+    use crate::{QuickstartTripsTable, SampleTable, extract_test_table};
+
+    fn collect_regular_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_regular_files(&path, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
 
     #[test]
     fn quickstart_trips_table_zip_file_should_exist() {
@@ -284,5 +295,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn v9_lance_nonpartitioned_fixture_contains_only_lance_base_files() {
+        let zip_path = SampleTable::V9LanceNonpartitioned.zip_path("cow", None);
+        let table_dir =
+            extract_test_table(zip_path.as_ref()).join(SampleTable::V9LanceNonpartitioned.as_ref());
+
+        let mut files = Vec::new();
+        collect_regular_files(&table_dir, &mut files);
+
+        assert!(
+            files.iter().any(|path| path
+                .extension()
+                .is_some_and(|extension| extension == "lance")),
+            "Lance fixture should contain .lance base files"
+        );
+        assert!(
+            files.iter().all(|path| !path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")),
+            "Lance fixture should not contain .parquet files"
+        );
+        assert!(
+            files.iter().all(|path| path.file_name().is_none_or(|name| {
+                let name = name.to_string_lossy();
+                !matches!(name.as_ref(), ".DS_Store") && !name.ends_with(".crc")
+            })),
+            "Lance fixture should not contain local checksum or platform files"
+        );
+
+        let props = std::fs::read_to_string(table_dir.join(".hoodie/hoodie.properties")).unwrap();
+        assert!(
+            props
+                .lines()
+                .any(|line| line == "hoodie.table.base.file.format=LANCE")
+        );
     }
 }

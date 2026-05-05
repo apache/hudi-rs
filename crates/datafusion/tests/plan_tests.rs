@@ -30,7 +30,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::{DataFusionError, ScalarValue};
 
-use hudi_core::config::read::HudiReadConfig::InputPartitions;
+use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::config::util::empty_options;
 use hudi_core::metadata::meta_field::MetaField;
 use hudi_datafusion::{HudiDataSource, HudiTableFactory};
@@ -100,6 +100,22 @@ where
     Ok(ctx)
 }
 
+async fn register_uri_as_table<I, K, V>(
+    table_name: &str,
+    base_uri: &str,
+    options: I,
+) -> Result<SessionContext, DataFusionError>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    let ctx = create_test_session().await;
+    let hudi = HudiDataSource::new_with_options(base_uri, options).await?;
+    ctx.register_table(table_name, Arc::new(hudi))?;
+    Ok(ctx)
+}
+
 fn concat_as_sql_options<I, K, V>(options: I) -> String
 where
     I: IntoIterator<Item = (K, V)>,
@@ -150,6 +166,13 @@ async fn verify_plan(
         plan.contains(&format!("input_partitions={planned_input_partitioned}")),
         "Plan should contain expected input_partitions={planned_input_partitioned}"
     );
+}
+
+async fn explain_physical_plan(ctx: &SessionContext, sql: &str) -> String {
+    let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
+    let explaining_rb = explaining_df.collect().await.unwrap();
+    let explaining_rb = explaining_rb.first().unwrap();
+    get_str_column(explaining_rb, "plan").join("")
 }
 
 async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -432,6 +455,68 @@ mod v8_tests {
     }
 }
 
+mod dispatch_tests {
+    use super::*;
+    use hudi_test::SampleTable::V6Nonpartitioned;
+
+    #[tokio::test]
+    async fn test_parquet_cow_uses_data_source_exec() {
+        let ctx = register_table_direct(&V6Nonpartitioned, empty_options())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT id FROM {}", V6Nonpartitioned.as_ref());
+        let plan = explain_physical_plan(&ctx, &sql).await;
+
+        assert!(
+            plan.contains("DataSourceExec"),
+            "Parquet COW should use DataSourceExec. Plan: {plan}"
+        );
+        assert!(
+            !plan.contains("HudiScanExec"),
+            "Parquet COW should not use HudiScanExec. Plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_mor_read_optimized_uses_data_source_exec() {
+        let base_url = V6Nonpartitioned.url_to_mor_parquet();
+        let ctx = register_uri_as_table(
+            "mor_ro",
+            base_url.as_str(),
+            [(UseReadOptimizedMode.as_ref(), "true")],
+        )
+        .await
+        .unwrap();
+
+        let plan = explain_physical_plan(&ctx, "SELECT id FROM mor_ro").await;
+
+        assert!(
+            plan.contains("DataSourceExec"),
+            "Parquet MOR read-optimized should use DataSourceExec. Plan: {plan}"
+        );
+        assert!(
+            !plan.contains("HudiScanExec"),
+            "Parquet MOR read-optimized should not use HudiScanExec. Plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_mor_snapshot_uses_hudi_scan_exec() {
+        let base_url = V6Nonpartitioned.url_to_mor_parquet();
+        let ctx = register_uri_as_table("mor_snapshot", base_url.as_str(), empty_options())
+            .await
+            .unwrap();
+
+        let plan = explain_physical_plan(&ctx, "SELECT id FROM mor_snapshot").await;
+
+        assert!(
+            plan.contains("HudiScanExec"),
+            "Parquet MOR snapshot should use HudiScanExec. Plan: {plan}"
+        );
+    }
+}
+
 // ============================================================================
 // Lance Table Tests (requires `lance` feature)
 // ============================================================================
@@ -439,7 +524,9 @@ mod v8_tests {
 #[cfg(feature = "lance")]
 mod lance_tests {
     use super::*;
+    use arrow_array::{Float64Array, Int32Array};
     use hudi_test::SampleTable::V9LanceNonpartitioned;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_datafusion_read_lance_cow_table() {
@@ -502,5 +589,43 @@ mod lance_tests {
             plan.contains("HudiScanExec"),
             "Lance table should use HudiScanExec, not DataSourceExec. Plan: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_lance_cow_query_applies_hudi_updates_deletes_and_inserts() {
+        let test_table = V9LanceNonpartitioned;
+        let ctx = register_table_direct(&test_table, empty_options())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT id, score FROM {} ORDER BY id", test_table.as_ref());
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let mut rows = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let scores = batch
+                .column_by_name("score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row_idx in 0..batch.num_rows() {
+                rows.insert(ids.value(row_idx), scores.value(row_idx));
+            }
+        }
+
+        let mut ids = rows.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 5, 6, 7, 8, 9, 10]);
+        assert!(!rows.contains_key(&4));
+        assert!((rows[&1] - 0.96).abs() < 1e-9);
+        assert!((rows[&2] - 0.93).abs() < 1e-9);
+        assert!(rows.contains_key(&9));
+        assert!(rows.contains_key(&10));
     }
 }

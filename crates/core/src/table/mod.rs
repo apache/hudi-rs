@@ -192,17 +192,21 @@ impl Table {
             return Some(estimator);
         }
 
-        // SINGLE point of parquet validation for the estimator concern.
-        if !matches!(
-            self.file_system_view.base_file_format(),
-            BaseFileFormatValue::Parquet
-        ) {
+        let configured_base_file_format =
+            self.file_system_view.configured_base_file_format().ok()?;
+        if configured_base_file_format
+            .as_ref()
+            .is_some_and(|format| !matches!(format, BaseFileFormatValue::Parquet))
+        {
             return None;
         }
 
         let path = self
             .sample_base_file_path_at_or_before(sample_at_timestamp)
             .await?;
+        if !BaseFileFormatValue::Parquet.matches_extension(&path) {
+            return None;
+        }
 
         self.cached_estimator
             .get_or_try_init(|| async {
@@ -917,13 +921,19 @@ impl Table {
             .await
             .ok()?;
 
-        let base_file_format = self.file_system_view.base_file_format();
-        let base_file_suffix = format!(".{}", base_file_format.as_ref());
+        let configured_base_file_format =
+            self.file_system_view.configured_base_file_format().ok()?;
+        if configured_base_file_format
+            .as_ref()
+            .is_some_and(|format| !matches!(format, BaseFileFormatValue::Parquet))
+        {
+            return None;
+        }
         let total_on_disk_size = records
             .values()
             .filter(|record| !record.is_all_partitions())
             .flat_map(|record| record.active_files_with_sizes())
-            .filter(|(name, _)| name.ends_with(&base_file_suffix))
+            .filter(|(name, _)| BaseFileFormatValue::Parquet.matches_extension(name))
             .map(|(_, size)| size)
             .sum::<u64>();
 

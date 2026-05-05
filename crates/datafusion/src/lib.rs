@@ -52,6 +52,7 @@ use crate::util::expr::exprs_to_filters;
 use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
 use hudi_core::config::util::empty_options;
+use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
 
@@ -98,8 +99,10 @@ pub struct HudiDataSource {
     cached_stats: Option<Statistics>,
     /// Number of input partitions for scan planning, extracted from read options.
     input_partitions: usize,
-    /// Base file format for this table, cached at construction.
-    base_file_format: BaseFileFormatValue,
+    /// Read-optimized mode requested when constructing the provider.
+    read_optimized_mode: bool,
+    /// Explicit base file format from table config, if present.
+    base_file_format: Option<BaseFileFormatValue>,
 }
 
 impl std::fmt::Debug for HudiDataSource {
@@ -146,18 +149,35 @@ impl HudiDataSource {
             })?,
             None => 0,
         };
+        let read_optimized_mode: bool = match all_options
+            .iter()
+            .find(|(k, _)| k == UseReadOptimizedMode.as_ref())
+        {
+            Some((_, v)) => v.parse().map_err(|e| {
+                Execution(format!(
+                    "Invalid value '{v}' for {}: {e}",
+                    UseReadOptimizedMode.as_ref()
+                ))
+            })?,
+            None => false,
+        };
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
 
-        let base_file_format: BaseFileFormatValue = {
-            let s: String = table
-                .hudi_configs
-                .get_or_default(HudiTableConfig::BaseFileFormat)
-                .into();
-            s.parse::<BaseFileFormatValue>()
-                .unwrap_or(BaseFileFormatValue::Parquet)
-        };
+        let base_file_format =
+            BaseFileFormatValue::from_configs(&table.hudi_configs).map_err(|e| {
+                Execution(format!(
+                    "Invalid {} config: {e}",
+                    HudiTableConfig::BaseFileFormat.as_ref()
+                ))
+            })?;
+        if matches!(base_file_format, Some(BaseFileFormatValue::HFile)) {
+            return Err(Execution(
+                "HFile is only supported for Hudi metadata tables, not regular DataFusion scans"
+                    .to_string(),
+            ));
+        }
 
         // Cache schema with meta fields at construction for synchronous access
         let schema = table
@@ -207,6 +227,7 @@ impl HudiDataSource {
             partition_schema,
             cached_stats,
             input_partitions,
+            read_optimized_mode,
             base_file_format,
         })
     }
@@ -218,19 +239,56 @@ impl HudiDataSource {
     /// Parquet COW and Parquet MOR read-optimized use ParquetSource for
     /// native row-group/page pruning. Parquet MOR snapshot, Lance, and
     /// all other cases use HudiScanExec.
-    fn use_parquet_source(&self) -> bool {
-        if !matches!(self.base_file_format, BaseFileFormatValue::Parquet) {
-            return false;
+    fn effective_read_optimized(&self) -> bool {
+        self.read_optimized_mode
+    }
+
+    fn scan_read_options(
+        &self,
+        pushdown_filters: Vec<(String, String, String)>,
+        read_optimized: bool,
+    ) -> Result<ReadOptions> {
+        let mut read_options = ReadOptions::new()
+            .with_filters(pushdown_filters)
+            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?;
+        if read_optimized {
+            read_options = read_options.with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
+        }
+        Ok(read_options)
+    }
+
+    fn file_slices_are_parquet(file_slices: &[FileSlice]) -> Result<bool> {
+        for file_slice in file_slices {
+            let relative_path = file_slice.base_file_relative_path().map_err(|e| {
+                Execution(format!(
+                    "Failed to get base file relative path for {file_slice:?} due to {e:?}"
+                ))
+            })?;
+            if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn use_parquet_source(
+        &self,
+        read_options: &ReadOptions,
+        file_slices: &[FileSlice],
+    ) -> Result<bool> {
+        let parquet_base_files = match &self.base_file_format {
+            Some(format) => matches!(format, BaseFileFormatValue::Parquet),
+            None => Self::file_slices_are_parquet(file_slices)?,
+        };
+        if !parquet_base_files {
+            return Ok(false);
         }
         if !self.table.is_mor() {
-            return true;
+            return Ok(true);
         }
-        let is_read_optimized: bool = self
-            .table
-            .hudi_configs
-            .get_or_default(UseReadOptimizedMode)
-            .into();
-        is_read_optimized
+        read_options
+            .is_read_optimized()
+            .map_err(|e| Execution(format!("Invalid read-optimized option: {e}")))
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -354,18 +412,9 @@ impl HudiDataSource {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-        input_partitions: usize,
-        pushdown_filters: Vec<(String, String, String)>,
+        flat_slices: Vec<FileSlice>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let read_options = ReadOptions::new()
-            .with_filters(pushdown_filters)
-            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?
-            .with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
-        let flat_slices = self
-            .table
-            .get_file_slices(&read_options)
-            .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
+        let input_partitions = self.get_input_partitions_for_scan(state);
         let file_slices =
             hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
         let base_url = self.table.base_url();
@@ -430,17 +479,9 @@ impl HudiDataSource {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
         input_partitions: usize,
-        pushdown_filters: Vec<(String, String, String)>,
+        flat_slices: Vec<FileSlice>,
+        read_options: ReadOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let read_options = ReadOptions::new()
-            .with_filters(pushdown_filters)
-            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?;
-
-        let flat_slices = self
-            .table
-            .get_file_slices(&read_options)
-            .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let file_slices =
             hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
 
@@ -467,6 +508,13 @@ impl HudiDataSource {
             projection.cloned(),
             limit,
         )))
+    }
+
+    fn get_input_partitions_for_scan(&self, state: &dyn Session) -> usize {
+        match self.get_input_partitions() {
+            0 => state.config_options().execution.target_partitions,
+            n => n,
+        }
     }
 }
 
@@ -497,10 +545,7 @@ impl TableProvider for HudiDataSource {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.table.register_storage(state.runtime_env().clone());
 
-        let input_partitions = match self.get_input_partitions() {
-            0 => state.config_options().execution.target_partitions,
-            n => n,
-        };
+        let input_partitions = self.get_input_partitions_for_scan(state);
 
         let partition_cols = self.get_partition_columns();
         let partition_filters: Vec<Expr> = filters
@@ -510,19 +555,26 @@ impl TableProvider for HudiDataSource {
             .collect();
         let pushdown_filters = exprs_to_filters(&partition_filters);
 
-        if self.use_parquet_source() {
-            self.scan_parquet(
-                state,
+        let read_optimized = self.effective_read_optimized();
+        let read_options = self.scan_read_options(pushdown_filters, read_optimized)?;
+        let flat_slices = self
+            .table
+            .get_file_slices(&read_options)
+            .await
+            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
+
+        if self.use_parquet_source(&read_options, &flat_slices)? {
+            self.scan_parquet(state, projection, filters, limit, flat_slices)
+                .await
+        } else {
+            self.scan_hudi(
                 projection,
-                filters,
                 limit,
                 input_partitions,
-                pushdown_filters,
+                flat_slices,
+                read_options,
             )
             .await
-        } else {
-            self.scan_hudi(projection, limit, input_partitions, pushdown_filters)
-                .await
         }
     }
 
@@ -657,7 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_with_options_accepts_hfile_format() {
+    async fn test_new_with_options_rejects_hfile_format_for_regular_scan() {
         let result = HudiDataSource::new_with_options(
             V6Nonpartitioned.path_to_cow().as_str(),
             [
@@ -671,9 +723,25 @@ mod tests {
         .await;
 
         assert!(
-            result.is_ok(),
-            "HFile format should be accepted (falls back to Parquet reader)"
+            result.is_err(),
+            "HFile format should be rejected for regular DataFusion scans"
         );
+        assert!(result.unwrap_err().to_string().contains("HFile"));
+    }
+
+    #[tokio::test]
+    async fn test_new_with_options_rejects_invalid_base_file_format_config() {
+        let result = HudiDataSource::new_with_options(
+            V6Nonpartitioned.path_to_cow().as_str(),
+            [
+                (HudiTableConfig::BaseFileFormat.as_ref(), "orc"),
+                (HudiInternalConfig::SkipConfigValidation.as_ref(), "true"),
+            ],
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("orc"));
     }
 
     #[tokio::test]

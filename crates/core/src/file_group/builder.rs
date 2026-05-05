@@ -17,6 +17,7 @@
  * under the License.
  */
 use crate::Result;
+use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
@@ -185,19 +186,39 @@ pub fn replaced_file_groups_from_replace_commit(
 ///
 /// # Arguments
 /// * `records` - Metadata table files partition records (partition_path -> FilesPartitionRecord)
-/// * `base_file_extension` - The base file format extension (e.g., "parquet", "hfile")
+/// * `base_file_extension` - The explicit base file format extension (e.g., "parquet", "hfile")
 /// * `completion_time_view` - View to look up completion timestamps.
 ///
 /// # Returns
 /// A map of partition paths to their FileGroups.
+#[cfg(test)]
 pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
     records: &HashMap<String, FilesPartitionRecord>,
     base_file_extension: &str,
     completion_time_view: &V,
     estimator: Option<&FileStatsEstimator>,
 ) -> Result<DashMap<String, Vec<FileGroup>>> {
+    let configured_format = BaseFileFormatValue::from_str(base_file_extension)?;
+    file_groups_from_files_partition_records_with_format(
+        records,
+        Some(&configured_format),
+        completion_time_view,
+        estimator,
+    )
+}
+
+/// Build FileGroups from metadata-table files records.
+///
+/// If `configured_base_file_format` is `Some`, only that suffix is treated as a
+/// base file. If it is `None`, any known base-file suffix is accepted so tables
+/// without `hoodie.table.base.file.format` can be discovered by extension.
+pub(crate) fn file_groups_from_files_partition_records_with_format<V: CompletionTimeView>(
+    records: &HashMap<String, FilesPartitionRecord>,
+    configured_base_file_format: Option<&BaseFileFormatValue>,
+    completion_time_view: &V,
+    estimator: Option<&FileStatsEstimator>,
+) -> Result<DashMap<String, Vec<FileGroup>>> {
     let file_groups_map = DashMap::new();
-    let base_file_suffix = format!(".{base_file_extension}");
 
     for (partition_path, record) in records {
         // Skip __all_partitions__ record - it lists partition names, not files
@@ -233,7 +254,10 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                     .entry(log_file.file_id.clone())
                     .or_default()
                     .push(log_file);
-            } else if file_name.ends_with(&base_file_suffix) {
+            } else if configured_base_file_format.as_ref().map_or_else(
+                || BaseFileFormatValue::from_extension(file_name).is_some(),
+                |format| format.matches_extension(file_name),
+            ) {
                 // Base file: ends with base file extension
                 let mut base_file = BaseFile::from_str(file_name).map_err(|e| {
                     CoreError::FileGroup(format!(
@@ -1342,6 +1366,37 @@ mod tests {
             let file_groups_map = result.unwrap();
 
             assert_eq!(file_groups_map.len(), 1);
+        }
+
+        #[test]
+        fn test_extension_fallback_accepts_lance_and_parquet_metadata_records() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.lance", 1000, false),
+                    ("file-id-1_0-8-25_20240418173210000.parquet", 2000, false),
+                    ("ignored.txt", 1, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records_with_format(
+                &records,
+                None,
+                &create_layout_v1_view(),
+                None,
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            let extensions: HashSet<_> = file_groups
+                .iter()
+                .flat_map(|fg| fg.file_slices.values())
+                .map(|slice| slice.base_file.extension.as_str())
+                .collect();
+
+            assert_eq!(extensions, HashSet::from(["lance", "parquet"]));
         }
 
         #[test]

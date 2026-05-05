@@ -404,12 +404,8 @@ impl BaseFileFormatValue {
 
     /// Returns true when `path` has this format's base-file suffix.
     pub fn matches_extension(&self, path: &str) -> bool {
-        let suffix = match self {
-            Self::Parquet => ".parquet",
-            Self::HFile => ".hfile",
-            Self::Lance => ".lance",
-        };
-        Self::ends_with_ignore_ascii_case(path, suffix)
+        let suffix = format!(".{}", self.as_ref());
+        Self::ends_with_ignore_ascii_case(path, &suffix)
     }
 
     /// Parse the explicit table base-file format config, if present.
@@ -621,6 +617,34 @@ mod tests {
             BaseFileFormatValue::resolve_from_configs(&configs, Some("file.unknown")).unwrap(),
             BaseFileFormatValue::Parquet
         );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("data/file.HFILE"),
+            Some(BaseFileFormatValue::HFile)
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("data/file.PARQUET"),
+            Some(BaseFileFormatValue::Parquet)
+        );
+        assert_eq!(BaseFileFormatValue::from_extension("data/file.orc"), None);
+        assert_eq!(BaseFileFormatValue::from_extension("data/file"), None);
+    }
+
+    #[test]
+    fn base_file_format_from_configs_distinguishes_missing_and_invalid() {
+        let configs = HudiConfigs::empty();
+        assert_eq!(BaseFileFormatValue::from_configs(&configs).unwrap(), None);
+
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "LANCE")]);
+        assert_eq!(
+            BaseFileFormatValue::from_configs(&configs).unwrap(),
+            Some(BaseFileFormatValue::Lance)
+        );
+
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "orc")]);
+        assert!(matches!(
+            BaseFileFormatValue::from_configs(&configs).unwrap_err(),
+            UnsupportedValue(_)
+        ));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::plan::HudiPlanConfig::ListingParallelism;
-use crate::config::table::HudiTableConfig::BaseFileFormat;
+use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
@@ -75,7 +75,7 @@ impl FileLister {
         completion_time_view: &V,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileGroup>> {
-        let base_file_format: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
+        let configured_base_file_format = BaseFileFormatValue::from_configs(&self.hudi_configs)?;
 
         let listed_file_metadata = self.storage.list_files(Some(partition_path)).await?;
 
@@ -87,8 +87,11 @@ impl FileLister {
                 continue;
             }
 
-            let base_file_extension = format!(".{base_file_format}");
-            if file_metadata.name.ends_with(&base_file_extension) {
+            let is_base_file = configured_base_file_format.as_ref().map_or_else(
+                || BaseFileFormatValue::from_extension(&file_metadata.name).is_some(),
+                |format| format.matches_extension(&file_metadata.name),
+            );
+            if is_base_file {
                 // After excluding the unintended files,
                 // we expect a file that has the base file extension to be a valid base file.
                 let mut base_file = BaseFile::try_from(file_metadata)?;
@@ -240,9 +243,24 @@ impl FileLister {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::config::table::HudiTableConfig::BasePath;
     use crate::table::Table;
+    use crate::timeline::view::TimelineView;
     use hudi_test::SampleTable;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use url::Url;
+
+    fn layout_v1_view() -> TimelineView {
+        TimelineView::new(
+            "99999999999999999".to_string(),
+            None,
+            &[],
+            HashSet::new(),
+            &Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")])),
+        )
+    }
 
     #[tokio::test]
     async fn list_partition_paths_for_nonpartitioned_table() {
@@ -280,5 +298,43 @@ mod test {
                 "byteField=30/shortField=100"
             ])
         )
+    }
+
+    #[tokio::test]
+    async fn list_file_groups_uses_extension_fallback_when_format_config_is_absent() {
+        let temp_dir = tempdir().unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("file-id-0_0-7-24_20240418173200000.lance"),
+            [],
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("file-id-1_0-8-25_20240418173210000.parquet"),
+            [],
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("ignored.txt"), []).unwrap();
+
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let hudi_configs = Arc::new(HudiConfigs::new([(BasePath.as_ref(), base_url.as_str())]));
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
+        let lister = FileLister::new(hudi_configs, storage, PartitionPruner::empty());
+        let view = layout_v1_view();
+
+        let file_groups = lister
+            .list_file_groups_for_partition(EMPTY_PARTITION_PATH, &view, None)
+            .await
+            .unwrap();
+        let extensions: HashSet<_> = file_groups
+            .iter()
+            .flat_map(|fg| fg.file_slices.values())
+            .map(|slice| slice.base_file.extension.as_str())
+            .collect();
+
+        assert_eq!(extensions, HashSet::from(["lance", "parquet"]));
     }
 }

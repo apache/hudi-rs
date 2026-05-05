@@ -25,11 +25,10 @@ use arrow_schema::Schema;
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::BaseFileFormatValue;
-use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::file_group::base_file::reader::BaseFileReader;
-use crate::file_group::builder::file_groups_from_files_partition_records;
+use crate::file_group::builder::file_groups_from_files_partition_records_with_format;
 use crate::file_group::file_slice::FileSlice;
 use crate::metadata::table::records::FilesPartitionRecord;
 use crate::statistics::estimator::FileStatsEstimator;
@@ -51,10 +50,8 @@ pub struct FileSystemView {
 }
 
 impl FileSystemView {
-    pub(crate) fn base_file_format(&self) -> BaseFileFormatValue {
-        let s: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
-        s.parse::<BaseFileFormatValue>()
-            .unwrap_or(BaseFileFormatValue::Parquet)
+    pub(crate) fn configured_base_file_format(&self) -> Result<Option<BaseFileFormatValue>> {
+        Ok(BaseFileFormatValue::from_configs(&self.hudi_configs)?)
     }
 
     pub async fn new(
@@ -100,13 +97,12 @@ impl FileSystemView {
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<()> {
-        let base_file_format = self.base_file_format();
-        let base_file_extension = base_file_format.as_ref();
+        let configured_base_file_format = self.configured_base_file_format()?;
 
         let file_groups_map = if let Some(records) = files_partition_records {
-            file_groups_from_files_partition_records(
+            file_groups_from_files_partition_records_with_format(
                 records,
-                base_file_extension,
+                configured_base_file_format.as_ref(),
                 timeline_view,
                 estimator,
             )?
@@ -136,6 +132,7 @@ impl FileSystemView {
                     file_pruner,
                     table_schema,
                     timeline_view.as_of_timestamp(),
+                    configured_base_file_format.as_ref(),
                 )
                 .await;
             self.partition_to_file_groups
@@ -160,16 +157,16 @@ impl FileSystemView {
         file_pruner: &FilePruner,
         table_schema: &Schema,
         as_of_timestamp: &str,
+        configured_base_file_format: Option<&BaseFileFormatValue>,
     ) -> Vec<FileGroup> {
         if file_pruner.is_empty() {
             return file_groups;
         }
 
-        let base_file_format = self.base_file_format();
         // Footer-based column-stats pruning only applies to Parquet base files.
         // (Separate concern from the FileStatsEstimator parquet check, which lives
         // on Table::get_or_init_estimator.)
-        if !matches!(base_file_format, BaseFileFormatValue::Parquet) {
+        if configured_base_file_format.is_some_and(|f| !matches!(f, BaseFileFormatValue::Parquet)) {
             return file_groups;
         }
 
@@ -189,7 +186,7 @@ impl FileSystemView {
                     }
                 };
 
-                if !base_file_format.matches_extension(&relative_path) {
+                if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
                     retained.push(fg);
                     continue;
                 }
@@ -345,7 +342,7 @@ mod tests {
     use super::*;
     use crate::config::HudiConfigs;
     use crate::config::table::BaseFileFormatValue;
-    use crate::config::table::HudiTableConfig::BasePath;
+    use crate::config::table::HudiTableConfig::{BaseFileFormat, BasePath};
     use crate::expr::filter::Filter;
     use crate::file_group::FileGroup;
     use crate::metadata::table::records::{
@@ -658,7 +655,13 @@ mod tests {
             FileGroup::new_with_base_file_name("fileid_0-0-1_20240418173551906.parquet", "")
                 .unwrap();
         let retained = fs_view
-            .apply_stats_pruning_from_footers(vec![file_group], &file_pruner, &table_schema, &as_of)
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                Some(&BaseFileFormatValue::HFile),
+            )
             .await;
 
         assert_eq!(retained.len(), 1);
@@ -673,7 +676,13 @@ mod tests {
             FileGroup::new_with_base_file_name("fileid_0-0-1_20240418173551906.hfile", "").unwrap();
         let retained = table
             .file_system_view
-            .apply_stats_pruning_from_footers(vec![file_group], &file_pruner, &table_schema, &as_of)
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                None,
+            )
             .await;
 
         assert_eq!(retained.len(), 1);
@@ -845,6 +854,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &as_of,
+                Some(&BaseFileFormatValue::Parquet),
             )
             .await;
 
@@ -863,7 +873,13 @@ mod tests {
         .unwrap();
         let retained = hudi_table
             .file_system_view
-            .apply_stats_pruning_from_footers(vec![file_group], &file_pruner, &table_schema, &as_of)
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                Some(&BaseFileFormatValue::Parquet),
+            )
             .await;
 
         assert!(retained.is_empty());
@@ -886,6 +902,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 "19700101000000",
+                Some(&BaseFileFormatValue::Parquet),
             )
             .await;
 
