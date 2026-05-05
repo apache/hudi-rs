@@ -137,6 +137,10 @@ pub enum SampleTable {
     V9TxnsSimpleNometa,
     V9TxnsSimpleOverwrite,
     V9LanceNonpartitioned,
+    V9LanceNonhivestyle,
+    V9LanceTxnsNonpart,
+    V9LanceTxnsSimple,
+    V9TripsLance,
 }
 
 impl SampleTable {
@@ -273,8 +277,20 @@ mod tests {
                 }
                 SampleTable::V9TimebasedkeygenEpochmillis
                 | SampleTable::V9TimebasedkeygenUnixtimestamp
-                | SampleTable::V9LanceNonpartitioned => {
+                | SampleTable::V9LanceNonpartitioned
+                | SampleTable::V9LanceTxnsNonpart
+                | SampleTable::V9LanceTxnsSimple => {
                     let path = t.zip_path("cow", None);
+                    assert!(path.exists());
+                }
+                SampleTable::V9LanceNonhivestyle => {
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
+                SampleTable::V9TripsLance => {
+                    let path = t.zip_path("cow", None);
+                    assert!(path.exists());
+                    let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }
                 ref table if table.as_ref().starts_with("v9") => {
@@ -297,14 +313,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn v9_lance_nonpartitioned_fixture_contains_only_lance_base_files() {
-        let zip_path = SampleTable::V9LanceNonpartitioned.zip_path("cow", None);
-        let table_dir =
-            extract_test_table(zip_path.as_ref()).join(SampleTable::V9LanceNonpartitioned.as_ref());
-
+    fn assert_lance_fixture_valid(table_dir: &std::path::Path) {
         let mut files = Vec::new();
-        collect_regular_files(&table_dir, &mut files);
+        collect_regular_files(table_dir, &mut files);
 
         assert!(
             files.iter().any(|path| path
@@ -313,9 +324,9 @@ mod tests {
             "Lance fixture should contain .lance base files"
         );
         assert!(
-            files.iter().all(|path| !path
+            files.iter().all(|path| path
                 .extension()
-                .is_some_and(|extension| extension == "parquet")),
+                .is_none_or(|extension| extension != "parquet")),
             "Lance fixture should not contain .parquet files"
         );
         assert!(
@@ -332,5 +343,45 @@ mod tests {
                 .lines()
                 .any(|line| line == "hoodie.table.base.file.format=LANCE")
         );
+    }
+
+    #[test]
+    fn v9_lance_nonpartitioned_fixture_contains_only_lance_base_files() {
+        let zip_path = SampleTable::V9LanceNonpartitioned.zip_path("cow", None);
+        let table_dir =
+            extract_test_table(zip_path.as_ref()).join(SampleTable::V9LanceNonpartitioned.as_ref());
+        assert_lance_fixture_valid(&table_dir);
+    }
+
+    #[test]
+    fn v9_lance_cow_fixtures_are_valid() {
+        for table in [
+            SampleTable::V9LanceTxnsSimple,
+            SampleTable::V9LanceTxnsNonpart,
+            SampleTable::V9TripsLance,
+        ] {
+            let zip_path = table.zip_path("cow", None);
+            let table_dir = extract_test_table(zip_path.as_ref()).join(table.as_ref());
+            assert_lance_fixture_valid(&table_dir);
+        }
+    }
+
+    #[test]
+    fn v9_lance_mor_fixtures_are_valid() {
+        for table in [SampleTable::V9LanceNonhivestyle, SampleTable::V9TripsLance] {
+            let zip_path = table.zip_path("mor", Some("avro"));
+            let table_dir = extract_test_table(zip_path.as_ref()).join(table.as_ref());
+            assert_lance_fixture_valid(&table_dir);
+
+            let mut files = Vec::new();
+            collect_regular_files(&table_dir, &mut files);
+            let has_log_files = files
+                .iter()
+                .any(|path| path.to_string_lossy().contains(".log."));
+            assert!(
+                has_log_files,
+                "MOR Lance fixture {table:?} should contain .log files"
+            );
+        }
     }
 }
