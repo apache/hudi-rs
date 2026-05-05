@@ -328,4 +328,29 @@ mod tests {
 
         assert_eq!(stream_batches[0].schema(), eager.schema());
     }
+
+    #[tokio::test]
+    async fn test_lance_reader_stream_with_projection_schema_matches_batches() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let file_name = lance_base_file_name();
+
+        let opts = BaseFileReadOptions::new().with_projection(["id", "name"]);
+        let stream = reader.read_stream(&file_name, opts).await.unwrap();
+
+        let stream_schema = stream.schema().clone();
+        assert_eq!(stream_schema.fields().len(), 2);
+
+        let mut batches = Vec::new();
+        let mut inner = stream.into_stream();
+        while let Some(batch) = inner.next().await {
+            batches.push(batch.unwrap());
+        }
+
+        assert!(!batches.is_empty());
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 2);
+            assert_eq!(batch.schema().fields(), stream_schema.fields());
+        }
+    }
 }
