@@ -81,7 +81,7 @@ prost = { workspace = true }
 # compression
 flate2 = { workspace = true }
 
-# lance
+# lance (requires Rust 1.91+; the `lance` feature has a higher MSRV than the base crate)
 lance = { version = "4.0.1", optional = true }
 lance-io = { version = "4.0.1", optional = true }
 
