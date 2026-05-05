@@ -219,7 +219,18 @@ impl HudiDataSource {
     /// native row-group/page pruning. Parquet MOR snapshot, Lance, and
     /// all other cases use HudiScanExec.
     fn use_parquet_source(&self) -> bool {
-        matches!(self.base_file_format, BaseFileFormatValue::Parquet) && !self.table.is_mor()
+        if !matches!(self.base_file_format, BaseFileFormatValue::Parquet) {
+            return false;
+        }
+        if !self.table.is_mor() {
+            return true;
+        }
+        let is_read_optimized: bool = self
+            .table
+            .hudi_configs
+            .get_or_default(UseReadOptimizedMode)
+            .into();
+        is_read_optimized
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
