@@ -25,10 +25,8 @@ use strum_macros::{AsRefStr, EnumIter, IntoStaticStr};
 
 use crate::config::Result;
 use crate::config::error::ConfigError;
-use crate::config::error::ConfigError::{
-    InvalidValue, NotFound, ParseBool, ParseInt, UnsupportedValue,
-};
-use crate::config::{ConfigParser, HudiConfigValue};
+use crate::config::error::ConfigError::{InvalidValue, ParseBool, ParseInt, UnsupportedValue};
+use crate::config::{ConfigAlias, ConfigParser, HudiConfigValue};
 use crate::merge::RecordMergeStrategyValue;
 
 /// Configurations for Hudi tables, most of them are persisted in `hoodie.properties`.
@@ -211,15 +209,23 @@ impl ConfigParser for HudiTableConfig {
         }
     }
 
+    fn aliases(&self) -> &[ConfigAlias] {
+        match self {
+            Self::PrecombineField => {
+                const ALIASES: &[ConfigAlias] =
+                    &[ConfigAlias::new("hoodie.table.ordering.fields")];
+                ALIASES
+            }
+            _ => &[],
+        }
+    }
+
     fn is_required(&self) -> bool {
         matches!(self, Self::TableName | Self::TableType | Self::TableVersion)
     }
 
     fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
-        let get_result = configs
-            .get(self.as_ref())
-            .map(|v| v.as_str())
-            .ok_or(NotFound(self.key()));
+        let get_result = self.resolve_raw_value(configs);
 
         match self {
             Self::BaseFileFormat => get_result
@@ -308,7 +314,10 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    if !configs.contains_key(HudiTableConfig::PrecombineField.as_ref()) {
+                    if HudiTableConfig::PrecombineField
+                        .parse_value(configs)
+                        .is_err()
+                    {
                         // When precombine field is not available, we treat the table as append-only
                         return HudiConfigValue::String(
                             RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
@@ -571,6 +580,28 @@ mod tests {
         assert_eq!(
             actual,
             RecordMergeStrategyValue::OverwriteWithLatest.as_ref()
+        );
+    }
+
+    #[test]
+    fn test_ordering_fields_alias_for_precombine() {
+        let ordering_fields_key = HudiTableConfig::PrecombineField.aliases()[0].key;
+        let hudi_configs = HudiConfigs::new(vec![
+            (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
+            (ordering_fields_key, "ts"),
+        ]);
+        let actual: String = hudi_configs
+            .get(HudiTableConfig::PrecombineField)
+            .unwrap()
+            .into();
+        assert_eq!(actual, "ts");
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
+        assert_eq!(
+            actual,
+            RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
+            "Should derive overwrite-with-latest from v9 ordering fields"
         );
     }
 }

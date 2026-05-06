@@ -40,6 +40,28 @@ pub use read_options::{QueryType, ReadOptions};
 
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
+/// An alternative key for a configuration, optionally marked as deprecated.
+pub struct ConfigAlias {
+    pub key: &'static str,
+    pub deprecated: bool,
+}
+
+impl ConfigAlias {
+    pub const fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            deprecated: false,
+        }
+    }
+
+    pub const fn deprecated(key: &'static str) -> Self {
+        Self {
+            key,
+            deprecated: true,
+        }
+    }
+}
+
 /// This defines some common APIs for working with configurations in Hudi.
 pub trait ConfigParser: AsRef<str> {
     /// Configuration value type.
@@ -52,9 +74,34 @@ pub trait ConfigParser: AsRef<str> {
         self.as_ref().to_string()
     }
 
+    /// Returns alternative keys for this configuration.
+    fn aliases(&self) -> &[ConfigAlias] {
+        &[]
+    }
+
     /// To indicate if the configuration is required or not, this helps in validation.
     fn is_required(&self) -> bool {
         false
+    }
+
+    /// Resolve the raw string value from configs, checking the primary key first, then aliases.
+    fn resolve_raw_value<'a>(&self, configs: &'a HashMap<String, String>) -> Result<&'a str> {
+        if let Some(v) = configs.get(self.as_ref()) {
+            return Ok(v.as_str());
+        }
+        for alias in self.aliases() {
+            if let Some(v) = configs.get(alias.key) {
+                if alias.deprecated {
+                    log::warn!(
+                        "Config '{}' is deprecated; use '{}' instead",
+                        alias.key,
+                        self.as_ref()
+                    );
+                }
+                return Ok(v.as_str());
+            }
+        }
+        Err(NotFound(self.key()))
     }
 
     /// Validate the configuration by parsing the given [String] value and check if it is required.
