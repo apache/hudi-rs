@@ -25,15 +25,17 @@ use std::sync::Arc;
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
-use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::TryStreamExt;
+use futures::future::BoxFuture;
+use futures::stream::{self, BoxStream};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, parse_url_opts};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
+use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -427,7 +429,30 @@ impl Storage {
     }
 }
 
+/// Predicate evaluated for each child directory during recursive descent.
+///
+/// Returning `false` prunes the entire subtree rooted at that child — no
+/// further `list_dirs` calls happen under it. The path is relative to the
+/// storage base (the same form returned by [`get_leaf_dirs`]).
+pub type LeafDirPredicate<'a> = &'a (dyn Fn(&str) -> bool + Send + Sync);
+
 /// Get relative paths of leaf directories under a given directory.
+///
+/// Walks subdirectories concurrently. Total in-flight `list_dirs` calls are
+/// globally bounded by `parallelism` via a [`Semaphore`] shared across the
+/// whole descent — recursion does not multiply concurrency. An optional
+/// `predicate` prunes subtrees that cannot match (e.g., partition pruning
+/// during file listing); subtrees rejected by the predicate are skipped
+/// without listing their contents.
+///
+/// # Parameters
+/// - `subdir`: starting directory relative to the storage base. `None` walks
+///   from the root.
+/// - `predicate`: if `Some`, called with each child path; subtrees where the
+///   predicate returns `false` are pruned.
+/// - `parallelism`: global upper bound on concurrent `list_dirs` calls
+///   across all recursion levels. Values `< 1` are clamped to 1 (sequential
+///   descent).
 ///
 /// **Example**
 /// - /usr/hudi/table_name
@@ -435,28 +460,79 @@ impl Storage {
 /// - /usr/hudi/table_name/dt=2024/month=01/day=01
 /// - /usr/hudi/table_name/dt=2025/month=02
 ///
-/// the result is \[".hoodie", "dt=2024/mont=01/day=01", "dt=2025/month=02"\]
-#[async_recursion]
-pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Vec<String>> {
-    let mut leaf_dirs = Vec::new();
-    let child_dirs = storage.list_dirs(subdir).await?;
-    if child_dirs.is_empty() {
-        leaf_dirs.push(subdir.unwrap_or_default().to_owned());
-    } else {
-        for child_dir in child_dirs {
-            let mut next_subdir = PathBuf::new();
-            if let Some(curr) = subdir {
-                next_subdir.push(curr);
-            }
-            next_subdir.push(child_dir);
-            let next_subdir = next_subdir
-                .to_str()
-                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {next_subdir:?}")))?;
-            let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
-            leaf_dirs.extend(curr_leaf_dir);
+/// the result is \[".hoodie", "dt=2024/month=01/day=01", "dt=2025/month=02"\]
+pub fn get_leaf_dirs<'a>(
+    storage: &'a Storage,
+    subdir: Option<&'a str>,
+    predicate: Option<LeafDirPredicate<'a>>,
+    parallelism: usize,
+) -> BoxFuture<'a, Result<Vec<String>>> {
+    let parallelism = parallelism.max(1);
+    let sem = Arc::new(Semaphore::new(parallelism));
+    get_leaf_dirs_inner(
+        storage,
+        subdir.map(String::from),
+        predicate,
+        parallelism,
+        sem,
+    )
+}
+
+fn get_leaf_dirs_inner<'a>(
+    storage: &'a Storage,
+    subdir: Option<String>,
+    predicate: Option<LeafDirPredicate<'a>>,
+    parallelism: usize,
+    sem: Arc<Semaphore>,
+) -> BoxFuture<'a, Result<Vec<String>>> {
+    Box::pin(async move {
+        // Acquire permit before issuing the list_dirs; release before
+        // recursing so children compete for the same global budget.
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            // The semaphore is private to this descent and never closed.
+            Err(_) => unreachable!("get_leaf_dirs semaphore is owned by the descent"),
+        };
+        let child_dirs = storage.list_dirs(subdir.as_deref()).await?;
+        drop(permit);
+
+        if child_dirs.is_empty() {
+            return Ok(vec![subdir.unwrap_or_default()]);
         }
-    }
-    Ok(leaf_dirs)
+
+        let mut next_subdirs: Vec<String> = Vec::with_capacity(child_dirs.len());
+        for child_dir in child_dirs {
+            let mut path = PathBuf::new();
+            if let Some(curr) = subdir.as_deref() {
+                path.push(curr);
+            }
+            path.push(&child_dir);
+            let next = path
+                .to_str()
+                .ok_or_else(|| InvalidPath(format!("Failed to convert path: {path:?}")))?
+                .to_owned();
+            if predicate.map(|p| p(&next)).unwrap_or(true) {
+                next_subdirs.push(next);
+            }
+        }
+
+        if next_subdirs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The semaphore caps actual list_dirs concurrency; buffer_unordered
+        // here only bounds memory of pending recursive futures per level.
+        stream::iter(next_subdirs)
+            .map(move |path| {
+                get_leaf_dirs_inner(storage, Some(path), predicate, parallelism, sem.clone())
+            })
+            .buffer_unordered(parallelism)
+            .try_fold(Vec::new(), |mut acc, mut sub| async move {
+                acc.append(&mut sub);
+                Ok::<_, StorageError>(acc)
+            })
+            .await
+    })
 }
 
 #[cfg(test)]
@@ -596,7 +672,8 @@ mod tests {
         )
         .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
+        let mut leaf_dirs = get_leaf_dirs(&storage, None, None, 1).await.unwrap();
+        leaf_dirs.sort();
         assert_eq!(
             leaf_dirs,
             vec![".hoodie", "part1", "part2/part22", "part3/part32/part33"]
@@ -609,11 +686,50 @@ mod tests {
             Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
+        let leaf_dirs = get_leaf_dirs(&storage, None, None, 1).await.unwrap();
         assert_eq!(
             leaf_dirs,
             vec![""],
             "Listing a leaf dir should get the relative path to itself."
+        );
+    }
+
+    #[tokio::test]
+    async fn get_leaf_dirs_descends_in_parallel_and_returns_all_leaves() {
+        let base_url = Url::from_directory_path(
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
+        )
+        .unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let mut leaf_dirs = get_leaf_dirs(&storage, None, None, 8).await.unwrap();
+        leaf_dirs.sort();
+        assert_eq!(
+            leaf_dirs,
+            vec![".hoodie", "part1", "part2/part22", "part3/part32/part33"],
+            "Parallel descent must yield the same set of leaves as sequential."
+        );
+    }
+
+    #[tokio::test]
+    async fn get_leaf_dirs_predicate_prunes_subtree() {
+        let base_url = Url::from_directory_path(
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
+        )
+        .unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let predicate = |path: &str| -> bool {
+            let top = path.split('/').next().unwrap_or("");
+            top != ".hoodie" && top != "part3"
+        };
+        let predicate_ref: LeafDirPredicate<'_> = &predicate;
+        let mut leaf_dirs = get_leaf_dirs(&storage, None, Some(predicate_ref), 4)
+            .await
+            .unwrap();
+        leaf_dirs.sort();
+        assert_eq!(
+            leaf_dirs,
+            vec!["part1", "part2/part22"],
+            "Subtrees rejected by the predicate must not appear in the output."
         );
     }
 

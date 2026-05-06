@@ -26,7 +26,7 @@ use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
 use crate::metadata::LAKE_FORMAT_METADATA_DIRS;
 use crate::statistics::estimator::FileStatsEstimator;
-use crate::storage::{Storage, get_leaf_dirs};
+use crate::storage::{LeafDirPredicate, Storage, get_leaf_dirs};
 use crate::table::partition::{
     EMPTY_PARTITION_PATH, PARTITION_METAFIELD_PREFIX, PartitionPruner, is_table_partitioned,
 };
@@ -168,26 +168,36 @@ impl FileLister {
             return Ok(vec![EMPTY_PARTITION_PATH.to_string()]);
         }
 
-        let top_level_dirs: Vec<String> = self
-            .storage
-            .list_dirs(None)
-            .await?
-            .into_iter()
-            .filter(|dir| !LAKE_FORMAT_METADATA_DIRS.contains(&dir.as_str()))
-            .collect();
+        let parallelism: usize = self.hudi_configs.get_or_default(ListingParallelism).into();
+        let pruner = &self.partition_pruner;
+        let pruner_is_empty = pruner.is_empty();
+        let predicate = move |path: &str| -> bool {
+            // Skip table-format metadata dirs (.hoodie, _delta_log, metadata)
+            // anywhere in the descent — they live at the table root in
+            // practice, so a top-level segment match is sufficient.
+            let top = path.split('/').next().unwrap_or("");
+            if LAKE_FORMAT_METADATA_DIRS.contains(&top) {
+                return false;
+            }
+            if pruner_is_empty {
+                return true;
+            }
+            pruner.should_include_prefix(path)
+        };
+        let predicate_ref: LeafDirPredicate<'_> = &predicate;
 
-        let mut partition_paths = Vec::new();
-        for dir in top_level_dirs {
-            partition_paths.extend(get_leaf_dirs(&self.storage, Some(&dir)).await?);
-        }
+        let partition_paths =
+            get_leaf_dirs(&self.storage, None, Some(predicate_ref), parallelism).await?;
 
-        if partition_paths.is_empty() || self.partition_pruner.is_empty() {
+        if pruner_is_empty {
             return Ok(partition_paths);
         }
-
+        // Final leaf filter for cases the prefix predicate must conservatively
+        // admit (single _hoodie_partition_path field with timestamp-based
+        // keygen): the filter compares the full leaf path string.
         Ok(partition_paths
             .into_iter()
-            .filter(|path_str| self.partition_pruner.should_include(path_str))
+            .filter(|p| pruner.should_include(p))
             .collect())
     }
 
@@ -240,6 +250,7 @@ impl FileLister {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::expr::filter::Filter;
     use crate::table::Table;
     use hudi_test::SampleTable;
     use std::collections::HashSet;
@@ -279,6 +290,60 @@ mod test {
                 "byteField=20/shortField=100",
                 "byteField=30/shortField=100"
             ])
+        )
+    }
+
+    #[tokio::test]
+    async fn list_partition_paths_prunes_subtrees_when_top_level_filter_rejects() {
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let fs_view = &hudi_table.file_system_view;
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let pruner = PartitionPruner::new(
+            &[Filter::try_from(("byteField", "<", "20")).unwrap()],
+            &partition_schema,
+            hudi_table.hudi_configs.as_ref(),
+        )
+        .unwrap();
+        let lister = FileLister::new(
+            fs_view.hudi_configs.clone(),
+            fs_view.storage.clone(),
+            pruner,
+        );
+        let partition_paths = lister.list_relevant_partition_paths().await.unwrap();
+        let partition_path_set: HashSet<&str> =
+            HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
+        // byteField=20 and byteField=30 should be pruned at level 1 — their
+        // shortField subdirs must never be listed.
+        assert_eq!(
+            partition_path_set,
+            HashSet::from_iter(vec!["byteField=10/shortField=300"])
+        )
+    }
+
+    #[tokio::test]
+    async fn list_partition_paths_prunes_at_deeper_level_when_only_inner_field_filtered() {
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let fs_view = &hudi_table.file_system_view;
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let pruner = PartitionPruner::new(
+            &[Filter::try_from(("shortField", "=", "300")).unwrap()],
+            &partition_schema,
+            hudi_table.hudi_configs.as_ref(),
+        )
+        .unwrap();
+        let lister = FileLister::new(
+            fs_view.hudi_configs.clone(),
+            fs_view.storage.clone(),
+            pruner,
+        );
+        let partition_paths = lister.list_relevant_partition_paths().await.unwrap();
+        let partition_path_set: HashSet<&str> =
+            HashSet::from_iter(partition_paths.iter().map(|p| p.as_str()));
+        assert_eq!(
+            partition_path_set,
+            HashSet::from_iter(vec!["byteField=10/shortField=300"])
         )
     }
 }
