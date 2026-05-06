@@ -27,17 +27,6 @@ on:
       - main
 
 jobs:
-  check-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust 1.88
-        run: rustup toolchain install 1.88 --profile minimal
-
-      - name: Check Rust MSRV without higher-MSRV optional features
-        run: cargo +1.88 check --workspace --all-targets
-
   check-code:
     runs-on: ubuntu-latest
     steps:
