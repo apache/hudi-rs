@@ -25,6 +25,9 @@ use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{
     Filter, SchemableFilter, filters_to_row_mask, validate_fields_against_schemas,
 };
+use crate::file_group::base_file::reader::{
+    self as base_file_reader, BaseFileReadOptions, BaseFileReader,
+};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
@@ -33,7 +36,7 @@ use crate::merge::record_merger::RecordMerger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
-use crate::storage::{ParquetReadOptions, Storage};
+use crate::storage::Storage;
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
@@ -48,10 +51,20 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 
 /// The reader that handles all read operations against a file group.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FileGroupReader {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    base_file_reader: Option<Arc<dyn BaseFileReader>>,
+}
+
+impl std::fmt::Debug for FileGroupReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileGroupReader")
+            .field("hudi_configs", &self.hudi_configs)
+            .field("storage", &self.storage)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileGroupReader {
@@ -74,10 +87,13 @@ impl FileGroupReader {
         final_opts.extend(extra_hudi_opts);
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
         let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
+        let format = base_file_reader::resolve_base_file_format(&hudi_configs, None)?;
+        let base_file_reader = base_file_reader::create_base_file_reader(&storage, &format).ok();
 
         Ok(Self {
             hudi_configs,
             storage,
+            base_file_reader,
         })
     }
 
@@ -99,10 +115,13 @@ impl FileGroupReader {
         resolver.resolve_options().await?;
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
         let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+        let format = base_file_reader::resolve_base_file_format(&hudi_configs, None)?;
+        let base_file_reader = base_file_reader::create_base_file_reader(&storage, &format).ok();
 
         Ok(Self {
             hudi_configs,
             storage,
+            base_file_reader,
         })
     }
 
@@ -110,13 +129,32 @@ impl FileGroupReader {
         options.with_defaults_from(&self.hudi_configs)
     }
 
+    /// Returns the base file reader for a given path. When the table config
+    /// explicitly sets the format, returns the cached reader. Otherwise falls
+    /// back to extension-based detection.
+    fn reader_for_path(&self, relative_path: &str) -> Result<Arc<dyn BaseFileReader>> {
+        if self
+            .hudi_configs
+            .contains(HudiTableConfig::BaseFileFormat.as_ref())
+        {
+            return self.base_file_reader.clone().ok_or_else(|| {
+                ReadFileSliceError(format!("No base file reader available for {relative_path}"))
+            });
+        }
+
+        let format =
+            base_file_reader::resolve_base_file_format(&self.hudi_configs, Some(relative_path))?;
+        base_file_reader::create_base_file_reader(&self.storage, &format)
+            .map_err(|e| ReadFileSliceError(format!("{e}")))
+    }
+
     /// Internal: read base file + apply commit-time filter, no [`ReadOptions`] applied.
     /// Used by the merge path so options aren't applied prematurely before merging
     /// with log files.
     async fn read_base_file_eager(&self, relative_path: &str) -> Result<RecordBatch> {
-        let records: RecordBatch = self
-            .storage
-            .get_parquet_file_data(relative_path)
+        let reader = self.reader_for_path(relative_path)?;
+        let records: RecordBatch = reader
+            .read_data(relative_path, BaseFileReadOptions::new())
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
             .await?;
         apply_commit_time_filter(&self.hudi_configs, records)
@@ -325,7 +363,7 @@ impl FileGroupReader {
     ///
     /// Supports the following [ReadOptions]:
     /// - `batch_size`: Controls the number of rows per batch
-    /// - `projection`: Pushes column selection to the parquet reader level
+    /// - `projection`: Pushes column selection to the base-file reader level
     /// - `filters`: Applied as a row-level mask after reading each batch (in addition to
     ///   any pruning that already happened upstream)
     async fn read_base_file_stream(
@@ -338,9 +376,9 @@ impl FileGroupReader {
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
         let batch_size = options.batch_size()?.unwrap_or(default_batch_size);
-        let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
+        let mut read_options = BaseFileReadOptions::new().with_batch_size(batch_size);
 
-        // If projection is set, widen the parquet read to also include any columns
+        // If projection is set, widen the base file read to also include any columns
         // we need post-read but the user didn't request:
         //   - filter fields, so the row-level mask can evaluate them
         //   - `_hoodie_commit_time`, when commit-time filtering is active
@@ -396,7 +434,7 @@ impl FileGroupReader {
             combined
         });
         if let Some(ref cols) = read_projection {
-            parquet_options = parquet_options.with_projection(cols.clone());
+            read_options = read_options.with_projection(cols.clone());
         }
 
         let hudi_configs = self.hudi_configs.clone();
@@ -407,14 +445,14 @@ impl FileGroupReader {
         // rather than silent no-ops in `filters_to_row_mask`.
         let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let parquet_stream = self
-            .storage
-            .get_parquet_file_stream(&path, parquet_options)
+        let reader = self.reader_for_path(&path)?;
+        let base_stream = reader
+            .read_stream(&path, read_options)
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
         // Apply filtering: commit time → structured filters → final projection.
-        let stream = parquet_stream.into_stream().filter_map(move |result| {
+        let stream = base_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
             let final_projection = final_projection.clone();

@@ -16,6 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod parquet;
+pub mod reader;
+
 use crate::Result;
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;

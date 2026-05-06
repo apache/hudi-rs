@@ -17,8 +17,10 @@
  * under the License.
  */
 use crate::avro_to_arrow::to_arrow_schema;
+use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig;
 use crate::error::{CoreError, Result};
+use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::schema::{prepend_meta_fields, prepend_meta_fields_to_avro_schema_str};
 use crate::storage::Storage;
@@ -142,9 +144,11 @@ async fn resolve_schema_from_base_file(
 
     // Try to get the base file path from either 'path' or 'baseFile' field
     if let Some(path) = &first_stat.path
-        && path.ends_with(".parquet")
+        && BaseFileFormatValue::from_extension(path) == Some(BaseFileFormatValue::Parquet)
     {
-        return Ok(storage.get_file_schema(path).await?);
+        return Ok(ParquetBaseFileReader::new(storage.clone())
+            .get_schema(path)
+            .await?);
     }
 
     // Handle deltacommit case with baseFile
@@ -159,7 +163,11 @@ async fn resolve_schema_from_base_file(
                 "Failed to resolve the latest schema: invalid file path".to_string(),
             )
         })?;
-        return Ok(storage.get_file_schema(path).await?);
+        if BaseFileFormatValue::from_extension(path) == Some(BaseFileFormatValue::Parquet) {
+            return Ok(ParquetBaseFileReader::new(storage.clone())
+                .get_schema(path)
+                .await?);
+        }
     }
 
     Err(CoreError::CommitMetadata(

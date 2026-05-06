@@ -360,6 +360,63 @@ pub enum BaseFileFormatValue {
     HFile,
 }
 
+impl BaseFileFormatValue {
+    fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+        let s_bytes = s.as_bytes();
+        let suffix_bytes = suffix.as_bytes();
+        s_bytes.len() >= suffix_bytes.len()
+            && s_bytes[s_bytes.len() - suffix_bytes.len()..].eq_ignore_ascii_case(suffix_bytes)
+    }
+
+    /// Detect format from a file extension, returning `None` if unrecognized.
+    pub fn from_extension(path: &str) -> Option<Self> {
+        if Self::ends_with_ignore_ascii_case(path, ".parquet") {
+            Some(Self::Parquet)
+        } else if Self::ends_with_ignore_ascii_case(path, ".hfile") {
+            Some(Self::HFile)
+        } else {
+            None
+        }
+    }
+
+    /// Returns true when `path` has this format's base-file suffix.
+    pub fn matches_extension(&self, path: &str) -> bool {
+        let suffix = format!(".{}", self.as_ref());
+        Self::ends_with_ignore_ascii_case(path, &suffix)
+    }
+
+    /// Parse the explicit table base-file format config, if present.
+    ///
+    /// Missing config returns `Ok(None)` so callers can choose a default or use
+    /// extension-based detection. Invalid or unsupported configured values are
+    /// returned as errors.
+    pub fn from_configs(configs: &crate::config::HudiConfigs) -> Result<Option<Self>, ConfigError> {
+        if !configs.contains(HudiTableConfig::BaseFileFormat.as_ref()) {
+            return Ok(None);
+        }
+
+        let value = configs.get(HudiTableConfig::BaseFileFormat)?;
+        let canonical: String = value.into();
+        Self::from_str(&canonical).map(Some)
+    }
+
+    /// Resolve format from explicit config, then extension, then the Hudi default.
+    pub fn resolve_from_configs(
+        configs: &crate::config::HudiConfigs,
+        file_path: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        if let Some(configured) = Self::from_configs(configs)? {
+            return Ok(configured);
+        }
+        if let Some(path) = file_path
+            && let Some(format) = Self::from_extension(path)
+        {
+            return Ok(format);
+        }
+        Ok(Self::Parquet)
+    }
+}
+
 impl FromStr for BaseFileFormatValue {
     type Err = ConfigError;
 
@@ -470,6 +527,72 @@ mod tests {
             BaseFileFormatValue::from_str("orc").unwrap_err(),
             UnsupportedValue(_)
         ));
+    }
+
+    #[test]
+    fn base_file_format_from_extension() {
+        assert_eq!(
+            BaseFileFormatValue::from_extension("partition/file.parquet"),
+            Some(BaseFileFormatValue::Parquet)
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("partition/file.PARQUET"),
+            Some(BaseFileFormatValue::Parquet)
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("partition/file.hfile"),
+            Some(BaseFileFormatValue::HFile)
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("partition/file.log"),
+            None
+        );
+    }
+
+    #[test]
+    fn base_file_format_matches_extension() {
+        assert!(BaseFileFormatValue::Parquet.matches_extension("file.PARQUET"));
+        assert!(BaseFileFormatValue::HFile.matches_extension("file.hfile"));
+        assert!(!BaseFileFormatValue::Parquet.matches_extension("file.hfile"));
+    }
+
+    #[test]
+    fn base_file_format_from_configs() {
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "hfile")]);
+        assert_eq!(
+            BaseFileFormatValue::from_configs(&configs).unwrap(),
+            Some(BaseFileFormatValue::HFile)
+        );
+
+        assert_eq!(
+            BaseFileFormatValue::from_configs(&HudiConfigs::empty()).unwrap(),
+            None
+        );
+
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "orc")]);
+        assert!(matches!(
+            BaseFileFormatValue::from_configs(&configs).unwrap_err(),
+            UnsupportedValue(_)
+        ));
+    }
+
+    #[test]
+    fn base_file_format_resolve_from_configs() {
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "parquet")]);
+        assert_eq!(
+            BaseFileFormatValue::resolve_from_configs(&configs, Some("file.hfile")).unwrap(),
+            BaseFileFormatValue::Parquet
+        );
+
+        let configs = HudiConfigs::empty();
+        assert_eq!(
+            BaseFileFormatValue::resolve_from_configs(&configs, Some("file.hfile")).unwrap(),
+            BaseFileFormatValue::HFile
+        );
+        assert_eq!(
+            BaseFileFormatValue::resolve_from_configs(&configs, Some("file.unknown")).unwrap(),
+            BaseFileFormatValue::Parquet
+        );
     }
 
     #[test]

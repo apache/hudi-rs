@@ -27,6 +27,8 @@ use crate::config::HudiConfigs;
 use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::file_group::FileGroup;
+use crate::file_group::base_file::parquet::ParquetBaseFileReader;
+use crate::file_group::base_file::reader::BaseFileReader;
 use crate::file_group::builder::file_groups_from_files_partition_records;
 use crate::file_group::file_slice::FileSlice;
 use crate::metadata::table::records::FilesPartitionRecord;
@@ -53,14 +55,6 @@ impl FileSystemView {
         let s: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
         s.parse::<BaseFileFormatValue>()
             .unwrap_or(BaseFileFormatValue::Parquet)
-    }
-
-    /// Case-insensitive ASCII suffix check that avoids allocating a lowercased copy of `s`.
-    fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
-        let s_bytes = s.as_bytes();
-        let suffix_bytes = suffix.as_bytes();
-        s_bytes.len() >= suffix_bytes.len()
-            && s_bytes[s_bytes.len() - suffix_bytes.len()..].eq_ignore_ascii_case(suffix_bytes)
     }
 
     pub async fn new(
@@ -178,7 +172,6 @@ impl FileSystemView {
         if !matches!(base_file_format, BaseFileFormatValue::Parquet) {
             return file_groups;
         }
-        let base_file_suffix = format!(".{}", base_file_format.as_ref());
 
         let mut retained = Vec::with_capacity(file_groups.len());
 
@@ -195,16 +188,16 @@ impl FileSystemView {
                     }
                 };
 
-                // Case-insensitive check for configured base file extension.
-                if !Self::ends_with_ignore_ascii_case(&relative_path, &base_file_suffix) {
+                if !base_file_format.matches_extension(&relative_path) {
                     retained.push(fg);
                     continue;
                 }
 
-                let (file_metadata, col_stats) = match self
-                    .storage
-                    .get_file_metadata_and_stats(&relative_path, table_schema)
-                    .await
+                let (file_metadata, col_stats) = match ParquetBaseFileReader::new(
+                    self.storage.clone(),
+                )
+                .get_metadata_and_stats(&relative_path, table_schema)
+                .await
                 {
                     Ok(result) => result,
                     Err(e) => {

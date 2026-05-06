@@ -34,6 +34,9 @@ pub enum StorageError {
     #[error("Invalid column: {0}")]
     InvalidColumn(String),
 
+    #[error("Unsupported base file format: {0}")]
+    UnsupportedBaseFileFormat(String),
+
     #[error(transparent)]
     ObjectStoreError(#[from] object_store::Error),
 

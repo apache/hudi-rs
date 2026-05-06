@@ -22,26 +22,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
-use arrow::record_batch::RecordBatch;
-use arrow_schema::SchemaRef;
 use async_recursion::async_recursion;
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::BoxStream;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, parse_url_opts};
-use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
-use parquet::file::metadata::ParquetMetaData;
 use url::Url;
 
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
-use crate::statistics::StatisticsContainer;
 
-use crate::storage::error::StorageError::{Creation, InvalidPath};
-use crate::storage::error::{Result, StorageError};
+use crate::storage::error::Result;
+use crate::storage::error::StorageError::{self, Creation, InvalidPath};
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
 use crate::storage::util::join_url_segments;
@@ -50,75 +41,6 @@ pub mod error;
 pub mod file_metadata;
 pub mod reader;
 pub mod util;
-
-/// Options for reading Parquet files with streaming.
-#[derive(Clone, Debug, Default)]
-pub struct ParquetReadOptions {
-    /// Target batch size (number of rows per batch).
-    pub batch_size: Option<usize>,
-    /// Column projection by names.
-    pub projection: Option<Vec<String>>,
-}
-
-impl ParquetReadOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = Some(batch_size);
-        self
-    }
-
-    /// Sets column projection by column names.
-    pub fn with_projection<I, S>(mut self, columns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.projection = Some(columns.into_iter().map(|s| s.into()).collect());
-        self
-    }
-}
-
-/// A stream of record batches from a Parquet file with its schema.
-///
-/// # Implementation Note
-///
-/// This struct uses a `BoxStream` internally, which requires a heap allocation per file.
-/// For high-performance scenarios with many small files, this adds minimal overhead since:
-/// - Batch processing amortizes the allocation cost (each batch may contain thousands of rows)
-/// - The streaming benefit (lazy evaluation, reduced memory) outweighs the Box allocation cost
-/// - For typical parquet files (>10MB), the Box overhead (~40-80 bytes) is negligible
-pub struct ParquetFileStream {
-    schema: SchemaRef,
-    stream: BoxStream<'static, std::result::Result<RecordBatch, parquet::errors::ParquetError>>,
-}
-
-impl ParquetFileStream {
-    /// Returns the Arrow schema of the Parquet file.
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    /// Consumes self and returns the inner stream.
-    pub fn into_stream(
-        self,
-    ) -> BoxStream<'static, std::result::Result<RecordBatch, parquet::errors::ParquetError>> {
-        self.stream
-    }
-}
-
-impl futures::Stream for ParquetFileStream {
-    type Item = std::result::Result<RecordBatch, parquet::errors::ParquetError>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.stream.as_mut().poll_next(cx)
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -193,83 +115,6 @@ impl Storage {
         Ok(FileMetadata::new(name.to_string(), meta.size))
     }
 
-    /// Get the Arrow schema from a base file.
-    ///
-    /// Currently supports Parquet only; other formats (e.g., Lance) can be added.
-    pub async fn get_file_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
-        let parquet_meta = self.get_parquet_file_metadata(relative_path).await?;
-        Ok(parquet_to_arrow_schema(
-            parquet_meta.file_metadata().schema_descr(),
-            None,
-        )?)
-    }
-
-    /// Read a Parquet file's footer and return the raw metadata.
-    ///
-    /// Internal API for callers that need raw row group details (estimator
-    /// sampling). Most callers should use [`Self::get_file_schema`] or
-    /// [`Self::get_file_metadata_and_stats`] instead.
-    pub(crate) async fn get_parquet_file_metadata(
-        &self,
-        relative_path: &str,
-    ) -> Result<ParquetMetaData> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        let obj_store = self.object_store.clone();
-        let meta = obj_store.head(&obj_path).await?;
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-        Ok(builder.metadata().as_ref().clone())
-    }
-
-    /// Get file metadata and column statistics from a base file.
-    ///
-    /// Reads the Parquet footer in a single HEAD + range request and returns:
-    /// - [`FileMetadata`]: `size` (on-disk from HEAD), `byte_size` (uncompressed
-    ///   from row groups), `num_records` (exact from footer).
-    /// - [`StatisticsContainer`]: per-column min/max from row group stats.
-    ///
-    /// Currently supports Parquet only; other base file formats can be added.
-    pub async fn get_file_metadata_and_stats(
-        &self,
-        relative_path: &str,
-        table_schema: &arrow_schema::Schema,
-    ) -> Result<(FileMetadata, StatisticsContainer)> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        let obj_store = self.object_store.clone();
-        let meta = obj_store.head(&obj_path).await?;
-        let file_size = meta.size as u64;
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-        let parquet_meta = builder.metadata().as_ref();
-
-        let name = std::path::Path::new(relative_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(relative_path)
-            .to_string();
-
-        let num_records = parquet_meta.file_metadata().num_rows().max(0);
-        let byte_size: i64 = parquet_meta
-            .row_groups()
-            .iter()
-            .map(|rg| rg.total_byte_size())
-            .sum::<i64>()
-            .max(0);
-
-        let file_metadata = FileMetadata {
-            name,
-            size: file_size,
-            byte_size,
-            num_records,
-        };
-
-        let col_stats = StatisticsContainer::from_parquet_metadata(parquet_meta, table_schema);
-
-        Ok((file_metadata, col_stats))
-    }
-
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
@@ -283,91 +128,6 @@ impl Storage {
         let result = self.object_store.get(&obj_path).await?;
         let bytes = result.bytes().await?;
         Ok(bytes)
-    }
-
-    pub async fn get_parquet_file_data(&self, relative_path: &str) -> Result<RecordBatch> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        let obj_store = self.object_store.clone();
-        let meta = obj_store.head(&obj_path).await?;
-
-        // read parquet
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-        let schema = builder.schema().clone();
-        let mut stream = builder.build()?;
-        let mut batches = Vec::new();
-
-        while let Some(r) = stream.next().await {
-            batches.push(r?)
-        }
-
-        if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(schema.clone()));
-        }
-
-        Ok(concat_batches(&schema, &batches)?)
-    }
-
-    /// Get a streaming reader for a Parquet file.
-    ///
-    /// Returns a [ParquetFileStream] that yields record batches as they are read,
-    /// without loading all data into memory at once.
-    ///
-    /// # Arguments
-    /// * `relative_path` - The relative path to the Parquet file.
-    /// * `options` - Options for reading the Parquet file (batch size, projection).
-    pub async fn get_parquet_file_stream(
-        &self,
-        relative_path: &str,
-        options: ParquetReadOptions,
-    ) -> Result<ParquetFileStream> {
-        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        let obj_store = self.object_store.clone();
-        let meta = obj_store.head(&obj_path).await?;
-
-        let reader = ParquetObjectReader::new(obj_store, obj_path).with_file_size(meta.size);
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-
-        if let Some(batch_size) = options.batch_size {
-            builder = builder.with_batch_size(batch_size);
-        }
-
-        // Handle projection: convert column names to indices using builder's schema
-        if let Some(ref column_names) = options.projection {
-            let arrow_schema = builder.schema();
-            let projection: Vec<usize> = column_names
-                .iter()
-                .map(|name| {
-                    arrow_schema.index_of(name).map_err(|_| {
-                        let available = arrow_schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        StorageError::InvalidColumn(format!(
-                            "Column '{name}' not found in parquet file schema. Available columns: [{available}]"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let projection_mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                projection.iter().copied(),
-            );
-            builder = builder.with_projection(projection_mask);
-        }
-
-        let schema = builder.schema().clone();
-        let stream = builder.build()?;
-
-        Ok(ParquetFileStream {
-            schema,
-            stream: Box::pin(stream),
-        })
     }
 
     pub async fn get_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
@@ -628,14 +388,5 @@ mod tests {
             .unwrap();
         assert_eq!(file_metadata.name, "a.parquet");
         assert_eq!(file_metadata.size, 866);
-    }
-
-    #[tokio::test]
-    async fn storage_get_parquet_file_data() {
-        let base_url =
-            Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
-        let storage = Storage::new_with_base_url(base_url).unwrap();
-        let file_data = storage.get_parquet_file_data("a.parquet").await.unwrap();
-        assert_eq!(file_data.num_rows(), 5);
     }
 }
