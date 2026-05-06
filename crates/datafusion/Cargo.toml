@@ -57,8 +57,5 @@ url = { workspace = true }
 # logging
 log = { workspace = true }
 
-[features]
-lance = ["hudi-core/lance"]
-
 [dev-dependencies]
 hudi-test = { path = "../test", features = ["datafusion"] }

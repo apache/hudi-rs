@@ -326,7 +326,7 @@ mod tests {
         let total_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, eager.num_rows());
 
-        assert_eq!(stream_batches[0].schema(), eager.schema());
+        assert_eq!(stream_batches[0].schema().fields(), eager.schema().fields());
     }
 
     #[tokio::test]

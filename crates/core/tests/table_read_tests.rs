@@ -2229,7 +2229,6 @@ mod manual_reader_matches_table_read {
     }
 }
 
-#[cfg(feature = "lance")]
 mod lance_tables {
     use super::*;
     use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};

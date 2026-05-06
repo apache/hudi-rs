@@ -558,10 +558,9 @@ mod dispatch_tests {
 }
 
 // ============================================================================
-// Lance Table Tests (requires `lance` feature)
+// Lance Table Tests
 // ============================================================================
 
-#[cfg(feature = "lance")]
 mod lance_tests {
     use super::*;
     use arrow_array::{Float64Array, Int32Array};

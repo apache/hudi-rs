@@ -81,12 +81,11 @@ prost = { workspace = true }
 # compression
 flate2 = { workspace = true }
 
-# lance (requires Rust 1.91+; the `lance` feature has a higher MSRV than the base crate)
-lance = { version = "4.0.1", optional = true }
-lance-core = { version = "4.0.1", optional = true }
-lance-encoding = { version = "4.0.1", optional = true }
-lance-file = { version = "4.0.1", optional = true }
-lance-io = { version = "4.0.1", optional = true }
+# lance
+lance-core = { version = "4.0.1" }
+lance-encoding = { version = "4.0.1" }
+lance-file = { version = "4.0.1" }
+lance-io = { version = "4.0.1" }
 
 # datafusion
 datafusion = { workspace = true, optional = true }
@@ -110,4 +109,3 @@ datafusion = [
     "datafusion-common",
     "datafusion-physical-expr",
 ]
-lance = ["dep:lance", "dep:lance-core", "dep:lance-encoding", "dep:lance-file", "dep:lance-io"]
