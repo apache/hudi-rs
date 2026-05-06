@@ -536,7 +536,7 @@ mod dispatch_tests {
     }
 
     #[tokio::test]
-    async fn test_empty_pruned_scan_uses_hudi_scan_exec_and_returns_empty() {
+    async fn test_mor_snapshot_with_full_pruning_returns_empty() {
         let ctx = register_table_direct(&V6SimplekeygenNonhivestyle, empty_options())
             .await
             .unwrap();
@@ -548,7 +548,7 @@ mod dispatch_tests {
         let plan = explain_physical_plan(&ctx, &sql).await;
         assert!(
             plan.contains("HudiScanExec"),
-            "Empty unknown-format scan should use HudiScanExec. Plan: {plan}"
+            "MOR snapshot with aggressive filter pruning should use HudiScanExec. Plan: {plan}"
         );
 
         let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
