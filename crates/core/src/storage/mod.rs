@@ -35,6 +35,7 @@ use object_store::{ObjectStore, parse_url_opts};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
+use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -437,18 +438,21 @@ pub type LeafDirPredicate<'a> = &'a (dyn Fn(&str) -> bool + Send + Sync);
 
 /// Get relative paths of leaf directories under a given directory.
 ///
-/// Walks subdirectories in parallel up to `parallelism` concurrent
-/// `list_dirs` calls. An optional `predicate` prunes subtrees that cannot
-/// match (e.g., partition pruning during file listing); subtrees rejected
-/// by the predicate are skipped without listing their contents.
+/// Walks subdirectories concurrently. Total in-flight `list_dirs` calls are
+/// globally bounded by `parallelism` via a [`Semaphore`] shared across the
+/// whole descent — recursion does not multiply concurrency. An optional
+/// `predicate` prunes subtrees that cannot match (e.g., partition pruning
+/// during file listing); subtrees rejected by the predicate are skipped
+/// without listing their contents.
 ///
 /// # Parameters
 /// - `subdir`: starting directory relative to the storage base. `None` walks
 ///   from the root.
 /// - `predicate`: if `Some`, called with each child path; subtrees where the
 ///   predicate returns `false` are pruned.
-/// - `parallelism`: maximum concurrent `list_dirs` calls. Values `< 1` are
-///   clamped to 1 (sequential descent).
+/// - `parallelism`: global upper bound on concurrent `list_dirs` calls
+///   across all recursion levels. Values `< 1` are clamped to 1 (sequential
+///   descent).
 ///
 /// **Example**
 /// - /usr/hudi/table_name
@@ -463,11 +467,14 @@ pub fn get_leaf_dirs<'a>(
     predicate: Option<LeafDirPredicate<'a>>,
     parallelism: usize,
 ) -> BoxFuture<'a, Result<Vec<String>>> {
+    let parallelism = parallelism.max(1);
+    let sem = Arc::new(Semaphore::new(parallelism));
     get_leaf_dirs_inner(
         storage,
         subdir.map(String::from),
         predicate,
-        parallelism.max(1),
+        parallelism,
+        sem,
     )
 }
 
@@ -476,9 +483,19 @@ fn get_leaf_dirs_inner<'a>(
     subdir: Option<String>,
     predicate: Option<LeafDirPredicate<'a>>,
     parallelism: usize,
+    sem: Arc<Semaphore>,
 ) -> BoxFuture<'a, Result<Vec<String>>> {
     Box::pin(async move {
+        // Acquire permit before issuing the list_dirs; release before
+        // recursing so children compete for the same global budget.
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            // The semaphore is private to this descent and never closed.
+            Err(_) => unreachable!("get_leaf_dirs semaphore is owned by the descent"),
+        };
         let child_dirs = storage.list_dirs(subdir.as_deref()).await?;
+        drop(permit);
+
         if child_dirs.is_empty() {
             return Ok(vec![subdir.unwrap_or_default()]);
         }
@@ -503,8 +520,12 @@ fn get_leaf_dirs_inner<'a>(
             return Ok(Vec::new());
         }
 
+        // The semaphore caps actual list_dirs concurrency; buffer_unordered
+        // here only bounds memory of pending recursive futures per level.
         stream::iter(next_subdirs)
-            .map(move |path| get_leaf_dirs_inner(storage, Some(path), predicate, parallelism))
+            .map(move |path| {
+                get_leaf_dirs_inner(storage, Some(path), predicate, parallelism, sem.clone())
+            })
             .buffer_unordered(parallelism)
             .try_fold(Vec::new(), |mut acc, mut sub| async move {
                 acc.append(&mut sub);
