@@ -60,6 +60,10 @@ jobs:
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y protobuf-compiler
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
