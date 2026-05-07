@@ -69,6 +69,7 @@ pub mod buffered_record_converter;
 pub mod delete_context;
 pub mod input_split;
 pub mod iterator_mode;
+pub mod key_spec;
 pub mod log_record_reader;
 pub mod merged_log_record_reader;
 pub mod output_converter;
