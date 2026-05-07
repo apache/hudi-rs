@@ -35,7 +35,7 @@ pub mod struct_like;
 
 // The following re-exports are commented out until each item is introduced
 // in subsequent tasks. Uncomment as each task lands:
-// pub use expression::{Expression, ExpressionKind, Operator};   // Task 1.6
+pub use expression::{Expression, ExpressionKind, Operator};
 // pub use literal::{Literal, LiteralValue};                     // Task 1.8
 // pub use name_reference::NameReference;                        // Task 1.9
 // pub use predicate::{Predicate, PredicateKind};                // Task 1.11
