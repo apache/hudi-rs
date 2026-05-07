@@ -491,6 +491,14 @@ impl HoodieFileGroupReader {
                             ))
                         })?
                 };
+                // Mirrors Java HoodieAvroReaderContext.getFileRecordIterator
+                // (lines 218-228): when keyFilterOpt is set and the reader does
+                // not support a native key predicate (Parquet has none), apply
+                // a row-level filter on _hoodie_record_key.
+                let batch = apply_key_filter_to_batch(
+                    batch,
+                    self.reader_context.key_filter_opt.as_deref(),
+                )?;
                 Ok(vec![batch])
             }
             None => Ok(Vec::new()),
@@ -721,4 +729,64 @@ impl HoodieFileGroupReaderBuilder {
 
         Ok(reader)
     }
+}
+
+// =========================================================================
+// Key filter helper
+// =========================================================================
+
+/// Filter rows in `batch` so only those whose `_hoodie_record_key` matches
+/// the given key-spec (derived from `key_filter_opt`) survive. If
+/// `key_filter_opt` is None or doesn't yield a KeySpec, returns the batch
+/// unchanged.
+///
+/// Mirrors Java HoodieAvroReaderContext.getFileRecordIterator (lines
+/// 218-228) for the non-key-predicate-supporting reader case.
+fn apply_key_filter_to_batch(
+    batch: RecordBatch,
+    key_filter_opt: Option<&dyn crate::expression::predicate::Predicate>,
+) -> Result<RecordBatch> {
+    use crate::file_group::reader::key_spec::create_key_spec;
+    let key_spec = match create_key_spec(key_filter_opt) {
+        Some(spec) => spec,
+        None => return Ok(batch),
+    };
+
+    // Find the _hoodie_record_key column.
+    let key_col_idx = match batch.schema().index_of("_hoodie_record_key") {
+        Ok(i) => i,
+        Err(_) => {
+            // Column not present (e.g., virtual keys). Return batch as-is —
+            // the filter cannot apply.
+            log::debug!(
+                "[HoodieFileGroupReader] key_filter_opt set but _hoodie_record_key \
+                 column not present in base file; skipping base-file filter"
+            );
+            return Ok(batch);
+        }
+    };
+
+    let key_col = batch
+        .column(key_col_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            CoreError::ReadFileSliceError(
+                "_hoodie_record_key column is not StringArray".to_string(),
+            )
+        })?;
+
+    // Build a BooleanArray mask: true for rows whose key matches the spec.
+    let mask: arrow_array::BooleanArray = (0..batch.num_rows())
+        .map(|i| {
+            if key_col.is_null(i) {
+                Some(false)
+            } else {
+                Some(key_spec.matches(key_col.value(i)))
+            }
+        })
+        .collect();
+
+    arrow::compute::filter_record_batch(&batch, &mask)
+        .map_err(|e| CoreError::ReadFileSliceError(format!("filter_record_batch: {e}")))
 }
