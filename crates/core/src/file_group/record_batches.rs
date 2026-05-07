@@ -115,7 +115,9 @@ impl RecordBatches {
         &self,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<RecordBatch> {
-        let ordering_field: String = hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
+        let ordering_fields: Vec<String> =
+            hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
+        let ordering_field = &ordering_fields[0];
 
         if self.num_delete_rows == 0 {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));

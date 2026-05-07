@@ -1328,8 +1328,8 @@ mod tests {
         assert_eq!(actual, "org.apache.hudi.keygen.SimpleKeyGenerator");
         let actual: Vec<String> = configs.get(PartitionFields).unwrap().into();
         assert_eq!(actual, vec!["city"]);
-        let actual: String = configs.get(OrderingFields).unwrap().into();
-        assert_eq!(actual, "ts");
+        let actual: Vec<String> = configs.get(OrderingFields).unwrap().into();
+        assert_eq!(actual, vec!["ts"]);
         let actual: bool = configs.get(PopulatesMetaFields).unwrap().into();
         assert!(actual);
         let actual: Vec<String> = configs.get(RecordKeyFields).unwrap().into();

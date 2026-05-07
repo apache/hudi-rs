@@ -62,11 +62,11 @@ pub fn process_batch_for_max_orderings(
         return Ok(());
     }
 
-    let ordering_field: String = hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
+    let ordering_fields: Vec<String> = hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
 
     let keys = extract_record_keys(key_converter, batch)?;
     let event_times =
-        extract_event_time_ordering_values(event_time_converter, batch, &ordering_field)?;
+        extract_event_time_ordering_values(event_time_converter, batch, &ordering_fields[0])?;
     let commit_times = extract_commit_time_ordering_values(commit_time_converter, batch)?;
     for i in 0..batch.num_rows() {
         let key = keys.row(i).owned();
