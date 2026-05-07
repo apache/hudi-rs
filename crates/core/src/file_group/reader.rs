@@ -145,24 +145,22 @@ impl FileGroupReader {
         }
     }
 
-    /// Returns the base file reader for a given path. When the table config
-    /// explicitly sets the format, returns the cached reader. Otherwise falls
-    /// back to extension-based detection.
+    /// Returns the base file reader for a given path. Path extension detection
+    /// keeps no-config readers from using the default Parquet reader for HFile
+    /// paths, while the resolved Parquet path still reuses the cached reader.
     fn reader_for_path(&self, relative_path: &str) -> Result<Arc<dyn BaseFileReader>> {
-        if self
-            .hudi_configs
-            .contains(HudiTableConfig::BaseFileFormat.as_ref())
-        {
-            if let Some(reader) = &self.base_file_reader {
-                return Ok(reader.clone());
-            }
-            let format = base_file_reader::resolve_base_file_format(&self.hudi_configs, None)?;
-            return base_file_reader::create_base_file_reader(&self.storage, &format)
-                .map_err(|e| ReadFileSliceError(format!("{e}")));
-        }
-
         let format =
             base_file_reader::resolve_base_file_format(&self.hudi_configs, Some(relative_path))?;
+
+        if let Some(reader) = &self.base_file_reader
+            && (self
+                .hudi_configs
+                .contains(HudiTableConfig::BaseFileFormat.as_ref())
+                || matches!(format, BaseFileFormatValue::Parquet))
+        {
+            return Ok(reader.clone());
+        }
+
         base_file_reader::create_base_file_reader(&self.storage, &format)
             .map_err(|e| ReadFileSliceError(format!("{e}")))
     }
@@ -1052,6 +1050,35 @@ mod tests {
             error_msg.contains("Unsupported base file format")
                 && error_msg.contains("hfile is only supported"),
             "Expected explicit unsupported HFile reader error, got: {error_msg}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reader_for_path_reuses_cached_default_parquet_reader() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+        let cached_reader = reader
+            .base_file_reader
+            .as_ref()
+            .expect("default Parquet reader should be cached");
+
+        let resolved_reader = reader.reader_for_path(TEST_SAMPLE_BASE_FILE)?;
+
+        assert!(
+            Arc::ptr_eq(cached_reader, &resolved_reader),
+            "no-config Parquet path should reuse the cached base-file reader"
+        );
+
+        let hfile_error = match reader.reader_for_path("fileid_0-0-1_20240418173551906.hfile") {
+            Ok(_) => panic!("no-config HFile path should still use extension detection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            hfile_error.contains("Unsupported base file format")
+                && hfile_error.contains("hfile is only supported"),
+            "Expected no-config HFile path to report unsupported reader, got: {hfile_error}"
         );
 
         Ok(())
