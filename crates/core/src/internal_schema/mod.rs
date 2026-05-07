@@ -20,4 +20,4 @@
 pub mod type_;
 pub mod types;
 
-// pub use type_::{Type, TypeID};   // ← will be uncommented in Task 1.2
+pub use type_::{Type, TypeID};
