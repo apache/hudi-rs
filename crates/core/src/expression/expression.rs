@@ -101,11 +101,10 @@ pub trait Expression: Debug + Send + Sync + Any {
 /// added as concrete types come online — see comment on `Expression::kind`.
 pub enum ExpressionKind<'a> {
     Literal(&'a crate::expression::literal::Literal),
-    // Future variants (added in subsequent tasks):
-    //   NameReference(&'a NameReference),       (Task 1.9)
+    NameReference(&'a crate::expression::name_reference::NameReference),
+    // Future variants:
     //   BoundReference(&'a BoundReference),     (Task 1.10)
     //   Predicate(&'a dyn crate::expression::Predicate),  (Task 1.11)
-    /// Placeholder so the enum can grow until all variants exist. Removed in Task 1.11.
     _Placeholder(std::marker::PhantomData<&'a ()>),
 }
 
