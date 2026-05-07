@@ -1303,3 +1303,75 @@ fn extract_row_with_id_opt(
     }
     None
 }
+
+// =============================================================================
+// Phase 3 e2e smoke test — keyFilterOpt actually filters rows
+// =============================================================================
+
+/// Phase 3 e2e smoke test — keyFilterOpt actually filters rows.
+///
+/// Reads partition `city=sf` of v9_mor_8i4u_commit_time twice:
+///   1. baseline (no filter)         → expect 2 rows (id=1 V2 update, id=2 base)
+///   2. filtered (In on record-key)  → expect 1 row (id=1)
+///
+/// See keyFilterOpt design spec §7.
+#[tokio::test]
+async fn fg_reader_with_key_filter_filters_rows() -> Result<()> {
+    // Fixture filenames copied from the existing test_e2e_v9_mor_commit_time_sf_merge
+    // test (lines 218-223) so both tests stay in sync if the fixture is regenerated.
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    let partition = "city=sf";
+    let base_file = "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+    let log_files: Vec<&str> = vec![
+        ".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73",
+    ];
+
+    // ── Read 1: no filter (baseline) ────────────────────────────────
+    let baseline_batch = read_file_group_with_key_filter(
+        &table_path,
+        partition,
+        base_file,
+        log_files.clone(),
+        None,
+    ).await?;
+
+    assert_eq!(baseline_batch.num_rows(), 2, "city=sf should have 2 rows in baseline");
+
+    // Derive the actual _hoodie_record_key string for id=1 from the baseline batch.
+    // Avoids hard-coding the keygen encoding (id:1 vs 1 vs id=1).
+    let key_for_id1 = lookup_record_key(&baseline_batch, 1);
+
+    // ── Read 2: filter with In(_hoodie_record_key, [<key for id=1>]) ────
+    //  Construction mirrors Java: Predicates.in(NameReference("_hoodie_record_key"),
+    //                                            [Literal.from(key_for_id1)])
+    let key_filter: StdArc<dyn Predicate> = StdArc::new(
+        predicates_factory::in_(
+            Box::new(NameReference::new("_hoodie_record_key")),
+            vec![Box::new(Literal::string(key_for_id1.clone())) as Box<dyn Expression>],
+        ),
+    );
+
+    let filtered_batch = read_file_group_with_key_filter(
+        &table_path,
+        partition,
+        base_file,
+        log_files.clone(),
+        Some(key_filter),
+    ).await?;
+
+    assert_eq!(filtered_batch.num_rows(), 1,
+        "filtered read should return only id=1");
+
+    // ── Cross-validate row content ────────────────────────────────
+    let expected = extract_row_with_id_opt(&baseline_batch, 1)
+        .expect("id=1 should exist in baseline");
+    let actual = extract_row_with_id_opt(&filtered_batch, 1)
+        .expect("id=1 should exist in filtered");
+    assert_eq!(expected, actual, "filtered id=1 row must equal baseline id=1 row");
+
+    // Negative assertion: id=2 (base-only) is NOT in filtered output.
+    assert!(extract_row_with_id_opt(&filtered_batch, 2).is_none(),
+        "id=2 must be excluded by the key filter");
+
+    Ok(())
+}
