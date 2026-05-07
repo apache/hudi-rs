@@ -260,10 +260,14 @@ impl ConfigParser for HudiTableConfig {
             Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
-            Self::OrderingFields => get_result.map(|v| {
-                // Ordering fields may be comma-separated; use the first as the ordering field.
-                let field = v.split(',').next().unwrap_or(v).trim();
-                HudiConfigValue::String(field.to_string())
+            Self::OrderingFields => get_result.and_then(|v| {
+                if v.contains(',') {
+                    Err(UnsupportedValue(format!(
+                        "Multiple ordering fields '{v}' are not yet supported"
+                    )))
+                } else {
+                    Ok(HudiConfigValue::String(v.to_string()))
+                }
             }),
             Self::PopulatesMetaFields => get_result
                 .and_then(|v| {
@@ -615,15 +619,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering_fields_comma_separated() {
+    fn test_ordering_fields_rejects_multiple() {
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
             (HudiTableConfig::OrderingFields.as_ref(), "ts,seq"),
         ]);
-        let actual: String = hudi_configs
-            .get(HudiTableConfig::OrderingFields)
-            .unwrap()
-            .into();
-        assert_eq!(actual, "ts", "Should use the first ordering field");
+        assert!(matches!(
+            hudi_configs.get(HudiTableConfig::OrderingFields).unwrap_err(),
+            ConfigError::UnsupportedValue(_)
+        ));
     }
 }
