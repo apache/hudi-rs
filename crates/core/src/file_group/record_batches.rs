@@ -125,7 +125,7 @@ impl RecordBatches {
 
         let mut delete_batches = Vec::with_capacity(self.delete_batches.len());
         for (batch, instant_time) in &self.delete_batches {
-            let batch = transform_delete_record_batch(batch, instant_time, &ordering_field)?;
+            let batch = transform_delete_record_batch(batch, instant_time, ordering_field)?;
             delete_batches.push(batch);
         }
 
