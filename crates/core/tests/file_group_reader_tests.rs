@@ -52,6 +52,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::sync::Arc;
+use hudi_core::expression::predicates::predicates_factory;
+use hudi_core::expression::{Expression, Literal, NameReference, Predicate};
+use std::sync::Arc as StdArc;
 
 /// Create HudiConfigs and Storage from table path using OptionResolver.
 async fn create_configs_and_storage(
@@ -1182,4 +1185,121 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
     assert_eq!(output_col_names, vec!["id", "name"]);
 
     Ok(())
+}
+
+// =============================================================================
+// Phase 3 helpers — keyFilterOpt e2e smoke test
+// =============================================================================
+
+/// Variant of `read_file_group` (lines 69-121 of this file) that accepts a
+/// `key_filter_opt`. Mirrors the existing helper, with the addition of
+/// `reader_context.key_filter_opt = key_filter_opt;` on the ctx before the
+/// reader is constructed.
+async fn read_file_group_with_key_filter(
+    table_path: &str,
+    partition: &str,
+    base_file: &str,
+    log_files: Vec<&str>,
+    key_filter_opt: Option<StdArc<dyn Predicate>>,
+) -> Result<arrow_array::RecordBatch> {
+    let (_hudi_configs, storage) = create_configs_and_storage(table_path).await?;
+
+    let base_path = if base_file.is_empty() {
+        None
+    } else if partition.is_empty() {
+        Some(base_file.to_string())
+    } else {
+        Some(format!("{}/{}", partition, base_file))
+    };
+    let log_paths: Vec<String> = log_files
+        .iter()
+        .map(|lf| {
+            if partition.is_empty() {
+                lf.to_string()
+            } else {
+                format!("{}/{}", partition, lf)
+            }
+        })
+        .collect();
+
+    let input_split = InputSplit::new(
+        base_path,
+        None,
+        log_paths,
+        partition.to_string(),
+    );
+
+    let mut reader_context = ReaderContext::empty();
+    reader_context.latest_commit_time = "99991231235959999".to_string();
+    reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+    reader_context.table_config.insert(
+        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    reader_context.rebuild_record_context(partition.to_string());
+    reader_context.key_filter_opt = key_filter_opt;       // ← the only addition
+
+    let mut reader = HoodieFileGroupReader::new(
+        Arc::new(reader_context),
+        storage,
+        input_split,
+        ReaderParameters::default(),
+        None,
+        None,
+    );
+
+    reader.read().await
+}
+
+/// Look up the `_hoodie_record_key` string for a given `id` in the baseline
+/// batch. Used to derive the literal value for the test filter without
+/// hard-coding the keygen encoding.
+fn lookup_record_key(batch: &arrow_array::RecordBatch, id: i32) -> String {
+    let id_col_idx = batch.schema().index_of("id").expect("id column missing");
+    let key_col_idx = batch
+        .schema()
+        .index_of("_hoodie_record_key")
+        .expect("_hoodie_record_key column missing");
+
+    let id_col = batch
+        .column(id_col_idx)
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .expect("id column should be Int32");
+    let key_col = batch
+        .column(key_col_idx)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("_hoodie_record_key column should be StringArray");
+
+    for i in 0..batch.num_rows() {
+        if id_col.value(i) == id {
+            return key_col.value(i).to_string();
+        }
+    }
+    panic!("id {id} not found in baseline batch");
+}
+
+/// Pull the row tuple `(id, name, age)` for the given id, or None.
+fn extract_row_with_id_opt(
+    batch: &arrow_array::RecordBatch,
+    id: i32,
+) -> Option<(i32, String, i32)> {
+    let id_col = batch.column_by_name("id")?
+        .as_any().downcast_ref::<arrow_array::Int32Array>()?;
+    let name_col = batch.column_by_name("name")?
+        .as_any().downcast_ref::<arrow_array::StringArray>()?;
+    let age_col = batch.column_by_name("age")?
+        .as_any().downcast_ref::<arrow_array::Int32Array>()?;
+
+    for i in 0..batch.num_rows() {
+        if id_col.value(i) == id {
+            return Some((
+                id_col.value(i),
+                name_col.value(i).to_string(),
+                age_col.value(i),
+            ));
+        }
+    }
+    None
 }
