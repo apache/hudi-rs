@@ -65,7 +65,6 @@ mod tests {
     use super::*;
     use crate::expression::{Expression, ExpressionKind};
     use crate::internal_schema::types::IntType;
-    use crate::internal_schema::Type;
 
     #[test]
     fn bound_reference_carries_ordinal_and_type() {
