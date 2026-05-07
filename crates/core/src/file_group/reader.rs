@@ -26,7 +26,7 @@ use crate::expr::filter::{
     Filter, SchemableFilter, filters_to_row_mask, validate_fields_against_schemas,
 };
 use crate::file_group::base_file::reader::{
-    self as base_file_reader, BaseFileReadOptions, BaseFileReader,
+    BaseFileReadOptions, BaseFileReader, create_base_file_reader,
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
@@ -56,6 +56,7 @@ use std::sync::Arc;
 pub struct FileGroupReader {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    base_file_format: BaseFileFormatValue,
     base_file_reader: Option<Arc<dyn BaseFileReader>>,
 }
 
@@ -64,6 +65,7 @@ impl std::fmt::Debug for FileGroupReader {
         f.debug_struct("FileGroupReader")
             .field("hudi_configs", &self.hudi_configs)
             .field("storage", &self.storage)
+            .field("base_file_format", &self.base_file_format)
             .finish_non_exhaustive()
     }
 }
@@ -94,6 +96,7 @@ impl FileGroupReader {
         Ok(Self {
             hudi_configs,
             storage,
+            base_file_format: format,
             base_file_reader,
         })
     }
@@ -122,6 +125,7 @@ impl FileGroupReader {
         Ok(Self {
             hudi_configs,
             storage,
+            base_file_format: format,
             base_file_reader,
         })
     }
@@ -134,7 +138,7 @@ impl FileGroupReader {
         storage: &Arc<Storage>,
         format: &BaseFileFormatValue,
     ) -> Result<Option<Arc<dyn BaseFileReader>>> {
-        match base_file_reader::create_base_file_reader(storage, format) {
+        match create_base_file_reader(storage, format) {
             Ok(reader) => Ok(Some(reader)),
             Err(StorageError::UnsupportedBaseFileFormat(_))
                 if matches!(format, BaseFileFormatValue::HFile) =>
@@ -145,23 +149,19 @@ impl FileGroupReader {
         }
     }
 
-    /// Returns the base file reader for a given path. Path extension detection
-    /// keeps no-config readers from using the default Parquet reader for HFile
-    /// paths, while the resolved Parquet path still reuses the cached reader.
+    /// Returns the base-file reader for a path, reusing the cached reader when
+    /// the path resolves to the same format selected at construction time.
     fn reader_for_path(&self, relative_path: &str) -> Result<Arc<dyn BaseFileReader>> {
         let format =
             BaseFileFormatValue::resolve_from_configs(&self.hudi_configs, Some(relative_path))?;
 
-        if let Some(reader) = &self.base_file_reader
-            && (self
-                .hudi_configs
-                .contains(HudiTableConfig::BaseFileFormat.as_ref())
-                || matches!(format, BaseFileFormatValue::Parquet))
+        if format == self.base_file_format
+            && let Some(reader) = &self.base_file_reader
         {
             return Ok(reader.clone());
         }
 
-        base_file_reader::create_base_file_reader(&self.storage, &format)
+        create_base_file_reader(&self.storage, &format)
             .map_err(|e| ReadFileSliceError(format!("{e}")))
     }
 
@@ -171,7 +171,7 @@ impl FileGroupReader {
     async fn read_base_file_eager(&self, relative_path: &str) -> Result<RecordBatch> {
         let reader = self.reader_for_path(relative_path)?;
         let records: RecordBatch = reader
-            .read_data(relative_path, BaseFileReadOptions::new())
+            .read_data(relative_path, BaseFileReadOptions::default())
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
             .await?;
         apply_commit_time_filter(&self.hudi_configs, records)
@@ -393,7 +393,7 @@ impl FileGroupReader {
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
         let batch_size = options.batch_size()?.unwrap_or(default_batch_size);
-        let mut read_options = BaseFileReadOptions::new().with_batch_size(batch_size);
+        let mut read_options = BaseFileReadOptions::default().with_batch_size(batch_size);
 
         // If projection is set, widen the base file read to also include any columns
         // we need post-read but the user didn't request:

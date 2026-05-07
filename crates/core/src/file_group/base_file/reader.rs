@@ -20,8 +20,10 @@
 
 use std::sync::Arc;
 
+use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
@@ -41,10 +43,6 @@ pub struct BaseFileReadOptions {
 }
 
 impl BaseFileReadOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
         self
@@ -101,7 +99,24 @@ pub trait BaseFileReader: Send + Sync {
         &'a self,
         relative_path: &'a str,
         options: BaseFileReadOptions,
-    ) -> BoxFuture<'a, Result<RecordBatch>>;
+    ) -> BoxFuture<'a, Result<RecordBatch>> {
+        Box::pin(async move {
+            let base_stream = self.read_stream(relative_path, options).await?;
+            let schema = base_stream.schema().clone();
+            let mut stream = base_stream.into_stream();
+
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
+            }
+
+            if batches.is_empty() {
+                return Ok(RecordBatch::new_empty(schema));
+            }
+
+            Ok(concat_batches(&schema, &batches)?)
+        })
+    }
 
     /// Read data from a base file as a stream of RecordBatches.
     fn read_stream<'a>(

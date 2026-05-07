@@ -20,8 +20,6 @@
 
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
-use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use object_store::path::Path as ObjPath;
@@ -122,7 +120,8 @@ impl ParquetBaseFileReader {
 
     /// Get the Arrow schema from a Parquet file's footer.
     pub async fn get_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
-        let parquet_meta = self.get_parquet_metadata(relative_path).await?;
+        let builder = self.open_builder(relative_path).await?;
+        let parquet_meta = builder.metadata();
         Ok(parquet_to_arrow_schema(
             parquet_meta.file_metadata().schema_descr(),
             None,
@@ -131,31 +130,6 @@ impl ParquetBaseFileReader {
 }
 
 impl BaseFileReader for ParquetBaseFileReader {
-    fn read_data<'a>(
-        &'a self,
-        relative_path: &'a str,
-        options: BaseFileReadOptions,
-    ) -> BoxFuture<'a, Result<RecordBatch>> {
-        Box::pin(async move {
-            let builder = self.open_builder(relative_path).await?;
-            let builder = Self::apply_options(builder, &options)?;
-            let schema = builder.schema().clone();
-            let mut stream = builder.build()?;
-
-            let mut batches = Vec::new();
-            while let Some(batch) = stream.next().await {
-                batches.push(batch?);
-            }
-
-            if batches.is_empty() {
-                return Ok(RecordBatch::new_empty(schema));
-            }
-
-            let schema = batches[0].schema();
-            Ok(concat_batches(&schema, &batches)?)
-        })
-    }
-
     fn read_stream<'a>(
         &'a self,
         relative_path: &'a str,
@@ -164,8 +138,8 @@ impl BaseFileReader for ParquetBaseFileReader {
         Box::pin(async move {
             let builder = self.open_builder(relative_path).await?;
             let builder = Self::apply_options(builder, &options)?;
-            let schema = builder.schema().clone();
             let stream = builder.build()?;
+            let schema = stream.schema().clone();
             let mapped_stream = stream
                 .map(|result| result.map_err(StorageError::from))
                 .boxed();
@@ -229,7 +203,7 @@ mod tests {
     async fn test_read_data_returns_all_rows() {
         let reader = ParquetBaseFileReader::new(test_storage());
         let batch = reader
-            .read_data("a.parquet", BaseFileReadOptions::new())
+            .read_data("a.parquet", BaseFileReadOptions::default())
             .await
             .unwrap();
         assert_eq!(batch.num_rows(), 5);
@@ -241,12 +215,12 @@ mod tests {
         let reader = ParquetBaseFileReader::new(test_storage());
 
         let full = reader
-            .read_data("a.parquet", BaseFileReadOptions::new())
+            .read_data("a.parquet", BaseFileReadOptions::default())
             .await
             .unwrap();
 
         let first_col = full.schema().field(0).name().clone();
-        let opts = BaseFileReadOptions::new().with_projection([&first_col]);
+        let opts = BaseFileReadOptions::default().with_projection([&first_col]);
         let projected = reader.read_data("a.parquet", opts).await.unwrap();
 
         assert_eq!(projected.num_columns(), 1);
@@ -259,11 +233,11 @@ mod tests {
         let reader = ParquetBaseFileReader::new(test_storage());
 
         let eager = reader
-            .read_data("a.parquet", BaseFileReadOptions::new())
+            .read_data("a.parquet", BaseFileReadOptions::default())
             .await
             .unwrap();
 
-        let opts = BaseFileReadOptions::new().with_batch_size(2);
+        let opts = BaseFileReadOptions::default().with_batch_size(2);
         let mut stream = reader.read_stream("a.parquet", opts).await.unwrap();
 
         let mut batches = Vec::new();
