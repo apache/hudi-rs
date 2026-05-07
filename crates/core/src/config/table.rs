@@ -381,8 +381,11 @@ impl BaseFileFormatValue {
 
     /// Returns true when `path` has this format's base-file suffix.
     pub fn matches_extension(&self, path: &str) -> bool {
-        let suffix = format!(".{}", self.as_ref());
-        Self::ends_with_ignore_ascii_case(path, &suffix)
+        let suffix = match self {
+            Self::Parquet => ".parquet",
+            Self::HFile => ".hfile",
+        };
+        Self::ends_with_ignore_ascii_case(path, suffix)
     }
 
     /// Parse the explicit table base-file format config, if present.

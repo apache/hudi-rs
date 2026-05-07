@@ -19,7 +19,7 @@
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig;
+use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{
@@ -37,6 +37,7 @@ use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::Storage;
+use crate::storage::error::StorageError;
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
@@ -88,7 +89,7 @@ impl FileGroupReader {
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
         let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
         let format = base_file_reader::resolve_base_file_format(&hudi_configs, None)?;
-        let base_file_reader = base_file_reader::create_base_file_reader(&storage, &format).ok();
+        let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
         Ok(Self {
             hudi_configs,
@@ -116,7 +117,7 @@ impl FileGroupReader {
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
         let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
         let format = base_file_reader::resolve_base_file_format(&hudi_configs, None)?;
-        let base_file_reader = base_file_reader::create_base_file_reader(&storage, &format).ok();
+        let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
         Ok(Self {
             hudi_configs,
@@ -129,6 +130,21 @@ impl FileGroupReader {
         options.with_defaults_from(&self.hudi_configs)
     }
 
+    fn create_optional_base_file_reader(
+        storage: &Arc<Storage>,
+        format: &BaseFileFormatValue,
+    ) -> Result<Option<Arc<dyn BaseFileReader>>> {
+        match base_file_reader::create_base_file_reader(storage, format) {
+            Ok(reader) => Ok(Some(reader)),
+            Err(StorageError::UnsupportedBaseFileFormat(_))
+                if matches!(format, BaseFileFormatValue::HFile) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Returns the base file reader for a given path. When the table config
     /// explicitly sets the format, returns the cached reader. Otherwise falls
     /// back to extension-based detection.
@@ -137,9 +153,12 @@ impl FileGroupReader {
             .hudi_configs
             .contains(HudiTableConfig::BaseFileFormat.as_ref())
         {
-            return self.base_file_reader.clone().ok_or_else(|| {
-                ReadFileSliceError(format!("No base file reader available for {relative_path}"))
-            });
+            if let Some(reader) = &self.base_file_reader {
+                return Ok(reader.clone());
+            }
+            let format = base_file_reader::resolve_base_file_format(&self.hudi_configs, None)?;
+            return base_file_reader::create_base_file_reader(&self.storage, &format)
+                .map_err(|e| ReadFileSliceError(format!("{e}")));
         }
 
         let format =
@@ -1000,6 +1019,39 @@ mod tests {
         assert!(
             error_msg.contains("not found") || error_msg.contains("Failed to read path"),
             "Should contain appropriate error message, got: {error_msg}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hfile_base_file_read_reports_unsupported_reader() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::BasePath, base_uri.as_str()),
+            (
+                HudiTableConfig::BaseFileFormat,
+                BaseFileFormatValue::HFile.as_ref(),
+            ),
+        ]));
+        let reader =
+            FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())?;
+
+        let result = reader
+            .read_file_slice_from_paths(
+                "fileid_0-0-1_20240418173551906.hfile",
+                Vec::<&str>::new(),
+                &ReadOptions::new(),
+            )
+            .await;
+
+        let error_msg = result
+            .expect_err("Expected unsupported HFile reader error")
+            .to_string();
+        assert!(
+            error_msg.contains("Unsupported base file format")
+                && error_msg.contains("hfile is only supported"),
+            "Expected explicit unsupported HFile reader error, got: {error_msg}"
         );
 
         Ok(())
