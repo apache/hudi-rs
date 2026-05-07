@@ -42,9 +42,9 @@ use crate::merge::RecordMergeStrategyValue;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter, IntoStaticStr)]
 pub enum HudiTableConfig {
-    /// Base file format
-    ///
-    /// Currently only parquet is supported.
+    /// Base file format. Supported values for regular tables: `parquet`,
+    /// `lance`. `hfile` is reserved for the metadata table and is rejected by
+    /// the regular base-file reader.
     BaseFileFormat,
 
     /// Base path to the table.

@@ -20,6 +20,7 @@ use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig;
 use crate::error::{CoreError, Result};
+use crate::file_group::base_file::lance::LanceBaseFileReader;
 use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::schema::{prepend_meta_fields, prepend_meta_fields_to_avro_schema_str};
@@ -144,35 +145,50 @@ async fn resolve_schema_from_base_file(
 
     // Try to get the base file path from either 'path' or 'baseFile' field
     if let Some(path) = &first_stat.path
-        && BaseFileFormatValue::from_extension(path) == Some(BaseFileFormatValue::Parquet)
+        && let Some(schema) = read_schema_by_extension(path, &storage).await?
     {
-        return Ok(ParquetBaseFileReader::new(storage.clone())
-            .get_schema(path)
-            .await?);
+        return Ok(schema);
     }
 
     // Handle deltacommit case with baseFile
     if let Some(base_file) = &first_stat.base_file {
-        let parquet_file_path_buf = PathBuf::from_str(partition)
+        let base_file_path_buf = PathBuf::from_str(partition)
             .map_err(|e| {
                 CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {e}"))
             })?
             .join(base_file);
-        let path = parquet_file_path_buf.to_str().ok_or_else(|| {
+        let path = base_file_path_buf.to_str().ok_or_else(|| {
             CoreError::CommitMetadata(
                 "Failed to resolve the latest schema: invalid file path".to_string(),
             )
         })?;
-        if BaseFileFormatValue::from_extension(path) == Some(BaseFileFormatValue::Parquet) {
-            return Ok(ParquetBaseFileReader::new(storage.clone())
-                .get_schema(path)
-                .await?);
+        if let Some(schema) = read_schema_by_extension(path, &storage).await? {
+            return Ok(schema);
         }
     }
 
     Err(CoreError::CommitMetadata(
         "Failed to resolve the latest schema: no file path found".to_string(),
     ))
+}
+
+/// Reads the Arrow schema from a base file using the reader matching the
+/// path's extension. Returns `Ok(None)` for unrecognized or unsupported
+/// extensions so callers can fall through to the next resolution step.
+async fn read_schema_by_extension(path: &str, storage: &Arc<Storage>) -> Result<Option<Schema>> {
+    match BaseFileFormatValue::from_extension(path) {
+        Some(BaseFileFormatValue::Parquet) => Ok(Some(
+            ParquetBaseFileReader::new(storage.clone())
+                .get_schema(path)
+                .await?,
+        )),
+        Some(BaseFileFormatValue::Lance) => Ok(Some(
+            LanceBaseFileReader::new(storage.clone())
+                .get_schema(path)
+                .await?,
+        )),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
@@ -270,6 +286,47 @@ mod tests {
 
         let schema = extract_avro_schema_from_commit_metadata(&metadata);
         assert_eq!(schema, Some("test_schema".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_schema_from_base_file_lance_path() {
+        use hudi_test::SampleTable;
+        use url::Url;
+
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
+        let base_url = Url::from_directory_path(&table_path).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+
+        let lance_file_name = std::fs::read_dir(&table_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().is_some_and(|ext| ext == "lance"))
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+
+        // Construct commit metadata with a Lance base-file `path` and no
+        // schema in `extraMetadata`, forcing the resolver onto the base-file
+        // fallback path.
+        let metadata = json!({
+            "partitionToWriteStats": {
+                "": [{
+                    "path": lance_file_name,
+                    "partitionPath": ""
+                }]
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let schema = resolve_schema_from_base_file(&metadata, storage)
+            .await
+            .expect("Lance schema should resolve from base file");
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(names.contains(&"id"));
+        assert!(names.contains(&"name"));
     }
 
     #[test]

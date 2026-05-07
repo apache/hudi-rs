@@ -288,12 +288,12 @@ impl FileGroupReader {
     /// It returns a stream that yields record batches as they are read.
     ///
     /// For COW tables or read-optimized mode (base file only), this returns a true
-    /// streaming iterator from the underlying parquet file, yielding batches as they
-    /// are read without loading all data into memory.
+    /// streaming iterator from the underlying base file (Parquet or Lance), yielding
+    /// batches as they are read without loading all data into memory.
     ///
     /// For MOR tables with log files, this falls back to the collect-and-merge approach
-    /// and yields the merged result as a single batch. This limitation exists because
-    /// streaming merge of base files with log files is not yet implemented.
+    /// and yields the merged result as a single batch. Streaming merge of base files
+    /// with log files is not yet implemented.
     ///
     /// # Arguments
     /// * `file_slice` - The file slice to read.

@@ -269,9 +269,9 @@ impl HudiDataSource {
         self.file_slice_read_concurrency
     }
 
-    /// Parquet COW and Parquet MOR read-optimized use ParquetSource for
-    /// native row-group/page pruning. Parquet MOR snapshot, Lance, and
-    /// all other cases use HudiScanExec.
+    /// Returns the effective `UseReadOptimizedMode` value cached from the
+    /// table options at construction time. Used by [`Self::use_parquet_source`]
+    /// to decide whether MOR snapshot semantics are required.
     fn effective_read_optimized(&self) -> bool {
         self.read_optimized_mode
     }
@@ -307,6 +307,15 @@ impl HudiDataSource {
         Ok(true)
     }
 
+    /// Decides whether a scan can be served by DataFusion's native
+    /// `ParquetSource` (cheap row-group / page pruning) or must go through
+    /// [`HudiScanExec`].
+    ///
+    /// Routing matrix:
+    /// - Parquet COW → `ParquetSource`
+    /// - Parquet MOR read-optimized → `ParquetSource`
+    /// - Parquet MOR snapshot → `HudiScanExec` (base + log merging)
+    /// - Lance and any other base format → `HudiScanExec`
     fn use_parquet_source(
         &self,
         read_options: &ReadOptions,

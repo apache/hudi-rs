@@ -34,7 +34,7 @@ use lance_io::utils::CachedFileSize;
 use object_store::path::Path as ObjPath;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
-use crate::statistics::StatisticsContainer;
+use crate::statistics::{ColumnStatistics, StatisticsContainer, StatsGranularity};
 use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
@@ -70,6 +70,11 @@ impl LanceBaseFileReader {
                 (*self.storage.options).clone(),
             ),
         );
+        // `ObjectStoreParams::storage_options_accessor` is marked deprecated in
+        // lance-io 4.0.x but is still the only supported way to forward
+        // hudi-rs's storage option map (e.g. cloud credentials, custom
+        // endpoints) into Lance's provider prefix calculation. The replacement
+        // API is not yet exposed by lance-io; revisit when upgrading lance-io.
         #[allow(deprecated)]
         let params = lance_io::object_store::ObjectStoreParams {
             object_store: Some((
@@ -142,6 +147,16 @@ impl LanceBaseFileReader {
             ))
         })
     }
+
+    /// Returns the Arrow schema of the Lance base file.
+    ///
+    /// Mirrors [`super::parquet::ParquetBaseFileReader::get_schema`] so that
+    /// schema-resolution callers can fall back to the base file when commit
+    /// metadata does not carry an explicit schema.
+    pub async fn get_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
+        let reader = self.open_file_reader(relative_path, None).await?;
+        Ok(arrow_schema::Schema::from(reader.schema().as_ref()))
+    }
 }
 
 impl BaseFileReader for LanceBaseFileReader {
@@ -182,7 +197,7 @@ impl BaseFileReader for LanceBaseFileReader {
     fn get_metadata_and_stats<'a>(
         &'a self,
         relative_path: &'a str,
-        _table_schema: &'a arrow_schema::Schema,
+        table_schema: &'a arrow_schema::Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
         Box::pin(async move {
             let reader = self.open_file_reader(relative_path, None).await?;
@@ -206,8 +221,18 @@ impl BaseFileReader for LanceBaseFileReader {
                 num_records: num_rows,
             };
 
-            use crate::statistics::StatsGranularity;
-            let col_stats = StatisticsContainer::new(StatsGranularity::File);
+            // lance-file 4.0.x exposes file-level row count and schema but no
+            // per-column min/max via `FileReader`. Populate row count and an
+            // entry per schema column with empty bounds so callers receive a
+            // consistent shape; column-level pruning falls back to "include".
+            let mut col_stats = StatisticsContainer::new(StatsGranularity::File);
+            col_stats.num_rows = Some(num_rows);
+            for field in table_schema.fields() {
+                col_stats.columns.insert(
+                    field.name().clone(),
+                    ColumnStatistics::new(field.name().clone(), field.data_type().clone()),
+                );
+            }
 
             Ok((file_metadata, col_stats))
         })
@@ -280,14 +305,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lance_reader_metadata_returns_correct_row_count() {
+    async fn test_lance_reader_metadata_returns_correct_row_count_and_stats() {
         let storage = lance_test_storage();
         let reader = LanceBaseFileReader::new(storage.clone());
         let file_name = lance_base_file_name();
 
-        let dummy_schema = arrow_schema::Schema::empty();
-        let (metadata, _stats) = reader
-            .get_metadata_and_stats(&file_name, &dummy_schema)
+        let table_schema = reader.get_schema(&file_name).await.unwrap();
+        let (metadata, stats) = reader
+            .get_metadata_and_stats(&file_name, &table_schema)
             .await
             .unwrap();
 
@@ -300,6 +325,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata.num_records, batch.num_rows() as i64);
+
+        // Stats are populated with row count and one entry per schema column
+        // (Lance file metadata does not surface per-column min/max).
+        assert_eq!(stats.num_rows, Some(metadata.num_records));
+        assert_eq!(stats.columns.len(), table_schema.fields().len());
+        for field in table_schema.fields() {
+            let col = stats
+                .columns
+                .get(field.name())
+                .expect("column entry present");
+            assert!(col.min_value.is_none());
+            assert!(col.max_value.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_get_schema_matches_data_schema() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let file_name = lance_base_file_name();
+
+        let schema = reader.get_schema(&file_name).await.unwrap();
+        let batch = reader
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(schema.fields(), batch.schema().fields());
     }
 
     #[tokio::test]

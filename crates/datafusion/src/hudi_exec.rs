@@ -31,7 +31,8 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use datafusion_common::DataFusionError::Execution;
-use datafusion_common::Result;
+use datafusion_common::stats::Precision;
+use datafusion_common::{ColumnStatistics, Result, Statistics};
 use futures::stream::TryStreamExt;
 use futures::{StreamExt, stream};
 
@@ -210,5 +211,180 @@ impl ExecutionPlan for HudiScanExec {
             projected_schema,
             stream,
         )))
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(self.aggregate_file_slice_statistics())
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        let column_statistics =
+            vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
+
+        let partitions: Box<dyn Iterator<Item = &Vec<FileSlice>>> = match partition {
+            None => Box::new(self.file_slice_partitions.iter()),
+            Some(idx) => match self.file_slice_partitions.get(idx) {
+                Some(slices) => Box::new(std::iter::once(slices)),
+                None => return Ok(Statistics::new_unknown(&self.projected_schema)),
+            },
+        };
+
+        Ok(Self::aggregate_partitions(partitions, column_statistics))
+    }
+}
+
+impl HudiScanExec {
+    fn aggregate_file_slice_statistics(&self) -> Statistics {
+        let column_statistics =
+            vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
+        Self::aggregate_partitions(self.file_slice_partitions.iter(), column_statistics)
+    }
+
+    fn aggregate_partitions<'a, I>(
+        partitions: I,
+        column_statistics: Vec<ColumnStatistics>,
+    ) -> Statistics
+    where
+        I: IntoIterator<Item = &'a Vec<FileSlice>>,
+    {
+        let mut total_rows: u64 = 0;
+        let mut total_byte_size: u64 = 0;
+        let mut have_row_estimate = false;
+        let mut have_byte_estimate = false;
+
+        for slices in partitions {
+            for file_slice in slices {
+                if let Some(meta) = &file_slice.base_file.file_metadata {
+                    if meta.num_records > 0 {
+                        total_rows = total_rows.saturating_add(meta.num_records as u64);
+                        have_row_estimate = true;
+                    }
+                    if meta.size > 0 {
+                        total_byte_size = total_byte_size.saturating_add(meta.size);
+                        have_byte_estimate = true;
+                    }
+                }
+                for log_file in &file_slice.log_files {
+                    if let Some(meta) = &log_file.file_metadata
+                        && meta.size > 0
+                    {
+                        total_byte_size = total_byte_size.saturating_add(meta.size);
+                        have_byte_estimate = true;
+                    }
+                }
+            }
+        }
+
+        let num_rows = if have_row_estimate {
+            Precision::Inexact(usize::try_from(total_rows).unwrap_or(usize::MAX))
+        } else {
+            Precision::Absent
+        };
+        let total_byte_size = if have_byte_estimate {
+            Precision::Inexact(usize::try_from(total_byte_size).unwrap_or(usize::MAX))
+        } else {
+            Precision::Absent
+        };
+
+        Statistics {
+            num_rows,
+            total_byte_size,
+            column_statistics,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hudi_core::file_group::base_file::BaseFile;
+    use hudi_core::storage::file_metadata::FileMetadata;
+    use std::collections::BTreeSet;
+    use std::str::FromStr;
+
+    fn file_slice_with_meta(
+        file_name: &str,
+        size: u64,
+        num_records: i64,
+        byte_size: i64,
+    ) -> FileSlice {
+        let mut bf = BaseFile::from_str(file_name).unwrap();
+        bf.file_metadata = Some(FileMetadata {
+            name: file_name.to_string(),
+            size,
+            byte_size,
+            num_records,
+        });
+        FileSlice {
+            base_file: bf,
+            log_files: BTreeSet::new(),
+            partition_path: String::new(),
+            base_file_column_stats: None,
+        }
+    }
+
+    #[test]
+    fn test_aggregate_partitions_sums_rows_and_bytes() {
+        let partitions = [
+            vec![
+                file_slice_with_meta("fileA-0_0-1-1_20250101000000000.parquet", 100, 10, 200),
+                file_slice_with_meta("fileB-0_0-1-1_20250101000000000.parquet", 300, 20, 600),
+            ],
+            vec![file_slice_with_meta(
+                "fileC-0_0-1-1_20250101000000000.parquet",
+                500,
+                30,
+                1000,
+            )],
+        ];
+
+        let stats = HudiScanExec::aggregate_partitions(
+            partitions.iter(),
+            vec![ColumnStatistics::new_unknown(); 2],
+        );
+
+        assert_eq!(stats.num_rows, Precision::Inexact(60));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(900));
+        assert_eq!(stats.column_statistics.len(), 2);
+    }
+
+    #[test]
+    fn test_aggregate_partitions_returns_absent_when_metadata_missing() {
+        let mut bf = BaseFile::from_str("fileA-0_0-1-1_20250101000000000.parquet").unwrap();
+        bf.file_metadata = None;
+        let slices = [vec![FileSlice {
+            base_file: bf,
+            log_files: BTreeSet::new(),
+            partition_path: String::new(),
+            base_file_column_stats: None,
+        }]];
+
+        let stats = HudiScanExec::aggregate_partitions(
+            slices.iter(),
+            vec![ColumnStatistics::new_unknown()],
+        );
+
+        assert!(matches!(stats.num_rows, Precision::Absent));
+        assert!(matches!(stats.total_byte_size, Precision::Absent));
+    }
+
+    #[test]
+    fn test_aggregate_partitions_byte_size_only_when_records_unknown() {
+        // Mirrors the Lance case: file listing reports `size` but
+        // FileStatsEstimator has not populated `num_records`.
+        let slices = [vec![file_slice_with_meta(
+            "fileA-0_0-1-1_20250101000000000.lance",
+            500,
+            0,
+            0,
+        )]];
+
+        let stats = HudiScanExec::aggregate_partitions(
+            slices.iter(),
+            vec![ColumnStatistics::new_unknown()],
+        );
+
+        assert!(matches!(stats.num_rows, Precision::Absent));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(500));
     }
 }
