@@ -1665,3 +1665,39 @@ async fn fg_filter_in_with_delete_block() -> Result<()> {
 
     Ok(())
 }
+
+/// Test 7: filter on a log-updated key on the non-partitioned fixture.
+///
+/// Validates: same as Test 1 but on V9MorNonpart3Commits (non-partitioned,
+/// 2 log files). id=5 is updated by log 2 → filtered output should reflect
+/// the log update (E2/55.0).
+#[tokio::test]
+async fn fg_filter_in_log_updated_key_nonpart() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = nonpart_3commits_file_group();
+
+    let baseline_for_key_lookup = read_file_group_with_key_filter(
+        &table_path, partition, base_file, log_files.clone(), None,
+    ).await?;
+    let key_for_id5 = lookup_record_key(&baseline_for_key_lookup, 5);
+
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::string(key_for_id5)) as Box<dyn Expression>],
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    ab.assert_filter_narrowed();         // 1 < 4
+    ab.assert_filtered_ids_eq(&[5]);
+
+    // Cross-validate: filtered id=5 row should be the log-updated value (E2, 55.0).
+    let expected = extract_row_with_id_opt_v9nonpart(&ab.baseline, 5)
+        .expect("id=5 in baseline");
+    let actual = extract_row_with_id_opt_v9nonpart(&ab.filtered, 5)
+        .expect("id=5 in filtered");
+    assert_eq!(expected, actual, "filtered id=5 must equal baseline id=5 (log-updated)");
+    // Sanity: name should be "E2" (the log update value).
+    assert_eq!(expected.1, "E2", "id=5 baseline value should be log update (E2)");
+
+    Ok(())
+}
