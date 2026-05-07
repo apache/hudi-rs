@@ -1496,3 +1496,35 @@ fn log_only_file_group() -> (String, &'static str, &'static str, Vec<&'static st
         ],
     )
 }
+
+/// Test 2: filter on a key that exists ONLY in the base file (no log update).
+///
+/// Validates: ISOLATES the base-file filter (apply_key_filter_to_batch).
+/// id=2 in city=sf has no log update — log scan finds no records for it,
+/// only the base-file filter narrows the output.
+#[tokio::test]
+async fn fg_filter_in_base_only_key() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = sf_file_group();
+
+    let baseline_for_key_lookup = read_file_group_with_key_filter(
+        &table_path, partition, base_file, log_files.clone(), None,
+    ).await?;
+    let key_for_id2 = lookup_record_key(&baseline_for_key_lookup, 2);
+
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::string(key_for_id2)) as Box<dyn Expression>],
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    ab.assert_filter_narrowed();         // 1 < 2
+    ab.assert_filtered_ids_eq(&[2]);     // exactly id=2
+
+    // Cross-validate: filtered id=2 row equals baseline id=2 row (Bob, base value).
+    let expected = extract_row_with_id_opt(&ab.baseline, 2).expect("id=2 in baseline");
+    let actual = extract_row_with_id_opt(&ab.filtered, 2).expect("id=2 in filtered");
+    assert_eq!(expected, actual, "filtered id=2 must equal baseline id=2 (Bob)");
+
+    Ok(())
+}
