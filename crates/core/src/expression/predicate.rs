@@ -29,11 +29,14 @@ pub trait Predicate: Expression {
 /// Borrowed enum view of `Predicate` for pattern matching. Variants are
 /// added in subsequent tasks (1.12–1.14) once concrete predicate types exist.
 pub enum PredicateKind<'a> {
-    // Variants added in Task 1.12-1.14:
-    //   True, False,
+    True,
+    False,
+    // Future variants (Task 1.13, 1.14):
     //   And(&'a predicates::And), Or(&'a predicates::Or), Not(&'a predicates::Not),
-    //   BinaryComparison(...), In(...), IsNull(...), IsNotNull(...),
-    //   StringStartsWith(...), StringStartsWithAny(...), StringContains(...).
-    /// Placeholder so the enum compiles. Removed in Task 1.14.
+    //   BinaryComparison(&'a predicates::BinaryComparison),
+    //   In(&'a predicates::In), IsNull(&'a predicates::IsNull), IsNotNull(&'a predicates::IsNotNull),
+    //   StringStartsWith(&'a predicates::StringStartsWith),
+    //   StringStartsWithAny(&'a predicates::StringStartsWithAny),
+    //   StringContains(&'a predicates::StringContains),
     _Placeholder(std::marker::PhantomData<&'a ()>),
 }
