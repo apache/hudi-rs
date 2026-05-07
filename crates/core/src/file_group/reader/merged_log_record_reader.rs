@@ -133,8 +133,12 @@ impl HoodieMergedLogRecordReader {
     async fn perform_scan(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
 
-        // KeySpec filtering not yet implemented in Rust; pass skip=false
-        self.base.scan_internal(None, false).await?;
+        // Mirrors Java: Option<KeySpec> keySpecOpt = createKeySpec(readerContext.getKeyFilterOpt());
+        let key_spec_opt = crate::file_group::reader::key_spec::create_key_spec_from_arc(
+            &self.base.reader_context.key_filter_opt,
+        );
+
+        self.base.scan_internal(key_spec_opt, false).await?;
 
         self.total_time_taken_to_read_and_merge_blocks_ms =
             start.elapsed().as_millis() as u64;
