@@ -103,23 +103,17 @@ impl RecordMerger {
                 // Use sorting fields to get sorted indices of the data batch (inserts and updates)
                 let ordering_fields: Vec<String> =
                     self.hudi_configs.get(OrderingFields)?.into();
+                let ordering_field = &ordering_fields[0];
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
+                let ordering_array = data_batch.get_array(ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
-                let mut sort_columns = vec![key_array];
-                for field in &ordering_fields {
-                    sort_columns.push(data_batch.get_array(field)?);
-                }
-                sort_columns.push(commit_seqno_array);
-                let desc_indices = lexsort_to_indices(&sort_columns, true);
+                let desc_indices =
+                    lexsort_to_indices(&[key_array, ordering_array, commit_seqno_array], true);
 
-                // Create shared converters for record keys and ordering values.
-                // Event time uses the first ordering field only for data-vs-delete comparison,
-                // since delete records store a single orderingVal.
+                // Create shared converters for record keys and ordering values
                 let key_converter = create_record_key_converter(data_batch.schema())?;
-                let event_time_converter = create_event_time_ordering_converter(
-                    data_batch.schema(),
-                    &ordering_fields[0],
-                )?;
+                let event_time_converter =
+                    create_event_time_ordering_converter(data_batch.schema(), ordering_field)?;
                 let commit_time_converter =
                     create_commit_time_ordering_converter(data_batch.schema())?;
 
@@ -150,7 +144,7 @@ impl RecordMerger {
                 let event_times = extract_event_time_ordering_values(
                     &event_time_converter,
                     &data_batch,
-                    &ordering_fields[0],
+                    ordering_field,
                 )?;
                 let commit_times =
                     extract_commit_time_ordering_values(&commit_time_converter, &data_batch)?;

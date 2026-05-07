@@ -260,8 +260,15 @@ impl ConfigParser for HudiTableConfig {
             Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
-            Self::OrderingFields => get_result
-                .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
+            Self::OrderingFields => get_result.and_then(|v| {
+                let fields: Vec<String> = v.split(',').map(str::to_string).collect();
+                if fields.len() > 1 {
+                    return Err(UnsupportedValue(format!(
+                        "Multiple ordering fields '{v}' are not yet supported"
+                    )));
+                }
+                Ok(HudiConfigValue::List(fields))
+            }),
             Self::PopulatesMetaFields => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
@@ -612,15 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering_fields_multiple() {
+    fn test_ordering_fields_rejects_multiple() {
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
             (HudiTableConfig::OrderingFields.as_ref(), "ts,seq"),
         ]);
-        let actual: Vec<String> = hudi_configs
-            .get(HudiTableConfig::OrderingFields)
-            .unwrap()
-            .into();
-        assert_eq!(actual, vec!["ts", "seq"]);
+        assert!(matches!(
+            hudi_configs
+                .get(HudiTableConfig::OrderingFields)
+                .unwrap_err(),
+            ConfigError::UnsupportedValue(_)
+        ));
     }
 }
