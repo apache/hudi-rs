@@ -386,6 +386,9 @@ pub fn new_file_group_reader_with_context(
         schema_handler,
         table_config: ffi_rc.table_config,
         hoodie_reader_config: ffi_rc.hoodie_reader_config,
+        // Mirrors Java HoodieReaderContext.keyFilterOpt — FFI bridge always
+        // initializes to None (FFI integration is out of scope per spec §2).
+        key_filter_opt: None,
     });
 
     // ── 7. Build tokio runtime ──────────────────────────────────────
