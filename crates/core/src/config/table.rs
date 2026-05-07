@@ -88,7 +88,7 @@ pub enum HudiTableConfig {
     /// the record with the larger ordering field value is picked.
     ///
     /// Alias: `hoodie.table.precombine.field` (deprecated).
-    OrderingField,
+    OrderingFields,
 
     /// When enabled, populates all meta fields. When disabled, no meta fields are populated
     /// and incremental queries will not be functional. This is only meant to be used for append only/immutable data for batch processing
@@ -161,7 +161,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::KeyGeneratorClass => "hoodie.table.keygenerator.class",
             Self::KeyGeneratorType => "hoodie.table.keygenerator.type",
             Self::PartitionFields => "hoodie.table.partition.fields",
-            Self::OrderingField => "hoodie.table.ordering.fields",
+            Self::OrderingFields => "hoodie.table.ordering.fields",
             Self::PopulatesMetaFields => "hoodie.populate.meta.fields",
             Self::RecordKeyFields => "hoodie.table.recordkey.fields",
             Self::RecordMergeStrategy => "hoodie.table.record.merge.strategy",
@@ -213,7 +213,7 @@ impl ConfigParser for HudiTableConfig {
 
     fn aliases(&self) -> &[ConfigAlias] {
         match self {
-            Self::OrderingField => {
+            Self::OrderingFields => {
                 const ALIASES: &[ConfigAlias] =
                     &[ConfigAlias::deprecated("hoodie.table.precombine.field")];
                 ALIASES
@@ -260,7 +260,7 @@ impl ConfigParser for HudiTableConfig {
             Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
-            Self::OrderingField => get_result.map(|v| {
+            Self::OrderingFields => get_result.map(|v| {
                 // Ordering fields may be comma-separated; use the first as the ordering field.
                 let field = v.split(',').next().unwrap_or(v).trim();
                 HudiConfigValue::String(field.to_string())
@@ -320,7 +320,7 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    if HudiTableConfig::OrderingField
+                    if HudiTableConfig::OrderingFields
                         .parse_value(configs)
                         .is_err()
                     {
@@ -555,7 +555,7 @@ mod tests {
     fn test_derive_record_merger_strategy() {
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields, "false"),
-            (HudiTableConfig::OrderingField, "ts"),
+            (HudiTableConfig::OrderingFields, "ts"),
         ]);
         let actual: String = hudi_configs
             .get_or_default(HudiTableConfig::RecordMergeStrategy)
@@ -578,7 +578,7 @@ mod tests {
 
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields, "true"),
-            (HudiTableConfig::OrderingField, "ts"),
+            (HudiTableConfig::OrderingFields, "ts"),
         ]);
         let actual: String = hudi_configs
             .get_or_default(HudiTableConfig::RecordMergeStrategy)
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_precombine_field_deprecated_alias() {
-        let deprecated_key = HudiTableConfig::OrderingField.aliases()[0].key;
+        let deprecated_key = HudiTableConfig::OrderingFields.aliases()[0].key;
         assert_eq!(deprecated_key, "hoodie.table.precombine.field");
 
         // Deprecated alias should still resolve
@@ -600,7 +600,7 @@ mod tests {
             (deprecated_key, "ts"),
         ]);
         let actual: String = hudi_configs
-            .get(HudiTableConfig::OrderingField)
+            .get(HudiTableConfig::OrderingFields)
             .unwrap()
             .into();
         assert_eq!(actual, "ts");
@@ -618,10 +618,10 @@ mod tests {
     fn test_ordering_fields_comma_separated() {
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
-            (HudiTableConfig::OrderingField.as_ref(), "ts,seq"),
+            (HudiTableConfig::OrderingFields.as_ref(), "ts,seq"),
         ]);
         let actual: String = hudi_configs
-            .get(HudiTableConfig::OrderingField)
+            .get(HudiTableConfig::OrderingFields)
             .unwrap()
             .into();
         assert_eq!(actual, "ts", "Should use the first ordering field");
