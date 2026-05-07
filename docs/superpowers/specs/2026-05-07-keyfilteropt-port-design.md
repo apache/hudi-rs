@@ -1,0 +1,225 @@
+# keyFilterOpt port — design spec
+
+**Date:** 2026-05-07
+**Owner:** Davis Zhang
+**Source repo:** `/home/ubuntu/ws3/hudi-rs`
+**Reference (Java):** `/home/ubuntu/ws3/hudi-internal`
+**Call-stack reference:** `/home/ubuntu/operations/tasks/quantonMORScanSupport/scanSpecPushDown/Tasks/phase3_rust_fg_integration/migrateFilterOptCode/readerContext_callstack.md`
+
+## 1. Goals
+
+Bring hudi-rs's `ReaderContext` to parity with Java's `HoodieReaderContext.keyFilterOpt`. The work has three goals:
+
+1. Port the entire `org.apache.hudi.expression` package (Predicate hierarchy) into hudi-rs.
+2. Port the `org.apache.hudi.internal.schema.{Type, Types}` Type system the Predicate hierarchy depends on. Schema-evolution code (`InternalSchema`, `InternalSchemaBuilder`, `AvroInternalSchemaConverter`, schema-evolution actions/visitors, `SchemaChangeUtils`, etc.) is **out of scope**.
+3. Add a `key_filter_opt: Option<Arc<dyn Predicate>>` field on hudi-rs's `ReaderContext` and wire it through the file-group reader so a key-based In-predicate actually filters output rows end-to-end on a v9 MOR + COMMIT_TIME_ORDERING table.
+
+The principle is faithful structural mirroring: same Rust class, same fn name, same arg order, same observable side-effect as Java, except where Rust's type system forces a deviation (called out explicitly in §6).
+
+## 2. Boundaries
+
+In-scope:
+- Spark-only assumption.
+- Table version 9, MOR, COMMIT_TIME_ORDERING.
+- Predicate hierarchy (Predicate, Expression, Predicates with all 12 inner classes — TrueExpression, FalseExpression, And, Or, Not, BinaryComparison, In, IsNull, IsNotNull, StringStartsWith, StringStartsWithAny, StringContains; Literal, NameReference, BinaryExpression, LeafExpression, ExpressionVisitor, BoundReference, BindVisitor, PartialBindVisitor, Comparators, ArrayData, StructLike).
+- `Type` / `Types` full port from `internal.schema`.
+
+Out-of-scope:
+- FFI / `FfiReaderContext` integration.
+- Schema evolution (no `InternalSchema`, `AvroInternalSchemaConverter`, no schema-change actions/visitors, no `SchemaChangeUtils`).
+- Engines other than Spark (no Flink/Trino/Hive ReaderContext changes).
+- Merge modes other than COMMIT_TIME_ORDERING.
+- `HoodieAvroReaderContext.getFileRecordIterator` HFile-supporting branch (no HFile reader in hudi-rs).
+- `ReusableKeyBasedRecordBuffer` (metadata-table buffer).
+- Per-record `Predicate.eval(StructLike)` evaluation against scan-time rows. The hierarchy ports `eval` so unit tests pass and behavior matches Java, but the e2e reader path uses Arrow `filter_record_batch` for the actual filtering.
+
+## 3. Phases
+
+The work lands in three independently-reviewable commits.
+
+| Phase | Deliverable | Verification |
+|------|------|------|
+| 1 | Port `org.apache.hudi.expression` (Predicate hierarchy) + full port of `org.apache.hudi.internal.schema.{Type, Types}`. **No reader integration yet.** | Unit tests on each Predicate / Type, plus structural pattern-match tests (`predicates::in_(...)` produces `predicates::In` with the right children). |
+| 2 | Add `key_filter_opt: Option<Arc<dyn Predicate>>` on `ReaderContext`. Add `KeySpec` enum + `create_key_spec()` mirroring Java line-for-line. Apply the filter at two call sites: (a) `merged_log_record_reader::perform_scan` → KeySpec → narrow log scan; (b) `HoodieFileGroupReader::make_base_file_batches` → row filter on base parquet (mirroring `HoodieAvroReaderContext.getFileRecordIterator`'s key-extraction path). | Unit tests on `create_key_spec`, plus per-site tests, plus a manual cross-check pass against `readerContext_callstack.md` confirming each call site listed there has a 1:1 hudi-rs equivalent. The cross-check produces a checklist in the Phase 2 PR description that names specific Rust `file:line` for each Java line. |
+| 3 | One e2e smoke test on `v9_mor_8i4u_commit_time` reading a single file group with and without `Predicates.In(_hoodie_record_key, [k])`. Compare row count + row content. | Single integration test in `crates/core/tests/file_group_reader_tests.rs`. |
+
+Phase 1 is purely additive — it compiles standalone and adds two new top-level modules. Phase 2 wires the field in but defaults to `None` so all existing tests keep passing. Phase 3 demonstrates the end-to-end contract.
+
+## 4. Phase 1 — file layout & module structure
+
+Two new module trees under `crates/core/src/`:
+
+```
+crates/core/src/
+├── internal_schema/                ← NEW (mirrors org.apache.hudi.internal.schema)
+│   ├── mod.rs
+│   ├── type_.rs                    ← `Type` trait + Type::PrimitiveType / Type::NestedType (Type.java in full)
+│   └── types.rs                    ← all concrete types from Types.java (full port)
+│
+└── expression/                     ← NEW (mirrors org.apache.hudi.expression)
+    ├── mod.rs
+    ├── expression.rs               ← Expression trait + Operator enum
+    ├── predicate.rs                ← Predicate trait
+    ├── leaf_expression.rs          ← LeafExpression trait
+    ├── binary_expression.rs        ← BinaryExpression
+    ├── literal.rs                  ← Literal
+    ├── name_reference.rs           ← NameReference
+    ├── bound_reference.rs          ← BoundReference
+    ├── struct_like.rs              ← StructLike trait
+    ├── array_data.rs               ← ArrayData
+    ├── comparators.rs              ← Comparators::for_type
+    ├── expression_visitor.rs       ← ExpressionVisitor trait
+    ├── bind_visitor.rs             ← BindVisitor
+    ├── partial_bind_visitor.rs     ← PartialBindVisitor
+    └── predicates.rs               ← Predicates factory + 12 inner classes (TrueExpression, FalseExpression, And, Or, Not, BinaryComparison, In, IsNull, IsNotNull, StringStartsWith, StringStartsWithAny, StringContains). One file mirrors Java's single-file shape.
+```
+
+Naming choices:
+
+- Java package `org.apache.hudi.expression` → Rust `expression` (snake_case).
+- Java package `org.apache.hudi.internal.schema` → Rust `internal_schema`.
+- Java `Predicates.In` → Rust `predicates::In` (struct in module). Factory functions `predicates::in_(...)`, `predicates::and(...)`, `predicates::eq(...)`, etc. (`in` is a Rust keyword, hence the trailing underscore.)
+- Polymorphism: Java `interface Expression` becomes Rust `trait Expression: Send + Sync + Debug`. The 13 Predicate variants become concrete structs implementing `Predicate: Expression`. Anywhere Java passes `Expression` or `Predicate`, Rust uses `Box<dyn Expression>` / `Arc<dyn Predicate>`.
+- Java `Comparator<T>` returned by `Comparators` becomes a Rust `fn(&LiteralValue, &LiteralValue) -> std::cmp::Ordering` returned by `Comparators::for_type(&Type)`.
+- Visitor pattern: Java `ExpressionVisitor<T>` → Rust trait with one method per `visit*` overload. `BindVisitor` and `PartialBindVisitor` become structs implementing `ExpressionVisitor<Box<dyn Expression>>`.
+
+Crate exports: both `internal_schema` and `expression` are re-exported from `crates/core/src/lib.rs` so downstream code can import at `hudi_core::expression::Predicate` / `hudi_core::internal_schema::Type`.
+
+No changes to `crates/core/src/expr/filter.rs` and its callers — that is the file-pruning predicate path and remains separate per the explicit decision to not converge the two abstractions.
+
+## 5. Phase 2 — keyFilterOpt integration call sites
+
+### 5.1 Field on `ReaderContext`
+
+```rust
+// crates/core/src/file_group/reader/reader_context.rs
+pub struct ReaderContext {
+    // … existing fields …
+    /// Mirrors Java `HoodieReaderContext.keyFilterOpt`.
+    /// Constructor-set, never mutated.
+    pub key_filter_opt: Option<Arc<dyn Predicate>>,
+}
+
+impl ReaderContext {
+    /// Mirrors Java `HoodieReaderContext.getKeyFilterOpt()`.
+    pub fn get_key_filter_opt(&self) -> Option<Arc<dyn Predicate>> { … }
+}
+```
+
+`ReaderContext::empty()` and the FFI bridge initialize `key_filter_opt = None`, matching Java's `Option.empty()` default in `BaseSparkInternalRowReaderContext`.
+
+### 5.2 Call site A — log scan
+
+New file `crates/core/src/file_group/reader/key_spec.rs`:
+
+```rust
+pub enum KeySpec {
+    /// Mirrors Java FullKeySpec — exact-match key list (from Predicates::In).
+    FullKeys(Vec<String>),
+    /// Mirrors Java PrefixKeySpec — prefix list (from Predicates::StringStartsWithAny).
+    PrefixKeys(Vec<String>),
+}
+
+/// Mirrors `HoodieMergedLogRecordReader.createKeySpec(Option<Predicate>)`
+/// (HoodieMergedLogRecordReader.java lines 109-126) line-for-line.
+pub fn create_key_spec(filter: &Option<Arc<dyn Predicate>>) -> Option<KeySpec> { … }
+```
+
+`merged_log_record_reader::perform_scan`:
+
+- Drops the existing TODO ("KeySpec filtering not yet implemented in Rust").
+- Calls `create_key_spec(reader_context.get_key_filter_opt())`.
+- Threads the resulting `Option<KeySpec>` into `BaseHoodieLogRecordReader::scan_internal(key_spec_opt, skip_processing_blocks)`.
+
+`BaseHoodieLogRecordReader::scan_internal` signature changes from `scan_internal(skip: bool)` to `scan_internal(key_spec_opt: Option<KeySpec>, skip: bool)`. All existing non-`perform_scan` call sites pass `None` for `key_spec_opt`. Inside `scan_internal`, the per-record processing in `process_data_block` / `process_delete_block` consults `KeySpec` and skips records whose key isn't in the FullKeys set / doesn't have a matching prefix in PrefixKeys — mirroring Java `BaseHoodieLogRecordReader.scanInternal` filtering.
+
+### 5.3 Call site B — base file
+
+In `HoodieFileGroupReader::make_base_file_batches`, after the parquet read returns its batches, apply a row-level filter when `reader_context.key_filter_opt.is_some()`. The filter materializes the keys/prefixes via the same `create_key_spec` (or directly extracts `Predicates::In::right_children` / `Predicates::StringStartsWithAny::right_children`) and uses Arrow `arrow::compute::filter_record_batch` against the `_hoodie_record_key` column. This mirrors Java's "fall through to row-level filter when reader doesn't `supportKeyPredicate`" — we always go through that path because Parquet has no native key predicate.
+
+The shared key-extraction helper lives on `key_spec.rs` so both sites use the same code.
+
+### 5.4 No `HoodieFileGroupReader::Builder` changes
+
+No new builder method — `key_filter_opt` is set on `ReaderContext` *before* the reader is constructed, exactly mirroring Java where `keyFilterOpt` is a constructor arg of `HoodieReaderContext`, not of `HoodieFileGroupReader`.
+
+### 5.5 Manual cross-check (Phase 2 verification)
+
+As part of the Phase 2 PR, walk through `readerContext_callstack.md` line by line and produce a checklist in the PR description: for each `readerContext.*` line in the doc that touches `keyFilterOpt` directly or indirectly, confirm hudi-rs has the same call in the same Rust class/function with the same args. Specifically the doc's §3.1 (eager-during-construction stack) and §3.2 (lazy `getClosableIterator` stack).
+
+Each verification line must name the specific Rust `file:line`, not just "yes, equivalent".
+
+## 6. Deviations from Java structure
+
+These are the only places where the Rust port intentionally differs from Java. Each is called out so future readers don't get confused:
+
+1. **`Literal<T>` shape.** Java `Literal<T>(T value, Type type)` is generic; Rust uses `Literal { value: LiteralValue, data_type: Type }` with a `LiteralValue` enum covering the actual value variants (Int, Long, String, Bool, …). This avoids fighting monomorphization across heterogeneous expression trees. Behavior is identical; only the type-parameter shape differs.
+2. **`Predicate` ownership.** Java passes `Predicate` references; Rust uses `Arc<dyn Predicate>` so predicates can be cloned into ReaderContext, scanners, and buffers without lifetime juggling. Concrete impls must avoid `Rc` (the trait bound `Send + Sync` enforces this).
+3. **`Comparator<T>` return.** Java `Comparators::forType` returns `Comparator<T>`; Rust returns `fn(&LiteralValue, &LiteralValue) -> std::cmp::Ordering`. Same dispatch table, different language idiom.
+4. **`expr/filter.rs` is not converged.** Java has only one expression abstraction. Rust keeps `Filter` (the existing flat file-pruning struct) separate from the new `Predicate` hierarchy, since they serve different purposes (file pruning vs key filtering) and converging them is out of scope.
+5. **`BindVisitor` / `PartialBindVisitor` ported but not wired.** They produce `BoundReference`s from `NameReference`s given a schema; nothing in keyFilterOpt's reader-side consumption needs binding (we extract literal values directly). They are ported for completeness and hierarchy faithfulness.
+
+## 7. Phase 3 — E2E smoke test
+
+**Location:** `crates/core/tests/file_group_reader_tests.rs` (existing file, add one new `#[tokio::test]`).
+
+**Fixture:** `QuickstartTripsTable::V9Mor8I4UCommitTime`. Pick partition `city=sf` which has one updated id (id=1) and one not-updated id (id=2). With both base + log content, this is the smallest interesting file group.
+
+**Two reads on the same file group:**
+
+```rust
+#[tokio::test]
+async fn fg_reader_with_key_filter_filters_rows() -> Result<()> {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.url_to_mor_avro();
+    let (configs, storage) = create_configs_and_storage(&table_path).await?;
+    let (partition, base_file, log_files) = locate_sf_file_group(&storage).await?;
+
+    // ── Read 1: no filter (baseline) ────────────────────────────────
+    let baseline_ctx = build_reader_context(/* key_filter_opt = */ None, &configs);
+    let baseline_batch = run_reader(baseline_ctx, …).await?;
+    assert_eq!(baseline_batch.num_rows(), 2);  // id=1 (V2 from log) + id=2 (from base)
+
+    // Look up the actual _hoodie_record_key string for id=1 from the baseline
+    // batch so the filter literal matches whatever the keygen produced.
+    let key_for_id1 = lookup_record_key(&baseline_batch, 1);
+
+    // ── Read 2: filter with In(_hoodie_record_key, [<key for id=1>]) ───────
+    //  Construction mirrors Java: Predicates.in(NameReference("_hoodie_record_key"),
+    //                                            [Literal.from(key_for_id1)])
+    let key_filter = predicates::in_(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::from(key_for_id1.clone()))],
+    );
+    let filtered_ctx = build_reader_context(Some(Arc::new(key_filter)), &configs);
+    let filtered_batch = run_reader(filtered_ctx, …).await?;
+    assert_eq!(filtered_batch.num_rows(), 1);
+
+    // ── Cross-validate: the filtered row equals the matching baseline row.
+    let expected = extract_row_with_id(&baseline_batch, 1);
+    let actual = extract_row_with_id(&filtered_batch, 1);
+    assert_eq!(expected, actual);
+
+    // Negative assertion: id=2 (base-only) is NOT in filtered output.
+    assert!(extract_row_with_id_opt(&filtered_batch, 2).is_none());
+
+    Ok(())
+}
+```
+
+**Helper functions** added to the same test file (no shared test util churn):
+
+- `locate_sf_file_group(&storage)` — finds the latest base-file + log-files for partition `city=sf`. Reuses existing `Table::file_slices(...)` if available, otherwise walks `.hoodie/timeline`.
+- `build_reader_context(key_filter_opt, configs)` — constructs `ReaderContext` with `merge_mode=COMMIT_TIME_ORDERING`, `latest_commit_time` from configs, partition path = `city=sf`, populated `table_config`, and the requested `key_filter_opt`.
+- `run_reader(ctx, …)` — wraps the existing `read_file_group` helper but takes a pre-built `ReaderContext`.
+- `lookup_record_key(batch, id) -> String` — pulls the `_hoodie_record_key` string for a given `id` from the baseline batch. Avoids hard-coding the keygen encoding (`id:1` vs `1` vs `id=1`).
+- `extract_row_with_id` / `extract_row_with_id_opt` — small Arrow helpers comparing row tuples.
+
+**One test, not multiple variants.** This is a smoke test for the integration. Comprehensive Predicate / KeySpec coverage is in Phase 1 + Phase 2 unit tests.
+
+## 8. Risks and assumptions
+
+1. **Record-key encoding ambiguity.** The exact `_hoodie_record_key` string format for `V9Mor8I4UCommitTime` is determined at test-write time by reading one baseline row. If the fixture is regenerated with a different key generator, the literal in the test breaks — kept tight by deriving the literal from the baseline read via `lookup_record_key`, not by hard-coding it.
+2. **`BaseHoodieLogRecordReader::scan_internal` signature change** breaks any internal callers. Audit all call sites at Phase 2 implementation time and update each to pass `None` for the new `key_spec_opt` parameter.
+3. **Manual cross-check discipline.** The walkthrough against `readerContext_callstack.md` is valuable but only if each verification line names a specific Rust `file:line`. Vague "yes, equivalent" entries defeat the point.
+4. **Open assumption — populate_meta_fields.** The v9 MOR fixture is assumed to populate `_hoodie_record_key`. If virtual keys are in play we'd need to filter on the actual key field name; we'll verify when writing the test by inspecting the baseline batch.
+5. **Trait-object hygiene.** `Arc<dyn Predicate>` requires concrete impls to be `Send + Sync` and avoid `Rc`. Standard Rust trait-object hygiene; called out so reviewers don't get surprised by `Rc<…>` showing up later.
