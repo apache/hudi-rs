@@ -104,6 +104,160 @@ impl fmt::Display for DecimalType {
     }
 }
 
+// =========================================================================
+// Nested types
+// =========================================================================
+
+/// Mirrors Java `Types.Field`.
+///
+/// Java fields: `int id`, `boolean isOptional`, `String name`, `Type type`, `String doc`.
+/// Default Java constructor sets `doc = null`.
+#[derive(Debug)]
+pub struct Field {
+    id: i32,
+    is_optional: bool,
+    name: String,
+    field_type: Box<dyn Type>,
+    doc: Option<String>,
+}
+
+impl Field {
+    pub fn new(id: i32, name: impl Into<String>, field_type: Box<dyn Type>, is_optional: bool) -> Self {
+        Self { id, name: name.into(), field_type, is_optional, doc: None }
+    }
+
+    pub fn with_doc(mut self, doc: impl Into<String>) -> Self {
+        self.doc = Some(doc.into());
+        self
+    }
+
+    pub fn id(&self) -> i32 { self.id }
+    pub fn name(&self) -> &str { &self.name }
+    pub fn field_type(&self) -> &dyn Type { self.field_type.as_ref() }
+    pub fn is_optional(&self) -> bool { self.is_optional }
+    pub fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+}
+
+impl PartialEq for Field {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.is_optional == other.is_optional
+            && self.name == other.name
+            && self.field_type.type_id() == other.field_type.type_id()
+            && self.doc == other.doc
+    }
+}
+
+impl Eq for Field {}
+
+/// Mirrors Java `Types.RecordType`.
+#[derive(Debug)]
+pub struct RecordType {
+    fields: Vec<Field>,
+}
+
+impl RecordType {
+    pub fn new(fields: Vec<Field>) -> Self {
+        Self { fields }
+    }
+
+    pub fn fields(&self) -> &[Field] { &self.fields }
+
+    /// Mirrors Java `RecordType.fieldType(String name)`.
+    pub fn field_type_by_name(&self, name: &str) -> Option<&dyn Type> {
+        self.fields.iter().find(|f| f.name == name).map(|f| f.field_type())
+    }
+
+    /// Mirrors Java `RecordType.field(int id)` — find by field id.
+    pub fn field_by_id(&self, id: i32) -> Option<&Field> {
+        self.fields.iter().find(|f| f.id == id)
+    }
+
+    /// Find a field by name (Rust convenience accessor).
+    pub fn field_by_name(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+}
+
+impl Type for RecordType {
+    fn type_id(&self) -> TypeID { TypeID::Record }
+    fn is_nested_type(&self) -> bool { true }
+}
+
+impl fmt::Display for RecordType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "record<{}>", self.fields.len())
+    }
+}
+
+/// Mirrors Java `Types.ArrayType`.
+#[derive(Debug)]
+pub struct ArrayType {
+    element_id: i32,
+    element_optional: bool,
+    element_type: Box<dyn Type>,
+}
+
+impl ArrayType {
+    pub fn new(element_id: i32, element_optional: bool, element_type: Box<dyn Type>) -> Self {
+        Self { element_id, element_optional, element_type }
+    }
+
+    pub fn element_id(&self) -> i32 { self.element_id }
+    pub fn is_element_optional(&self) -> bool { self.element_optional }
+    pub fn element_type(&self) -> &dyn Type { self.element_type.as_ref() }
+}
+
+impl Type for ArrayType {
+    fn type_id(&self) -> TypeID { TypeID::Array }
+    fn is_nested_type(&self) -> bool { true }
+}
+
+impl fmt::Display for ArrayType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "array<{}>", self.element_type.type_id().get_name())
+    }
+}
+
+/// Mirrors Java `Types.MapType`.
+#[derive(Debug)]
+pub struct MapType {
+    key_id: i32,
+    value_id: i32,
+    value_optional: bool,
+    key_type: Box<dyn Type>,
+    value_type: Box<dyn Type>,
+}
+
+impl MapType {
+    pub fn new(
+        key_id: i32,
+        value_id: i32,
+        value_optional: bool,
+        key_type: Box<dyn Type>,
+        value_type: Box<dyn Type>,
+    ) -> Self {
+        Self { key_id, value_id, value_optional, key_type, value_type }
+    }
+
+    pub fn key_id(&self) -> i32 { self.key_id }
+    pub fn value_id(&self) -> i32 { self.value_id }
+    pub fn is_value_optional(&self) -> bool { self.value_optional }
+    pub fn key_type(&self) -> &dyn Type { self.key_type.as_ref() }
+    pub fn value_type(&self) -> &dyn Type { self.value_type.as_ref() }
+}
+
+impl Type for MapType {
+    fn type_id(&self) -> TypeID { TypeID::Map }
+    fn is_nested_type(&self) -> bool { true }
+}
+
+impl fmt::Display for MapType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "map<{},{}>", self.key_type.type_id().get_name(), self.value_type.type_id().get_name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +318,51 @@ mod tests {
         assert_eq!(d.precision(), 10);
         assert_eq!(d.scale(), 2);
         assert_eq!(d.to_string(), "decimal(10, 2)");
+    }
+
+    #[test]
+    fn field_carries_id_name_type_nullable() {
+        let f = Field::new(1, "id", Box::new(IntType::get()), false);
+        assert_eq!(f.id(), 1);
+        assert_eq!(f.name(), "id");
+        assert!(!f.is_optional());
+        assert_eq!(f.field_type().type_id(), TypeID::Int);
+    }
+
+    #[test]
+    fn record_type_lookup_field_by_name() {
+        let fields = vec![
+            Field::new(1, "id", Box::new(IntType::get()), false),
+            Field::new(2, "name", Box::new(StringType::get()), true),
+        ];
+        let rec = RecordType::new(fields);
+        assert_eq!(rec.type_id(), TypeID::Record);
+        assert!(rec.is_nested_type());
+        assert_eq!(rec.field_by_name("id").unwrap().id(), 1);
+        assert_eq!(rec.field_by_name("name").unwrap().id(), 2);
+        assert!(rec.field_by_name("missing").is_none());
+    }
+
+    #[test]
+    fn array_type_carries_element_type() {
+        let arr = ArrayType::new(2, true, Box::new(IntType::get()));
+        assert_eq!(arr.type_id(), TypeID::Array);
+        assert!(arr.is_nested_type());
+        assert!(arr.is_element_optional());
+        assert_eq!(arr.element_type().type_id(), TypeID::Int);
+    }
+
+    #[test]
+    fn map_type_carries_key_value_types() {
+        let m = MapType::new(
+            3, 4, true,
+            Box::new(StringType::get()),
+            Box::new(LongType::get()),
+        );
+        assert_eq!(m.type_id(), TypeID::Map);
+        assert!(m.is_nested_type());
+        assert_eq!(m.key_type().type_id(), TypeID::String);
+        assert_eq!(m.value_type().type_id(), TypeID::Long);
+        assert!(m.is_value_optional());
     }
 }
