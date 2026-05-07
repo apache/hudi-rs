@@ -325,3 +325,62 @@ async fn fg_reader_with_key_filter_filters_rows() -> Result<()> {
 3. **Manual cross-check discipline.** The walkthrough against `readerContext_callstack.md` is valuable but only if each verification line names a specific Rust `file:line`. Vague "yes, equivalent" entries defeat the point.
 4. **Open assumption — populate_meta_fields.** The v9 MOR fixture is assumed to populate `_hoodie_record_key`. If virtual keys are in play we'd need to filter on the actual key field name; we'll verify when writing the test by inspecting the baseline batch.
 5. **Trait-object hygiene.** `Arc<dyn Predicate>` requires concrete impls to be `Send + Sync` and avoid `Rc`. Standard Rust trait-object hygiene; called out so reviewers don't get surprised by `Rc<…>` showing up later.
+
+---
+
+## Appendix A — Phase 2 cross-check vs readerContext_callstack.md
+
+This appendix maps each Java `readerContext.*` interaction in
+`/home/ubuntu/operations/tasks/quantonMORScanSupport/scanSpecPushDown/Tasks/phase3_rust_fg_integration/migrateFilterOptCode/readerContext_callstack.md`
+to its hudi-rs file:line equivalent, validating that Phase 2 of the
+keyFilterOpt port preserves structural parity for the keyFilterOpt
+flow.
+
+**Date of cross-check:** 2026-05-07
+**Phase 2 SHA range:** `08c5ff7` .. `021960f`
+
+Commits in range (oldest → newest):
+- `3780b8b` — add KeySpec + create_key_spec for keyFilterOpt log-scan path
+- `40a5d87` — add key_filter_opt field to ReaderContext
+- `540ff15` — scan_internal accepts Option<KeySpec>; buffer applies key-spec filter
+- `86ff53e` — wire create_key_spec into HoodieMergedLogRecordReader::perform_scan
+- `021960f` — apply keyFilterOpt as row filter on base parquet batches
+
+### keyFilterOpt-relevant interactions (must match)
+
+| # | Java site | Rust file:line equivalent | Notes |
+|---|-----------|---------------------------|-------|
+| 1 | `HoodieReaderContext.keyFilterOpt` field declaration (`HoodieReaderContext.java:81`) | `crates/core/src/file_group/reader/reader_context.rs:90` — `pub key_filter_opt: Option<Arc<dyn Predicate>>` | Direct structural equivalent. Java uses `Option<Predicate>` (Avro/OSS abstraction); Rust uses `Option<Arc<dyn Predicate>>`. Arc needed for trait-object sharing across async call sites. |
+| 2 | `HoodieReaderContext.getKeyFilterOpt()` (`HoodieReaderContext.java:221-222`) | `crates/core/src/file_group/reader/reader_context.rs:175` — `pub fn get_key_filter_opt(&self) -> Option<Arc<dyn Predicate>>` | Method signature and semantics match. Returns a clone of the Arc (cheap) rather than a borrow, to avoid lifetime entanglement with callers. |
+| 3 | `HoodieReaderContext` ctor sets `keyFilterOpt = Option.empty()` for Spark FileFormat path (`BaseSparkInternalRowReaderContext`) | `crates/core/src/file_group/reader/reader_context.rs:206` — `ReaderContext::empty()` initializes `key_filter_opt: None`. FFI bridge at `cpp/context.rs` excluded per spec §2. | Initialisation to `None` matches Java's `Option.empty()`. The Java ctor receiving a non-empty value (incremental scan path) maps to callers explicitly setting `key_filter_opt` on the struct before passing it into the reader. |
+| 4 | `HoodieMergedLogRecordReader.createKeySpec(Option<Predicate>)` (`HoodieMergedLogRecordReader.java:109-126`) | `crates/core/src/file_group/reader/key_spec.rs:44` — `pub fn create_key_spec(filter: Option<&dyn Predicate>) -> Option<KeySpec>` and `key_spec.rs:71` — `pub fn create_key_spec_from_arc(filter: &Option<Arc<dyn Predicate>>) -> Option<KeySpec>` | Java uses `instanceof` + cast (`Predicate instanceof In`, `instanceof StringStartsWith`) to route to `FullKeys` vs `PrefixKeys`. Rust uses `pred_kind()` pattern match (`PredicateKind::In`, `PredicateKind::StringStartsWithAny`) — same routing logic, idiomatic Rust. Spec §6 deviation #2 documents this. Non-`In`/non-`StringStartsWithAny` predicates return `None` in both Java and Rust. |
+| 5 | `HoodieMergedLogRecordReader.performScan` calls `createKeySpec(readerContext.getKeyFilterOpt())` then `scanInternal(keySpec, false)` (`HoodieMergedLogRecordReader.java:95-107`) | `crates/core/src/file_group/reader/merged_log_record_reader.rs:133` — `async fn perform_scan` calls `create_key_spec_from_arc(&self.base.reader_context.key_filter_opt)` at line 137-139, then `self.base.scan_internal(key_spec_opt, false).await` at line 141 | Structural parity: same two-step pattern (derive KeySpec from filter, then call scan_internal). Rust accesses `key_filter_opt` directly on the struct (no getter call needed since perform_scan is in the same module); Java goes through `getKeyFilterOpt()`. Equivalent. |
+| 6 | `BaseHoodieLogRecordReader.scanInternal(Option<KeySpec>, boolean)` filters records by KeySpec inside per-record processing (`BaseHoodieLogRecordReader.java`) | `crates/core/src/file_group/reader/log_record_reader.rs:376` — `pub async fn scan_internal(&mut self, key_spec_opt: Option<KeySpec>, skip_processing_blocks: bool)`. Propagates to buffer at line 395 via `self.record_buffer.set_key_spec(self.key_spec_opt.clone())`. Buffer applies filter at `crates/core/src/file_group/reader/buffer/key_based.rs:235-236` (`process_data_block`, `if !spec.matches(&key) { continue }`) and `key_based.rs:307-308` (`process_delete_block`) | Full structural parity: `scan_internal` stores `key_spec_opt` on self (line 382), propagates to buffer (line 395), buffer applies `spec.matches(&key)` gate per record in both data-block (line 235) and delete-block (line 307) paths. Java's equivalent is threaded through `KeyBasedFileGroupRecordBuffer.processDataBlock` / `processDeleteBlock`. |
+| 7 | `HoodieAvroReaderContext.getFileRecordIterator` lines 218-228 (key-extract path, fall-through row filter for non-HFile readers) | `crates/core/src/file_group/reader/mod.rs:498` — `apply_key_filter_to_batch` called from `make_base_file_batches` (defined at line 456). `apply_key_filter_to_batch` itself at `mod.rs:745` | Java's HFile branch is out of scope (no HFile reader in hudi-rs); Rust always takes the row-filter fall-through path. `apply_key_filter_to_batch` calls `create_key_spec(key_filter_opt)` then row-filters the Arrow `RecordBatch` on `_hoodie_record_key` — same semantics as Java's per-row `recordKey` extraction + `keyFilterOpt.test(recordKey)`. The `make_base_file_batches` → `apply_key_filter_to_batch` chain at line 342/456 mirrors Java's `makeBaseFileIterator` → `getFileRecordIterator`. |
+
+**Summary:** No gaps found. All 7 keyFilterOpt-relevant Java interactions have confirmed Rust `file:line` equivalents. The two design deviations noted in spec §6 (Arc wrapping, `pred_kind()` dispatch vs `instanceof`) are intentional and preserve semantics.
+
+### Other readerContext interactions (informational — outside Phase 2 scope)
+
+The table below accounts for all non-keyFilterOpt `readerContext.*` call sites listed in §3.1, §3.2, and §5 of the call-stack doc. "Equivalent" means hudi-rs has a structurally corresponding field/method; "no equivalent" means the concept does not exist in hudi-rs (typically engine-specific Spark plumbing). No audit depth is warranted for Phase 2.
+
+| Java call-stack site | Rust equivalent? | Where |
+|---|---|---|
+| `readerContext.setHasLogFiles(...)` / `getHasLogFiles()` | Equivalent | `ReaderContext.has_log_files: bool` (`reader_context.rs:61`) |
+| `readerContext.getRecordContext().setPartitionPath(...)` | Equivalent | `ReaderContext.record_context.partition_path` (`reader_context.rs:79`; set via `rebuild_record_context`) |
+| `readerContext.initRecordMerger(props)` | No equivalent | hudi-rs uses DataFusion merge pipeline, not a Java `HoodieRecordMerger` |
+| `readerContext.setTablePath(tablePath)` | Equivalent | `ReaderContext.table_path: String` (`reader_context.rs:58`) |
+| `readerContext.setLatestCommitTime(latestCommitTime)` | Equivalent | `ReaderContext.latest_commit_time: String` (`reader_context.rs:59`) |
+| `readerContext.setShouldMergeUseRecordPosition(...)` | Equivalent | `ReaderContext.should_merge_use_record_position: bool` (`reader_context.rs:64`) |
+| `readerContext.setHasBootstrapBaseFile(...)` | Equivalent | `ReaderContext.has_bootstrap_base_file: bool` (`reader_context.rs:62`) |
+| `readerContext.setSchemaHandler(...)` | Equivalent | `ReaderContext.schema_handler: FileGroupReaderSchemaHandler` (`reader_context.rs:84`) |
+| `readerContext.getSchemaHandler().getOutputConverter()` | No equivalent | Spark-specific `outputConverter`; hudi-rs uses Arrow `RecordBatch` throughout |
+| `readerContext.getMergeMode()` | Equivalent | `ReaderContext.merge_mode: String` (`reader_context.rs:67`) |
+| `readerContext.getRecordContext().seal(rec)` | No equivalent | Spark InternalRow lifecycle concept; hudi-rs works with owned `RecordBatch` rows |
+| `readerContext.getIteratorMode()` / `setIteratorMode(...)` | Equivalent | `ReaderContext.iterator_mode: String` (`reader_context.rs:66`) |
+| `readerContext.getInstantRange()` + `applyInstantRangeFilter` | Equivalent | `ReaderContext.instant_range: Option<InstantRange>` (`reader_context.rs:69`); filter applied in file-group reader pipeline |
+| `readerContext.getFileRecordIterator(...)` (StoragePathInfo / StoragePath branches) | Equivalent | `make_base_file_batches` at `mod.rs:456`; reads base Parquet via DataFusion |
+| `readerContext.getRecordContext().convertPartitionValueToEngineType(...)` | No equivalent | Spark partition value type conversion; hudi-rs handles via Arrow schema directly |
+| `readerContext.mergeBootstrapReaders(...)` | No equivalent | Bootstrap merge is not implemented in hudi-rs Phase 2 scope |
+| `readerContext.getStorageConfiguration()` | No equivalent | JVM Hadoop `Configuration`; hudi-rs uses `object_store` + filesystem path directly |
+| `readerContext.getRecordContext().constructFinalHoodieRecord(...)` | No equivalent | Spark `HoodieRecord` wrapping; hudi-rs returns `RecordBatch` directly |
