@@ -19,11 +19,14 @@
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
-use crate::config::table::HudiTableConfig;
+use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::expr::filter::{
     Filter, SchemableFilter, filters_to_row_mask, validate_fields_against_schemas,
+};
+use crate::file_group::base_file::reader::{
+    BaseFileReadOptions, BaseFileReader, create_base_file_reader,
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
@@ -33,7 +36,8 @@ use crate::merge::record_merger::RecordMerger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
-use crate::storage::{ParquetReadOptions, Storage};
+use crate::storage::Storage;
+use crate::storage::error::StorageError;
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
@@ -48,10 +52,22 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 
 /// The reader that handles all read operations against a file group.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FileGroupReader {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    base_file_format: BaseFileFormatValue,
+    base_file_reader: Option<Arc<dyn BaseFileReader>>,
+}
+
+impl std::fmt::Debug for FileGroupReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileGroupReader")
+            .field("hudi_configs", &self.hudi_configs)
+            .field("storage", &self.storage)
+            .field("base_file_format", &self.base_file_format)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileGroupReader {
@@ -74,10 +90,14 @@ impl FileGroupReader {
         final_opts.extend(extra_hudi_opts);
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
         let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
+        let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
+        let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
         Ok(Self {
             hudi_configs,
             storage,
+            base_file_format: format,
+            base_file_reader,
         })
     }
 
@@ -99,10 +119,14 @@ impl FileGroupReader {
         resolver.resolve_options().await?;
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
         let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+        let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
+        let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
         Ok(Self {
             hudi_configs,
             storage,
+            base_file_format: format,
+            base_file_reader,
         })
     }
 
@@ -110,13 +134,44 @@ impl FileGroupReader {
         options.with_defaults_from(&self.hudi_configs)
     }
 
+    fn create_optional_base_file_reader(
+        storage: &Arc<Storage>,
+        format: &BaseFileFormatValue,
+    ) -> Result<Option<Arc<dyn BaseFileReader>>> {
+        match create_base_file_reader(storage, format) {
+            Ok(reader) => Ok(Some(reader)),
+            Err(StorageError::UnsupportedBaseFileFormat(_))
+                if matches!(format, BaseFileFormatValue::HFile) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Returns the base-file reader for a path, reusing the cached reader when
+    /// the path resolves to the same format selected at construction time.
+    fn reader_for_path(&self, relative_path: &str) -> Result<Arc<dyn BaseFileReader>> {
+        let format =
+            BaseFileFormatValue::resolve_from_configs(&self.hudi_configs, Some(relative_path))?;
+
+        if format == self.base_file_format
+            && let Some(reader) = &self.base_file_reader
+        {
+            return Ok(reader.clone());
+        }
+
+        create_base_file_reader(&self.storage, &format)
+            .map_err(|e| ReadFileSliceError(format!("{e}")))
+    }
+
     /// Internal: read base file + apply commit-time filter, no [`ReadOptions`] applied.
     /// Used by the merge path so options aren't applied prematurely before merging
     /// with log files.
     async fn read_base_file_eager(&self, relative_path: &str) -> Result<RecordBatch> {
-        let records: RecordBatch = self
-            .storage
-            .get_parquet_file_data(relative_path)
+        let reader = self.reader_for_path(relative_path)?;
+        let records: RecordBatch = reader
+            .read_data(relative_path, BaseFileReadOptions::default())
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
             .await?;
         apply_commit_time_filter(&self.hudi_configs, records)
@@ -325,7 +380,7 @@ impl FileGroupReader {
     ///
     /// Supports the following [ReadOptions]:
     /// - `batch_size`: Controls the number of rows per batch
-    /// - `projection`: Pushes column selection to the parquet reader level
+    /// - `projection`: Pushes column selection to the base-file reader level
     /// - `filters`: Applied as a row-level mask after reading each batch (in addition to
     ///   any pruning that already happened upstream)
     async fn read_base_file_stream(
@@ -338,9 +393,9 @@ impl FileGroupReader {
             .get_or_default(HudiReadConfig::StreamBatchSize)
             .into();
         let batch_size = options.batch_size()?.unwrap_or(default_batch_size);
-        let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
+        let mut read_options = BaseFileReadOptions::default().with_batch_size(batch_size);
 
-        // If projection is set, widen the parquet read to also include any columns
+        // If projection is set, widen the base file read to also include any columns
         // we need post-read but the user didn't request:
         //   - filter fields, so the row-level mask can evaluate them
         //   - `_hoodie_commit_time`, when commit-time filtering is active
@@ -396,7 +451,7 @@ impl FileGroupReader {
             combined
         });
         if let Some(ref cols) = read_projection {
-            parquet_options = parquet_options.with_projection(cols.clone());
+            read_options = read_options.with_projection(cols.clone());
         }
 
         let hudi_configs = self.hudi_configs.clone();
@@ -407,14 +462,14 @@ impl FileGroupReader {
         // rather than silent no-ops in `filters_to_row_mask`.
         let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let parquet_stream = self
-            .storage
-            .get_parquet_file_stream(&path, parquet_options)
+        let reader = self.reader_for_path(&path)?;
+        let base_stream = reader
+            .read_stream(&path, read_options)
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
         // Apply filtering: commit time → structured filters → final projection.
-        let stream = parquet_stream.into_stream().filter_map(move |result| {
+        let stream = base_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
             let final_projection = final_projection.clone();
@@ -962,6 +1017,68 @@ mod tests {
         assert!(
             error_msg.contains("not found") || error_msg.contains("Failed to read path"),
             "Should contain appropriate error message, got: {error_msg}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hfile_base_file_read_reports_unsupported_reader() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::BasePath, base_uri.as_str()),
+            (
+                HudiTableConfig::BaseFileFormat,
+                BaseFileFormatValue::HFile.as_ref(),
+            ),
+        ]));
+        let reader =
+            FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())?;
+
+        let result = reader
+            .read_file_slice_from_paths(
+                "fileid_0-0-1_20240418173551906.hfile",
+                Vec::<&str>::new(),
+                &ReadOptions::new(),
+            )
+            .await;
+
+        let error_msg = result
+            .expect_err("Expected unsupported HFile reader error")
+            .to_string();
+        assert!(
+            error_msg.contains("Unsupported base file format")
+                && error_msg.contains("hfile is only supported"),
+            "Expected explicit unsupported HFile reader error, got: {error_msg}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reader_for_path_reuses_cached_default_parquet_reader() -> Result<()> {
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+        let cached_reader = reader
+            .base_file_reader
+            .as_ref()
+            .expect("default Parquet reader should be cached");
+
+        let resolved_reader = reader.reader_for_path(TEST_SAMPLE_BASE_FILE)?;
+
+        assert!(
+            Arc::ptr_eq(cached_reader, &resolved_reader),
+            "no-config Parquet path should reuse the cached base-file reader"
+        );
+
+        let hfile_error = match reader.reader_for_path("fileid_0-0-1_20240418173551906.hfile") {
+            Ok(_) => panic!("no-config HFile path should still use extension detection"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            hfile_error.contains("Unsupported base file format")
+                && hfile_error.contains("hfile is only supported"),
+            "Expected no-config HFile path to report unsupported reader, got: {hfile_error}"
         );
 
         Ok(())
