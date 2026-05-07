@@ -84,8 +84,10 @@ pub enum HudiTableConfig {
     /// These fields also include the partition type which is used by custom key generators
     PartitionFields,
 
-    /// Field used in preCombining before actual write. By default, when two records have the same key value,
-    /// the largest value for the precombine field determined by Object.compareTo(..), is picked.
+    /// Fields used for ordering records during merge. When two records have the same key,
+    /// the record with the larger ordering field value is picked.
+    ///
+    /// Alias: `hoodie.table.precombine.field` (deprecated).
     PrecombineField,
 
     /// When enabled, populates all meta fields. When disabled, no meta fields are populated
@@ -159,7 +161,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::KeyGeneratorClass => "hoodie.table.keygenerator.class",
             Self::KeyGeneratorType => "hoodie.table.keygenerator.type",
             Self::PartitionFields => "hoodie.table.partition.fields",
-            Self::PrecombineField => "hoodie.table.precombine.field",
+            Self::PrecombineField => "hoodie.table.ordering.fields",
             Self::PopulatesMetaFields => "hoodie.populate.meta.fields",
             Self::RecordKeyFields => "hoodie.table.recordkey.fields",
             Self::RecordMergeStrategy => "hoodie.table.record.merge.strategy",
@@ -213,7 +215,7 @@ impl ConfigParser for HudiTableConfig {
         match self {
             Self::PrecombineField => {
                 const ALIASES: &[ConfigAlias] =
-                    &[ConfigAlias::new("hoodie.table.ordering.fields")];
+                    &[ConfigAlias::deprecated("hoodie.table.precombine.field")];
                 ALIASES
             }
             _ => &[],
@@ -258,7 +260,11 @@ impl ConfigParser for HudiTableConfig {
             Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
-            Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::PrecombineField => get_result.map(|v| {
+                // Ordering fields may be comma-separated; use the first as the ordering field.
+                let field = v.split(',').next().unwrap_or(v).trim();
+                HudiConfigValue::String(field.to_string())
+            }),
             Self::PopulatesMetaFields => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
@@ -584,11 +590,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering_fields_alias_for_precombine() {
-        let ordering_fields_key = HudiTableConfig::PrecombineField.aliases()[0].key;
+    fn test_precombine_field_deprecated_alias() {
+        let deprecated_key = HudiTableConfig::PrecombineField.aliases()[0].key;
+        assert_eq!(deprecated_key, "hoodie.table.precombine.field");
+
+        // Deprecated alias should still resolve
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
-            (ordering_fields_key, "ts"),
+            (deprecated_key, "ts"),
         ]);
         let actual: String = hudi_configs
             .get(HudiTableConfig::PrecombineField)
@@ -601,7 +610,20 @@ mod tests {
         assert_eq!(
             actual,
             RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
-            "Should derive overwrite-with-latest from v9 ordering fields"
+            "Should derive overwrite-with-latest from deprecated precombine field"
         );
+    }
+
+    #[test]
+    fn test_ordering_fields_comma_separated() {
+        let hudi_configs = HudiConfigs::new(vec![
+            (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
+            (HudiTableConfig::PrecombineField.as_ref(), "ts,seq"),
+        ]);
+        let actual: String = hudi_configs
+            .get(HudiTableConfig::PrecombineField)
+            .unwrap()
+            .into();
+        assert_eq!(actual, "ts", "Should use the first ordering field");
     }
 }
