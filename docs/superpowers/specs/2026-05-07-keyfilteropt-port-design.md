@@ -40,7 +40,7 @@ The work lands in three independently-reviewable commits.
 | Phase | Deliverable | Verification |
 |------|------|------|
 | 1 | Port `org.apache.hudi.expression` (Predicate hierarchy) + full port of `org.apache.hudi.internal.schema.{Type, Types}`. **No reader integration yet.** | Unit tests on each Predicate / Type, plus structural pattern-match tests (`predicates::in_(...)` produces `predicates::In` with the right children). |
-| 2 | Add `key_filter_opt: Option<Arc<dyn Predicate>>` on `ReaderContext`. Add `KeySpec` enum + `create_key_spec()` mirroring Java line-for-line. Apply the filter at two call sites: (a) `merged_log_record_reader::perform_scan` → KeySpec → narrow log scan; (b) `HoodieFileGroupReader::make_base_file_batches` → row filter on base parquet (mirroring `HoodieAvroReaderContext.getFileRecordIterator`'s key-extraction path). | Unit tests on `create_key_spec`, plus per-site tests, plus a manual cross-check pass against `readerContext_callstack.md` confirming each call site listed there has a 1:1 hudi-rs equivalent. The cross-check produces a checklist in the Phase 2 PR description that names specific Rust `file:line` for each Java line. |
+| 2 | Add `key_filter_opt: Option<Arc<dyn Predicate>>` on `ReaderContext`. Add `KeySpec` enum + `create_key_spec()` (Java input/output preserved; body uses Rust `match` on `PredicateKind` instead of Java's `instanceof`/cast — see §6 deviation #2). Apply the filter at two call sites: (a) `merged_log_record_reader::perform_scan` → KeySpec → narrow log scan; (b) `HoodieFileGroupReader::make_base_file_batches` → row filter on base parquet (mirroring `HoodieAvroReaderContext.getFileRecordIterator`'s key-extraction path). | Unit tests on `create_key_spec`, plus per-site tests, plus a manual cross-check pass against `readerContext_callstack.md` confirming each call site listed there has a 1:1 hudi-rs equivalent. The cross-check produces a checklist in the Phase 2 PR description that names specific Rust `file:line` for each Java line. |
 | 3 | One e2e smoke test on `v9_mor_8i4u_commit_time` reading a single file group with and without `Predicates.In(_hoodie_record_key, [k])`. Compare row count + row content. | Single integration test in `crates/core/tests/file_group_reader_tests.rs`. |
 
 Phase 1 is purely additive — it compiles standalone and adds two new top-level modules. Phase 2 wires the field in but defaults to `None` so all existing tests keep passing. Phase 3 demonstrates the end-to-end contract.
@@ -59,10 +59,10 @@ crates/core/src/
 └── expression/                     ← NEW (mirrors org.apache.hudi.expression)
     ├── mod.rs
     ├── expression.rs               ← Expression trait + Operator enum
-    ├── predicate.rs                ← Predicate trait
+    ├── predicate.rs                ← Predicate trait + PredicateKind enum
     ├── leaf_expression.rs          ← LeafExpression trait
     ├── binary_expression.rs        ← BinaryExpression
-    ├── literal.rs                  ← Literal
+    ├── literal.rs                  ← Literal + LiteralValue enum
     ├── name_reference.rs           ← NameReference
     ├── bound_reference.rs          ← BoundReference
     ├── struct_like.rs              ← StructLike trait
@@ -74,14 +74,90 @@ crates/core/src/
     └── predicates.rs               ← Predicates factory + 12 inner classes (TrueExpression, FalseExpression, And, Or, Not, BinaryComparison, In, IsNull, IsNotNull, StringStartsWith, StringStartsWithAny, StringContains). One file mirrors Java's single-file shape.
 ```
 
+`expression.rs` also defines an `ExpressionKind<'a>` enum (a borrowed view) alongside the `Expression` trait. `predicate.rs` defines `PredicateKind<'a>` alongside `Predicate`. See §4.1 for the rationale.
+
 Naming choices:
 
 - Java package `org.apache.hudi.expression` → Rust `expression` (snake_case).
 - Java package `org.apache.hudi.internal.schema` → Rust `internal_schema`.
 - Java `Predicates.In` → Rust `predicates::In` (struct in module). Factory functions `predicates::in_(...)`, `predicates::and(...)`, `predicates::eq(...)`, etc. (`in` is a Rust keyword, hence the trailing underscore.)
-- Polymorphism: Java `interface Expression` becomes Rust `trait Expression: Send + Sync + Debug`. The 13 Predicate variants become concrete structs implementing `Predicate: Expression`. Anywhere Java passes `Expression` or `Predicate`, Rust uses `Box<dyn Expression>` / `Arc<dyn Predicate>`.
+- Polymorphism: Java `interface Expression` becomes Rust `trait Expression: Send + Sync + Debug` (with a `kind() -> ExpressionKind<'_>` accessor — see §4.1). The 12 Predicate variants become concrete structs implementing `Predicate: Expression` (with `kind() -> PredicateKind<'_>`). Anywhere Java passes `Expression` or `Predicate`, Rust uses `Box<dyn Expression>` / `Arc<dyn Predicate>`.
 - Java `Comparator<T>` returned by `Comparators` becomes a Rust `fn(&LiteralValue, &LiteralValue) -> std::cmp::Ordering` returned by `Comparators::for_type(&Type)`.
 - Visitor pattern: Java `ExpressionVisitor<T>` → Rust trait with one method per `visit*` overload. `BindVisitor` and `PartialBindVisitor` become structs implementing `ExpressionVisitor<Box<dyn Expression>>`.
+
+### 4.1 Pattern-match accessors (`PredicateKind` / `ExpressionKind`)
+
+The Predicate hierarchy is a *closed* set of variants in Hudi (12 Predicate types, 4 Expression non-Predicate types: Literal, NameReference, BoundReference, plus Predicate-as-Expression). Rust handles closed variant sets best with pattern matching, not `Any::downcast_ref`. To keep the Java-faithful trait hierarchy *and* give downstream Rust code an idiomatic inspection point, we add two `kind()` accessors that return borrowed enum views:
+
+```rust
+pub trait Predicate: Expression + Send + Sync + Debug {
+    /// Mirrors Java `Predicate.getOperator()`.
+    fn operator(&self) -> Operator;
+    /// Borrowed enum view for pattern matching.
+    fn kind(&self) -> PredicateKind<'_>;
+}
+
+pub enum PredicateKind<'a> {
+    True,
+    False,
+    And(&'a predicates::And),
+    Or(&'a predicates::Or),
+    Not(&'a predicates::Not),
+    BinaryComparison(&'a predicates::BinaryComparison),
+    In(&'a predicates::In),
+    IsNull(&'a predicates::IsNull),
+    IsNotNull(&'a predicates::IsNotNull),
+    StringStartsWith(&'a predicates::StringStartsWith),
+    StringStartsWithAny(&'a predicates::StringStartsWithAny),
+    StringContains(&'a predicates::StringContains),
+}
+
+pub trait Expression: Send + Sync + Debug {
+    fn data_type(&self) -> &Type;
+    fn kind(&self) -> ExpressionKind<'_>;
+    // … other Java-faithful methods
+}
+
+pub enum ExpressionKind<'a> {
+    Literal(&'a Literal),
+    NameReference(&'a NameReference),
+    BoundReference(&'a BoundReference),
+    Predicate(&'a dyn Predicate),
+}
+```
+
+Each concrete struct's `kind()` is one line: `fn kind(&self) -> PredicateKind<'_> { PredicateKind::In(self) }`. Adding a new variant means adding one enum variant + one `kind()` method, and the compiler points at every match site that needs to handle it.
+
+`Literal` uses a `LiteralValue` enum for its value field:
+
+```rust
+pub struct Literal {
+    value: LiteralValue,
+    data_type: Type,
+}
+
+pub enum LiteralValue {
+    Bool(bool),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Date(i32),
+    Time(i64),
+    Timestamp(i64),
+    TimestampMillis(i64),
+    LocalTimestampMillis(i64),
+    LocalTimestampMicros(i64),
+    Decimal { unscaled: i128, precision: u8, scale: u8 },
+    String(String),
+    Binary(Vec<u8>),
+    Fixed(Vec<u8>),
+    UUID([u8; 16]),
+    Null,
+}
+```
+
+This is the one place where Rust shape diverges from Java (Java has `Literal<T>(T value, Type type)`). The reason is a chain: `kind()` returns `ExpressionKind::Literal(&Literal)` — to extract the value via pattern matching without a second `downcast_ref`, the value field has to be a closed enum. Behavior is identical; the type-parameter shape is the only deviation.
 
 Crate exports: both `internal_schema` and `expression` are re-exported from `crates/core/src/lib.rs` so downstream code can import at `hudi_core::expression::Predicate` / `hudi_core::internal_schema::Type`.
 
@@ -121,9 +197,34 @@ pub enum KeySpec {
 }
 
 /// Mirrors `HoodieMergedLogRecordReader.createKeySpec(Option<Predicate>)`
-/// (HoodieMergedLogRecordReader.java lines 109-126) line-for-line.
-pub fn create_key_spec(filter: &Option<Arc<dyn Predicate>>) -> Option<KeySpec> { … }
+/// (HoodieMergedLogRecordReader.java lines 109-126), implemented in idiomatic
+/// Rust via `PredicateKind` pattern matching instead of Java's `instanceof`/cast.
+pub fn create_key_spec(filter: Option<&dyn Predicate>) -> Option<KeySpec> {
+    match filter?.kind() {
+        PredicateKind::In(p) => {
+            Some(KeySpec::FullKeys(string_literals(p.right_children())?))
+        }
+        PredicateKind::StringStartsWithAny(p) => {
+            Some(KeySpec::PrefixKeys(string_literals(p.right_children())?))
+        }
+        _ => None,
+    }
+}
+
+/// Extract `String` values from a list of `Literal(LiteralValue::String(_))`
+/// expressions. Returns `None` if any child is not a String literal.
+fn string_literals(exprs: &[Box<dyn Expression>]) -> Option<Vec<String>> {
+    exprs.iter().map(|e| match e.kind() {
+        ExpressionKind::Literal(lit) => match lit.value() {
+            LiteralValue::String(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }).collect()
+}
 ```
+
+The Rust match-on-`kind()` is the structural equivalent of Java's `if (filter.get().getOperator() == Expression.Operator.IN) { ... } else if (filter.get().getOperator() == Expression.Operator.STARTS_WITH) { ... }` plus the cast on the next line. Same input, same output, idiomatic Rust on the inside.
 
 `merged_log_record_reader::perform_scan`:
 
@@ -153,11 +254,12 @@ Each verification line must name the specific Rust `file:line`, not just "yes, e
 
 These are the only places where the Rust port intentionally differs from Java. Each is called out so future readers don't get confused:
 
-1. **`Literal<T>` shape.** Java `Literal<T>(T value, Type type)` is generic; Rust uses `Literal { value: LiteralValue, data_type: Type }` with a `LiteralValue` enum covering the actual value variants (Int, Long, String, Bool, …). This avoids fighting monomorphization across heterogeneous expression trees. Behavior is identical; only the type-parameter shape differs.
-2. **`Predicate` ownership.** Java passes `Predicate` references; Rust uses `Arc<dyn Predicate>` so predicates can be cloned into ReaderContext, scanners, and buffers without lifetime juggling. Concrete impls must avoid `Rc` (the trait bound `Send + Sync` enforces this).
-3. **`Comparator<T>` return.** Java `Comparators::forType` returns `Comparator<T>`; Rust returns `fn(&LiteralValue, &LiteralValue) -> std::cmp::Ordering`. Same dispatch table, different language idiom.
-4. **`expr/filter.rs` is not converged.** Java has only one expression abstraction. Rust keeps `Filter` (the existing flat file-pruning struct) separate from the new `Predicate` hierarchy, since they serve different purposes (file pruning vs key filtering) and converging them is out of scope.
-5. **`BindVisitor` / `PartialBindVisitor` ported but not wired.** They produce `BoundReference`s from `NameReference`s given a schema; nothing in keyFilterOpt's reader-side consumption needs binding (we extract literal values directly). They are ported for completeness and hierarchy faithfulness.
+1. **`Literal` is non-generic; value is a `LiteralValue` enum.** Java has `Literal<T>(T value, Type type)`; Rust has `Literal { value: LiteralValue, data_type: Type }`. The reason is the `kind()`-driven inspection pattern (deviation #2): when downstream code matches `ExpressionKind::Literal(lit)` and then needs to read the underlying value, a closed `LiteralValue` enum lets it pattern-match directly without a second `downcast_ref`. Behavior is identical; only the type-parameter shape differs.
+2. **`kind() -> {Predicate,Expression}Kind<'_>` accessors.** Not present in Java. Added in Rust because the canonical Rust idiom for inspecting a closed set of variants is enum pattern matching, not `Any::downcast_ref` on a trait object. Each concrete struct's `kind()` is one line returning `Self`-as-enum-variant. Lets `create_key_spec` (and any future inspection code) be a clean `match` instead of a chain of `instanceof`-style downcasts. The trait hierarchy itself stays Java-faithful — `kind()` is pure inspection sugar that returns borrowed references into the existing concrete types.
+3. **`Predicate` ownership.** Java passes `Predicate` references; Rust uses `Arc<dyn Predicate>` so predicates can be cloned into ReaderContext, scanners, and buffers without lifetime juggling. Concrete impls must avoid `Rc` (the trait bound `Send + Sync` enforces this).
+4. **`Comparator<T>` return.** Java `Comparators::forType` returns `Comparator<T>`; Rust returns `fn(&LiteralValue, &LiteralValue) -> std::cmp::Ordering`. Same dispatch table, different language idiom.
+5. **`expr/filter.rs` is not converged.** Java has only one expression abstraction. Rust keeps `Filter` (the existing flat file-pruning struct) separate from the new `Predicate` hierarchy, since they serve different purposes (file pruning vs key filtering) and converging them is out of scope.
+6. **`BindVisitor` / `PartialBindVisitor` ported but not wired.** They produce `BoundReference`s from `NameReference`s given a schema; nothing in keyFilterOpt's reader-side consumption needs binding (we extract literal values directly). They are ported for completeness and hierarchy faithfulness.
 
 ## 7. Phase 3 — E2E smoke test
 
@@ -186,11 +288,11 @@ async fn fg_reader_with_key_filter_filters_rows() -> Result<()> {
     // ── Read 2: filter with In(_hoodie_record_key, [<key for id=1>]) ───────
     //  Construction mirrors Java: Predicates.in(NameReference("_hoodie_record_key"),
     //                                            [Literal.from(key_for_id1)])
-    let key_filter = predicates::in_(
+    let key_filter: Arc<dyn Predicate> = Arc::new(predicates::in_(
         Box::new(NameReference::new("_hoodie_record_key")),
-        vec![Box::new(Literal::from(key_for_id1.clone()))],
-    );
-    let filtered_ctx = build_reader_context(Some(Arc::new(key_filter)), &configs);
+        vec![Box::new(Literal::string(key_for_id1.clone()))],
+    ));
+    let filtered_ctx = build_reader_context(Some(key_filter), &configs);
     let filtered_batch = run_reader(filtered_ctx, …).await?;
     assert_eq!(filtered_batch.num_rows(), 1);
 
