@@ -26,10 +26,12 @@
 //! the structured configuration that the reader stack needs.
 
 use crate::config::table::HudiTableConfig;
+use crate::expression::predicate::Predicate;
 use crate::timeline::selector::InstantRange;
 use super::record_context::RecordContext;
 use super::schema_handler::FileGroupReaderSchemaHandler;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Reader context that flows through the file group reader call stack.
 ///
@@ -50,6 +52,7 @@ use std::collections::HashMap;
 /// | `readerContext.getSchemaHandler()`          | `schema_handler`                        |
 /// | `metaClient.getTableConfig()` (config map)  | `table_config`                          |
 /// | `props` (hoodie reader config overrides)    | `hoodie_reader_config`                  |
+/// | `readerContext.getKeyFilterOpt()`           | `key_filter_opt`                        |
 #[derive(Debug, Clone)]
 pub struct ReaderContext {
     pub table_path: String,
@@ -81,6 +84,10 @@ pub struct ReaderContext {
     pub schema_handler: FileGroupReaderSchemaHandler,
     pub table_config: HashMap<String, String>,
     pub hoodie_reader_config: HashMap<String, String>,
+    /// Mirrors Java `HoodieReaderContext.keyFilterOpt` — an optional
+    /// predicate (typically `In` or `StringStartsWithAny`) used to
+    /// narrow which records are scanned. None by default. See spec §5.1.
+    pub key_filter_opt: Option<Arc<dyn Predicate>>,
 }
 
 impl ReaderContext {
@@ -164,6 +171,11 @@ impl ReaderContext {
             .unwrap_or_else(|| "utc".to_string())
     }
 
+    /// Mirrors Java `HoodieReaderContext.getKeyFilterOpt()`.
+    pub fn get_key_filter_opt(&self) -> Option<Arc<dyn Predicate>> {
+        self.key_filter_opt.clone()
+    }
+
     /// Rebuild the stored `record_context` from the current `table_config`
     /// and the given `partition_path`.
     ///
@@ -191,6 +203,32 @@ impl ReaderContext {
             schema_handler: FileGroupReaderSchemaHandler::new(),
             table_config: HashMap::new(),
             hoodie_reader_config: HashMap::new(),
+            key_filter_opt: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod key_filter_opt_tests {
+    use super::*;
+    use crate::expression::predicates::predicates_factory;
+    use crate::expression::{Expression, Literal, NameReference};
+    use std::sync::Arc;
+
+    #[test]
+    fn empty_reader_context_has_no_key_filter() {
+        let ctx = ReaderContext::empty();
+        assert!(ctx.get_key_filter_opt().is_none());
+    }
+
+    #[test]
+    fn key_filter_opt_can_be_set_and_retrieved() {
+        let mut ctx = ReaderContext::empty();
+        let pred = predicates_factory::in_(
+            Box::new(NameReference::new("_hoodie_record_key")),
+            vec![Box::new(Literal::string("k1")) as Box<dyn Expression>],
+        );
+        ctx.key_filter_opt = Some(Arc::new(pred));
+        assert!(ctx.get_key_filter_opt().is_some());
     }
 }
