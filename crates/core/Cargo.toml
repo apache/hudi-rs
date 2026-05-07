@@ -82,6 +82,8 @@ prost = { workspace = true }
 flate2 = { workspace = true }
 
 # lance
+# lance-encoding and lance-file run prost-build at build time; every workflow
+# that builds the Rust graph must have `protoc` on PATH.
 lance-core = { version = "4.0.1" }
 lance-encoding = { version = "4.0.1" }
 lance-file = { version = "4.0.1" }

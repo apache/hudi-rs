@@ -49,6 +49,7 @@ use log::warn;
 
 use crate::hudi_exec::HudiScanExec;
 use crate::util::expr::exprs_to_filters;
+use hudi_core::config::ConfigParser;
 use hudi_core::config::read::HudiReadConfig::{
     FileSliceReadConcurrency, InputPartitions, UseReadOptimizedMode,
 };
@@ -58,7 +59,12 @@ use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
 
-const DEFAULT_FILE_SLICE_READ_CONCURRENCY: usize = 4;
+fn default_file_slice_read_concurrency() -> usize {
+    FileSliceReadConcurrency
+        .default_value()
+        .expect("FileSliceReadConcurrency has a default value defined in hudi-core")
+        .into()
+}
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -186,7 +192,7 @@ impl HudiDataSource {
                 }
                 parsed
             }
-            None => DEFAULT_FILE_SLICE_READ_CONCURRENCY,
+            None => default_file_slice_read_concurrency(),
         };
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
@@ -744,7 +750,7 @@ mod tests {
         assert_eq!(hudi.get_input_partitions(), 0);
         assert_eq!(
             hudi.get_file_slice_read_concurrency(),
-            DEFAULT_FILE_SLICE_READ_CONCURRENCY
+            default_file_slice_read_concurrency()
         );
         assert_eq!(hudi.table_type(), TableType::Base);
         assert_eq!(hudi.statistics(), None);

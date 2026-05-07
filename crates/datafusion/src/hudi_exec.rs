@@ -203,8 +203,10 @@ impl ExecutionPlan for HudiScanExec {
                     }))
                 }
             })
-            .buffered(concurrency)
-            // Scan output is unordered; SQL ordering is provided by explicit SortExec nodes.
+            // Scan output is unordered; SQL ordering is provided by explicit
+            // SortExec nodes. `buffer_unordered` avoids head-of-line blocking
+            // when one slice is slower than its neighbours.
+            .buffer_unordered(concurrency)
             .try_flatten_unordered(concurrency);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
