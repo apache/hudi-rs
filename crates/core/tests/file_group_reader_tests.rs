@@ -1528,3 +1528,23 @@ async fn fg_filter_in_base_only_key() -> Result<()> {
 
     Ok(())
 }
+
+/// Test 3: filter on a non-existent key → 0 rows.
+///
+/// Validates: filter actually drops everything when nothing matches.
+/// Catches a bug where filter is silently a no-op.
+#[tokio::test]
+async fn fg_filter_in_no_match() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = sf_file_group();
+
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::string("definitely-not-a-real-record-key")) as Box<dyn Expression>],
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    ab.assert_filtered_empty();          // baseline > 0, filtered == 0
+
+    Ok(())
+}
