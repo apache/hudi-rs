@@ -10,4 +10,10 @@
  *   http://www.apache.org/licenses/LICENSE-2.0
  */
 
-//! Stub — populated in Task 1.7 (BinaryExpression + LeafExpression).
+//! Mirrors Java `org.apache.hudi.expression.LeafExpression`.
+
+use crate::expression::Expression;
+
+/// Marker trait for expressions with no children. Mirrors Java's
+/// `LeafExpression` abstract class.
+pub trait LeafExpression: Expression {}
