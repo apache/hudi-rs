@@ -1548,3 +1548,31 @@ async fn fg_filter_in_no_match() -> Result<()> {
 
     Ok(())
 }
+
+/// Test 4: filter via StringStartsWithAny → PrefixKeys path.
+///
+/// Validates: exercises the PrefixKeys KeySpec branch of create_key_spec
+/// (Predicates::StringStartsWithAny → KeySpec::PrefixKeys). Uses id=1's
+/// full record-key string as the prefix; this yields a single-row match
+/// (a prefix that equals one key matches exactly that key).
+#[tokio::test]
+async fn fg_filter_starts_with_any_prefix() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = sf_file_group();
+
+    let baseline_for_key_lookup = read_file_group_with_key_filter(
+        &table_path, partition, base_file, log_files.clone(), None,
+    ).await?;
+    let prefix_for_id1 = lookup_record_key(&baseline_for_key_lookup, 1);
+
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::starts_with_any(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::string(prefix_for_id1)) as Box<dyn Expression>],
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    ab.assert_filter_narrowed();         // 1 < 2
+    ab.assert_filtered_ids_eq(&[1]);
+
+    Ok(())
+}
