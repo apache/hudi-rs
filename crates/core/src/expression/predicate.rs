@@ -26,16 +26,18 @@ pub trait Predicate: Expression {
     fn pred_kind(&self) -> PredicateKind<'_>;
 }
 
-/// Borrowed enum view of `Predicate` for pattern matching. Variants are
-/// added in subsequent tasks (1.12–1.14) once concrete predicate types exist.
+/// Borrowed enum view of `Predicate` for pattern matching.
 pub enum PredicateKind<'a> {
     True,
     False,
     And(&'a crate::expression::predicates::And),
     Or(&'a crate::expression::predicates::Or),
     Not(&'a crate::expression::predicates::Not),
-    // Future variants (Task 1.14):
-    //   BinaryComparison(...), In(...), IsNull(...), IsNotNull(...),
-    //   StringStartsWith(...), StringStartsWithAny(...), StringContains(...)
-    _Placeholder(std::marker::PhantomData<&'a ()>),
+    BinaryComparison(&'a crate::expression::predicates::BinaryComparison),
+    In(&'a crate::expression::predicates::In),
+    IsNull(&'a crate::expression::predicates::IsNull),
+    IsNotNull(&'a crate::expression::predicates::IsNotNull),
+    StringStartsWith(&'a crate::expression::predicates::StringStartsWith),
+    StringStartsWithAny(&'a crate::expression::predicates::StringStartsWithAny),
+    StringContains(&'a crate::expression::predicates::StringContains),
 }
