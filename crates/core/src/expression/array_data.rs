@@ -10,4 +10,12 @@
  *   http://www.apache.org/licenses/LICENSE-2.0
  */
 
-//! Stub — populated in Task 1.5 (ArrayData + StructLike).
+//! Mirrors Java `org.apache.hudi.expression.ArrayData`.
+
+use std::any::Any;
+
+/// Read-only view over an array-like value. Mirrors Java's `ArrayData`.
+pub trait ArrayData: Send + Sync {
+    fn num_elements(&self) -> usize;
+    fn get(&self, pos: usize) -> Option<&dyn Any>;
+}
