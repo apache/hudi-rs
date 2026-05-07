@@ -25,8 +25,6 @@ use arrow_schema::SchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
-use crate::Result as CoreResult;
-use crate::config::HudiConfigs;
 use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
 use crate::storage::Storage;
@@ -138,26 +136,12 @@ pub fn create_base_file_reader(
     }
 }
 
-/// Resolve the base-file format from table config, falling back to file
-/// extension detection if the config is absent.
-pub fn resolve_base_file_format(
-    hudi_configs: &HudiConfigs,
-    file_path: Option<&str>,
-) -> CoreResult<BaseFileFormatValue> {
-    Ok(BaseFileFormatValue::resolve_from_configs(
-        hudi_configs,
-        file_path,
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::canonicalize;
     use std::path::Path;
     use url::Url;
-
-    use crate::config::table::HudiTableConfig;
 
     fn test_storage() -> Arc<Storage> {
         let base_url =
@@ -181,44 +165,5 @@ mod tests {
             Ok(_) => panic!("HFile should not create a generic base-file reader"),
             Err(err) => panic!("Expected unsupported HFile error, got {err}"),
         }
-    }
-
-    #[test]
-    fn test_resolve_base_file_format_from_config() {
-        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "parquet")]);
-        assert_eq!(
-            resolve_base_file_format(&configs, None).unwrap(),
-            BaseFileFormatValue::Parquet
-        );
-    }
-
-    #[test]
-    fn test_resolve_base_file_format_extension_fallback() {
-        let configs = HudiConfigs::empty();
-        assert_eq!(
-            resolve_base_file_format(&configs, Some("data/file.hfile")).unwrap(),
-            BaseFileFormatValue::HFile
-        );
-        assert_eq!(
-            resolve_base_file_format(&configs, Some("data/file.parquet")).unwrap(),
-            BaseFileFormatValue::Parquet
-        );
-    }
-
-    #[test]
-    fn test_resolve_base_file_format_defaults_to_parquet() {
-        let configs = HudiConfigs::empty();
-        assert_eq!(
-            resolve_base_file_format(&configs, None).unwrap(),
-            BaseFileFormatValue::Parquet
-        );
-    }
-
-    #[test]
-    fn test_resolve_base_file_format_rejects_invalid_config() {
-        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "orc")]);
-        let err = resolve_base_file_format(&configs, Some("data/file.parquet"))
-            .expect_err("invalid explicit config must not fall back to extension");
-        assert!(err.to_string().contains("orc"));
     }
 }

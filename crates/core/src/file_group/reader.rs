@@ -88,7 +88,7 @@ impl FileGroupReader {
         final_opts.extend(extra_hudi_opts);
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
         let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
-        let format = base_file_reader::resolve_base_file_format(&hudi_configs, None)?;
+        let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
         Ok(Self {
@@ -116,7 +116,7 @@ impl FileGroupReader {
         resolver.resolve_options().await?;
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
         let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
-        let format = base_file_reader::resolve_base_file_format(&hudi_configs, None)?;
+        let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
         Ok(Self {
@@ -150,7 +150,7 @@ impl FileGroupReader {
     /// paths, while the resolved Parquet path still reuses the cached reader.
     fn reader_for_path(&self, relative_path: &str) -> Result<Arc<dyn BaseFileReader>> {
         let format =
-            base_file_reader::resolve_base_file_format(&self.hudi_configs, Some(relative_path))?;
+            BaseFileFormatValue::resolve_from_configs(&self.hudi_configs, Some(relative_path))?;
 
         if let Some(reader) = &self.base_file_reader
             && (self
