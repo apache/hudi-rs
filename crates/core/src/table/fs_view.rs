@@ -173,6 +173,7 @@ impl FileSystemView {
             return file_groups;
         }
 
+        let parquet_reader = ParquetBaseFileReader::new(self.storage.clone());
         let mut retained = Vec::with_capacity(file_groups.len());
 
         for mut fg in file_groups {
@@ -193,11 +194,9 @@ impl FileSystemView {
                     continue;
                 }
 
-                let (file_metadata, col_stats) = match ParquetBaseFileReader::new(
-                    self.storage.clone(),
-                )
-                .get_metadata_and_stats(&relative_path, table_schema)
-                .await
+                let (file_metadata, col_stats) = match parquet_reader
+                    .get_metadata_and_stats(&relative_path, table_schema)
+                    .await
                 {
                     Ok(result) => result,
                     Err(e) => {
