@@ -31,12 +31,11 @@ pub trait Predicate: Expression {
 pub enum PredicateKind<'a> {
     True,
     False,
-    // Future variants (Task 1.13, 1.14):
-    //   And(&'a predicates::And), Or(&'a predicates::Or), Not(&'a predicates::Not),
-    //   BinaryComparison(&'a predicates::BinaryComparison),
-    //   In(&'a predicates::In), IsNull(&'a predicates::IsNull), IsNotNull(&'a predicates::IsNotNull),
-    //   StringStartsWith(&'a predicates::StringStartsWith),
-    //   StringStartsWithAny(&'a predicates::StringStartsWithAny),
-    //   StringContains(&'a predicates::StringContains),
+    And(&'a crate::expression::predicates::And),
+    Or(&'a crate::expression::predicates::Or),
+    Not(&'a crate::expression::predicates::Not),
+    // Future variants (Task 1.14):
+    //   BinaryComparison(...), In(...), IsNull(...), IsNotNull(...),
+    //   StringStartsWith(...), StringStartsWithAny(...), StringContains(...)
     _Placeholder(std::marker::PhantomData<&'a ()>),
 }
