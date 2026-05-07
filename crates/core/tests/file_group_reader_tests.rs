@@ -1576,3 +1576,26 @@ async fn fg_filter_starts_with_any_prefix() -> Result<()> {
 
     Ok(())
 }
+
+/// Test 5: unsupported predicate (eq) → filter is a no-op.
+///
+/// Validates: regression guard. create_key_spec only handles In and
+/// StringStartsWithAny — anything else returns None, which means the
+/// filter must NOT drop rows. This catches a bug where an unsupported
+/// predicate accidentally drops rows.
+#[tokio::test]
+async fn fg_filter_unsupported_predicate_is_noop() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = sf_file_group();
+
+    // BinaryComparison (eq) is not In/StringStartsWithAny → create_key_spec returns None.
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::eq(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        Box::new(Literal::string("anything")),
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    ab.assert_filter_was_noop();         // baseline.num_rows == filtered.num_rows; same id set
+
+    Ok(())
+}
