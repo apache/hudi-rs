@@ -102,8 +102,8 @@ pub trait Expression: Debug + Send + Sync + Any {
 pub enum ExpressionKind<'a> {
     Literal(&'a crate::expression::literal::Literal),
     NameReference(&'a crate::expression::name_reference::NameReference),
-    // Future variants:
-    //   BoundReference(&'a BoundReference),     (Task 1.10)
+    BoundReference(&'a crate::expression::bound_reference::BoundReference),
+    // Future variant:
     //   Predicate(&'a dyn crate::expression::Predicate),  (Task 1.11)
     _Placeholder(std::marker::PhantomData<&'a ()>),
 }
