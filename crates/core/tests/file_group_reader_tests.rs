@@ -1599,3 +1599,69 @@ async fn fg_filter_unsupported_predicate_is_noop() -> Result<()> {
 
     Ok(())
 }
+
+/// Schema-specific extractor for V9MorNonpart3Commits.
+/// Schema: id INT, name STRING, price DOUBLE, ts LONG.
+fn extract_row_with_id_opt_v9nonpart(
+    batch: &arrow_array::RecordBatch,
+    id: i32,
+) -> Option<(i32, String, f64, i64)> {
+    let id_col = batch.column_by_name("id")?
+        .as_any().downcast_ref::<arrow_array::Int32Array>()?;
+    let name_col = batch.column_by_name("name")?
+        .as_any().downcast_ref::<arrow_array::StringArray>()?;
+    let price_col = batch.column_by_name("price")?
+        .as_any().downcast_ref::<arrow_array::Float64Array>()?;
+    let ts_col = batch.column_by_name("ts")?
+        .as_any().downcast_ref::<arrow_array::Int64Array>()?;
+
+    for i in 0..batch.num_rows() {
+        if id_col.value(i) == id {
+            return Some((
+                id_col.value(i),
+                name_col.value(i).to_string(),
+                price_col.value(i),
+                ts_col.value(i),
+            ));
+        }
+    }
+    None
+}
+
+/// Test 6: filter on a deleted-by-log key → 0 rows in filtered output.
+///
+/// Validates: filter passes through process_delete_block correctly.
+/// V9MorNonpart3Commits: id=0 is deleted by log block. To look up id=0's
+/// record key, read the base file alone (no logs) — that unmerged view
+/// still contains id=0.
+#[tokio::test]
+async fn fg_filter_in_with_delete_block() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = nonpart_3commits_file_group();
+
+    // Read base-only (no log files) to recover id=0's record key.
+    let base_only = read_file_group_with_key_filter(
+        &table_path, partition, base_file, vec![], None,
+    ).await?;
+    let key_for_id0 = lookup_record_key(&base_only, 0);
+
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::string(key_for_id0)) as Box<dyn Expression>],
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    // Baseline already excludes id=0 (deleted by log).
+    assert!(extract_row_with_id_opt_v9nonpart(&ab.baseline, 0).is_none(),
+        "baseline must NOT contain id=0 (deleted by log)");
+
+    // Filtered must also exclude id=0 (filter applied to deleted key → 0 rows).
+    assert!(extract_row_with_id_opt_v9nonpart(&ab.filtered, 0).is_none(),
+        "filtered must NOT contain id=0");
+
+    // Stronger: filtered should be empty since the only key in the filter is id=0,
+    // which is deleted, so no rows survive the filter.
+    ab.assert_filtered_empty();
+
+    Ok(())
+}
