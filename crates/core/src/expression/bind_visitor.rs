@@ -10,4 +10,26 @@
  *   http://www.apache.org/licenses/LICENSE-2.0
  */
 
-//! Stub — populated in Task 1.16 (BindVisitor + ExpressionVisitor + PartialBindVisitor).
+//! Mirrors Java `org.apache.hudi.expression.BindVisitor`.
+//!
+//! BindVisitor walks an expression tree, replacing `NameReference`s with
+//! `BoundReference`s by looking up names in a `RecordType` schema.
+//!
+//! Ported as a placeholder — not wired into the keyFilterOpt reader path.
+//! See keyFilterOpt design spec §6 deviation #6.
+
+use crate::expression::expression_visitor::ExpressionVisitor;
+use crate::internal_schema::types::RecordType;
+
+pub struct BindVisitor {
+    pub schema: RecordType,
+    pub case_sensitive: bool,
+}
+
+impl BindVisitor {
+    pub fn new(schema: RecordType, case_sensitive: bool) -> Self {
+        Self { schema, case_sensitive }
+    }
+}
+
+impl<T: Default> ExpressionVisitor<T> for BindVisitor {}
