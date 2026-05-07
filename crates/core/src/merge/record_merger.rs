@@ -21,7 +21,7 @@ use crate::config::HudiConfigs;
 use crate::config::error::ConfigError;
 use crate::config::error::Result as ConfigResult;
 use crate::config::table::HudiTableConfig::{
-    PopulatesMetaFields, PrecombineField, RecordMergeStrategy,
+    OrderingFields, PopulatesMetaFields, RecordMergeStrategy,
 };
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::RecordMergeStrategyValue;
@@ -64,7 +64,7 @@ impl RecordMerger {
             )));
         }
 
-        let precombine_field = hudi_configs.try_get(PrecombineField)?;
+        let precombine_field = hudi_configs.try_get(OrderingFields)?;
         if precombine_field.is_none()
             && merge_strategy == RecordMergeStrategyValue::OverwriteWithLatest
         {
@@ -72,7 +72,7 @@ impl RecordMerger {
                 "When {:?} is {:?}, {:?} must be set.",
                 RecordMergeStrategy,
                 RecordMergeStrategyValue::OverwriteWithLatest,
-                PrecombineField
+                OrderingFields
             )));
         }
 
@@ -101,18 +101,18 @@ impl RecordMerger {
                 }
 
                 // Use sorting fields to get sorted indices of the data batch (inserts and updates)
+                let ordering_fields: Vec<String> = self.hudi_configs.get(OrderingFields)?.into();
+                let ordering_field = &ordering_fields[0];
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
-                let ordering_field: String = self.hudi_configs.get(PrecombineField)?.into();
-                let ordering_array = data_batch.get_array(&ordering_field)?;
+                let ordering_array = data_batch.get_array(ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
                 let desc_indices =
                     lexsort_to_indices(&[key_array, ordering_array, commit_seqno_array], true);
 
                 // Create shared converters for record keys and ordering values
                 let key_converter = create_record_key_converter(data_batch.schema())?;
-                let ordering_field: String = self.hudi_configs.get(PrecombineField)?.into();
                 let event_time_converter =
-                    create_event_time_ordering_converter(data_batch.schema(), &ordering_field)?;
+                    create_event_time_ordering_converter(data_batch.schema(), ordering_field)?;
                 let commit_time_converter =
                     create_commit_time_ordering_converter(data_batch.schema())?;
 
@@ -143,7 +143,7 @@ impl RecordMerger {
                 let event_times = extract_event_time_ordering_values(
                     &event_time_converter,
                     &data_batch,
-                    &ordering_field,
+                    ordering_field,
                 )?;
                 let commit_times =
                     extract_commit_time_ordering_values(&commit_time_converter, &data_batch)?;
@@ -204,7 +204,7 @@ mod tests {
             HudiConfigs::new([
                 (RecordMergeStrategy, strategy.to_string()),
                 (PopulatesMetaFields, populates_meta_fields.to_string()),
-                (PrecombineField, precombine.to_string()),
+                (OrderingFields, precombine.to_string()),
             ])
         } else {
             HudiConfigs::new([

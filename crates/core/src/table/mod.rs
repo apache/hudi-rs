@@ -950,8 +950,8 @@ mod tests {
     use crate::config::table::BaseFileFormatValue;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
-        IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
-        PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
+        IsPartitionPathUrlencoded, KeyGeneratorClass, OrderingFields, PartitionFields,
+        PopulatesMetaFields, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion, TimelineTimezone,
     };
     use crate::config::util::empty_options;
@@ -1227,7 +1227,7 @@ mod tests {
             "non-required config is missing"
         );
         assert!(
-            configs.validate(PrecombineField).is_ok(),
+            configs.validate(OrderingFields).is_ok(),
             "non-required config is missing"
         );
         assert!(
@@ -1266,7 +1266,7 @@ mod tests {
         assert!(configs.get(IsPartitionPathUrlencoded).is_err());
         assert!(configs.get(KeyGeneratorClass).is_err());
         assert!(configs.get(PartitionFields).is_err());
-        assert!(configs.get(PrecombineField).is_err());
+        assert!(configs.get(OrderingFields).is_err());
         assert!(configs.get(PopulatesMetaFields).is_err());
         assert!(configs.get(RecordKeyFields).is_err());
         assert!(configs.get(TableName).is_err());
@@ -1294,7 +1294,7 @@ mod tests {
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
         let actual: Vec<String> = configs.get_or_default(PartitionFields).into();
         assert!(actual.is_empty());
-        assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(OrderingFields)).is_err());
         let actual: bool = configs.get_or_default(PopulatesMetaFields).into();
         assert!(actual);
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());
@@ -1328,8 +1328,8 @@ mod tests {
         assert_eq!(actual, "org.apache.hudi.keygen.SimpleKeyGenerator");
         let actual: Vec<String> = configs.get(PartitionFields).unwrap().into();
         assert_eq!(actual, vec!["city"]);
-        let actual: String = configs.get(PrecombineField).unwrap().into();
-        assert_eq!(actual, "ts");
+        let actual: Vec<String> = configs.get(OrderingFields).unwrap().into();
+        assert_eq!(actual, vec!["ts"]);
         let actual: bool = configs.get(PopulatesMetaFields).unwrap().into();
         assert!(actual);
         let actual: Vec<String> = configs.get(RecordKeyFields).unwrap().into();

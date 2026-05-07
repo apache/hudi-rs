@@ -40,6 +40,28 @@ pub use read_options::{QueryType, ReadOptions};
 
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
+/// An alternative key for a configuration, optionally marked as deprecated.
+pub struct ConfigAlias {
+    pub key: &'static str,
+    pub deprecated: bool,
+}
+
+impl ConfigAlias {
+    pub const fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            deprecated: false,
+        }
+    }
+
+    pub const fn deprecated(key: &'static str) -> Self {
+        Self {
+            key,
+            deprecated: true,
+        }
+    }
+}
+
 /// This defines some common APIs for working with configurations in Hudi.
 pub trait ConfigParser: AsRef<str> {
     /// Configuration value type.
@@ -52,9 +74,34 @@ pub trait ConfigParser: AsRef<str> {
         self.as_ref().to_string()
     }
 
+    /// Returns alternative keys for this configuration.
+    fn aliases(&self) -> &[ConfigAlias] {
+        &[]
+    }
+
     /// To indicate if the configuration is required or not, this helps in validation.
     fn is_required(&self) -> bool {
         false
+    }
+
+    /// Resolve the raw string value from configs, checking the primary key first, then aliases.
+    fn resolve_raw_value<'a>(&self, configs: &'a HashMap<String, String>) -> Result<&'a str> {
+        if let Some(v) = configs.get(self.as_ref()) {
+            return Ok(v.as_str());
+        }
+        for alias in self.aliases() {
+            if let Some(v) = configs.get(alias.key) {
+                if alias.deprecated {
+                    log_once::warn_once!(
+                        "Config '{}' is deprecated; use '{}' instead",
+                        alias.key,
+                        self.as_ref()
+                    );
+                }
+                return Ok(v.as_str());
+            }
+        }
+        Err(NotFound(self.key()))
     }
 
     /// Validate the configuration by parsing the given [String] value and check if it is required.
@@ -237,6 +284,57 @@ impl HudiConfigs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::table::HudiTableConfig;
+
+    #[test]
+    fn test_config_alias_constructors() {
+        let alias = ConfigAlias::new("key");
+        assert_eq!(alias.key, "key");
+        assert!(!alias.deprecated);
+
+        let alias = ConfigAlias::deprecated("old_key");
+        assert_eq!(alias.key, "old_key");
+        assert!(alias.deprecated);
+    }
+
+    #[test]
+    fn test_aliases_default_returns_empty() {
+        assert!(HudiTableConfig::TableName.aliases().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_raw_value_primary_key() {
+        let mut configs = HashMap::new();
+        configs.insert("hoodie.table.name".to_string(), "trips".to_string());
+        let result = HudiTableConfig::TableName.resolve_raw_value(&configs);
+        assert_eq!(result.unwrap(), "trips");
+    }
+
+    #[test]
+    fn test_resolve_raw_value_deprecated_alias() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "hoodie.table.precombine.field".to_string(),
+            "ts".to_string(),
+        );
+        let result = HudiTableConfig::OrderingFields.resolve_raw_value(&configs);
+        assert_eq!(result.unwrap(), "ts");
+    }
+
+    #[test]
+    fn test_resolve_raw_value_not_found() {
+        let configs = HashMap::new();
+        let result = HudiTableConfig::TableName.resolve_raw_value(&configs);
+        assert!(matches!(result.unwrap_err(), ConfigError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_try_get_returns_err_on_parse_failure() {
+        let hudi_configs =
+            HudiConfigs::new([(HudiTableConfig::PopulatesMetaFields.as_ref(), "not_a_bool")]);
+        let result = hudi_configs.try_get(HudiTableConfig::PopulatesMetaFields);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_new_using_hashmap() {

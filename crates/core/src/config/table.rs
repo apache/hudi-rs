@@ -25,10 +25,8 @@ use strum_macros::{AsRefStr, EnumIter, IntoStaticStr};
 
 use crate::config::Result;
 use crate::config::error::ConfigError;
-use crate::config::error::ConfigError::{
-    InvalidValue, NotFound, ParseBool, ParseInt, UnsupportedValue,
-};
-use crate::config::{ConfigParser, HudiConfigValue};
+use crate::config::error::ConfigError::{InvalidValue, ParseBool, ParseInt, UnsupportedValue};
+use crate::config::{ConfigAlias, ConfigParser, HudiConfigValue};
 use crate::merge::RecordMergeStrategyValue;
 
 /// Configurations for Hudi tables, most of them are persisted in `hoodie.properties`.
@@ -86,9 +84,11 @@ pub enum HudiTableConfig {
     /// These fields also include the partition type which is used by custom key generators
     PartitionFields,
 
-    /// Field used in preCombining before actual write. By default, when two records have the same key value,
-    /// the largest value for the precombine field determined by Object.compareTo(..), is picked.
-    PrecombineField,
+    /// Fields used for ordering records during merge. When two records have the same key,
+    /// the record with the larger ordering field value is picked.
+    ///
+    /// Alias: `hoodie.table.precombine.field` (deprecated).
+    OrderingFields,
 
     /// When enabled, populates all meta fields. When disabled, no meta fields are populated
     /// and incremental queries will not be functional. This is only meant to be used for append only/immutable data for batch processing
@@ -161,7 +161,7 @@ impl AsRef<str> for HudiTableConfig {
             Self::KeyGeneratorClass => "hoodie.table.keygenerator.class",
             Self::KeyGeneratorType => "hoodie.table.keygenerator.type",
             Self::PartitionFields => "hoodie.table.partition.fields",
-            Self::PrecombineField => "hoodie.table.precombine.field",
+            Self::OrderingFields => "hoodie.table.ordering.fields",
             Self::PopulatesMetaFields => "hoodie.populate.meta.fields",
             Self::RecordKeyFields => "hoodie.table.recordkey.fields",
             Self::RecordMergeStrategy => "hoodie.table.record.merge.strategy",
@@ -211,15 +211,23 @@ impl ConfigParser for HudiTableConfig {
         }
     }
 
+    fn aliases(&self) -> &[ConfigAlias] {
+        match self {
+            Self::OrderingFields => {
+                const ALIASES: &[ConfigAlias] =
+                    &[ConfigAlias::deprecated("hoodie.table.precombine.field")];
+                ALIASES
+            }
+            _ => &[],
+        }
+    }
+
     fn is_required(&self) -> bool {
         matches!(self, Self::TableName | Self::TableType | Self::TableVersion)
     }
 
     fn parse_value(&self, configs: &HashMap<String, String>) -> Result<Self::Output> {
-        let get_result = configs
-            .get(self.as_ref())
-            .map(|v| v.as_str())
-            .ok_or(NotFound(self.key()));
+        let get_result = self.resolve_raw_value(configs);
 
         match self {
             Self::BaseFileFormat => get_result
@@ -252,7 +260,15 @@ impl ConfigParser for HudiTableConfig {
             Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::PartitionFields => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
-            Self::PrecombineField => get_result.map(|v| HudiConfigValue::String(v.to_string())),
+            Self::OrderingFields => get_result.and_then(|v| {
+                let fields: Vec<String> = v.split(',').map(str::to_string).collect();
+                if fields.len() > 1 {
+                    return Err(UnsupportedValue(format!(
+                        "Multiple ordering fields '{v}' are not yet supported"
+                    )));
+                }
+                Ok(HudiConfigValue::List(fields))
+            }),
             Self::PopulatesMetaFields => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
@@ -308,7 +324,10 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    if !configs.contains_key(HudiTableConfig::PrecombineField.as_ref()) {
+                    if HudiTableConfig::OrderingFields
+                        .parse_value(configs)
+                        .is_err()
+                    {
                         // When precombine field is not available, we treat the table as append-only
                         return HudiConfigValue::String(
                             RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
@@ -540,7 +559,7 @@ mod tests {
     fn test_derive_record_merger_strategy() {
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields, "false"),
-            (HudiTableConfig::PrecombineField, "ts"),
+            (HudiTableConfig::OrderingFields, "ts"),
         ]);
         let actual: String = hudi_configs
             .get_or_default(HudiTableConfig::RecordMergeStrategy)
@@ -563,7 +582,7 @@ mod tests {
 
         let hudi_configs = HudiConfigs::new(vec![
             (HudiTableConfig::PopulatesMetaFields, "true"),
-            (HudiTableConfig::PrecombineField, "ts"),
+            (HudiTableConfig::OrderingFields, "ts"),
         ]);
         let actual: String = hudi_configs
             .get_or_default(HudiTableConfig::RecordMergeStrategy)
@@ -572,5 +591,44 @@ mod tests {
             actual,
             RecordMergeStrategyValue::OverwriteWithLatest.as_ref()
         );
+    }
+
+    #[test]
+    fn test_precombine_field_deprecated_alias() {
+        let deprecated_key = HudiTableConfig::OrderingFields.aliases()[0].key;
+        assert_eq!(deprecated_key, "hoodie.table.precombine.field");
+
+        // Deprecated alias should still resolve
+        let hudi_configs = HudiConfigs::new(vec![
+            (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
+            (deprecated_key, "ts"),
+        ]);
+        let actual: Vec<String> = hudi_configs
+            .get(HudiTableConfig::OrderingFields)
+            .unwrap()
+            .into();
+        assert_eq!(actual, vec!["ts"]);
+        let actual: String = hudi_configs
+            .get_or_default(HudiTableConfig::RecordMergeStrategy)
+            .into();
+        assert_eq!(
+            actual,
+            RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
+            "Should derive overwrite-with-latest from deprecated precombine field"
+        );
+    }
+
+    #[test]
+    fn test_ordering_fields_rejects_multiple() {
+        let hudi_configs = HudiConfigs::new(vec![
+            (HudiTableConfig::PopulatesMetaFields.as_ref(), "true"),
+            (HudiTableConfig::OrderingFields.as_ref(), "ts,seq"),
+        ]);
+        assert!(matches!(
+            hudi_configs
+                .get(HudiTableConfig::OrderingFields)
+                .unwrap_err(),
+            ConfigError::UnsupportedValue(_)
+        ));
     }
 }

@@ -62,11 +62,11 @@ pub fn process_batch_for_max_orderings(
         return Ok(());
     }
 
-    let ordering_field: String = hudi_configs.get(HudiTableConfig::PrecombineField)?.into();
+    let ordering_fields: Vec<String> = hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
 
     let keys = extract_record_keys(key_converter, batch)?;
     let event_times =
-        extract_event_time_ordering_values(event_time_converter, batch, &ordering_field)?;
+        extract_event_time_ordering_values(event_time_converter, batch, &ordering_fields[0])?;
     let commit_times = extract_commit_time_ordering_values(commit_time_converter, batch)?;
     for i in 0..batch.num_rows() {
         let key = keys.row(i).owned();
@@ -340,7 +340,7 @@ mod tests {
     // Helper function to create test HudiConfigs
     fn create_test_hudi_configs() -> Arc<HudiConfigs> {
         Arc::new(HudiConfigs::new([(
-            HudiTableConfig::PrecombineField.as_ref(),
+            HudiTableConfig::OrderingFields.as_ref(),
             "an_ordering_field",
         )]))
     }
@@ -570,7 +570,7 @@ mod tests {
         let (key_converter, event_time_converter, commit_time_converter) =
             create_test_converters(schema);
 
-        // Create configs without PrecombineField
+        // Create configs without OrderingFields
         let hudi_configs = Arc::new(HudiConfigs::empty());
 
         let mut max_ordering = HashMap::new();
