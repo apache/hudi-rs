@@ -1701,3 +1701,65 @@ async fn fg_filter_in_log_updated_key_nonpart() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// Test 8: log-only filter — isolates log-scan filter
+// =============================================================================
+
+/// Test 8: filter on a log-only file group (no base file).
+///
+/// Validates: ISOLATES the log-scan filter (KeyBasedFileGroupRecordBuffer
+/// process_data_block / process_delete_block). All output flows through
+/// the log-scan path because there is no base file.
+///
+/// MorLayoutLogOnly schema: key STRING, ts INT64, level STRING, severity INT32,
+/// partition STRING, round INT32. _hoodie_record_key values are "k1", "k2" (k3 deleted).
+///
+/// Picks one key from the baseline batch ("k1") and filters on it; expects the
+/// filtered output to contain exactly that key's row (and no others).
+#[tokio::test]
+async fn fg_filter_in_log_only_filegroup() -> Result<()> {
+    let (table_path, partition, base_file, log_files) = log_only_file_group();
+
+    // Read baseline first to discover one valid record key.
+    let baseline_for_key_lookup = read_file_group_with_key_filter(
+        &table_path, partition, base_file, log_files.clone(), None,
+    ).await?;
+    assert!(baseline_for_key_lookup.num_rows() >= 2,
+        "log-only baseline must have >=2 rows for the filter to be a real narrow");
+
+    // Use the _hoodie_record_key of the first row.
+    let hoodie_key_col = baseline_for_key_lookup
+        .column_by_name("_hoodie_record_key")
+        .expect("MorLayoutLogOnly should expose _hoodie_record_key in merged output")
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("_hoodie_record_key should be StringArray");
+    let target_key = hoodie_key_col.value(0).to_string();
+
+    let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
+        Box::new(NameReference::new("_hoodie_record_key")),
+        vec![Box::new(Literal::string(target_key.clone())) as Box<dyn Expression>],
+    ));
+
+    let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
+
+    ab.assert_filter_narrowed();         // 1 < 2
+
+    // Verify exactly the target key remains.
+    let filtered_keys: Vec<String> = {
+        let key_col = ab.filtered
+            .column_by_name("_hoodie_record_key")
+            .expect("_hoodie_record_key missing from filtered batch")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("_hoodie_record_key should be StringArray");
+        (0..ab.filtered.num_rows())
+            .map(|i| key_col.value(i).to_string())
+            .collect()
+    };
+    assert_eq!(filtered_keys, vec![target_key.clone()],
+        "filtered keys should be exactly [target_key]");
+
+    Ok(())
+}
