@@ -103,9 +103,7 @@ pub enum ExpressionKind<'a> {
     Literal(&'a crate::expression::literal::Literal),
     NameReference(&'a crate::expression::name_reference::NameReference),
     BoundReference(&'a crate::expression::bound_reference::BoundReference),
-    // Future variant:
-    //   Predicate(&'a dyn crate::expression::Predicate),  (Task 1.11)
-    _Placeholder(std::marker::PhantomData<&'a ()>),
+    Predicate(&'a dyn crate::expression::predicate::Predicate),
 }
 
 #[cfg(test)]

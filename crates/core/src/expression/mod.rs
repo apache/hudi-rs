@@ -38,4 +38,4 @@ pub mod struct_like;
 pub use expression::{Expression, ExpressionKind, Operator};
 pub use literal::{Literal, LiteralValue};
 pub use name_reference::NameReference;                           // Task 1.9
-// pub use predicate::{Predicate, PredicateKind};                // Task 1.11
+pub use predicate::{Predicate, PredicateKind};                   // Task 1.11
