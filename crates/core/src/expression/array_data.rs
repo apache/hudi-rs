@@ -52,6 +52,6 @@ mod tests {
             arr.get(0).and_then(|v| v.downcast_ref::<i32>()).copied(),
             Some(42)
         );
-        assert_eq!(arr.get(2).is_none(), true);
+        assert!(arr.get(2).is_none());
     }
 }
