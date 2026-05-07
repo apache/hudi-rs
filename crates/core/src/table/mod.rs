@@ -950,8 +950,8 @@ mod tests {
     use crate::config::table::BaseFileFormatValue;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
-        IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
-        OrderingFields, RecordKeyFields, TableName, TableType, TableVersion,
+        IsPartitionPathUrlencoded, KeyGeneratorClass, OrderingFields, PartitionFields,
+        PopulatesMetaFields, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion, TimelineTimezone,
     };
     use crate::config::util::empty_options;

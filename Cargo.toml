@@ -74,6 +74,7 @@ chrono = { version = "0.4" }
 chrono-tz = { version = "0.10" }
 lazy_static = { version = "1" }
 log = { version = "0.4" }
+log-once = { version = "0.4" }
 num-traits = { version = "0.2" }
 once_cell = { version = "1" }
 paste = { version = "1" }

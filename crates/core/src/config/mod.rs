@@ -18,8 +18,8 @@
  */
 //! Hudi Configurations.
 use std::any::type_name;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::error::{ConfigError, Result};
 use crate::storage::error::Result as StorageResult;
@@ -92,15 +92,11 @@ pub trait ConfigParser: AsRef<str> {
         for alias in self.aliases() {
             if let Some(v) = configs.get(alias.key) {
                 if alias.deprecated {
-                    static WARNED: LazyLock<Mutex<HashSet<&'static str>>> =
-                        LazyLock::new(|| Mutex::new(HashSet::new()));
-                    if WARNED.lock().unwrap().insert(alias.key) {
-                        log::warn!(
-                            "Config '{}' is deprecated; use '{}' instead",
-                            alias.key,
-                            self.as_ref()
-                        );
-                    }
+                    log_once::warn_once!(
+                        "Config '{}' is deprecated; use '{}' instead",
+                        alias.key,
+                        self.as_ref()
+                    );
                 }
                 return Ok(v.as_str());
             }
@@ -334,10 +330,8 @@ mod tests {
 
     #[test]
     fn test_try_get_returns_err_on_parse_failure() {
-        let hudi_configs = HudiConfigs::new([(
-            HudiTableConfig::PopulatesMetaFields.as_ref(),
-            "not_a_bool",
-        )]);
+        let hudi_configs =
+            HudiConfigs::new([(HudiTableConfig::PopulatesMetaFields.as_ref(), "not_a_bool")]);
         let result = hudi_configs.try_get(HudiTableConfig::PopulatesMetaFields);
         assert!(result.is_err());
     }

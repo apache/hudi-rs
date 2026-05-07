@@ -21,7 +21,7 @@ use crate::config::HudiConfigs;
 use crate::config::error::ConfigError;
 use crate::config::error::Result as ConfigResult;
 use crate::config::table::HudiTableConfig::{
-    PopulatesMetaFields, OrderingFields, RecordMergeStrategy,
+    OrderingFields, PopulatesMetaFields, RecordMergeStrategy,
 };
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::RecordMergeStrategyValue;
@@ -101,8 +101,7 @@ impl RecordMerger {
                 }
 
                 // Use sorting fields to get sorted indices of the data batch (inserts and updates)
-                let ordering_fields: Vec<String> =
-                    self.hudi_configs.get(OrderingFields)?.into();
+                let ordering_fields: Vec<String> = self.hudi_configs.get(OrderingFields)?.into();
                 let ordering_field = &ordering_fields[0];
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
                 let ordering_array = data_batch.get_array(ordering_field)?;
