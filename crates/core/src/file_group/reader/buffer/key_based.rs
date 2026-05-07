@@ -93,6 +93,10 @@ pub struct KeyBasedFileGroupRecordBuffer {
     /// Record context for record-level operations (key extraction, ordering, etc.).
     /// Mirrors Java's `readerContext.getRecordContext()`.
     pub record_context: RecordContext,
+
+    /// Key-spec filter set by scan_internal for per-record filtering.
+    /// Mirrors Java's keySpecOpt threaded through to KeyBasedFileGroupRecordBuffer.
+    pub key_spec_opt: Option<crate::file_group::reader::key_spec::KeySpec>,
 }
 
 impl KeyBasedFileGroupRecordBuffer {
@@ -147,6 +151,7 @@ impl KeyBasedFileGroupRecordBuffer {
             base,
             reader_context,
             record_context,
+            key_spec_opt: None,
         })
     }
 
@@ -194,6 +199,10 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         BufferType::KeyBasedMerge
     }
 
+    fn set_key_spec(&mut self, key_spec: Option<crate::file_group::reader::key_spec::KeySpec>) {
+        self.key_spec_opt = key_spec;
+    }
+
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.processDataBlock(HoodieDataBlock, Option<KeySpec>)`.
     ///
     /// Inflates the block on demand (matching Java where inflate/deserialize/deflate
@@ -221,6 +230,11 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                     self.base.delete_context.as_ref(),
                 )?;
                 for (key, record) in records {
+                    // Mirrors Java BaseHoodieLogRecordReader: skip records
+                    // that don't match the key-spec filter.
+                    if let Some(spec) = &self.key_spec_opt {
+                        if !spec.matches(&key) { continue; }
+                    }
                     self.process_next_data_record(record, &key)?;
                 }
             }
@@ -289,6 +303,10 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             for (batch, _inst) in record_batches.delete_batches {
                 let delete_records = self.record_context.delete_batch_to_buffered_records(&batch)?;
                 for (key, _record) in delete_records {
+                    // Same key-spec filter as the data block path.
+                    if let Some(spec) = &self.key_spec_opt {
+                        if !spec.matches(&key) { continue; }
+                    }
                     let delete_record = DeleteRecord {
                         record_key: key.clone(),
                         partition_path: String::new(), // TODO: extract from batch

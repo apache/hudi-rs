@@ -349,6 +349,9 @@ pub struct BaseHoodieLogRecordReader {
     pub force_full_scan: bool,
     pub record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
     pub allow_inflight_instants: bool,
+    /// Mirrors Java `BaseHoodieLogRecordReader.keySpecOpt` — set by the
+    /// scanner caller to narrow which records are processed.
+    pub key_spec_opt: Option<crate::file_group::reader::key_spec::KeySpec>,
 
     // ── Stats / state (mirrors Java's AtomicLong counters + progress) ──
     pub valid_block_instants: Vec<String>,
@@ -365,10 +368,19 @@ impl BaseHoodieLogRecordReader {
     /// Mirrors Java's `scanInternal(Option<KeySpec> keySpecOpt, boolean skipProcessingBlocks)`.
     ///
     /// # Arguments
+    /// - `key_spec_opt` — optional key-spec filter; records whose key doesn't match are skipped.
+    ///   Mirrors Java's `keySpecOpt` parameter.
     /// - `skip_processing_blocks` — when `true`, Pass 3 (block processing) is skipped.
     ///   Java's `HoodieMergedLogRecordReader.scan(true)` uses this to collect block
     ///   metadata without actually merging records.
-    pub async fn scan_internal(&mut self, skip_processing_blocks: bool) -> Result<()> {
+    pub async fn scan_internal(
+        &mut self,
+        key_spec_opt: Option<crate::file_group::reader::key_spec::KeySpec>,
+        skip_processing_blocks: bool,
+    ) -> Result<()> {
+        // Store on self so deeper dispatch points can consult it.
+        self.key_spec_opt = key_spec_opt;
+
         // Reset state (mirrors Java: currentInstantLogBlocks = new ArrayDeque<>(), progress = 0.0f, ...)
         self.valid_block_instants.clear();
         self.progress = 0.0;
@@ -377,6 +389,10 @@ impl BaseHoodieLogRecordReader {
         self.total_log_records = 0;
         self.total_corrupt_blocks = 0;
         self.total_rollbacks = 0;
+
+        // Propagate to buffer for per-record filtering (mirrors Java's
+        // BaseHoodieLogRecordReader → buffer key-spec threading).
+        self.record_buffer.set_key_spec(self.key_spec_opt.clone());
 
         let timezone = self.reader_context.timezone();
 

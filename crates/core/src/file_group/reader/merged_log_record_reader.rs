@@ -117,7 +117,7 @@ impl HoodieMergedLogRecordReader {
             // When full-scan is enforced, scanning is invoked upfront (during initialization)
             return Ok(());
         }
-        self.base.scan_internal(skip_processing_blocks).await
+        self.base.scan_internal(None, skip_processing_blocks).await
     }
 
     /// Mirrors Java's `performScan()`:
@@ -134,7 +134,7 @@ impl HoodieMergedLogRecordReader {
         let start = std::time::Instant::now();
 
         // KeySpec filtering not yet implemented in Rust; pass skip=false
-        self.base.scan_internal(false).await?;
+        self.base.scan_internal(None, false).await?;
 
         self.total_time_taken_to_read_and_merge_blocks_ms =
             start.elapsed().as_millis() as u64;
@@ -345,6 +345,7 @@ impl Builder {
             force_full_scan: self.force_full_scan,
             record_buffer,
             allow_inflight_instants: self.allow_inflight_instants,
+            key_spec_opt: None,
             valid_block_instants: Vec::new(),
             total_log_files: 0,
             total_log_blocks: 0,

@@ -155,6 +155,12 @@ pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
     /// Mirrors Java's `next()`.
     fn next(&mut self) -> Option<BufferedRecord>;
 
+    /// Set the key-spec filter. Records whose key doesn't match are skipped
+    /// during `process_data_block` / `process_delete_block`. Mirrors how
+    /// Java's BaseHoodieLogRecordReader threads keySpecOpt through to
+    /// per-record processing. Default: no-op for buffers that don't support filtering.
+    fn set_key_spec(&mut self, _key_spec: Option<crate::file_group::reader::key_spec::KeySpec>) {}
+
     /// Consume the buffer and produce the merged output as a `RecordBatch`.
     ///
     /// This is Rust-specific — Java uses the `hasNext()`/`next()` iterator instead.
