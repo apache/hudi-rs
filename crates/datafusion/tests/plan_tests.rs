@@ -563,7 +563,7 @@ mod dispatch_tests {
 
 mod lance_tests {
     use super::*;
-    use arrow_array::{Float64Array, Int32Array};
+    use arrow_array::{Float64Array, Int32Array, Int64Array};
     use hudi_test::SampleTable::V9LanceNonpartitioned;
     use std::collections::HashMap;
 
@@ -628,6 +628,33 @@ mod lance_tests {
             plan.contains("HudiScanExec"),
             "Lance table should use HudiScanExec, not DataSourceExec. Plan: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_lance_cow_count_star_projection_elimination() {
+        // Regression test: DataFusion forwards `Some(vec![])` as the
+        // projection for COUNT(*). lance-file rejects zero-column
+        // projections, so the Lance reader must emit zero-column
+        // batches with the row count derived from metadata.
+        let test_table = V9LanceNonpartitioned;
+        let ctx = register_table_direct(&test_table, empty_options())
+            .await
+            .unwrap();
+
+        let count_sql = format!("SELECT COUNT(*) FROM {}", test_table.as_ref());
+        let count_batches = ctx.sql(&count_sql).await.unwrap().collect().await.unwrap();
+        let counted = count_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT(*) returns Int64")
+            .value(0);
+
+        let rows_sql = format!("SELECT id FROM {}", test_table.as_ref());
+        let row_batches = ctx.sql(&rows_sql).await.unwrap().collect().await.unwrap();
+        let expected: i64 = row_batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        assert_eq!(counted, expected);
     }
 
     #[tokio::test]

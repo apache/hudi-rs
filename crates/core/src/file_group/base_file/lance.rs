@@ -23,15 +23,20 @@
 
 use std::sync::Arc;
 
+use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_io::ReadBatchParams;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::object_store::{ObjectStore as LanceObjectStore, ObjectStoreRegistry};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path as ObjPath;
+use tokio::sync::OnceCell;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
 use crate::statistics::{ColumnStatistics, StatisticsContainer, StatsGranularity};
@@ -46,106 +51,168 @@ const DEFAULT_BATCH_READAHEAD: u32 = 16;
 /// Lance implementation of [`BaseFileReader`].
 ///
 /// Each Hudi base file with `.lance` extension is a standalone Lance data
-/// file containing a single fragment. This reader opens individual files
-/// using `lance-file`'s `FileReader`.
+/// file. The Lance object store and scan scheduler are built once per
+/// reader and reused across every file open.
 pub struct LanceBaseFileReader {
     storage: Arc<Storage>,
+    /// Lazily-initialized Lance scheduler. The scheduler holds the
+    /// Lance-wrapped object store, so caching it covers both pieces of
+    /// per-table infrastructure.
+    scheduler: OnceCell<Arc<ScanScheduler>>,
 }
 
 impl LanceBaseFileReader {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            scheduler: OnceCell::new(),
+        }
     }
 
-    async fn open_file_reader(
+    /// Returns the Lance scan scheduler shared across all file reads on
+    /// this reader, initializing it on first use.
+    async fn scheduler(&self) -> Result<Arc<ScanScheduler>> {
+        let scheduler = self
+            .scheduler
+            .get_or_try_init(|| async {
+                let storage_accessor = Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        (*self.storage.options).clone(),
+                    ),
+                );
+                // `ObjectStoreParams::storage_options_accessor` is marked deprecated in
+                // lance-io 4.0.x but is still the only supported way to forward
+                // hudi-rs's storage option map (e.g. cloud credentials, custom
+                // endpoints) into Lance's provider prefix calculation. The replacement
+                // API is not yet exposed by lance-io; revisit when upgrading lance-io.
+                #[allow(deprecated)]
+                let params = lance_io::object_store::ObjectStoreParams {
+                    object_store: Some((
+                        self.storage.object_store.clone(),
+                        (*self.storage.base_url).clone(),
+                    )),
+                    storage_options_accessor: Some(storage_accessor),
+                    ..Default::default()
+                };
+
+                let (lance_store, _root_path) = LanceObjectStore::from_uri_and_params(
+                    Arc::new(ObjectStoreRegistry::default()),
+                    self.storage.base_url.as_str(),
+                    &params,
+                )
+                .await
+                .map_err(|e| {
+                    StorageError::Creation(format!(
+                        "Failed to create Lance object store for {}: {e}",
+                        self.storage.base_url
+                    ))
+                })?;
+
+                let scheduler_config = SchedulerConfig::max_bandwidth(&lance_store);
+                Ok::<_, StorageError>(ScanScheduler::new(lance_store, scheduler_config))
+            })
+            .await?;
+        Ok(scheduler.clone())
+    }
+
+    /// Open a Lance `FileScheduler` for `relative_path`. Pass `known_size`
+    /// when the caller has already discovered the file size to skip
+    /// Lance's internal size lookup.
+    async fn open_file_scheduler(
         &self,
         relative_path: &str,
-        projection: Option<&[String]>,
-    ) -> Result<FileReader> {
+        known_size: Option<u64>,
+    ) -> Result<FileScheduler> {
+        let scheduler = self.scheduler().await?;
         let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
-
-        let storage_accessor = Arc::new(
-            lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                (*self.storage.options).clone(),
-            ),
-        );
-        // `ObjectStoreParams::storage_options_accessor` is marked deprecated in
-        // lance-io 4.0.x but is still the only supported way to forward
-        // hudi-rs's storage option map (e.g. cloud credentials, custom
-        // endpoints) into Lance's provider prefix calculation. The replacement
-        // API is not yet exposed by lance-io; revisit when upgrading lance-io.
-        #[allow(deprecated)]
-        let params = lance_io::object_store::ObjectStoreParams {
-            object_store: Some((
-                self.storage.object_store.clone(),
-                (*self.storage.base_url).clone(),
-            )),
-            storage_options_accessor: Some(storage_accessor),
-            ..Default::default()
+        let cached_size = match known_size {
+            Some(size) => CachedFileSize::new(size),
+            None => CachedFileSize::unknown(),
         };
-
-        let lance_store = lance_io::object_store::ObjectStore::from_uri_and_params(
-            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
-            obj_url.as_str(),
-            &params,
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Creation(format!(
-                "Failed to create Lance object store for {relative_path}: {e}"
-            ))
-        })?;
-
-        let scheduler_config = SchedulerConfig::max_bandwidth(&lance_store.0);
-        let scheduler = ScanScheduler::new(lance_store.0, scheduler_config);
-
-        let file_scheduler = scheduler
-            .open_file(&obj_path, &CachedFileSize::unknown())
+        scheduler
+            .open_file(&obj_path, &cached_size)
             .await
             .map_err(|e| {
                 StorageError::Creation(format!("Failed to open Lance file {relative_path}: {e}"))
-            })?;
+            })
+    }
 
-        let cache = LanceCache::no_cache();
+    /// Build a `ReaderProjection` from the requested column names. Empty
+    /// projections return `Ok(None)`: lance-file rejects zero-column
+    /// projections, so callers that want a row-count-preserving scan must
+    /// handle the empty case themselves.
+    fn build_projection(
+        col_names: &[String],
+        metadata: &CachedFileMetadata,
+        relative_path: &str,
+    ) -> Result<Option<ReaderProjection>> {
+        if col_names.is_empty() {
+            return Ok(None);
+        }
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+        ReaderProjection::from_column_names(
+            metadata.version(),
+            metadata.file_schema.as_ref(),
+            &col_refs,
+        )
+        .map(Some)
+        .map_err(|e| {
+            StorageError::Creation(format!(
+                "Failed to create Lance projection for {relative_path}: {e}"
+            ))
+        })
+    }
 
-        let base_projection = if let Some(col_names) = projection {
-            let metadata = FileReader::read_all_metadata(&file_scheduler)
+    /// Open a Lance `FileReader` and return the file metadata used to
+    /// build it. The metadata is read once and reused via
+    /// [`FileReader::try_open_with_file_metadata`] so callers don't pay
+    /// for the read twice.
+    async fn open_file_reader_with_metadata(
+        &self,
+        relative_path: &str,
+        projection: Option<&[String]>,
+        known_size: Option<u64>,
+    ) -> Result<(FileReader, Arc<CachedFileMetadata>)> {
+        let file_scheduler = self.open_file_scheduler(relative_path, known_size).await?;
+        let metadata = Arc::new(
+            FileReader::read_all_metadata(&file_scheduler)
                 .await
                 .map_err(|e| {
                     StorageError::Creation(format!(
                         "Failed to read Lance metadata for {relative_path}: {e}"
                     ))
-                })?;
-            let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-            let proj = ReaderProjection::from_column_names(
-                metadata.version(),
-                metadata.file_schema.as_ref(),
-                &col_refs,
-            )
-            .map_err(|e| {
-                StorageError::Creation(format!(
-                    "Failed to create Lance projection for {relative_path}: {e}"
-                ))
-            })?;
-            Some(proj)
-        } else {
-            None
+                })?,
+        );
+
+        let base_projection = match projection {
+            Some(cols) => Self::build_projection(cols, &metadata, relative_path)?,
+            None => None,
         };
 
-        FileReader::try_open(
-            file_scheduler,
+        let cache = LanceCache::no_cache();
+        let path = file_scheduler.reader().path().clone();
+        let options = FileReaderOptions::default();
+        let encodings_io =
+            LanceEncodingsIo::new(file_scheduler).with_read_chunk_size(options.read_chunk_size);
+
+        let reader = FileReader::try_open_with_file_metadata(
+            Arc::new(encodings_io),
+            path,
             base_projection,
             Arc::new(DecoderPlugins {}),
+            metadata.clone(),
             &cache,
-            FileReaderOptions::default(),
+            options,
         )
         .await
         .map_err(|e| {
             StorageError::Creation(format!(
                 "Failed to open Lance file reader for {relative_path}: {e}"
             ))
-        })
+        })?;
+
+        Ok((reader, metadata))
     }
 
     /// Returns the Arrow schema of the Lance base file.
@@ -154,8 +221,40 @@ impl LanceBaseFileReader {
     /// schema-resolution callers can fall back to the base file when commit
     /// metadata does not carry an explicit schema.
     pub async fn get_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
-        let reader = self.open_file_reader(relative_path, None).await?;
+        let (reader, _) = self
+            .open_file_reader_with_metadata(relative_path, None, None)
+            .await?;
         Ok(arrow_schema::Schema::from(reader.schema().as_ref()))
+    }
+
+    /// Build a single zero-column [`RecordBatch`] with the Lance file's
+    /// row count. Used to satisfy projection-elimination scans (e.g.
+    /// DataFusion `SELECT COUNT(*)`) without rejecting on Lance's
+    /// zero-column-projection check.
+    async fn empty_projection_stream(&self, relative_path: &str) -> Result<BaseFileStream> {
+        let file_scheduler = self.open_file_scheduler(relative_path, None).await?;
+        let metadata = FileReader::read_all_metadata(&file_scheduler)
+            .await
+            .map_err(|e| {
+                StorageError::Creation(format!(
+                    "Failed to read Lance metadata for {relative_path}: {e}"
+                ))
+            })?;
+
+        let empty_schema: SchemaRef = Arc::new(arrow_schema::Schema::empty());
+        let row_count = usize::try_from(metadata.num_rows).unwrap_or(usize::MAX);
+        let batch = RecordBatch::try_new_with_options(
+            empty_schema.clone(),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        )
+        .map_err(|e| {
+            StorageError::Creation(format!(
+                "Failed to build empty RecordBatch for {relative_path}: {e}"
+            ))
+        })?;
+        let stream = futures::stream::once(futures::future::ready(Ok(batch))).boxed();
+        Ok(BaseFileStream::new(empty_schema, stream))
     }
 }
 
@@ -166,8 +265,16 @@ impl BaseFileReader for LanceBaseFileReader {
         options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
-            let reader = self
-                .open_file_reader(relative_path, options.projection.as_deref())
+            // DataFusion sends `Some(vec![])` as the projection for queries
+            // like `SELECT COUNT(*)` and lance-file rejects zero-column
+            // projections; emit a single empty-schema batch with the row
+            // count derived from metadata instead.
+            if options.projection.as_ref().is_some_and(|p| p.is_empty()) {
+                return self.empty_projection_stream(relative_path).await;
+            }
+
+            let (reader, _) = self
+                .open_file_reader_with_metadata(relative_path, options.projection.as_deref(), None)
                 .await?;
 
             let batch_size = options.batch_size.unwrap_or(DEFAULT_BATCH_SIZE as usize) as u32;
@@ -200,7 +307,16 @@ impl BaseFileReader for LanceBaseFileReader {
         table_schema: &'a arrow_schema::Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
         Box::pin(async move {
-            let reader = self.open_file_reader(relative_path, None).await?;
+            let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+            let obj_path = ObjPath::from_url_path(obj_url.path())?;
+            let head = self.storage.object_store.head(&obj_path).await?;
+            let file_size = head.size as u64;
+
+            // Open with the size we just discovered so Lance doesn't issue
+            // its own head request.
+            let (reader, _) = self
+                .open_file_reader_with_metadata(relative_path, None, Some(file_size))
+                .await?;
 
             let name = std::path::Path::new(relative_path)
                 .file_name()
@@ -208,16 +324,12 @@ impl BaseFileReader for LanceBaseFileReader {
                 .unwrap_or(relative_path)
                 .to_string();
 
-            let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
-            let obj_path = ObjPath::from_url_path(obj_url.path())?;
-            let meta = self.storage.object_store.head(&obj_path).await?;
-
             let num_rows = reader.num_rows() as i64;
 
             let file_metadata = FileMetadata {
                 name,
-                size: meta.size as u64,
-                byte_size: meta.size as i64,
+                size: file_size,
+                byte_size: file_size as i64,
                 num_records: num_rows,
             };
 
@@ -404,5 +516,35 @@ mod tests {
             assert_eq!(batch.num_columns(), 2);
             assert_eq!(batch.schema().fields(), stream_schema.fields());
         }
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_empty_projection_yields_zero_column_batch_with_row_count() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let file_name = lance_base_file_name();
+
+        // Sanity-check the row count via an unprojected read.
+        let full = reader
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .unwrap();
+        let expected_rows = full.num_rows();
+        assert!(expected_rows > 0);
+
+        // Empty projection: lance-file would normally reject this, but the
+        // reader special-cases it for row-count-preserving scans.
+        let opts = BaseFileReadOptions::new().with_projection(Vec::<String>::new());
+        let stream = reader.read_stream(&file_name, opts).await.unwrap();
+        assert_eq!(stream.schema().fields().len(), 0);
+
+        let mut total_rows = 0;
+        let mut inner = stream.into_stream();
+        while let Some(batch) = inner.next().await {
+            let batch = batch.unwrap();
+            assert_eq!(batch.num_columns(), 0);
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, expected_rows);
     }
 }
