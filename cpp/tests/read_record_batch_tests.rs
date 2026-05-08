@@ -29,6 +29,7 @@
 //! owns a `tokio::runtime::Runtime` and calls `block_on` internally — nesting
 //! a second runtime under `#[tokio::test]` would panic.
 
+use hudi::HoodieFileGroupReader;
 use hudi::hudi_core::config::HudiConfigs;
 use hudi::hudi_core::config::table::HudiTableConfig;
 use hudi::hudi_core::file_group::reader::input_split::InputSplit;
@@ -38,7 +39,6 @@ use hudi::hudi_core::file_group::reader::record_context::RecordContext;
 use hudi::hudi_core::file_group::reader::schema_handler::FileGroupReaderSchemaHandler;
 use hudi::hudi_core::storage::Storage;
 use hudi::hudi_core::table::builder::OptionResolver;
-use hudi::HoodieFileGroupReader;
 use hudi_test::QuickstartTripsTable;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -62,8 +62,8 @@ fn create_storage_and_props(table_path: &str) -> (Arc<Storage>, HashMap<String, 
         let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
         resolver.resolve_options().await.expect("resolve options");
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options.clone()));
-        let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs)
-            .expect("create storage");
+        let storage =
+            Storage::new(Arc::new(resolver.storage_options), hudi_configs).expect("create storage");
         (storage, resolver.hudi_options)
     })
 }
@@ -137,8 +137,7 @@ fn read_record_batch(
         "ts".to_string(),
     );
 
-    let reader_context =
-        build_reader_context(table_path, partition, has_log_files, table_config);
+    let reader_context = build_reader_context(table_path, partition, has_log_files, table_config);
 
     let reader = HoodieFileGroupReader::new(
         reader_context,
@@ -163,16 +162,38 @@ fn extract_id_name_price(batch: &arrow_array::RecordBatch) -> Vec<(i32, String, 
     QuickstartTripsTable::id_name_price(batch)
 }
 
+/// Extract (id, name) tuples from a RecordBatch, sorted by id.
+/// Used by tests that exercise column projection where `age` has been
+/// projected away.
+fn extract_id_name(batch: &arrow_array::RecordBatch) -> Vec<(i32, String)> {
+    use arrow_array::{Int32Array, StringArray};
+    let ids = batch
+        .column_by_name("id")
+        .expect("id column")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id Int32Array");
+    let names = batch
+        .column_by_name("name")
+        .expect("name column")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name StringArray");
+    let mut out: Vec<(i32, String)> = ids
+        .iter()
+        .zip(names.iter())
+        .map(|(i, n)| (i.unwrap(), n.unwrap().to_string()))
+        .collect();
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
+
 /// Read gold parquet data from disk.
 fn read_gold_parquet(gold_dir: &str) -> arrow_array::RecordBatch {
     let entries: Vec<_> = std::fs::read_dir(gold_dir)
         .expect("gold_data dir should exist")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "parquet")
-        })
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
         .collect();
     assert!(!entries.is_empty(), "no parquet files in {gold_dir}");
     let file = File::open(entries[0].path()).expect("open gold parquet");
@@ -550,16 +571,20 @@ fn test_read_record_batch_all_data_types() {
 }
 
 // =============================================================================
-// Column projection via schema handler
+// Column projection via schema handler (FFI shape)
 //
-// Note: The cpp `HoodieFileGroupReader` sets the schema handler on
-// `ReaderContext`, but the core `CoreFileGroupReader::builder().build()`
-// creates its own schema handler from `data_schema`/`requested_schema`
-// params. Column projection through the cpp path requires the schema
-// handler on the ReaderContext to be picked up by the core reader.
-// This test verifies merge correctness with schema handler set; the
-// output currently includes all columns (projection is applied at the
-// core builder level, not via the ReaderContext schema handler).
+// Verifies the FFI projection path: when a `FileGroupReaderSchemaHandler`
+// is set on `ReaderContext` and the core builder is called without
+// builder-level schema args, the core builder reuses the handler from
+// `ReaderContext` (mod.rs `else` branch in `HoodieFileGroupReader::new`)
+// and `OutputConverter` projects the merged batch from `required_schema`
+// down to `requested_schema`.
+//
+// Mirrors the Java `HoodieFileGroupReader` constructor (lines 119-122)
+// and `next()` projection loop (lines 264-265). For v9 MOR
+// COMMIT_TIME_ORDERING, `required_schema = requested_schema ∪ {record_key,
+// _hoodie_is_deleted (if in table schema), …}` — no precombine field is
+// added (see `SchemaHandlerTestBase.testMor` line 121 in hudi-internal).
 // =============================================================================
 
 #[test]
@@ -568,11 +593,8 @@ fn test_read_record_batch_column_projection() {
     let (storage, props) = create_storage_and_props(&table_path);
 
     let partition = "city=sf";
-    let base_file =
-        "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
-    let log_files = vec![
-        ".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73",
-    ];
+    let base_file = "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+    let log_files = vec![".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73"];
 
     let input_split = build_input_split(partition, base_file, log_files);
 
@@ -590,7 +612,7 @@ fn test_read_record_batch_column_projection() {
         )
     };
 
-    // Request only id and name.
+    // Request only id and name → projection should drop everything else.
     let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, true),
         Field::new("name", DataType::Utf8, true),
@@ -637,12 +659,106 @@ fn test_read_record_batch_column_projection() {
     )
     .expect("build HoodieFileGroupReader");
 
+    let (batch, schema) = reader.read_record_batch().expect("read_record_batch");
+
+    // Output schema must be exactly the requested fields, in order.
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        field_names,
+        vec!["id", "name"],
+        "output schema is the requested projection",
+    );
+    assert_eq!(batch.num_columns(), 2);
+
+    // Merge correctness: id 1 was upserted to "Alice-V2"; id 2 untouched.
+    let records = extract_id_name(&batch);
+    assert_eq!(records.len(), 2, "sf partition should have 2 rows");
+    assert_eq!(records[0], (1, "Alice-V2".to_string()));
+    assert_eq!(records[1], (2, "Bob".to_string()));
+}
+
+// Companion to `test_read_record_batch_column_projection` — same FFI shape
+// (schema handler on `ReaderContext`, no builder schema args), but
+// `requested_schema` covers all `data_schema` fields. In that case
+// `required_schema == requested_schema`, `getOutputConverter()` returns
+// `None`, and every column flows through unprojected.
+#[test]
+fn test_read_record_batch_no_projection_when_requested_equals_data() {
+    let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+    let (storage, props) = create_storage_and_props(&table_path);
+
+    let partition = "city=sf";
+    let base_file = "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+    let log_files = vec![".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73"];
+
+    let input_split = build_input_split(partition, base_file, log_files);
+
+    let data_schema: SchemaRef = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build schema-read runtime");
+        let base_rel = format!("{}/{}", partition, base_file);
+        let s = storage.clone();
+        Arc::new(
+            rt.block_on(s.get_parquet_file_schema(&base_rel))
+                .expect("read parquet schema"),
+        )
+    };
+    let expected_field_count = data_schema.fields().len();
+
+    // requested_schema == data_schema → required == requested → no projection.
+    let schema_handler = FileGroupReaderSchemaHandler::new()
+        .with_data_schema(data_schema.clone())
+        .with_requested_schema(data_schema);
+
+    let mut table_config: HashMap<String, String> = HashMap::new();
+    table_config.insert(
+        HudiTableConfig::PrecombineField.as_ref().to_string(),
+        "ts".to_string(),
+    );
+    let record_context = RecordContext::new(&table_config, partition.to_string());
+
+    let reader_context = Arc::new(ReaderContext {
+        table_path: table_path.clone(),
+        latest_commit_time: "99991231235959999".to_string(),
+        base_file_format: String::new(),
+        has_log_files: true,
+        has_bootstrap_base_file: false,
+        needs_bootstrap_merge: false,
+        should_merge_use_record_position: false,
+        enable_logical_timestamp_field_repair: false,
+        iterator_mode: String::new(),
+        merge_mode: "COMMIT_TIME_ORDERING".to_string(),
+        merge_strategy_id: String::new(),
+        instant_range: None,
+        record_context,
+        schema_handler,
+        table_config,
+        hoodie_reader_config: HashMap::new(),
+        key_filter_opt: None,
+    });
+
+    let reader = HoodieFileGroupReader::new(
+        reader_context,
+        storage,
+        props,
+        ReaderParameters::default(),
+        input_split,
+        None,
+    )
+    .expect("build HoodieFileGroupReader");
+
     let (batch, _schema) = reader.read_record_batch().expect("read_record_batch");
 
-    // Verify merge correctness — the merge result should contain the
-    // correct data even though projection is not applied at this layer.
+    assert_eq!(
+        batch.num_columns(),
+        expected_field_count,
+        "no-projection path should keep every data_schema column",
+    );
+    // Sanity: data columns are still present and merge result is correct.
     let records = extract_id_name_age(&batch);
-    assert_eq!(records.len(), 2, "sf partition should have 2 rows");
+    assert_eq!(records.len(), 2);
     assert_eq!(records[0], (1, "Alice-V2".to_string(), 31));
     assert_eq!(records[1], (2, "Bob".to_string(), 25));
 }
