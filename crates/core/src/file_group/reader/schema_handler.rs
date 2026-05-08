@@ -157,10 +157,7 @@ impl FileGroupReaderSchemaHandler {
             .or(self.data_schema.as_ref())?;
 
         // The field source for looking up field definitions.
-        let field_source = self
-            .table_schema
-            .as_ref()
-            .or(self.data_schema.as_ref())?;
+        let field_source = self.table_schema.as_ref().or(self.data_schema.as_ref())?;
 
         // COW path: no log files.
         // Mirrors Java lines 190-197:
@@ -172,9 +169,7 @@ impl FileGroupReaderSchemaHandler {
         //     return requestedSchema;
         //   }
         if !has_log_files {
-            if has_instant_range
-                && base_schema.column_with_name(COMMIT_TIME_FIELD).is_none()
-            {
+            if has_instant_range && base_schema.column_with_name(COMMIT_TIME_FIELD).is_none() {
                 if let Some((_, field)) = field_source.column_with_name(COMMIT_TIME_FIELD) {
                     let mut fields: Vec<Arc<Field>> = base_schema.fields().to_vec();
                     fields.push(Arc::new(field.clone()));
@@ -410,7 +405,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             field_names.contains(&"_hoodie_commit_time"),
             "COW with instant range should add _hoodie_commit_time"
@@ -473,7 +472,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             field_names.contains(&"_hoodie_record_key"),
             "required_schema should include record key field"
@@ -516,7 +519,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             field_names.contains(&"_hoodie_commit_time"),
             "MOR with instant range should add _hoodie_commit_time"
@@ -547,7 +554,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             !field_names.contains(&"timestamp"),
             "COMMIT_TIME_ORDERING should NOT include ordering field"
@@ -581,7 +592,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             field_names.contains(&"timestamp"),
             "required_schema should include ordering field"
@@ -615,7 +630,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(field_names.contains(&"_hoodie_is_deleted"));
         assert!(field_names.contains(&"_hoodie_operation"));
     }
@@ -623,12 +642,8 @@ mod tests {
     /// MOR with custom delete marker config → custom field added.
     #[test]
     fn test_mor_adds_custom_delete_marker() {
-        let table_schema = make_schema(&[
-            "_hoodie_record_key",
-            "col_a",
-            "col_b",
-            "is_deleted_custom",
-        ]);
+        let table_schema =
+            make_schema(&["_hoodie_record_key", "col_a", "col_b", "is_deleted_custom"]);
         let requested_schema = make_schema(&["col_a"]);
 
         let handler = FileGroupReaderSchemaHandler::new()
@@ -658,7 +673,11 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             field_names.contains(&"is_deleted_custom"),
             "required_schema should include custom delete marker field"
@@ -721,12 +740,7 @@ mod tests {
     /// MOR with composite record keys → all key fields added.
     #[test]
     fn test_mor_composite_record_keys() {
-        let table_schema = make_schema(&[
-            "pk1",
-            "pk2",
-            "col_a",
-            "_hoodie_is_deleted",
-        ]);
+        let table_schema = make_schema(&["pk1", "pk2", "col_a", "_hoodie_is_deleted"]);
         let requested_schema = make_schema(&["col_a"]);
 
         let handler = FileGroupReaderSchemaHandler::new()
@@ -746,10 +760,23 @@ mod tests {
             )
             .unwrap();
 
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
-        assert!(field_names.contains(&"pk1"), "should include first key field");
-        assert!(field_names.contains(&"pk2"), "should include second key field");
-        assert!(field_names.contains(&"col_a"), "should include requested fields");
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"pk1"),
+            "should include first key field"
+        );
+        assert!(
+            field_names.contains(&"pk2"),
+            "should include second key field"
+        );
+        assert!(
+            field_names.contains(&"col_a"),
+            "should include requested fields"
+        );
     }
 
     // =========================================================================
@@ -772,8 +799,7 @@ mod tests {
     fn test_get_output_converter_some_when_different() {
         let requested = make_schema(&["col_a"]);
         let required = make_schema(&["col_a", "col_b"]);
-        let mut handler = FileGroupReaderSchemaHandler::new()
-            .with_requested_schema(requested);
+        let mut handler = FileGroupReaderSchemaHandler::new().with_requested_schema(requested);
         handler.required_schema = Some(required);
 
         assert!(handler.get_output_converter().is_some());
@@ -803,7 +829,11 @@ mod tests {
         );
 
         let required = handler.required_schema.as_ref().unwrap();
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(field_names.contains(&"begin_lat"));
         assert!(field_names.contains(&"rider"));
         assert!(field_names.contains(&"_hoodie_record_key"));
@@ -811,7 +841,10 @@ mod tests {
         assert!(field_names.contains(&"_hoodie_is_deleted"));
 
         // schema_for_updates should equal required_schema
-        assert_eq!(handler.schema_for_updates(), handler.required_schema.as_ref());
+        assert_eq!(
+            handler.schema_for_updates(),
+            handler.required_schema.as_ref()
+        );
         // delete_context should be stored
         assert!(handler.delete_context().is_some());
     }
@@ -836,7 +869,11 @@ mod tests {
         );
 
         let required = handler.required_schema.as_ref().unwrap();
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(field_names.contains(&"begin_lat"));
         assert!(field_names.contains(&"rider"));
         assert!(field_names.contains(&"_hoodie_record_key"));
@@ -868,7 +905,11 @@ mod tests {
         );
 
         let required = handler.required_schema.as_ref().unwrap();
-        let field_names: Vec<&str> = required.fields().iter().map(|f| f.name().as_str()).collect();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert!(
             field_names.contains(&"_hoodie_commit_time"),
             "should add _hoodie_commit_time when instant range is active"

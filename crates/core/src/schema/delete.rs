@@ -241,7 +241,12 @@ mod tests {
                             AvroSchema::Record(RecordSchema {
                                 name: schema_name, ..
                             }) => {
-                                assert_eq!(schema_name.name, *name, "wrapper at index {} mismatch", i + 1);
+                                assert_eq!(
+                                    schema_name.name,
+                                    *name,
+                                    "wrapper at index {} mismatch",
+                                    i + 1
+                                );
                             }
                             other => panic!(
                                 "Expected Record schema for {} at index {}, got {:?}",

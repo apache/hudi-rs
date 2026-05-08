@@ -73,12 +73,8 @@ fn schema_to_field_with_props(
         AvroSchema::Array(item_schema) => {
             // Use "array" as the child field name to match Spark/Parquet convention
             // (Parquet uses "array" while Avro convention uses "element").
-            let mut item_field = schema_to_field_with_props(
-                &item_schema.items,
-                Some("array"),
-                false,
-                None,
-            )?;
+            let mut item_field =
+                schema_to_field_with_props(&item_schema.items, Some("array"), false, None)?;
             // Spark's Parquet writer marks list elements as non-null
             item_field = item_field.with_nullable(false);
             DataType::List(Arc::new(item_field))

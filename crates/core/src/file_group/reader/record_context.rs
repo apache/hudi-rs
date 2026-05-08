@@ -144,12 +144,15 @@ impl RecordContext {
     ///
     /// Uses `self.record_key_field` to locate the key column.
     pub fn get_record_keys(&self, batch: &RecordBatch) -> Result<Vec<String>> {
-        let col_idx = batch.schema().index_of(&self.record_key_field).map_err(|e| {
-            CoreError::ReadFileSliceError(format!(
-                "Key field '{}' not found in schema: {e}",
-                self.record_key_field
-            ))
-        })?;
+        let col_idx = batch
+            .schema()
+            .index_of(&self.record_key_field)
+            .map_err(|e| {
+                CoreError::ReadFileSliceError(format!(
+                    "Key field '{}' not found in schema: {e}",
+                    self.record_key_field
+                ))
+            })?;
 
         let key_array = batch
             .column(col_idx)
@@ -175,19 +178,14 @@ impl RecordContext {
     /// Uses `self.ordering_field_names` to locate the ordering column.
     /// Supports Int32, Int64, and Utf8 column types.
     /// Returns None if no ordering fields specified or column not found.
-    pub fn get_ordering_values(
-        &self,
-        batch: &RecordBatch,
-    ) -> Option<Vec<Option<OrderingValue>>> {
+    pub fn get_ordering_values(&self, batch: &RecordBatch) -> Option<Vec<Option<OrderingValue>>> {
         let field_name = self.ordering_field_names.first()?;
         let col_idx = batch.schema().index_of(field_name).ok()?;
         let col = batch.column(col_idx);
 
         let values: Vec<Option<OrderingValue>> = match col.data_type() {
             DataType::Int64 => {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()?;
+                let arr = col.as_any().downcast_ref::<arrow_array::Int64Array>()?;
                 (0..arr.len())
                     .map(|i| {
                         if arr.is_null(i) {
@@ -199,9 +197,7 @@ impl RecordContext {
                     .collect()
             }
             DataType::Int32 => {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int32Array>()?;
+                let arr = col.as_any().downcast_ref::<arrow_array::Int32Array>()?;
                 (0..arr.len())
                     .map(|i| {
                         if arr.is_null(i) {
@@ -392,11 +388,7 @@ impl RecordContext {
             }
         };
 
-        if let Some(arr) = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-        {
+        if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
             if !arr.is_null(row_idx) {
                 let op = arr.value(row_idx);
                 if op == "DELETE" || op == "UPDATE_BEFORE" {
@@ -435,19 +427,13 @@ impl RecordContext {
                 }
             }
             // Int32 column — compare stringified value against marker
-            if let Some(arr) = col
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-            {
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
                 if !arr.is_null(row_idx) && arr.value(row_idx).to_string() == marker_value {
                     return true;
                 }
             }
             // Int64 column — compare stringified value against marker
-            if let Some(arr) = col
-                .as_any()
-                .downcast_ref::<arrow_array::Int64Array>()
-            {
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
                 if !arr.is_null(row_idx) && arr.value(row_idx).to_string() == marker_value {
                     return true;
                 }
@@ -542,8 +528,14 @@ mod tests {
 
     fn make_record_context() -> RecordContext {
         let table_config = HashMap::from([
-            (HudiTableConfig::PopulatesMetaFields.as_ref().to_string(), "true".to_string()),
-            (HudiTableConfig::PrecombineField.as_ref().to_string(), "ts".to_string()),
+            (
+                HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
+                "true".to_string(),
+            ),
+            (
+                HudiTableConfig::PrecombineField.as_ref().to_string(),
+                "ts".to_string(),
+            ),
         ]);
         RecordContext::new(&table_config, "partition/path".to_string())
     }
@@ -555,8 +547,7 @@ mod tests {
             Field::new("ts", DataType::Int64, false),
         ]));
         let keys: Vec<String> = (0..num_rows).map(|i| format!("key_{i}")).collect();
-        let names: Vec<Option<String>> =
-            (0..num_rows).map(|i| Some(format!("name_{i}"))).collect();
+        let names: Vec<Option<String>> = (0..num_rows).map(|i| Some(format!("name_{i}"))).collect();
         let timestamps: Vec<i64> = (0..num_rows).map(|i| i as i64).collect();
         RecordBatch::try_new(
             schema,
@@ -638,8 +629,14 @@ mod tests {
     fn test_get_record_keys_missing_field() {
         // Virtual keys mode with a nonexistent field
         let table_config = HashMap::from([
-            (HudiTableConfig::PopulatesMetaFields.as_ref().to_string(), "false".to_string()),
-            (HudiTableConfig::RecordKeyFields.as_ref().to_string(), "nonexistent".to_string()),
+            (
+                HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
+                "false".to_string(),
+            ),
+            (
+                HudiTableConfig::RecordKeyFields.as_ref().to_string(),
+                "nonexistent".to_string(),
+            ),
         ]);
         let ctx = RecordContext::new(&table_config, String::new());
         let batch = make_keyed_batch(1);
@@ -677,10 +674,7 @@ mod tests {
         assert!(!records[0].1.is_delete());
         assert!(!records[0].1.is_empty());
         // Check ordering values were extracted
-        assert_eq!(
-            records[0].1.ordering_value,
-            Some(OrderingValue::Long(0))
-        );
+        assert_eq!(records[0].1.ordering_value, Some(OrderingValue::Long(0)));
     }
 
     #[test]

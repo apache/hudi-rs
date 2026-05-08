@@ -112,9 +112,7 @@ impl DeleteContext {
     /// Sets `reader_schema` and computes `hoodie_operation_pos` and
     /// `has_built_in_delete_field` from it.
     pub fn with_reader_schema(mut self, schema: SchemaRef) -> Self {
-        self.has_built_in_delete_field = schema
-            .column_with_name("_hoodie_is_deleted")
-            .is_some();
+        self.has_built_in_delete_field = schema.column_with_name("_hoodie_is_deleted").is_some();
         self.hoodie_operation_pos = schema
             .column_with_name("_hoodie_operation")
             .map(|(idx, _)| idx);
@@ -126,9 +124,7 @@ impl DeleteContext {
     ///
     /// Used when properties are not available (e.g., in tests or simple paths).
     pub fn from_reader_schema(schema: SchemaRef) -> Self {
-        let has_built_in_delete_field = schema
-            .column_with_name("_hoodie_is_deleted")
-            .is_some();
+        let has_built_in_delete_field = schema.column_with_name("_hoodie_is_deleted").is_some();
 
         let hoodie_operation_pos = schema
             .column_with_name("_hoodie_operation")

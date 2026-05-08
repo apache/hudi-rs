@@ -402,9 +402,10 @@ impl LogBlock {
             CoreError::LogBlockError("No content location for inflate".to_string())
         })?;
 
-        let bytes = self.source_bytes.as_ref().ok_or_else(|| {
-            CoreError::LogBlockError("No source bytes for inflate".to_string())
-        })?;
+        let bytes = self
+            .source_bytes
+            .as_ref()
+            .ok_or_else(|| CoreError::LogBlockError("No source bytes for inflate".to_string()))?;
 
         log::debug!(
             "[LogBlock::inflate_from_bytes] type={:?} file={} pos={} len={} block_len={}",

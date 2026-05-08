@@ -97,10 +97,7 @@ impl LogFileReader<StorageReader> {
     ///
     /// # Arguments
     /// * `log_file_path` - The relative path to the log file (stored in `LogBlockContentLocation`)
-    pub fn read_all_blocks_metadata_only(
-        &mut self,
-        log_file_path: &str,
-    ) -> Result<Vec<LogBlock>> {
+    pub fn read_all_blocks_metadata_only(&mut self, log_file_path: &str) -> Result<Vec<LogBlock>> {
         let file_bytes = self.reader.get_ref_bytes().clone();
         let mut blocks = Vec::new();
         while let Some(mut block) = self.read_next_block_metadata_only(log_file_path)? {
@@ -314,12 +311,8 @@ impl<R: Read + Seek> LogFileReader<R> {
         let content_length = self.read_content_length(&format_version, block_length)?;
 
         let decoder = Decoder::new(self.reader_context.clone());
-        let content = decoder.decode_content(
-            self.reader.by_ref(),
-            content_length,
-            &block_type,
-            &header,
-        )?;
+        let content =
+            decoder.decode_content(self.reader.by_ref(), content_length, &block_type, &header)?;
         let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
         let _ = self.read_total_block_length(&format_version)?;
 
@@ -340,10 +333,7 @@ impl<R: Read + Seek> LogFileReader<R> {
     ///
     /// The returned `LogBlock` has `content = Empty` and `content_location = Some(...)`.
     /// Call `LogBlock::inflate()` later to load and decode the content on demand.
-    fn read_next_block_metadata_only(
-        &mut self,
-        log_file_path: &str,
-    ) -> Result<Option<LogBlock>> {
+    fn read_next_block_metadata_only(&mut self, log_file_path: &str) -> Result<Option<LogBlock>> {
         if !self.read_magic()? {
             return Ok(None);
         }

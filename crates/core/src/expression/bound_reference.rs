@@ -70,7 +70,10 @@ mod tests {
     fn bound_reference_carries_ordinal_and_type() {
         let br = BoundReference::new(3, Box::new(IntType::get()));
         assert_eq!(br.ordinal(), 3);
-        assert_eq!(br.data_type().type_id(), crate::internal_schema::TypeID::Int);
+        assert_eq!(
+            br.data_type().type_id(),
+            crate::internal_schema::TypeID::Int
+        );
     }
 
     #[test]

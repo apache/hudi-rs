@@ -87,37 +87,23 @@ pub trait HoodieFileGroupRecordBuffer: Send + Sync + std::fmt::Debug {
     /// The buffer is responsible for inflating the block and extracting records,
     /// matching Java where inflate/deserialize/deflate happens inside the block
     /// triggered by the buffer's `getRecordsIterator`.
-    fn process_data_block(
-        &mut self,
-        block: &mut LogBlock,
-    ) -> Result<()>;
+    fn process_data_block(&mut self, block: &mut LogBlock) -> Result<()>;
 
     /// Process a single data record within a data block.
     ///
     /// Mirrors Java's `processNextDataRecord(BufferedRecord<T>, Serializable)`.
-    fn process_next_data_record(
-        &mut self,
-        record: BufferedRecord,
-        key: &str,
-    ) -> Result<()>;
+    fn process_next_data_record(&mut self, record: BufferedRecord, key: &str) -> Result<()>;
 
     /// Process a delete block from log scanning.
     ///
     /// Mirrors Java's `processDeleteBlock(HoodieDeleteBlock)`.
     /// The buffer inflates the block and extracts delete records internally.
-    fn process_delete_block(
-        &mut self,
-        block: &mut LogBlock,
-    ) -> Result<()>;
+    fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()>;
 
     /// Process a single deleted record within a delete block.
     ///
     /// Mirrors Java's `processNextDeletedRecord(DeleteRecord, Serializable)`.
-    fn process_next_deleted_record(
-        &mut self,
-        delete_record: DeleteRecord,
-        key: &str,
-    );
+    fn process_next_deleted_record(&mut self, delete_record: DeleteRecord, key: &str);
 
     /// Check if a record exists in the buffered records.
     ///

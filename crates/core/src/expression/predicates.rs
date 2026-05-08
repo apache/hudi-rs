@@ -21,8 +21,8 @@ use crate::expression::leaf_expression::LeafExpression;
 use crate::expression::predicate::{Predicate, PredicateKind};
 use crate::expression::struct_like::StructLike;
 use crate::expression::{Expression, Operator};
-use crate::internal_schema::types::BooleanType;
 use crate::internal_schema::Type;
+use crate::internal_schema::types::BooleanType;
 use std::any::Any;
 
 // =========================================================================
@@ -34,18 +34,27 @@ use std::any::Any;
 pub struct TrueExpression;
 
 impl Expression for TrueExpression {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::True }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::True
+    }
     fn eval(&self, _data: Option<&dyn StructLike>) -> Option<Box<dyn Any>> {
         Some(Box::new(true))
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl LeafExpression for TrueExpression {}
 
 impl Predicate for TrueExpression {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::True }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::True
+    }
 }
 
 /// Mirrors Java `Predicates.FalseExpression`.
@@ -53,18 +62,27 @@ impl Predicate for TrueExpression {
 pub struct FalseExpression;
 
 impl Expression for FalseExpression {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::False }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::False
+    }
     fn eval(&self, _data: Option<&dyn StructLike>) -> Option<Box<dyn Any>> {
         Some(Box::new(false))
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl LeafExpression for FalseExpression {}
 
 impl Predicate for FalseExpression {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::False }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::False
+    }
 }
 
 // =========================================================================
@@ -82,27 +100,44 @@ impl And {
     pub fn new(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Self {
         Self { left, right }
     }
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right(&self) -> &dyn Expression { self.right.as_ref() }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right(&self) -> &dyn Expression {
+        self.right.as_ref()
+    }
 }
 
 impl Expression for And {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::And }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.left.as_ref(), self.right.as_ref()] }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::And
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
     fn eval(&self, data: Option<&dyn StructLike>) -> Option<Box<dyn Any>> {
         let left = self.left.eval(data)?;
         let lb = left.downcast_ref::<bool>().copied().unwrap_or(false);
-        if !lb { return Some(Box::new(false)); }
+        if !lb {
+            return Some(Box::new(false));
+        }
         let right = self.right.eval(data)?;
         let rb = right.downcast_ref::<bool>().copied().unwrap_or(false);
         Some(Box::new(lb && rb))
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for And {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::And(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::And(self)
+    }
 }
 
 /// Mirrors Java `Predicates.Or`.
@@ -116,27 +151,44 @@ impl Or {
     pub fn new(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Self {
         Self { left, right }
     }
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right(&self) -> &dyn Expression { self.right.as_ref() }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right(&self) -> &dyn Expression {
+        self.right.as_ref()
+    }
 }
 
 impl Expression for Or {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::Or }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.left.as_ref(), self.right.as_ref()] }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::Or
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
     fn eval(&self, data: Option<&dyn StructLike>) -> Option<Box<dyn Any>> {
         let left = self.left.eval(data)?;
         let lb = left.downcast_ref::<bool>().copied().unwrap_or(false);
-        if lb { return Some(Box::new(true)); }
+        if lb {
+            return Some(Box::new(true));
+        }
         let right = self.right.eval(data)?;
         let rb = right.downcast_ref::<bool>().copied().unwrap_or(false);
         Some(Box::new(lb || rb))
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for Or {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::Or(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::Or(self)
+    }
 }
 
 /// Mirrors Java `Predicates.Not`.
@@ -146,24 +198,39 @@ pub struct Not {
 }
 
 impl Not {
-    pub fn new(child: Box<dyn Expression>) -> Self { Self { child } }
-    pub fn child(&self) -> &dyn Expression { self.child.as_ref() }
+    pub fn new(child: Box<dyn Expression>) -> Self {
+        Self { child }
+    }
+    pub fn child(&self) -> &dyn Expression {
+        self.child.as_ref()
+    }
 }
 
 impl Expression for Not {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::Not }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.child.as_ref()] }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::Not
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.child.as_ref()]
+    }
     fn eval(&self, data: Option<&dyn StructLike>) -> Option<Box<dyn Any>> {
         let v = self.child.eval(data)?;
         let b = v.downcast_ref::<bool>().copied().unwrap_or(false);
         Some(Box::new(!b))
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for Not {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::Not(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::Not(self)
+    }
 }
 
 // =========================================================================
@@ -182,19 +249,34 @@ impl BinaryComparison {
     pub fn new(left: Box<dyn Expression>, op: Operator, right: Box<dyn Expression>) -> Self {
         Self { left, op, right }
     }
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right(&self) -> &dyn Expression { self.right.as_ref() }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right(&self) -> &dyn Expression {
+        self.right.as_ref()
+    }
 }
 
 impl Expression for BinaryComparison {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { self.op }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.left.as_ref(), self.right.as_ref()] }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        self.op
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for BinaryComparison {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::BinaryComparison(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::BinaryComparison(self)
+    }
 }
 
 /// Mirrors Java `Predicates.In`.
@@ -206,25 +288,41 @@ pub struct In {
 
 impl In {
     pub fn new(value: Box<dyn Expression>, valid_values: Vec<Box<dyn Expression>>) -> Self {
-        Self { value, valid_values }
+        Self {
+            value,
+            valid_values,
+        }
     }
-    pub fn value(&self) -> &dyn Expression { self.value.as_ref() }
-    pub fn right_children(&self) -> &[Box<dyn Expression>] { &self.valid_values }
+    pub fn value(&self) -> &dyn Expression {
+        self.value.as_ref()
+    }
+    pub fn right_children(&self) -> &[Box<dyn Expression>] {
+        &self.valid_values
+    }
 }
 
 impl Expression for In {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::In }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::In
+    }
     fn children(&self) -> Vec<&dyn Expression> {
         let mut all = vec![self.value.as_ref()];
         all.extend(self.valid_values.iter().map(|e| e.as_ref()));
         all
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for In {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::In(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::In(self)
+    }
 }
 
 /// Mirrors Java `Predicates.IsNull`.
@@ -234,19 +332,34 @@ pub struct IsNull {
 }
 
 impl IsNull {
-    pub fn new(child: Box<dyn Expression>) -> Self { Self { child } }
-    pub fn child(&self) -> &dyn Expression { self.child.as_ref() }
+    pub fn new(child: Box<dyn Expression>) -> Self {
+        Self { child }
+    }
+    pub fn child(&self) -> &dyn Expression {
+        self.child.as_ref()
+    }
 }
 
 impl Expression for IsNull {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::IsNull }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.child.as_ref()] }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::IsNull
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.child.as_ref()]
+    }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for IsNull {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::IsNull(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::IsNull(self)
+    }
 }
 
 /// Mirrors Java `Predicates.IsNotNull`.
@@ -256,19 +369,34 @@ pub struct IsNotNull {
 }
 
 impl IsNotNull {
-    pub fn new(child: Box<dyn Expression>) -> Self { Self { child } }
-    pub fn child(&self) -> &dyn Expression { self.child.as_ref() }
+    pub fn new(child: Box<dyn Expression>) -> Self {
+        Self { child }
+    }
+    pub fn child(&self) -> &dyn Expression {
+        self.child.as_ref()
+    }
 }
 
 impl Expression for IsNotNull {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::IsNotNull }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.child.as_ref()] }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::IsNotNull
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.child.as_ref()]
+    }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for IsNotNull {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::IsNotNull(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::IsNotNull(self)
+    }
 }
 
 /// Mirrors Java `Predicates.StringStartsWith`.
@@ -282,19 +410,34 @@ impl StringStartsWith {
     pub fn new(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Self {
         Self { left, right }
     }
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right(&self) -> &dyn Expression { self.right.as_ref() }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right(&self) -> &dyn Expression {
+        self.right.as_ref()
+    }
 }
 
 impl Expression for StringStartsWith {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::StartsWith }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.left.as_ref(), self.right.as_ref()] }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::StartsWith
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for StringStartsWith {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::StringStartsWith(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::StringStartsWith(self)
+    }
 }
 
 /// Mirrors Java `Predicates.StringStartsWithAny`.
@@ -308,23 +451,36 @@ impl StringStartsWithAny {
     pub fn new(left: Box<dyn Expression>, right: Vec<Box<dyn Expression>>) -> Self {
         Self { left, right }
     }
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right_children(&self) -> &[Box<dyn Expression>] { &self.right }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right_children(&self) -> &[Box<dyn Expression>] {
+        &self.right
+    }
 }
 
 impl Expression for StringStartsWithAny {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::StartsWith }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::StartsWith
+    }
     fn children(&self) -> Vec<&dyn Expression> {
         let mut all = vec![self.left.as_ref()];
         all.extend(self.right.iter().map(|e| e.as_ref()));
         all
     }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for StringStartsWithAny {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::StringStartsWithAny(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::StringStartsWithAny(self)
+    }
 }
 
 /// Mirrors Java `Predicates.StringContains`.
@@ -338,19 +494,34 @@ impl StringContains {
     pub fn new(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Self {
         Self { left, right }
     }
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right(&self) -> &dyn Expression { self.right.as_ref() }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right(&self) -> &dyn Expression {
+        self.right.as_ref()
+    }
 }
 
 impl Expression for StringContains {
-    fn data_type(&self) -> &dyn Type { static T: BooleanType = BooleanType; &T }
-    fn operator(&self) -> Operator { Operator::Contains }
-    fn children(&self) -> Vec<&dyn Expression> { vec![self.left.as_ref(), self.right.as_ref()] }
-    fn kind(&self) -> ExpressionKind<'_> { ExpressionKind::Predicate(self) }
+    fn data_type(&self) -> &dyn Type {
+        static T: BooleanType = BooleanType;
+        &T
+    }
+    fn operator(&self) -> Operator {
+        Operator::Contains
+    }
+    fn children(&self) -> Vec<&dyn Expression> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+    fn kind(&self) -> ExpressionKind<'_> {
+        ExpressionKind::Predicate(self)
+    }
 }
 
 impl Predicate for StringContains {
-    fn pred_kind(&self) -> PredicateKind<'_> { PredicateKind::StringContains(self) }
+    fn pred_kind(&self) -> PredicateKind<'_> {
+        PredicateKind::StringContains(self)
+    }
 }
 
 // =========================================================================
@@ -362,11 +533,21 @@ impl Predicate for StringContains {
 pub mod predicates_factory {
     use super::*;
 
-    pub fn always_true() -> TrueExpression { TrueExpression }
-    pub fn always_false() -> FalseExpression { FalseExpression }
-    pub fn and(left: Box<dyn Expression>, right: Box<dyn Expression>) -> And { And::new(left, right) }
-    pub fn or(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Or { Or::new(left, right) }
-    pub fn not(child: Box<dyn Expression>) -> Not { Not::new(child) }
+    pub fn always_true() -> TrueExpression {
+        TrueExpression
+    }
+    pub fn always_false() -> FalseExpression {
+        FalseExpression
+    }
+    pub fn and(left: Box<dyn Expression>, right: Box<dyn Expression>) -> And {
+        And::new(left, right)
+    }
+    pub fn or(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Or {
+        Or::new(left, right)
+    }
+    pub fn not(child: Box<dyn Expression>) -> Not {
+        Not::new(child)
+    }
     pub fn gt(left: Box<dyn Expression>, right: Box<dyn Expression>) -> BinaryComparison {
         BinaryComparison::new(left, Operator::Gt, right)
     }
@@ -391,9 +572,16 @@ pub mod predicates_factory {
     pub fn in_(value: Box<dyn Expression>, valid_values: Vec<Box<dyn Expression>>) -> In {
         In::new(value, valid_values)
     }
-    pub fn is_null(child: Box<dyn Expression>) -> IsNull { IsNull::new(child) }
-    pub fn is_not_null(child: Box<dyn Expression>) -> IsNotNull { IsNotNull::new(child) }
-    pub fn starts_with_any(left: Box<dyn Expression>, right: Vec<Box<dyn Expression>>) -> StringStartsWithAny {
+    pub fn is_null(child: Box<dyn Expression>) -> IsNull {
+        IsNull::new(child)
+    }
+    pub fn is_not_null(child: Box<dyn Expression>) -> IsNotNull {
+        IsNotNull::new(child)
+    }
+    pub fn starts_with_any(
+        left: Box<dyn Expression>,
+        right: Vec<Box<dyn Expression>>,
+    ) -> StringStartsWithAny {
         StringStartsWithAny::new(left, right)
     }
 }
@@ -401,8 +589,8 @@ pub mod predicates_factory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expression::{Expression, Predicate, Operator};
     use crate::expression::Literal;
+    use crate::expression::{Expression, Operator, Predicate};
 
     #[test]
     fn true_expression_eval_returns_true() {
@@ -462,7 +650,10 @@ mod tests {
     #[test]
     fn binary_comparison_eq() {
         let bc = BinaryComparison::new(
-            Box::new(Literal::int(5)), Operator::Eq, Box::new(Literal::int(5)));
+            Box::new(Literal::int(5)),
+            Operator::Eq,
+            Box::new(Literal::int(5)),
+        );
         assert_eq!(bc.operator(), Operator::Eq);
     }
 
@@ -494,7 +685,9 @@ mod tests {
     #[test]
     fn string_starts_with_carries_left_right() {
         let p = StringStartsWith::new(
-            Box::new(Literal::string("name")), Box::new(Literal::string("Al")));
+            Box::new(Literal::string("name")),
+            Box::new(Literal::string("Al")),
+        );
         assert_eq!(p.operator(), Operator::StartsWith);
     }
 
@@ -505,7 +698,7 @@ mod tests {
             vec![
                 Box::new(Literal::string("Al")) as Box<dyn Expression>,
                 Box::new(Literal::string("Bo")) as Box<dyn Expression>,
-            ]
+            ],
         );
         assert_eq!(p.operator(), Operator::StartsWith);
         assert_eq!(p.right_children().len(), 2);
@@ -514,7 +707,9 @@ mod tests {
     #[test]
     fn string_contains_constructs() {
         let p = StringContains::new(
-            Box::new(Literal::string("desc")), Box::new(Literal::string("foo")));
+            Box::new(Literal::string("desc")),
+            Box::new(Literal::string("foo")),
+        );
         assert_eq!(p.operator(), Operator::Contains);
     }
 

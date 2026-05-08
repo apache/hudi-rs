@@ -369,9 +369,7 @@ impl Storage {
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
 
         if let Some(batch_size) = options.batch_size {
-            log::debug!(
-                "Parquet reader: batch_size={batch_size} for '{relative_path}'"
-            );
+            log::debug!("Parquet reader: batch_size={batch_size} for '{relative_path}'");
             builder = builder.with_batch_size(batch_size);
         }
 

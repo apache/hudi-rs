@@ -24,9 +24,9 @@
 //! passes through the merged record; more advanced implementations
 //! can track stats, invoke callbacks, etc.
 
-use crate::Result;
 use super::buffered_record::BufferedRecord;
 use super::read_stats::HoodieReadStats;
+use crate::Result;
 
 /// Strategy for processing record updates during merge iteration.
 ///

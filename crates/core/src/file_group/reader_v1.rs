@@ -206,10 +206,7 @@ impl FileGroupReader {
             vec![]
         };
         match base_file_path {
-            Some(path) => {
-                self.read_file_slice_from_paths(&path, log_file_paths)
-                    .await
-            }
+            Some(path) => self.read_file_slice_from_paths(&path, log_file_paths).await,
             None => {
                 // Log-only file slice: delegate directly to the Java-style reader
                 self.read_file_slice_from_paths_log_only(log_file_paths)
@@ -500,7 +497,11 @@ impl FileGroupReader {
         log::debug!(
             "FileGroupReader: reading '{}' | batch_size={batch_size}{}",
             relative_path,
-            if options.batch_size.is_some() { " (from ReadOptions)" } else { " (default)" },
+            if options.batch_size.is_some() {
+                " (from ReadOptions)"
+            } else {
+                " (default)"
+            },
         );
         let mut parquet_options = ParquetReadOptions::new().with_batch_size(batch_size);
 
@@ -699,9 +700,10 @@ impl FileGroupReader {
             vec![]
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan();
-            let scan_result = LogFileScanner::new(Arc::new(ReaderContext::empty()), self.storage.clone())
-                .scan(log_file_paths, &instant_range)
-                .await?;
+            let scan_result =
+                LogFileScanner::new(Arc::new(ReaderContext::empty()), self.storage.clone())
+                    .scan(log_file_paths, &instant_range)
+                    .await?;
 
             match scan_result {
                 ScanResult::HFileRecords(records) => records,

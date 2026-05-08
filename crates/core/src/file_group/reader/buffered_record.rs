@@ -64,7 +64,11 @@ pub struct BufferedRecord {
 
 impl BufferedRecord {
     /// Create a new data record.
-    pub fn new_data(record_key: String, data: RecordBatch, ordering_value: Option<OrderingValue>) -> Self {
+    pub fn new_data(
+        record_key: String,
+        data: RecordBatch,
+        ordering_value: Option<OrderingValue>,
+    ) -> Self {
         Self {
             record_key,
             data: Some(data),
@@ -223,4 +227,3 @@ impl BufferedRecords {
         )
     }
 }
-

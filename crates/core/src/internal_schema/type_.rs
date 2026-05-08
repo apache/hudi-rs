@@ -153,7 +153,10 @@ mod tests {
     fn type_id_get_name_returns_lowercase() {
         assert_eq!(TypeID::Int.get_name(), "int");
         assert_eq!(TypeID::TimestampMillis.get_name(), "timestamp_millis");
-        assert_eq!(TypeID::LocalTimestampMicros.get_name(), "local_timestamp_micros");
+        assert_eq!(
+            TypeID::LocalTimestampMicros.get_name(),
+            "local_timestamp_micros"
+        );
     }
 
     #[test]

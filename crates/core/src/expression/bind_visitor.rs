@@ -28,7 +28,10 @@ pub struct BindVisitor {
 
 impl BindVisitor {
     pub fn new(schema: RecordType, case_sensitive: bool) -> Self {
-        Self { schema, case_sensitive }
+        Self {
+            schema,
+            case_sensitive,
+        }
     }
 }
 

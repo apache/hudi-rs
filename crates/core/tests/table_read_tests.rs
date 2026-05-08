@@ -132,7 +132,6 @@ mod v6_tables {
         }
     }
 
-
     mod incremental_queries {
         use super::*;
 
@@ -145,7 +144,6 @@ mod v6_tables {
             }
             Ok(())
         }
-
     }
 }
 
@@ -256,7 +254,6 @@ mod v8_tables {
     /// MOR log file tests for v8 tables
     mod mor_log_file_queries {
         use super::*;
-
     }
 
     /// Streaming query tests for v8 tables

@@ -152,9 +152,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
                 "SortedKeyBasedFileGroupRecordBuffer (sort_output mode) is not yet implemented"
                     .to_string(),
             ));
-        } else if reader_parameters.use_record_position
-            && input_split.base_file_path.is_some()
-        {
+        } else if reader_parameters.use_record_position && input_split.base_file_path.is_some() {
             return Err(crate::error::CoreError::Unsupported(
                 "PositionBasedFileGroupRecordBuffer (position-based merge) is not yet implemented"
                     .to_string(),

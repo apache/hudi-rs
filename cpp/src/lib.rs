@@ -53,7 +53,6 @@ fn init_logger() {
     });
 }
 
-
 #[cxx::bridge]
 mod ffi {
     /// Mirrors `HudiReadOptions.LogFile` proto (CXX-safe, used in `Vec`).
@@ -156,9 +155,7 @@ mod ffi {
         ) -> Result<Box<HoodieFileGroupReader>>;
 
         /// Read the file group and return merged results as an ArrowArrayStream.
-        fn get_closable_iterator(
-            self: &HoodieFileGroupReader,
-        ) -> Result<*mut ArrowArrayStream>;
+        fn get_closable_iterator(self: &HoodieFileGroupReader) -> Result<*mut ArrowArrayStream>;
 
         /// Free an ArrowArrayStream that was returned by `get_closable_iterator`.
         ///
@@ -213,7 +210,11 @@ pub fn new_file_group_reader_with_context(
         ed = fgrc.emit_delete,
         so = fgrc.sort_output,
         props_count = fgrc.props.len(),
-        base_file = fgrc.base_file.as_ref().map(|bf| bf.file_name.as_str()).unwrap_or("<none>"),
+        base_file = fgrc
+            .base_file
+            .as_ref()
+            .map(|bf| bf.file_name.as_str())
+            .unwrap_or("<none>"),
         log_files_count = fgrc.log_files.len(),
         has_data_schema = fgrc.data_schema.is_some(),
         has_req_schema = fgrc.requested_schema.is_some(),
@@ -297,17 +298,13 @@ pub fn new_file_group_reader_with_context(
             }
         })
         .collect();
-    let input_split = InputSplit::new(
-        base_file_path,
-        None,
-        log_file_paths,
-        fgrc.partition_path,
-    );
+    let input_split = InputSplit::new(base_file_path, None, log_file_paths, fgrc.partition_path);
 
     // ── 5. Convert FFI ReaderContext → core ReaderContext ────────────
     let ffi_rc = fgrc.reader_context;
     let instant_range = ffi_rc.instant_range.map(|ir| {
-        let timezone = ffi_rc.table_config
+        let timezone = ffi_rc
+            .table_config
             .get(HudiTableConfig::TimelineTimezone.as_ref())
             .cloned()
             .unwrap_or_else(|| "utc".to_string());
@@ -317,8 +314,16 @@ pub fn new_file_group_reader_with_context(
             "CLOSED_OPEN" => (true, false),
             _ => (false, true), // default
         };
-        let start = if ir.start_instant.is_empty() { None } else { Some(ir.start_instant) };
-        let end = if ir.end_instant.is_empty() { None } else { Some(ir.end_instant) };
+        let start = if ir.start_instant.is_empty() {
+            None
+        } else {
+            Some(ir.start_instant)
+        };
+        let end = if ir.end_instant.is_empty() {
+            None
+        } else {
+            Some(ir.end_instant)
+        };
         InstantRange::new(timezone, start, end, start_inclusive, end_inclusive)
     });
     // RecordContext is constructed from table_config, matching Java's
@@ -472,9 +477,7 @@ impl HoodieFileGroupReader {
     }
 
     /// Uses the core `HoodieFileGroupReader` for the full 3-phase merge.
-    pub fn get_closable_iterator(
-        &self,
-    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+    pub fn get_closable_iterator(&self) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let (record_batch, schema) = self.read_record_batch()?;
         Ok(create_raw_pointer_for_record_batches(
             vec![record_batch],
@@ -493,9 +496,7 @@ unsafe fn hudi_free_arrow_stream(ptr: *mut ffi::ArrowArrayStream) {
 }
 
 /// Convert an Avro schema JSON string to an Arrow Schema.
-fn avro_json_to_arrow_schema(
-    avro_json: &str,
-) -> std::result::Result<arrow_schema::Schema, String> {
+fn avro_json_to_arrow_schema(avro_json: &str) -> std::result::Result<arrow_schema::Schema, String> {
     let sanitized = avro_json.trim().replace("\\:", ":");
     let avro_schema = apache_avro::Schema::parse_str(&sanitized)
         .map_err(|e| format!("Failed to parse Avro schema: {e}"))?;

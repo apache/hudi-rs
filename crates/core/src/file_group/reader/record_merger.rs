@@ -24,8 +24,8 @@
 //! log scanning (delta merge: log-vs-log) and at read time (final merge:
 //! base-vs-log).
 
-use crate::Result;
 use super::buffered_record::{BufferedRecord, DeleteRecord};
+use crate::Result;
 
 /// Trait for merging buffered records during the file group read pipeline.
 ///
@@ -299,10 +299,7 @@ mod tests {
 
         let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
         assert!(result.is_some());
-        assert_eq!(
-            result.unwrap().ordering_value,
-            Some(OrderingValue::Long(2))
-        );
+        assert_eq!(result.unwrap().ordering_value, Some(OrderingValue::Long(2)));
     }
 
     /// Given: EventTimeRecordMerger, new record has lower ordering (ts=0) than existing (ts=1)
@@ -316,10 +313,7 @@ mod tests {
 
         let result = merger.delta_merge(&new_rec, Some(&existing)).unwrap();
         assert!(result.is_some());
-        assert_eq!(
-            result.unwrap().ordering_value,
-            Some(OrderingValue::Long(1))
-        );
+        assert_eq!(result.unwrap().ordering_value, Some(OrderingValue::Long(1)));
     }
 
     /// Given: EventTimeRecordMerger, equal ordering values
@@ -358,10 +352,7 @@ mod tests {
         let result = merger
             .delta_merge_delete(&delete_low, Some(&existing))
             .unwrap();
-        assert!(
-            result.is_none(),
-            "delete(ts=0) should lose to data(ts=1)"
-        );
+        assert!(result.is_none(), "delete(ts=0) should lose to data(ts=1)");
     }
 
     /// Given: EventTimeRecordMerger, no existing record

@@ -20,8 +20,8 @@
 use crate::expression::expression::ExpressionKind;
 use crate::expression::leaf_expression::LeafExpression;
 use crate::expression::{Expression, Operator};
-use crate::internal_schema::types::*;
 use crate::internal_schema::Type;
+use crate::internal_schema::types::*;
 
 /// Closed enum of literal-value variants. Mirrors the runtime values
 /// Java's `Literal<T>` can carry. Variants are 1:1 with `Types.java` primitives
@@ -34,14 +34,18 @@ pub enum LiteralValue {
     Long(i64),
     Float(f32),
     Double(f64),
-    Date(i32),                              // days since epoch
-    Time(i64),                              // micros since midnight
-    TimeMillis(i32),                        // millis since midnight
-    Timestamp(i64),                         // micros since epoch
-    TimestampMillis(i64),                   // millis since epoch
+    Date(i32),            // days since epoch
+    Time(i64),            // micros since midnight
+    TimeMillis(i32),      // millis since midnight
+    Timestamp(i64),       // micros since epoch
+    TimestampMillis(i64), // millis since epoch
     LocalTimestampMillis(i64),
     LocalTimestampMicros(i64),
-    Decimal { unscaled: i128, precision: u8, scale: u8 },
+    Decimal {
+        unscaled: i128,
+        precision: u8,
+        scale: u8,
+    },
     String(String),
     Binary(Vec<u8>),
     Fixed(Vec<u8>),
@@ -60,7 +64,10 @@ impl Clone for Literal {
     fn clone(&self) -> Self {
         // Reconstruct data_type from TypeID since Box<dyn Type> is not Clone.
         let data_type = clone_type_by_id(self.data_type.as_ref());
-        Self { value: self.value.clone(), data_type }
+        Self {
+            value: self.value.clone(),
+            data_type,
+        }
     }
 }
 
@@ -98,7 +105,9 @@ impl Literal {
     }
 
     /// Mirrors Java `Literal.getValue()` (returns the carried value enum).
-    pub fn value(&self) -> &LiteralValue { &self.value }
+    pub fn value(&self) -> &LiteralValue {
+        &self.value
+    }
 
     // Convenience constructors — mirror Java's `Literal.from(value)` static.
     pub fn string(s: impl Into<String>) -> Self {
@@ -126,14 +135,20 @@ impl Literal {
 }
 
 impl Expression for Literal {
-    fn data_type(&self) -> &dyn Type { self.data_type.as_ref() }
+    fn data_type(&self) -> &dyn Type {
+        self.data_type.as_ref()
+    }
 
     /// Java `Literal.getOperator()` is inherited from LeafExpression which
     /// in turn returns `Operator.TRUE` (Java has no specific literal op).
-    fn operator(&self) -> Operator { Operator::True }
+    fn operator(&self) -> Operator {
+        Operator::True
+    }
 
-    fn eval(&self, _data: Option<&dyn crate::expression::struct_like::StructLike>)
-        -> Option<Box<dyn std::any::Any>> {
+    fn eval(
+        &self,
+        _data: Option<&dyn crate::expression::struct_like::StructLike>,
+    ) -> Option<Box<dyn std::any::Any>> {
         // Mirrors Java: `Literal.eval(data)` returns the carried value
         // ignoring `data`. We box-clone the LiteralValue.
         Some(Box::new(self.value.clone()))

@@ -174,9 +174,12 @@ impl FileGroupRecordBuffer {
 
         let iter = self.log_record_iter.as_mut().unwrap();
         while let Some(record) = iter.next() {
-            let processed = self
-                .update_processor
-                .process_update(&record.record_key, None, &record, record.is_delete());
+            let processed = self.update_processor.process_update(
+                &record.record_key,
+                None,
+                &record,
+                record.is_delete(),
+            );
             match processed {
                 Ok(Some(r)) => {
                     self.next_record = Some(r);

@@ -133,12 +133,8 @@ mod tests {
     /// Nested struct fields — top-level field names match so these are equivalent.
     #[test]
     fn test_are_schemas_projection_equivalent_nested_record_schemas() {
-        let inner1 = DataType::Struct(
-            vec![Field::new("x", DataType::Utf8, true)].into(),
-        );
-        let inner2 = DataType::Struct(
-            vec![Field::new("x", DataType::Utf8, true)].into(),
-        );
+        let inner1 = DataType::Struct(vec![Field::new("x", DataType::Utf8, true)].into());
+        let inner2 = DataType::Struct(vec![Field::new("x", DataType::Utf8, true)].into());
         let s1 = make_schema(&[("inner", inner1)]);
         let s2 = make_schema(&[("inner", inner2)]);
         assert!(are_schemas_projection_equivalent(&s1, &s2));

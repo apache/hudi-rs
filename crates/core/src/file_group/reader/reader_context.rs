@@ -25,11 +25,11 @@
 //! directly with Arrow `RecordBatch`es, so this is a plain data struct carrying
 //! the structured configuration that the reader stack needs.
 
+use super::record_context::RecordContext;
+use super::schema_handler::FileGroupReaderSchemaHandler;
 use crate::config::table::HudiTableConfig;
 use crate::expression::predicate::Predicate;
 use crate::timeline::selector::InstantRange;
-use super::record_context::RecordContext;
-use super::schema_handler::FileGroupReaderSchemaHandler;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -132,22 +132,21 @@ impl ReaderContext {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
         if populate {
-            vec![crate::metadata::meta_field::MetaField::RecordKey
-                .as_ref()
-                .to_string()]
+            vec![
+                crate::metadata::meta_field::MetaField::RecordKey
+                    .as_ref()
+                    .to_string(),
+            ]
         } else {
             self.table_config
                 .get(HudiTableConfig::RecordKeyFields.as_ref())
-                .map(|fields| {
-                    fields
-                        .split(',')
-                        .map(|f| f.trim().to_string())
-                        .collect()
-                })
+                .map(|fields| fields.split(',').map(|f| f.trim().to_string()).collect())
                 .unwrap_or_else(|| {
-                    vec![crate::metadata::meta_field::MetaField::RecordKey
-                        .as_ref()
-                        .to_string()]
+                    vec![
+                        crate::metadata::meta_field::MetaField::RecordKey
+                            .as_ref()
+                            .to_string(),
+                    ]
                 })
         }
     }

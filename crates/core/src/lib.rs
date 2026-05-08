@@ -50,10 +50,10 @@ pub mod avro_to_arrow;
 pub mod config;
 pub mod error;
 pub mod expr;
-pub mod expression;            // ← NEW
+pub mod expression; // ← NEW
 pub mod file_group;
 pub mod hfile;
-pub mod internal_schema;       // ← NEW
+pub mod internal_schema; // ← NEW
 pub mod keygen;
 pub mod merge;
 pub mod metadata;

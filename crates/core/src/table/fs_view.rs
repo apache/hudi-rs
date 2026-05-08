@@ -386,7 +386,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.as_ref().unwrap().file_metadata.as_ref().unwrap().num_records, 4);
+            assert_eq!(
+                fsl.base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .as_ref()
+                    .unwrap()
+                    .num_records,
+                4
+            );
         }
     }
 
@@ -427,7 +436,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.as_ref().unwrap().file_metadata.as_ref().unwrap().num_records, 1);
+            assert_eq!(
+                fsl.base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .as_ref()
+                    .unwrap()
+                    .num_records,
+                1
+            );
         }
     }
 
@@ -479,7 +497,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {
-            assert_eq!(fsl.base_file.as_ref().unwrap().file_metadata.as_ref().unwrap().num_records, 2);
+            assert_eq!(
+                fsl.base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .as_ref()
+                    .unwrap()
+                    .num_records,
+                2
+            );
         }
     }
 }

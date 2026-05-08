@@ -431,7 +431,10 @@ mod tests {
         assert!(fg.file_slices.contains_key("20250113230302428"));
         // Verify we can get the file slice using request timestamp
         let slice = fg.get_file_slice_as_of("20250113230302428").unwrap();
-        assert_eq!(slice.base_file.as_ref().unwrap().commit_timestamp, "20250113230302428");
+        assert_eq!(
+            slice.base_file.as_ref().unwrap().commit_timestamp,
+            "20250113230302428"
+        );
         assert_eq!(
             slice.base_file.as_ref().unwrap().completion_timestamp,
             Some("20250113230310000".to_string())

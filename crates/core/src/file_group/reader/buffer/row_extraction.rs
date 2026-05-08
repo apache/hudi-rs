@@ -44,15 +44,9 @@ pub fn slice_row(batch: &RecordBatch, row_index: usize) -> RecordBatch {
 ///
 /// Concatenates all single-row batches from the records into one batch.
 /// Records without data (deletes) are skipped.
-pub fn records_to_batch(
-    records: Vec<BufferedRecord>,
-    schema: SchemaRef,
-) -> Result<RecordBatch> {
+pub fn records_to_batch(records: Vec<BufferedRecord>, schema: SchemaRef) -> Result<RecordBatch> {
     // Mirrors Java: BufferedRecord.getRecord() unwraps from binary if needed
-    let batches: Vec<RecordBatch> = records
-        .iter()
-        .filter_map(|r| r.get_record())
-        .collect();
+    let batches: Vec<RecordBatch> = records.iter().filter_map(|r| r.get_record()).collect();
 
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));

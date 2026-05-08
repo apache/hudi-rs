@@ -83,10 +83,10 @@ pub mod update_processor;
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::buffer::loader::{
     DefaultFileGroupRecordBufferLoader, FileGroupRecordBufferLoader,
 };
-use crate::file_group::reader::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader::buffered_record_converter::BufferedRecordConverter;
 use crate::file_group::reader::input_split::InputSplit;
 use crate::file_group::reader::iterator_mode::IteratorMode;
@@ -333,7 +333,10 @@ impl HoodieFileGroupReader {
         log::debug!(
             "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
             self.input_split.partition_path,
-            self.input_split.base_file_path.as_deref().unwrap_or("<none>"),
+            self.input_split
+                .base_file_path
+                .as_deref()
+                .unwrap_or("<none>"),
             self.input_split.log_file_paths.len(),
         );
 
@@ -348,8 +351,12 @@ impl HoodieFileGroupReader {
         );
         if let Some(first) = base_file_batches.first() {
             let schema = first.schema();
-            let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-            log::debug!("[HoodieFileGroupReader] base file schema: {:?}", field_names);
+            let field_names: Vec<&str> =
+                schema.fields().iter().map(|f| f.name().as_str()).collect();
+            log::debug!(
+                "[HoodieFileGroupReader] base file schema: {:?}",
+                field_names
+            );
         }
 
         // Apply instant range filter on base file records.
@@ -370,22 +377,21 @@ impl HoodieFileGroupReader {
         // Step 2: If no records to merge (no log files), return base file data directly
         if self.input_split.has_no_records_to_merge() {
             let batches = self.base_file_iterator.as_ref().unwrap();
-            log::debug!("[HoodieFileGroupReader] no log files → returning base file data directly ({base_rows} rows)");
+            log::debug!(
+                "[HoodieFileGroupReader] no log files → returning base file data directly ({base_rows} rows)"
+            );
             if batches.is_empty() {
                 // No base file and no log files — return empty batch.
-                return self.apply_output_converter(RecordBatch::new_empty(
-                    std::sync::Arc::new(arrow_schema::Schema::empty()),
-                ));
+                return self.apply_output_converter(RecordBatch::new_empty(std::sync::Arc::new(
+                    arrow_schema::Schema::empty(),
+                )));
             }
-            let result = arrow::compute::concat_batches(
-                &batches[0].schema(),
-                batches,
-            )
-            .map_err(|e| {
-                CoreError::ReadFileSliceError(format!(
-                    "Failed to concatenate base file batches: {e}"
-                ))
-            })?;
+            let result =
+                arrow::compute::concat_batches(&batches[0].schema(), batches).map_err(|e| {
+                    CoreError::ReadFileSliceError(format!(
+                        "Failed to concatenate base file batches: {e}"
+                    ))
+                })?;
             return self.apply_output_converter(result);
         }
 
@@ -470,9 +476,7 @@ impl HoodieFileGroupReader {
                 // Mirrors Java line 159-162:
                 // readerContext.getFileRecordIterator(pathInfo, start, len,
                 //     schemaHandler.getTableSchema(), schemaHandler.getRequiredSchema(), storage)
-                let batch = if let Some(required_schema) =
-                    &self.schema_handler.required_schema
-                {
+                let batch = if let Some(required_schema) = &self.schema_handler.required_schema {
                     self.storage
                         .get_parquet_file_data_projected(path, required_schema)
                         .await
@@ -535,10 +539,7 @@ impl HoodieFileGroupReader {
     ///
     /// In Rust/Arrow, we use columnar filtering: extract the `_hoodie_commit_time`
     /// column, build a boolean mask, and use `arrow::compute::filter_record_batch`.
-    fn apply_instant_range_filter(
-        &self,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>> {
+    fn apply_instant_range_filter(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         let instant_range = match &self.reader_context.instant_range {
             Some(range) => range,
             None => return Ok(batches),
@@ -600,13 +601,11 @@ impl HoodieFileGroupReader {
                     mask_builder.append_value(false);
                 } else {
                     let ts = commit_time_col.value(i);
-                    let in_range = instant_range
-                        .is_in_range(ts, &timezone)
-                        .map_err(|e| {
-                            CoreError::ReadFileSliceError(format!(
-                                "Failed to check instant range for '{ts}': {e}"
-                            ))
-                        })?;
+                    let in_range = instant_range.is_in_range(ts, &timezone).map_err(|e| {
+                        CoreError::ReadFileSliceError(format!(
+                            "Failed to check instant range for '{ts}': {e}"
+                        ))
+                    })?;
                     mask_builder.append_value(in_range);
                 }
             }

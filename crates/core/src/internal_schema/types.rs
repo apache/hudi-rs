@@ -25,11 +25,15 @@ macro_rules! singleton_primitive {
         pub struct $name;
 
         impl $name {
-            pub fn get() -> Self { $name }
+            pub fn get() -> Self {
+                $name
+            }
         }
 
         impl Type for $name {
-            fn type_id(&self) -> TypeID { TypeID::$id }
+            fn type_id(&self) -> TypeID {
+                TypeID::$id
+            }
         }
 
         impl fmt::Display for $name {
@@ -50,8 +54,16 @@ singleton_primitive!(TimeType, Time, "time");
 singleton_primitive!(TimestampType, Timestamp, "timestamp");
 singleton_primitive!(TimeMillisType, TimeMillis, "time_millis");
 singleton_primitive!(TimestampMillisType, TimestampMillis, "timestamp_millis");
-singleton_primitive!(LocalTimestampMillisType, LocalTimestampMillis, "local_timestamp_millis");
-singleton_primitive!(LocalTimestampMicrosType, LocalTimestampMicros, "local_timestamp_micros");
+singleton_primitive!(
+    LocalTimestampMillisType,
+    LocalTimestampMillis,
+    "local_timestamp_millis"
+);
+singleton_primitive!(
+    LocalTimestampMicrosType,
+    LocalTimestampMicros,
+    "local_timestamp_micros"
+);
 singleton_primitive!(StringType, String, "string");
 singleton_primitive!(BinaryType, Binary, "binary");
 singleton_primitive!(UUIDType, UUID, "uuid");
@@ -67,12 +79,18 @@ pub struct FixedType {
 }
 
 impl FixedType {
-    pub fn new(size: u32) -> Self { Self { size } }
-    pub fn size(&self) -> u32 { self.size }
+    pub fn new(size: u32) -> Self {
+        Self { size }
+    }
+    pub fn size(&self) -> u32 {
+        self.size
+    }
 }
 
 impl Type for FixedType {
-    fn type_id(&self) -> TypeID { TypeID::Fixed }
+    fn type_id(&self) -> TypeID {
+        TypeID::Fixed
+    }
 }
 
 impl fmt::Display for FixedType {
@@ -89,13 +107,21 @@ pub struct DecimalType {
 }
 
 impl DecimalType {
-    pub fn new(precision: u8, scale: u8) -> Self { Self { precision, scale } }
-    pub fn precision(&self) -> u8 { self.precision }
-    pub fn scale(&self) -> u8 { self.scale }
+    pub fn new(precision: u8, scale: u8) -> Self {
+        Self { precision, scale }
+    }
+    pub fn precision(&self) -> u8 {
+        self.precision
+    }
+    pub fn scale(&self) -> u8 {
+        self.scale
+    }
 }
 
 impl Type for DecimalType {
-    fn type_id(&self) -> TypeID { TypeID::Decimal }
+    fn type_id(&self) -> TypeID {
+        TypeID::Decimal
+    }
 }
 
 impl fmt::Display for DecimalType {
@@ -122,8 +148,19 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn new(id: i32, name: impl Into<String>, field_type: Box<dyn Type>, is_optional: bool) -> Self {
-        Self { id, name: name.into(), field_type, is_optional, doc: None }
+    pub fn new(
+        id: i32,
+        name: impl Into<String>,
+        field_type: Box<dyn Type>,
+        is_optional: bool,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            field_type,
+            is_optional,
+            doc: None,
+        }
     }
 
     pub fn with_doc(mut self, doc: impl Into<String>) -> Self {
@@ -131,11 +168,21 @@ impl Field {
         self
     }
 
-    pub fn id(&self) -> i32 { self.id }
-    pub fn name(&self) -> &str { &self.name }
-    pub fn field_type(&self) -> &dyn Type { self.field_type.as_ref() }
-    pub fn is_optional(&self) -> bool { self.is_optional }
-    pub fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn field_type(&self) -> &dyn Type {
+        self.field_type.as_ref()
+    }
+    pub fn is_optional(&self) -> bool {
+        self.is_optional
+    }
+    pub fn doc(&self) -> Option<&str> {
+        self.doc.as_deref()
+    }
 }
 
 impl PartialEq for Field {
@@ -161,11 +208,16 @@ impl RecordType {
         Self { fields }
     }
 
-    pub fn fields(&self) -> &[Field] { &self.fields }
+    pub fn fields(&self) -> &[Field] {
+        &self.fields
+    }
 
     /// Mirrors Java `RecordType.fieldType(String name)`.
     pub fn field_type_by_name(&self, name: &str) -> Option<&dyn Type> {
-        self.fields.iter().find(|f| f.name == name).map(|f| f.field_type())
+        self.fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.field_type())
     }
 
     /// Mirrors Java `RecordType.field(int id)` — find by field id.
@@ -180,8 +232,12 @@ impl RecordType {
 }
 
 impl Type for RecordType {
-    fn type_id(&self) -> TypeID { TypeID::Record }
-    fn is_nested_type(&self) -> bool { true }
+    fn type_id(&self) -> TypeID {
+        TypeID::Record
+    }
+    fn is_nested_type(&self) -> bool {
+        true
+    }
 }
 
 impl fmt::Display for RecordType {
@@ -200,17 +256,31 @@ pub struct ArrayType {
 
 impl ArrayType {
     pub fn new(element_id: i32, element_optional: bool, element_type: Box<dyn Type>) -> Self {
-        Self { element_id, element_optional, element_type }
+        Self {
+            element_id,
+            element_optional,
+            element_type,
+        }
     }
 
-    pub fn element_id(&self) -> i32 { self.element_id }
-    pub fn is_element_optional(&self) -> bool { self.element_optional }
-    pub fn element_type(&self) -> &dyn Type { self.element_type.as_ref() }
+    pub fn element_id(&self) -> i32 {
+        self.element_id
+    }
+    pub fn is_element_optional(&self) -> bool {
+        self.element_optional
+    }
+    pub fn element_type(&self) -> &dyn Type {
+        self.element_type.as_ref()
+    }
 }
 
 impl Type for ArrayType {
-    fn type_id(&self) -> TypeID { TypeID::Array }
-    fn is_nested_type(&self) -> bool { true }
+    fn type_id(&self) -> TypeID {
+        TypeID::Array
+    }
+    fn is_nested_type(&self) -> bool {
+        true
+    }
 }
 
 impl fmt::Display for ArrayType {
@@ -237,24 +307,49 @@ impl MapType {
         key_type: Box<dyn Type>,
         value_type: Box<dyn Type>,
     ) -> Self {
-        Self { key_id, value_id, value_optional, key_type, value_type }
+        Self {
+            key_id,
+            value_id,
+            value_optional,
+            key_type,
+            value_type,
+        }
     }
 
-    pub fn key_id(&self) -> i32 { self.key_id }
-    pub fn value_id(&self) -> i32 { self.value_id }
-    pub fn is_value_optional(&self) -> bool { self.value_optional }
-    pub fn key_type(&self) -> &dyn Type { self.key_type.as_ref() }
-    pub fn value_type(&self) -> &dyn Type { self.value_type.as_ref() }
+    pub fn key_id(&self) -> i32 {
+        self.key_id
+    }
+    pub fn value_id(&self) -> i32 {
+        self.value_id
+    }
+    pub fn is_value_optional(&self) -> bool {
+        self.value_optional
+    }
+    pub fn key_type(&self) -> &dyn Type {
+        self.key_type.as_ref()
+    }
+    pub fn value_type(&self) -> &dyn Type {
+        self.value_type.as_ref()
+    }
 }
 
 impl Type for MapType {
-    fn type_id(&self) -> TypeID { TypeID::Map }
-    fn is_nested_type(&self) -> bool { true }
+    fn type_id(&self) -> TypeID {
+        TypeID::Map
+    }
+    fn is_nested_type(&self) -> bool {
+        true
+    }
 }
 
 impl fmt::Display for MapType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "map<{},{}>", self.key_type.type_id().get_name(), self.value_type.type_id().get_name())
+        write!(
+            f,
+            "map<{},{}>",
+            self.key_type.type_id().get_name(),
+            self.value_type.type_id().get_name()
+        )
     }
 }
 
@@ -274,9 +369,18 @@ mod tests {
         assert_eq!(TimeType::get().type_id(), TypeID::Time);
         assert_eq!(TimestampType::get().type_id(), TypeID::Timestamp);
         assert_eq!(TimeMillisType::get().type_id(), TypeID::TimeMillis);
-        assert_eq!(TimestampMillisType::get().type_id(), TypeID::TimestampMillis);
-        assert_eq!(LocalTimestampMillisType::get().type_id(), TypeID::LocalTimestampMillis);
-        assert_eq!(LocalTimestampMicrosType::get().type_id(), TypeID::LocalTimestampMicros);
+        assert_eq!(
+            TimestampMillisType::get().type_id(),
+            TypeID::TimestampMillis
+        );
+        assert_eq!(
+            LocalTimestampMillisType::get().type_id(),
+            TypeID::LocalTimestampMillis
+        );
+        assert_eq!(
+            LocalTimestampMicrosType::get().type_id(),
+            TypeID::LocalTimestampMicros
+        );
         assert_eq!(StringType::get().type_id(), TypeID::String);
         assert_eq!(BinaryType::get().type_id(), TypeID::Binary);
         assert_eq!(UUIDType::get().type_id(), TypeID::UUID);
@@ -355,7 +459,9 @@ mod tests {
     #[test]
     fn map_type_carries_key_value_types() {
         let m = MapType::new(
-            3, 4, true,
+            3,
+            4,
+            true,
             Box::new(StringType::get()),
             Box::new(LongType::get()),
         );

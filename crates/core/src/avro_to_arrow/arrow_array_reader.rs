@@ -553,10 +553,8 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     self.build_struct_array(&rows, &sub_parent_field_name, fields)?
                 } else {
                     // Build arrays directly from Record field names
-                    let avro_values: Vec<Value> = rows
-                        .iter()
-                        .map(|r| Value::Record(r.to_vec()))
-                        .collect();
+                    let avro_values: Vec<Value> =
+                        rows.iter().map(|r| Value::Record(r.to_vec())).collect();
                     fields
                         .iter()
                         .map(|f| build_struct_field_from_avro_values(&avro_values, f))
@@ -841,9 +839,7 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                 let len = all_values.len();
                 let child_arrays: ArrowResult<Vec<ArrayRef>> = value_struct_fields
                     .iter()
-                    .map(|sf| {
-                        build_struct_field_from_avro_values(&all_values, sf)
-                    })
+                    .map(|sf| build_struct_field_from_avro_values(&all_values, sf))
                     .collect();
                 let child_arrays = child_arrays?;
                 let data = ArrayDataBuilder::new(DataType::Struct(value_struct_fields.clone()))
@@ -1260,27 +1256,45 @@ mod tests {
         let records = vec![
             Value::Record(vec![
                 ("key".into(), Value::String("k1".into())),
-                ("arr_bool".into(), Value::Union(1, Box::new(Value::Array(vec![
-                    Value::Union(1, Box::new(Value::Boolean(false))),
-                    Value::Union(1, Box::new(Value::Boolean(true))),
-                    Value::Union(1, Box::new(Value::Boolean(false))),
-                ])))),
+                (
+                    "arr_bool".into(),
+                    Value::Union(
+                        1,
+                        Box::new(Value::Array(vec![
+                            Value::Union(1, Box::new(Value::Boolean(false))),
+                            Value::Union(1, Box::new(Value::Boolean(true))),
+                            Value::Union(1, Box::new(Value::Boolean(false))),
+                        ])),
+                    ),
+                ),
             ]),
             Value::Record(vec![
                 ("key".into(), Value::String("k2".into())),
-                ("arr_bool".into(), Value::Union(1, Box::new(Value::Array(vec![
-                    Value::Union(1, Box::new(Value::Boolean(true))),
-                    Value::Union(1, Box::new(Value::Boolean(true))),
-                    Value::Union(1, Box::new(Value::Boolean(true))),
-                ])))),
+                (
+                    "arr_bool".into(),
+                    Value::Union(
+                        1,
+                        Box::new(Value::Array(vec![
+                            Value::Union(1, Box::new(Value::Boolean(true))),
+                            Value::Union(1, Box::new(Value::Boolean(true))),
+                            Value::Union(1, Box::new(Value::Boolean(true))),
+                        ])),
+                    ),
+                ),
             ]),
             Value::Record(vec![
                 ("key".into(), Value::String("k3".into())),
-                ("arr_bool".into(), Value::Union(1, Box::new(Value::Array(vec![
-                    Value::Union(1, Box::new(Value::Boolean(true))),
-                    Value::Union(1, Box::new(Value::Boolean(false))),
-                    Value::Union(1, Box::new(Value::Boolean(true))),
-                ])))),
+                (
+                    "arr_bool".into(),
+                    Value::Union(
+                        1,
+                        Box::new(Value::Array(vec![
+                            Value::Union(1, Box::new(Value::Boolean(true))),
+                            Value::Union(1, Box::new(Value::Boolean(false))),
+                            Value::Union(1, Box::new(Value::Boolean(true))),
+                        ])),
+                    ),
+                ),
             ]),
         ];
 
@@ -1331,16 +1345,20 @@ mod tests {
             ]
         }"#;
 
-        let records = vec![
-            Value::Record(vec![
-                ("key".into(), Value::String("k1".into())),
-                ("arr_int".into(), Value::Union(1, Box::new(Value::Array(vec![
-                    Value::Union(1, Box::new(Value::Int(10))),
-                    Value::Union(1, Box::new(Value::Int(20))),
-                    Value::Union(1, Box::new(Value::Int(30))),
-                ])))),
-            ]),
-        ];
+        let records = vec![Value::Record(vec![
+            ("key".into(), Value::String("k1".into())),
+            (
+                "arr_int".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![
+                        Value::Union(1, Box::new(Value::Int(10))),
+                        Value::Union(1, Box::new(Value::Int(20))),
+                        Value::Union(1, Box::new(Value::Int(30))),
+                    ])),
+                ),
+            ),
+        ])];
 
         let batch = read_records(schema_json, records);
         let arr_col = batch.column_by_name("arr_int").unwrap();

@@ -78,16 +78,28 @@ mod tests {
     #[test]
     fn int_comparator_orders_correctly() {
         let cmp = Comparators::for_type(&IntType::get());
-        assert_eq!(cmp(&LiteralValue::Int(1), &LiteralValue::Int(2)), Ordering::Less);
-        assert_eq!(cmp(&LiteralValue::Int(5), &LiteralValue::Int(5)), Ordering::Equal);
-        assert_eq!(cmp(&LiteralValue::Int(9), &LiteralValue::Int(2)), Ordering::Greater);
+        assert_eq!(
+            cmp(&LiteralValue::Int(1), &LiteralValue::Int(2)),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp(&LiteralValue::Int(5), &LiteralValue::Int(5)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp(&LiteralValue::Int(9), &LiteralValue::Int(2)),
+            Ordering::Greater
+        );
     }
 
     #[test]
     fn string_comparator_lexicographic() {
         let cmp = Comparators::for_type(&StringType::get());
         assert_eq!(
-            cmp(&LiteralValue::String("a".into()), &LiteralValue::String("b".into())),
+            cmp(
+                &LiteralValue::String("a".into()),
+                &LiteralValue::String("b".into())
+            ),
             Ordering::Less
         );
     }
@@ -95,6 +107,9 @@ mod tests {
     #[test]
     fn boolean_comparator() {
         let cmp = Comparators::for_type(&BooleanType::get());
-        assert_eq!(cmp(&LiteralValue::Bool(false), &LiteralValue::Bool(true)), Ordering::Less);
+        assert_eq!(
+            cmp(&LiteralValue::Bool(false), &LiteralValue::Bool(true)),
+            Ordering::Less
+        );
     }
 }

@@ -29,10 +29,20 @@ pub struct BinaryExpression {
 
 impl BinaryExpression {
     pub fn new(left: Box<dyn Expression>, operator: Operator, right: Box<dyn Expression>) -> Self {
-        Self { left, operator, right }
+        Self {
+            left,
+            operator,
+            right,
+        }
     }
 
-    pub fn left(&self) -> &dyn Expression { self.left.as_ref() }
-    pub fn right(&self) -> &dyn Expression { self.right.as_ref() }
-    pub fn operator(&self) -> Operator { self.operator }
+    pub fn left(&self) -> &dyn Expression {
+        self.left.as_ref()
+    }
+    pub fn right(&self) -> &dyn Expression {
+        self.right.as_ref()
+    }
+    pub fn operator(&self) -> Operator {
+        self.operator
+    }
 }

@@ -80,7 +80,10 @@ impl std::fmt::Debug for HoodieMergedLogRecordReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HoodieMergedLogRecordReader")
             .field("num_merged_records", &self.num_merged_records_in_log)
-            .field("total_time_ms", &self.total_time_taken_to_read_and_merge_blocks_ms)
+            .field(
+                "total_time_ms",
+                &self.total_time_taken_to_read_and_merge_blocks_ms,
+            )
             .finish()
     }
 }
@@ -140,8 +143,7 @@ impl HoodieMergedLogRecordReader {
 
         self.base.scan_internal(key_spec_opt, false).await?;
 
-        self.total_time_taken_to_read_and_merge_blocks_ms =
-            start.elapsed().as_millis() as u64;
+        self.total_time_taken_to_read_and_merge_blocks_ms = start.elapsed().as_millis() as u64;
         self.num_merged_records_in_log = self.base.record_buffer.size() as u64;
 
         log::info!(
@@ -158,13 +160,7 @@ impl HoodieMergedLogRecordReader {
 
     /// Decompose the reader after scanning, returning the populated buffer,
     /// valid block instants, and scan statistics.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Box<dyn HoodieFileGroupRecordBuffer>,
-        Vec<String>,
-        ScanStats,
-    ) {
+    pub fn into_parts(self) -> (Box<dyn HoodieFileGroupRecordBuffer>, Vec<String>, ScanStats) {
         let stats = ScanStats {
             total_time_taken_to_read_and_merge_blocks_ms: self
                 .total_time_taken_to_read_and_merge_blocks_ms,
@@ -385,9 +381,12 @@ mod tests {
     fn make_test_reader_context() -> Arc<ReaderContext> {
         let mut ctx = ReaderContext::empty();
         // Prepare schema handler with DeleteContext for buffer construction.
-        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, false),
-        ]));
+        let schema =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "_hoodie_record_key",
+                arrow_schema::DataType::Utf8,
+                false,
+            )]));
         let mut handler =
             crate::file_group::reader::schema_handler::FileGroupReaderSchemaHandler::new()
                 .with_table_schema(schema.clone())
@@ -407,11 +406,10 @@ mod tests {
     fn make_test_buffer() -> Box<dyn HoodieFileGroupRecordBuffer> {
         let ctx = make_test_reader_context();
         let stats = HoodieReadStats::default();
-        Box::new(KeyBasedFileGroupRecordBuffer::new(
-            ctx,
-            "COMMIT_TIME_ORDERING".to_string(),
-            &stats,
-        ).unwrap())
+        Box::new(
+            KeyBasedFileGroupRecordBuffer::new(ctx, "COMMIT_TIME_ORDERING".to_string(), &stats)
+                .unwrap(),
+        )
     }
 
     /// Java: TestHoodieMergedLogRecordReader — builder validation
@@ -506,10 +504,7 @@ mod tests {
 
         // In lazy mode, no scan performed
         assert_eq!(reader.get_num_merged_records_in_log(), 0);
-        assert_eq!(
-            reader.get_total_time_taken_to_read_and_merge_blocks(),
-            0
-        );
+        assert_eq!(reader.get_total_time_taken_to_read_and_merge_blocks(), 0);
     }
 
     /// into_parts() returns buffer, valid instants, and stats.

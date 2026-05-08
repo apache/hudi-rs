@@ -161,9 +161,7 @@ impl QuickstartTripsTable {
             .iter()
             .zip(names.iter())
             .zip(prices.iter())
-            .map(|((id, name), price)| {
-                (id.unwrap(), name.unwrap().to_string(), price.unwrap())
-            })
+            .map(|((id, name), price)| (id.unwrap(), name.unwrap().to_string(), price.unwrap()))
             .collect();
         result.sort_by_key(|(id, _, _)| *id);
         result
@@ -193,9 +191,7 @@ impl QuickstartTripsTable {
             .iter()
             .zip(names.iter())
             .zip(ages.iter())
-            .map(|((id, name), age)| {
-                (id.unwrap(), name.unwrap().to_string(), age.unwrap())
-            })
+            .map(|((id, name), age)| (id.unwrap(), name.unwrap().to_string(), age.unwrap()))
             .collect();
         result.sort_by_key(|(id, _, _)| *id);
         result

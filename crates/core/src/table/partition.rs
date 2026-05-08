@@ -162,17 +162,16 @@ impl PartitionPruner {
             }
         };
 
-        let included = self.and_filters.iter().all(|filter| {
-            match segments.get(filter.field.name()) {
-                Some(segment_value) => {
-                    match filter.apply_comparison(segment_value) {
+        let included =
+            self.and_filters
+                .iter()
+                .all(|filter| match segments.get(filter.field.name()) {
+                    Some(segment_value) => match filter.apply_comparison(segment_value) {
                         Ok(scalar) => scalar.value(0),
                         Err(_) => true,
-                    }
-                }
-                None => true,
-            }
-        });
+                    },
+                    None => true,
+                });
 
         if !included {
             let filter_exprs: Vec<String> = self

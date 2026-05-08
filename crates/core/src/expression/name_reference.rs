@@ -15,8 +15,8 @@
 use crate::expression::expression::ExpressionKind;
 use crate::expression::leaf_expression::LeafExpression;
 use crate::expression::{Expression, Operator};
-use crate::internal_schema::types::StringType;
 use crate::internal_schema::Type;
+use crate::internal_schema::types::StringType;
 
 /// Reference to a column by name. Mirrors Java `NameReference(String name)`.
 ///

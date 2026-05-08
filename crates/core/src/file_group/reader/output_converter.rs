@@ -82,9 +82,9 @@ impl OutputConverter for ProjectionConverter {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        batch.project(&indices).map_err(|e| {
-            CoreError::ReadFileSliceError(format!("Output projection failed: {e}"))
-        })
+        batch
+            .project(&indices)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("Output projection failed: {e}")))
     }
 }
 
@@ -154,15 +154,10 @@ mod tests {
     /// Test that ProjectionConverter errors on missing column.
     #[test]
     fn test_output_converter_error_on_missing_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("col_a", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col_a", DataType::Utf8, true)]));
 
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["a1"]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a1"]))]).unwrap();
 
         let target_schema = Arc::new(Schema::new(vec![
             Field::new("col_a", DataType::Utf8, true),

@@ -38,28 +38,26 @@
 //!   id=7  Grace-V2  age=28  city=la
 //!   id=8  Hank      age=45  city=la
 
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use hudi_core::config::HudiConfigs;
 use hudi_core::config::table::HudiTableConfig;
 use hudi_core::error::Result;
+use hudi_core::expression::predicates::predicates_factory;
+use hudi_core::expression::{Expression, Literal, NameReference, Predicate};
+use hudi_core::file_group::reader::HoodieFileGroupReader;
 use hudi_core::file_group::reader::input_split::InputSplit;
 use hudi_core::file_group::reader::reader_context::ReaderContext;
 use hudi_core::file_group::reader::reader_parameters::ReaderParameters;
-use hudi_core::file_group::reader::HoodieFileGroupReader;
 use hudi_core::storage::Storage;
 use hudi_core::table::builder::OptionResolver;
 use hudi_test::QuickstartTripsTable;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::sync::Arc;
-use hudi_core::expression::predicates::predicates_factory;
-use hudi_core::expression::{Expression, Literal, NameReference, Predicate};
 use std::sync::Arc as StdArc;
 
 /// Create HudiConfigs and Storage from table path using OptionResolver.
-async fn create_configs_and_storage(
-    table_path: &str,
-) -> Result<(Arc<HudiConfigs>, Arc<Storage>)> {
+async fn create_configs_and_storage(table_path: &str) -> Result<(Arc<HudiConfigs>, Arc<Storage>)> {
     let empty_opts: Vec<(&str, &str)> = vec![];
     let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
     resolver.resolve_options().await?;
@@ -95,12 +93,7 @@ async fn read_file_group(
         })
         .collect();
 
-    let input_split = InputSplit::new(
-        base_path,
-        None,
-        log_paths,
-        partition.to_string(),
-    );
+    let input_split = InputSplit::new(base_path, None, log_paths, partition.to_string());
 
     let mut reader_context = ReaderContext::empty();
     reader_context.latest_commit_time = "99991231235959999".to_string();
@@ -156,12 +149,7 @@ async fn read_file_group_with_projection(
         })
         .collect();
 
-    let input_split = InputSplit::new(
-        base_path.clone(),
-        None,
-        log_paths,
-        partition.to_string(),
-    );
+    let input_split = InputSplit::new(base_path.clone(), None, log_paths, partition.to_string());
 
     let mut reader_context = ReaderContext::empty();
     reader_context.latest_commit_time = "99991231235959999".to_string();
@@ -228,8 +216,16 @@ async fn test_e2e_v9_mor_commit_time_sf_merge() -> Result<()> {
 
     let records = extract_id_name_age(&result);
     assert_eq!(records.len(), 2, "sf partition should have 2 rows");
-    assert_eq!(records[0], (1, "Alice-V2".to_string(), 31), "id=1 should be updated");
-    assert_eq!(records[1], (2, "Bob".to_string(), 25), "id=2 should be unchanged");
+    assert_eq!(
+        records[0],
+        (1, "Alice-V2".to_string(), 31),
+        "id=1 should be updated"
+    );
+    assert_eq!(
+        records[1],
+        (2, "Bob".to_string(), 25),
+        "id=2 should be unchanged"
+    );
 
     Ok(())
 }
@@ -258,8 +254,16 @@ async fn test_e2e_v9_mor_commit_time_nyc_merge() -> Result<()> {
 
     let records = extract_id_name_age(&result);
     assert_eq!(records.len(), 2, "nyc partition should have 2 rows");
-    assert_eq!(records[0], (3, "Carol-V2".to_string(), 36), "id=3 should be updated");
-    assert_eq!(records[1], (4, "Dave".to_string(), 28), "id=4 should be unchanged");
+    assert_eq!(
+        records[0],
+        (3, "Carol-V2".to_string(), 36),
+        "id=3 should be updated"
+    );
+    assert_eq!(
+        records[1],
+        (4, "Dave".to_string(), 28),
+        "id=4 should be unchanged"
+    );
 
     Ok(())
 }
@@ -288,8 +292,16 @@ async fn test_e2e_v9_mor_commit_time_chi_merge() -> Result<()> {
 
     let records = extract_id_name_age(&result);
     assert_eq!(records.len(), 2, "chi partition should have 2 rows");
-    assert_eq!(records[0], (5, "Eve-V2".to_string(), 33), "id=5 should be updated");
-    assert_eq!(records[1], (6, "Frank".to_string(), 40), "id=6 should be unchanged");
+    assert_eq!(
+        records[0],
+        (5, "Eve-V2".to_string(), 33),
+        "id=5 should be updated"
+    );
+    assert_eq!(
+        records[1],
+        (6, "Frank".to_string(), 40),
+        "id=6 should be unchanged"
+    );
 
     Ok(())
 }
@@ -318,8 +330,16 @@ async fn test_e2e_v9_mor_commit_time_la_merge() -> Result<()> {
 
     let records = extract_id_name_age(&result);
     assert_eq!(records.len(), 2, "la partition should have 2 rows");
-    assert_eq!(records[0], (7, "Grace-V2".to_string(), 28), "id=7 should be updated");
-    assert_eq!(records[1], (8, "Hank".to_string(), 45), "id=8 should be unchanged");
+    assert_eq!(
+        records[0],
+        (7, "Grace-V2".to_string(), 28),
+        "id=7 should be updated"
+    );
+    assert_eq!(
+        records[1],
+        (8, "Hank".to_string(), 45),
+        "id=8 should be unchanged"
+    );
 
     Ok(())
 }
@@ -347,8 +367,16 @@ async fn test_e2e_v9_mor_base_only_read() -> Result<()> {
 
     let records = extract_id_name_age(&result);
     assert_eq!(records.len(), 2, "base-only should have 2 rows");
-    assert_eq!(records[0], (1, "Alice".to_string(), 30), "id=1 should be original (no update)");
-    assert_eq!(records[1], (2, "Bob".to_string(), 25), "id=2 should be original");
+    assert_eq!(
+        records[0],
+        (1, "Alice".to_string(), 30),
+        "id=1 should be original (no update)"
+    );
+    assert_eq!(
+        records[1],
+        (2, "Bob".to_string(), 25),
+        "id=2 should be original"
+    );
 
     Ok(())
 }
@@ -376,7 +404,7 @@ async fn test_e2e_v9_mor_commit_time_nonpart_multi_log() -> Result<()> {
 
     let result = read_file_group(
         &table_path,
-        "",  // non-partitioned
+        "", // non-partitioned
         "960a29a0-0f78-401d-85b1-1cbc44b34121-0_0-846-1597_20260409002001492.parquet",
         vec![
             ".960a29a0-0f78-401d-85b1-1cbc44b34121-0_20260409002002957.log.1_0-868-1644",
@@ -386,11 +414,31 @@ async fn test_e2e_v9_mor_commit_time_nonpart_multi_log() -> Result<()> {
     .await?;
 
     let records = extract_id_name_price(&result);
-    assert_eq!(records.len(), 4, "should have 4 rows after merge (3 deleted, 3 updated)");
-    assert_eq!(records[0], (3, "C".to_string(), 30.0), "id=3 should be unchanged");
-    assert_eq!(records[1], (4, "D2".to_string(), 45.0), "id=4 should be updated");
-    assert_eq!(records[2], (5, "E2".to_string(), 55.0), "id=5 should be updated");
-    assert_eq!(records[3], (6, "F2".to_string(), 65.0), "id=6 should be updated");
+    assert_eq!(
+        records.len(),
+        4,
+        "should have 4 rows after merge (3 deleted, 3 updated)"
+    );
+    assert_eq!(
+        records[0],
+        (3, "C".to_string(), 30.0),
+        "id=3 should be unchanged"
+    );
+    assert_eq!(
+        records[1],
+        (4, "D2".to_string(), 45.0),
+        "id=4 should be updated"
+    );
+    assert_eq!(
+        records[2],
+        (5, "E2".to_string(), 55.0),
+        "id=5 should be updated"
+    );
+    assert_eq!(
+        records[3],
+        (6, "F2".to_string(), 65.0),
+        "id=6 should be updated"
+    );
 
     Ok(())
 }
@@ -410,11 +458,7 @@ fn read_gold_parquet(gold_dir: &str) -> arrow_array::RecordBatch {
     let entries: Vec<_> = std::fs::read_dir(gold_dir)
         .expect("gold_data dir should exist")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "parquet")
-        })
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
         .collect();
     assert!(!entries.is_empty(), "no parquet files in {gold_dir}");
     let file = File::open(entries[0].path()).expect("open gold parquet");
@@ -664,11 +708,7 @@ async fn test_e2e_v9_mor_column_projection_via_schema_handler() -> Result<()> {
 
     // Output should have exactly 2 columns: id and name.
     let schema = result.schema();
-    let output_col_names: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let output_col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         output_col_names,
         vec!["id", "name"],
@@ -696,7 +736,11 @@ async fn test_e2e_v9_mor_column_projection_via_schema_handler() -> Result<()> {
     rows.sort_by_key(|(id, _)| *id);
 
     assert_eq!(rows.len(), 2, "sf partition should have 2 rows");
-    assert_eq!(rows[0], (1, "Alice-V2".to_string()), "id=1 should be updated");
+    assert_eq!(
+        rows[0],
+        (1, "Alice-V2".to_string()),
+        "id=1 should be updated"
+    );
     assert_eq!(rows[1], (2, "Bob".to_string()), "id=2 should be unchanged");
 
     Ok(())
@@ -752,12 +796,7 @@ async fn read_file_group_via_builder(
         })
         .collect();
 
-    let input_split = InputSplit::new(
-        base_path.clone(),
-        None,
-        log_paths,
-        partition.to_string(),
-    );
+    let input_split = InputSplit::new(base_path.clone(), None, log_paths, partition.to_string());
 
     // Read table schema from the base file parquet metadata (like the FFI bridge does).
     let table_schema: Option<SchemaRef> = if let Some(ref bp) = base_path {
@@ -776,9 +815,7 @@ async fn read_file_group_via_builder(
     let schema_handler = {
         let mut handler = FileGroupReaderSchemaHandler::new();
         if let Some(ts) = table_schema {
-            handler = handler
-                .with_table_schema(ts.clone())
-                .with_data_schema(ts);
+            handler = handler.with_table_schema(ts.clone()).with_data_schema(ts);
         }
         handler = handler.with_requested_schema(requested_schema);
         handler
@@ -839,11 +876,7 @@ async fn test_e2e_v9_mor_column_projection_via_builder() -> Result<()> {
 
     // Output should have exactly 2 columns: id and name.
     let schema = result.schema();
-    let output_col_names: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let output_col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         output_col_names,
         vec!["id", "name"],
@@ -852,12 +885,23 @@ async fn test_e2e_v9_mor_column_projection_via_builder() -> Result<()> {
     );
 
     // Verify merge results are correct.
-    let ids = result.column_by_name("id").unwrap().as_any()
-        .downcast_ref::<arrow_array::Int32Array>().unwrap();
-    let names = result.column_by_name("name").unwrap().as_any()
-        .downcast_ref::<arrow_array::StringArray>().unwrap();
-    let mut rows: Vec<(i32, String)> = ids.iter().zip(names.iter())
-        .map(|(id, name)| (id.unwrap(), name.unwrap().to_string())).collect();
+    let ids = result
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .unwrap();
+    let names = result
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    let mut rows: Vec<(i32, String)> = ids
+        .iter()
+        .zip(names.iter())
+        .map(|(id, name)| (id.unwrap(), name.unwrap().to_string()))
+        .collect();
     rows.sort_by_key(|(id, _)| *id);
 
     assert_eq!(rows.len(), 2);
@@ -893,11 +937,7 @@ async fn test_e2e_cow_column_projection_via_builder() -> Result<()> {
     .await?;
 
     let schema = result.schema();
-    let output_col_names: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let output_col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         output_col_names,
         vec!["id", "age"],
@@ -906,12 +946,23 @@ async fn test_e2e_cow_column_projection_via_builder() -> Result<()> {
 
     assert_eq!(result.num_rows(), 2, "sf base has 2 rows");
 
-    let ids = result.column_by_name("id").unwrap().as_any()
-        .downcast_ref::<arrow_array::Int32Array>().unwrap();
-    let ages = result.column_by_name("age").unwrap().as_any()
-        .downcast_ref::<arrow_array::Int32Array>().unwrap();
-    let mut rows: Vec<(i32, i32)> = ids.iter().zip(ages.iter())
-        .map(|(id, age)| (id.unwrap(), age.unwrap())).collect();
+    let ids = result
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .unwrap();
+    let ages = result
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .unwrap();
+    let mut rows: Vec<(i32, i32)> = ids
+        .iter()
+        .zip(ages.iter())
+        .map(|(id, age)| (id.unwrap(), age.unwrap()))
+        .collect();
     rows.sort_by_key(|(id, _)| *id);
 
     assert_eq!(rows[0], (1, 30), "id=1 original age=30 (no merge)");
@@ -930,9 +981,8 @@ async fn test_e2e_cow_column_projection_via_builder() -> Result<()> {
 async fn test_e2e_mor_single_column_projection_via_builder() -> Result<()> {
     let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
 
-    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-    ]));
+    let requested_schema: SchemaRef =
+        Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
 
     let result = read_file_group_via_builder(
         &table_path,
@@ -944,11 +994,7 @@ async fn test_e2e_mor_single_column_projection_via_builder() -> Result<()> {
     .await?;
 
     let schema = result.schema();
-    let output_col_names: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let output_col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         output_col_names,
         vec!["name"],
@@ -957,14 +1003,23 @@ async fn test_e2e_mor_single_column_projection_via_builder() -> Result<()> {
 
     assert_eq!(result.num_rows(), 2);
 
-    let names = result.column_by_name("name").unwrap().as_any()
-        .downcast_ref::<arrow_array::StringArray>().unwrap();
-    let mut values: Vec<String> = names.iter()
-        .map(|n| n.unwrap().to_string()).collect();
+    let names = result
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    let mut values: Vec<String> = names.iter().map(|n| n.unwrap().to_string()).collect();
     values.sort();
 
-    assert!(values.contains(&"Alice-V2".to_string()), "merged name should be Alice-V2");
-    assert!(values.contains(&"Bob".to_string()), "unchanged name should be Bob");
+    assert!(
+        values.contains(&"Alice-V2".to_string()),
+        "merged name should be Alice-V2"
+    );
+    assert!(
+        values.contains(&"Bob".to_string()),
+        "unchanged name should be Bob"
+    );
 
     Ok(())
 }
@@ -1022,14 +1077,22 @@ fn test_component_required_schema_is_pruned_not_full() {
         "COMMIT_TIME_ORDERING",
     );
 
-    let required = handler.required_schema.as_ref()
+    let required = handler
+        .required_schema
+        .as_ref()
         .expect("required_schema should be computed");
-    let required_cols: Vec<&str> = required.fields().iter()
-        .map(|f| f.name().as_str()).collect();
+    let required_cols: Vec<&str> = required
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
 
     // Must include user-requested columns.
     assert!(required_cols.contains(&"id"), "must include requested 'id'");
-    assert!(required_cols.contains(&"name"), "must include requested 'name'");
+    assert!(
+        required_cols.contains(&"name"),
+        "must include requested 'name'"
+    );
 
     // Must include merge-mandatory field.
     assert!(
@@ -1082,9 +1145,8 @@ fn test_component_cow_required_equals_requested() {
         Field::new("age", DataType::Int32, true),
     ]));
 
-    let requested_schema: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, true),
-    ]));
+    let requested_schema: SchemaRef =
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
 
     let mut handler = FileGroupReaderSchemaHandler::new()
         .with_table_schema(table_schema.clone())
@@ -1123,7 +1185,8 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
     let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
     let (_hudi_configs, storage) = create_configs_and_storage(&table_path).await?;
 
-    let base_file = "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+    let base_file =
+        "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
 
     // Read the full parquet schema.
     let full_schema: SchemaRef = Arc::new(storage.get_parquet_file_schema(base_file).await?);
@@ -1174,14 +1237,14 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
         "parquet should have more than 2 columns (has {full_col_count})"
     );
     assert_eq!(
-        result.num_columns(), 2,
+        result.num_columns(),
+        2,
         "builder path with schema_handler: output should have only 2 columns, \
          not all {full_col_count} parquet columns"
     );
 
     let schema = result.schema();
-    let output_col_names: Vec<&str> = schema.fields().iter()
-        .map(|f| f.name().as_str()).collect();
+    let output_col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(output_col_names, vec!["id", "name"]);
 
     Ok(())
@@ -1222,12 +1285,7 @@ async fn read_file_group_with_key_filter(
         })
         .collect();
 
-    let input_split = InputSplit::new(
-        base_path,
-        None,
-        log_paths,
-        partition.to_string(),
-    );
+    let input_split = InputSplit::new(base_path, None, log_paths, partition.to_string());
 
     let mut reader_context = ReaderContext::empty();
     reader_context.latest_commit_time = "99991231235959999".to_string();
@@ -1237,7 +1295,7 @@ async fn read_file_group_with_key_filter(
         "ts".to_string(),
     );
     reader_context.rebuild_record_context(partition.to_string());
-    reader_context.key_filter_opt = key_filter_opt;       // ← the only addition
+    reader_context.key_filter_opt = key_filter_opt; // ← the only addition
 
     let mut reader = HoodieFileGroupReader::new(
         Arc::new(reader_context),
@@ -1285,12 +1343,18 @@ fn extract_row_with_id_opt(
     batch: &arrow_array::RecordBatch,
     id: i32,
 ) -> Option<(i32, String, i32)> {
-    let id_col = batch.column_by_name("id")?
-        .as_any().downcast_ref::<arrow_array::Int32Array>()?;
-    let name_col = batch.column_by_name("name")?
-        .as_any().downcast_ref::<arrow_array::StringArray>()?;
-    let age_col = batch.column_by_name("age")?
-        .as_any().downcast_ref::<arrow_array::Int32Array>()?;
+    let id_col = batch
+        .column_by_name("id")?
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()?;
+    let name_col = batch
+        .column_by_name("name")?
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()?;
+    let age_col = batch
+        .column_by_name("age")?
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()?;
 
     for i in 0..batch.num_rows() {
         if id_col.value(i) == id {
@@ -1317,9 +1381,9 @@ async fn fg_filter_in_log_updated_key() -> Result<()> {
     let (table_path, partition, base_file, log_files) = sf_file_group();
 
     // First read no-filter to discover id=1's record key dynamically.
-    let baseline_for_key_lookup = read_file_group_with_key_filter(
-        &table_path, partition, base_file, log_files.clone(), None,
-    ).await?;
+    let baseline_for_key_lookup =
+        read_file_group_with_key_filter(&table_path, partition, base_file, log_files.clone(), None)
+            .await?;
     let key_for_id1 = lookup_record_key(&baseline_for_key_lookup, 1);
 
     let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
@@ -1329,13 +1393,16 @@ async fn fg_filter_in_log_updated_key() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filter_narrowed();         // 1 < 2
-    ab.assert_filtered_ids_eq(&[1]);     // exactly id=1
+    ab.assert_filter_narrowed(); // 1 < 2
+    ab.assert_filtered_ids_eq(&[1]); // exactly id=1
 
     // Cross-validate: filtered id=1 row equals baseline id=1 row.
     let expected = extract_row_with_id_opt(&ab.baseline, 1).expect("id=1 in baseline");
     let actual = extract_row_with_id_opt(&ab.filtered, 1).expect("id=1 in filtered");
-    assert_eq!(expected, actual, "filtered id=1 must equal baseline id=1 (Alice-V2)");
+    assert_eq!(
+        expected, actual,
+        "filtered id=1 must equal baseline id=1 (Alice-V2)"
+    );
 
     Ok(())
 }
@@ -1431,22 +1498,12 @@ async fn ab_read_with_filter(
     log_files: Vec<&str>,
     filter: StdArc<dyn Predicate>,
 ) -> Result<FilterAbResult> {
-    let baseline = read_file_group_with_key_filter(
-        table_path,
-        partition,
-        base_file,
-        log_files.clone(),
-        None,
-    )
-    .await?;
-    let filtered = read_file_group_with_key_filter(
-        table_path,
-        partition,
-        base_file,
-        log_files,
-        Some(filter),
-    )
-    .await?;
+    let baseline =
+        read_file_group_with_key_filter(table_path, partition, base_file, log_files.clone(), None)
+            .await?;
+    let filtered =
+        read_file_group_with_key_filter(table_path, partition, base_file, log_files, Some(filter))
+            .await?;
     Ok(FilterAbResult { baseline, filtered })
 }
 
@@ -1506,9 +1563,9 @@ fn log_only_file_group() -> (String, &'static str, &'static str, Vec<&'static st
 async fn fg_filter_in_base_only_key() -> Result<()> {
     let (table_path, partition, base_file, log_files) = sf_file_group();
 
-    let baseline_for_key_lookup = read_file_group_with_key_filter(
-        &table_path, partition, base_file, log_files.clone(), None,
-    ).await?;
+    let baseline_for_key_lookup =
+        read_file_group_with_key_filter(&table_path, partition, base_file, log_files.clone(), None)
+            .await?;
     let key_for_id2 = lookup_record_key(&baseline_for_key_lookup, 2);
 
     let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
@@ -1518,13 +1575,16 @@ async fn fg_filter_in_base_only_key() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filter_narrowed();         // 1 < 2
-    ab.assert_filtered_ids_eq(&[2]);     // exactly id=2
+    ab.assert_filter_narrowed(); // 1 < 2
+    ab.assert_filtered_ids_eq(&[2]); // exactly id=2
 
     // Cross-validate: filtered id=2 row equals baseline id=2 row (Bob, base value).
     let expected = extract_row_with_id_opt(&ab.baseline, 2).expect("id=2 in baseline");
     let actual = extract_row_with_id_opt(&ab.filtered, 2).expect("id=2 in filtered");
-    assert_eq!(expected, actual, "filtered id=2 must equal baseline id=2 (Bob)");
+    assert_eq!(
+        expected, actual,
+        "filtered id=2 must equal baseline id=2 (Bob)"
+    );
 
     Ok(())
 }
@@ -1544,7 +1604,7 @@ async fn fg_filter_in_no_match() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filtered_empty();          // baseline > 0, filtered == 0
+    ab.assert_filtered_empty(); // baseline > 0, filtered == 0
 
     Ok(())
 }
@@ -1559,9 +1619,9 @@ async fn fg_filter_in_no_match() -> Result<()> {
 async fn fg_filter_starts_with_any_prefix() -> Result<()> {
     let (table_path, partition, base_file, log_files) = sf_file_group();
 
-    let baseline_for_key_lookup = read_file_group_with_key_filter(
-        &table_path, partition, base_file, log_files.clone(), None,
-    ).await?;
+    let baseline_for_key_lookup =
+        read_file_group_with_key_filter(&table_path, partition, base_file, log_files.clone(), None)
+            .await?;
     let prefix_for_id1 = lookup_record_key(&baseline_for_key_lookup, 1);
 
     let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::starts_with_any(
@@ -1571,7 +1631,7 @@ async fn fg_filter_starts_with_any_prefix() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filter_narrowed();         // 1 < 2
+    ab.assert_filter_narrowed(); // 1 < 2
     ab.assert_filtered_ids_eq(&[1]);
 
     Ok(())
@@ -1595,7 +1655,7 @@ async fn fg_filter_unsupported_predicate_is_noop() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filter_was_noop();         // baseline.num_rows == filtered.num_rows; same id set
+    ab.assert_filter_was_noop(); // baseline.num_rows == filtered.num_rows; same id set
 
     Ok(())
 }
@@ -1606,14 +1666,22 @@ fn extract_row_with_id_opt_v9nonpart(
     batch: &arrow_array::RecordBatch,
     id: i32,
 ) -> Option<(i32, String, f64, i64)> {
-    let id_col = batch.column_by_name("id")?
-        .as_any().downcast_ref::<arrow_array::Int32Array>()?;
-    let name_col = batch.column_by_name("name")?
-        .as_any().downcast_ref::<arrow_array::StringArray>()?;
-    let price_col = batch.column_by_name("price")?
-        .as_any().downcast_ref::<arrow_array::Float64Array>()?;
-    let ts_col = batch.column_by_name("ts")?
-        .as_any().downcast_ref::<arrow_array::Int64Array>()?;
+    let id_col = batch
+        .column_by_name("id")?
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()?;
+    let name_col = batch
+        .column_by_name("name")?
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()?;
+    let price_col = batch
+        .column_by_name("price")?
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()?;
+    let ts_col = batch
+        .column_by_name("ts")?
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()?;
 
     for i in 0..batch.num_rows() {
         if id_col.value(i) == id {
@@ -1639,9 +1707,8 @@ async fn fg_filter_in_with_delete_block() -> Result<()> {
     let (table_path, partition, base_file, log_files) = nonpart_3commits_file_group();
 
     // Read base-only (no log files) to recover id=0's record key.
-    let base_only = read_file_group_with_key_filter(
-        &table_path, partition, base_file, vec![], None,
-    ).await?;
+    let base_only =
+        read_file_group_with_key_filter(&table_path, partition, base_file, vec![], None).await?;
     let key_for_id0 = lookup_record_key(&base_only, 0);
 
     let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
@@ -1652,12 +1719,16 @@ async fn fg_filter_in_with_delete_block() -> Result<()> {
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
     // Baseline already excludes id=0 (deleted by log).
-    assert!(extract_row_with_id_opt_v9nonpart(&ab.baseline, 0).is_none(),
-        "baseline must NOT contain id=0 (deleted by log)");
+    assert!(
+        extract_row_with_id_opt_v9nonpart(&ab.baseline, 0).is_none(),
+        "baseline must NOT contain id=0 (deleted by log)"
+    );
 
     // Filtered must also exclude id=0 (filter applied to deleted key → 0 rows).
-    assert!(extract_row_with_id_opt_v9nonpart(&ab.filtered, 0).is_none(),
-        "filtered must NOT contain id=0");
+    assert!(
+        extract_row_with_id_opt_v9nonpart(&ab.filtered, 0).is_none(),
+        "filtered must NOT contain id=0"
+    );
 
     // Stronger: filtered should be empty since the only key in the filter is id=0,
     // which is deleted, so no rows survive the filter.
@@ -1675,9 +1746,9 @@ async fn fg_filter_in_with_delete_block() -> Result<()> {
 async fn fg_filter_in_log_updated_key_nonpart() -> Result<()> {
     let (table_path, partition, base_file, log_files) = nonpart_3commits_file_group();
 
-    let baseline_for_key_lookup = read_file_group_with_key_filter(
-        &table_path, partition, base_file, log_files.clone(), None,
-    ).await?;
+    let baseline_for_key_lookup =
+        read_file_group_with_key_filter(&table_path, partition, base_file, log_files.clone(), None)
+            .await?;
     let key_for_id5 = lookup_record_key(&baseline_for_key_lookup, 5);
 
     let filter: StdArc<dyn Predicate> = StdArc::new(predicates_factory::in_(
@@ -1687,17 +1758,21 @@ async fn fg_filter_in_log_updated_key_nonpart() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filter_narrowed();         // 1 < 4
+    ab.assert_filter_narrowed(); // 1 < 4
     ab.assert_filtered_ids_eq(&[5]);
 
     // Cross-validate: filtered id=5 row should be the log-updated value (E2, 55.0).
-    let expected = extract_row_with_id_opt_v9nonpart(&ab.baseline, 5)
-        .expect("id=5 in baseline");
-    let actual = extract_row_with_id_opt_v9nonpart(&ab.filtered, 5)
-        .expect("id=5 in filtered");
-    assert_eq!(expected, actual, "filtered id=5 must equal baseline id=5 (log-updated)");
+    let expected = extract_row_with_id_opt_v9nonpart(&ab.baseline, 5).expect("id=5 in baseline");
+    let actual = extract_row_with_id_opt_v9nonpart(&ab.filtered, 5).expect("id=5 in filtered");
+    assert_eq!(
+        expected, actual,
+        "filtered id=5 must equal baseline id=5 (log-updated)"
+    );
     // Sanity: name should be "E2" (the log update value).
-    assert_eq!(expected.1, "E2", "id=5 baseline value should be log update (E2)");
+    assert_eq!(
+        expected.1, "E2",
+        "id=5 baseline value should be log update (E2)"
+    );
 
     Ok(())
 }
@@ -1722,11 +1797,13 @@ async fn fg_filter_in_log_only_filegroup() -> Result<()> {
     let (table_path, partition, base_file, log_files) = log_only_file_group();
 
     // Read baseline first to discover one valid record key.
-    let baseline_for_key_lookup = read_file_group_with_key_filter(
-        &table_path, partition, base_file, log_files.clone(), None,
-    ).await?;
-    assert!(baseline_for_key_lookup.num_rows() >= 2,
-        "log-only baseline must have >=2 rows for the filter to be a real narrow");
+    let baseline_for_key_lookup =
+        read_file_group_with_key_filter(&table_path, partition, base_file, log_files.clone(), None)
+            .await?;
+    assert!(
+        baseline_for_key_lookup.num_rows() >= 2,
+        "log-only baseline must have >=2 rows for the filter to be a real narrow"
+    );
 
     // Use the _hoodie_record_key of the first row.
     let hoodie_key_col = baseline_for_key_lookup
@@ -1744,11 +1821,12 @@ async fn fg_filter_in_log_only_filegroup() -> Result<()> {
 
     let ab = ab_read_with_filter(&table_path, partition, base_file, log_files, filter).await?;
 
-    ab.assert_filter_narrowed();         // 1 < 2
+    ab.assert_filter_narrowed(); // 1 < 2
 
     // Verify exactly the target key remains.
     let filtered_keys: Vec<String> = {
-        let key_col = ab.filtered
+        let key_col = ab
+            .filtered
             .column_by_name("_hoodie_record_key")
             .expect("_hoodie_record_key missing from filtered batch")
             .as_any()
@@ -1758,8 +1836,11 @@ async fn fg_filter_in_log_only_filegroup() -> Result<()> {
             .map(|i| key_col.value(i).to_string())
             .collect()
     };
-    assert_eq!(filtered_keys, vec![target_key.clone()],
-        "filtered keys should be exactly [target_key]");
+    assert_eq!(
+        filtered_keys,
+        vec![target_key.clone()],
+        "filtered keys should be exactly [target_key]"
+    );
 
     Ok(())
 }

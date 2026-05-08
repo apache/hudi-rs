@@ -148,7 +148,8 @@ impl LogFileScanner {
 
         for path in relative_paths {
             let mut reader =
-                LogFileReader::new(self.reader_context.clone(), self.storage.clone(), &path).await?;
+                LogFileReader::new(self.reader_context.clone(), self.storage.clone(), &path)
+                    .await?;
             let blocks = reader.read_all_blocks(instant_range)?;
 
             // Collect rollback targets from command blocks

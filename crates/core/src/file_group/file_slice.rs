@@ -92,7 +92,11 @@ impl FileSlice {
     ///
     /// Mirrors Java's `new FileSlice(fileGroupId, baseInstantTime)` where `baseFile` stays null.
     /// Used when a file group has only log files and no base file.
-    pub fn new_log_only(file_id: String, base_instant_time: String, partition_path: String) -> Self {
+    pub fn new_log_only(
+        file_id: String,
+        base_instant_time: String,
+        partition_path: String,
+    ) -> Self {
         Self {
             file_id,
             base_instant_time,

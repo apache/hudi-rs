@@ -183,7 +183,10 @@ pub fn forward_scan_pass1(
         log::debug!(
             "[Pass1]   instant={instant}: {} block(s) [{:?}]",
             blocks.len(),
-            blocks.iter().map(|b| format!("{:?}", b.block_type)).collect::<Vec<_>>(),
+            blocks
+                .iter()
+                .map(|b| format!("{:?}", b.block_type))
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -253,8 +256,9 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
         let first_block = &instants_blocks[0];
 
         // Check for compacted blocks (has COMPACTED_BLOCK_TIMES header)
-        if let Some(compacted_times) =
-            first_block.header.get(&BlockMetadataKey::CompactedBlockTimes)
+        if let Some(compacted_times) = first_block
+            .header
+            .get(&BlockMetadataKey::CompactedBlockTimes)
         {
             for original_instant in compacted_times.split(',') {
                 let original_instant = original_instant.trim().to_string();
@@ -273,7 +277,7 @@ pub fn reverse_scan_pass2(pass1: &mut Pass1Result) -> Pass2Result {
                 if instant_times_included.contains(&final_instant) {
                     continue;
                 }
-            if let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) {
+                if let Some(blocks) = pass1.instant_to_blocks_map.get(&final_instant) {
                     let mut reversed = blocks.clone();
                     reversed.reverse();
                     for block in reversed {
@@ -670,8 +674,7 @@ mod tests {
         ];
         let range = Some(InstantRange::up_to("20250102000000000", "utc"));
 
-        let result =
-            forward_scan_pass1(blocks, "99991231235959999", &range, "utc").unwrap();
+        let result = forward_scan_pass1(blocks, "99991231235959999", &range, "utc").unwrap();
 
         assert_eq!(result.ordered_instants_list, vec!["20250101000000000"]);
     }
@@ -789,7 +792,10 @@ mod tests {
                 .current_instant_log_blocks
                 .iter()
                 .any(|b| get_instant(b) == *instant);
-            assert!(has_block, "Valid instant {instant} should have blocks in deque");
+            assert!(
+                has_block,
+                "Valid instant {instant} should have blocks in deque"
+            );
         }
     }
 
@@ -838,13 +844,21 @@ mod tests {
 
         // pop_back drains tail-first = oldest first
         let first = pass2.current_instant_log_blocks.pop_back().unwrap();
-        assert_eq!(get_instant(&first), "t1", "First pop_back should be oldest (t1)");
+        assert_eq!(
+            get_instant(&first),
+            "t1",
+            "First pop_back should be oldest (t1)"
+        );
 
         let second = pass2.current_instant_log_blocks.pop_back().unwrap();
         assert_eq!(get_instant(&second), "t2", "Second pop_back should be t2");
 
         let third = pass2.current_instant_log_blocks.pop_back().unwrap();
-        assert_eq!(get_instant(&third), "t3", "Third pop_back should be newest (t3)");
+        assert_eq!(
+            get_instant(&third),
+            "t3",
+            "Third pop_back should be newest (t3)"
+        );
 
         assert!(pass2.current_instant_log_blocks.is_empty());
     }
@@ -859,8 +873,8 @@ mod tests {
     fn test_pass2_multi_block_instant_order() {
         // t1: 1 block, t2: 2 blocks (B seen first, then C)
         let blocks = vec![
-            make_data_block("t1"),  // A
-            make_data_block("t2"),  // B
+            make_data_block("t1"),   // A
+            make_data_block("t2"),   // B
             make_delete_block("t2"), // C (delete block for same instant)
         ];
         let mut pass1 = forward_scan_pass1(blocks, "z", &None, "utc").unwrap();
@@ -894,20 +908,16 @@ mod tests {
     #[test]
     fn test_concrete_trace_from_docs() {
         let blocks = vec![
-            make_data_block("20250101"),            // B1
-            make_data_block("20250102"),            // B2
-            make_data_block("20250102"),            // B3
-            make_data_block("20250103"),            // B4
+            make_data_block("20250101"),                 // B1
+            make_data_block("20250102"),                 // B2
+            make_data_block("20250102"),                 // B3
+            make_data_block("20250103"),                 // B4
             make_rollback_block("20250104", "20250102"), // R1: rollback 20250102
         ];
 
-        let mut pass1 =
-            forward_scan_pass1(blocks, "99991231235959999", &None, "utc").unwrap();
+        let mut pass1 = forward_scan_pass1(blocks, "99991231235959999", &None, "utc").unwrap();
 
-        assert_eq!(
-            pass1.ordered_instants_list,
-            vec!["20250101", "20250103"]
-        );
+        assert_eq!(pass1.ordered_instants_list, vec!["20250101", "20250103"]);
         assert!(!pass1.instant_to_blocks_map.contains_key("20250102"));
 
         let mut pass2 = reverse_scan_pass2(&mut pass1);
@@ -931,10 +941,10 @@ mod tests {
     fn test_five_block_example_from_docs() {
         // Simulate: t1→[A,B], t2→[C], t3→[D,E]
         let blocks = vec![
-            make_data_block("t1"),  // A
-            make_data_block("t1"),  // B
-            make_data_block("t2"),  // C
-            make_data_block("t3"),  // D
+            make_data_block("t1"),   // A
+            make_data_block("t1"),   // B
+            make_data_block("t2"),   // C
+            make_data_block("t3"),   // D
             make_delete_block("t3"), // E (different block type to distinguish)
         ];
 
@@ -1053,11 +1063,10 @@ mod tests {
         ctx.schema_handler = handler;
         let ctx = std::sync::Arc::new(ctx);
         let stats = HoodieReadStats::default();
-        Box::new(KeyBasedFileGroupRecordBuffer::new(
-            ctx,
-            "COMMIT_TIME_ORDERING".to_string(),
-            &stats,
-        ).unwrap())
+        Box::new(
+            KeyBasedFileGroupRecordBuffer::new(ctx, "COMMIT_TIME_ORDERING".to_string(), &stats)
+                .unwrap(),
+        )
     }
 
     /// Commit-time ordering: oldest instant processed first, newest last.

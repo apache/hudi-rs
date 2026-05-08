@@ -436,6 +436,12 @@ mod tests {
         assert!(ctx.reader_context.has_log_files);
         let ir = ctx.reader_context.instant_range.unwrap();
         assert_eq!(ir.range_type, "CLOSED_CLOSED");
-        assert_eq!(ctx.reader_context.table_config.get("hoodie.table.name").unwrap(), "test");
+        assert_eq!(
+            ctx.reader_context
+                .table_config
+                .get("hoodie.table.name")
+                .unwrap(),
+            "test"
+        );
     }
 }

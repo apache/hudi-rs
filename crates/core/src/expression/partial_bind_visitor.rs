@@ -25,7 +25,10 @@ pub struct PartialBindVisitor {
 
 impl PartialBindVisitor {
     pub fn new(schema: RecordType, case_sensitive: bool) -> Self {
-        Self { schema, case_sensitive }
+        Self {
+            schema,
+            case_sensitive,
+        }
     }
 }
 

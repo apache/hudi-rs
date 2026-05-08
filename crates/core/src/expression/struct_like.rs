@@ -30,7 +30,9 @@ mod tests {
     struct MockStruct(Vec<Option<Box<dyn std::any::Any + Send + Sync>>>);
 
     impl StructLike for MockStruct {
-        fn num_fields(&self) -> usize { self.0.len() }
+        fn num_fields(&self) -> usize {
+            self.0.len()
+        }
         fn get(&self, pos: usize) -> Option<&dyn std::any::Any> {
             self.0[pos].as_deref().map(|v| v as &dyn std::any::Any)
         }
