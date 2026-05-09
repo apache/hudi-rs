@@ -50,7 +50,6 @@ datafusion-physical-expr = { workspace = true }
 
 # runtime / async
 async-trait = { workspace = true }
-futures = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 

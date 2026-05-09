@@ -17,7 +17,6 @@
  * under the License.
  */
 
-pub(crate) mod hudi_exec;
 pub(crate) mod util;
 
 use std::any::Any;
@@ -47,24 +46,12 @@ use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, Ta
 use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
-use crate::hudi_exec::HudiScanExec;
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::ConfigParser;
-use hudi_core::config::read::HudiReadConfig::{
-    FileSliceReadConcurrency, InputPartitions, UseReadOptimizedMode,
-};
+use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
 use hudi_core::config::util::empty_options;
-use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
-
-fn default_file_slice_read_concurrency() -> usize {
-    FileSliceReadConcurrency
-        .default_value()
-        .expect("FileSliceReadConcurrency has a default value defined in hudi-core")
-        .into()
-}
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -106,28 +93,9 @@ pub struct HudiDataSource {
     /// and is needed synchronously in `supports_filters_pushdown`.
     partition_schema: Schema,
     /// Cached table-level statistics for join ordering and broadcast decisions.
-    ///
-    /// Consumed in two places:
-    /// 1. `TableProvider::statistics()` - returned to the optimizer (note:
-    ///    DataFusion's main planner does not currently consult this method;
-    ///    see the trait docs).
-    /// 2. `scan_parquet` - passed to `FileScanConfigBuilder::with_statistics(...)`,
-    ///    which IS consumed by the optimizer for join planning on the
-    ///    Parquet/COW fast path.
-    ///
-    /// The `HudiScanExec` path (Lance and MOR snapshot) derives statistics
-    /// per-execution from `FileSlice` metadata via `aggregate_partitions`
-    /// rather than reusing this table-level cache, since per-partition stats
-    /// are more useful for that path.
     cached_stats: Option<Statistics>,
     /// Number of input partitions for scan planning, extracted from read options.
     input_partitions: usize,
-    /// Read-optimized mode requested when constructing the provider.
-    read_optimized_mode: bool,
-    /// Maximum number of file-slice streams polled concurrently within a scan partition.
-    file_slice_read_concurrency: usize,
-    /// Explicit base file format from table config, if present.
-    base_file_format: Option<BaseFileFormatValue>,
 }
 
 impl std::fmt::Debug for HudiDataSource {
@@ -174,55 +142,18 @@ impl HudiDataSource {
             })?,
             None => 0,
         };
-        let read_optimized_mode: bool = match all_options
-            .iter()
-            .find(|(k, _)| k == UseReadOptimizedMode.as_ref())
-        {
-            Some((_, v)) => v.parse().map_err(|e| {
-                Execution(format!(
-                    "Invalid value '{v}' for {}: {e}",
-                    UseReadOptimizedMode.as_ref()
-                ))
-            })?,
-            None => false,
-        };
-        let file_slice_read_concurrency: usize = match all_options
-            .iter()
-            .find(|(k, _)| k == FileSliceReadConcurrency.as_ref())
-        {
-            Some((_, v)) => {
-                let parsed = v.parse().map_err(|_| {
-                    Execution(format!(
-                        "Invalid value '{v}' for {}: expected a positive integer",
-                        FileSliceReadConcurrency.as_ref()
-                    ))
-                })?;
-                if parsed == 0 {
-                    return Err(Execution(format!(
-                        "Invalid value '0' for {}: expected a positive integer",
-                        FileSliceReadConcurrency.as_ref()
-                    )));
-                }
-                parsed
-            }
-            None => default_file_slice_read_concurrency(),
-        };
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
 
-        let base_file_format =
-            BaseFileFormatValue::from_configs(&table.hudi_configs).map_err(|e| {
-                Execution(format!(
-                    "Invalid {} config: {e}",
-                    HudiTableConfig::BaseFileFormat.as_ref()
-                ))
-            })?;
-        if matches!(base_file_format, Some(BaseFileFormatValue::HFile)) {
-            return Err(Execution(
-                "HFile is only supported for Hudi metadata tables, not regular DataFusion scans"
-                    .to_string(),
-            ));
+        let base_file_format: String = table
+            .hudi_configs
+            .get_or_default(HudiTableConfig::BaseFileFormat)
+            .into();
+        if !base_file_format.eq_ignore_ascii_case(BaseFileFormatValue::Parquet.as_ref()) {
+            return Err(Execution(format!(
+                "Unsupported base file format '{base_file_format}' for HudiDataSource; only parquet is supported"
+            )));
         }
 
         // Cache schema with meta fields at construction for synchronous access
@@ -273,89 +204,11 @@ impl HudiDataSource {
             partition_schema,
             cached_stats,
             input_partitions,
-            read_optimized_mode,
-            file_slice_read_concurrency,
-            base_file_format,
         })
     }
 
     fn get_input_partitions(&self) -> usize {
         self.input_partitions
-    }
-
-    #[cfg(test)]
-    fn get_file_slice_read_concurrency(&self) -> usize {
-        self.file_slice_read_concurrency
-    }
-
-    /// Returns the effective `UseReadOptimizedMode` value cached from the
-    /// table options at construction time. Used by [`Self::use_parquet_source`]
-    /// to decide whether MOR snapshot semantics are required.
-    fn effective_read_optimized(&self) -> bool {
-        self.read_optimized_mode
-    }
-
-    fn scan_read_options(
-        &self,
-        pushdown_filters: Vec<(String, String, String)>,
-        read_optimized: bool,
-    ) -> Result<ReadOptions> {
-        let mut read_options = ReadOptions::new()
-            .with_filters(pushdown_filters)
-            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?;
-        if read_optimized {
-            read_options = read_options.with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
-        }
-        Ok(read_options)
-    }
-
-    /// Returns true iff every file slice has a `.parquet` base file.
-    /// Empty input returns `false` so the scan is routed to `HudiScanExec`,
-    /// which handles the empty case via `RecordBatchStreamAdapter::new(.., empty())`.
-    fn file_slices_are_parquet(file_slices: &[FileSlice]) -> Result<bool> {
-        if file_slices.is_empty() {
-            return Ok(false);
-        }
-        for file_slice in file_slices {
-            let relative_path = file_slice.base_file_relative_path().map_err(|e| {
-                Execution(format!(
-                    "Failed to get base file relative path for {file_slice:?} due to {e:?}"
-                ))
-            })?;
-            if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Decides whether a scan can be served by DataFusion's native
-    /// `ParquetSource` (cheap row-group / page pruning) or must go through
-    /// [`HudiScanExec`].
-    ///
-    /// Routing matrix:
-    /// - Parquet COW → `ParquetSource`
-    /// - Parquet MOR read-optimized → `ParquetSource`
-    /// - Parquet MOR snapshot → `HudiScanExec` (base + log merging)
-    /// - Lance and any other base format → `HudiScanExec`
-    fn use_parquet_source(
-        &self,
-        read_options: &ReadOptions,
-        file_slices: &[FileSlice],
-    ) -> Result<bool> {
-        let parquet_base_files = match &self.base_file_format {
-            Some(format) => matches!(format, BaseFileFormatValue::Parquet),
-            None => Self::file_slices_are_parquet(file_slices)?,
-        };
-        if !parquet_base_files {
-            return Ok(false);
-        }
-        if !self.table.is_mor() {
-            return Ok(true);
-        }
-        read_options
-            .is_read_optimized()
-            .map_err(|e| Execution(format!("Invalid read-optimized option: {e}")))
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -471,17 +324,62 @@ impl HudiDataSource {
             _ => false,
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    async fn scan_parquet(
+#[async_trait]
+impl TableProvider for HudiDataSource {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.cached_stats.clone()
+    }
+
+    async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-        flat_slices: Vec<FileSlice>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input_partitions = self.get_input_partitions_for_scan(state);
+        self.table.register_storage(state.runtime_env().clone());
+
+        // Resolve input partitions: use Hudi config if set, otherwise fall back
+        // to DataFusion's target_partitions (defaults to number of CPU cores).
+        let input_partitions = match self.get_input_partitions() {
+            0 => state.config_options().execution.target_partitions,
+            n => n,
+        };
+
+        // Only push down partition column filters to Hudi's file listing layer.
+        // Non-partition filters would trigger Parquet footer reads for file-level
+        // stats pruning, which is redundant since DataFusion's ParquetSource already
+        // handles row-group/page-level pruning during the scan.
+        let partition_cols = self.get_partition_columns();
+        let partition_filters: Vec<Expr> = filters
+            .iter()
+            .filter(|expr| Self::is_partition_column_filter(expr, &partition_cols))
+            .cloned()
+            .collect();
+        let pushdown_filters = exprs_to_filters(&partition_filters);
+        let read_options = ReadOptions::new()
+            .with_filters(pushdown_filters)
+            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?
+            .with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
+        let flat_slices = self
+            .table
+            .get_file_slices(&read_options)
+            .await
+            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
         let file_slices =
             hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
         let base_url = self.table.base_url();
@@ -503,7 +401,9 @@ impl HudiDataSource {
             parquet_file_groups.push(parquet_file_group_vec)
         }
 
+        let base_url = self.table.base_url();
         let url = ObjectStoreUrl::parse(get_scheme_authority(&base_url))?;
+
         let parquet_opts = TableParquetOptions {
             global: state.config_options().execution.parquet.clone(),
             column_specific_options: Default::default(),
@@ -533,146 +433,17 @@ impl HudiDataSource {
             .with_projection_indices(projection.cloned())?
             .with_limit(limit);
 
+        // Pass table statistics to the physical plan so DataFusion's join_selection
+        // optimizer can swap build/probe sides and choose broadcast joins.
         if let Some(stats) = &self.cached_stats {
             fsc_builder = fsc_builder.with_statistics(stats.clone());
         }
 
         let fsc = fsc_builder.build();
+
         Ok(Arc::new(DataSourceExec::new(Arc::new(fsc))))
     }
 
-    async fn scan_hudi(
-        &self,
-        projection: Option<&Vec<usize>>,
-        input_partitions: usize,
-        flat_slices: Vec<FileSlice>,
-        read_options: ReadOptions,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let file_slices =
-            hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
-
-        let file_group_reader = Arc::new(
-            self.table
-                .create_file_group_reader_with_options(Some(&read_options), empty_options())
-                .map_err(|e| Execution(format!("Failed to create FileGroupReader: {e}")))?,
-        );
-
-        let mut hudi_read_options = read_options;
-        if let Some(proj) = projection {
-            let col_names: Vec<String> = proj
-                .iter()
-                .map(|&i| self.schema.field(i).name().clone())
-                .collect();
-            hudi_read_options = hudi_read_options.with_projection(col_names);
-        }
-
-        Ok(Arc::new(HudiScanExec::new(
-            file_slices,
-            file_group_reader,
-            hudi_read_options,
-            self.file_slice_read_concurrency,
-            self.schema.clone(),
-            projection.cloned(),
-        )))
-    }
-
-    fn get_input_partitions_for_scan(&self, state: &dyn Session) -> usize {
-        match self.get_input_partitions() {
-            0 => state.config_options().execution.target_partitions,
-            n => n,
-        }
-    }
-}
-
-#[async_trait]
-impl TableProvider for HudiDataSource {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.cached_stats.clone()
-    }
-
-    /// Builds the scan `ExecutionPlan` for this Hudi table.
-    ///
-    /// Per DataFusion's [custom table provider guide], `scan()` is meant to
-    /// run during planning and stay cheap. This implementation deviates from
-    /// that ideal: it calls `Table::get_file_slices(&read_options)`, which
-    /// performs I/O proportional to the partition count: directory listing
-    /// for storage-listing tables, or metadata-table HFile reads when MDT is
-    /// enabled. The cost is unavoidable for partition pruning at plan time
-    /// and is the same pattern DataFusion's own `ListingTable` uses.
-    ///
-    /// Callers that issue many `scan()` calls per session against the same
-    /// table (e.g. ad-hoc SQL across the same dataset) may see planning
-    /// latency dominated by the file listing. Future work could cache the
-    /// resolved file-slice set keyed by `(filters, as_of_timestamp)`.
-    ///
-    /// We implement the legacy `scan()` rather than `scan_with_args()`. The
-    /// default `scan_with_args()` impl delegates to `scan()`, so today's
-    /// behavior is identical. Revisit if a future DataFusion version adds
-    /// optimization hints to `scan_with_args()` that we'd want to consume.
-    ///
-    /// [custom table provider guide]: https://datafusion.apache.org/library-user-guide/custom-table-providers.html
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Idempotent: registers our object store with the session's runtime
-        // so the Parquet path (DataSourceExec) can resolve `s3://`/`gs://`/`az://`
-        // URIs. Per-scan invocation is intentional: `TableProvider` has no
-        // registration hook called by the SessionContext, and direct callers
-        // (`HudiDataSource::new`) wouldn't have a chance to call it otherwise.
-        self.table.register_storage(state.runtime_env().clone());
-
-        let input_partitions = self.get_input_partitions_for_scan(state);
-
-        let partition_cols = self.get_partition_columns();
-        let partition_filters: Vec<Expr> = filters
-            .iter()
-            .filter(|expr| Self::is_partition_column_filter(expr, &partition_cols))
-            .cloned()
-            .collect();
-        let pushdown_filters = exprs_to_filters(&partition_filters);
-
-        let read_optimized = self.effective_read_optimized();
-        let read_options = self.scan_read_options(pushdown_filters, read_optimized)?;
-        let flat_slices = self
-            .table
-            .get_file_slices(&read_options)
-            .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
-
-        if self.use_parquet_source(&read_options, &flat_slices)? {
-            self.scan_parquet(state, projection, filters, limit, flat_slices)
-                .await
-        } else {
-            self.scan_hudi(projection, input_partitions, flat_slices, read_options)
-                .await
-        }
-    }
-
-    /// # Limitations
-    ///
-    /// AND expressions that mix partition-column predicates with non-partition
-    /// predicates are reported as `Inexact`, not partial `Exact`. The
-    /// partition-column atom still drives partition pruning at `scan()` time
-    /// (via `exprs_to_filters` which extracts conjuncts), but DataFusion will
-    /// redundantly re-evaluate it in `FilterExec`. To remove the redundancy,
-    /// split each filter via `datafusion::logical_expr::utils::split_conjunction`
-    /// before returning the per-filter verdict.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -799,49 +570,12 @@ mod tests {
                 .unwrap();
         let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
         assert_eq!(hudi.get_input_partitions(), 0);
-        assert_eq!(
-            hudi.get_file_slice_read_concurrency(),
-            default_file_slice_read_concurrency()
-        );
         assert_eq!(hudi.table_type(), TableType::Base);
         assert_eq!(hudi.statistics(), None);
     }
 
     #[tokio::test]
-    async fn test_new_with_options_sets_file_slice_read_concurrency() {
-        let hudi = HudiDataSource::new_with_options(
-            V6Nonpartitioned.path_to_cow().as_str(),
-            [(FileSliceReadConcurrency.as_ref(), "2")],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(hudi.get_file_slice_read_concurrency(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_new_with_options_rejects_invalid_file_slice_read_concurrency() {
-        for invalid in ["0", "abc"] {
-            let result = HudiDataSource::new_with_options(
-                V6Nonpartitioned.path_to_cow().as_str(),
-                [(FileSliceReadConcurrency.as_ref(), invalid)],
-            )
-            .await;
-
-            assert!(result.is_err());
-            let error = result.unwrap_err().to_string();
-            assert!(error.contains(FileSliceReadConcurrency.as_ref()));
-            assert!(error.contains(invalid));
-        }
-    }
-
-    #[test]
-    fn test_file_slices_are_parquet_empty_is_false() {
-        assert!(!HudiDataSource::file_slices_are_parquet(&[]).unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_new_with_options_rejects_hfile_format_for_regular_scan() {
+    async fn test_new_with_options_fails_fast_on_non_parquet_base_file_format() {
         let result = HudiDataSource::new_with_options(
             V6Nonpartitioned.path_to_cow().as_str(),
             [
@@ -856,24 +590,17 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "HFile format should be rejected for regular DataFusion scans"
+            "Expected constructor fail-fast for unsupported base file format"
         );
-        assert!(result.unwrap_err().to_string().contains("HFile"));
-    }
-
-    #[tokio::test]
-    async fn test_new_with_options_rejects_invalid_base_file_format_config() {
-        let result = HudiDataSource::new_with_options(
-            V6Nonpartitioned.path_to_cow().as_str(),
-            [
-                (HudiTableConfig::BaseFileFormat.as_ref(), "orc"),
-                (HudiInternalConfig::SkipConfigValidation.as_ref(), "true"),
-            ],
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("orc"));
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Unsupported base file format 'hfile'"),
+            "Expected explicit base format error, got: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("only parquet is supported"),
+            "Expected parquet-only guidance, got: {error_msg}"
+        );
     }
 
     #[tokio::test]
