@@ -106,6 +106,19 @@ pub struct HudiDataSource {
     /// and is needed synchronously in `supports_filters_pushdown`.
     partition_schema: Schema,
     /// Cached table-level statistics for join ordering and broadcast decisions.
+    ///
+    /// Consumed in two places:
+    /// 1. `TableProvider::statistics()` - returned to the optimizer (note:
+    ///    DataFusion's main planner does not currently consult this method;
+    ///    see the trait docs).
+    /// 2. `scan_parquet` - passed to `FileScanConfigBuilder::with_statistics(...)`,
+    ///    which IS consumed by the optimizer for join planning on the
+    ///    Parquet/COW fast path.
+    ///
+    /// The `HudiScanExec` path (Lance and MOR snapshot) derives statistics
+    /// per-execution from `FileSlice` metadata via `aggregate_partitions`
+    /// rather than reusing this table-level cache, since per-partition stats
+    /// are more useful for that path.
     cached_stats: Option<Statistics>,
     /// Number of input partitions for scan planning, extracted from read options.
     input_partitions: usize,
@@ -589,6 +602,27 @@ impl TableProvider for HudiDataSource {
         self.cached_stats.clone()
     }
 
+    /// Builds the scan `ExecutionPlan` for this Hudi table.
+    ///
+    /// Per DataFusion's [custom table provider guide], `scan()` is meant to
+    /// run during planning and stay cheap. This implementation deviates from
+    /// that ideal: it calls `Table::get_file_slices(&read_options)`, which
+    /// performs I/O proportional to the partition count: directory listing
+    /// for storage-listing tables, or metadata-table HFile reads when MDT is
+    /// enabled. The cost is unavoidable for partition pruning at plan time
+    /// and is the same pattern DataFusion's own `ListingTable` uses.
+    ///
+    /// Callers that issue many `scan()` calls per session against the same
+    /// table (e.g. ad-hoc SQL across the same dataset) may see planning
+    /// latency dominated by the file listing. Future work could cache the
+    /// resolved file-slice set keyed by `(filters, as_of_timestamp)`.
+    ///
+    /// We implement the legacy `scan()` rather than `scan_with_args()`. The
+    /// default `scan_with_args()` impl delegates to `scan()`, so today's
+    /// behavior is identical. Revisit if a future DataFusion version adds
+    /// optimization hints to `scan_with_args()` that we'd want to consume.
+    ///
+    /// [custom table provider guide]: https://datafusion.apache.org/library-user-guide/custom-table-providers.html
     async fn scan(
         &self,
         state: &dyn Session,
@@ -596,6 +630,11 @@ impl TableProvider for HudiDataSource {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Idempotent: registers our object store with the session's runtime
+        // so the Parquet path (DataSourceExec) can resolve `s3://`/`gs://`/`az://`
+        // URIs. Per-scan invocation is intentional: `TableProvider` has no
+        // registration hook called by the SessionContext, and direct callers
+        // (`HudiDataSource::new`) wouldn't have a chance to call it otherwise.
         self.table.register_storage(state.runtime_env().clone());
 
         let input_partitions = self.get_input_partitions_for_scan(state);
@@ -625,6 +664,15 @@ impl TableProvider for HudiDataSource {
         }
     }
 
+    /// # Limitations
+    ///
+    /// AND expressions that mix partition-column predicates with non-partition
+    /// predicates are reported as `Inexact`, not partial `Exact`. The
+    /// partition-column atom still drives partition pruning at `scan()` time
+    /// (via `exprs_to_filters` which extracts conjuncts), but DataFusion will
+    /// redundantly re-evaluate it in `FilterExec`. To remove the redundancy,
+    /// split each filter via `datafusion::logical_expr::utils::split_conjunction`
+    /// before returning the per-filter verdict.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

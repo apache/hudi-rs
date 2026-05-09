@@ -21,10 +21,14 @@
 
 use std::any::Any;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -33,8 +37,8 @@ use datafusion::physical_plan::{
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, Result, Statistics};
-use futures::stream::TryStreamExt;
-use futures::{StreamExt, stream};
+use futures::stream::{self, BoxStream, TryStreamExt};
+use futures::{Stream, StreamExt};
 
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::file_group::reader::FileGroupReader;
@@ -56,6 +60,7 @@ pub struct HudiScanExec {
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl HudiScanExec {
@@ -74,6 +79,11 @@ impl HudiScanExec {
             schema.clone()
         };
 
+        // Empty input is normalized to one empty partition so that
+        // `Partitioning::UnknownPartitioning(0)` doesn't propagate downstream
+        // (DataFusion's planners typically expect at least one partition; some
+        // operators panic on zero). `execute(0)` then returns an empty stream
+        // via the `if file_slices.is_empty()` short-circuit below.
         let partitions: Vec<Arc<Vec<FileSlice>>> = if file_slice_partitions.is_empty() {
             vec![Arc::new(vec![])]
         } else {
@@ -96,7 +106,36 @@ impl HudiScanExec {
             projected_schema,
             projection,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+}
+
+struct BaselineMetricStream {
+    inner: BoxStream<'static, Result<RecordBatch>>,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl BaselineMetricStream {
+    fn new<S>(stream: S, baseline_metrics: BaselineMetrics) -> Self
+    where
+        S: Stream<Item = Result<RecordBatch>> + Send + 'static,
+    {
+        Self {
+            inner: stream.boxed(),
+            baseline_metrics,
+        }
+    }
+}
+
+impl Stream for BaselineMetricStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let _timer = this.baseline_metrics.elapsed_compute().timer();
+        let poll = this.inner.as_mut().poll_next(cx);
+        this.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -151,6 +190,22 @@ impl ExecutionPlan for HudiScanExec {
         }
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    // Default `cardinality_effect()` (`Unknown`) is intentional. The
+    // `CardinalityEffect::Equal` variant describes pass-through nodes that
+    // preserve their input cardinality; for a leaf scan whose row count
+    // comes from `partition_statistics()`, `Unknown` is the conservative
+    // and correct value.
+
+    // We deliberately do NOT override `repartitioned`. Partition count is
+    // fixed at `scan()` time from `state.target_partitions` (or the
+    // `hoodie.read.input.partitions` config) and we re-chunk file slices
+    // accordingly. Re-chunking after the fact would require redistributing
+    // already-bound `FileSlice` lists, which is not currently worth the
+    // complexity. Default `Ok(None)` declines re-partitioning.
     fn execute(
         &self,
         partition: usize,
@@ -168,11 +223,13 @@ impl ExecutionPlan for HudiScanExec {
             .clone();
 
         let projected_schema = self.projected_schema.clone();
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
         if file_slices.is_empty() {
+            let stream = BaselineMetricStream::new(futures::stream::empty(), baseline_metrics);
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 projected_schema,
-                futures::stream::empty(),
+                stream,
             )));
         }
 
@@ -209,6 +266,7 @@ impl ExecutionPlan for HudiScanExec {
             // when one slice is slower than its neighbours.
             .buffer_unordered(concurrency)
             .try_flatten_unordered(concurrency);
+        let stream = BaselineMetricStream::new(stream, baseline_metrics);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
@@ -309,10 +367,15 @@ impl HudiScanExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::Schema;
+    use hudi_core::config::util::empty_options;
     use hudi_core::file_group::base_file::BaseFile;
     use hudi_core::storage::file_metadata::FileMetadata;
     use std::collections::BTreeSet;
+    use std::fs::canonicalize;
+    use std::path::Path;
     use std::str::FromStr;
+    use url::Url;
 
     fn file_slice_with_meta(
         file_name: &str,
@@ -398,5 +461,27 @@ mod tests {
 
         assert!(matches!(stats.num_rows, Precision::Absent));
         assert_eq!(stats.total_byte_size, Precision::Inexact(500));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_override_is_wired() {
+        let base_url =
+            Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
+                .unwrap();
+        let reader = Arc::new(
+            FileGroupReader::new_with_options(base_url.as_str(), empty_options())
+                .await
+                .unwrap(),
+        );
+        let exec = HudiScanExec::new(
+            vec![],
+            reader,
+            ReadOptions::new(),
+            1,
+            Arc::new(Schema::empty()),
+            None,
+        );
+
+        assert!(exec.metrics().is_some());
     }
 }
