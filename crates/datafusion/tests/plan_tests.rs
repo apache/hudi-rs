@@ -564,7 +564,7 @@ mod dispatch_tests {
 mod lance_tests {
     use super::*;
     use arrow_array::{Float64Array, Int32Array, Int64Array};
-    use hudi_test::SampleTable::V9LanceNonpartitioned;
+    use hudi_test::SampleTable::{V9LanceNonpartitioned, V9LanceTxnsSimple};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -693,5 +693,36 @@ mod lance_tests {
         assert!((rows[&2] - 0.93).abs() < 1e-9);
         assert!(rows.contains_key(&9));
         assert!(rows.contains_key(&10));
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_partitioned_lance_filter_uses_hudi_scan_exec() {
+        let test_table = V9LanceTxnsSimple;
+        let ctx = register_table_direct(&test_table, empty_options())
+            .await
+            .unwrap();
+
+        let sql = format!(
+            "SELECT txn_id, txn_type FROM {} WHERE region = 'us' ORDER BY txn_id",
+            test_table.as_ref()
+        );
+        let plan = explain_physical_plan(&ctx, &sql).await;
+        assert!(
+            plan.contains("HudiScanExec"),
+            "Partitioned Lance table should use HudiScanExec. Plan: {plan}"
+        );
+
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let txn_ids = batches
+            .iter()
+            .flat_map(|batch| get_str_column(batch, "txn_id"))
+            .collect::<Vec<_>>();
+        let txn_types = batches
+            .iter()
+            .flat_map(|batch| get_str_column(batch, "txn_type"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(txn_ids, ["TXN-001", "TXN-003", "TXN-013", "TXN-014"]);
+        assert_eq!(txn_types, ["reversal", "transfer", "debit", "debit"]);
     }
 }

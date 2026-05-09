@@ -28,6 +28,7 @@ use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use lance_core::cache::LanceCache;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
@@ -46,7 +47,6 @@ use crate::storage::file_metadata::FileMetadata;
 use crate::storage::util::join_url_segments;
 
 const DEFAULT_BATCH_SIZE: u32 = 8192;
-const DEFAULT_BATCH_READAHEAD: u32 = 16;
 
 /// Lance implementation of [`BaseFileReader`].
 ///
@@ -80,11 +80,11 @@ impl LanceBaseFileReader {
                         (*self.storage.options).clone(),
                     ),
                 );
-                // `ObjectStoreParams::storage_options_accessor` is marked deprecated in
-                // lance-io 4.0.x but is still the only supported way to forward
-                // hudi-rs's storage option map (e.g. cloud credentials, custom
-                // endpoints) into Lance's provider prefix calculation. The replacement
-                // API is not yet exposed by lance-io; revisit when upgrading lance-io.
+                // `ObjectStoreParams::object_store` is marked deprecated in lance-io
+                // 4.0.x in favor of implementing `ObjectStoreProvider`. We still set
+                // it here so Lance reuses the ObjectStore we already built (with
+                // hudi-rs's storage options applied) and skips re-resolving
+                // credentials. `storage_options_accessor` itself is current API.
                 #[allow(deprecated)]
                 let params = lance_io::object_store::ObjectStoreParams {
                     object_store: Some((
@@ -141,7 +141,10 @@ impl LanceBaseFileReader {
     /// Build a `ReaderProjection` from the requested column names. Empty
     /// projections return `Ok(None)`: lance-file rejects zero-column
     /// projections, so callers that want a row-count-preserving scan must
-    /// handle the empty case themselves.
+    /// handle the empty case themselves. `ReaderProjection::from_column_names`
+    /// is case-sensitive: every column in `col_names` must match the Lance file
+    /// schema exactly. lance-core has case-insensitive helpers, but
+    /// `Schema::project` does not use them here.
     fn build_projection(
         col_names: &[String],
         metadata: &CachedFileMetadata,
@@ -190,6 +193,9 @@ impl LanceBaseFileReader {
             None => None,
         };
 
+        // `no_cache` is fine for sequential full-file scans; the file metadata is
+        // already shared via `Arc<CachedFileMetadata>` (see try_open_with_file_metadata).
+        // Switch to `LanceCache::with_capacity(...)` if we ever add take/range workloads.
         let cache = LanceCache::no_cache();
         let path = file_scheduler.reader().path().clone();
         let options = FileReaderOptions::default();
@@ -231,8 +237,12 @@ impl LanceBaseFileReader {
     /// row count. Used to satisfy projection-elimination scans (e.g.
     /// DataFusion `SELECT COUNT(*)`) without rejecting on Lance's
     /// zero-column-projection check.
-    async fn empty_projection_stream(&self, relative_path: &str) -> Result<BaseFileStream> {
-        let file_scheduler = self.open_file_scheduler(relative_path, None).await?;
+    async fn empty_projection_stream(
+        &self,
+        relative_path: &str,
+        known_size: Option<u64>,
+    ) -> Result<BaseFileStream> {
+        let file_scheduler = self.open_file_scheduler(relative_path, known_size).await?;
         let metadata = FileReader::read_all_metadata(&file_scheduler)
             .await
             .map_err(|e| {
@@ -270,19 +280,34 @@ impl BaseFileReader for LanceBaseFileReader {
             // projections; emit a single empty-schema batch with the row
             // count derived from metadata instead.
             if options.projection.as_ref().is_some_and(|p| p.is_empty()) {
-                return self.empty_projection_stream(relative_path).await;
+                return self
+                    .empty_projection_stream(relative_path, options.known_file_size)
+                    .await;
             }
 
             let (reader, _) = self
-                .open_file_reader_with_metadata(relative_path, options.projection.as_deref(), None)
+                .open_file_reader_with_metadata(
+                    relative_path,
+                    options.projection.as_deref(),
+                    options.known_file_size,
+                )
                 .await?;
 
-            let batch_size = options.batch_size.unwrap_or(DEFAULT_BATCH_SIZE as usize) as u32;
+            let batch_size = options
+                .batch_size
+                .map(|size| u32::try_from(size).unwrap_or(u32::MAX))
+                .unwrap_or(DEFAULT_BATCH_SIZE);
+            let batch_readahead =
+                u32::try_from(get_num_compute_intensive_cpus()).unwrap_or(u32::MAX);
             let lance_stream = reader
                 .read_stream(
                     ReadBatchParams::RangeFull,
                     batch_size,
-                    DEFAULT_BATCH_READAHEAD,
+                    batch_readahead,
+                    // lance-file 4.0.x decoders do not act on FilterExpression:
+                    // per lance-encoding, "the core decoders do not currently
+                    // take advantage of filtering in any way." Predicate pushdown,
+                    // when desired, must happen before this point (DataFusion FilterExec).
                     FilterExpression::no_filter(),
                 )
                 .map_err(|e| {
@@ -304,13 +329,13 @@ impl BaseFileReader for LanceBaseFileReader {
     fn get_metadata_and_stats<'a>(
         &'a self,
         relative_path: &'a str,
-        table_schema: &'a arrow_schema::Schema,
+        _table_schema: &'a arrow_schema::Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
         Box::pin(async move {
             let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
             let obj_path = ObjPath::from_url_path(obj_url.path())?;
             let head = self.storage.object_store.head(&obj_path).await?;
-            let file_size = head.size as u64;
+            let file_size = head.size;
 
             // Open with the size we just discovered so Lance doesn't issue
             // its own head request.
@@ -324,25 +349,27 @@ impl BaseFileReader for LanceBaseFileReader {
                 .unwrap_or(relative_path)
                 .to_string();
 
-            let num_rows = reader.num_rows() as i64;
+            let num_rows = i64::try_from(reader.num_rows()).unwrap_or(i64::MAX);
 
             let file_metadata = FileMetadata {
                 name,
                 size: file_size,
-                byte_size: file_size as i64,
+                byte_size: i64::try_from(file_size).unwrap_or(i64::MAX),
                 num_records: num_rows,
             };
 
-            // lance-file 4.0.x exposes file-level row count and schema but no
-            // per-column min/max via `FileReader`. Populate row count and an
-            // entry per schema column with empty bounds so callers receive a
-            // consistent shape; column-level pruning falls back to "include".
+            // lance-file 4.0.x v2 format does not expose per-column min/max via
+            // `FileReader` (only num_pages and size_bytes via `FileStatistics`).
+            // Populate an entry per file column with empty bounds so column-level
+            // pruning falls back to "include".
             let mut col_stats = StatisticsContainer::new(StatsGranularity::File);
             col_stats.num_rows = Some(num_rows);
-            for field in table_schema.fields() {
+            let file_schema = reader.schema();
+            for field in &file_schema.fields {
+                let field_name = field.name.clone();
                 col_stats.columns.insert(
-                    field.name().clone(),
-                    ColumnStatistics::new(field.name().clone(), field.data_type().clone()),
+                    field_name.clone(),
+                    ColumnStatistics::new(field_name, field.data_type()),
                 );
             }
 

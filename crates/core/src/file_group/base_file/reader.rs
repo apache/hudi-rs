@@ -40,6 +40,8 @@ pub struct BaseFileReadOptions {
     pub batch_size: Option<usize>,
     /// Column projection by names.
     pub projection: Option<Vec<String>>,
+    /// Known base-file size in bytes, when the caller already has file metadata.
+    pub known_file_size: Option<u64>,
 }
 
 impl BaseFileReadOptions {
@@ -49,6 +51,12 @@ impl BaseFileReadOptions {
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Sets the known base-file size in bytes.
+    pub fn with_known_file_size(mut self, size: u64) -> Self {
+        self.known_file_size = Some(size);
         self
     }
 

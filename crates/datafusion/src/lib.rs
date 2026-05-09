@@ -296,6 +296,9 @@ impl HudiDataSource {
         Ok(read_options)
     }
 
+    /// Returns true iff every file slice has a `.parquet` base file.
+    /// Empty input returns `false` so the scan is routed to `HudiScanExec`,
+    /// which handles the empty case via `RecordBatchStreamAdapter::new(.., empty())`.
     fn file_slices_are_parquet(file_slices: &[FileSlice]) -> Result<bool> {
         if file_slices.is_empty() {
             return Ok(false);

@@ -49,7 +49,7 @@ use hudi_core::table::ReadOptions;
 /// native `ParquetSource` path for row-group/page-level pruning.
 #[derive(Debug)]
 pub struct HudiScanExec {
-    file_slice_partitions: Vec<Vec<FileSlice>>,
+    file_slice_partitions: Vec<Arc<Vec<FileSlice>>>,
     file_group_reader: Arc<FileGroupReader>,
     read_options: ReadOptions,
     file_slice_read_concurrency: usize,
@@ -74,10 +74,10 @@ impl HudiScanExec {
             schema.clone()
         };
 
-        let partitions = if file_slice_partitions.is_empty() {
-            vec![vec![]]
+        let partitions: Vec<Arc<Vec<FileSlice>>> = if file_slice_partitions.is_empty() {
+            vec![Arc::new(vec![])]
         } else {
-            file_slice_partitions
+            file_slice_partitions.into_iter().map(Arc::new).collect()
         };
         let n_partitions = partitions.len();
 
@@ -183,8 +183,9 @@ impl ExecutionPlan for HudiScanExec {
             .min(file_slices.len())
             .max(1);
 
-        let stream = stream::iter(file_slices)
-            .map(move |file_slice| {
+        let stream = stream::iter(0..file_slices.len())
+            .map(move |idx| {
+                let file_slice = file_slices[idx].clone();
                 let reader = reader.clone();
                 let options = options.clone();
                 async move {
@@ -223,10 +224,14 @@ impl ExecutionPlan for HudiScanExec {
         let column_statistics =
             vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
 
-        let partitions: Box<dyn Iterator<Item = &Vec<FileSlice>>> = match partition {
-            None => Box::new(self.file_slice_partitions.iter()),
+        let partitions: Box<dyn Iterator<Item = &[FileSlice]> + '_> = match partition {
+            None => Box::new(
+                self.file_slice_partitions
+                    .iter()
+                    .map(|slices| slices.as_slice()),
+            ),
             Some(idx) => match self.file_slice_partitions.get(idx) {
-                Some(slices) => Box::new(std::iter::once(slices)),
+                Some(slices) => Box::new(std::iter::once(slices.as_slice())),
                 None => return Ok(Statistics::new_unknown(&self.projected_schema)),
             },
         };
@@ -239,7 +244,12 @@ impl HudiScanExec {
     fn aggregate_file_slice_statistics(&self) -> Statistics {
         let column_statistics =
             vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
-        Self::aggregate_partitions(self.file_slice_partitions.iter(), column_statistics)
+        Self::aggregate_partitions(
+            self.file_slice_partitions
+                .iter()
+                .map(|slices| slices.as_slice()),
+            column_statistics,
+        )
     }
 
     fn aggregate_partitions<'a, I>(
@@ -247,7 +257,7 @@ impl HudiScanExec {
         column_statistics: Vec<ColumnStatistics>,
     ) -> Statistics
     where
-        I: IntoIterator<Item = &'a Vec<FileSlice>>,
+        I: IntoIterator<Item = &'a [FileSlice]>,
     {
         let mut total_rows: u64 = 0;
         let mut total_byte_size: u64 = 0;
@@ -341,7 +351,7 @@ mod tests {
         ];
 
         let stats = HudiScanExec::aggregate_partitions(
-            partitions.iter(),
+            partitions.iter().map(Vec::as_slice),
             vec![ColumnStatistics::new_unknown(); 2],
         );
 
@@ -362,7 +372,7 @@ mod tests {
         }]];
 
         let stats = HudiScanExec::aggregate_partitions(
-            slices.iter(),
+            slices.iter().map(Vec::as_slice),
             vec![ColumnStatistics::new_unknown()],
         );
 
@@ -382,7 +392,7 @@ mod tests {
         )]];
 
         let stats = HudiScanExec::aggregate_partitions(
-            slices.iter(),
+            slices.iter().map(Vec::as_slice),
             vec![ColumnStatistics::new_unknown()],
         );
 

@@ -320,6 +320,11 @@ impl FileGroupReader {
         options: &ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let base_file_path = file_slice.base_file_relative_path()?;
+        let known_base_file_size = file_slice
+            .base_file
+            .file_metadata
+            .as_ref()
+            .map(|metadata| metadata.size);
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
             file_slice
                 .log_files
@@ -330,8 +335,13 @@ impl FileGroupReader {
             vec![]
         };
 
-        self.read_file_slice_from_paths_stream(&base_file_path, log_file_paths, options)
-            .await
+        self.read_file_slice_from_paths_stream_inner(
+            &base_file_path,
+            log_file_paths,
+            options,
+            known_base_file_size,
+        )
+        .await
     }
 
     /// Reads a file slice from paths as a stream of record batches.
@@ -355,9 +365,26 @@ impl FileGroupReader {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.read_file_slice_from_paths_stream_inner(base_file_path, log_file_paths, options, None)
+            .await
+    }
+
+    async fn read_file_slice_from_paths_stream_inner<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+        options: &ReadOptions,
+        known_base_file_size: Option<u64>,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let options = self.resolve_read_options(options)?;
         if options.is_read_optimized()? {
-            return self.read_base_file_stream(base_file_path, &options).await;
+            return self
+                .read_base_file_stream(base_file_path, &options, known_base_file_size)
+                .await;
         }
 
         let log_file_paths: Vec<String> = log_file_paths
@@ -366,7 +393,8 @@ impl FileGroupReader {
             .collect();
 
         if log_file_paths.is_empty() {
-            self.read_base_file_stream(base_file_path, &options).await
+            self.read_base_file_stream(base_file_path, &options, known_base_file_size)
+                .await
         } else {
             // Fallback: collect + merge, then yield as single-item stream
             let batch = self
@@ -387,6 +415,7 @@ impl FileGroupReader {
         &self,
         relative_path: &str,
         options: &ReadOptions,
+        known_file_size: Option<u64>,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let default_batch_size: usize = self
             .hudi_configs
@@ -394,6 +423,9 @@ impl FileGroupReader {
             .into();
         let batch_size = options.batch_size()?.unwrap_or(default_batch_size);
         let mut read_options = BaseFileReadOptions::default().with_batch_size(batch_size);
+        if let Some(size) = known_file_size {
+            read_options = read_options.with_known_file_size(size);
+        }
 
         // If projection is set, widen the base file read to also include any columns
         // we need post-read but the user didn't request:
