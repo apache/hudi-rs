@@ -234,9 +234,9 @@ impl LanceBaseFileReader {
     }
 
     /// Build a single zero-column [`RecordBatch`] with the Lance file's
-    /// row count. Used to satisfy projection-elimination scans (e.g.
-    /// DataFusion `SELECT COUNT(*)`) without rejecting on Lance's
-    /// zero-column-projection check.
+    /// row count. Callers requesting an empty projection
+    /// (`Some(vec![])`) get row-count-only semantics without tripping
+    /// `lance-file`'s zero-column-projection rejection.
     async fn empty_projection_stream(
         &self,
         relative_path: &str,
@@ -275,10 +275,10 @@ impl BaseFileReader for LanceBaseFileReader {
         options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
-            // DataFusion sends `Some(vec![])` as the projection for queries
-            // like `SELECT COUNT(*)` and lance-file rejects zero-column
-            // projections; emit a single empty-schema batch with the row
-            // count derived from metadata instead.
+            // `Some(vec![])` is the row-count-only request shape on
+            // `BaseFileReadOptions`. lance-file rejects zero-column
+            // projections, so emit a single empty-schema batch carrying
+            // the row count from file metadata instead.
             if options.projection.as_ref().is_some_and(|p| p.is_empty()) {
                 return self
                     .empty_projection_stream(relative_path, options.known_file_size)
@@ -306,8 +306,9 @@ impl BaseFileReader for LanceBaseFileReader {
                     batch_readahead,
                     // lance-file 4.0.x decoders do not act on FilterExpression:
                     // per lance-encoding, "the core decoders do not currently
-                    // take advantage of filtering in any way." Predicate pushdown,
-                    // when desired, must happen before this point (DataFusion FilterExec).
+                    // take advantage of filtering in any way." Callers needing
+                    // row-level predicates must apply them on the returned
+                    // record batches.
                     FilterExpression::no_filter(),
                 )
                 .map_err(|e| {
@@ -404,24 +405,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lance_reader_read_data_schema_correctness() {
-        let storage = lance_test_storage();
-        let reader = LanceBaseFileReader::new(storage);
-        let file_name = lance_base_file_name();
-
-        let batch = reader
-            .read_data(&file_name, BaseFileReadOptions::new())
-            .await
-            .unwrap();
-
-        assert!(batch.num_rows() > 0);
-        let schema = batch.schema();
-        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert!(field_names.contains(&"id"));
-        assert!(field_names.contains(&"name"));
-    }
-
-    #[tokio::test]
     async fn test_lance_reader_read_data_with_projection() {
         let storage = lance_test_storage();
         let reader = LanceBaseFileReader::new(storage);
@@ -480,7 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lance_reader_get_schema_matches_data_schema() {
+    async fn test_lance_reader_get_schema_matches_data_schema_with_expected_fields() {
         let storage = lance_test_storage();
         let reader = LanceBaseFileReader::new(storage);
         let file_name = lance_base_file_name();
@@ -490,7 +473,11 @@ mod tests {
             .read_data(&file_name, BaseFileReadOptions::new())
             .await
             .unwrap();
+        assert!(batch.num_rows() > 0);
         assert_eq!(schema.fields(), batch.schema().fields());
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(field_names.contains(&"id"));
+        assert!(field_names.contains(&"name"));
     }
 
     #[tokio::test]
@@ -573,5 +560,128 @@ mod tests {
             total_rows += batch.num_rows();
         }
         assert_eq!(total_rows, expected_rows);
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_with_batch_size_yields_multiple_batches() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let file_name = lance_base_file_name();
+
+        let eager = reader
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .unwrap();
+        assert!(
+            eager.num_rows() > 1,
+            "fixture must have at least 2 rows for the batch-split assertion"
+        );
+
+        // Force the smallest possible batch size to exercise the explicit
+        // `batch_size` branch and assert that lance-file honors it.
+        let opts = BaseFileReadOptions::new().with_batch_size(1);
+        let stream = reader.read_stream(&file_name, opts).await.unwrap();
+
+        let mut batches = Vec::new();
+        let mut inner = stream.into_stream();
+        while let Some(batch) = inner.next().await {
+            batches.push(batch.unwrap());
+        }
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, eager.num_rows());
+        assert!(
+            batches.len() > 1,
+            "with batch_size=1 we expect multiple batches, got {}",
+            batches.len()
+        );
+        for batch in &batches {
+            assert!(batch.num_rows() <= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_with_known_file_size_matches_unsized_read() {
+        // Exercises the `with_known_file_size` Some-branch in
+        // `open_file_scheduler` (which builds CachedFileSize::new instead of
+        // CachedFileSize::unknown). The result must match an ordinary read.
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage.clone());
+        let file_name = lance_base_file_name();
+
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
+        let file_size = std::fs::metadata(std::path::Path::new(&table_path).join(&file_name))
+            .unwrap()
+            .len();
+
+        let unsized_batch = reader
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .unwrap();
+        let sized_batch = reader
+            .read_data(
+                &file_name,
+                BaseFileReadOptions::new().with_known_file_size(file_size),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sized_batch.num_rows(), unsized_batch.num_rows());
+        assert_eq!(
+            sized_batch.schema().fields(),
+            unsized_batch.schema().fields()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_unknown_projection_column_returns_error() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let file_name = lance_base_file_name();
+
+        let opts = BaseFileReadOptions::new().with_projection(["does_not_exist"]);
+        let err = reader
+            .read_data(&file_name, opts)
+            .await
+            .expect_err("projection on missing column must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to create Lance projection"),
+            "expected projection-error message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_missing_file_returns_error() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+
+        // A path that lives under the same base URL but doesn't exist on disk.
+        let err = reader
+            .read_data("does_not_exist.lance", BaseFileReadOptions::new())
+            .await
+            .expect_err("missing file must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to open Lance file") || msg.contains("does_not_exist.lance"),
+            "expected missing-file error to mention the path, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_get_metadata_and_stats_missing_file_returns_error() {
+        let storage = lance_test_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let table_schema = arrow_schema::Schema::empty();
+
+        // Exercises the head() error path before any Lance call is made.
+        let err = reader
+            .get_metadata_and_stats("does_not_exist.lance", &table_schema)
+            .await
+            .expect_err("missing file must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does_not_exist") || msg.contains("not found"),
+            "expected missing-file error, got: {msg}"
+        );
     }
 }

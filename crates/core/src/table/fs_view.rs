@@ -28,7 +28,7 @@ use crate::config::table::BaseFileFormatValue;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::file_group::base_file::reader::BaseFileReader;
-use crate::file_group::builder::file_groups_from_files_partition_records_with_format;
+use crate::file_group::builder::file_groups_from_files_partition_records;
 use crate::file_group::file_slice::FileSlice;
 use crate::metadata::table::records::FilesPartitionRecord;
 use crate::statistics::estimator::FileStatsEstimator;
@@ -100,7 +100,7 @@ impl FileSystemView {
         let configured_base_file_format = self.configured_base_file_format()?;
 
         let file_groups_map = if let Some(records) = files_partition_records {
-            file_groups_from_files_partition_records_with_format(
+            file_groups_from_files_partition_records(
                 records,
                 configured_base_file_format.as_ref(),
                 timeline_view,
