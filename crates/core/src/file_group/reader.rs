@@ -1355,6 +1355,167 @@ mod tests {
             .clone())
     }
 
+    /// Locate a (partition, base_file, single_log_file) triple for a MOR
+    /// file slice in the V8Trips8I3U1D fixture so we can read it through
+    /// `FileGroupReader` directly.
+    fn v8_trips_mor_first_slice() -> (String, String, String, String) {
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let base_url = Url::from_directory_path(&table_path).unwrap();
+        // San Francisco partition has both an initial parquet base file and a
+        // `.log.1_0-...` log file written before the compaction commit.
+        let partition = "city=san_francisco";
+        let partition_dir = PathBuf::from(&table_path).join(partition);
+        let mut parquet_files: Vec<String> = std::fs::read_dir(&partition_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".parquet") && !name.starts_with('.'))
+            .collect();
+        parquet_files.sort();
+        let base_file_name = parquet_files
+            .into_iter()
+            .next()
+            .expect("san_francisco partition must contain a base parquet file");
+        let log_file_name = std::fs::read_dir(&partition_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|name| {
+                name.starts_with('.') && name.contains(".log.") && !name.starts_with(".hoodie")
+            })
+            .expect("san_francisco partition must contain a log file");
+        (
+            base_url.as_str().to_string(),
+            partition.to_string(),
+            base_file_name,
+            log_file_name,
+        )
+    }
+
+    #[test]
+    fn test_filegroupreader_debug_format_includes_struct_fields() -> Result<()> {
+        // Exercises the manual Debug impl on FileGroupReader (the auto-derive
+        // is opted out so internal trait objects aren't formatted).
+        let base_uri = get_base_uri_with_valid_props_minimum();
+        let reader = create_test_reader(&base_uri)?;
+        let formatted = format!("{reader:?}");
+        assert!(formatted.contains("FileGroupReader"));
+        assert!(formatted.contains("hudi_configs"));
+        assert!(formatted.contains("storage"));
+        assert!(formatted.contains("base_file_format"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_eager_with_real_log_files_merges() -> Result<()> {
+        // Eager MOR read with at least one log file exercises the merge branch
+        // of `read_file_slice_from_paths`: log scanning, RecordBatches scan
+        // result, and the RecordMerger pass that combines base + log batches.
+        let (base_uri, partition, base_file_name, log_file_name) = v8_trips_mor_first_slice();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+
+        let base_path = format!("{partition}/{base_file_name}");
+        let log_path = format!("{partition}/{log_file_name}");
+
+        let merged = reader
+            .read_file_slice_from_paths(&base_path, vec![log_path], &ReadOptions::new())
+            .await?;
+        assert!(merged.num_rows() > 0);
+        let schema = merged.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(field_names.contains(&"uuid"));
+        assert!(field_names.contains(&"rider"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_stream_with_log_files_yields_single_merged_batch() -> Result<()> {
+        use futures::StreamExt;
+
+        // Streaming read with log files falls back to the eager collect+merge
+        // path and yields the merged result as a single-item stream — covers
+        // the `else` branch of `read_file_slice_from_paths_stream_inner`.
+        let (base_uri, partition, base_file_name, log_file_name) = v8_trips_mor_first_slice();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+
+        let base_path = format!("{partition}/{base_file_name}");
+        let log_path = format!("{partition}/{log_file_name}");
+
+        let mut stream = reader
+            .read_file_slice_from_paths_stream(&base_path, vec![log_path], &ReadOptions::new())
+            .await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        assert_eq!(
+            batches.len(),
+            1,
+            "MOR stream fallback must emit exactly one merged batch"
+        );
+        assert!(batches[0].num_rows() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_from_paths_stream_no_log_files_streams_base_file() -> Result<()> {
+        use futures::StreamExt;
+
+        // Public `read_file_slice_from_paths_stream` entry point with no log
+        // files takes the streaming `read_base_file_stream` branch (rather
+        // than the collect+merge fallback).
+        let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+
+        let mut stream = reader
+            .read_file_slice_from_paths_stream(
+                &base_file_name,
+                Vec::<&str>::new(),
+                &ReadOptions::new().with_batch_size(1)?,
+            )
+            .await?;
+        let mut total_rows = 0;
+        let mut batch_count = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            total_rows += batch.num_rows();
+            batch_count += 1;
+        }
+        assert!(total_rows > 0);
+        assert!(
+            batch_count > 1,
+            "no-log-files stream with batch_size=1 should split into multiple batches"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_slice_from_paths_stream_read_optimized_skips_log_files() -> Result<()> {
+        use futures::StreamExt;
+
+        // With read-optimized mode set, the streaming path must short-circuit
+        // through `read_base_file_stream` even when log paths are supplied —
+        // the bogus log path here would otherwise fail the call.
+        let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")],
+        )
+        .await?;
+        let bogus_log = vec![".does-not-exist.log.1_0-0-0".to_string()];
+
+        let mut stream = reader
+            .read_file_slice_from_paths_stream(&base_file_name, bogus_log, &ReadOptions::new())
+            .await?;
+        let mut total_rows = 0;
+        while let Some(batch) = stream.next().await {
+            total_rows += batch?.num_rows();
+        }
+        assert!(total_rows > 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_read_metadata_table_files_partition() -> Result<()> {
         use crate::metadata::table_record::{FilesPartitionRecord, MetadataRecordType};

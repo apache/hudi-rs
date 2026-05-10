@@ -383,12 +383,29 @@ impl BaseFileReader for LanceBaseFileReader {
 mod tests {
     use super::*;
     use hudi_test::SampleTable;
+    use std::io::Write;
+    use tempfile::TempDir;
     use url::Url;
 
     fn lance_test_storage() -> Arc<Storage> {
         let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
         let base_url = Url::from_directory_path(&table_path).unwrap();
         Storage::new_with_base_url(base_url).unwrap()
+    }
+
+    /// Create a temp directory containing a non-empty `.lance` file whose bytes
+    /// are not a valid Lance dataset. Returns (`TempDir`, `file_name`).
+    fn corrupt_lance_storage() -> (TempDir, String, Arc<Storage>) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_name = "corrupt.lance".to_string();
+        let file_path = temp_dir.path().join(&file_name);
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        // 4 KiB of zeros — passes object_store::head but fails Lance metadata parsing.
+        f.write_all(&[0u8; 4096]).unwrap();
+        f.sync_all().unwrap();
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        (temp_dir, file_name, storage)
     }
 
     fn lance_base_file_name() -> String {
@@ -682,6 +699,58 @@ mod tests {
         assert!(
             msg.contains("does_not_exist") || msg.contains("not found"),
             "expected missing-file error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_corrupt_file_returns_metadata_error_on_read_stream() {
+        let (_tmp, file_name, storage) = corrupt_lance_storage();
+        let reader = LanceBaseFileReader::new(storage);
+
+        let err = reader
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .expect_err("corrupt lance file must fail to read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to read Lance metadata"),
+            "expected metadata-read error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_corrupt_file_empty_projection_returns_metadata_error() {
+        let (_tmp, file_name, storage) = corrupt_lance_storage();
+        let reader = LanceBaseFileReader::new(storage);
+
+        let opts = BaseFileReadOptions::new().with_projection(Vec::<String>::new());
+        let err = reader
+            .read_data(&file_name, opts)
+            .await
+            .expect_err("corrupt lance file with empty projection must fail to read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to read Lance metadata"),
+            "expected metadata-read error from empty_projection_stream, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_get_metadata_and_stats_corrupt_file_returns_error() {
+        let (_tmp, file_name, storage) = corrupt_lance_storage();
+        let reader = LanceBaseFileReader::new(storage);
+        let table_schema = arrow_schema::Schema::empty();
+
+        // head() succeeds (the file exists with non-zero size), but Lance metadata
+        // parsing fails inside open_file_reader_with_metadata.
+        let err = reader
+            .get_metadata_and_stats(&file_name, &table_schema)
+            .await
+            .expect_err("corrupt lance file must fail metadata read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to read Lance metadata"),
+            "expected metadata-read error, got: {msg}"
         );
     }
 }

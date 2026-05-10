@@ -970,4 +970,123 @@ mod tests {
 
         assert_eq!(file_slices.len(), 1);
     }
+
+    #[tokio::test]
+    async fn fs_view_apply_stats_pruning_populates_metadata_for_retained_files() {
+        let (hudi_table, table_schema, file_pruner, as_of) =
+            build_file_pruning_context(("intField", ">=", "0")).await;
+
+        let file_group = FileGroup::new_with_base_file_name(
+            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+            "",
+        )
+        .unwrap();
+        let retained = hudi_table
+            .file_system_view
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                None,
+            )
+            .await;
+
+        assert_eq!(retained.len(), 1);
+        let fsl = retained[0].get_file_slice_as_of(&as_of).unwrap();
+        let file_metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+        assert!(file_metadata.size > 0);
+        assert!(file_metadata.num_records > 0);
+        assert!(fsl.base_file_column_stats.is_some());
+    }
+
+    #[tokio::test]
+    async fn fs_view_load_file_groups_returns_error_for_invalid_base_file_format() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (BasePath.as_ref(), base_url.as_str()),
+            (BaseFileFormat.as_ref(), "orc"),
+        ]));
+        let fs_view = FileSystemView::new(hudi_configs, Arc::new(HashMap::new()))
+            .await
+            .unwrap();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
+            .await
+            .unwrap();
+        let partition_pruner = PartitionPruner::empty();
+        let file_pruner = FilePruner::empty();
+        let table_schema = hudi_table.get_schema().await.unwrap();
+
+        let result = fs_view
+            .load_file_groups(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fs_view_get_file_slices_excludes_partitions_outside_pruner() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
+            .await
+            .unwrap();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema().await.unwrap();
+
+        // First load all partitions into the dashmap with an empty pruner.
+        let _ = hudi_table
+            .file_system_view
+            .get_file_slices_by_storage_listing(
+                &PartitionPruner::empty(),
+                &FilePruner::empty(),
+                &table_schema,
+                &timeline_view,
+                None,
+            )
+            .await
+            .unwrap();
+        let initial_partitions = hudi_table.file_system_view.partition_to_file_groups.len();
+        assert!(initial_partitions > 1);
+
+        // Then issue a stricter call that prunes some loaded partitions during collection.
+        let partition_filters = vec![Filter::try_from(("byteField", "=", "10")).unwrap()];
+        let partition_pruner = PartitionPruner::new(
+            &partition_filters,
+            &partition_schema,
+            hudi_table.hudi_configs.as_ref(),
+        )
+        .unwrap();
+        let file_slices = hudi_table
+            .file_system_view
+            .get_file_slices_by_storage_listing(
+                &partition_pruner,
+                &FilePruner::empty(),
+                &table_schema,
+                &timeline_view,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let returned_partitions: std::collections::HashSet<_> =
+            file_slices.iter().map(|fsl| &fsl.partition_path).collect();
+        assert_eq!(returned_partitions.len(), 1);
+        assert!(returned_partitions.contains(&"10".to_string()));
+    }
 }

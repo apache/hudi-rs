@@ -1107,7 +1107,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, Some(&BaseFileFormatValue::Parquet), &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1130,7 +1135,12 @@ mod tests {
 
             let view = create_layout_v2_view(&[]);
 
-            let result = file_groups_from_files_partition_records(&records, Some(&BaseFileFormatValue::Parquet), &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1157,7 +1167,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, Some(&BaseFileFormatValue::Parquet), &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1200,7 +1215,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, Some(&BaseFileFormatValue::Parquet), &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1239,7 +1259,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, Some(&BaseFileFormatValue::Parquet), &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
