@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef};
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -32,8 +32,9 @@ use futures::stream::BoxStream;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, parse_url_opts};
 use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -55,8 +56,15 @@ pub mod util;
 pub struct ParquetReadOptions {
     /// Target batch size (number of rows per batch).
     pub batch_size: Option<usize>,
-    /// Column projection by names.
+    /// Top-level column projection by name. Drives `ProjectionMask::roots`
+    /// (top-level only; reads every leaf inside any selected struct/list/map).
     pub projection: Option<Vec<String>>,
+    /// Nested-aware column projection. When set, takes precedence over
+    /// `projection` and drives `ProjectionMask::leaves` against the parquet
+    /// leaf-column tree, so unused parquet leaves inside structs are NOT
+    /// read from disk.  ENG-40168 path B2 — saves I/O when Spark's nested-
+    /// column pruning narrows a struct to a subset of its subfields.
+    pub nested_projection: Option<SchemaRef>,
 }
 
 impl ParquetReadOptions {
@@ -69,7 +77,7 @@ impl ParquetReadOptions {
         self
     }
 
-    /// Sets column projection by column names.
+    /// Sets top-level column projection by column names.
     pub fn with_projection<I, S>(mut self, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -78,6 +86,73 @@ impl ParquetReadOptions {
         self.projection = Some(columns.into_iter().map(|s| s.into()).collect());
         self
     }
+
+    /// Sets nested-aware column projection from an Arrow schema.  Causes
+    /// `get_parquet_file_stream` to mask parquet at the leaf level, so
+    /// e.g. `fare<currency>` is read from disk without `fare.amount`.
+    pub fn with_nested_projection(mut self, schema: SchemaRef) -> Self {
+        self.nested_projection = Some(schema);
+        self
+    }
+}
+
+/// Returns true if `parquet_path` (relative to a top-level field) selects a
+/// leaf that is included in `arrow_field`'s nested type.
+///
+/// Examples:
+/// - `arrow_field = fare: struct<currency>`, `parquet_path = ["currency"]` → true
+/// - `arrow_field = fare: struct<currency>`, `parquet_path = ["amount"]`   → false
+/// - `arrow_field = fare: struct<currency>`, `parquet_path = []`           → true (whole struct selected)
+///
+/// For `List`/`LargeList`/`Map` fields we conservatively return `true` for
+/// any path inside, since narrowing struct subfields *inside an array element*
+/// is not common in this code path and would require matching parquet's
+/// "list/element" / "key_value/key|value" path levels.
+fn arrow_includes_parquet_leaf(arrow_field: &Field, parquet_path: &[String]) -> bool {
+    if parquet_path.is_empty() {
+        return true;
+    }
+    match arrow_field.data_type() {
+        DataType::Struct(fields) => {
+            let head = &parquet_path[0];
+            for f in fields.iter() {
+                if f.name() == head {
+                    return arrow_includes_parquet_leaf(f, &parquet_path[1..]);
+                }
+            }
+            false
+        }
+        // Conservative: include any parquet leaf below a List/Map/etc.
+        // Spark's nested-column pruning rarely narrows array elements via
+        // this path; if/when it does, expand this match.
+        _ => true,
+    }
+}
+
+/// Compute parquet leaf-column indices selected by `requested` (an Arrow
+/// schema potentially containing narrowed nested structs).
+///
+/// Iterates the parquet leaf columns in their declared order and matches each
+/// path's first element against a top-level field in `requested`.  If the
+/// rest of the path is selected (nested narrowing), the leaf index is kept.
+fn compute_leaf_indices(
+    parquet_schema: &SchemaDescriptor,
+    requested: &arrow_schema::Schema,
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for (idx, col) in parquet_schema.columns().iter().enumerate() {
+        let parts: Vec<String> = col.path().parts().to_vec();
+        if parts.is_empty() {
+            continue;
+        }
+        let top = &parts[0];
+        if let Ok(arrow_field) = requested.field_with_name(top) {
+            if arrow_includes_parquet_leaf(arrow_field, &parts[1..]) {
+                indices.push(idx);
+            }
+        }
+    }
+    indices
 }
 
 /// A stream of record batches from a Parquet file with its schema.
@@ -318,20 +393,26 @@ impl Storage {
         relative_path: &str,
         projection_schema: &arrow_schema::SchemaRef,
     ) -> Result<RecordBatch> {
-        let column_names: Vec<String> = projection_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-
         log::debug!(
             "Parquet projected read (non-streaming) for '{relative_path}': \
-             projecting {n} cols: [{cols}]",
-            n = column_names.len(),
-            cols = column_names.join(", "),
+             projecting {n} top-level cols: [{cols}]",
+            n = projection_schema.fields().len(),
+            cols = projection_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         );
 
-        let options = ParquetReadOptions::new().with_projection(column_names);
+        // Use nested-aware projection so any narrowed struct subfields
+        // (e.g. `fare<currency>` from a wider `fare<amount,currency>`) are
+        // honored at the parquet leaf-column level — saves disk I/O for
+        // unused subfields. Top-level-only narrowing still works because the
+        // leaf walk picks every leaf below an unnarrowed top-level field.
+        // ENG-40168 path B2.
+        let options =
+            ParquetReadOptions::new().with_nested_projection(projection_schema.clone());
         let mut stream = self.get_parquet_file_stream(relative_path, options).await?;
         let schema = stream.schema.clone();
 
@@ -378,7 +459,60 @@ impl Storage {
         // Handle projection: convert column names to indices using builder's schema.
         // Build `projected_schema` that reflects the actual columns in the stream.
         let projected_schema: SchemaRef;
-        if let Some(ref column_names) = options.projection {
+        // ENG-40168 leaf-level parquet projection: opt-in via
+        // `HUDI_B2_ENABLED=1` (or `true`). Default is OFF because the
+        // current implementation regresses TestMORDataSource by ~6x at
+        // N=50000 — see investigation subtask under ENG-40168. When OFF,
+        // fall back to the top-level `ProjectionMask::roots` path even
+        // when a nested schema was supplied (top-level names are derived
+        // from the nested schema's top-level fields).
+        let b2_enabled: bool = std::env::var("HUDI_B2_ENABLED")
+            .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+            .unwrap_or(false);
+        let mut effective_options = options.clone();
+        if !b2_enabled {
+            if let Some(ref nested_schema) = effective_options.nested_projection {
+                let top_level_names: Vec<String> = nested_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                effective_options.nested_projection = None;
+                effective_options.projection = Some(top_level_names);
+            }
+        }
+        if let Some(ref nested_schema) = effective_options.nested_projection {
+            // ENG-40168 path B2 — leaf-level parquet projection.
+            //
+            // `nested_schema` is the requested Arrow schema (possibly with
+            // narrowed structs). We compute the parquet *leaf* indices it
+            // selects, then mask via `ProjectionMask::leaves` so the parquet
+            // reader only fetches/decodes those leaves.
+            let leaf_indices =
+                compute_leaf_indices(builder.parquet_schema(), nested_schema.as_ref());
+            log::debug!(
+                "Parquet leaf-projection for '{relative_path}': {n_leaf} parquet leaves selected by nested arrow schema [{cols}]",
+                n_leaf = leaf_indices.len(),
+                cols = nested_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let projection_mask =
+                ProjectionMask::leaves(builder.parquet_schema(), leaf_indices);
+            builder = builder.with_projection(projection_mask);
+            // Don't set `projected_schema` here — the post-projection
+            // schema will be read off the *built* stream below, in parquet
+            // physical-leaf order (which is what the stream actually
+            // produces). Using `nested_schema` as-is is wrong because the
+            // caller's field order is unrelated to parquet's declared
+            // order. Downstream `ProjectionConverter` (B1) reorders by
+            // name to match the caller's expected output. Set a placeholder
+            // here that will be overwritten before constructing the stream.
+            projected_schema = Arc::new(arrow_schema::Schema::empty());
+        } else if let Some(ref column_names) = effective_options.projection {
             let arrow_schema = builder.schema();
             let file_cols: Vec<&str> = arrow_schema
                 .fields()
@@ -453,8 +587,19 @@ impl Storage {
 
         let stream = builder.build()?;
 
+        // For the leaf-projection path the stream itself is the source of
+        // truth for the post-projection schema (parquet emits leaves in
+        // declared file order, not the caller's requested order). Use the
+        // stream's schema directly when the caller asked for nested
+        // projection; otherwise keep the schema we computed above.
+        let final_schema = if effective_options.nested_projection.is_some() {
+            stream.schema().clone()
+        } else {
+            projected_schema
+        };
+
         Ok(ParquetFileStream {
-            schema: projected_schema,
+            schema: final_schema,
             stream: Box::pin(stream),
         })
     }
@@ -551,9 +696,120 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{Field, Fields, Schema};
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
+
+    // ── Path B2: arrow_includes_parquet_leaf ────────────────────────────
+
+    #[test]
+    fn test_arrow_includes_parquet_leaf_empty_path_selects_whole_field() {
+        let f = Field::new("anything", DataType::Utf8, true);
+        // Empty path = "the whole field below this point is selected".
+        assert!(arrow_includes_parquet_leaf(&f, &[]));
+    }
+
+    #[test]
+    fn test_arrow_includes_parquet_leaf_struct_subfield_present() {
+        let f = Field::new(
+            "fare",
+            DataType::Struct(Fields::from(vec![
+                Field::new("currency", DataType::Utf8, true),
+            ])),
+            true,
+        );
+        assert!(arrow_includes_parquet_leaf(&f, &["currency".to_string()]));
+    }
+
+    #[test]
+    fn test_arrow_includes_parquet_leaf_struct_subfield_pruned() {
+        // `fare<currency>` should NOT include the `amount` parquet leaf
+        // (this is the ENG-40168 nested-narrowing case).
+        let f = Field::new(
+            "fare",
+            DataType::Struct(Fields::from(vec![
+                Field::new("currency", DataType::Utf8, true),
+            ])),
+            true,
+        );
+        assert!(!arrow_includes_parquet_leaf(&f, &["amount".to_string()]));
+    }
+
+    #[test]
+    fn test_arrow_includes_parquet_leaf_struct_path_recurses() {
+        // outer<inner<a>>; selecting only `a` within `inner`.
+        let inner = Field::new(
+            "inner",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "a",
+                DataType::Int64,
+                true,
+            )])),
+            true,
+        );
+        let outer = Field::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![inner])),
+            true,
+        );
+        assert!(arrow_includes_parquet_leaf(
+            &outer,
+            &["inner".to_string(), "a".to_string()]
+        ));
+        assert!(!arrow_includes_parquet_leaf(
+            &outer,
+            &["inner".to_string(), "b".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_arrow_includes_parquet_leaf_list_is_conservative() {
+        // For now, anything inside a List is always included (conservative).
+        let elem = Field::new(
+            "element",
+            DataType::Struct(Fields::from(vec![
+                Field::new("amount", DataType::Float64, true),
+                Field::new("currency", DataType::Utf8, true),
+            ])),
+            true,
+        );
+        let list = Field::new(
+            "tip_history",
+            DataType::List(Arc::new(elem)),
+            true,
+        );
+        // Parquet path inside a list will start with "list" / "element".
+        // We don't recurse into List today — return true.
+        assert!(arrow_includes_parquet_leaf(
+            &list,
+            &["list".to_string(), "element".to_string(), "amount".to_string()]
+        ));
+        assert!(arrow_includes_parquet_leaf(
+            &list,
+            &["list".to_string(), "element".to_string(), "currency".to_string()]
+        ));
+    }
+
+    /// Round-trip: `with_nested_projection` populates the field; `with_projection`
+    /// does not (and vice versa).  Sanity-check the API surface.
+    #[test]
+    fn test_parquet_read_options_accessors() {
+        let opts1 = ParquetReadOptions::new().with_projection(["a", "b"]);
+        assert_eq!(opts1.projection.as_deref(), Some(&["a".to_string(), "b".to_string()][..]));
+        assert!(opts1.nested_projection.is_none());
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let opts2 = ParquetReadOptions::new().with_nested_projection(schema.clone());
+        assert!(opts2.projection.is_none());
+        assert!(opts2.nested_projection.is_some());
+        assert_eq!(
+            opts2.nested_projection.as_ref().unwrap().fields().len(),
+            1
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_storage_new_error_no_base_path() {
