@@ -2233,17 +2233,12 @@ mod lance_tables {
     use super::*;
     use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
     use std::collections::HashMap;
+    use url::Url;
 
     async fn read_lance_table(
-        table: &SampleTable,
-        cow: bool,
+        base_url: Url,
         projection: impl IntoIterator<Item = &'static str>,
     ) -> Result<RecordBatch> {
-        let base_url = if cow {
-            table.url_to_cow()
-        } else {
-            table.url_to_mor_avro()
-        };
         let hudi_table = Table::new(base_url.path()).await?;
         let batches = hudi_table
             .read(&ReadOptions::new().with_projection(projection))
@@ -2379,8 +2374,7 @@ mod lance_tables {
     async fn test_v9_lance_nonpartitioned_cow_snapshot_applies_hudi_updates_deletes_and_inserts()
     -> Result<()> {
         let batch = read_lance_table(
-            &SampleTable::V9LanceNonpartitioned,
-            true,
+            SampleTable::V9LanceNonpartitioned.url_to_cow(),
             ["id", "name", "score", "updated_at"],
         )
         .await?;
@@ -2446,8 +2440,7 @@ mod lance_tables {
     async fn test_v9_lance_txns_nonpart_cow_snapshot_applies_updates_deletes_and_inserts()
     -> Result<()> {
         let batch = read_lance_table(
-            &SampleTable::V9LanceTxnsNonpart,
-            true,
+            SampleTable::V9LanceTxnsNonpart.url_to_cow(),
             ["txn_id", "txn_type", "txn_ts"],
         )
         .await?;
@@ -2459,8 +2452,7 @@ mod lance_tables {
     async fn test_v9_lance_txns_simple_cow_snapshot_applies_updates_deletes_and_inserts()
     -> Result<()> {
         let batch = read_lance_table(
-            &SampleTable::V9LanceTxnsSimple,
-            true,
+            SampleTable::V9LanceTxnsSimple.url_to_cow(),
             ["txn_id", "txn_type", "txn_ts", "region"],
         )
         .await?;
@@ -2471,8 +2463,7 @@ mod lance_tables {
     #[tokio::test]
     async fn test_v9_trips_lance_cow_snapshot_applies_updates_deletes_and_inserts() -> Result<()> {
         let batch = read_lance_table(
-            &SampleTable::V9TripsLance,
-            true,
+            QuickstartTripsTable::V9TripsLance.url_to_cow(),
             ["rider", "driver", "fare", "ts"],
         )
         .await?;
@@ -2502,8 +2493,7 @@ mod lance_tables {
     async fn test_v9_lance_nonhivestyle_mor_snapshot_merges_available_log_update_and_base_files()
     -> Result<()> {
         let batch = read_lance_table(
-            &SampleTable::V9LanceNonhivestyle,
-            false,
+            SampleTable::V9LanceNonhivestyle.url_to_mor_avro(),
             ["event_id", "user_id", "payload", "event_ts", "event_date"],
         )
         .await?;
@@ -2547,8 +2537,7 @@ mod lance_tables {
     async fn test_v9_trips_lance_mor_snapshot_merges_available_log_update_and_base_files()
     -> Result<()> {
         let batch = read_lance_table(
-            &SampleTable::V9TripsLance,
-            false,
+            QuickstartTripsTable::V9TripsLance.url_to_mor_avro(),
             ["rider", "driver", "fare", "ts"],
         )
         .await?;

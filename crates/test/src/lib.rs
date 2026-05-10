@@ -50,6 +50,8 @@ pub enum QuickstartTripsTable {
     V6Trips8I3D,
     #[strum(serialize = "v8_trips_8i3u1d")]
     V8Trips8I3U1D,
+    #[strum(serialize = "v9_trips_lance")]
+    V9TripsLance,
 }
 
 impl QuickstartTripsTable {
@@ -96,6 +98,17 @@ impl QuickstartTripsTable {
         data_path.into_boxed_path()
     }
 
+    pub fn path_to_cow(&self) -> String {
+        let zip_path = self.zip_path("cow", None);
+        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+        path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn url_to_cow(&self) -> Url {
+        let path = self.path_to_cow();
+        Url::from_file_path(path).unwrap()
+    }
+
     pub fn path_to_mor_avro(&self) -> String {
         let zip_path = self.zip_path("mor", Some("avro"));
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
@@ -140,7 +153,6 @@ pub enum SampleTable {
     V9LanceNonhivestyle,
     V9LanceTxnsNonpart,
     V9LanceTxnsSimple,
-    V9TripsLance,
 }
 
 impl SampleTable {
@@ -256,6 +268,12 @@ mod tests {
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }
+                QuickstartTripsTable::V9TripsLance => {
+                    let path = t.zip_path("cow", None);
+                    assert!(path.exists());
+                    let path = t.zip_path("mor", Some("avro"));
+                    assert!(path.exists());
+                }
             }
         }
     }
@@ -284,12 +302,6 @@ mod tests {
                     assert!(path.exists());
                 }
                 SampleTable::V9LanceNonhivestyle => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                SampleTable::V9TripsLance => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
                     let path = t.zip_path("mor", Some("avro"));
                     assert!(path.exists());
                 }
@@ -358,7 +370,6 @@ mod tests {
         for table in [
             SampleTable::V9LanceTxnsSimple,
             SampleTable::V9LanceTxnsNonpart,
-            SampleTable::V9TripsLance,
         ] {
             let zip_path = table.zip_path("cow", None);
             let table_dir = extract_test_table(zip_path.as_ref()).join(table.as_ref());
@@ -368,20 +379,42 @@ mod tests {
 
     #[test]
     fn v9_lance_mor_fixtures_are_valid() {
-        for table in [SampleTable::V9LanceNonhivestyle, SampleTable::V9TripsLance] {
-            let zip_path = table.zip_path("mor", Some("avro"));
-            let table_dir = extract_test_table(zip_path.as_ref()).join(table.as_ref());
-            assert_lance_fixture_valid(&table_dir);
+        let table = SampleTable::V9LanceNonhivestyle;
+        let zip_path = table.zip_path("mor", Some("avro"));
+        let table_dir = extract_test_table(zip_path.as_ref()).join(table.as_ref());
+        assert_lance_fixture_valid(&table_dir);
 
-            let mut files = Vec::new();
-            collect_regular_files(&table_dir, &mut files);
-            let has_log_files = files
+        let mut files = Vec::new();
+        collect_regular_files(&table_dir, &mut files);
+        let has_log_files = files
+            .iter()
+            .any(|path| path.to_string_lossy().contains(".log."));
+        assert!(
+            has_log_files,
+            "MOR Lance fixture {table:?} should contain .log files"
+        );
+    }
+
+    #[test]
+    fn v9_trips_lance_cow_and_mor_fixtures_are_valid() {
+        // V9TripsLance lives under QuickstartTripsTable because it has the
+        // trips schema, but the fixture itself is still a Lance-format Hudi
+        // table — same shape checks apply.
+        let table = QuickstartTripsTable::V9TripsLance;
+
+        let cow_dir = extract_test_table(table.zip_path("cow", None).as_ref()).join(table.as_ref());
+        assert_lance_fixture_valid(&cow_dir);
+
+        let mor_dir =
+            extract_test_table(table.zip_path("mor", Some("avro")).as_ref()).join(table.as_ref());
+        assert_lance_fixture_valid(&mor_dir);
+        let mut files = Vec::new();
+        collect_regular_files(&mor_dir, &mut files);
+        assert!(
+            files
                 .iter()
-                .any(|path| path.to_string_lossy().contains(".log."));
-            assert!(
-                has_log_files,
-                "MOR Lance fixture {table:?} should contain .log files"
-            );
-        }
+                .any(|path| path.to_string_lossy().contains(".log.")),
+            "MOR Lance trips fixture should contain .log files"
+        );
     }
 }
