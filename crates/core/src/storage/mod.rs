@@ -129,6 +129,19 @@ fn arrow_includes_parquet_leaf(arrow_field: &Field, parquet_path: &[String]) -> 
     }
 }
 
+/// Recursive leaf count for an Arrow `DataType` (struct/list-aware), used
+/// for diagnostic perf logging.
+fn count_leaves(dt: &DataType) -> usize {
+    match dt {
+        DataType::Struct(fields) => fields.iter().map(|f| count_leaves(f.data_type())).sum(),
+        DataType::List(elem)
+        | DataType::LargeList(elem)
+        | DataType::FixedSizeList(elem, _) => count_leaves(elem.data_type()),
+        DataType::Map(field, _) => count_leaves(field.data_type()),
+        _ => 1,
+    }
+}
+
 /// Compute parquet leaf-column indices selected by `requested` (an Arrow
 /// schema potentially containing narrowed nested structs).
 ///
@@ -393,16 +406,10 @@ impl Storage {
         relative_path: &str,
         projection_schema: &arrow_schema::SchemaRef,
     ) -> Result<RecordBatch> {
+        let t0 = std::time::Instant::now();
         log::debug!(
-            "Parquet projected read (non-streaming) for '{relative_path}': \
-             projecting {n} top-level cols: [{cols}]",
+            "[ENG-40168 perf] get_parquet_file_data_projected START path='{relative_path}' top_cols={n}",
             n = projection_schema.fields().len(),
-            cols = projection_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
         );
 
         // Use nested-aware projection so any narrowed struct subfields
@@ -413,19 +420,54 @@ impl Storage {
         // ENG-40168 path B2.
         let options =
             ParquetReadOptions::new().with_nested_projection(projection_schema.clone());
+        let stream_open_start = std::time::Instant::now();
         let mut stream = self.get_parquet_file_stream(relative_path, options).await?;
+        let stream_open_ms = stream_open_start.elapsed().as_millis();
         let schema = stream.schema.clone();
+        log::debug!(
+            "[ENG-40168 perf]   stream opened in {stream_open_ms}ms, post-projection schema has {n} cols, {leaves} leaves",
+            n = schema.fields().len(),
+            leaves = schema.fields().iter().map(|f| count_leaves(f.data_type())).sum::<usize>(),
+        );
 
         let mut batches = Vec::new();
-        while let Some(r) = stream.stream.next().await {
-            batches.push(r?);
+        let mut total_rows = 0usize;
+        let mut max_batch_ms = 0u128;
+        let mut min_batch_ms = u128::MAX;
+        let read_start = std::time::Instant::now();
+        loop {
+            let bt = std::time::Instant::now();
+            let next = stream.stream.next().await;
+            let bt_ms = bt.elapsed().as_millis();
+            match next {
+                Some(r) => {
+                    let batch = r?;
+                    total_rows += batch.num_rows();
+                    if bt_ms > max_batch_ms { max_batch_ms = bt_ms; }
+                    if bt_ms < min_batch_ms { min_batch_ms = bt_ms; }
+                    batches.push(batch);
+                }
+                None => break,
+            }
         }
+        let read_ms = read_start.elapsed().as_millis();
 
         if batches.is_empty() {
+            log::debug!(
+                "[ENG-40168 perf]   stream produced 0 batches in {read_ms}ms (empty)"
+            );
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        Ok(concat_batches(&schema, &batches)?)
+        let n_batches = batches.len();
+        let concat_start = std::time::Instant::now();
+        let result = concat_batches(&schema, &batches)?;
+        let concat_ms = concat_start.elapsed().as_millis();
+        let total_ms = t0.elapsed().as_millis();
+        log::debug!(
+            "[ENG-40168 perf]   {n_batches} batches, {total_rows} rows, read={read_ms}ms (per-batch min={min_batch_ms}ms max={max_batch_ms}ms), concat={concat_ms}ms, TOTAL={total_ms}ms",
+        );
+        Ok(result)
     }
 
     /// Get a streaming reader for a Parquet file.
@@ -488,11 +530,17 @@ impl Storage {
             // narrowed structs). We compute the parquet *leaf* indices it
             // selects, then mask via `ProjectionMask::leaves` so the parquet
             // reader only fetches/decodes those leaves.
+            let li_start = std::time::Instant::now();
             let leaf_indices =
                 compute_leaf_indices(builder.parquet_schema(), nested_schema.as_ref());
+            let n_total_leaves = builder.parquet_schema().columns().len();
+            let n_sel = leaf_indices.len();
+            let li_us = li_start.elapsed().as_micros();
             log::debug!(
-                "Parquet leaf-projection for '{relative_path}': {n_leaf} parquet leaves selected by nested arrow schema [{cols}]",
-                n_leaf = leaf_indices.len(),
+                "[ENG-40168 perf]   B2 leaf-index walk for '{relative_path}': total_parquet_leaves={n_total_leaves} selected={n_sel} walk_us={li_us}"
+            );
+            log::debug!(
+                "Parquet leaf-projection for '{relative_path}': {n_sel} parquet leaves selected by nested arrow schema [{cols}]",
                 cols = nested_schema
                     .fields()
                     .iter()
