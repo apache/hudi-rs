@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use arrow_array::{Float64Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use hudi_core::config::read::HudiReadConfig::UseReadOptimizedMode;
 use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
@@ -48,6 +49,15 @@ fn rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, f64)> {
         for row_idx in 0..batch.num_rows() {
             rows.push((riders.value(row_idx).to_string(), fares.value(row_idx)));
         }
+    }
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn uuid_rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, String, f64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        rows.extend(QuickstartTripsTable::uuid_rider_and_fare(batch));
     }
     rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     rows
@@ -163,5 +173,65 @@ async fn test_mor_snapshot_query_matches_core_log_merged_read() {
             .unwrap()
             .1,
         0.0
+    );
+}
+
+#[tokio::test]
+async fn test_lance_mor_snapshot_query_matches_core_log_merged_read() {
+    let base_url = QuickstartTripsTable::V9TripsLance.url_to_mor_avro();
+
+    let table = Table::new(base_url.path()).await.unwrap();
+    let expected_batches = table
+        .read(&ReadOptions::new().with_projection(["uuid", "rider", "fare"]))
+        .await
+        .unwrap();
+    let expected_rows = uuid_rider_fare_rows(&expected_batches);
+    let read_optimized_batches = table
+        .read(
+            &ReadOptions::new()
+                .with_projection(["uuid", "rider", "fare"])
+                .with_hudi_option(UseReadOptimizedMode.as_ref(), "true"),
+        )
+        .await
+        .unwrap();
+    let read_optimized_rows = uuid_rider_fare_rows(&read_optimized_batches);
+
+    let ctx = SessionContext::new();
+    let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
+    ctx.register_table("trips", Arc::new(hudi)).unwrap();
+    let actual_batches = ctx
+        .sql("SELECT uuid, rider, fare FROM trips")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let actual_rows = uuid_rider_fare_rows(&actual_batches);
+
+    assert_eq!(actual_rows, expected_rows);
+    assert_eq!(actual_rows.len(), 12);
+    assert_ne!(
+        actual_rows, read_optimized_rows,
+        "snapshot read should merge the active Lance MOR data log"
+    );
+
+    // The archived fixture has one active data log, for rider-A. The later
+    // SQL delete operations are not present as active data-log delete blocks,
+    // so the merge-specific assertion here is the rider-A fare update.
+    assert_eq!(
+        actual_rows
+            .iter()
+            .find(|(_, rider, _)| rider == "rider-A")
+            .unwrap()
+            .2,
+        0.0
+    );
+    assert_eq!(
+        read_optimized_rows
+            .iter()
+            .find(|(_, rider, _)| rider == "rider-A")
+            .unwrap()
+            .2,
+        19.1
     );
 }

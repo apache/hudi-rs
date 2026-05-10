@@ -457,6 +457,7 @@ mod v8_tests {
 
 mod dispatch_tests {
     use super::*;
+    use hudi_test::QuickstartTripsTable;
     use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle};
 
     #[tokio::test]
@@ -513,6 +514,29 @@ mod dispatch_tests {
         assert!(
             plan.contains("HudiScanExec"),
             "Parquet MOR snapshot should use HudiScanExec. Plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lance_mor_snapshot_uses_hudi_scan_exec() {
+        let base_url = QuickstartTripsTable::V9TripsLance.url_to_mor_avro();
+        let ctx = register_uri_as_table("lance_mor_snapshot", base_url.as_str(), empty_options())
+            .await
+            .unwrap();
+
+        let plan = explain_physical_plan(&ctx, "SELECT uuid FROM lance_mor_snapshot").await;
+
+        assert!(
+            plan.contains("HudiScanExec"),
+            "Lance MOR snapshot should use HudiScanExec. Plan: {plan}"
+        );
+        assert!(
+            !plan.contains("DataSourceExec"),
+            "Lance MOR snapshot should not use DataSourceExec. Plan: {plan}"
+        );
+        assert!(
+            !plan.contains("ParquetSource"),
+            "Lance MOR snapshot should not use ParquetSource. Plan: {plan}"
         );
     }
 
