@@ -117,6 +117,11 @@ impl HudiScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn read_options(&self) -> &ReadOptions {
+        &self.read_options
+    }
 }
 
 struct LimitBatchStream {
@@ -310,8 +315,10 @@ impl ExecutionPlan for HudiScanExec {
                 }
             })
             // Scan output is unordered; SQL ordering is provided by explicit
-            // SortExec nodes. `buffer_unordered` avoids head-of-line blocking
-            // when one slice is slower than its neighbours.
+            // SortExec nodes. Keep both stages on the same small knob: one cap
+            // for async stream construction and one cap for active slice
+            // streams. Raising this can multiply memory pressure across input
+            // partitions on wide MOR scans.
             .buffer_unordered(concurrency)
             .try_flatten_unordered(concurrency)
             .boxed();
@@ -362,6 +369,8 @@ impl ExecutionPlan for HudiScanExec {
             projection: self.projection.clone(),
             limit,
             properties: self.properties.clone(),
+            // `with_fetch` is a planner-time clone used before execution. Metrics
+            // belong to the cloned plan instance and must start empty.
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }

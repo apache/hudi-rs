@@ -26,7 +26,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
-use hudi_core::error::Result;
+use hudi_core::error::{CoreError, Result};
 use hudi_core::table::{QueryType, ReadOptions, Table};
 use hudi_test::{QuickstartTripsTable, SampleTable};
 
@@ -979,6 +979,7 @@ mod v8_tables {
             let hudi_table = Table::new(base_url.path()).await?;
 
             let options = ReadOptions::new();
+            let file_slices = hudi_table.get_file_slices(&options).await?;
             let mut stream = hudi_table.read_stream(&options).await?;
 
             let mut batches = Vec::new();
@@ -987,6 +988,11 @@ mod v8_tables {
             }
 
             assert!(!batches.is_empty(), "Should produce batches from MOR table");
+            assert_eq!(
+                batches.len(),
+                file_slices.len(),
+                "MOR snapshot stream should emit one merged batch per file slice"
+            );
             // Verify total row count - should have 6 rows (8 inserts - 2 deletes)
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 6, "Should have 6 rows (8 inserts - 2 deleted)");
@@ -1578,23 +1584,20 @@ mod v9_tables {
 
             let fg_reader = hudi_table
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            let expected = fg_reader
+                .read_file_slice(file_slice, &ReadOptions::new())
+                .await?;
             let options = ReadOptions::new().with_batch_size(1)?;
             let stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
             let batches = collect_stream_batches(stream).await?;
 
-            assert!(
-                !batches.is_empty(),
-                "V9 file-slice stream should produce at least one batch"
-            );
-            assert!(
-                batches.iter().all(|batch| batch.num_rows() <= 1),
-                "V9 file-slice stream batch_size=1 must cap row counts, got {:?}",
-                batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .collect::<Vec<_>>()
+            assert_batch_size_respected(
+                &batches,
+                1,
+                expected.num_rows(),
+                "V9 file-slice stream batch_size=1",
             );
             Ok(())
         }
@@ -1792,13 +1795,39 @@ mod streaming_queries {
         let hudi_table = Table::new(base_url.path()).await?;
 
         let options = ReadOptions::new();
+        let file_slices = hudi_table.get_file_slices(&options).await?;
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce batches from MOR table");
+        assert_eq!(
+            batches.len(),
+            file_slices.len(),
+            "MOR snapshot stream should emit one merged batch per file slice"
+        );
         // Verify total row count
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 8, "Should have 8 rows (8 inserts)");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_stream_incremental_returns_unsupported() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let err = match hudi_table
+            .read_stream(&ReadOptions::new().with_query_type(QueryType::Incremental))
+            .await
+        {
+            Ok(_) => panic!("incremental streaming should be unsupported"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, CoreError::Unsupported(_)),
+            "expected Unsupported for incremental streaming, got: {err}"
+        );
         Ok(())
     }
 

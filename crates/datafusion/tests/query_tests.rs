@@ -494,4 +494,20 @@ async fn test_hudi_scan_exec_strips_filters_on_dropped_partition_columns() {
             (3, "Carol".to_string(), true)
         ]
     );
+
+    let err = match ctx
+        .sql(r#"SELECT "byteField" FROM sample WHERE "byteField" = 10"#)
+        .await
+        .unwrap()
+        .collect()
+        .await
+    {
+        Ok(_) => panic!("projecting a dropped partition column should fail"),
+        Err(err) => err,
+    };
+    let err_message = err.to_string();
+    assert!(
+        err_message.contains("byteField"),
+        "dropped partition projection error should name byteField, got: {err_message}"
+    );
 }

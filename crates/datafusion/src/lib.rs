@@ -82,6 +82,13 @@ where
     DataFusionError::External(Box::new(error)).context(context)
 }
 
+fn filter_field_matches_partition_column(filter_field: &str, partition_column: &str) -> bool {
+    filter_field == partition_column
+        || filter_field
+            .rsplit_once('.')
+            .is_some_and(|(_, name)| name == partition_column)
+}
+
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
 ///
@@ -349,7 +356,11 @@ impl HudiDataSource {
         applicable.filters = options
             .filters
             .iter()
-            .filter(|filter| !partition_columns.iter().any(|p| p == &filter.field))
+            .filter(|filter| {
+                !partition_columns
+                    .iter()
+                    .any(|p| filter_field_matches_partition_column(&filter.field, p))
+            })
             .cloned()
             .collect();
         applicable
@@ -614,6 +625,10 @@ impl HudiDataSource {
         let file_slices =
             hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
 
+        // The reader is built with the caller's full options so table-level
+        // setup sees the same query context. Dropped partition filters are only
+        // stripped from the per-slice options passed into HudiScanExec below,
+        // before FileGroupReader validates base-file batch schemas.
         let file_group_reader = Arc::new(
             self.table
                 .create_file_group_reader_with_options(Some(&read_options), empty_options())
@@ -851,7 +866,7 @@ mod tests {
     use url::Url;
 
     use datafusion::logical_expr::BinaryExpr;
-    use hudi_test::SampleTable::V6Nonpartitioned;
+    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle};
 
     use crate::HudiDataSource;
 
@@ -1131,7 +1146,7 @@ mod tests {
             .with_filters([
                 ("region", "=", "us"),
                 ("amount", ">", "10"),
-                ("country", "=", "ca"),
+                ("txns.country", "=", "ca"),
             ])
             .unwrap()
             .with_projection(["txn_id", "amount"]);
@@ -1142,5 +1157,33 @@ mod tests {
         assert_eq!(actual.filters[0].field, "amount");
         assert_eq!(actual.projection, read_options.projection);
         assert_eq!(actual.hudi_options, read_options.hudi_options);
+    }
+
+    #[tokio::test]
+    async fn test_scan_hudi_keeps_inexact_non_partition_filters() {
+        let hudi = HudiDataSource::new(V6SimplekeygenNonhivestyle.url_to_mor_parquet().as_str())
+            .await
+            .unwrap();
+        let read_options = hudi
+            .scan_read_options(
+                vec![("id".to_string(), ">".to_string(), "1".to_string())],
+                false,
+            )
+            .unwrap();
+        let flat_slices = hudi.table.get_file_slices(&read_options).await.unwrap();
+
+        let plan = hudi
+            .scan_hudi(None, None, 1, flat_slices, read_options)
+            .await
+            .unwrap();
+        let exec = plan
+            .as_any()
+            .downcast_ref::<HudiScanExec>()
+            .expect("MOR snapshot scan should use HudiScanExec");
+
+        assert_eq!(exec.read_options().filters.len(), 1);
+        let filter = &exec.read_options().filters[0];
+        assert_eq!(filter.field, "id");
+        assert_eq!(filter.values, vec!["1".to_string()]);
     }
 }
