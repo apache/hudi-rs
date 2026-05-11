@@ -49,7 +49,7 @@ arrow-row = { version = "57" }
 arrow-schema = { version = "57", features = ["serde"] }
 arrow-select = { version = "57" }
 object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
-parquet = { version = "57", features = ["async", "object_store"] }
+parquet = { version = "58", features = ["async", "object_store"] }
 
 # avro
 apache-avro = { version = "0.21", features = ["derive"] }
