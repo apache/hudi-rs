@@ -34,7 +34,7 @@ use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedM
 use hudi_core::config::util::empty_options;
 use hudi_core::metadata::meta_field::MetaField;
 use hudi_datafusion::{HudiDataSource, HudiTableFactory};
-use hudi_test::util::{get_bool_column, get_i32_column, get_str_column};
+use hudi_test::util::{explain_physical_plan, get_bool_column, get_i32_column, get_str_column};
 use hudi_test::{SampleTable, assert_arrow_field_names_eq};
 
 // ============================================================================
@@ -166,13 +166,6 @@ async fn verify_plan(
         plan.contains(&format!("input_partitions={planned_input_partitioned}")),
         "Plan should contain expected input_partitions={planned_input_partitioned}"
     );
-}
-
-async fn explain_physical_plan(ctx: &SessionContext, sql: &str) -> String {
-    let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
-    let explaining_rb = explaining_df.collect().await.unwrap();
-    let explaining_rb = explaining_rb.first().unwrap();
-    get_str_column(explaining_rb, "plan").join("")
 }
 
 async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {

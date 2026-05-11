@@ -27,6 +27,7 @@ use datafusion::prelude::SessionContext;
 use hudi_datafusion::HudiDataSource;
 
 use crate::SampleTable;
+use crate::util::explain_physical_plan;
 
 pub const EXPECTED_PARTITIONED_TXN_IDS: &[&str] = &[
     "TXN-001", "TXN-003", "TXN-007", "TXN-008", "TXN-011", "TXN-012", "TXN-013", "TXN-014",
@@ -190,6 +191,19 @@ pub async fn verify_v9_txns_table(table: &SampleTable, cow: bool, partitioned: b
 pub async fn verify_v9_txns_table_snapshot(table: &SampleTable, partitioned: bool) {
     let ctx = SessionContext::new();
     register_v9_table(&ctx, table, false, false).await;
+    let plan = explain_physical_plan(&ctx, "SELECT txn_id FROM txns").await;
+    assert!(
+        plan.contains("HudiScanExec"),
+        "MOR snapshot should use HudiScanExec. Plan: {plan}"
+    );
+    assert!(
+        !plan.contains("DataSourceExec"),
+        "MOR snapshot should not use DataSourceExec. Plan: {plan}"
+    );
+    assert!(
+        !plan.contains("ParquetSource"),
+        "MOR snapshot should not use ParquetSource. Plan: {plan}"
+    );
     if partitioned {
         verify_partitioned_records(&ctx).await;
     } else {

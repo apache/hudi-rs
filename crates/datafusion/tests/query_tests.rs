@@ -17,17 +17,18 @@
  * under the License.
  */
 
-//! DataFusion read tests for v9 txns tables.
+//! DataFusion read tests for Hudi sample tables.
 
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Float64Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
 use hudi_test::SampleTable;
+use hudi_test::util::explain_physical_plan;
 use hudi_test::v9_verification::{
     verify_partitioned_records, verify_v9_txns_table, verify_v9_txns_table_snapshot,
 };
@@ -65,58 +66,35 @@ fn uuid_rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, String, f64)> {
     rows
 }
 
+fn fares_for_rider(rows: &[(String, f64)], rider: &str) -> Vec<f64> {
+    let mut fares = rows
+        .iter()
+        .filter_map(|(row_rider, fare)| (row_rider == rider).then_some(*fare))
+        .collect::<Vec<_>>();
+    fares.sort_unstable_by(f64::total_cmp);
+    fares
+}
+
+fn uuid_fares_for_rider(rows: &[(String, String, f64)], rider: &str) -> Vec<f64> {
+    let mut fares = rows
+        .iter()
+        .filter_map(|(_, row_rider, fare)| (row_rider == rider).then_some(*fare))
+        .collect::<Vec<_>>();
+    fares.sort_unstable_by(f64::total_cmp);
+    fares
+}
+
 fn id_name_active_rows(batches: &[RecordBatch]) -> Vec<(i32, String, bool)> {
     let mut rows = Vec::new();
     for batch in batches {
-        let ids = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let active = batch
-            .column_by_name("isActive")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
-
-        for row_idx in 0..batch.num_rows() {
-            rows.push((
-                ids.value(row_idx),
-                names.value(row_idx).to_string(),
-                active.value(row_idx),
-            ));
-        }
+        rows.extend(
+            SampleTable::sample_data_order_by_id(batch)
+                .into_iter()
+                .map(|(id, name, active)| (id, name.to_string(), active)),
+        );
     }
     rows.sort_unstable_by_key(|(id, _, _)| *id);
     rows
-}
-
-async fn explain_physical_plan(ctx: &SessionContext, sql: &str) -> String {
-    let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
-    let batches = explaining_df.collect().await.unwrap();
-    batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column_by_name("plan")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .iter()
-                .map(|line| line.unwrap().to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 // ============================================================================
@@ -236,13 +214,23 @@ async fn test_v9_txns_mor_snapshot_nonpart_meta() {
 #[tokio::test]
 async fn test_mor_snapshot_query_matches_core_log_merged_read() {
     let base_url = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
+    let projection = ["rider", "fare"];
 
     let table = Table::new(base_url.path()).await.unwrap();
     let expected_batches = table
-        .read(&ReadOptions::new().with_projection(["rider", "fare"]))
+        .read(&ReadOptions::new().with_projection(projection))
         .await
         .unwrap();
     let expected_rows = rider_fare_rows(&expected_batches);
+    let read_optimized_batches = table
+        .read(
+            &ReadOptions::new()
+                .with_projection(projection)
+                .with_hudi_option(UseReadOptimizedMode.as_ref(), "true"),
+        )
+        .await
+        .unwrap();
+    let read_optimized_rows = rider_fare_rows(&read_optimized_batches);
 
     let ctx = SessionContext::new();
     let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
@@ -260,22 +248,12 @@ async fn test_mor_snapshot_query_matches_core_log_merged_read() {
     assert_eq!(actual_rows.len(), 6);
     assert!(actual_rows.iter().all(|(rider, _)| rider != "rider-F"));
     assert!(actual_rows.iter().all(|(rider, _)| rider != "rider-J"));
-    assert_eq!(
-        actual_rows
-            .iter()
-            .find(|(rider, _)| rider == "rider-A")
-            .unwrap()
-            .1,
-        0.0
+    assert_ne!(
+        actual_rows, read_optimized_rows,
+        "snapshot read should merge Parquet MOR log files"
     );
-    assert_eq!(
-        actual_rows
-            .iter()
-            .find(|(rider, _)| rider == "rider-G")
-            .unwrap()
-            .1,
-        0.0
-    );
+    assert_eq!(fares_for_rider(&actual_rows, "rider-A"), vec![0.0]);
+    assert_eq!(fares_for_rider(&actual_rows, "rider-G"), vec![0.0]);
 }
 
 #[tokio::test]
@@ -320,21 +298,10 @@ async fn test_lance_mor_snapshot_query_matches_core_log_merged_read() {
     // The archived fixture has one active data log, for rider-A. The later
     // SQL delete operations are not present as active data-log delete blocks,
     // so the merge-specific assertion here is the rider-A fare update.
+    assert_eq!(uuid_fares_for_rider(&actual_rows, "rider-A"), vec![0.0]);
     assert_eq!(
-        actual_rows
-            .iter()
-            .find(|(_, rider, _)| rider == "rider-A")
-            .unwrap()
-            .2,
-        0.0
-    );
-    assert_eq!(
-        read_optimized_rows
-            .iter()
-            .find(|(_, rider, _)| rider == "rider-A")
-            .unwrap()
-            .2,
-        19.1
+        uuid_fares_for_rider(&read_optimized_rows, "rider-A"),
+        vec![19.1]
     );
 }
 
