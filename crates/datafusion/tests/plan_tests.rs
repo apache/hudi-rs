@@ -599,7 +599,7 @@ mod dispatch_tests {
     }
 
     #[tokio::test]
-    async fn test_hudi_scan_exec_display_omits_limit() {
+    async fn test_hudi_scan_exec_display_includes_limit() {
         let base_url = V6Nonpartitioned.url_to_mor_parquet();
         let ctx = register_uri_as_table("mor_snapshot", base_url.as_str(), empty_options())
             .await
@@ -612,8 +612,8 @@ mod dispatch_tests {
             "Parquet MOR snapshot should use HudiScanExec. Plan: {plan}"
         );
         assert!(
-            !plan.contains("limit="),
-            "HudiScanExec display should not advertise limit pushdown. Plan: {plan}"
+            plan.contains("limit=Some(1)"),
+            "HudiScanExec display should advertise pushed limit. Plan: {plan}"
         );
     }
 

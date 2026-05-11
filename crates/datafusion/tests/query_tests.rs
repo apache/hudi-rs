@@ -101,34 +101,22 @@ fn id_name_active_rows(batches: &[RecordBatch]) -> Vec<(i32, String, bool)> {
 // COW tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_v9_txns_cow_simple_nometa() {
-    verify_v9_txns_table(&SampleTable::V9TxnsSimpleNometa, true, true).await;
+fn v9_txns_cases() -> [(SampleTable, bool); 6] {
+    [
+        (SampleTable::V9TxnsSimpleNometa, true),
+        (SampleTable::V9TxnsSimpleMeta, true),
+        (SampleTable::V9TxnsComplexNometa, true),
+        (SampleTable::V9TxnsComplexMeta, true),
+        (SampleTable::V9TxnsNonpartNometa, false),
+        (SampleTable::V9TxnsNonpartMeta, false),
+    ]
 }
 
 #[tokio::test]
-async fn test_v9_txns_cow_simple_meta() {
-    verify_v9_txns_table(&SampleTable::V9TxnsSimpleMeta, true, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_cow_complex_nometa() {
-    verify_v9_txns_table(&SampleTable::V9TxnsComplexNometa, true, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_cow_complex_meta() {
-    verify_v9_txns_table(&SampleTable::V9TxnsComplexMeta, true, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_cow_nonpart_nometa() {
-    verify_v9_txns_table(&SampleTable::V9TxnsNonpartNometa, true, false).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_cow_nonpart_meta() {
-    verify_v9_txns_table(&SampleTable::V9TxnsNonpartMeta, true, false).await;
+async fn test_v9_txns_cow_tables() {
+    for (table, partitioned) in v9_txns_cases() {
+        verify_v9_txns_table(&table, true, partitioned).await;
+    }
 }
 
 // ============================================================================
@@ -136,33 +124,10 @@ async fn test_v9_txns_cow_nonpart_meta() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_v9_txns_mor_simple_nometa() {
-    verify_v9_txns_table(&SampleTable::V9TxnsSimpleNometa, false, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_mor_simple_meta() {
-    verify_v9_txns_table(&SampleTable::V9TxnsSimpleMeta, false, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_mor_complex_nometa() {
-    verify_v9_txns_table(&SampleTable::V9TxnsComplexNometa, false, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_mor_complex_meta() {
-    verify_v9_txns_table(&SampleTable::V9TxnsComplexMeta, false, true).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_mor_nonpart_nometa() {
-    verify_v9_txns_table(&SampleTable::V9TxnsNonpartNometa, false, false).await;
-}
-
-#[tokio::test]
-async fn test_v9_txns_mor_nonpart_meta() {
-    verify_v9_txns_table(&SampleTable::V9TxnsNonpartMeta, false, false).await;
+async fn test_v9_txns_mor_read_optimized_tables() {
+    for (table, partitioned) in v9_txns_cases() {
+        verify_v9_txns_table(&table, false, partitioned).await;
+    }
 }
 
 // ============================================================================

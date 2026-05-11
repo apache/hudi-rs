@@ -36,10 +36,11 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::stats::Precision;
-use datafusion_common::{ColumnStatistics, Result, Statistics};
+use datafusion_common::{ColumnStatistics, DataFusionError, Result, Statistics};
 use futures::stream::{self, BoxStream, TryStreamExt};
 use futures::{Stream, StreamExt};
 
+use crate::{external_error, inexact_usize_from_u64};
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::file_group::reader::FileGroupReader;
 use hudi_core::table::ReadOptions;
@@ -60,11 +61,13 @@ pub struct HudiScanExec {
     file_slice_read_concurrency: usize,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    limit: Option<usize>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl HudiScanExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         file_slice_partitions: Vec<Vec<FileSlice>>,
         file_group_reader: Arc<FileGroupReader>,
@@ -73,6 +76,7 @@ impl HudiScanExec {
         file_slice_read_concurrency: usize,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
+        limit: Option<usize>,
     ) -> Self {
         let projected_schema = if let Some(ref proj) = projection {
             let fields: Vec<_> = proj.iter().map(|&i| schema.field(i).clone()).collect();
@@ -108,8 +112,52 @@ impl HudiScanExec {
             file_slice_read_concurrency: file_slice_read_concurrency.max(1),
             projected_schema,
             projection,
+            limit,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+struct LimitBatchStream {
+    inner: BoxStream<'static, Result<RecordBatch>>,
+    remaining: usize,
+}
+
+impl LimitBatchStream {
+    fn new<S>(stream: S, limit: usize) -> Self
+    where
+        S: Stream<Item = Result<RecordBatch>> + Send + 'static,
+    {
+        Self {
+            inner: stream.boxed(),
+            remaining: limit,
+        }
+    }
+}
+
+impl Stream for LimitBatchStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let row_count = batch.num_rows();
+                if row_count > this.remaining {
+                    let limited = batch.slice(0, this.remaining);
+                    this.remaining = 0;
+                    Poll::Ready(Some(Ok(limited)))
+                } else {
+                    this.remaining -= row_count;
+                    Poll::Ready(Some(Ok(batch)))
+                }
+            }
+            other => other,
         }
     }
 }
@@ -149,12 +197,13 @@ impl DisplayAs for HudiScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "HudiScanExec: input_partitions={}, partitions={}, file_slices={}, file_slice_read_concurrency={}, projection={:?}",
+                    "HudiScanExec: input_partitions={}, partitions={}, file_slices={}, file_slice_read_concurrency={}, projection={:?}, limit={:?}",
                     self.input_partitions,
                     self.file_slice_partitions.len(),
                     total_slices,
                     self.file_slice_read_concurrency,
                     self.projection,
+                    self.limit,
                 )
             }
             _ => {
@@ -229,7 +278,7 @@ impl ExecutionPlan for HudiScanExec {
         let projected_schema = self.projected_schema.clone();
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
-        if file_slices.is_empty() {
+        if file_slices.is_empty() || self.limit == Some(0) {
             let stream = BaselineMetricStream::new(futures::stream::empty(), baseline_metrics);
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 projected_schema,
@@ -250,26 +299,27 @@ impl ExecutionPlan for HudiScanExec {
                 let reader = reader.clone();
                 let options = options.clone();
                 async move {
-                    let inner_stream = reader
-                        .read_file_slice_stream(&file_slice, &options)
-                        .await
-                        .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to read file slice: {e}"
-                        ))
-                    })?;
-                    Ok::<_, datafusion_common::DataFusionError>(inner_stream.map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to read batch: {e}"
-                        ))
-                    }))
+                    let inner_stream =
+                        reader
+                            .read_file_slice_stream(&file_slice, &options)
+                            .await
+                            .map_err(|e| external_error("Failed to read file slice", e))?;
+                    Ok::<_, DataFusionError>(
+                        inner_stream.map_err(|e| external_error("Failed to read batch", e)),
+                    )
                 }
             })
             // Scan output is unordered; SQL ordering is provided by explicit
             // SortExec nodes. `buffer_unordered` avoids head-of-line blocking
             // when one slice is slower than its neighbours.
             .buffer_unordered(concurrency)
-            .try_flatten_unordered(concurrency);
+            .try_flatten_unordered(concurrency)
+            .boxed();
+        let stream = if let Some(limit) = self.limit {
+            LimitBatchStream::new(stream, limit).boxed()
+        } else {
+            stream
+        };
         let stream = BaselineMetricStream::new(stream, baseline_metrics);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -299,6 +349,25 @@ impl ExecutionPlan for HudiScanExec {
         };
 
         Ok(Self::aggregate_partitions(partitions, column_statistics))
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(Self {
+            file_slice_partitions: self.file_slice_partitions.clone(),
+            file_group_reader: self.file_group_reader.clone(),
+            read_options: self.read_options.clone(),
+            input_partitions: self.input_partitions,
+            file_slice_read_concurrency: self.file_slice_read_concurrency,
+            projected_schema: self.projected_schema.clone(),
+            projection: self.projection.clone(),
+            limit,
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
     }
 }
 
@@ -350,12 +419,12 @@ impl HudiScanExec {
         }
 
         let num_rows = if have_row_estimate {
-            Precision::Inexact(usize::try_from(total_rows).unwrap_or(usize::MAX))
+            inexact_usize_from_u64(total_rows)
         } else {
             Precision::Absent
         };
         let total_byte_size = if have_byte_estimate {
-            Precision::Inexact(usize::try_from(total_byte_size).unwrap_or(usize::MAX))
+            inexact_usize_from_u64(total_byte_size)
         } else {
             Precision::Absent
         };
@@ -371,7 +440,9 @@ impl HudiScanExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Int32Array;
     use arrow_schema::Schema;
+    use arrow_schema::{DataType, Field};
     use hudi_core::config::util::empty_options;
     use hudi_core::file_group::base_file::BaseFile;
     use hudi_core::storage::file_metadata::FileMetadata;
@@ -380,6 +451,27 @@ mod tests {
     use std::path::Path;
     use std::str::FromStr;
     use url::Url;
+
+    fn int_batch(values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .unwrap()
+    }
+
+    fn int_values(batch: &RecordBatch) -> Vec<i32> {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..values.len()).map(|idx| values.value(idx)).collect()
+    }
 
     fn file_slice_with_meta(
         file_name: &str,
@@ -468,6 +560,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_limit_batch_stream_truncates_and_stops() {
+        let batches = vec![
+            Ok(int_batch(vec![1, 2, 3])),
+            Ok(int_batch(vec![4, 5, 6])),
+            Ok(int_batch(vec![7, 8, 9])),
+        ];
+
+        let limited = LimitBatchStream::new(stream::iter(batches), 4)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(limited.len(), 2);
+        assert_eq!(int_values(&limited[0]), vec![1, 2, 3]);
+        assert_eq!(int_values(&limited[1]), vec![4]);
+    }
+
+    #[tokio::test]
     async fn test_metrics_override_is_wired() {
         let base_url =
             Url::from_file_path(canonicalize(Path::new("tests/data/table_props_valid")).unwrap())
@@ -484,6 +594,7 @@ mod tests {
             1,
             1,
             Arc::new(Schema::empty()),
+            None,
             None,
         );
 
