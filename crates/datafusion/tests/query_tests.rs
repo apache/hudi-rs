@@ -19,11 +19,16 @@
 
 //! DataFusion read tests for Hudi sample tables.
 
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{Float64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, StringArray};
+use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::prelude::SessionContext;
+use hudi_core::config::internal::HudiInternalConfig;
 use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
+use hudi_core::config::table::HudiTableConfig;
 use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
@@ -32,6 +37,8 @@ use hudi_test::util::explain_physical_plan;
 use hudi_test::v9_verification::{
     verify_partitioned_records, verify_v9_txns_table, verify_v9_txns_table_snapshot,
 };
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, f64)> {
     let mut rows = Vec::new();
@@ -95,6 +102,110 @@ fn id_name_active_rows(batches: &[RecordBatch]) -> Vec<(i32, String, bool)> {
     }
     rows.sort_unstable_by_key(|(id, _, _)| *id);
     rows
+}
+
+fn collect_parquet_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy() == ".hoodie")
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_parquet_files(&path, files);
+        } else if path.extension().is_some_and(|ext| ext == "parquet") {
+            files.push(path);
+        }
+    }
+}
+
+fn record_batch_without_column(
+    batch: &RecordBatch,
+    schema: SchemaRef,
+    indices: &[usize],
+) -> RecordBatch {
+    let columns: Vec<ArrayRef> = indices
+        .iter()
+        .map(|index| batch.column(*index).clone())
+        .collect();
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+fn rewrite_parquet_without_column(path: &Path, column_name: &str) {
+    let input = File::open(path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input).unwrap();
+    let original_schema = builder.schema().clone();
+    let indices: Vec<usize> = original_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (field.name() != column_name).then_some(index))
+        .collect();
+    assert!(
+        indices.len() < original_schema.fields().len(),
+        "test fixture parquet file should contain {column_name}: {path:?}"
+    );
+
+    let projected_fields: Vec<Field> = indices
+        .iter()
+        .map(|index| original_schema.field(*index).as_ref().clone())
+        .collect();
+    let projected_schema = SchemaRef::new(Schema::new(projected_fields));
+    let temp_path = path.with_extension("parquet.tmp");
+    let output = File::create(&temp_path).unwrap();
+    let mut writer = ArrowWriter::try_new(output, projected_schema.clone(), None).unwrap();
+
+    for batch in builder.build().unwrap() {
+        let batch = batch.unwrap();
+        let projected_batch =
+            record_batch_without_column(&batch, projected_schema.clone(), &indices);
+        writer.write(&projected_batch).unwrap();
+    }
+
+    writer.close().unwrap();
+    fs::rename(temp_path, path).unwrap();
+}
+
+fn set_drop_partition_columns(table_path: &Path) {
+    let props_path = table_path.join(".hoodie/hoodie.properties");
+    let props = fs::read_to_string(&props_path).unwrap();
+    let key = HudiTableConfig::DropsPartitionFields.as_ref();
+    let mut replaced = false;
+    let mut lines = Vec::new();
+
+    for line in props.lines() {
+        if line
+            .split_once('=')
+            .is_some_and(|(line_key, _)| line_key == key)
+        {
+            lines.push(format!("{key}=true"));
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !replaced {
+        lines.push(format!("{key}=true"));
+    }
+
+    fs::write(props_path, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+fn dropped_partition_column_mor_table() -> PathBuf {
+    let table_path = PathBuf::from(SampleTable::V6SimplekeygenNonhivestyle.path_to_mor_parquet());
+    set_drop_partition_columns(&table_path);
+
+    let mut parquet_files = Vec::new();
+    collect_parquet_files(&table_path, &mut parquet_files);
+    assert!(!parquet_files.is_empty());
+    for parquet_file in parquet_files {
+        rewrite_parquet_without_column(&parquet_file, "byteField");
+    }
+
+    table_path
 }
 
 // ============================================================================
@@ -345,6 +456,40 @@ async fn test_partitioned_parquet_mor_snapshot_query_matches_core_after_partitio
         read_optimized_filtered_rows,
         [
             (1, "Alice".to_string(), true),
+            (3, "Carol".to_string(), true)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_hudi_scan_exec_strips_filters_on_dropped_partition_columns() {
+    let table_path = dropped_partition_column_mor_table();
+    let ctx = SessionContext::new();
+    let hudi = HudiDataSource::new_with_options(
+        table_path.to_str().unwrap(),
+        [
+            (InputPartitions.as_ref(), "2"),
+            (HudiInternalConfig::SkipConfigValidation.as_ref(), "true"),
+        ],
+    )
+    .await
+    .unwrap();
+    ctx.register_table("sample", Arc::new(hudi)).unwrap();
+
+    let sql = r#"SELECT id, name, "isActive" FROM sample WHERE "byteField" = 10 ORDER BY id"#;
+    let plan = explain_physical_plan(&ctx, sql).await;
+    assert!(
+        plan.contains("HudiScanExec"),
+        "dropped-partition MOR snapshot should use HudiScanExec. Plan: {plan}"
+    );
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let rows = id_name_active_rows(&batches);
+
+    assert_eq!(
+        rows,
+        [
+            (1, "Alice".to_string(), false),
             (3, "Carol".to_string(), true)
         ]
     );

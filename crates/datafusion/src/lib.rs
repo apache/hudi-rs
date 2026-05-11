@@ -51,12 +51,12 @@ use log::warn;
 
 use crate::hudi_exec::HudiScanExec;
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::ConfigParser;
 use hudi_core::config::read::HudiReadConfig::{
     FileSliceReadConcurrency, InputPartitions, UseReadOptimizedMode,
 };
 use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
 use hudi_core::config::util::empty_options;
+use hudi_core::config::{ConfigParser, HudiConfigs};
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
@@ -326,6 +326,35 @@ impl HudiDataSource {
         Ok(read_options)
     }
 
+    /// Build the [`ReadOptions`] passed to `HudiScanExec` for per-slice reads.
+    ///
+    /// Hudi table-level planning has already applied partition filters. When
+    /// partition fields are dropped from data files, passing those filters to
+    /// `FileGroupReader` would fail its strict batch-schema validation.
+    fn read_options_for_hudi_exec(
+        hudi_configs: &HudiConfigs,
+        options: &ReadOptions,
+    ) -> ReadOptions {
+        let drops_partition_columns: bool = hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        if !drops_partition_columns || options.filters.is_empty() {
+            return options.clone();
+        }
+
+        let partition_columns: Vec<String> = hudi_configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into();
+        let mut applicable = options.clone();
+        applicable.filters = options
+            .filters
+            .iter()
+            .filter(|filter| !partition_columns.iter().any(|p| p == &filter.field))
+            .cloned()
+            .collect();
+        applicable
+    }
+
     /// Returns true iff every file slice has a `.parquet` base file.
     /// Empty input returns `false` so the scan is routed to `HudiScanExec`,
     /// which handles the empty case via `RecordBatchStreamAdapter::new(.., empty())`.
@@ -591,7 +620,8 @@ impl HudiDataSource {
                 .map_err(|e| external_error("Failed to create FileGroupReader", e))?,
         );
 
-        let mut hudi_read_options = read_options;
+        let mut hudi_read_options =
+            Self::read_options_for_hudi_exec(&self.table.hudi_configs, &read_options);
         if let Some(proj) = projection {
             let col_names: Vec<String> = proj
                 .iter()
@@ -1089,5 +1119,28 @@ mod tests {
             pushdown_support(&schema, &partition_cols, &or_expr),
             TableProviderFilterPushDown::Unsupported
         );
+    }
+
+    #[test]
+    fn test_read_options_for_hudi_exec_strips_dropped_partition_filters() {
+        let hudi_configs = HudiConfigs::new([
+            (HudiTableConfig::DropsPartitionFields, "true"),
+            (HudiTableConfig::PartitionFields, "region,country"),
+        ]);
+        let read_options = ReadOptions::new()
+            .with_filters([
+                ("region", "=", "us"),
+                ("amount", ">", "10"),
+                ("country", "=", "ca"),
+            ])
+            .unwrap()
+            .with_projection(["txn_id", "amount"]);
+
+        let actual = HudiDataSource::read_options_for_hudi_exec(&hudi_configs, &read_options);
+
+        assert_eq!(actual.filters.len(), 1);
+        assert_eq!(actual.filters[0].field, "amount");
+        assert_eq!(actual.projection, read_options.projection);
+        assert_eq!(actual.hudi_options, read_options.hudi_options);
     }
 }
