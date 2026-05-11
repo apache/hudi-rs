@@ -42,9 +42,9 @@ use crate::merge::RecordMergeStrategyValue;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter, IntoStaticStr)]
 pub enum HudiTableConfig {
-    /// Base file format
-    ///
-    /// Currently only parquet is supported.
+    /// Base file format. Supported values for regular tables: `parquet`,
+    /// `lance`. `hfile` is reserved for the metadata table and is rejected by
+    /// the regular base-file reader.
     BaseFileFormat,
 
     /// Base path to the table.
@@ -377,6 +377,8 @@ pub enum BaseFileFormatValue {
     /// HFile format - only valid for metadata tables.
     #[strum(serialize = "hfile")]
     HFile,
+    #[strum(serialize = "lance")]
+    Lance,
 }
 
 impl BaseFileFormatValue {
@@ -393,6 +395,8 @@ impl BaseFileFormatValue {
             Some(Self::Parquet)
         } else if Self::ends_with_ignore_ascii_case(path, ".hfile") {
             Some(Self::HFile)
+        } else if Self::ends_with_ignore_ascii_case(path, ".lance") {
+            Some(Self::Lance)
         } else {
             None
         }
@@ -403,6 +407,7 @@ impl BaseFileFormatValue {
         let suffix = match self {
             Self::Parquet => ".parquet",
             Self::HFile => ".hfile",
+            Self::Lance => ".lance",
         };
         Self::ends_with_ignore_ascii_case(path, suffix)
     }
@@ -446,6 +451,7 @@ impl FromStr for BaseFileFormatValue {
         match s.to_ascii_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
             "hfile" => Ok(Self::HFile),
+            "lance" => Ok(Self::Lance),
             "orc" => Err(UnsupportedValue(s.to_string())),
             v => Err(InvalidValue(v.to_string())),
         }
@@ -615,6 +621,34 @@ mod tests {
             BaseFileFormatValue::resolve_from_configs(&configs, Some("file.unknown")).unwrap(),
             BaseFileFormatValue::Parquet
         );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("data/file.HFILE"),
+            Some(BaseFileFormatValue::HFile)
+        );
+        assert_eq!(
+            BaseFileFormatValue::from_extension("data/file.PARQUET"),
+            Some(BaseFileFormatValue::Parquet)
+        );
+        assert_eq!(BaseFileFormatValue::from_extension("data/file.orc"), None);
+        assert_eq!(BaseFileFormatValue::from_extension("data/file"), None);
+    }
+
+    #[test]
+    fn base_file_format_from_configs_distinguishes_missing_and_invalid() {
+        let configs = HudiConfigs::empty();
+        assert_eq!(BaseFileFormatValue::from_configs(&configs).unwrap(), None);
+
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "LANCE")]);
+        assert_eq!(
+            BaseFileFormatValue::from_configs(&configs).unwrap(),
+            Some(BaseFileFormatValue::Lance)
+        );
+
+        let configs = HudiConfigs::new([(HudiTableConfig::BaseFileFormat, "orc")]);
+        assert!(matches!(
+            BaseFileFormatValue::from_configs(&configs).unwrap_err(),
+            UnsupportedValue(_)
+        ));
     }
 
     #[test]

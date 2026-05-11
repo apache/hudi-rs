@@ -17,7 +17,7 @@
 
 FROM rust:1.94
 
-RUN apt-get update && apt-get install -y cmake curl ca-certificates
+RUN apt-get update && apt-get install -y cmake curl ca-certificates protobuf-compiler
 
 ADD https://astral.sh/uv/install.sh /uv-installer.sh
 

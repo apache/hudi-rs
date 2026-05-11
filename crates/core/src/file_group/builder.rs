@@ -17,6 +17,7 @@
  * under the License.
  */
 use crate::Result;
+use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
@@ -177,27 +178,33 @@ pub fn replaced_file_groups_from_replace_commit(
     Ok(file_groups)
 }
 
-/// Build FileGroups from metadata table FilesPartitionRecords.
+/// Build FileGroups from metadata-table FilesPartitionRecords.
 ///
-/// This function is used for **snapshot queries** when the metadata table is enabled.
-/// It parses file names from the `.hoodie/metadata` table's files partition records
-/// and constructs FileGroup objects. Only includes active (non-deleted) files.
+/// Used for **snapshot queries** when the metadata table is enabled. Parses file
+/// names from the `.hoodie/metadata` table's files partition records and
+/// constructs FileGroup objects. Only includes active (non-deleted) files.
+///
+/// If `configured_base_file_format` is `Some`, only that suffix is treated as a
+/// base file. If it is `None`, any known base-file suffix is accepted so tables
+/// without `hoodie.table.base.file.format` can be discovered by extension.
 ///
 /// # Arguments
 /// * `records` - Metadata table files partition records (partition_path -> FilesPartitionRecord)
-/// * `base_file_extension` - The base file format extension (e.g., "parquet", "hfile")
+/// * `configured_base_file_format` - Explicit base-file format from table config, or
+///   `None` to fall back to extension-based discovery.
 /// * `completion_time_view` - View to look up completion timestamps.
+/// * `estimator` - Optional [FileStatsEstimator] used to populate `byte_size`
+///   and `num_records` on each base file.
 ///
 /// # Returns
 /// A map of partition paths to their FileGroups.
 pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
     records: &HashMap<String, FilesPartitionRecord>,
-    base_file_extension: &str,
+    configured_base_file_format: Option<&BaseFileFormatValue>,
     completion_time_view: &V,
     estimator: Option<&FileStatsEstimator>,
 ) -> Result<DashMap<String, Vec<FileGroup>>> {
     let file_groups_map = DashMap::new();
-    let base_file_suffix = format!(".{base_file_extension}");
 
     for (partition_path, record) in records {
         // Skip __all_partitions__ record - it lists partition names, not files
@@ -233,7 +240,10 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                     .entry(log_file.file_id.clone())
                     .or_default()
                     .push(log_file);
-            } else if file_name.ends_with(&base_file_suffix) {
+            } else if configured_base_file_format.as_ref().map_or_else(
+                || BaseFileFormatValue::from_extension(file_name).is_some(),
+                |format| format.matches_extension(file_name),
+            ) {
                 // Base file: ends with base file extension
                 let mut base_file = BaseFile::from_str(file_name).map_err(|e| {
                     CoreError::FileGroup(format!(
@@ -767,6 +777,7 @@ mod tests {
     mod test_file_groups_from_files_partition_records {
         use super::super::*;
         use crate::config::HudiConfigs;
+        use crate::config::table::BaseFileFormatValue;
         use crate::metadata::table_record::{
             FilesPartitionRecord, HoodieMetadataFileInfo, MetadataRecordType,
         };
@@ -839,7 +850,7 @@ mod tests {
             let records: HashMap<String, FilesPartitionRecord> = HashMap::new();
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -856,7 +867,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -880,7 +891,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -914,7 +925,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -951,7 +962,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -978,7 +989,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1007,7 +1018,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1034,7 +1045,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1062,7 +1073,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1096,7 +1107,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1119,7 +1135,12 @@ mod tests {
 
             let view = create_layout_v2_view(&[]);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1146,7 +1167,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1189,7 +1215,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1228,7 +1259,12 @@ mod tests {
             }];
             let view = create_layout_v2_view(&instants);
 
-            let result = file_groups_from_files_partition_records(&records, "parquet", &view, None);
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            );
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
@@ -1257,7 +1293,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1283,7 +1319,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1312,7 +1348,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1334,7 +1370,7 @@ mod tests {
 
             let result = file_groups_from_files_partition_records(
                 &records,
-                "hfile", // Different base file extension
+                Some(&BaseFileFormatValue::HFile),
                 &create_layout_v1_view(),
                 None,
             );
@@ -1342,6 +1378,37 @@ mod tests {
             let file_groups_map = result.unwrap();
 
             assert_eq!(file_groups_map.len(), 1);
+        }
+
+        #[test]
+        fn test_extension_fallback_accepts_lance_and_parquet_metadata_records() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    ("file-id-0_0-7-24_20240418173200000.lance", 1000, false),
+                    ("file-id-1_0-8-25_20240418173210000.parquet", 2000, false),
+                    ("ignored.txt", 1, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                None,
+                &create_layout_v1_view(),
+                None,
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            let extensions: HashSet<_> = file_groups
+                .iter()
+                .flat_map(|fg| fg.file_slices.values())
+                .map(|slice| slice.base_file.extension.as_str())
+                .collect();
+
+            assert_eq!(extensions, HashSet::from(["lance", "parquet"]));
         }
 
         #[test]
@@ -1359,7 +1426,7 @@ mod tests {
             let estimator = FileStatsEstimator::new(250.0, 2.0);
             let result = file_groups_from_files_partition_records(
                 &records,
-                "parquet",
+                Some(&BaseFileFormatValue::Parquet),
                 &create_layout_v1_view(),
                 Some(&estimator),
             );

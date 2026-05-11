@@ -40,11 +40,23 @@ pub struct BaseFileReadOptions {
     pub batch_size: Option<usize>,
     /// Column projection by names.
     pub projection: Option<Vec<String>>,
+    /// Known base-file size in bytes, when the caller already has file metadata.
+    pub known_file_size: Option<u64>,
 }
 
 impl BaseFileReadOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Sets the known base-file size in bytes.
+    pub fn with_known_file_size(mut self, size: u64) -> Self {
+        self.known_file_size = Some(size);
         self
     }
 
@@ -148,6 +160,9 @@ pub fn create_base_file_reader(
         BaseFileFormatValue::HFile => Err(StorageError::UnsupportedBaseFileFormat(
             "hfile is only supported through the metadata-table HFile reader".to_string(),
         )),
+        BaseFileFormatValue::Lance => Ok(Arc::new(super::lance::LanceBaseFileReader::new(
+            storage.clone(),
+        ))),
     }
 }
 
@@ -180,5 +195,12 @@ mod tests {
             Ok(_) => panic!("HFile should not create a generic base-file reader"),
             Err(err) => panic!("Expected unsupported HFile error, got {err}"),
         }
+    }
+
+    #[test]
+    fn test_create_base_file_reader_lance() {
+        let storage = test_storage();
+        let result = create_base_file_reader(&storage, &BaseFileFormatValue::Lance);
+        assert!(result.is_ok());
     }
 }

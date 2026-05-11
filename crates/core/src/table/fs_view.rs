@@ -25,7 +25,6 @@ use arrow_schema::Schema;
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::BaseFileFormatValue;
-use crate::config::table::HudiTableConfig::BaseFileFormat;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::file_group::base_file::reader::BaseFileReader;
@@ -51,10 +50,8 @@ pub struct FileSystemView {
 }
 
 impl FileSystemView {
-    pub(crate) fn base_file_format(&self) -> BaseFileFormatValue {
-        let s: String = self.hudi_configs.get_or_default(BaseFileFormat).into();
-        s.parse::<BaseFileFormatValue>()
-            .unwrap_or(BaseFileFormatValue::Parquet)
+    pub(crate) fn configured_base_file_format(&self) -> Result<Option<BaseFileFormatValue>> {
+        Ok(BaseFileFormatValue::from_configs(&self.hudi_configs)?)
     }
 
     pub async fn new(
@@ -100,13 +97,12 @@ impl FileSystemView {
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<()> {
-        let base_file_format = self.base_file_format();
-        let base_file_extension = base_file_format.as_ref();
+        let configured_base_file_format = self.configured_base_file_format()?;
 
         let file_groups_map = if let Some(records) = files_partition_records {
             file_groups_from_files_partition_records(
                 records,
-                base_file_extension,
+                configured_base_file_format.as_ref(),
                 timeline_view,
                 estimator,
             )?
@@ -136,6 +132,7 @@ impl FileSystemView {
                     file_pruner,
                     table_schema,
                     timeline_view.as_of_timestamp(),
+                    configured_base_file_format.as_ref(),
                 )
                 .await;
             self.partition_to_file_groups
@@ -160,16 +157,16 @@ impl FileSystemView {
         file_pruner: &FilePruner,
         table_schema: &Schema,
         as_of_timestamp: &str,
+        configured_base_file_format: Option<&BaseFileFormatValue>,
     ) -> Vec<FileGroup> {
         if file_pruner.is_empty() {
             return file_groups;
         }
 
-        let base_file_format = self.base_file_format();
         // Footer-based column-stats pruning only applies to Parquet base files.
         // (Separate concern from the FileStatsEstimator parquet check, which lives
         // on Table::get_or_init_estimator.)
-        if !matches!(base_file_format, BaseFileFormatValue::Parquet) {
+        if configured_base_file_format.is_some_and(|f| !matches!(f, BaseFileFormatValue::Parquet)) {
             return file_groups;
         }
 
@@ -189,7 +186,7 @@ impl FileSystemView {
                     }
                 };
 
-                if !base_file_format.matches_extension(&relative_path) {
+                if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
                     retained.push(fg);
                     continue;
                 }
@@ -345,7 +342,7 @@ mod tests {
     use super::*;
     use crate::config::HudiConfigs;
     use crate::config::table::BaseFileFormatValue;
-    use crate::config::table::HudiTableConfig::BasePath;
+    use crate::config::table::HudiTableConfig::{BaseFileFormat, BasePath};
     use crate::expr::filter::Filter;
     use crate::file_group::FileGroup;
     use crate::metadata::table::records::{
@@ -658,7 +655,13 @@ mod tests {
             FileGroup::new_with_base_file_name("fileid_0-0-1_20240418173551906.parquet", "")
                 .unwrap();
         let retained = fs_view
-            .apply_stats_pruning_from_footers(vec![file_group], &file_pruner, &table_schema, &as_of)
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                Some(&BaseFileFormatValue::HFile),
+            )
             .await;
 
         assert_eq!(retained.len(), 1);
@@ -673,7 +676,13 @@ mod tests {
             FileGroup::new_with_base_file_name("fileid_0-0-1_20240418173551906.hfile", "").unwrap();
         let retained = table
             .file_system_view
-            .apply_stats_pruning_from_footers(vec![file_group], &file_pruner, &table_schema, &as_of)
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                None,
+            )
             .await;
 
         assert_eq!(retained.len(), 1);
@@ -845,6 +854,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &as_of,
+                Some(&BaseFileFormatValue::Parquet),
             )
             .await;
 
@@ -863,7 +873,13 @@ mod tests {
         .unwrap();
         let retained = hudi_table
             .file_system_view
-            .apply_stats_pruning_from_footers(vec![file_group], &file_pruner, &table_schema, &as_of)
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                Some(&BaseFileFormatValue::Parquet),
+            )
             .await;
 
         assert!(retained.is_empty());
@@ -886,6 +902,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 "19700101000000",
+                Some(&BaseFileFormatValue::Parquet),
             )
             .await;
 
@@ -952,5 +969,124 @@ mod tests {
             .unwrap();
 
         assert_eq!(file_slices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fs_view_apply_stats_pruning_populates_metadata_for_retained_files() {
+        let (hudi_table, table_schema, file_pruner, as_of) =
+            build_file_pruning_context(("intField", ">=", "0")).await;
+
+        let file_group = FileGroup::new_with_base_file_name(
+            "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+            "",
+        )
+        .unwrap();
+        let retained = hudi_table
+            .file_system_view
+            .apply_stats_pruning_from_footers(
+                vec![file_group],
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                None,
+            )
+            .await;
+
+        assert_eq!(retained.len(), 1);
+        let fsl = retained[0].get_file_slice_as_of(&as_of).unwrap();
+        let file_metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+        assert!(file_metadata.size > 0);
+        assert!(file_metadata.num_records > 0);
+        assert!(fsl.base_file_column_stats.is_some());
+    }
+
+    #[tokio::test]
+    async fn fs_view_load_file_groups_returns_error_for_invalid_base_file_format() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (BasePath.as_ref(), base_url.as_str()),
+            (BaseFileFormat.as_ref(), "orc"),
+        ]));
+        let fs_view = FileSystemView::new(hudi_configs, Arc::new(HashMap::new()))
+            .await
+            .unwrap();
+
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
+            .await
+            .unwrap();
+        let partition_pruner = PartitionPruner::empty();
+        let file_pruner = FilePruner::empty();
+        let table_schema = hudi_table.get_schema().await.unwrap();
+
+        let result = fs_view
+            .load_file_groups(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                &timeline_view,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fs_view_get_file_slices_excludes_partitions_outside_pruner() {
+        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
+        let timeline_view = hudi_table
+            .timeline
+            .create_view_as_of(&latest_timestamp)
+            .await
+            .unwrap();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+        let table_schema = hudi_table.get_schema().await.unwrap();
+
+        // First load all partitions into the dashmap with an empty pruner.
+        let _ = hudi_table
+            .file_system_view
+            .get_file_slices_by_storage_listing(
+                &PartitionPruner::empty(),
+                &FilePruner::empty(),
+                &table_schema,
+                &timeline_view,
+                None,
+            )
+            .await
+            .unwrap();
+        let initial_partitions = hudi_table.file_system_view.partition_to_file_groups.len();
+        assert!(initial_partitions > 1);
+
+        // Then issue a stricter call that prunes some loaded partitions during collection.
+        let partition_filters = vec![Filter::try_from(("byteField", "=", "10")).unwrap()];
+        let partition_pruner = PartitionPruner::new(
+            &partition_filters,
+            &partition_schema,
+            hudi_table.hudi_configs.as_ref(),
+        )
+        .unwrap();
+        let file_slices = hudi_table
+            .file_system_view
+            .get_file_slices_by_storage_listing(
+                &partition_pruner,
+                &FilePruner::empty(),
+                &table_schema,
+                &timeline_view,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let returned_partitions: std::collections::HashSet<_> =
+            file_slices.iter().map(|fsl| &fsl.partition_path).collect();
+        assert_eq!(returned_partitions.len(), 1);
+        assert!(returned_partitions.contains(&"10".to_string()));
     }
 }

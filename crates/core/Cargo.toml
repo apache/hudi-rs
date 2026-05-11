@@ -81,6 +81,16 @@ prost = { workspace = true }
 # compression
 flate2 = { workspace = true }
 
+# lance
+# lance-encoding and lance-file generate Rust code from .proto files via
+# prost-build at compile time, which shells out to `protoc`. Any build of
+# hudi-core (CI, Docker, local dev, downstream consumers) must therefore
+# have `protoc` available on PATH — there is no opt-out.
+lance-core = { version = "4.0.1" }
+lance-encoding = { version = "4.0.1" }
+lance-file = { version = "4.0.1" }
+lance-io = { version = "4.0.1" }
+
 # datafusion
 datafusion = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }

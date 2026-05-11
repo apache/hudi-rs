@@ -2229,6 +2229,372 @@ mod manual_reader_matches_table_read {
     }
 }
 
+mod lance_tables {
+    use super::*;
+    use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use std::collections::HashMap;
+    use url::Url;
+
+    async fn read_lance_table(
+        base_url: Url,
+        projection: impl IntoIterator<Item = &'static str>,
+    ) -> Result<RecordBatch> {
+        let hudi_table = Table::new(base_url.path()).await?;
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_projection(projection))
+            .await?;
+        let schema = batches[0].schema();
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
+    fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+    }
+
+    fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+    }
+
+    fn float64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Float64Array {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+    }
+
+    fn sorted_string_values(batch: &RecordBatch, name: &str) -> Vec<String> {
+        let values = string_column(batch, name);
+        let mut strings = (0..batch.num_rows())
+            .map(|row| values.value(row).to_string())
+            .collect::<Vec<_>>();
+        strings.sort_unstable();
+        strings
+    }
+
+    fn assert_float_eq(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn txn_rows(batch: &RecordBatch) -> HashMap<String, (String, i64, Option<String>)> {
+        let txn_ids = string_column(batch, "txn_id");
+        let txn_types = string_column(batch, "txn_type");
+        let txn_timestamps = int64_column(batch, "txn_ts");
+        let regions = batch
+            .column_by_name("region")
+            .map(|column| column.as_any().downcast_ref::<StringArray>().unwrap());
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                txn_ids.value(row_idx).to_string(),
+                (
+                    txn_types.value(row_idx).to_string(),
+                    txn_timestamps.value(row_idx),
+                    regions.map(|column| column.value(row_idx).to_string()),
+                ),
+            );
+        }
+        rows
+    }
+
+    fn assert_lance_txn_table_rows(batch: &RecordBatch, partitioned: bool) {
+        let rows = txn_rows(batch);
+        let mut actual_ids = rows.keys().cloned().collect::<Vec<_>>();
+        actual_ids.sort_unstable();
+        assert_eq!(
+            actual_ids,
+            [
+                "TXN-001", "TXN-003", "TXN-004", "TXN-006", "TXN-007", "TXN-008", "TXN-009",
+                "TXN-010", "TXN-011", "TXN-012", "TXN-013", "TXN-014", "TXN-015", "TXN-016",
+            ]
+        );
+        assert!(
+            !rows.contains_key("TXN-002"),
+            "deleted TXN-002 must be absent"
+        );
+        assert!(
+            !rows.contains_key("TXN-005"),
+            "deleted TXN-005 must be absent"
+        );
+        assert_eq!(rows.get("TXN-001").unwrap().0, "reversal");
+        assert_eq!(rows.get("TXN-001").unwrap().1, 1700100000001);
+        assert_eq!(rows.get("TXN-007").unwrap().1, 1700300000007);
+        assert_eq!(rows.get("TXN-016").unwrap().0, "debit");
+
+        if partitioned {
+            let region_rows = rows
+                .iter()
+                .map(|(txn_id, (_, _, region))| {
+                    (txn_id.as_str(), region.as_ref().unwrap().as_str())
+                })
+                .collect::<HashMap<_, _>>();
+            assert_eq!(region_rows.get("TXN-001"), Some(&"us"));
+            assert_eq!(region_rows.get("TXN-004"), Some(&"eu"));
+            assert_eq!(region_rows.get("TXN-007"), Some(&"apac"));
+            assert_eq!(region_rows.get("TXN-016"), Some(&"apac"));
+        }
+    }
+
+    fn trips_rows(batch: &RecordBatch) -> HashMap<String, (String, f64, i64)> {
+        let riders = string_column(batch, "rider");
+        let drivers = string_column(batch, "driver");
+        let fares = float64_column(batch, "fare");
+        let timestamps = int64_column(batch, "ts");
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                riders.value(row_idx).to_string(),
+                (
+                    drivers.value(row_idx).to_string(),
+                    fares.value(row_idx),
+                    timestamps.value(row_idx),
+                ),
+            );
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonpartitioned_cow_snapshot_applies_hudi_updates_deletes_and_inserts()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceNonpartitioned.url_to_cow(),
+            ["id", "name", "score", "updated_at"],
+        )
+        .await?;
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let updated_at = batch
+            .column_by_name("updated_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                ids.value(row_idx),
+                (
+                    names.value(row_idx).to_string(),
+                    scores.value(row_idx),
+                    updated_at.value(row_idx),
+                ),
+            );
+        }
+
+        let mut actual_ids = rows.keys().copied().collect::<Vec<_>>();
+        actual_ids.sort_unstable();
+        assert_eq!(actual_ids, vec![1, 2, 3, 5, 6, 7, 8, 9, 10]);
+        assert!(!rows.contains_key(&4), "deleted id 4 must be absent");
+        assert!(
+            (rows.get(&1).unwrap().1 - 0.96).abs() < 1e-9,
+            "id 1 should reflect the score update"
+        );
+        assert_eq!(rows.get(&1).unwrap().2, 1700100000000);
+        assert!(
+            (rows.get(&2).unwrap().1 - 0.93).abs() < 1e-9,
+            "id 2 should reflect the score update"
+        );
+        assert_eq!(rows.get(&2).unwrap().2, 1700100000001);
+        assert_eq!(rows.get(&9).unwrap().0, "feature-set-iota");
+        assert_eq!(rows.get(&10).unwrap().0, "feature-set-kappa");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_txns_nonpart_cow_snapshot_applies_updates_deletes_and_inserts()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceTxnsNonpart.url_to_cow(),
+            ["txn_id", "txn_type", "txn_ts"],
+        )
+        .await?;
+        assert_lance_txn_table_rows(&batch, false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_txns_simple_cow_snapshot_applies_updates_deletes_and_inserts()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceTxnsSimple.url_to_cow(),
+            ["txn_id", "txn_type", "txn_ts", "region"],
+        )
+        .await?;
+        assert_lance_txn_table_rows(&batch, true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_trips_lance_cow_snapshot_applies_updates_deletes_and_inserts() -> Result<()> {
+        let batch = read_lance_table(
+            QuickstartTripsTable::V9TripsLance.url_to_cow(),
+            ["rider", "driver", "fare", "ts"],
+        )
+        .await?;
+        let rows = trips_rows(&batch);
+        let mut riders = rows.keys().cloned().collect::<Vec<_>>();
+        riders.sort_unstable();
+        assert_eq!(
+            riders,
+            [
+                "rider-A", "rider-C", "rider-D", "rider-E", "rider-G", "rider-I", "rider-J",
+                "rider-K", "rider-L", "rider-M", "rider-N",
+            ]
+        );
+        assert!(
+            !rows.contains_key("rider-F"),
+            "deleted rider-F must be absent"
+        );
+        assert_float_eq(rows.get("rider-A").unwrap().1, 0.0);
+        assert_eq!(rows.get("rider-A").unwrap().2, 1695200000000);
+        assert_float_eq(rows.get("rider-G").unwrap().1, 0.0);
+        assert_eq!(rows.get("rider-K").unwrap().0, "driver-U");
+        assert_eq!(rows.get("rider-N").unwrap().0, "driver-X");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonhivestyle_mor_snapshot_merges_available_log_update_and_base_files()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceNonhivestyle.url_to_mor_avro(),
+            ["event_id", "user_id", "payload", "event_ts", "event_date"],
+        )
+        .await?;
+        let event_ids = sorted_string_values(&batch, "event_id");
+        assert_eq!(
+            event_ids,
+            [
+                "evt-001", "evt-002", "evt-003", "evt-004", "evt-005", "evt-006", "evt-007",
+                "evt-008", "evt-009", "evt-010", "evt-011", "evt-012", "evt-013", "evt-014",
+            ]
+        );
+
+        let event_id_col = string_column(&batch, "event_id");
+        let user_id_col = string_column(&batch, "user_id");
+        let payload_col = string_column(&batch, "payload");
+        let event_ts_col = int64_column(&batch, "event_ts");
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                event_id_col.value(row_idx).to_string(),
+                (
+                    user_id_col.value(row_idx).to_string(),
+                    payload_col.value(row_idx).to_string(),
+                    event_ts_col.value(row_idx),
+                ),
+            );
+        }
+
+        assert_eq!(
+            rows.get("evt-001").unwrap().1,
+            r#"{"page": "/home", "session": "sess-abc123"}"#
+        );
+        assert_eq!(rows.get("evt-001").unwrap().2, 1700000000001);
+        assert_eq!(rows.get("evt-002").unwrap().1, r#"{"button": "signup"}"#);
+        assert_eq!(rows.get("evt-013").unwrap().0, "user-100");
+        assert_eq!(rows.get("evt-014").unwrap().0, "user-101");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_trips_lance_mor_snapshot_merges_available_log_update_and_base_files()
+    -> Result<()> {
+        let batch = read_lance_table(
+            QuickstartTripsTable::V9TripsLance.url_to_mor_avro(),
+            ["rider", "driver", "fare", "ts"],
+        )
+        .await?;
+        let rows = trips_rows(&batch);
+        let mut riders = rows.keys().cloned().collect::<Vec<_>>();
+        riders.sort_unstable();
+        assert_eq!(
+            riders,
+            [
+                "rider-A", "rider-C", "rider-D", "rider-E", "rider-F", "rider-G", "rider-I",
+                "rider-J", "rider-M", "rider-N", "rider-O", "rider-P",
+            ]
+        );
+        assert_float_eq(rows.get("rider-A").unwrap().1, 0.0);
+        assert_eq!(rows.get("rider-A").unwrap().2, 1695200000000);
+        assert_float_eq(rows.get("rider-C").unwrap().1, 27.70);
+        assert_float_eq(rows.get("rider-G").unwrap().1, 43.40);
+        assert_eq!(rows.get("rider-O").unwrap().0, "driver-Y");
+        assert_eq!(rows.get("rider-P").unwrap().0, "driver-Z");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonpartitioned_cow_read_uses_extension_fallback_without_format_config()
+    -> Result<()> {
+        // Safe because each `path_to_cow()` call extracts the zip into its own
+        // tempdir (see `hudi_test::extract_test_table`); the in-place edit does
+        // not leak into other tests.
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
+        let props_path = std::path::Path::new(&table_path).join(".hoodie/hoodie.properties");
+        let props = std::fs::read_to_string(&props_path).unwrap();
+        let props_without_format = props
+            .lines()
+            .filter(|line| !line.starts_with("hoodie.table.base.file.format="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&props_path, props_without_format).unwrap();
+
+        let hudi_table = Table::new(&table_path).await?;
+        let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(
+            file_slices.iter().any(|slice| slice
+                .base_file_relative_path()
+                .is_ok_and(|path| path.ends_with(".lance"))),
+            "table listing should discover .lance base files without an explicit format config"
+        );
+
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_projection(["id"]))
+            .await?;
+        let total_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(total_rows, 9);
+
+        Ok(())
+    }
+}
+
 /// Test module for tables with metadata table (MDT) enabled.
 /// These tests verify MDT-accelerated file listing and partition normalization.
 mod mdt_enabled_tables {
