@@ -39,7 +39,7 @@ repository = "https://github.com/apache/hudi-rs"
 # arrow
 arrow = { version = "57" }
 arrow-arith = { version = "57" }
-arrow-array = { version = "57" }
+arrow-array = { version = "58" }
 arrow-buffer = { version = "57" }
 arrow-cast = { version = "57" }
 arrow-ipc = { version = "57" }
