@@ -570,6 +570,7 @@ impl HudiDataSource {
             file_slices,
             file_group_reader,
             hudi_read_options,
+            input_partitions,
             self.file_slice_read_concurrency,
             self.schema.clone(),
             projection.cloned(),

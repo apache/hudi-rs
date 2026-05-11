@@ -21,9 +21,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Float64Array, RecordBatch, StringArray};
+use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
-use hudi_core::config::read::HudiReadConfig::UseReadOptimizedMode;
+use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
 use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
@@ -60,6 +60,40 @@ fn uuid_rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, String, f64)> {
         rows.extend(QuickstartTripsTable::uuid_rider_and_fare(batch));
     }
     rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn id_name_active_rows(batches: &[RecordBatch]) -> Vec<(i32, String, bool)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let active = batch
+            .column_by_name("isActive")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+
+        for row_idx in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row_idx),
+                names.value(row_idx).to_string(),
+                active.value(row_idx),
+            ));
+        }
+    }
+    rows.sort_unstable_by_key(|(id, _, _)| *id);
     rows
 }
 
@@ -233,5 +267,85 @@ async fn test_lance_mor_snapshot_query_matches_core_log_merged_read() {
             .unwrap()
             .2,
         19.1
+    );
+}
+
+#[tokio::test]
+async fn test_partitioned_parquet_mor_snapshot_query_matches_core_after_partition_pruning() {
+    let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_mor_parquet();
+    let projection = ["id", "name", "isActive"];
+
+    let table = Table::new(base_url.path()).await.unwrap();
+    let expected_all_batches = table
+        .read(&ReadOptions::new().with_projection(projection))
+        .await
+        .unwrap();
+    let expected_all_rows = id_name_active_rows(&expected_all_batches);
+    let expected_filtered_batches = table
+        .read(
+            &ReadOptions::new()
+                .with_filters([("byteField", "=", "10")])
+                .unwrap()
+                .with_projection(projection),
+        )
+        .await
+        .unwrap();
+    let expected_filtered_rows = id_name_active_rows(&expected_filtered_batches);
+    let read_optimized_filtered_batches = table
+        .read(
+            &ReadOptions::new()
+                .with_filters([("byteField", "=", "10")])
+                .unwrap()
+                .with_projection(projection)
+                .with_hudi_option(UseReadOptimizedMode.as_ref(), "true"),
+        )
+        .await
+        .unwrap();
+    let read_optimized_filtered_rows = id_name_active_rows(&read_optimized_filtered_batches);
+
+    let ctx = SessionContext::new();
+    let hudi =
+        HudiDataSource::new_with_options(base_url.as_str(), [(InputPartitions.as_ref(), "2")])
+            .await
+            .unwrap();
+    ctx.register_table("sample", Arc::new(hudi)).unwrap();
+
+    let actual_all_batches = ctx
+        .sql(r#"SELECT id, name, "isActive" FROM sample"#)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let actual_all_rows = id_name_active_rows(&actual_all_batches);
+    let actual_filtered_batches = ctx
+        .sql(r#"SELECT id, name, "isActive" FROM sample WHERE "byteField" = 10"#)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let actual_filtered_rows = id_name_active_rows(&actual_filtered_batches);
+
+    assert_eq!(actual_all_rows, expected_all_rows);
+    assert_eq!(actual_all_rows.len(), 4);
+    assert_eq!(actual_filtered_rows, expected_filtered_rows);
+    assert_eq!(
+        actual_filtered_rows,
+        [
+            (1, "Alice".to_string(), false),
+            (3, "Carol".to_string(), true)
+        ]
+    );
+    assert_ne!(
+        actual_filtered_rows, read_optimized_filtered_rows,
+        "partition-filtered snapshot should merge the active MOR log in byteField=10"
+    );
+    assert_eq!(
+        read_optimized_filtered_rows,
+        [
+            (1, "Alice".to_string(), true),
+            (3, "Carol".to_string(), true)
+        ]
     );
 }

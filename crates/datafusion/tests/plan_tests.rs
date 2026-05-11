@@ -518,6 +518,71 @@ mod dispatch_tests {
     }
 
     #[tokio::test]
+    async fn test_partitioned_parquet_mor_snapshot_prunes_file_slices() {
+        let base_url = V6SimplekeygenNonhivestyle.url_to_mor_parquet();
+        let ctx = register_uri_as_table(
+            "partitioned_mor_snapshot",
+            base_url.as_str(),
+            [(InputPartitions.as_ref(), "2")],
+        )
+        .await
+        .unwrap();
+
+        let no_filter_plan =
+            explain_physical_plan(&ctx, "SELECT id FROM partitioned_mor_snapshot").await;
+        assert!(
+            no_filter_plan.contains("HudiScanExec"),
+            "Partitioned Parquet MOR snapshot should use HudiScanExec. Plan: {no_filter_plan}"
+        );
+        assert!(
+            !no_filter_plan.contains("DataSourceExec"),
+            "Partitioned Parquet MOR snapshot should not use DataSourceExec. Plan: {no_filter_plan}"
+        );
+        assert!(
+            !no_filter_plan.contains("ParquetSource"),
+            "Partitioned Parquet MOR snapshot should not use ParquetSource. Plan: {no_filter_plan}"
+        );
+        assert!(
+            no_filter_plan.contains("input_partitions=2"),
+            "Plan should preserve configured input_partitions=2. Plan: {no_filter_plan}"
+        );
+        assert!(
+            no_filter_plan.contains("partitions=2"),
+            "Unfiltered scan should be split across 2 execution partitions. Plan: {no_filter_plan}"
+        );
+        assert!(
+            no_filter_plan.contains("file_slices=3"),
+            "Unfiltered scan should include all 3 file slices. Plan: {no_filter_plan}"
+        );
+
+        let filtered_plan = explain_physical_plan(
+            &ctx,
+            "SELECT id FROM partitioned_mor_snapshot WHERE byteField = 10",
+        )
+        .await;
+        assert!(
+            filtered_plan.contains("HudiScanExec"),
+            "Partition-filtered Parquet MOR snapshot should use HudiScanExec. Plan: {filtered_plan}"
+        );
+        assert!(
+            filtered_plan.contains("input_partitions=2"),
+            "Partition-filtered plan should preserve configured input_partitions=2. Plan: {filtered_plan}"
+        );
+        assert!(
+            filtered_plan.contains("partitions=1"),
+            "Partition filter should reduce the scan to 1 execution partition. Plan: {filtered_plan}"
+        );
+        assert!(
+            filtered_plan.contains("file_slices=1"),
+            "Partition filter should reduce the scan to 1 file slice. Plan: {filtered_plan}"
+        );
+        assert!(
+            !filtered_plan.contains("FilterExec"),
+            "Exact partition filter should not leave a residual FilterExec. Plan: {filtered_plan}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lance_mor_snapshot_uses_hudi_scan_exec() {
         let base_url = QuickstartTripsTable::V9TripsLance.url_to_mor_avro();
         let ctx = register_uri_as_table("lance_mor_snapshot", base_url.as_str(), empty_options())
