@@ -28,7 +28,9 @@ use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
 use hudi_test::SampleTable;
-use hudi_test::v9_verification::verify_v9_txns_table;
+use hudi_test::v9_verification::{
+    verify_partitioned_records, verify_v9_txns_table, verify_v9_txns_table_snapshot,
+};
 
 fn rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, f64)> {
     let mut rows = Vec::new();
@@ -97,6 +99,26 @@ fn id_name_active_rows(batches: &[RecordBatch]) -> Vec<(i32, String, bool)> {
     rows
 }
 
+async fn explain_physical_plan(ctx: &SessionContext, sql: &str) -> String {
+    let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
+    let batches = explaining_df.collect().await.unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("plan")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|line| line.unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ============================================================================
 // COW tests
 // ============================================================================
@@ -163,6 +185,52 @@ async fn test_v9_txns_mor_nonpart_nometa() {
 #[tokio::test]
 async fn test_v9_txns_mor_nonpart_meta() {
     verify_v9_txns_table(&SampleTable::V9TxnsNonpartMeta, false, false).await;
+}
+
+// ============================================================================
+// MOR tests (snapshot mode, after compaction + clustering)
+// ============================================================================
+
+#[tokio::test]
+async fn test_v9_txns_mor_snapshot_simple_nometa() {
+    let base_url = SampleTable::V9TxnsSimpleNometa.url_to_mor_avro();
+    let ctx = SessionContext::new();
+    let hudi =
+        HudiDataSource::new_with_options(base_url.as_str(), [(InputPartitions.as_ref(), "2")])
+            .await
+            .unwrap();
+    ctx.register_table("txns", Arc::new(hudi)).unwrap();
+
+    verify_partitioned_records(&ctx).await;
+
+    let plan = explain_physical_plan(&ctx, "SELECT txn_id FROM txns WHERE region = 'us'").await;
+    assert!(plan.contains("HudiScanExec"));
+    assert!(plan.contains("input_partitions=2"));
+}
+
+#[tokio::test]
+async fn test_v9_txns_mor_snapshot_simple_meta() {
+    verify_v9_txns_table_snapshot(&SampleTable::V9TxnsSimpleMeta, true).await;
+}
+
+#[tokio::test]
+async fn test_v9_txns_mor_snapshot_complex_nometa() {
+    verify_v9_txns_table_snapshot(&SampleTable::V9TxnsComplexNometa, true).await;
+}
+
+#[tokio::test]
+async fn test_v9_txns_mor_snapshot_complex_meta() {
+    verify_v9_txns_table_snapshot(&SampleTable::V9TxnsComplexMeta, true).await;
+}
+
+#[tokio::test]
+async fn test_v9_txns_mor_snapshot_nonpart_nometa() {
+    verify_v9_txns_table_snapshot(&SampleTable::V9TxnsNonpartNometa, false).await;
+}
+
+#[tokio::test]
+async fn test_v9_txns_mor_snapshot_nonpart_meta() {
+    verify_v9_txns_table_snapshot(&SampleTable::V9TxnsNonpartMeta, false).await;
 }
 
 #[tokio::test]
