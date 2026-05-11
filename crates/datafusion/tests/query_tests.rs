@@ -195,7 +195,8 @@ fn set_drop_partition_columns(table_path: &Path) {
 }
 
 fn dropped_partition_column_mor_table() -> PathBuf {
-    let table_path = PathBuf::from(SampleTable::V6SimplekeygenNonhivestyle.path_to_mor_parquet());
+    let table_path =
+        PathBuf::from(SampleTable::V6SimplekeygenNonhivestyle.path_to_mor_parquet_fresh());
     set_drop_partition_columns(&table_path);
 
     let mut parquet_files = Vec::new();

@@ -2563,10 +2563,9 @@ mod lance_tables {
     #[tokio::test]
     async fn test_v9_lance_nonpartitioned_cow_read_uses_extension_fallback_without_format_config()
     -> Result<()> {
-        // Safe because each `path_to_cow()` call extracts the zip into its own
-        // tempdir (see `hudi_test::extract_test_table`); the in-place edit does
-        // not leak into other tests.
-        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
+        // Safe because this test asks for a fresh extraction before mutating
+        // hoodie.properties in place.
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow_fresh();
         let props_path = std::path::Path::new(&table_path).join(".hoodie/hoodie.properties");
         let props = std::fs::read_to_string(&props_path).unwrap();
         let props_without_format = props

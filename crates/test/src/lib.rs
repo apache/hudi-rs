@@ -18,11 +18,15 @@
  */
 
 use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 use strum_macros::{AsRefStr, EnumIter, EnumString};
-use tempfile::tempdir;
+use tempfile::{Builder as TempDirBuilder, tempdir};
 use url::Url;
 use zip::ZipArchive;
 
@@ -31,14 +35,121 @@ pub mod util;
 #[cfg(feature = "datafusion")]
 pub mod v9_verification;
 
+static EXTRACT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum TableFormat {
+    Cow,
+    MorParquet,
+    MorAvro,
+}
+
+impl TableFormat {
+    fn table_type(self) -> &'static str {
+        match self {
+            Self::Cow => "cow",
+            Self::MorParquet | Self::MorAvro => "mor",
+        }
+    }
+
+    fn log_format(self) -> Option<&'static str> {
+        match self {
+            Self::Cow => None,
+            Self::MorParquet => Some("parquet"),
+            Self::MorAvro => Some("avro"),
+        }
+    }
+}
+
+const COW: &[TableFormat] = &[TableFormat::Cow];
+const MOR_AVRO: &[TableFormat] = &[TableFormat::MorAvro];
+const MOR_PARQUET: &[TableFormat] = &[TableFormat::MorParquet];
+const COW_AND_MOR_AVRO: &[TableFormat] = &[TableFormat::Cow, TableFormat::MorAvro];
+const COW_AND_MOR_PARQUET: &[TableFormat] = &[TableFormat::Cow, TableFormat::MorParquet];
+
 pub fn extract_test_table(zip_path: &Path) -> PathBuf {
-    let target_dir = tempdir().unwrap().path().to_path_buf();
-    let archive = fs::read(zip_path).unwrap();
-    ZipArchive::new(Cursor::new(archive))
-        .unwrap()
-        .extract(&target_dir)
-        .unwrap();
+    let _lock = EXTRACT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("fixture extraction lock should not be poisoned");
+
+    let target_dir = cached_extract_dir(zip_path);
+    if target_dir.exists() {
+        return target_dir;
+    }
+
+    let cache_root = target_dir
+        .parent()
+        .expect("fixture cache path should have a parent");
+    fs::create_dir_all(cache_root)
+        .unwrap_or_else(|e| panic!("create fixture cache {}: {e}", cache_root.display()));
+    let temp_dir = TempDirBuilder::new()
+        .prefix("extract-")
+        .tempdir_in(cache_root)
+        .unwrap_or_else(|e| panic!("create temp fixture dir in {}: {e}", cache_root.display()));
+
+    extract_zip_to_dir(zip_path, temp_dir.path());
+
+    match fs::rename(temp_dir.path(), &target_dir) {
+        Ok(()) => target_dir,
+        Err(_) if target_dir.exists() => target_dir,
+        Err(e) => panic!(
+            "move extracted fixture {} to {}: {e}",
+            temp_dir.path().display(),
+            target_dir.display()
+        ),
+    }
+}
+
+/// Extracts a fixture into a unique temp directory.
+///
+/// Use this only for tests that mutate the extracted table in place. Normal
+/// readers should use [`extract_test_table`], which reuses a bounded fixture
+/// cache keyed by zip path and metadata.
+pub fn extract_test_table_fresh(zip_path: &Path) -> PathBuf {
+    let temp_dir = tempdir().expect("create temp fixture dir");
+    let target_dir = temp_dir.path().to_path_buf();
+    extract_zip_to_dir(zip_path, &target_dir);
+    let kept_dir = temp_dir.keep();
+    debug_assert_eq!(kept_dir, target_dir);
     target_dir
+}
+
+fn cached_extract_dir(zip_path: &Path) -> PathBuf {
+    let zip_path = zip_path
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("canonicalize fixture {}: {e}", zip_path.display()));
+    let metadata = fs::metadata(&zip_path)
+        .unwrap_or_else(|e| panic!("stat fixture {}: {e}", zip_path.display()));
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    let mut hasher = DefaultHasher::new();
+    zip_path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+
+    std::env::temp_dir()
+        .join("hudi-rs-test-fixtures")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+fn extract_zip_to_dir(zip_path: &Path, target_dir: &Path) {
+    let archive =
+        fs::read(zip_path).unwrap_or_else(|e| panic!("read fixture {}: {e}", zip_path.display()));
+    let mut zip = ZipArchive::new(Cursor::new(archive))
+        .unwrap_or_else(|e| panic!("open fixture zip {}: {e}", zip_path.display()));
+    zip.extract(target_dir).unwrap_or_else(|e| {
+        panic!(
+            "extract fixture {} to {}: {e}",
+            zip_path.display(),
+            target_dir.display()
+        )
+    });
 }
 
 #[allow(dead_code)]
@@ -98,10 +209,25 @@ impl QuickstartTripsTable {
         data_path.into_boxed_path()
     }
 
-    pub fn path_to_cow(&self) -> String {
-        let zip_path = self.zip_path("cow", None);
+    fn zip_path_for(&self, format: TableFormat) -> Box<Path> {
+        self.zip_path(format.table_type(), format.log_format())
+    }
+
+    pub fn available_formats(&self) -> &'static [TableFormat] {
+        match self {
+            Self::V6Trips8I1U | Self::V6Trips8I3D | Self::V8Trips8I3U1D => MOR_AVRO,
+            Self::V9TripsLance => COW_AND_MOR_AVRO,
+        }
+    }
+
+    pub fn path(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn path_to_cow(&self) -> String {
+        self.path(TableFormat::Cow)
     }
 
     pub fn url_to_cow(&self) -> Url {
@@ -110,9 +236,12 @@ impl QuickstartTripsTable {
     }
 
     pub fn path_to_mor_avro(&self) -> String {
-        let zip_path = self.zip_path("mor", Some("avro"));
-        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
-        path_buf.to_str().unwrap().to_string()
+        self.path(TableFormat::MorAvro)
+    }
+
+    pub fn url(&self, format: TableFormat) -> Url {
+        let path = self.path(format);
+        Url::from_file_path(path).unwrap()
     }
 
     pub fn url_to_mor_avro(&self) -> Url {
@@ -197,16 +326,72 @@ impl SampleTable {
         data_path.into_boxed_path()
     }
 
-    pub fn path_to_cow(&self) -> String {
-        let zip_path = self.zip_path("cow", None);
+    fn zip_path_for(&self, format: TableFormat) -> Box<Path> {
+        self.zip_path(format.table_type(), format.log_format())
+    }
+
+    pub fn available_formats(&self) -> &'static [TableFormat] {
+        match self {
+            Self::V6TimebasedkeygenNonhivestyle
+            | Self::V8ComplexkeygenHivestyle
+            | Self::V8Empty
+            | Self::V8Nonpartitioned
+            | Self::V8SimplekeygenHivestyleNoMetafields
+            | Self::V8SimplekeygenNonhivestyle
+            | Self::V9TimebasedkeygenEpochmillis
+            | Self::V9TimebasedkeygenUnixtimestamp
+            | Self::V9LanceNonpartitioned
+            | Self::V9LanceTxnsNonpart
+            | Self::V9LanceTxnsSimple => COW,
+
+            Self::V6NonpartitionedRollback => MOR_PARQUET,
+
+            Self::V9NonpartitionedRollback | Self::V9LanceNonhivestyle => MOR_AVRO,
+
+            Self::V9TimebasedkeygenNonhivestyle
+            | Self::V9TxnsComplexMeta
+            | Self::V9TxnsComplexNometa
+            | Self::V9TxnsNonpartMeta
+            | Self::V9TxnsNonpartNometa
+            | Self::V9TxnsSimpleMeta
+            | Self::V9TxnsSimpleNometa
+            | Self::V9TxnsSimpleOverwrite => COW_AND_MOR_AVRO,
+
+            Self::V6ComplexkeygenHivestyle
+            | Self::V6Empty
+            | Self::V6Nonpartitioned
+            | Self::V6SimplekeygenHivestyleNoMetafields
+            | Self::V6SimplekeygenNonhivestyle
+            | Self::V6SimplekeygenNonhivestyleOverwritetable => COW_AND_MOR_PARQUET,
+        }
+    }
+
+    pub fn path(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
     }
 
-    pub fn path_to_mor_parquet(&self) -> String {
-        let zip_path = self.zip_path("mor", Some("parquet"));
-        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
+    pub fn path_fresh(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        let path_buf = extract_test_table_fresh(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
+    }
+
+    pub fn path_to_cow(&self) -> String {
+        self.path(TableFormat::Cow)
+    }
+
+    pub fn path_to_cow_fresh(&self) -> String {
+        self.path_fresh(TableFormat::Cow)
+    }
+
+    pub fn path_to_mor_parquet(&self) -> String {
+        self.path(TableFormat::MorParquet)
+    }
+
+    pub fn path_to_mor_parquet_fresh(&self) -> String {
+        self.path_fresh(TableFormat::MorParquet)
     }
 
     pub fn url_to_cow(&self) -> Url {
@@ -215,9 +400,12 @@ impl SampleTable {
     }
 
     pub fn path_to_mor_avro(&self) -> String {
-        let zip_path = self.zip_path("mor", Some("avro"));
-        let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
-        path_buf.to_str().unwrap().to_string()
+        self.path(TableFormat::MorAvro)
+    }
+
+    pub fn url(&self, format: TableFormat) -> Url {
+        let path = self.path(format);
+        Url::from_file_path(path).unwrap()
     }
 
     pub fn url_to_mor_parquet(&self) -> Url {
@@ -231,7 +419,10 @@ impl SampleTable {
     }
 
     pub fn urls(&self) -> Vec<Url> {
-        vec![self.url_to_cow(), self.url_to_mor_parquet()]
+        self.available_formats()
+            .iter()
+            .map(|format| self.url(*format))
+            .collect()
     }
 }
 
@@ -255,72 +446,25 @@ mod tests {
     #[test]
     fn quickstart_trips_table_zip_file_should_exist() {
         for t in QuickstartTripsTable::iter() {
-            match t {
-                QuickstartTripsTable::V6Trips8I1U => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                QuickstartTripsTable::V6Trips8I3D => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                QuickstartTripsTable::V8Trips8I3U1D => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                QuickstartTripsTable::V9TripsLance => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
+            for format in t.available_formats() {
+                let path = t.zip_path_for(*format);
+                assert!(
+                    path.exists(),
+                    "missing fixture {path:?} for {t:?} {format:?}"
+                );
             }
         }
     }
+
     #[test]
     fn sample_table_zip_file_should_exist() {
         for t in SampleTable::iter() {
-            match t {
-                SampleTable::V6TimebasedkeygenNonhivestyle => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
-                }
-                SampleTable::V6NonpartitionedRollback => {
-                    let path = t.zip_path("mor", Some("parquet"));
-                    assert!(path.exists());
-                }
-                SampleTable::V9NonpartitionedRollback => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                SampleTable::V9TimebasedkeygenEpochmillis
-                | SampleTable::V9TimebasedkeygenUnixtimestamp
-                | SampleTable::V9LanceNonpartitioned
-                | SampleTable::V9LanceTxnsNonpart
-                | SampleTable::V9LanceTxnsSimple => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
-                }
-                SampleTable::V9LanceNonhivestyle => {
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                ref table if table.as_ref().starts_with("v9") => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
-                    let path = t.zip_path("mor", Some("avro"));
-                    assert!(path.exists());
-                }
-                ref table if table.as_ref().starts_with("v8") => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
-                }
-                _ => {
-                    let path = t.zip_path("cow", None);
-                    assert!(path.exists());
-                    let path = t.zip_path("mor", Some("parquet"));
-                    assert!(path.exists());
-                }
+            for format in t.available_formats() {
+                let path = t.zip_path_for(*format);
+                assert!(
+                    path.exists(),
+                    "missing fixture {path:?} for {t:?} {format:?}"
+                );
             }
         }
     }
