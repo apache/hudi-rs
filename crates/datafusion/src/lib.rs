@@ -596,7 +596,7 @@ impl HudiDataSource {
             .collect();
         let partition_pushdown_exprs = all_pushdown_exprs
             .iter()
-            .filter(|expr| Self::is_partition_column_filter(expr, &partition_cols))
+            .filter(|expr| Self::is_partition_column_filter(expr, partition_cols))
             .cloned()
             .collect();
 
@@ -993,7 +993,8 @@ mod tests {
     use url::Url;
 
     use datafusion::logical_expr::BinaryExpr;
-    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle};
+    use datafusion::prelude::SessionContext;
+    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle, V9LanceTxnsSimple};
 
     use crate::HudiDataSource;
 
@@ -1107,6 +1108,52 @@ mod tests {
         expr: &Expr,
     ) -> TableProviderFilterPushDown {
         HudiDataSource::filter_pushdown_support(schema, partition_cols, expr)
+    }
+
+    async fn scan_hudi_exec_filter_triplets(
+        hudi: &HudiDataSource,
+        filters: &[Expr],
+    ) -> Vec<(String, String, Vec<String>)> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = hudi.scan(&state, None, filters, None).await.unwrap();
+        let exec = plan
+            .as_any()
+            .downcast_ref::<HudiScanExec>()
+            .expect("scan should route to HudiScanExec");
+
+        exec.read_options()
+            .filters
+            .iter()
+            .map(|filter| {
+                (
+                    filter.field.clone(),
+                    filter.operator.to_string(),
+                    filter.values.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_scan_filter(
+        filters: &[(String, String, Vec<String>)],
+        field: &str,
+        operator: &str,
+        values: &[&str],
+    ) {
+        assert!(
+            filters
+                .iter()
+                .any(|(actual_field, actual_operator, actual_values)| {
+                    actual_field == field
+                        && actual_operator == operator
+                        && actual_values
+                            .iter()
+                            .map(String::as_str)
+                            .eq(values.iter().copied())
+                }),
+            "expected filter ({field}, {operator}, {values:?}) in {filters:?}"
+        );
     }
 
     #[test]
@@ -1352,5 +1399,43 @@ mod tests {
         let filter = &exec.read_options().filters[0];
         assert_eq!(filter.field, "id");
         assert_eq!(filter.values, vec!["1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_mor_snapshot_keeps_partition_and_non_partition_filters_for_hudi_exec() {
+        let hudi = HudiDataSource::new(V6SimplekeygenNonhivestyle.url_to_mor_parquet().as_str())
+            .await
+            .unwrap();
+        let partition_filter = col_lit("byteField", Operator::Eq, ScalarValue::Int32(Some(10)));
+        let non_partition_filter = col_lit("id", Operator::Gt, ScalarValue::Int32(Some(1)));
+
+        let filters =
+            scan_hudi_exec_filter_triplets(&hudi, &[partition_filter, non_partition_filter]).await;
+
+        assert_scan_filter(&filters, "byteField", "=", &["10"]);
+        assert_scan_filter(&filters, "id", ">", &["1"]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_lance_keeps_partition_and_non_partition_filters_for_hudi_exec() {
+        let hudi = HudiDataSource::new(V9LanceTxnsSimple.url_to_cow().as_str())
+            .await
+            .unwrap();
+        let partition_filter = col_lit(
+            "region",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("us".to_string())),
+        );
+        let non_partition_filter = col_lit(
+            "txn_id",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("TXN-001".to_string())),
+        );
+
+        let filters =
+            scan_hudi_exec_filter_triplets(&hudi, &[partition_filter, non_partition_filter]).await;
+
+        assert_scan_filter(&filters, "region", "=", &["us"]);
+        assert_scan_filter(&filters, "txn_id", "=", &["TXN-001"]);
     }
 }
