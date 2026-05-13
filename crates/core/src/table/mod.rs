@@ -795,8 +795,8 @@ impl Table {
     /// Snapshot streams batches as they are read from each file slice. Incremental
     /// streaming is not yet supported and returns an `Unsupported` error.
     ///
-    /// For MOR tables with log files, streaming falls back to a collect-and-merge that
-    /// yields the merged result as a single batch.
+    /// For MOR file slices with log files, streaming falls back to a collect-and-merge
+    /// that yields that file slice's merged result as a single batch.
     ///
     /// # Example
     /// ```ignore

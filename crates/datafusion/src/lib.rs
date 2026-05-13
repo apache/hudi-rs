@@ -17,10 +17,12 @@
  * under the License.
  */
 
+pub(crate) mod hudi_exec;
 pub(crate) mod util;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -39,19 +41,53 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
-use datafusion_common::Statistics;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::stats::Precision;
+use datafusion_common::{DataFusionError, Statistics};
+use datafusion_expr::utils::split_conjunction;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
+use crate::hudi_exec::HudiScanExec;
 use crate::util::expr::exprs_to_filters;
-use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
+use hudi_core::config::read::HudiReadConfig::{
+    FileSliceReadConcurrency, InputPartitions, UseReadOptimizedMode,
+};
 use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
 use hudi_core::config::util::empty_options;
+use hudi_core::config::{ConfigParser, HudiConfigs};
+use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
+
+fn default_file_slice_read_concurrency() -> usize {
+    match FileSliceReadConcurrency.default_value() {
+        Some(value) => value.into(),
+        None => unreachable!("FileSliceReadConcurrency has a default value defined in hudi-core"),
+    }
+}
+
+pub(crate) fn inexact_usize_from_u64(value: u64) -> Precision<usize> {
+    match usize::try_from(value) {
+        Ok(value) => Precision::Inexact(value),
+        Err(_) => Precision::Absent,
+    }
+}
+
+pub(crate) fn external_error<E>(context: impl Into<String>, error: E) -> DataFusionError
+where
+    E: Error + Send + Sync + 'static,
+{
+    DataFusionError::External(Box::new(error)).context(context)
+}
+
+fn filter_field_matches_partition_column(filter_field: &str, partition_column: &str) -> bool {
+    filter_field == partition_column
+        || filter_field
+            .rsplit_once('.')
+            .is_some_and(|(_, name)| name == partition_column)
+}
 
 /// Create a `HudiDataSource`.
 /// Used for Datafusion to query Hudi tables
@@ -87,15 +123,36 @@ use hudi_core::table::{ReadOptions, Table as HudiTable};
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
     /// Cached table schema (with meta fields) for synchronous access in `TableProvider::schema()`.
+    /// This provider is a construction-time metadata snapshot; create a new
+    /// provider to observe schema/stat changes from later commits.
     schema: SchemaRef,
     /// Cached partition schema for determining partition columns.
     /// This is cached at construction since partition schema rarely changes
     /// and is needed synchronously in `supports_filters_pushdown`.
     partition_schema: Schema,
     /// Cached table-level statistics for join ordering and broadcast decisions.
+    ///
+    /// Consumed in two places:
+    /// 1. `TableProvider::statistics()` - returned to the optimizer (note:
+    ///    DataFusion's main planner does not currently consult this method;
+    ///    see the trait docs).
+    /// 2. `scan_parquet` - passed to `FileScanConfigBuilder::with_statistics(...)`,
+    ///    which IS consumed by the optimizer for join planning on the
+    ///    Parquet/COW fast path.
+    ///
+    /// The `HudiScanExec` path (Lance and MOR snapshot) derives statistics
+    /// per-execution from `FileSlice` metadata via `aggregate_partitions`
+    /// rather than reusing this table-level cache, since per-partition stats
+    /// are more useful for that path.
     cached_stats: Option<Statistics>,
     /// Number of input partitions for scan planning, extracted from read options.
     input_partitions: usize,
+    /// Read-optimized mode requested when constructing the provider.
+    read_optimized_mode: bool,
+    /// Maximum number of file-slice streams polled concurrently within a scan partition.
+    file_slice_read_concurrency: usize,
+    /// Explicit base file format from table config, if present.
+    base_file_format: Option<BaseFileFormatValue>,
 }
 
 impl std::fmt::Debug for HudiDataSource {
@@ -142,18 +199,58 @@ impl HudiDataSource {
             })?,
             None => 0,
         };
+        let read_optimized_mode: bool = match all_options
+            .iter()
+            .find(|(k, _)| k == UseReadOptimizedMode.as_ref())
+        {
+            Some((_, v)) => v.parse().map_err(|e| {
+                Execution(format!(
+                    "Invalid value '{v}' for {}: {e}",
+                    UseReadOptimizedMode.as_ref()
+                ))
+            })?,
+            None => false,
+        };
+        let file_slice_read_concurrency: usize = match all_options
+            .iter()
+            .find(|(k, _)| k == FileSliceReadConcurrency.as_ref())
+        {
+            Some((_, v)) => {
+                let parsed = v.parse().map_err(|_| {
+                    Execution(format!(
+                        "Invalid value '{v}' for {}: expected a positive integer",
+                        FileSliceReadConcurrency.as_ref()
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(Execution(format!(
+                        "Invalid value '0' for {}: expected a positive integer",
+                        FileSliceReadConcurrency.as_ref()
+                    )));
+                }
+                parsed
+            }
+            None => default_file_slice_read_concurrency(),
+        };
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
-            .map_err(|e| Execution(format!("Failed to create Hudi table: {e}")))?;
+            .map_err(|e| external_error("Failed to create Hudi table", e))?;
 
-        let base_file_format: String = table
-            .hudi_configs
-            .get_or_default(HudiTableConfig::BaseFileFormat)
-            .into();
-        if !base_file_format.eq_ignore_ascii_case(BaseFileFormatValue::Parquet.as_ref()) {
-            return Err(Execution(format!(
-                "Unsupported base file format '{base_file_format}' for HudiDataSource; only parquet is supported"
-            )));
+        let base_file_format =
+            BaseFileFormatValue::from_configs(&table.hudi_configs).map_err(|e| {
+                external_error(
+                    format!(
+                        "Invalid {} config",
+                        HudiTableConfig::BaseFileFormat.as_ref()
+                    ),
+                    e,
+                )
+            })?;
+        if matches!(base_file_format, Some(BaseFileFormatValue::HFile)) {
+            return Err(Execution(
+                "HFile is only supported for Hudi metadata tables, not regular DataFusion scans"
+                    .to_string(),
+            ));
         }
 
         // Cache schema with meta fields at construction for synchronous access
@@ -182,13 +279,9 @@ impl HudiDataSource {
         let cached_stats = match table.compute_table_stats(None).await {
             Some((num_rows, total_byte_size)) => {
                 let num_fields = schema.fields().len();
-                // Saturate on 32-bit targets where `u64` cannot fit into `usize`;
-                // on 64-bit this is a lossless conversion.
-                let num_rows = usize::try_from(num_rows).unwrap_or(usize::MAX);
-                let total_byte_size = usize::try_from(total_byte_size).unwrap_or(usize::MAX);
                 Some(Statistics {
-                    num_rows: Precision::Inexact(num_rows),
-                    total_byte_size: Precision::Inexact(total_byte_size),
+                    num_rows: inexact_usize_from_u64(num_rows),
+                    total_byte_size: inexact_usize_from_u64(total_byte_size),
                     column_statistics: vec![
                         datafusion_common::ColumnStatistics::new_unknown();
                         num_fields
@@ -204,11 +297,123 @@ impl HudiDataSource {
             partition_schema,
             cached_stats,
             input_partitions,
+            read_optimized_mode,
+            file_slice_read_concurrency,
+            base_file_format,
         })
     }
 
     fn get_input_partitions(&self) -> usize {
         self.input_partitions
+    }
+
+    #[cfg(test)]
+    fn get_file_slice_read_concurrency(&self) -> usize {
+        self.file_slice_read_concurrency
+    }
+
+    /// Returns the effective `UseReadOptimizedMode` value cached from the
+    /// table options at construction time. Used by [`Self::use_parquet_source`]
+    /// to decide whether MOR snapshot semantics are required.
+    fn effective_read_optimized(&self) -> bool {
+        self.read_optimized_mode
+    }
+
+    fn scan_read_options(
+        &self,
+        pushdown_filters: Vec<(String, String, String)>,
+        read_optimized: bool,
+    ) -> Result<ReadOptions> {
+        let mut read_options = ReadOptions::new()
+            .with_filters(pushdown_filters)
+            .map_err(|e| external_error("Invalid pushdown filter", e))?;
+        if read_optimized {
+            read_options = read_options.with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
+        }
+        Ok(read_options)
+    }
+
+    /// Build the [`ReadOptions`] passed to `HudiScanExec` for per-slice reads.
+    ///
+    /// Hudi table-level planning has already applied partition filters. When
+    /// partition fields are dropped from data files, passing those filters to
+    /// `FileGroupReader` would fail its strict batch-schema validation.
+    fn read_options_for_hudi_exec(
+        hudi_configs: &HudiConfigs,
+        options: &ReadOptions,
+    ) -> ReadOptions {
+        let drops_partition_columns: bool = hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        if !drops_partition_columns || options.filters.is_empty() {
+            return options.clone();
+        }
+
+        let partition_columns: Vec<String> = hudi_configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into();
+        let mut applicable = options.clone();
+        applicable.filters = options
+            .filters
+            .iter()
+            .filter(|filter| {
+                !partition_columns
+                    .iter()
+                    .any(|p| filter_field_matches_partition_column(&filter.field, p))
+            })
+            .cloned()
+            .collect();
+        applicable
+    }
+
+    /// Returns true iff every file slice has a `.parquet` base file.
+    /// Empty input returns `false` so the scan is routed to `HudiScanExec`,
+    /// which handles the empty case via `RecordBatchStreamAdapter::new(.., empty())`.
+    fn file_slices_are_parquet(file_slices: &[FileSlice]) -> Result<bool> {
+        if file_slices.is_empty() {
+            return Ok(false);
+        }
+        for file_slice in file_slices {
+            let relative_path = file_slice.base_file_relative_path().map_err(|e| {
+                external_error(
+                    format!("Failed to get base file relative path for {file_slice:?}"),
+                    e,
+                )
+            })?;
+            if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Decides whether a scan can be served by DataFusion's native
+    /// `ParquetSource` (cheap row-group / page pruning) or must go through
+    /// [`HudiScanExec`].
+    ///
+    /// Routing matrix:
+    /// - Parquet COW → `ParquetSource`
+    /// - Parquet MOR read-optimized → `ParquetSource`
+    /// - Parquet MOR snapshot → `HudiScanExec` (base + log merging)
+    /// - Lance and any other base format → `HudiScanExec`
+    fn use_parquet_source(
+        &self,
+        read_options: &ReadOptions,
+        file_slices: &[FileSlice],
+    ) -> Result<bool> {
+        let parquet_base_files = match &self.base_file_format {
+            Some(format) => matches!(format, BaseFileFormatValue::Parquet),
+            None => Self::file_slices_are_parquet(file_slices)?,
+        };
+        if !parquet_base_files {
+            return Ok(false);
+        }
+        if !self.table.is_mor() {
+            return Ok(true);
+        }
+        read_options
+            .is_read_optimized()
+            .map_err(|e| external_error("Invalid read-optimized option", e))
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -218,7 +423,7 @@ impl HudiDataSource {
     /// - A NOT expression wrapping a pushable expression
     /// - An AND compound expression where at least one side can be pushed down
     /// - A BETWEEN expression with column and literals
-    fn can_push_down(&self, expr: &Expr) -> bool {
+    fn can_push_down_expr(schema: &Schema, expr: &Expr) -> bool {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
                 let left = &binary_expr.left;
@@ -228,35 +433,44 @@ impl HudiDataSource {
                 match op {
                     Operator::And => {
                         // AND is pushable if at least one side is pushable
-                        self.can_push_down(left) || self.can_push_down(right)
+                        Self::can_push_down_expr(schema, left)
+                            || Self::can_push_down_expr(schema, right)
                     }
                     Operator::Or => {
                         // OR cannot be pushed down with current filter model
                         false
                     }
                     _ => {
-                        self.is_supported_operator(op)
-                            && self.is_supported_operand(left)
-                            && self.is_supported_operand(right)
+                        Self::is_supported_operator(op)
+                            && Self::is_supported_operand(schema, left)
+                            && Self::is_supported_operand(schema, right)
                     }
                 }
             }
             Expr::Not(inner_expr) => {
                 // Recursively check if the inner expression can be pushed down
-                self.can_push_down(inner_expr)
+                Self::can_push_down_expr(schema, inner_expr)
             }
             Expr::Between(between) => {
                 // BETWEEN can be pushed if expr is a column and bounds are literals
                 !between.negated
-                    && matches!(&*between.expr, Expr::Column(_))
+                    && matches!(&*between.expr, Expr::Column(col) if schema.column_with_name(&col.name).is_some())
                     && matches!(&*between.low, Expr::Literal(..))
                     && matches!(&*between.high, Expr::Literal(..))
+            }
+            Expr::InList(in_list) => {
+                !in_list.list.is_empty()
+                    && matches!(in_list.expr.as_ref(), Expr::Column(col) if schema.column_with_name(&col.name).is_some())
+                    && in_list
+                        .list
+                        .iter()
+                        .all(|expr| matches!(expr, Expr::Literal(..)))
             }
             _ => false,
         }
     }
 
-    fn is_supported_operator(&self, op: &Operator) -> bool {
+    fn is_supported_operator(op: &Operator) -> bool {
         matches!(
             op,
             Operator::Eq
@@ -268,9 +482,9 @@ impl HudiDataSource {
         )
     }
 
-    fn is_supported_operand(&self, expr: &Expr) -> bool {
+    fn is_supported_operand(schema: &Schema, expr: &Expr) -> bool {
         match expr {
-            Expr::Column(col) => self.schema().column_with_name(&col.name).is_some(),
+            Expr::Column(col) => schema.column_with_name(&col.name).is_some(),
             Expr::Literal(..) => true,
             _ => false,
         }
@@ -285,101 +499,139 @@ impl HudiDataSource {
             .collect()
     }
 
-    /// Checks if expression filters on a partition column.
+    /// Checks if expression filters only on a partition column.
     ///
-    /// Partition column filters can be marked as `Exact` because they are
-    /// fully handled by partition pruning and don't need post-filtering.
+    /// Partition filters are safe to push into Hudi file listing for every
+    /// scan path. For Parquet scans, non-partition predicates are left to
+    /// DataFusion's `ParquetSource` so Hudi doesn't read Parquet footers for
+    /// stats pruning before DataFusion reads the same files.
     fn is_partition_column_filter(expr: &Expr, partition_cols: &[String]) -> bool {
         match expr {
-            Expr::BinaryExpr(binary_expr) => {
-                match binary_expr.op {
-                    Operator::And => {
-                        // For AND, check if both sides are partition filters
-                        Self::is_partition_column_filter(&binary_expr.left, partition_cols)
-                            && Self::is_partition_column_filter(&binary_expr.right, partition_cols)
-                    }
-                    _ => {
-                        // For partition filters, one side must be a partition column
-                        // and the other side must be a literal value
-                        match (&*binary_expr.left, &*binary_expr.right) {
-                            (Expr::Column(col), Expr::Literal(..))
-                                if partition_cols.contains(&col.name) =>
-                            {
-                                true
-                            }
-                            (Expr::Literal(..), Expr::Column(col))
-                                if partition_cols.contains(&col.name) =>
-                            {
-                                true
-                            }
-                            _ => false,
-                        }
-                    }
+            Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+                Operator::And => {
+                    Self::is_partition_column_filter(&binary_expr.left, partition_cols)
+                        && Self::is_partition_column_filter(&binary_expr.right, partition_cols)
                 }
-            }
+                Operator::Or => false,
+                _ => match (&*binary_expr.left, &*binary_expr.right) {
+                    (Expr::Column(col), Expr::Literal(..))
+                    | (Expr::Literal(..), Expr::Column(col)) => partition_cols.contains(&col.name),
+                    _ => false,
+                },
+            },
             Expr::Not(inner) => Self::is_partition_column_filter(inner, partition_cols),
             Expr::Between(between) => {
-                matches!(&*between.expr, Expr::Column(col) if partition_cols.contains(&col.name))
+                !between.negated
+                    && matches!(&*between.expr, Expr::Column(col) if partition_cols.contains(&col.name))
+                    && matches!(&*between.low, Expr::Literal(..))
+                    && matches!(&*between.high, Expr::Literal(..))
+            }
+            Expr::InList(in_list) => {
+                !in_list.list.is_empty()
+                    && matches!(in_list.expr.as_ref(), Expr::Column(col) if partition_cols.contains(&col.name))
+                    && in_list
+                        .list
+                        .iter()
+                        .all(|expr| matches!(expr, Expr::Literal(..)))
             }
             _ => false,
         }
     }
-}
 
-#[async_trait]
-impl TableProvider for HudiDataSource {
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn is_exact_partition_equality_filter(expr: &Expr, partition_cols: &[String]) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
+                match (&*binary_expr.left, &*binary_expr.right) {
+                    (Expr::Column(col), Expr::Literal(..))
+                    | (Expr::Literal(..), Expr::Column(col)) => partition_cols.contains(&col.name),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn filter_pushdown_support(
+        table_schema: &Schema,
+        partition_cols: &[String],
+        expr: &Expr,
+    ) -> TableProviderFilterPushDown {
+        let conjuncts = split_conjunction(expr);
+        let has_pushable_conjunct = conjuncts
+            .iter()
+            .any(|conjunct| Self::can_push_down_expr(table_schema, conjunct));
+
+        if !has_pushable_conjunct {
+            return TableProviderFilterPushDown::Unsupported;
+        }
+
+        let all_conjuncts_are_exact_partition_eq = conjuncts.iter().all(|conjunct| {
+            Self::can_push_down_expr(table_schema, conjunct)
+                && Self::is_exact_partition_equality_filter(conjunct, partition_cols)
+        });
+
+        if all_conjuncts_are_exact_partition_eq {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Inexact
+        }
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
+    /// Returns `(partition_pushdown_exprs, all_pushdown_exprs)`.
+    fn split_scan_pushdown_exprs(&self, filters: &[Expr]) -> (Vec<Expr>, Vec<Expr>) {
+        let partition_cols = self.get_partition_columns();
+        Self::split_scan_pushdown_exprs_for_schema(self.schema.as_ref(), &partition_cols, filters)
     }
 
-    fn statistics(&self) -> Option<Statistics> {
-        self.cached_stats.clone()
+    fn split_scan_pushdown_exprs_for_schema(
+        table_schema: &Schema,
+        partition_cols: &[String],
+        filters: &[Expr],
+    ) -> (Vec<Expr>, Vec<Expr>) {
+        let all_pushdown_exprs: Vec<Expr> = filters
+            .iter()
+            .flat_map(|expr| split_conjunction(expr).into_iter())
+            .filter(|expr| Self::can_push_down_expr(table_schema, expr))
+            .cloned()
+            .collect();
+        let partition_pushdown_exprs = all_pushdown_exprs
+            .iter()
+            .filter(|expr| Self::is_partition_column_filter(expr, partition_cols))
+            .cloned()
+            .collect();
+
+        (partition_pushdown_exprs, all_pushdown_exprs)
     }
 
-    async fn scan(
+    fn use_parquet_source_without_file_slices(
+        &self,
+        read_options: &ReadOptions,
+    ) -> Result<Option<bool>> {
+        if self.table.is_mor()
+            && !read_options
+                .is_read_optimized()
+                .map_err(|e| external_error("Invalid read-optimized option", e))?
+        {
+            return Ok(Some(false));
+        }
+
+        match &self.base_file_format {
+            Some(BaseFileFormatValue::Parquet) => Ok(Some(true)),
+            Some(_) => Ok(Some(false)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_parquet(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        flat_slices: Vec<FileSlice>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.table.register_storage(state.runtime_env().clone());
-
-        // Resolve input partitions: use Hudi config if set, otherwise fall back
-        // to DataFusion's target_partitions (defaults to number of CPU cores).
-        let input_partitions = match self.get_input_partitions() {
-            0 => state.config_options().execution.target_partitions,
-            n => n,
-        };
-
-        // Only push down partition column filters to Hudi's file listing layer.
-        // Non-partition filters would trigger Parquet footer reads for file-level
-        // stats pruning, which is redundant since DataFusion's ParquetSource already
-        // handles row-group/page-level pruning during the scan.
-        let partition_cols = self.get_partition_columns();
-        let partition_filters: Vec<Expr> = filters
-            .iter()
-            .filter(|expr| Self::is_partition_column_filter(expr, &partition_cols))
-            .cloned()
-            .collect();
-        let pushdown_filters = exprs_to_filters(&partition_filters);
-        let read_options = ReadOptions::new()
-            .with_filters(pushdown_filters)
-            .map_err(|e| Execution(format!("Invalid pushdown filter: {e}")))?
-            .with_hudi_option(UseReadOptimizedMode.as_ref(), "true");
-        let flat_slices = self
-            .table
-            .get_file_slices(&read_options)
-            .await
-            .map_err(|e| Execution(format!("Failed to get file slices from Hudi table: {e}")))?;
+        let input_partitions = self.get_input_partitions_for_scan(state);
         let file_slices =
             hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
         let base_url = self.table.base_url();
@@ -388,12 +640,13 @@ impl TableProvider for HudiDataSource {
             let mut parquet_file_group_vec = Vec::new();
             for f in file_slice_vec {
                 let relative_path = f.base_file_relative_path().map_err(|e| {
-                    Execution(format!(
-                        "Failed to get base file relative path for {f:?} due to {e:?}"
-                    ))
+                    external_error(
+                        format!("Failed to get base file relative path for {f:?}"),
+                        e,
+                    )
                 })?;
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
-                    .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
+                    .map_err(|e| external_error("Failed to join URL segments", e))?;
                 let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
                 let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
@@ -401,9 +654,7 @@ impl TableProvider for HudiDataSource {
             parquet_file_groups.push(parquet_file_group_vec)
         }
 
-        let base_url = self.table.base_url();
         let url = ObjectStoreUrl::parse(get_scheme_authority(&base_url))?;
-
         let parquet_opts = TableParquetOptions {
             global: state.config_options().execution.parquet.clone(),
             column_specific_options: Default::default(),
@@ -433,17 +684,204 @@ impl TableProvider for HudiDataSource {
             .with_projection_indices(projection.cloned())?
             .with_limit(limit);
 
-        // Pass table statistics to the physical plan so DataFusion's join_selection
-        // optimizer can swap build/probe sides and choose broadcast joins.
         if let Some(stats) = &self.cached_stats {
+            // DataFusion's FileScanConfig stores unprojected table statistics
+            // and applies the source projection inside partition_statistics().
             fsc_builder = fsc_builder.with_statistics(stats.clone());
         }
 
         let fsc = fsc_builder.build();
-
         Ok(Arc::new(DataSourceExec::new(Arc::new(fsc))))
     }
 
+    async fn scan_hudi(
+        &self,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+        input_partitions: usize,
+        flat_slices: Vec<FileSlice>,
+        read_options: ReadOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let file_slices =
+            hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
+
+        // The reader is built with the caller's full options so table-level
+        // setup sees the same query context. Dropped partition filters are only
+        // stripped from the per-slice options passed into HudiScanExec below,
+        // before FileGroupReader validates base-file batch schemas.
+        let file_group_reader = Arc::new(
+            self.table
+                .create_file_group_reader_with_options(Some(&read_options), empty_options())
+                .map_err(|e| external_error("Failed to create FileGroupReader", e))?,
+        );
+
+        let mut hudi_read_options =
+            Self::read_options_for_hudi_exec(&self.table.hudi_configs, &read_options);
+        if let Some(proj) = projection {
+            let col_names: Vec<String> = proj
+                .iter()
+                .map(|&i| self.schema.field(i).name().clone())
+                .collect();
+            hudi_read_options = hudi_read_options.with_projection(col_names);
+        }
+
+        Ok(Arc::new(HudiScanExec::new(
+            file_slices,
+            file_group_reader,
+            hudi_read_options,
+            input_partitions,
+            self.file_slice_read_concurrency,
+            self.schema.clone(),
+            projection.cloned(),
+            limit,
+        )))
+    }
+
+    fn get_input_partitions_for_scan(&self, state: &dyn Session) -> usize {
+        match self.get_input_partitions() {
+            0 => state.config_options().execution.target_partitions,
+            n => n,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for HudiDataSource {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.cached_stats.clone()
+    }
+
+    /// Builds the scan `ExecutionPlan` for this Hudi table.
+    ///
+    /// Per DataFusion's [custom table provider guide], `scan()` should avoid
+    /// data-reading I/O (work proportional to row count). Catalog I/O — the
+    /// listing needed to decide what files exist and which ones the query
+    /// touches — is expected; it is what DataFusion's own `ListingTable` does.
+    ///
+    /// `Table::get_file_slices(&read_options)` is catalog I/O: it loads the
+    /// timeline, resolves file groups, and applies partition pruning. Its cost
+    /// is proportional to partition count, not row count. When the metadata
+    /// table is enabled, partition discovery reads a few HFile blocks instead
+    /// of doing recursive object-store listing, so MDT is strictly cheaper
+    /// than the generic `ListingTable` path.
+    ///
+    /// Callers that issue many `scan()` calls per session against the same
+    /// table (e.g. ad-hoc SQL across the same dataset) may still benefit from
+    /// caching the resolved file-slice set keyed by
+    /// `(filters, as_of_timestamp)`. Tracked as future work.
+    ///
+    /// We implement the legacy `scan()` rather than `scan_with_args()`. The
+    /// default `scan_with_args()` impl delegates to `scan()`, so today's
+    /// behavior is identical. Revisit if a future DataFusion version adds
+    /// optimization hints to `scan_with_args()` that we'd want to consume.
+    ///
+    /// [custom table provider guide]: https://datafusion.apache.org/library-user-guide/custom-table-providers.html
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Idempotent: registers our object store with the session's runtime
+        // so the Parquet path (DataSourceExec) can resolve `s3://`/`gs://`/`az://`
+        // URIs. Per-scan invocation is intentional: `TableProvider` has no
+        // registration hook called by the SessionContext, and direct callers
+        // (`HudiDataSource::new`) wouldn't have a chance to call it otherwise.
+        self.table.register_storage(state.runtime_env().clone());
+
+        let input_partitions = self.get_input_partitions_for_scan(state);
+
+        let (partition_pushdown_exprs, all_pushdown_exprs) =
+            self.split_scan_pushdown_exprs(filters);
+        let partition_pushdown_filters = exprs_to_filters(&partition_pushdown_exprs);
+        let all_pushdown_filters = exprs_to_filters(&all_pushdown_exprs);
+        let all_filters_are_partition_filters = all_pushdown_filters == partition_pushdown_filters;
+
+        let read_optimized = self.effective_read_optimized();
+        let partition_read_options =
+            self.scan_read_options(partition_pushdown_filters.clone(), read_optimized)?;
+        let all_read_options = if all_filters_are_partition_filters {
+            partition_read_options.clone()
+        } else {
+            self.scan_read_options(all_pushdown_filters, read_optimized)?
+        };
+
+        match self.use_parquet_source_without_file_slices(&partition_read_options)? {
+            Some(true) => {
+                let flat_slices = self
+                    .table
+                    .get_file_slices(&partition_read_options)
+                    .await
+                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                self.scan_parquet(state, projection, filters, limit, flat_slices)
+                    .await
+            }
+            Some(false) => {
+                let flat_slices = self
+                    .table
+                    .get_file_slices(&all_read_options)
+                    .await
+                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                self.scan_hudi(
+                    projection,
+                    limit,
+                    input_partitions,
+                    flat_slices,
+                    all_read_options,
+                )
+                .await
+            }
+            None => {
+                let partition_flat_slices = self
+                    .table
+                    .get_file_slices(&partition_read_options)
+                    .await
+                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+
+                if self.use_parquet_source(&partition_read_options, &partition_flat_slices)? {
+                    self.scan_parquet(state, projection, filters, limit, partition_flat_slices)
+                        .await
+                } else {
+                    let flat_slices = if all_filters_are_partition_filters {
+                        partition_flat_slices
+                    } else {
+                        self.table
+                            .get_file_slices(&all_read_options)
+                            .await
+                            .map_err(|e| {
+                                external_error("Failed to get file slices from Hudi table", e)
+                            })?
+                    };
+                    self.scan_hudi(
+                        projection,
+                        limit,
+                        input_partitions,
+                        flat_slices,
+                        all_read_options,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+
+    /// Reports partition equality predicates as `Exact`; all other pushed
+    /// filters are `Inexact` so DataFusion retains a residual `FilterExec`.
+    /// `scan()` splits conjunctions before converting them to Hudi filters, so
+    /// pushable atoms inside mixed `AND` predicates still help pruning.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -453,16 +891,11 @@ impl TableProvider for HudiDataSource {
         filters
             .iter()
             .map(|expr| {
-                if !self.can_push_down(expr) {
-                    return Ok(TableProviderFilterPushDown::Unsupported);
-                }
-
-                // Partition column filters are fully handled by partition pruning
-                if Self::is_partition_column_filter(expr, &partition_cols) {
-                    Ok(TableProviderFilterPushDown::Exact)
-                } else {
-                    Ok(TableProviderFilterPushDown::Inexact)
-                }
+                Ok(Self::filter_pushdown_support(
+                    self.schema.as_ref(),
+                    &partition_cols,
+                    expr,
+                ))
             })
             .collect()
     }
@@ -551,6 +984,7 @@ impl TableProviderFactory for HudiTableFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field};
     use datafusion_common::{Column, ScalarValue};
     use hudi_core::config::internal::HudiInternalConfig;
     use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
@@ -559,7 +993,8 @@ mod tests {
     use url::Url;
 
     use datafusion::logical_expr::BinaryExpr;
-    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle};
+    use datafusion::prelude::SessionContext;
+    use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle, V9LanceTxnsSimple};
 
     use crate::HudiDataSource;
 
@@ -570,12 +1005,49 @@ mod tests {
                 .unwrap();
         let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
         assert_eq!(hudi.get_input_partitions(), 0);
+        assert_eq!(
+            hudi.get_file_slice_read_concurrency(),
+            default_file_slice_read_concurrency()
+        );
         assert_eq!(hudi.table_type(), TableType::Base);
         assert_eq!(hudi.statistics(), None);
     }
 
     #[tokio::test]
-    async fn test_new_with_options_fails_fast_on_non_parquet_base_file_format() {
+    async fn test_new_with_options_sets_file_slice_read_concurrency() {
+        let hudi = HudiDataSource::new_with_options(
+            V6Nonpartitioned.path_to_cow().as_str(),
+            [(FileSliceReadConcurrency.as_ref(), "2")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hudi.get_file_slice_read_concurrency(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_new_with_options_rejects_invalid_file_slice_read_concurrency() {
+        for invalid in ["0", "abc"] {
+            let result = HudiDataSource::new_with_options(
+                V6Nonpartitioned.path_to_cow().as_str(),
+                [(FileSliceReadConcurrency.as_ref(), invalid)],
+            )
+            .await;
+
+            assert!(result.is_err());
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(FileSliceReadConcurrency.as_ref()));
+            assert!(error.contains(invalid));
+        }
+    }
+
+    #[test]
+    fn test_file_slices_are_parquet_empty_is_false() {
+        assert!(!HudiDataSource::file_slices_are_parquet(&[]).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_new_with_options_rejects_hfile_format_for_regular_scan() {
         let result = HudiDataSource::new_with_options(
             V6Nonpartitioned.path_to_cow().as_str(),
             [
@@ -590,187 +1062,380 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "Expected constructor fail-fast for unsupported base file format"
+            "HFile format should be rejected for regular DataFusion scans"
         );
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("Unsupported base file format 'hfile'"),
-            "Expected explicit base format error, got: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("only parquet is supported"),
-            "Expected parquet-only guidance, got: {error_msg}"
-        );
+        assert!(result.unwrap_err().to_string().contains("HFile"));
     }
 
     #[tokio::test]
-    async fn test_supports_filters_pushdown() {
-        let table_provider = HudiDataSource::new_with_options(
+    async fn test_new_with_options_rejects_invalid_base_file_format_config() {
+        let result = HudiDataSource::new_with_options(
             V6Nonpartitioned.path_to_cow().as_str(),
-            empty_options(),
+            [
+                (HudiTableConfig::BaseFileFormat.as_ref(), "orc"),
+                (HudiInternalConfig::SkipConfigValidation.as_ref(), "true"),
+            ],
         )
-        .await
-        .unwrap();
+        .await;
 
-        let expr0 = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("orc"));
+    }
+
+    fn pushdown_test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("byteField", DataType::Int8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("intField", DataType::Int32, true),
+        ])
+    }
+
+    fn partition_cols() -> Vec<String> {
+        vec!["byteField".to_string()]
+    }
+
+    fn col_lit(name: &str, op: Operator, lit: ScalarValue) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name(name.to_string()))),
+            op,
+            right: Box::new(Expr::Literal(lit, None)),
+        })
+    }
+
+    fn pushdown_support(
+        schema: &Schema,
+        partition_cols: &[String],
+        expr: &Expr,
+    ) -> TableProviderFilterPushDown {
+        HudiDataSource::filter_pushdown_support(schema, partition_cols, expr)
+    }
+
+    async fn scan_hudi_exec_filter_triplets(
+        hudi: &HudiDataSource,
+        filters: &[Expr],
+    ) -> Vec<(String, String, Vec<String>)> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = hudi.scan(&state, None, filters, None).await.unwrap();
+        let exec = plan
+            .as_any()
+            .downcast_ref::<HudiScanExec>()
+            .expect("scan should route to HudiScanExec");
+
+        exec.read_options()
+            .filters
+            .iter()
+            .map(|filter| {
+                (
+                    filter.field.clone(),
+                    filter.operator.to_string(),
+                    filter.values.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_scan_filter(
+        filters: &[(String, String, Vec<String>)],
+        field: &str,
+        operator: &str,
+        values: &[&str],
+    ) {
+        assert!(
+            filters
+                .iter()
+                .any(|(actual_field, actual_operator, actual_values)| {
+                    actual_field == field
+                        && actual_operator == operator
+                        && actual_values
+                            .iter()
+                            .map(String::as_str)
+                            .eq(values.iter().copied())
+                }),
+            "expected filter ({field}, {operator}, {values:?}) in {filters:?}"
+        );
+    }
+
+    #[test]
+    fn test_filter_pushdown_support_for_non_partitioned_schema() {
+        let schema = pushdown_test_schema();
+        let partition_cols = vec![];
+        let filters = [
+            col_lit(
+                "name",
+                Operator::Eq,
                 ScalarValue::Utf8(Some("Alice".to_string())),
-                None,
-            )),
-        });
-
-        let expr1 = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
-            op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)), None)),
-        });
-
-        let expr2 = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name(
-                "nonexistent_column".to_string(),
-            ))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(1)), None)),
-        });
-
-        let expr3 = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
-            op: Operator::NotEq,
-            right: Box::new(Expr::Literal(
+            ),
+            col_lit("intField", Operator::Gt, ScalarValue::Int32(Some(20000))),
+            col_lit(
+                "nonexistent_column",
+                Operator::Eq,
+                ScalarValue::Int32(Some(1)),
+            ),
+            col_lit(
+                "name",
+                Operator::NotEq,
                 ScalarValue::Utf8(Some("Diana".to_string())),
-                None,
-            )),
-        });
+            ),
+            Expr::Literal(ScalarValue::Int32(Some(10)), None),
+            Expr::Not(Box::new(col_lit(
+                "intField",
+                Operator::Gt,
+                ScalarValue::Int32(Some(20000)),
+            ))),
+        ];
 
-        let expr4 = Expr::Literal(ScalarValue::Int32(Some(10)), None);
+        let result = filters
+            .iter()
+            .map(|expr| pushdown_support(&schema, &partition_cols, expr))
+            .collect::<Vec<_>>();
 
-        let expr5 = Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
-            op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)), None)),
-        })));
-
-        let filters = vec![&expr0, &expr1, &expr2, &expr3, &expr4, &expr5];
-        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
-
-        assert_eq!(result.len(), 6);
-        // Non-partitioned table - all filters are Inexact (no partition columns)
-        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
-        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
-        assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
-        assert_eq!(result[3], TableProviderFilterPushDown::Inexact);
-        assert_eq!(result[4], TableProviderFilterPushDown::Unsupported);
-        assert_eq!(result[5], TableProviderFilterPushDown::Inexact);
+        assert_eq!(
+            result,
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
+            ]
+        );
     }
 
-    #[tokio::test]
-    async fn test_supports_filters_pushdown_exact_for_partition_columns() {
-        // Use a partitioned table - byteField is the partition column
-        let table_provider = HudiDataSource::new_with_options(
-            V6SimplekeygenNonhivestyle.path_to_cow().as_str(),
-            empty_options(),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn test_filter_pushdown_exact_only_for_partition_equality() {
+        let schema = pushdown_test_schema();
+        let partition_cols = partition_cols();
 
-        // Filter on partition column (byteField) - should be Exact
-        let partition_filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("byteField".to_string()))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int8(Some(1)), None)),
-        });
+        let partition_eq = col_lit("byteField", Operator::Eq, ScalarValue::Int8(Some(1)));
+        let partition_gt = col_lit("byteField", Operator::Gt, ScalarValue::Int8(Some(1)));
+        let non_partition_eq = col_lit(
+            "name",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("Alice".to_string())),
+        );
 
-        // Filter on non-partition column (name) - should be Inexact
-        let non_partition_filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                ScalarValue::Utf8(Some("Alice".to_string())),
-                None,
-            )),
-        });
-
-        let filters = vec![&partition_filter, &non_partition_filter];
-        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
-
-        assert_eq!(result.len(), 2);
-        // Partition column filter is Exact
-        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
-        // Non-partition column filter is Inexact
-        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &partition_eq),
+            TableProviderFilterPushDown::Exact
+        );
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &partition_gt),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &non_partition_eq),
+            TableProviderFilterPushDown::Inexact
+        );
     }
 
-    #[tokio::test]
-    async fn test_supports_filters_pushdown_and_between() {
-        let table_provider = HudiDataSource::new_with_options(
-            V6Nonpartitioned.path_to_cow().as_str(),
-            empty_options(),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn test_filter_pushdown_splits_conjunctions_for_classification() {
+        let schema = pushdown_test_schema();
+        let partition_cols = partition_cols();
 
-        // AND expression: name = 'Alice' AND intField > 100
-        let left = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                ScalarValue::Utf8(Some("Alice".to_string())),
-                None,
-            )),
-        });
-        let right = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("intField".to_string()))),
-            op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(100)), None)),
-        });
-        let and_expr = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(left),
-            op: Operator::And,
-            right: Box::new(right),
-        });
+        let partition_eq = col_lit("byteField", Operator::Eq, ScalarValue::Int8(Some(1)));
+        let second_partition_eq = col_lit("byteField", Operator::Eq, ScalarValue::Int8(Some(2)));
+        let non_partition_eq = col_lit(
+            "name",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("Alice".to_string())),
+        );
+        let unsupported = Expr::Literal(ScalarValue::Boolean(Some(true)), None);
 
-        // BETWEEN expression: intField BETWEEN 10 AND 100
-        let between_expr = Expr::Between(datafusion_expr::Between::new(
-            Box::new(Expr::Column(Column::from_name("intField".to_string()))),
+        assert_eq!(
+            pushdown_support(
+                &schema,
+                &partition_cols,
+                &partition_eq.clone().and(second_partition_eq)
+            ),
+            TableProviderFilterPushDown::Exact
+        );
+        assert_eq!(
+            pushdown_support(
+                &schema,
+                &partition_cols,
+                &partition_eq.clone().and(non_partition_eq)
+            ),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &partition_eq.and(unsupported)),
+            TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn test_filter_pushdown_between_in_list_and_or() {
+        let schema = pushdown_test_schema();
+        let partition_cols = partition_cols();
+
+        let partition_between = Expr::Between(datafusion_expr::Between::new(
+            Box::new(Expr::Column(Column::from_name("byteField".to_string()))),
             false,
-            Box::new(Expr::Literal(ScalarValue::Int32(Some(10)), None)),
-            Box::new(Expr::Literal(ScalarValue::Int32(Some(100)), None)),
+            Box::new(Expr::Literal(ScalarValue::Int8(Some(1)), None)),
+            Box::new(Expr::Literal(ScalarValue::Int8(Some(3)), None)),
+        ));
+        let partition_in = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(Expr::Column(Column::from_name("byteField".to_string()))),
+            vec![
+                Expr::Literal(ScalarValue::Int8(Some(1)), None),
+                Expr::Literal(ScalarValue::Int8(Some(2)), None),
+            ],
+            false,
+        ));
+        let or_expr = col_lit(
+            "name",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("Alice".to_string())),
+        )
+        .or(col_lit(
+            "name",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("Bob".to_string())),
         ));
 
-        // OR expression - should be unsupported
-        let or_left = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                ScalarValue::Utf8(Some("Alice".to_string())),
-                None,
-            )),
-        });
-        let or_right = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("name".to_string()))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                ScalarValue::Utf8(Some("Bob".to_string())),
-                None,
-            )),
-        });
-        let or_expr = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(or_left),
-            op: Operator::Or,
-            right: Box::new(or_right),
-        });
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &partition_between),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &partition_in),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            pushdown_support(&schema, &partition_cols, &or_expr),
+            TableProviderFilterPushDown::Unsupported
+        );
+    }
 
-        let filters = vec![&and_expr, &between_expr, &or_expr];
-        let result = table_provider.supports_filters_pushdown(&filters).unwrap();
+    #[test]
+    fn test_scan_pushdown_exprs_separates_partition_filters_for_listing() {
+        let schema = pushdown_test_schema();
+        let partition_cols = partition_cols();
+        let partition_eq = col_lit("byteField", Operator::Eq, ScalarValue::Int8(Some(1)));
+        let non_partition_eq = col_lit(
+            "name",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("Alice".to_string())),
+        );
+        let partition_in = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(Expr::Column(Column::from_name("byteField".to_string()))),
+            vec![
+                Expr::Literal(ScalarValue::Int8(Some(1)), None),
+                Expr::Literal(ScalarValue::Int8(Some(2)), None),
+            ],
+            false,
+        ));
 
-        assert_eq!(result.len(), 3);
-        // AND expression is supported
-        assert_eq!(result[0], TableProviderFilterPushDown::Inexact);
-        // BETWEEN expression is supported
-        assert_eq!(result[1], TableProviderFilterPushDown::Inexact);
-        // OR expression is not supported
-        assert_eq!(result[2], TableProviderFilterPushDown::Unsupported);
+        let (partition_exprs, all_exprs) = HudiDataSource::split_scan_pushdown_exprs_for_schema(
+            &schema,
+            &partition_cols,
+            &[partition_eq.and(non_partition_eq), partition_in],
+        );
+        let partition_filters = exprs_to_filters(&partition_exprs);
+        let all_filters = exprs_to_filters(&all_exprs);
+
+        let partition_fields = partition_filters
+            .iter()
+            .map(|(field, _, _)| field.as_str())
+            .collect::<Vec<_>>();
+        let all_fields = all_filters
+            .iter()
+            .map(|(field, _, _)| field.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(partition_fields, ["byteField", "byteField"]);
+        assert_eq!(all_fields, ["byteField", "name", "byteField"]);
+    }
+
+    #[test]
+    fn test_read_options_for_hudi_exec_strips_dropped_partition_filters() {
+        let hudi_configs = HudiConfigs::new([
+            (HudiTableConfig::DropsPartitionFields, "true"),
+            (HudiTableConfig::PartitionFields, "region,country"),
+        ]);
+        let read_options = ReadOptions::new()
+            .with_filters([
+                ("region", "=", "us"),
+                ("amount", ">", "10"),
+                ("txns.country", "=", "ca"),
+            ])
+            .unwrap()
+            .with_projection(["txn_id", "amount"]);
+
+        let actual = HudiDataSource::read_options_for_hudi_exec(&hudi_configs, &read_options);
+
+        assert_eq!(actual.filters.len(), 1);
+        assert_eq!(actual.filters[0].field, "amount");
+        assert_eq!(actual.projection, read_options.projection);
+        assert_eq!(actual.hudi_options, read_options.hudi_options);
+    }
+
+    #[tokio::test]
+    async fn test_scan_hudi_keeps_inexact_non_partition_filters() {
+        let hudi = HudiDataSource::new(V6SimplekeygenNonhivestyle.url_to_mor_parquet().as_str())
+            .await
+            .unwrap();
+        let read_options = hudi
+            .scan_read_options(
+                vec![("id".to_string(), ">".to_string(), "1".to_string())],
+                false,
+            )
+            .unwrap();
+        let flat_slices = hudi.table.get_file_slices(&read_options).await.unwrap();
+
+        let plan = hudi
+            .scan_hudi(None, None, 1, flat_slices, read_options)
+            .await
+            .unwrap();
+        let exec = plan
+            .as_any()
+            .downcast_ref::<HudiScanExec>()
+            .expect("MOR snapshot scan should use HudiScanExec");
+
+        assert_eq!(exec.read_options().filters.len(), 1);
+        let filter = &exec.read_options().filters[0];
+        assert_eq!(filter.field, "id");
+        assert_eq!(filter.values, vec!["1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_mor_snapshot_keeps_partition_and_non_partition_filters_for_hudi_exec() {
+        let hudi = HudiDataSource::new(V6SimplekeygenNonhivestyle.url_to_mor_parquet().as_str())
+            .await
+            .unwrap();
+        let partition_filter = col_lit("byteField", Operator::Eq, ScalarValue::Int32(Some(10)));
+        let non_partition_filter = col_lit("id", Operator::Gt, ScalarValue::Int32(Some(1)));
+
+        let filters =
+            scan_hudi_exec_filter_triplets(&hudi, &[partition_filter, non_partition_filter]).await;
+
+        assert_scan_filter(&filters, "byteField", "=", &["10"]);
+        assert_scan_filter(&filters, "id", ">", &["1"]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_lance_keeps_partition_and_non_partition_filters_for_hudi_exec() {
+        let hudi = HudiDataSource::new(V9LanceTxnsSimple.url_to_cow().as_str())
+            .await
+            .unwrap();
+        let partition_filter = col_lit(
+            "region",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("us".to_string())),
+        );
+        let non_partition_filter = col_lit(
+            "txn_id",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("TXN-001".to_string())),
+        );
+
+        let filters =
+            scan_hudi_exec_filter_triplets(&hudi, &[partition_filter, non_partition_filter]).await;
+
+        assert_scan_filter(&filters, "region", "=", &["us"]);
+        assert_scan_filter(&filters, "txn_id", "=", &["TXN-001"]);
     }
 }

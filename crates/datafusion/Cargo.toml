@@ -50,6 +50,7 @@ datafusion-physical-expr = { workspace = true }
 
 # runtime / async
 async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 
@@ -58,3 +59,4 @@ log = { workspace = true }
 
 [dev-dependencies]
 hudi-test = { path = "../test", features = ["datafusion"] }
+parquet = { workspace = true }
