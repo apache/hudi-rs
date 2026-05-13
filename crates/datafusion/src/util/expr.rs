@@ -220,6 +220,15 @@ fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
     }
 }
 
+/// Stringifies a DataFusion literal for Hudi's string-typed `Filter` API.
+///
+/// `ScalarValue::Display` is lossy for decimals — it prints the unscaled
+/// integer (e.g. `Decimal128(7500, 10, 2)` becomes `"7500"` rather than
+/// `"75.00"`) — so those are formatted explicitly here. Other types fall
+/// through to `to_string()`.
+///
+/// Tracking the typed-value refactor that would eliminate this round trip:
+/// <https://github.com/apache/hudi-rs/issues/609>.
 fn scalar_to_filter_value(literal: &ScalarValue) -> String {
     match literal {
         ScalarValue::Decimal32(Some(value), _, scale) => {

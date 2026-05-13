@@ -423,10 +423,6 @@ impl HudiDataSource {
     /// - A NOT expression wrapping a pushable expression
     /// - An AND compound expression where at least one side can be pushed down
     /// - A BETWEEN expression with column and literals
-    fn can_push_down(&self, expr: &Expr) -> bool {
-        Self::can_push_down_expr(self.schema.as_ref(), expr)
-    }
-
     fn can_push_down_expr(schema: &Schema, expr: &Expr) -> bool {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
@@ -503,6 +499,45 @@ impl HudiDataSource {
             .collect()
     }
 
+    /// Checks if expression filters only on a partition column.
+    ///
+    /// Partition filters are safe to push into Hudi file listing for every
+    /// scan path. For Parquet scans, non-partition predicates are left to
+    /// DataFusion's `ParquetSource` so Hudi doesn't read Parquet footers for
+    /// stats pruning before DataFusion reads the same files.
+    fn is_partition_column_filter(expr: &Expr, partition_cols: &[String]) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+                Operator::And => {
+                    Self::is_partition_column_filter(&binary_expr.left, partition_cols)
+                        && Self::is_partition_column_filter(&binary_expr.right, partition_cols)
+                }
+                Operator::Or => false,
+                _ => match (&*binary_expr.left, &*binary_expr.right) {
+                    (Expr::Column(col), Expr::Literal(..))
+                    | (Expr::Literal(..), Expr::Column(col)) => partition_cols.contains(&col.name),
+                    _ => false,
+                },
+            },
+            Expr::Not(inner) => Self::is_partition_column_filter(inner, partition_cols),
+            Expr::Between(between) => {
+                !between.negated
+                    && matches!(&*between.expr, Expr::Column(col) if partition_cols.contains(&col.name))
+                    && matches!(&*between.low, Expr::Literal(..))
+                    && matches!(&*between.high, Expr::Literal(..))
+            }
+            Expr::InList(in_list) => {
+                !in_list.list.is_empty()
+                    && matches!(in_list.expr.as_ref(), Expr::Column(col) if partition_cols.contains(&col.name))
+                    && in_list
+                        .list
+                        .iter()
+                        .all(|expr| matches!(expr, Expr::Literal(..)))
+            }
+            _ => false,
+        }
+    }
+
     fn is_exact_partition_equality_filter(expr: &Expr, partition_cols: &[String]) -> bool {
         match expr {
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
@@ -539,6 +574,51 @@ impl HudiDataSource {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Inexact
+        }
+    }
+
+    /// Returns `(partition_pushdown_exprs, all_pushdown_exprs)`.
+    fn split_scan_pushdown_exprs(&self, filters: &[Expr]) -> (Vec<Expr>, Vec<Expr>) {
+        let partition_cols = self.get_partition_columns();
+        Self::split_scan_pushdown_exprs_for_schema(self.schema.as_ref(), &partition_cols, filters)
+    }
+
+    fn split_scan_pushdown_exprs_for_schema(
+        table_schema: &Schema,
+        partition_cols: &[String],
+        filters: &[Expr],
+    ) -> (Vec<Expr>, Vec<Expr>) {
+        let all_pushdown_exprs: Vec<Expr> = filters
+            .iter()
+            .flat_map(|expr| split_conjunction(expr).into_iter())
+            .filter(|expr| Self::can_push_down_expr(table_schema, expr))
+            .cloned()
+            .collect();
+        let partition_pushdown_exprs = all_pushdown_exprs
+            .iter()
+            .filter(|expr| Self::is_partition_column_filter(expr, &partition_cols))
+            .cloned()
+            .collect();
+
+        (partition_pushdown_exprs, all_pushdown_exprs)
+    }
+
+    fn use_parquet_source_without_file_slices(
+        &self,
+        read_options: &ReadOptions,
+    ) -> Result<Option<bool>> {
+        if self.table.is_mor()
+            && !read_options
+                .is_read_optimized()
+                .map_err(|e| external_error("Invalid read-optimized option", e))?
+        {
+            return Ok(Some(false));
+        }
+
+        match &self.base_file_format {
+            Some(BaseFileFormatValue::Parquet) => Ok(Some(true)),
+            Some(_) => Ok(Some(false)),
+            None => Ok(None),
         }
     }
 
@@ -685,18 +765,22 @@ impl TableProvider for HudiDataSource {
 
     /// Builds the scan `ExecutionPlan` for this Hudi table.
     ///
-    /// Per DataFusion's [custom table provider guide], `scan()` is meant to
-    /// run during planning and stay cheap. This implementation deviates from
-    /// that ideal: it calls `Table::get_file_slices(&read_options)`, which
-    /// performs I/O proportional to the partition count: directory listing
-    /// for storage-listing tables, or metadata-table HFile reads when MDT is
-    /// enabled. The cost is unavoidable for partition pruning at plan time
-    /// and is the same pattern DataFusion's own `ListingTable` uses.
+    /// Per DataFusion's [custom table provider guide], `scan()` should avoid
+    /// data-reading I/O (work proportional to row count). Catalog I/O — the
+    /// listing needed to decide what files exist and which ones the query
+    /// touches — is expected; it is what DataFusion's own `ListingTable` does.
+    ///
+    /// `Table::get_file_slices(&read_options)` is catalog I/O: it loads the
+    /// timeline, resolves file groups, and applies partition pruning. Its cost
+    /// is proportional to partition count, not row count. When the metadata
+    /// table is enabled, partition discovery reads a few HFile blocks instead
+    /// of doing recursive object-store listing, so MDT is strictly cheaper
+    /// than the generic `ListingTable` path.
     ///
     /// Callers that issue many `scan()` calls per session against the same
-    /// table (e.g. ad-hoc SQL across the same dataset) may see planning
-    /// latency dominated by the file listing. Future work could cache the
-    /// resolved file-slice set keyed by `(filters, as_of_timestamp)`.
+    /// table (e.g. ad-hoc SQL across the same dataset) may still benefit from
+    /// caching the resolved file-slice set keyed by
+    /// `(filters, as_of_timestamp)`. Tracked as future work.
     ///
     /// We implement the legacy `scan()` rather than `scan_with_args()`. The
     /// default `scan_with_args()` impl delegates to `scan()`, so today's
@@ -720,34 +804,77 @@ impl TableProvider for HudiDataSource {
 
         let input_partitions = self.get_input_partitions_for_scan(state);
 
-        let pushdown_exprs: Vec<Expr> = filters
-            .iter()
-            .flat_map(|expr| split_conjunction(expr).into_iter())
-            .filter(|expr| self.can_push_down(expr))
-            .cloned()
-            .collect();
-        let pushdown_filters = exprs_to_filters(&pushdown_exprs);
+        let (partition_pushdown_exprs, all_pushdown_exprs) =
+            self.split_scan_pushdown_exprs(filters);
+        let partition_pushdown_filters = exprs_to_filters(&partition_pushdown_exprs);
+        let all_pushdown_filters = exprs_to_filters(&all_pushdown_exprs);
+        let all_filters_are_partition_filters = all_pushdown_filters == partition_pushdown_filters;
 
         let read_optimized = self.effective_read_optimized();
-        let read_options = self.scan_read_options(pushdown_filters, read_optimized)?;
-        let flat_slices = self
-            .table
-            .get_file_slices(&read_options)
-            .await
-            .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
-
-        if self.use_parquet_source(&read_options, &flat_slices)? {
-            self.scan_parquet(state, projection, filters, limit, flat_slices)
-                .await
+        let partition_read_options =
+            self.scan_read_options(partition_pushdown_filters.clone(), read_optimized)?;
+        let all_read_options = if all_filters_are_partition_filters {
+            partition_read_options.clone()
         } else {
-            self.scan_hudi(
-                projection,
-                limit,
-                input_partitions,
-                flat_slices,
-                read_options,
-            )
-            .await
+            self.scan_read_options(all_pushdown_filters, read_optimized)?
+        };
+
+        match self.use_parquet_source_without_file_slices(&partition_read_options)? {
+            Some(true) => {
+                let flat_slices = self
+                    .table
+                    .get_file_slices(&partition_read_options)
+                    .await
+                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                self.scan_parquet(state, projection, filters, limit, flat_slices)
+                    .await
+            }
+            Some(false) => {
+                let flat_slices = self
+                    .table
+                    .get_file_slices(&all_read_options)
+                    .await
+                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                self.scan_hudi(
+                    projection,
+                    limit,
+                    input_partitions,
+                    flat_slices,
+                    all_read_options,
+                )
+                .await
+            }
+            None => {
+                let partition_flat_slices = self
+                    .table
+                    .get_file_slices(&partition_read_options)
+                    .await
+                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+
+                if self.use_parquet_source(&partition_read_options, &partition_flat_slices)? {
+                    self.scan_parquet(state, projection, filters, limit, partition_flat_slices)
+                        .await
+                } else {
+                    let flat_slices = if all_filters_are_partition_filters {
+                        partition_flat_slices
+                    } else {
+                        self.table
+                            .get_file_slices(&all_read_options)
+                            .await
+                            .map_err(|e| {
+                                external_error("Failed to get file slices from Hudi table", e)
+                            })?
+                    };
+                    self.scan_hudi(
+                        projection,
+                        limit,
+                        input_partitions,
+                        flat_slices,
+                        all_read_options,
+                    )
+                    .await
+                }
+            }
         }
     }
 
@@ -1134,6 +1261,46 @@ mod tests {
             pushdown_support(&schema, &partition_cols, &or_expr),
             TableProviderFilterPushDown::Unsupported
         );
+    }
+
+    #[test]
+    fn test_scan_pushdown_exprs_separates_partition_filters_for_listing() {
+        let schema = pushdown_test_schema();
+        let partition_cols = partition_cols();
+        let partition_eq = col_lit("byteField", Operator::Eq, ScalarValue::Int8(Some(1)));
+        let non_partition_eq = col_lit(
+            "name",
+            Operator::Eq,
+            ScalarValue::Utf8(Some("Alice".to_string())),
+        );
+        let partition_in = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(Expr::Column(Column::from_name("byteField".to_string()))),
+            vec![
+                Expr::Literal(ScalarValue::Int8(Some(1)), None),
+                Expr::Literal(ScalarValue::Int8(Some(2)), None),
+            ],
+            false,
+        ));
+
+        let (partition_exprs, all_exprs) = HudiDataSource::split_scan_pushdown_exprs_for_schema(
+            &schema,
+            &partition_cols,
+            &[partition_eq.and(non_partition_eq), partition_in],
+        );
+        let partition_filters = exprs_to_filters(&partition_exprs);
+        let all_filters = exprs_to_filters(&all_exprs);
+
+        let partition_fields = partition_filters
+            .iter()
+            .map(|(field, _, _)| field.as_str())
+            .collect::<Vec<_>>();
+        let all_fields = all_filters
+            .iter()
+            .map(|(field, _, _)| field.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(partition_fields, ["byteField", "byteField"]);
+        assert_eq!(all_fields, ["byteField", "name", "byteField"]);
     }
 
     #[test]
