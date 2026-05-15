@@ -18,14 +18,10 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::error::ConfigError;
-use crate::config::error::Result as ConfigResult;
-use crate::config::table::HudiTableConfig::{
-    OrderingFields, PopulatesMetaFields, RecordMergeStrategy,
-};
+use crate::config::table::HudiTableConfig::{OrderingFields, RecordMergeStrategy};
 use crate::file_group::record_batches::RecordBatches;
-use crate::merge::RecordMergeStrategyValue;
 use crate::merge::ordering::{MaxOrderingInfo, process_batch_for_max_orderings};
+use crate::merge::{RecordMergeStrategyValue, RecordMerger};
 use crate::metadata::meta_field::MetaField;
 use crate::record::{
     create_commit_time_ordering_converter, create_event_time_ordering_converter,
@@ -42,43 +38,16 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Default record-batch merger using Hudi's current sort-and-deduplicate logic.
 #[derive(Debug, Clone)]
-pub struct RecordMerger {
+pub struct RecordBatchMerger {
+    /// Schema used by merged output batches.
     pub schema: SchemaRef,
+    /// Hudi configs that control merge strategy and ordering fields.
     pub hudi_configs: Arc<HudiConfigs>,
 }
 
-impl RecordMerger {
-    /// Validates the given [HudiConfigs] against the [RecordMergeStrategy].
-    pub fn validate_configs(hudi_configs: &HudiConfigs) -> ConfigResult<()> {
-        let merge_strategy: String = hudi_configs.get_or_default(RecordMergeStrategy).into();
-        let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
-
-        let populate_meta_fields: bool = hudi_configs.get_or_default(PopulatesMetaFields).into();
-        if !populate_meta_fields && merge_strategy != RecordMergeStrategyValue::AppendOnly {
-            return Err(ConfigError::InvalidValue(format!(
-                "When {:?} is false, {:?} must be {:?}.",
-                PopulatesMetaFields,
-                RecordMergeStrategy,
-                RecordMergeStrategyValue::AppendOnly
-            )));
-        }
-
-        let precombine_field = hudi_configs.try_get(OrderingFields)?;
-        if precombine_field.is_none()
-            && merge_strategy == RecordMergeStrategyValue::OverwriteWithLatest
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "When {:?} is {:?}, {:?} must be set.",
-                RecordMergeStrategy,
-                RecordMergeStrategyValue::OverwriteWithLatest,
-                OrderingFields
-            )));
-        }
-
-        Ok(())
-    }
-
+impl RecordBatchMerger {
     pub fn new(schema: SchemaRef, hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             schema,
@@ -189,9 +158,21 @@ impl RecordMerger {
     }
 }
 
+impl RecordMerger for RecordBatchMerger {
+    fn merge(&self, inputs: RecordBatches) -> Result<RecordBatch> {
+        self.merge_record_batches(inputs)
+    }
+
+    fn output_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::error::ConfigError;
+    use crate::config::table::HudiTableConfig::PopulatesMetaFields;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -216,21 +197,32 @@ mod tests {
 
     #[test]
     fn test_validate_configs() {
-        // Valid config with precombine field and meta fields
-        let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        assert!(RecordMerger::validate_configs(&configs).is_ok());
+        let cases = [
+            ("OVERWRITE_WITH_LATEST", true, Some("ts"), None),
+            ("APPEND_ONLY", false, None, None),
+            ("OVERWRITE_WITH_LATEST", true, None, Some("OrderingFields")),
+            (
+                "OVERWRITE_WITH_LATEST",
+                false,
+                Some("ts"),
+                Some("PopulatesMetaFields"),
+            ),
+        ];
 
-        // Valid append only config without meta fields
-        let configs = create_configs("APPEND_ONLY", false, None);
-        assert!(RecordMerger::validate_configs(&configs).is_ok());
-
-        // Invalid: Overwrite without precombine field
-        let configs = create_configs("OVERWRITE_WITH_LATEST", true, None);
-        assert!(RecordMerger::validate_configs(&configs).is_err());
-
-        // Invalid: No meta fields with overwrite strategy
-        let configs = create_configs("OVERWRITE_WITH_LATEST", false, Some("ts"));
-        assert!(RecordMerger::validate_configs(&configs).is_err());
+        for (strategy, populates_meta_fields, precombine, expected_error) in cases {
+            let configs = create_configs(strategy, populates_meta_fields, precombine);
+            match expected_error {
+                None => assert!(crate::merge::validate_configs(&configs).is_ok()),
+                Some(message_fragment) => {
+                    let result = crate::merge::validate_configs(&configs);
+                    assert!(matches!(
+                        result,
+                        Err(ConfigError::InvalidValue(message))
+                            if message.contains(message_fragment)
+                    ));
+                }
+            }
+        }
     }
 
     fn create_schema(fields: Vec<(&str, DataType, bool)>) -> SchemaRef {
@@ -300,7 +292,7 @@ mod tests {
         let schema = create_test_schema(false);
 
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let merger = RecordBatchMerger::new(schema.clone(), Arc::new(configs));
 
         // Test empty input
         let empty_result = merger.merge_record_batches(RecordBatches::new()).unwrap();
@@ -344,7 +336,7 @@ mod tests {
         .unwrap();
 
         let configs = create_configs("APPEND_ONLY", false, None);
-        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let merger = RecordBatchMerger::new(schema.clone(), Arc::new(configs));
         let merged = merger
             .merge_record_batches(RecordBatches::new_with_data_batches([batch1, batch2]))
             .unwrap();
@@ -395,7 +387,7 @@ mod tests {
         .unwrap();
 
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let merger = RecordBatchMerger::new(schema.clone(), Arc::new(configs));
         let batches = RecordBatches::new_with_data_batches([batch1, batch2]);
         let merged = merger.merge_record_batches(batches).unwrap();
 
@@ -443,7 +435,7 @@ mod tests {
         .unwrap();
 
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let merger = RecordBatchMerger::new(schema.clone(), Arc::new(configs));
         let batches = RecordBatches::new_with_data_batches([batch1, batch2]);
         let merged = merger.merge_record_batches(batches).unwrap();
 
@@ -457,6 +449,46 @@ mod tests {
                 ("c1".to_string(), "s1".to_string(), "k2".to_string(), 2, 20), // Original value since ts=1 < ts=2
                 ("c2".to_string(), "s2".to_string(), "k3".to_string(), 3, 60), // Latest value due to equal ts and seqno=s2
             ]
+        );
+    }
+
+    #[test]
+    fn test_record_merger_trait_merge_matches_direct_merge() {
+        let schema = create_test_schema(false);
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c1", "c1", "c1"])),
+                Arc::new(StringArray::from(vec!["s1", "s1", "s1"])),
+                Arc::new(StringArray::from(vec!["k1", "k2", "k3"])),
+                Arc::new(Int32Array::from(vec![1, 5, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c2", "c2", "c2"])),
+                Arc::new(StringArray::from(vec!["s2", "s2", "s2"])),
+                Arc::new(StringArray::from(vec!["k1", "k2", "k4"])),
+                Arc::new(Int32Array::from(vec![4, 2, 6])),
+                Arc::new(Int32Array::from(vec![40, 50, 60])),
+            ],
+        )
+        .unwrap();
+
+        let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
+        let merger = RecordBatchMerger::new(schema.clone(), Arc::new(configs));
+        let batches = RecordBatches::new_with_data_batches([batch1, batch2]);
+
+        let direct_merged = merger.merge_record_batches(batches.clone()).unwrap();
+        let trait_merged = <RecordBatchMerger as RecordMerger>::merge(&merger, batches).unwrap();
+
+        assert_eq!(trait_merged.schema(), direct_merged.schema());
+        assert_eq!(
+            get_sorted_rows(&trait_merged),
+            get_sorted_rows(&direct_merged)
         );
     }
 }

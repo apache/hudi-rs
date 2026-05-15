@@ -32,7 +32,7 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::merge::record_merger::RecordMerger;
+use crate::merge::create_record_merger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
@@ -271,8 +271,8 @@ impl FileGroupReader {
             all_batches.push_data_batch(base_batch);
             all_batches.extend(log_batches);
 
-            let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)?
+            let merger = create_record_merger(schema.clone(), self.hudi_configs.clone())?;
+            merger.merge(all_batches)?
         };
 
         apply_eager_options(&options, merged)
