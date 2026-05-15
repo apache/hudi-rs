@@ -104,6 +104,9 @@ pub enum HudiReadConfig {
 
     /// Maximum number of file-slice streams to poll concurrently within one scan partition.
     FileSliceReadConcurrency,
+
+    /// Record merger implementation used for file-slice merging.
+    RecordMergerImpl,
 }
 
 impl HudiReadConfig {
@@ -120,6 +123,7 @@ impl HudiReadConfig {
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
+            Self::RecordMergerImpl => "hoodie.read.record.merger.impl",
         }
     }
 }
@@ -148,6 +152,9 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
+            HudiReadConfig::RecordMergerImpl => {
+                Some(HudiConfigValue::String("record_batch".to_string()))
+            }
             _ => None,
         }
     }
@@ -197,6 +204,7 @@ impl ConfigParser for HudiReadConfig {
                     Ok(parsed)
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::RecordMergerImpl => get_result.map(|v| HudiConfigValue::String(v.to_string())),
         }
     }
 }
@@ -206,7 +214,8 @@ mod tests {
     use super::*;
     use crate::config::read::HudiReadConfig::{
         AsOfTimestamp, EndTimestamp, FileSliceReadConcurrency, InputPartitions,
-        QueryType as QueryTypeKey, StartTimestamp, StreamBatchSize, UseReadOptimizedMode,
+        QueryType as QueryTypeKey, RecordMergerImpl, StartTimestamp, StreamBatchSize,
+        UseReadOptimizedMode,
     };
 
     #[test]
@@ -225,6 +234,10 @@ mod tests {
             (
                 FileSliceReadConcurrency.as_ref().to_string(),
                 "8".to_string(),
+            ),
+            (
+                RecordMergerImpl.as_ref().to_string(),
+                "record_batch".to_string(),
             ),
         ]);
         let actual: String = QueryTypeKey.parse_value(&options).unwrap().into();
@@ -246,6 +259,8 @@ mod tests {
             .unwrap()
             .into();
         assert_eq!(actual, 8);
+        let actual: String = RecordMergerImpl.parse_value(&options).unwrap().into();
+        assert_eq!(actual, "record_batch");
     }
 
     #[test]
@@ -292,6 +307,8 @@ mod tests {
             .parse_value_or_default(&options)
             .into();
         assert_eq!(actual, 4);
+        let actual: String = RecordMergerImpl.parse_value_or_default(&options).into();
+        assert_eq!(actual, "record_batch");
 
         let zero = HashMap::from([(
             FileSliceReadConcurrency.as_ref().to_string(),
@@ -341,6 +358,10 @@ mod tests {
         assert_eq!(
             format!("{}", HudiReadConfig::QueryType),
             "hoodie.read.query.type"
+        );
+        assert_eq!(
+            format!("{}", HudiReadConfig::RecordMergerImpl),
+            "hoodie.read.record.merger.impl"
         );
     }
 }

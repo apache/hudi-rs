@@ -18,11 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::error::ConfigError;
-use crate::config::error::Result as ConfigResult;
-use crate::config::table::HudiTableConfig::{
-    OrderingFields, PopulatesMetaFields, RecordMergeStrategy,
-};
+use crate::config::table::HudiTableConfig::{OrderingFields, RecordMergeStrategy};
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::ordering::{MaxOrderingInfo, process_batch_for_max_orderings};
 use crate::merge::{RecordMergeStrategyValue, RecordMerger};
@@ -52,36 +48,6 @@ pub struct RecordBatchMerger {
 }
 
 impl RecordBatchMerger {
-    /// Validates the given [HudiConfigs] against the [RecordMergeStrategy].
-    pub fn validate_configs(hudi_configs: &HudiConfigs) -> ConfigResult<()> {
-        let merge_strategy: String = hudi_configs.get_or_default(RecordMergeStrategy).into();
-        let merge_strategy = RecordMergeStrategyValue::from_str(&merge_strategy)?;
-
-        let populate_meta_fields: bool = hudi_configs.get_or_default(PopulatesMetaFields).into();
-        if !populate_meta_fields && merge_strategy != RecordMergeStrategyValue::AppendOnly {
-            return Err(ConfigError::InvalidValue(format!(
-                "When {:?} is false, {:?} must be {:?}.",
-                PopulatesMetaFields,
-                RecordMergeStrategy,
-                RecordMergeStrategyValue::AppendOnly
-            )));
-        }
-
-        let precombine_field = hudi_configs.try_get(OrderingFields)?;
-        if precombine_field.is_none()
-            && merge_strategy == RecordMergeStrategyValue::OverwriteWithLatest
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "When {:?} is {:?}, {:?} must be set.",
-                RecordMergeStrategy,
-                RecordMergeStrategyValue::OverwriteWithLatest,
-                OrderingFields
-            )));
-        }
-
-        Ok(())
-    }
-
     pub fn new(schema: SchemaRef, hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             schema,
@@ -205,6 +171,7 @@ impl RecordMerger for RecordBatchMerger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::table::HudiTableConfig::PopulatesMetaFields;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -229,21 +196,20 @@ mod tests {
 
     #[test]
     fn test_validate_configs() {
-        // Valid config with precombine field and meta fields
-        let configs = create_configs("OVERWRITE_WITH_LATEST", true, Some("ts"));
-        assert!(RecordBatchMerger::validate_configs(&configs).is_ok());
+        let cases = [
+            ("OVERWRITE_WITH_LATEST", true, Some("ts"), true),
+            ("APPEND_ONLY", false, None, true),
+            ("OVERWRITE_WITH_LATEST", true, None, false),
+            ("OVERWRITE_WITH_LATEST", false, Some("ts"), false),
+        ];
 
-        // Valid append only config without meta fields
-        let configs = create_configs("APPEND_ONLY", false, None);
-        assert!(RecordBatchMerger::validate_configs(&configs).is_ok());
-
-        // Invalid: Overwrite without precombine field
-        let configs = create_configs("OVERWRITE_WITH_LATEST", true, None);
-        assert!(RecordBatchMerger::validate_configs(&configs).is_err());
-
-        // Invalid: No meta fields with overwrite strategy
-        let configs = create_configs("OVERWRITE_WITH_LATEST", false, Some("ts"));
-        assert!(RecordBatchMerger::validate_configs(&configs).is_err());
+        for (strategy, populates_meta_fields, precombine, should_pass) in cases {
+            let configs = create_configs(strategy, populates_meta_fields, precombine);
+            assert_eq!(
+                crate::merge::validate_configs(&configs).is_ok(),
+                should_pass
+            );
+        }
     }
 
     fn create_schema(fields: Vec<(&str, DataType, bool)>) -> SchemaRef {

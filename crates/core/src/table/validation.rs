@@ -25,7 +25,7 @@ use crate::config::table::HudiTableConfig::{
     BaseFileFormat, BasePath, DropsPartitionFields, TableVersion, TimelineLayoutVersion,
 };
 use crate::error::CoreError;
-use crate::merge::record_batch_merger::RecordBatchMerger;
+use crate::merge::validate_configs as validate_record_merger_configs;
 use crate::util::path::is_metadata_table_path;
 use std::str::FromStr;
 use strum::IntoEnumIterator;
@@ -82,7 +82,7 @@ pub fn validate_configs(hudi_configs: &HudiConfigs) -> crate::error::Result<()> 
         }
     }
 
-    RecordBatchMerger::validate_configs(hudi_configs)?;
+    validate_record_merger_configs(hudi_configs)?;
 
     Ok(())
 }

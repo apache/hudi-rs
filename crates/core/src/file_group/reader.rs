@@ -32,7 +32,7 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::merge::record_batch_merger::RecordBatchMerger;
+use crate::merge::create_record_merger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
@@ -271,8 +271,8 @@ impl FileGroupReader {
             all_batches.push_data_batch(base_batch);
             all_batches.extend(log_batches);
 
-            let merger = RecordBatchMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)?
+            let merger = create_record_merger(schema.clone(), self.hudi_configs.clone())?;
+            merger.merge(all_batches)?
         };
 
         apply_eager_options(&options, merged)
@@ -1411,7 +1411,7 @@ mod tests {
     async fn test_read_file_slice_eager_with_real_log_files_merges() -> Result<()> {
         // Eager MOR read with at least one log file exercises the merge branch
         // of `read_file_slice_from_paths`: log scanning, RecordBatches scan
-        // result, and the RecordBatchMerger pass that combines base + log batches.
+        // result, and the RecordMerger pass that combines base + log batches.
         let (base_uri, partition, base_file_name, log_file_name) = v8_trips_mor_first_slice();
         let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
 
