@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#[cfg(test)]
+mod conformance_tests;
 mod ordering;
 pub mod record_batch_merger;
 
