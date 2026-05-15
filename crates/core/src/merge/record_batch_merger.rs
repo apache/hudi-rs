@@ -171,6 +171,7 @@ impl RecordMerger for RecordBatchMerger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::error::ConfigError;
     use crate::config::table::HudiTableConfig::PopulatesMetaFields;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -197,18 +198,30 @@ mod tests {
     #[test]
     fn test_validate_configs() {
         let cases = [
-            ("OVERWRITE_WITH_LATEST", true, Some("ts"), true),
-            ("APPEND_ONLY", false, None, true),
-            ("OVERWRITE_WITH_LATEST", true, None, false),
-            ("OVERWRITE_WITH_LATEST", false, Some("ts"), false),
+            ("OVERWRITE_WITH_LATEST", true, Some("ts"), None),
+            ("APPEND_ONLY", false, None, None),
+            ("OVERWRITE_WITH_LATEST", true, None, Some("OrderingFields")),
+            (
+                "OVERWRITE_WITH_LATEST",
+                false,
+                Some("ts"),
+                Some("PopulatesMetaFields"),
+            ),
         ];
 
-        for (strategy, populates_meta_fields, precombine, should_pass) in cases {
+        for (strategy, populates_meta_fields, precombine, expected_error) in cases {
             let configs = create_configs(strategy, populates_meta_fields, precombine);
-            assert_eq!(
-                crate::merge::validate_configs(&configs).is_ok(),
-                should_pass
-            );
+            match expected_error {
+                None => assert!(crate::merge::validate_configs(&configs).is_ok()),
+                Some(message_fragment) => {
+                    let result = crate::merge::validate_configs(&configs);
+                    assert!(matches!(
+                        result,
+                        Err(ConfigError::InvalidValue(message))
+                            if message.contains(message_fragment)
+                    ));
+                }
+            }
         }
     }
 
