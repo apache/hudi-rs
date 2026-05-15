@@ -59,6 +59,9 @@ pub trait RecordMerger: Send + Sync + std::fmt::Debug {
     fn output_schema(&self) -> &SchemaRef;
 }
 
+/// Default record merger implementation name.
+pub const DEFAULT_RECORD_MERGER_IMPL: &str = "record_batch";
+
 /// Creates a record merger from the configured merger implementation name.
 pub fn create_record_merger(
     schema: SchemaRef,
@@ -67,10 +70,11 @@ pub fn create_record_merger(
     let impl_name: String = hudi_configs
         .get_or_default(HudiReadConfig::RecordMergerImpl)
         .into();
-    match impl_name.as_str() {
-        "record_batch" => Ok(Arc::new(RecordBatchMerger::new(schema, hudi_configs))),
-        other => Err(CoreError::Config(ConfigError::InvalidValue(format!(
-            "unknown record_merger_impl: {other}"
+    let normalized_impl_name = impl_name.to_ascii_lowercase();
+    match normalized_impl_name.as_str() {
+        DEFAULT_RECORD_MERGER_IMPL => Ok(Arc::new(RecordBatchMerger::new(schema, hudi_configs))),
+        _ => Err(CoreError::Config(ConfigError::InvalidValue(format!(
+            "unknown record_merger_impl: {impl_name}"
         )))),
     }
 }

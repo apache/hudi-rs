@@ -28,6 +28,7 @@ use crate::config::Result;
 use crate::config::error::ConfigError;
 use crate::config::error::ConfigError::{InvalidValue, NotFound, ParseBool, ParseInt};
 use crate::config::{ConfigParser, HudiConfigValue};
+use crate::merge::DEFAULT_RECORD_MERGER_IMPL;
 
 /// Config value for [`HudiReadConfig::QueryType`]. Canonical strings are
 /// `snapshot` and `incremental`; [`FromStr`] accepts case-insensitive forms.
@@ -152,9 +153,9 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
-            HudiReadConfig::RecordMergerImpl => {
-                Some(HudiConfigValue::String("record_batch".to_string()))
-            }
+            HudiReadConfig::RecordMergerImpl => Some(HudiConfigValue::String(
+                DEFAULT_RECORD_MERGER_IMPL.to_string(),
+            )),
             _ => None,
         }
     }
@@ -237,7 +238,7 @@ mod tests {
             ),
             (
                 RecordMergerImpl.as_ref().to_string(),
-                "record_batch".to_string(),
+                DEFAULT_RECORD_MERGER_IMPL.to_string(),
             ),
         ]);
         let actual: String = QueryTypeKey.parse_value(&options).unwrap().into();
@@ -260,7 +261,7 @@ mod tests {
             .into();
         assert_eq!(actual, 8);
         let actual: String = RecordMergerImpl.parse_value(&options).unwrap().into();
-        assert_eq!(actual, "record_batch");
+        assert_eq!(actual, DEFAULT_RECORD_MERGER_IMPL);
     }
 
     #[test]
@@ -308,7 +309,7 @@ mod tests {
             .into();
         assert_eq!(actual, 4);
         let actual: String = RecordMergerImpl.parse_value_or_default(&options).into();
-        assert_eq!(actual, "record_batch");
+        assert_eq!(actual, DEFAULT_RECORD_MERGER_IMPL);
 
         let zero = HashMap::from([(
             FileSliceReadConcurrency.as_ref().to_string(),
