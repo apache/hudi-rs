@@ -86,7 +86,7 @@ flate2 = { workspace = true }
 # prost-build at compile time, which shells out to `protoc`. Any build of
 # hudi-core (CI, Docker, local dev, downstream consumers) must therefore
 # have `protoc` available on PATH — there is no opt-out.
-lance-core = { version = "4.0.1" }
+lance-core = { version = "6.0.0" }
 lance-encoding = { version = "4.0.1" }
 lance-file = { version = "4.0.1" }
 lance-io = { version = "4.0.1" }
