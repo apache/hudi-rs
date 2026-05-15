@@ -42,15 +42,15 @@ use strum_macros::AsRefStr;
 ///
 /// Implementations are configured when constructed. Callers provide the union of
 /// base-file and log-file data batches plus delete batches; the merger returns a
-/// batch using [`RecordMerger::output_schema`]. Errors are returned for invalid
+/// batch using [`Self::output_schema`]. Errors are returned for invalid
 /// merge configuration, missing required fields, or Arrow compute failures.
 pub trait RecordMerger: Send + Sync + std::fmt::Debug {
     /// Merges the provided record batches into one output batch.
     ///
     /// The input must contain batches compatible with this merger's output
-    /// schema and configured Hudi merge strategy. Implementations apply deletes
-    /// and choose the latest version for each record key according to their
-    /// strategy-specific ordering rules.
+    /// schema and configured Hudi merge strategy. Depending on that strategy,
+    /// implementations may apply deletes or deduplicate by record key using
+    /// ordering values. The returned batch uses [`Self::output_schema`].
     fn merge(&self, inputs: RecordBatches) -> Result<RecordBatch>;
 
     /// Returns the schema used by batches produced by this merger.
