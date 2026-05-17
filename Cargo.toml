@@ -37,7 +37,7 @@ repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "57" }
+arrow = { version = "58" }
 arrow-arith = { version = "57" }
 arrow-array = { version = "57" }
 arrow-buffer = { version = "57" }
