@@ -712,9 +712,7 @@ impl Storage {
         if let Some(ref build_filter) = effective_options.row_filter_builder {
             if let Some(row_filter) = build_filter(builder.parquet_schema(), &projected_schema) {
                 log::info!(
-                    "[ENG-40156] installing parquet RowFilter for '{relative_path}' \
-                     ({} predicate(s))",
-                    row_filter.predicates.len()
+                    "[ENG-40156] installing parquet RowFilter for '{relative_path}'"
                 );
                 builder = builder.with_row_filter(row_filter);
             }

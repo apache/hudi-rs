@@ -90,6 +90,15 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # protobuf
 prost = { version = "0.14" }
+# ENG-40156 — substrait wire format for Velox → hudi-rs predicate pushdown.
+# Proto definitions only (no DataFusion). Compatible with prost 0.14 above.
+#
+# Pinned to 0.59 because that's the last release where the proto field is
+# `extension_uris` / `SimpleExtensionUri` — matching the Substrait protos
+# Gluten ships in gluten-substrait/src/main/resources/substrait/proto/.
+# Substrait 0.60+ renamed these to `extension_urns` / `SimpleExtensionUrn`,
+# which would not decode bytes Gluten emits.
+substrait = { version = "=0.59" }
 
 # compression
 flate2 = { version = "1" }

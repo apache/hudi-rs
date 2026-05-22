@@ -405,6 +405,7 @@ mod tests {
                 suffix: "".into(),
                 file_size: 512,
             }],
+            substrait_filter_bytes: vec![],
         };
 
         let ctx: FileGroupReaderContext = ffi.into();

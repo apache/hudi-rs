@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 mod predicate;
-use predicate::ColumnPredicate;
+use predicate::PushedFilter;
 
 static LOGGER: OnceLock<()> = OnceLock::new();
 
@@ -60,81 +60,22 @@ fn init_logger() {
 #[cxx::bridge]
 mod ffi {
     // ════════════════════════════════════════════════════════════════════════
-    // ENG-40156 — predicate pushdown IR
+    // ENG-40156 — predicate pushdown wire format
     // ════════════════════════════════════════════════════════════════════════
     //
-    // Velox HudiSplitReader walks scanSpec_ (and optionally remainingFilter_)
-    // and produces one FfiColumnFilter per filtered column.  hudi-rs decodes
-    // these into arrow::compute predicates and applies them either at parquet
-    // read time (with_row_filter, for RO / no-log-files paths — Phase 4) or
-    // post-merge against the final RecordBatch (Phase 3 — semantically safe
-    // for all MOR cases because the merge has already resolved log updates).
+    // Velox HudiSplitReader forwards the Substrait filter that Gluten emitted
+    // for this ReadRel, wrapped in a substrait::proto::ExtendedExpression so
+    // the hudi-rs side has everything it needs in one blob:
+    //   - the filter Expression itself
+    //   - a NamedStruct base_schema (so substrait field indices resolve to
+    //     hudi-rs column names)
+    //   - SimpleExtensionDeclaration entries that map function_reference ints
+    //     to URI-qualified names like "lt:any_any"
     //
-    // The IR is intentionally narrow: tagged union of the Velox common::Filter
-    // shapes we actually see today (range, value-list, null, bool). Compound
-    // expressions (OR across columns, function calls in remainingFilter) are
-    // NOT modelled here — those continue to be handled by Velox's existing
-    // post-scan filter evaluator. See the design doc for the rationale.
-    //
-    // cxx-rs doesn't support sum types directly so we encode as a "kind" enum
-    // string plus parallel value vectors; each FfiColumnFilter sets the fields
-    // its kind needs and leaves the rest at default.
-
-    /// Kind of column-level predicate. String-encoded because cxx-rs doesn't
-    /// pass Rust enums by value across the bridge.
-    ///
-    /// Each kind is interpreted as follows (all optional null-allowed unless
-    /// stated). Numeric values are encoded in i64_lo/i64_hi/f64_lo/f64_hi as
-    /// inclusive lower/upper bounds; string values use bytes_values.
-    ///
-    /// | kind              | fields                                          |
-    /// |-------------------|-------------------------------------------------|
-    /// | "is_null"         | (none)                                          |
-    /// | "is_not_null"     | (none)                                          |
-    /// | "bool"            | bool_value                                      |
-    /// | "bigint_range"    | i64_lo, i64_hi, lo_unbounded, hi_unbounded      |
-    /// | "double_range"    | f64_lo, f64_hi, lo_unbounded, hi_unbounded      |
-    /// | "bigint_values"   | i64_values (sorted, deduped)                    |
-    /// | "bytes_range"     | bytes_lo, bytes_hi, lo_unbounded, hi_unbounded  |
-    /// | "bytes_values"    | bytes_values                                    |
-    ///
-    /// `null_allowed` applies to every kind and indicates whether NULL values
-    /// in the column should pass the predicate. Mirrors Velox's
-    /// Filter::testNull(). Default false (NULL fails the predicate).
-
-    #[derive(Default, Clone)]
-    struct FfiColumnFilter {
-        /// Column name in the file group reader's output schema (matches the
-        /// `requested_schema` field order, NOT necessarily the parquet leaf
-        /// order — Phase 4's parquet pushdown maps by name).
-        column: String,
-
-        /// One of the kinds in the table above; see comment for field
-        /// semantics per kind.
-        kind: String,
-
-        /// True iff NULL in the column should satisfy this predicate.
-        null_allowed: bool,
-
-        // ── range/values payload (only the fields for the chosen kind are
-        //    populated; the rest stay at default zero/empty)
-        i64_lo: i64,
-        i64_hi: i64,
-        f64_lo: f64,
-        f64_hi: f64,
-        lo_unbounded: bool,
-        hi_unbounded: bool,
-        bool_value: bool,
-        i64_values: Vec<i64>,
-
-        // cxx-rs forbids nested generics (Vec<Vec<u8>>), so bytes-typed values
-        // are passed as Vec<String>. Arrow string columns are UTF-8 so this is
-        // a natural fit. Truly binary columns are not supported by this IR —
-        // they fall through to Velox's existing post-scan filter evaluator.
-        bytes_lo: String,
-        bytes_hi: String,
-        bytes_values: Vec<String>,
-    }
+    // The bytes are produced inside Gluten's SubstraitToVeloxPlan converter,
+    // stashed on HiveTableHandle, and pulled back out by HudiSplitReader.
+    // Empty bytes mean the scan has no pushable predicate; hudi-rs returns
+    // every row and Velox's existing post-scan filter does all the work.
 
     /// Mirrors `HudiReadOptions.LogFile` proto (CXX-safe, used in `Vec`).
     #[derive(Default)]
@@ -219,11 +160,11 @@ mod ffi {
         base_file_name: String,
         log_file_names: Vec<String>,
 
-        // ── predicate pushdown (ENG-40156, Phases 1-4) ────────────────────
-        // Column-level filters extracted from Velox's scanSpec_. Empty when
-        // the caller didn't push any predicates. See FfiColumnFilter comment
-        // above for the encoding.
-        column_filters: Vec<FfiColumnFilter>,
+        // ── predicate pushdown (ENG-40156) ────────────────────────────────
+        // prost-serialized substrait::proto::ExtendedExpression. Empty when
+        // the caller pushed no predicate (e.g. unfiltered scan, or Gluten
+        // didn't run the Hudi pushdown path for this query).
+        substrait_filter_bytes: Vec<u8>,
     }
 
     unsafe extern "C++" {
@@ -264,18 +205,16 @@ pub struct HoodieFileGroupReader {
     input_split: InputSplit,
     partition_path_fields: Option<Vec<String>>,
 
-    // ── ENG-40156 predicate pushdown (Phases 3-4) ────────────────────
-    // Column-level filters from Velox's scanSpec_. Always non-empty when
-    // FfiReaderContext carried any; the constructor decodes them once.
+    // ── ENG-40156 predicate pushdown ────────────────────────────────
+    // Decoded substrait predicate from `FfiReaderContext.substrait_filter_bytes`.
+    // None when no predicate was pushed (or when the substrait expression
+    // referenced functions outside the hudi-rs evaluator's inventory — in
+    // that case PushedFilter::decode dropped the filter and Velox's
+    // post-scan filter does all the work).
     //
-    // Two evaluation sites depending on file-group shape:
-    //  - Phase 4 (Storage::get_parquet_file_data_projected): if no log
-    //    files exist for this file group, push to parquet's with_row_filter
-    //    so we can skip pages and decode work.
-    //  - Phase 3 (read_record_batch, post-merge): always apply on the final
-    //    merged RecordBatch — safe regardless of log presence because the
-    //    merge has already resolved updates.
-    column_predicates: Vec<ColumnPredicate>,
+    // Applied post-merge in read_record_batch — semantically safe for any
+    // MOR shape because the merge has resolved log updates before we filter.
+    pushed_filter: Option<PushedFilter>,
 
     // ── Rust-only ──────────────────────────────────────────────────
     rt: tokio::runtime::Runtime,
@@ -290,8 +229,8 @@ pub fn new_file_group_reader_with_context(
     // Capture transport-only file names before ctx is consumed by .into().
     let base_file_name = ctx.base_file_name.clone();
     let log_file_names: Vec<String> = ctx.log_file_names.iter().cloned().collect();
-    // ENG-40156 — snapshot column_filters before `ctx.into()` consumes ctx.
-    let ctx_column_filters: Vec<ffi::FfiColumnFilter> = ctx.column_filters.clone();
+    // ENG-40156 — snapshot substrait filter bytes before `ctx.into()` consumes ctx.
+    let substrait_filter_bytes = ctx.substrait_filter_bytes.clone();
 
     // Convert flat FFI struct → nested Rust types (intermediate, not stored).
     let fgrc: FileGroupReaderContext = ctx.into();
@@ -495,19 +434,17 @@ pub fn new_file_group_reader_with_context(
         .build()
         .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
 
-    // ── 8. Decode ENG-40156 column predicates from FFI IR ────────────
-    // Predicates whose kind isn't recognised are logged + dropped here;
-    // Velox's post-scan filter still evaluates the original expression
-    // so there is no correctness regression.
-    let column_predicates: Vec<ColumnPredicate> = ctx_column_filters
-        .iter()
-        .filter_map(ColumnPredicate::from_ffi)
-        .collect();
-    if !column_predicates.is_empty() {
+    // ── 8. Decode ENG-40156 substrait predicate ──────────────────────
+    // Decode errors are hard-fail (malformed bytes), but predicates referring
+    // to functions we don't recognise are silently dropped (decode returns
+    // Ok(None)) — Velox's post-scan filter still evaluates the original
+    // expression so there is no correctness regression.
+    let pushed_filter = PushedFilter::decode(&substrait_filter_bytes)
+        .map_err(|e| format!("[ENG-40156] failed to decode pushed filter: {e}"))?;
+    if let Some(ref pf) = pushed_filter {
         log::info!(
-            "[ENG-40156] decoded {} column predicate(s): {:?}",
-            column_predicates.len(),
-            column_predicates.iter().map(|p| p.column()).collect::<Vec<_>>()
+            "[ENG-40156] decoded substrait predicate over columns {:?}",
+            pf.columns()
         );
     }
 
@@ -518,7 +455,7 @@ pub fn new_file_group_reader_with_context(
         reader_parameters,
         input_split,
         partition_path_fields,
-        column_predicates,
+        pushed_filter,
         rt,
     }))
 }
@@ -544,7 +481,7 @@ impl HoodieFileGroupReader {
             reader_parameters,
             input_split,
             partition_path_fields,
-            column_predicates: Vec::new(),
+            pushed_filter: None,
             rt,
         })
     }
@@ -583,32 +520,30 @@ impl HoodieFileGroupReader {
             record_batch.num_columns(),
         );
 
-        // ── ENG-40156 Phase 3 — post-merge predicate evaluation ──────
+        // ── ENG-40156 — post-merge predicate evaluation ───────────────
         // Safe for all MOR shapes: the merge has already resolved log
         // updates so predicate values reflect the snapshot the caller
-        // would see. Phase 4 separately pushes the same predicates into
-        // the parquet reader for the RO / no-log-files paths; this filter
-        // is still applied here, but only against the already-narrowed
-        // input, so it's cheap.
+        // would see.
         let pre_rows = record_batch.num_rows();
-        let record_batch = if self.column_predicates.is_empty() {
-            record_batch
-        } else {
-            let filtered = predicate::filter_batch(&record_batch, &self.column_predicates)
-                .map_err(|e| {
-                    format!(
-                        "[ENG-40156] post-merge filter failed: {e}; \
-                         predicates={:?}",
-                        self.column_predicates
-                    )
-                })?;
-            log::info!(
-                "[ENG-40156] post-merge filter: {} -> {} rows ({} predicates)",
-                pre_rows,
-                filtered.num_rows(),
-                self.column_predicates.len()
-            );
-            filtered
+        let record_batch = match &self.pushed_filter {
+            None => record_batch,
+            Some(filter) => {
+                let filtered = predicate::filter_batch(&record_batch, filter)
+                    .map_err(|e| {
+                        format!(
+                            "[ENG-40156] post-merge filter failed: {e}; \
+                             columns={:?}",
+                            filter.columns()
+                        )
+                    })?;
+                log::info!(
+                    "[ENG-40156] post-merge filter: {} -> {} rows (cols={:?})",
+                    pre_rows,
+                    filtered.num_rows(),
+                    filter.columns()
+                );
+                filtered
+            }
         };
         let schema = record_batch.schema();
 
