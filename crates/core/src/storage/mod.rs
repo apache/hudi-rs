@@ -52,7 +52,7 @@ pub mod reader;
 pub mod util;
 
 /// Options for reading Parquet files with streaming.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ParquetReadOptions {
     /// Target batch size (number of rows per batch).
     pub batch_size: Option<usize>,
@@ -65,7 +65,33 @@ pub struct ParquetReadOptions {
     /// read from disk.  ENG-40168 path B2 — saves I/O when Spark's nested-
     /// column pruning narrows a struct to a subset of its subfields.
     pub nested_projection: Option<SchemaRef>,
+    /// ENG-40156 Phase 4 — caller-supplied closure that builds a parquet
+    /// RowFilter from the file's schema. Called once after the file metadata
+    /// is loaded but before `builder.build()`. Returning None means no
+    /// pushdown. Storage stays predicate-agnostic; the actual predicate IR
+    /// lives in the FFI / lib.rs layer that knows about Velox scanSpec.
+    ///
+    /// Type-erased to avoid pulling the predicate types into core. Callers
+    /// pass a boxed closure that captures their decoded predicates.
+    pub row_filter_builder: Option<RowFilterBuilder>,
 }
+
+/// Shared builder for a parquet `RowFilter`. The function receives the
+/// parquet `SchemaDescriptor` + the arrow `Schema` after projection.
+/// Returns `None` if no filter applies (e.g. predicate columns not in
+/// schema).
+///
+/// `Arc` (not `Box`) so `ParquetReadOptions` stays `Clone` for callers that
+/// expect it. The captured state must be Send+Sync because the parquet
+/// stream may evaluate the filter on any worker thread.
+pub type RowFilterBuilder = Arc<
+    dyn Fn(
+            &parquet::schema::types::SchemaDescriptor,
+            &arrow_schema::Schema,
+        ) -> Option<parquet::arrow::arrow_reader::RowFilter>
+        + Send
+        + Sync,
+>;
 
 impl ParquetReadOptions {
     pub fn new() -> Self {
@@ -93,6 +119,29 @@ impl ParquetReadOptions {
     pub fn with_nested_projection(mut self, schema: SchemaRef) -> Self {
         self.nested_projection = Some(schema);
         self
+    }
+
+    /// Sets the parquet RowFilter builder (ENG-40156 Phase 4 pushdown).
+    /// Callers pass a closure that decides — given the actual parquet schema
+    /// of the file being opened — whether to install a row filter.
+    pub fn with_row_filter_builder(mut self, b: RowFilterBuilder) -> Self {
+        self.row_filter_builder = Some(b);
+        self
+    }
+}
+
+// Manual Debug — RowFilterBuilder is a closure, not Debug. We elide it.
+impl std::fmt::Debug for ParquetReadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetReadOptions")
+            .field("batch_size", &self.batch_size)
+            .field("projection", &self.projection)
+            .field("nested_projection", &self.nested_projection)
+            .field(
+                "row_filter_builder",
+                &self.row_filter_builder.as_ref().map(|_| "<closure>"),
+            )
+            .finish()
     }
 }
 
@@ -406,9 +455,29 @@ impl Storage {
         relative_path: &str,
         projection_schema: &arrow_schema::SchemaRef,
     ) -> Result<RecordBatch> {
+        self.get_parquet_file_data_projected_with_options(
+            relative_path,
+            projection_schema,
+            None,
+        )
+        .await
+    }
+
+    /// ENG-40156 Phase 4 — like `get_parquet_file_data_projected` but
+    /// optionally installs a parquet `RowFilter` built by the caller's
+    /// closure. The caller is responsible for not pushing filters that
+    /// could be invalidated by log-file updates (use
+    /// `predicate::is_parquet_pushdown_safe` to gate).
+    pub async fn get_parquet_file_data_projected_with_options(
+        &self,
+        relative_path: &str,
+        projection_schema: &arrow_schema::SchemaRef,
+        row_filter_builder: Option<RowFilterBuilder>,
+    ) -> Result<RecordBatch> {
         let t0 = std::time::Instant::now();
         log::debug!(
-            "[ENG-40168 perf] get_parquet_file_data_projected START path='{relative_path}' top_cols={n}",
+            "[ENG-40168 perf] get_parquet_file_data_projected START path='{relative_path}' top_cols={n} row_filter={}",
+            row_filter_builder.is_some(),
             n = projection_schema.fields().len(),
         );
 
@@ -418,8 +487,11 @@ impl Storage {
         // unused subfields. Top-level-only narrowing still works because the
         // leaf walk picks every leaf below an unnarrowed top-level field.
         // ENG-40168 path B2.
-        let options =
+        let mut options =
             ParquetReadOptions::new().with_nested_projection(projection_schema.clone());
+        if let Some(b) = row_filter_builder {
+            options = options.with_row_filter_builder(b);
+        }
         let stream_open_start = std::time::Instant::now();
         let mut stream = self.get_parquet_file_stream(relative_path, options).await?;
         let stream_open_ms = stream_open_start.elapsed().as_millis();
@@ -631,6 +703,21 @@ impl Storage {
                 cols = all_cols.join(", "),
             );
             projected_schema = arrow_schema.clone();
+        }
+
+        // ── ENG-40156 Phase 4 — install row filter if the caller built one.
+        // Safety responsibility is on the caller: they invoke this only when
+        // the file group has no log files that could override base values
+        // (see `predicate::is_parquet_pushdown_safe`).
+        if let Some(ref build_filter) = effective_options.row_filter_builder {
+            if let Some(row_filter) = build_filter(builder.parquet_schema(), &projected_schema) {
+                log::info!(
+                    "[ENG-40156] installing parquet RowFilter for '{relative_path}' \
+                     ({} predicate(s))",
+                    row_filter.predicates.len()
+                );
+                builder = builder.with_row_filter(row_filter);
+            }
         }
 
         let stream = builder.build()?;
