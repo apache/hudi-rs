@@ -98,7 +98,7 @@ prost = { version = "0.14" }
 # Gluten ships in gluten-substrait/src/main/resources/substrait/proto/.
 # Substrait 0.60+ renamed these to `extension_urns` / `SimpleExtensionUrn`,
 # which would not decode bytes Gluten emits.
-substrait = { version = "=0.59" }
+substrait = { version = "=0.59", features = ["protoc"] }
 
 # compression
 flate2 = { version = "1" }
