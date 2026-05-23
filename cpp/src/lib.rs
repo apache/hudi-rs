@@ -528,21 +528,32 @@ impl HoodieFileGroupReader {
         let record_batch = match &self.pushed_filter {
             None => record_batch,
             Some(filter) => {
-                let filtered = predicate::filter_batch(&record_batch, filter)
-                    .map_err(|e| {
-                        format!(
-                            "[ENG-40156] post-merge filter failed: {e}; \
-                             columns={:?}",
+                // Graceful fallback: if the evaluator hits a shape it doesn't
+                // support (nested struct/list/map access, unusual column type,
+                // type mismatch, etc.), log a warning and return the batch
+                // unfiltered.  Velox's existing post-scan filter machinery
+                // (Option A) will still evaluate the full original predicate
+                // on the returned rows, so correctness is preserved — only the
+                // perf benefit of early filtering is lost for that shape.
+                match predicate::filter_batch(&record_batch, filter) {
+                    Ok(filtered) => {
+                        log::info!(
+                            "[ENG-40156] post-merge filter: {} -> {} rows (cols={:?})",
+                            pre_rows,
+                            filtered.num_rows(),
                             filter.columns()
-                        )
-                    })?;
-                log::info!(
-                    "[ENG-40156] post-merge filter: {} -> {} rows (cols={:?})",
-                    pre_rows,
-                    filtered.num_rows(),
-                    filter.columns()
-                );
-                filtered
+                        );
+                        filtered
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[ENG-40156] filter eval failed; falling back to \
+                             Velox post-scan filter: {e}; cols={:?}",
+                            filter.columns()
+                        );
+                        record_batch
+                    }
+                }
             }
         };
         let schema = record_batch.schema();
