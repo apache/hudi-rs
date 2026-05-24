@@ -95,3 +95,73 @@ impl CompressionCodec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    #[test]
+    fn test_from_id_maps_known_codec_ids() -> Result<()> {
+        assert_eq!(CompressionCodec::from_id(0)?, CompressionCodec::Lzo);
+        assert_eq!(CompressionCodec::from_id(1)?, CompressionCodec::Gzip);
+        assert_eq!(CompressionCodec::from_id(2)?, CompressionCodec::None);
+        assert_eq!(CompressionCodec::from_id(3)?, CompressionCodec::Snappy);
+        assert_eq!(CompressionCodec::from_id(4)?, CompressionCodec::Lz4);
+        assert_eq!(CompressionCodec::from_id(5)?, CompressionCodec::Bzip2);
+        assert_eq!(CompressionCodec::from_id(6)?, CompressionCodec::Zstd);
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_id_rejects_unknown_codec_id() {
+        let err = CompressionCodec::from_id(42).unwrap_err();
+        assert!(matches!(err, HFileError::UnsupportedCompression(42)));
+    }
+
+    #[test]
+    fn test_decompress_none_returns_input_bytes() -> Result<()> {
+        let input = b"uncompressed hfile block";
+        let output = CompressionCodec::None.decompress(input, input.len())?;
+        assert_eq!(output, input);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decompress_gzip_decodes_payload() -> Result<()> {
+        let input = b"gzip-compressed hfile block";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input)?;
+        let compressed = encoder.finish()?;
+
+        let output = CompressionCodec::Gzip.decompress(&compressed, input.len())?;
+        assert_eq!(output, input);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decompress_gzip_rejects_invalid_payload() {
+        let err = CompressionCodec::Gzip
+            .decompress(b"not gzip data", 0)
+            .unwrap_err();
+        assert!(matches!(err, HFileError::DecompressionError(message) if message.contains("GZIP")));
+    }
+
+    #[test]
+    fn test_decompress_unsupported_codecs_return_errors() {
+        for codec in [
+            CompressionCodec::Lzo,
+            CompressionCodec::Snappy,
+            CompressionCodec::Lz4,
+            CompressionCodec::Bzip2,
+            CompressionCodec::Zstd,
+        ] {
+            let err = codec.decompress(b"compressed", 0).unwrap_err();
+            assert!(
+                matches!(err, HFileError::DecompressionError(message) if message.contains("not yet supported"))
+            );
+        }
+    }
+}
