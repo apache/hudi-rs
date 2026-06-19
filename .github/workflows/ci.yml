@@ -59,7 +59,7 @@ jobs:
       image: xd009642/tarpaulin:0.32.7
       options: --security-opt seccomp=unconfined
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install system dependencies
         run: |
           apt-get update
@@ -86,7 +86,7 @@ jobs:
     # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
     if: false    
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run unit tests on Windows with no coverage report
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
 
@@ -106,7 +106,7 @@ jobs:
             python-version: '3.10'
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'
@@ -179,7 +179,7 @@ jobs:
           app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Pre-pull base images
@@ -216,7 +216,7 @@ jobs:
     needs: [ rust-tests, python-tests ]
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: cov-report-*
