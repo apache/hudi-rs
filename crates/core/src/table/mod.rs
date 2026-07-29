@@ -341,7 +341,7 @@ impl Table {
         TableCreateBuilder::new(base_uri)
     }
 
-    /// Append Arrow record batches as a new INSERT commit (append-only COW, unpartitioned).
+    /// Append Arrow record batches as a new INSERT commit (unpartitioned COW or MOR).
     ///
     /// Mirrors pyIceberg's `table.append(df)`. After a successful write the in-memory
     /// timeline and file-system view cache are refreshed so subsequent reads see new data.

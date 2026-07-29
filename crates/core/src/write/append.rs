@@ -54,10 +54,12 @@ pub struct AppendResult {
 
 static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
-/// Append one or more record batches as a single INSERT commit (append-only COW).
+/// Append one or more record batches as a single INSERT commit.
 pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
-    ensure_append_only(table)?;
-    ensure_copy_on_write(table)?;
+    if !table.is_mor() {
+        ensure_append_only(table)?;
+    }
+    ensure_supported_table_type(table)?;
     ensure_unpartitioned(table)?;
 
     if batches.is_empty() {
@@ -87,7 +89,12 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     } else {
         None
     };
-    let instant = Instant::new_completed(request_instant.clone(), Action::Commit, completion)?;
+    let action = if table.is_mor() {
+        Action::DeltaCommit
+    } else {
+        Action::Commit
+    };
+    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
     let timeline_dir = timeline_dir(table);
 
     let file_id = format!("append-{request_instant}");
@@ -156,6 +163,13 @@ pub(crate) fn ensure_copy_on_write(table: &Table) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn ensure_supported_table_type(table: &Table) -> Result<()> {
+    let table_type: String = table.hudi_configs.get(TableType)?.into();
+    match TableTypeValue::from_str(&table_type)? {
+        TableTypeValue::CopyOnWrite | TableTypeValue::MergeOnRead => Ok(()),
+    }
 }
 
 pub(crate) fn ensure_unpartitioned(table: &Table) -> Result<()> {

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use hudi_core::config::table::TableTypeValue;
 use hudi_core::error::CoreError;
 use hudi_core::index::HoodieKey;
 use hudi_core::table::partition::PartitionPruner;
@@ -85,6 +86,31 @@ fn ordered_batch(rows: Vec<(&str, i64, i64)>) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+fn rows_by_id(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+    let mut rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|index| (ids.value(index).to_string(), values.value(index)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
 }
 
 #[tokio::test]
@@ -186,13 +212,7 @@ async fn test_upsert_delete_and_overwrite() {
 
     let deleted = table.delete("id = 'b'").await.unwrap();
     assert_eq!(deleted.num_deletes, 1);
-    let deleted = table
-        .delete_keys([HoodieKey {
-            record_key: "a".to_string(),
-            partition_path: String::new(),
-        }])
-        .await
-        .unwrap();
+    let deleted = table.delete("id = 'a'").await.unwrap();
     assert_eq!(deleted.num_deletes, 1);
     let overwritten = table.overwrite([batch(vec![("z", 99)])]).await.unwrap();
     assert_eq!(overwritten.num_writes, 1);
@@ -288,6 +308,77 @@ async fn test_upsert_uses_event_time_ordering() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(values.value(0), 4);
+}
+
+#[tokio::test]
+async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
+    let dir = tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+
+    let append = table
+        .append([ordered_batch(vec![("a", 1, 1), ("b", 2, 1)])])
+        .await
+        .unwrap();
+    assert!(append.commit_relative_path.ends_with(".deltacommit"));
+    assert!(dir.path().join(&append.base_file_path).is_file());
+
+    let first_upsert = table
+        .upsert([ordered_batch(vec![("a", 10, 2), ("c", 3, 1)])])
+        .await
+        .unwrap();
+    assert_eq!(first_upsert.num_updates, 1);
+    assert_eq!(first_upsert.num_inserts, 1);
+    let second_upsert = table
+        .upsert([ordered_batch(vec![("a", 20, 3)])])
+        .await
+        .unwrap();
+    assert_eq!(second_upsert.num_updates, 1);
+
+    let snapshot = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(
+        rows_by_id(&snapshot),
+        vec![
+            ("a".to_string(), 20),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ]
+    );
+
+    let read_optimized = table
+        .read(&ReadOptions::new().with_hudi_option("hoodie.read.use.read_optimized.mode", "true"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_by_id(&read_optimized),
+        vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ]
+    );
+
+    let deleted = table
+        .delete_keys([HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: String::new(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    let snapshot = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(
+        rows_by_id(&snapshot),
+        vec![("b".to_string(), 2), ("c".to_string(), 3)]
+    );
 }
 
 #[tokio::test]

@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use apache_avro::to_avro_datum;
+use apache_avro::types::Value as AvroValue;
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -29,12 +31,16 @@ use crate::Result;
 use crate::config::table::HudiTableConfig::{OrderingFields, RecordKeyFields, RecordMergeStrategy};
 use crate::error::CoreError;
 use crate::expr::filter::{Filter, filters_to_row_mask, validate_fields_against_schemas};
+use crate::file_group::log_file::writer::LogFileWriter;
+use crate::file_group::log_file::{BlockMetadataKey, BlockType};
+use crate::file_group::reader::FileGroupReader;
 use crate::file_group::record_batches::RecordBatches;
 use crate::index::HoodieKey;
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::meta_field::MetaField;
+use crate::schema::delete::avro_schema_for_delete_record_list;
 use crate::table::{ReadOptions, Table};
 use crate::timeline::instant::{Action, Instant};
 use crate::write::append::{
@@ -70,6 +76,9 @@ pub async fn upsert_batches(
     batches: &[RecordBatch],
     options: UpsertOptions,
 ) -> Result<WriteResult> {
+    if table.is_mor() {
+        return mor_upsert_batches(table, batches, options).await;
+    }
     ensure_rewrite_supported(table)?;
     if batches.is_empty() {
         return Err(CoreError::Write(
@@ -126,6 +135,26 @@ pub async fn upsert_batches(
 }
 
 pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteResult> {
+    if table.is_mor() {
+        ensure_mor_merge_supported(table)?;
+        let (Some(old), _, _) = current_data(table).await? else {
+            return Ok(WriteResult::default());
+        };
+        validate_fields_against_schemas(&[filter.clone()], [old.schema().as_ref()])?;
+        let mask = filters_to_row_mask(&[filter], &old)?;
+        let key_name = record_key_name(table, &old)?;
+        let keys = keys(&old, &key_name)?;
+        let delete_keys = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, matches)| matches.unwrap_or(false))
+            .map(|(index, _)| HoodieKey {
+                record_key: keys[index].clone(),
+                partition_path: String::new(),
+            })
+            .collect::<Vec<_>>();
+        return mor_delete_keys(table, &delete_keys).await;
+    }
     ensure_rewrite_supported(table)?;
     let (Some(old), file_ids, old_paths) = current_data(table).await? else {
         return Ok(WriteResult::default());
@@ -148,6 +177,9 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
 }
 
 pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result<WriteResult> {
+    if table.is_mor() {
+        return mor_delete_keys(table, delete_keys).await;
+    }
     ensure_rewrite_supported(table)?;
     let (Some(old), file_ids, old_paths) = current_data(table).await? else {
         return Ok(WriteResult::default());
@@ -206,6 +238,24 @@ fn ensure_rewrite_supported(table: &Table) -> Result<()> {
     ensure_supported_merge_configs(table)
 }
 
+fn ensure_mor_merge_supported(table: &Table) -> Result<()> {
+    ensure_unpartitioned(table)?;
+    ensure_supported_merge_configs(table)?;
+    let strategy: String = table
+        .hudi_configs
+        .get_or_default(RecordMergeStrategy)
+        .into();
+    if RecordMergeStrategyValue::from_str(&strategy)?
+        != RecordMergeStrategyValue::OverwriteWithLatest
+    {
+        return Err(CoreError::Unsupported(
+            "MERGE_ON_READ upsert and delete require populated meta fields and an ordering field"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_supported_merge_configs(table: &Table) -> Result<()> {
     const UNSUPPORTED_CUSTOM_MERGE_OPTIONS: [&str; 4] = [
         "hoodie.compaction.payload.class",
@@ -219,9 +269,285 @@ fn ensure_supported_merge_configs(table: &Table) -> Result<()> {
         .find(|option| options.contains_key(**option))
     {
         return Err(CoreError::Unsupported(format!(
-            "COW rewrite does not support custom payload or record merger option '{option}'"
+            "writes do not support custom payload or record merger option '{option}'"
         )));
     }
+    Ok(())
+}
+
+struct MorFileLocation {
+    file_id: String,
+    base_file_path: String,
+    base_instant: String,
+}
+
+async fn mor_file_locations(table: &Table) -> Result<HashMap<String, MorFileLocation>> {
+    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let reader = FileGroupReader::new_with_overrides(
+        table.hudi_configs.clone(),
+        HashMap::new(),
+        table.storage_options.as_ref().clone(),
+    )?;
+    let mut locations = HashMap::new();
+    for slice in slices {
+        let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
+        let key_name = record_key_name(table, &batch)?;
+        for key in keys(&batch, &key_name)? {
+            locations.insert(
+                key,
+                MorFileLocation {
+                    file_id: slice.file_id().to_string(),
+                    base_file_path: slice.base_file_relative_path()?,
+                    base_instant: slice.base_file.commit_timestamp.clone(),
+                },
+            );
+        }
+    }
+    Ok(locations)
+}
+
+async fn mor_upsert_batches(
+    table: &mut Table,
+    batches: &[RecordBatch],
+    options: UpsertOptions,
+) -> Result<WriteResult> {
+    ensure_mor_merge_supported(table)?;
+    if options.update_columns.is_some() {
+        return Err(CoreError::Unsupported(
+            "partial updates are not yet supported for MERGE_ON_READ tables".to_string(),
+        ));
+    }
+    if batches.is_empty() {
+        return Err(CoreError::Write(
+            "upsert requires at least one RecordBatch".to_string(),
+        ));
+    }
+
+    let incoming = concat(batches)?;
+    let key_name = record_key_name(table, &incoming)?;
+    let incoming_keys = keys(&incoming, &key_name)?;
+    let locations = mor_file_locations(table).await?;
+    let instant = next_instant_timestamp();
+    let mut update_indices: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut insert_indices = Vec::new();
+    let mut updates = 0;
+    let mut inserts = 0;
+    for (index, key) in incoming_keys.iter().enumerate() {
+        if let Some(location) = locations.get(key) {
+            update_indices
+                .entry(location.file_id.clone())
+                .or_default()
+                .push(index as u32);
+            updates += 1;
+        } else {
+            insert_indices.push(index as u32);
+            inserts += 1;
+        }
+    }
+
+    let storage = table.file_system_view.storage.clone();
+    let mut stats = Vec::new();
+    if !insert_indices.is_empty() {
+        let file_id = format!("append-{instant}");
+        let base_file_path = format!("{file_id}_0-0-0_{instant}.parquet");
+        let insert_batch = take_batch(&incoming, &insert_indices)?;
+        let prepared =
+            prepare_batches_for_write(table, &[insert_batch], &instant, &base_file_path)?;
+        let bytes = write_parquet_bytes(&prepared)?;
+        let size = bytes.len() as i64;
+        storage.put_file(&base_file_path, bytes).await?;
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(base_file_path.clone()),
+            base_file: Some(base_file_path),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(inserts as i64),
+            num_inserts: Some(inserts as i64),
+            total_write_bytes: Some(size),
+            file_size_in_bytes: Some(size),
+            partition_path: Some(String::new()),
+            ..Default::default()
+        });
+    }
+
+    for (file_id, indices) in update_indices {
+        let location = locations
+            .get(
+                incoming_keys
+                    .get(indices[0] as usize)
+                    .ok_or_else(|| CoreError::Write("missing upsert key".to_string()))?,
+            )
+            .ok_or_else(|| CoreError::Write("missing file location for upsert key".to_string()))?;
+        let log_file = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let update_batch = take_batch(&incoming, &indices)?;
+        let prepared = prepare_batches_for_write(table, &[update_batch], &instant, &log_file)?;
+        let parquet = write_parquet_bytes(&prepared)?;
+        let content = LogFileWriter::write_log_block(
+            BlockType::ParquetData,
+            HashMap::from([(BlockMetadataKey::InstantTime, instant.clone())]),
+            &parquet,
+        );
+        let size = content.len() as i64;
+        storage.put_file(&log_file, content).await?;
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(log_file.clone()),
+            base_file: Some(location.base_file_path.clone()),
+            log_files: Some(vec![log_file]),
+            prev_commit: Some(location.base_instant.clone()),
+            num_writes: Some(indices.len() as i64),
+            num_update_writes: Some(indices.len() as i64),
+            total_write_bytes: Some(size),
+            file_size_in_bytes: Some(size),
+            total_log_records: Some(indices.len() as i64),
+            total_log_files: Some(1),
+            total_log_blocks: Some(1),
+            partition_path: Some(String::new()),
+            ..Default::default()
+        });
+    }
+    write_delta_commit(table, &instant, "UPSERT", stats).await?;
+    table.timeline.reload_completed_commits().await?;
+    table.file_system_view.clear_cache();
+    Ok(WriteResult {
+        instant,
+        num_writes: incoming.num_rows(),
+        num_updates: updates,
+        num_inserts: inserts,
+        num_deletes: 0,
+    })
+}
+
+async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result<WriteResult> {
+    ensure_mor_merge_supported(table)?;
+    let locations = mor_file_locations(table).await?;
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for key in delete_keys
+        .iter()
+        .filter(|key| key.partition_path.is_empty())
+    {
+        if let Some(location) = locations.get(&key.record_key) {
+            grouped
+                .entry(location.file_id.clone())
+                .or_default()
+                .push(key.record_key.clone());
+        }
+    }
+    if grouped.is_empty() {
+        return Ok(WriteResult::default());
+    }
+
+    let instant = next_instant_timestamp();
+    let storage = table.file_system_view.storage.clone();
+    let mut stats = Vec::new();
+    let mut deleted = 0;
+    for (file_id, keys) in grouped {
+        let location = locations
+            .get(
+                keys.first()
+                    .ok_or_else(|| CoreError::Write("missing delete key".to_string()))?,
+            )
+            .ok_or_else(|| CoreError::Write("missing file location for delete key".to_string()))?;
+        let log_file = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let content = delete_log_block(&instant, &keys)?;
+        let size = content.len() as i64;
+        storage.put_file(&log_file, content).await?;
+        deleted += keys.len();
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(log_file.clone()),
+            base_file: Some(location.base_file_path.clone()),
+            log_files: Some(vec![log_file]),
+            prev_commit: Some(location.base_instant.clone()),
+            num_writes: Some(keys.len() as i64),
+            num_deletes: Some(keys.len() as i64),
+            total_write_bytes: Some(size),
+            file_size_in_bytes: Some(size),
+            total_log_records: Some(keys.len() as i64),
+            total_log_files: Some(1),
+            total_log_blocks: Some(1),
+            partition_path: Some(String::new()),
+            ..Default::default()
+        });
+    }
+    write_delta_commit(table, &instant, "DELETE", stats).await?;
+    table.timeline.reload_completed_commits().await?;
+    table.file_system_view.clear_cache();
+    Ok(WriteResult {
+        instant,
+        num_writes: 0,
+        num_updates: 0,
+        num_inserts: 0,
+        num_deletes: deleted,
+    })
+}
+
+fn delete_log_block(instant: &str, keys: &[String]) -> Result<Vec<u8>> {
+    let records = keys
+        .iter()
+        .map(|key| {
+            AvroValue::Record(vec![
+                (
+                    "recordKey".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String(key.clone()))),
+                ),
+                (
+                    "partitionPath".to_string(),
+                    AvroValue::Union(1, Box::new(AvroValue::String(String::new()))),
+                ),
+                (
+                    "orderingVal".to_string(),
+                    AvroValue::Union(2, Box::new(AvroValue::Long(i64::MAX))),
+                ),
+            ])
+        })
+        .collect();
+    let payload = to_avro_datum(
+        avro_schema_for_delete_record_list()?,
+        AvroValue::Record(vec![(
+            "deleteRecordList".to_string(),
+            AvroValue::Array(records),
+        )]),
+    )?;
+    let mut content = Vec::with_capacity(8 + payload.len());
+    content.extend_from_slice(&3u32.to_be_bytes());
+    content.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    content.extend_from_slice(&payload);
+    Ok(LogFileWriter::write_log_block(
+        BlockType::Delete,
+        HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())]),
+        &content,
+    ))
+}
+
+async fn write_delta_commit(
+    table: &Table,
+    instant: &str,
+    operation: &str,
+    stats: Vec<HoodieWriteStat>,
+) -> Result<()> {
+    let metadata = HoodieCommitMetadata {
+        version: Some(1),
+        operation_type: Some(operation.to_string()),
+        partition_to_write_stats: Some(HashMap::from([(String::new(), stats)])),
+        partition_to_replace_file_ids: None,
+        compacted: Some(false),
+        extra_metadata: None,
+    };
+    let layout_two = is_layout_two(table);
+    let completed = layout_two.then(|| instant.to_string());
+    let commit = Instant::new_completed(instant.to_string(), Action::DeltaCommit, completed)?;
+    let path = commit.relative_path_with_base(&timeline_dir(table))?;
+    let bytes = if layout_two {
+        metadata.to_avro_bytes()?
+    } else {
+        metadata.to_json_bytes()?
+    };
+    table
+        .file_system_view
+        .storage
+        .put_file(&path, bytes)
+        .await?;
     Ok(())
 }
 
