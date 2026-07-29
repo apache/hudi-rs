@@ -530,7 +530,12 @@ async fn test_create_requires_table_name_and_upsert_requires_record_key() {
         .await
         .unwrap();
     let error = table.upsert([batch(vec![("a", 1)])]).await.unwrap_err();
-    assert!(error.to_string().contains("record key"));
+    assert!(
+        error.to_string().contains("record key")
+            || error.to_string().contains("recordkey.fields")
+            || error.to_string().contains("auto-generated keys"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -577,4 +582,207 @@ async fn test_upsert_rejects_schema_mismatch() {
     .unwrap();
     let error = table.upsert([mismatched]).await.unwrap_err();
     assert!(matches!(error, CoreError::Schema(_)));
+}
+
+fn set_value(value: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+}
+
+fn city_batch(rows: Vec<(&str, &str, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, city, _)| *city).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn set_fare(value: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+}
+
+#[tokio::test]
+async fn test_delete_by_non_key_column_scan() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1), ("b", 2), ("c", 2)])]).await.unwrap();
+
+    let deleted = table.delete("value = 2").await.unwrap();
+    assert_eq!(deleted.num_deletes, 2);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn test_delete_by_record_key_equality_routes_keyed_path() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1), ("b", 2)])]).await.unwrap();
+
+    let deleted = table.delete("id = 'b'").await.unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 1)]
+    );
+
+    // Meta record-key predicate also routes through keyed delete.
+    let deleted = table.delete("_hoodie_record_key = 'a'").await.unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    assert!(table.read(&ReadOptions::new()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_iceberg_style_update_by_non_key_filter() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([city_batch(vec![
+            ("a", "sf", 1),
+            ("b", "nyc", 2),
+            ("c", "sf", 3),
+        ])])
+        .await
+        .unwrap();
+
+    let result = table.update("city = 'sf'", set_fare(99)).await.unwrap();
+    assert_eq!(result.num_updates, 2);
+    let rows = rows_by_id(&table.read(&ReadOptions::new()).await.unwrap());
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), 99),
+            ("b".to_string(), 2),
+            ("c".to_string(), 99),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_update_zero_matches_is_noop() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+
+    let result = table.update("value = 999", set_value(0)).await.unwrap();
+    assert_eq!(result, hudi_core::WriteResult::default());
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn test_update_rejects_multi_row_set_batch() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+
+    let multi = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let error = table.update("id = 'a'", multi).await.unwrap_err();
+    assert!(
+        error.to_string().contains("single-row"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_mor_delete_by_non_key_column() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_batch(vec![("a", 1, 1), ("b", 2, 1), ("c", 3, 1)])])
+        .await
+        .unwrap();
+
+    let deleted = table.delete("value = 2").await.unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 1), ("c".to_string(), 3)]
+    );
+}
+
+#[tokio::test]
+async fn test_mor_update_by_filter() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_batch(vec![("a", 1, 1), ("b", 2, 1)])])
+        .await
+        .unwrap();
+
+    let result = table
+        .update("id = 'a'", set_value(10))
+        .await
+        .unwrap();
+    assert!(result.num_updates >= 1);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 10), ("b".to_string(), 2)]
+    );
 }

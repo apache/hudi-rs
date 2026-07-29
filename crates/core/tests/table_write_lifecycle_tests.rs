@@ -498,3 +498,367 @@ async fn test_cow_and_mor_mutable_ops_roundtrip_like_pyiceberg() {
         }
     }
 }
+
+fn partitioned_batch(rows: Vec<(&str, &str, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, city, _)| *city).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn partitioned_ordered_batch(rows: Vec<(&str, &str, i64, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, city, _, _)| *city).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, value, _)| *value).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, _, _, event_time)| *event_time)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_create_defaults_enable_mdt_and_record_index() {
+    let dir = tempdir().unwrap();
+    let table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    assert!(table.is_metadata_table_enabled());
+    assert!(hudi_core::index::is_record_index_enabled(&table));
+    assert!(
+        dir.path()
+            .join(".hoodie/metadata/record_index")
+            .is_dir()
+    );
+}
+
+#[tokio::test]
+async fn test_record_index_requires_metadata() {
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_metadata(false)
+        .with_record_index(true)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, hudi_core::error::CoreError::Write(_)));
+    assert!(err.to_string().contains("record index requires"));
+}
+
+#[tokio::test]
+async fn test_record_index_off_falls_back_to_simple_index() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_record_index(false)
+        .create()
+        .await
+        .unwrap();
+    assert!(table.is_metadata_table_enabled());
+    assert!(!hudi_core::index::is_record_index_enabled(&table));
+    assert!(
+        !dir.path()
+            .join(".hoodie/metadata/record_index")
+            .is_dir()
+    );
+
+    table
+        .append([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    table
+        .upsert([batch(vec![("a", 10), ("c", 3)])])
+        .await
+        .unwrap();
+    assert_snapshot_async(&table, vec![("a", 10), ("b", 2), ("c", 3)]).await;
+}
+
+#[tokio::test]
+async fn test_partitioned_cow_hive_style_keeps_partition_columns() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let base_uri = root.to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+
+    table
+        .append([partitioned_batch(vec![
+            ("a", "sf", 1),
+            ("b", "nyc", 2),
+        ])])
+        .await
+        .unwrap();
+    assert!(root.join("city=sf").is_dir());
+    assert!(root.join("city=nyc").is_dir());
+
+    table
+        .upsert([partitioned_batch(vec![
+            ("a", "sf", 10),
+            ("c", "sf", 3),
+        ])])
+        .await
+        .unwrap();
+    table
+        .delete_keys([HoodieKey {
+            record_key: "b".to_string(),
+            partition_path: "city=nyc".to_string(),
+        }])
+        .await
+        .unwrap();
+
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(
+        rows_by_id(&batches),
+        vec![("a".to_string(), 10), ("c".to_string(), 3)]
+    );
+    // Partition column retained in data files (not stripped).
+    let city = batches[0]
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(city.iter().flatten().any(|v| v == "sf"));
+
+    let index = hudi_core::index::RecordIndex;
+    use hudi_core::index::HoodieIndex;
+    let tagged = index
+        .tag_location(
+            &table,
+            &[HoodieKey {
+                record_key: "a".to_string(),
+                partition_path: "city=sf".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    let location = tagged
+        .values()
+        .next()
+        .and_then(|v| v.as_ref())
+        .expect("RLI should locate key a");
+    assert_eq!(location.partition_path, "city=sf");
+}
+
+#[tokio::test]
+async fn test_partitioned_mor_writes_logs_under_partition() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut table = Table::create(root.to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+
+    table
+        .append([partitioned_ordered_batch(vec![
+            ("a", "sf", 1, 1),
+            ("b", "nyc", 2, 1),
+        ])])
+        .await
+        .unwrap();
+
+    table
+        .upsert([partitioned_ordered_batch(vec![("a", "sf", 10, 2)])])
+        .await
+        .unwrap();
+
+    let logs = list_data_log_files(root);
+    assert_eq!(logs.len(), 1);
+    assert!(
+        logs[0].to_string_lossy().contains("city=sf"),
+        "MOR log should live under hive-style partition: {:?}",
+        logs[0]
+    );
+    assert_snapshot_async(&table, vec![("a", 10), ("b", 2)]).await;
+}
+
+
+#[tokio::test]
+async fn test_create_props_match_spark_shape() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let _table = Table::create(root.to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+
+    let props = std::fs::read_to_string(root.join(".hoodie/hoodie.properties")).unwrap();
+    for key in [
+        "hoodie.table.checksum=",
+        "hoodie.database.name=default",
+        "hoodie.table.base.file.format=PARQUET",
+        "hoodie.populate.meta.fields=true",
+        "hoodie.timeline.path=timeline",
+        "hoodie.timeline.history.path=history",
+        "hoodie.table.keygenerator.type=SIMPLE",
+        "hoodie.table.metadata.partitions=files,record_index",
+        "hoodie.table.version=8",
+        "hoodie.timeline.layout.version=2",
+        "hoodie.record.merge.mode=EVENT_TIME_ORDERING",
+    ] {
+        assert!(props.contains(key), "missing {key} in:\n{props}");
+    }
+    assert!(
+        !props.contains("hoodie.metadata.enable="),
+        "must not invent write-side hoodie.metadata.enable in table props:\n{props}"
+    );
+    assert!(
+        !props.contains("hoodie.metadata.record.index.enable="),
+        "must not invent write-side hoodie.metadata.record.index.enable in table props:\n{props}"
+    );
+    // Checksum must match Java CRC32("default.trips")
+    assert!(props.contains("hoodie.table.checksum=2200697520"), "{props}");
+
+    let mdt_props =
+        std::fs::read_to_string(root.join(".hoodie/metadata/.hoodie/hoodie.properties")).unwrap();
+    assert!(mdt_props.contains("hoodie.table.keygenerator.type=HOODIE_TABLE_METADATA"));
+    assert!(mdt_props.contains("hoodie.compaction.payload.class=org.apache.hudi.metadata.HoodieMetadataPayload"));
+    assert!(mdt_props.contains("hoodie.table.checksum=1249152950"));
+
+    let mdt_timeline = std::fs::read_dir(root.join(".hoodie/metadata/.hoodie/timeline"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    assert!(
+        mdt_timeline.iter().any(|n| n.ends_with(".deltacommit.requested")),
+        "{mdt_timeline:?}"
+    );
+    assert!(
+        mdt_timeline.iter().any(|n| n.ends_with(".deltacommit")),
+        "{mdt_timeline:?}"
+    );
+
+    // Optional dump for Spark side-by-side inspection.
+    if let Ok(out) = std::env::var("HUDI_RS_INTEROP_OUT") {
+        let dest = std::path::PathBuf::from(&out);
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        // Fresh append-only create (ordering fields force overwrite strategy which
+        // rejects append).
+        let mut table = Table::create(dest.to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([partitioned_ordered_batch(vec![
+                ("a", "sf", 1, 1),
+                ("b", "nyc", 2, 1),
+                ("c", "la", 3, 1),
+                ("d", "chi", 4, 1),
+                ("e", "sf", 5, 1),
+                ("f", "nyc", 6, 1),
+                ("g", "la", 7, 1),
+                ("h", "chi", 8, 1),
+                ("i", "sf", 9, 1),
+                ("j", "nyc", 10, 1),
+            ])])
+            .await
+            .unwrap();
+        eprintln!("wrote interop table to {}", dest.display());
+    }
+}
+
+#[tokio::test]
+async fn test_append_splits_files_by_max_file_size() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut table = Table::create(root.to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_option("hoodie.parquet.max.file.size", "1")
+        .with_option("hoodie.copyonwrite.record.size.estimate", "1")
+        .create()
+        .await
+        .unwrap();
+
+    // 6 rows in one partition → with max_records=1, expect 6 base files.
+    table
+        .append([partitioned_ordered_batch(vec![
+            ("k0", "sf", 0, 0),
+            ("k1", "sf", 1, 1),
+            ("k2", "sf", 2, 2),
+            ("k3", "sf", 3, 3),
+            ("k4", "sf", 4, 4),
+            ("k5", "sf", 5, 5),
+        ])])
+        .await
+        .unwrap();
+
+    let parquet_count = walkdir_count_parquet(root);
+    assert!(
+        parquet_count >= 6,
+        "expected file-size splitting to create >=6 files, got {parquet_count}"
+    );
+}
+
+fn walkdir_count_parquet(root: &std::path::Path) -> usize {
+    let mut n = 0;
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() && entry.file_name() != ".hoodie" {
+            n += walkdir_count_parquet(&path);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+            n += 1;
+        }
+    }
+    n
+}
