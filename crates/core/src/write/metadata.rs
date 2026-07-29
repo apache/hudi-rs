@@ -106,6 +106,12 @@ pub async fn bootstrap_metadata_table(
     )
     .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
     let files_base_size = hfile.len() as i64;
+    crate::write::ensure_partition_metadata(
+        data_table_storage,
+        &format!("{METADATA_BASE}/files"),
+        instant,
+    )
+    .await?;
     data_table_storage
         .put_file(
             &format!("{METADATA_BASE}/files/{files_base_name}"),
@@ -140,6 +146,12 @@ pub async fn bootstrap_metadata_table(
         )
         .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
         let rli_size = empty_rli.len() as i64;
+        crate::write::ensure_partition_metadata(
+            data_table_storage,
+            &format!("{METADATA_BASE}/record_index"),
+            instant,
+        )
+        .await?;
         data_table_storage
             .put_file(
                 &format!("{METADATA_BASE}/record_index/{rli_base_name}"),

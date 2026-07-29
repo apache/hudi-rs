@@ -575,6 +575,8 @@ async fn mor_upsert_batches(
         let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
         let insert_batch = take_batch(&incoming, &insert_indices)?;
         let base_file_path = relative_data_path(&partition_path, &file_name);
+        crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
+            .await?;
         let prepared =
             prepare_batches_for_write(table, &[insert_batch], &instant, &file_name)?;
         let bytes = write_parquet_bytes(&prepared)?;
@@ -619,6 +621,12 @@ async fn mor_upsert_batches(
             .ok_or_else(|| CoreError::Write("missing file location for upsert key".to_string()))?;
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
         let log_file = relative_data_path(&location.partition_path, &log_name);
+        crate::write::ensure_partition_metadata(
+            storage.as_ref(),
+            &location.partition_path,
+            &instant,
+        )
+        .await?;
         let base_basename = std::path::Path::new(&location.base_file_path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -754,6 +762,8 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             .ok_or_else(|| CoreError::Write("missing file location for delete key".to_string()))?;
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
         let log_file = relative_data_path(&partition_path, &log_name);
+        crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
+            .await?;
         let content = delete_log_block(&instant, &keys)?;
         let size = content.len() as i64;
         if let Err(error) = storage.put_file(&log_file, content).await {
@@ -1291,8 +1301,10 @@ async fn rewrite(
         for (partition_path, rows) in rows_by_partition {
             let partition_batch = take_batch(batch, &rows)?;
             let path = relative_data_path(&partition_path, file_name);
+            crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, instant)
+                .await?;
             let bytes = write_parquet_bytes(std::slice::from_ref(&partition_batch))?;
-        let size = bytes.len() as i64;
+            let size = bytes.len() as i64;
             storage.put_file(&path, bytes).await?;
             written_paths.push(path.clone());
             additions.push((partition_path.clone(), file_name.to_string(), size, false));
@@ -1300,18 +1312,18 @@ async fn rewrite(
                 .entry(partition_path.clone())
                 .or_default()
                 .push(HoodieWriteStat {
-            file_id: Some(format!("rewrite-{instant}")),
-            path: Some(path),
-            base_file: Some(file_name.to_string()),
-            prev_commit: Some("null".to_string()),
-            num_writes: Some(partition_batch.num_rows() as i64),
-            num_deletes: Some(deletes as i64),
-            num_update_writes: Some(updates as i64),
-            num_inserts: Some(inserts as i64),
-            total_write_bytes: Some(size),
-            file_size_in_bytes: Some(size),
-            partition_path: Some(partition_path),
-            ..Default::default()
+                    file_id: Some(format!("rewrite-{instant}")),
+                    path: Some(path),
+                    base_file: Some(file_name.to_string()),
+                    prev_commit: Some("null".to_string()),
+                    num_writes: Some(partition_batch.num_rows() as i64),
+                    num_deletes: Some(deletes as i64),
+                    num_update_writes: Some(updates as i64),
+                    num_inserts: Some(inserts as i64),
+                    total_write_bytes: Some(size),
+                    file_size_in_bytes: Some(size),
+                    partition_path: Some(partition_path),
+                    ..Default::default()
                 });
         }
     }

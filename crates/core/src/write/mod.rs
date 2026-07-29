@@ -30,3 +30,31 @@ pub use rewrite::{
     UpsertOptions, WriteResult, delete_filter, delete_keys, overwrite_batches, update_filter,
     upsert_batches,
 };
+
+use crate::Result;
+use crate::storage::Storage;
+use crate::table::partition::PARTITION_METAFIELD_PREFIX;
+
+/// Write `.hoodie_partition_metadata` if missing (required for Spark FS partition listing).
+pub(crate) async fn ensure_partition_metadata(
+    storage: &Storage,
+    partition_path: &str,
+    instant: &str,
+) -> Result<()> {
+    if partition_path.is_empty() {
+        return Ok(());
+    }
+    let meta_rel = format!("{partition_path}/{PARTITION_METAFIELD_PREFIX}");
+    if storage.exists(&meta_rel).await? {
+        return Ok(());
+    }
+    let depth = partition_path.matches('/').count() + 1;
+    // Java `Properties.store` format consumed by HoodiePartitionMetadata.
+    let body = format!(
+        "#partition metadata\n\
+         commitTime={instant}\n\
+         partitionDepth={depth}\n"
+    );
+    storage.put_file(&meta_rel, body.into_bytes()).await?;
+    Ok(())
+}

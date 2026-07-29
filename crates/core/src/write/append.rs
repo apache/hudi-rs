@@ -165,6 +165,12 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                 primary_base_path = base_file_path.clone();
             }
 
+            crate::write::ensure_partition_metadata(
+                storage.as_ref(),
+                &partition_path,
+                &request_instant,
+            )
+            .await?;
             let write_batches =
                 prepare_batches_for_write(table, &[chunk], &request_instant, &file_name)?;
             let file_bytes = write_parquet_bytes(&write_batches)?;

@@ -634,6 +634,14 @@ async fn test_partitioned_cow_hive_style_keeps_partition_columns() {
         .unwrap();
     assert!(root.join("city=sf").is_dir());
     assert!(root.join("city=nyc").is_dir());
+    assert!(
+        root.join("city=sf/.hoodie_partition_metadata").is_file(),
+        "Spark FS listing requires .hoodie_partition_metadata"
+    );
+    assert!(root.join("city=nyc/.hoodie_partition_metadata").is_file());
+    let meta = std::fs::read_to_string(root.join("city=sf/.hoodie_partition_metadata")).unwrap();
+    assert!(meta.contains("commitTime="));
+    assert!(meta.contains("partitionDepth=1"));
 
     table
         .upsert([partitioned_batch(vec![
