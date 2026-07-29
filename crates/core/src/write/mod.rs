@@ -27,5 +27,6 @@ mod rewrite;
 pub use append::{AppendResult, append_batches};
 pub use create::TableCreateBuilder;
 pub use rewrite::{
-    UpsertOptions, WriteResult, delete_filter, delete_keys, overwrite_batches, upsert_batches,
+    UpsertOptions, WriteResult, delete_filter, delete_keys, overwrite_batches, update_filter,
+    upsert_batches,
 };

@@ -382,25 +382,38 @@ impl Table {
         crate::write::overwrite_batches(self, &batches).await
     }
 
-    /// Delete rows matching a single binary filter such as `id = 'a'`.
+    /// Delete rows matching a single binary filter such as `id = 'a'` or `value = 2`.
     ///
-    /// Only unpartitioned tables are supported. A filter that matches no rows
-    /// succeeds without creating a commit and reports zero deletes.
+    /// Equality / `IN` predicates on the configured record key field or
+    /// `_hoodie_record_key` are routed through [`Self::delete_keys`] (RLI when enabled).
+    /// Other predicates scan the snapshot and rewrite (COW) or write delete logs (MOR).
+    /// A filter that matches no rows succeeds without creating a commit and reports zero deletes.
     pub async fn delete(&mut self, filter: &str) -> Result<WriteResult> {
         let filter = parse_write_filter(filter)?;
         crate::write::delete_filter(self, filter).await
     }
 
-    /// Delete records identified by record key in the unpartitioned table.
+    /// Delete records identified by record key.
     ///
-    /// The input must contain at least one key. Unknown keys succeed without
-    /// creating a commit and report zero deletes.
+    /// Uses the table index (RLI when enabled, otherwise SimpleIndex) to locate
+    /// affected file groups. The input must contain at least one key. Unknown keys
+    /// succeed without creating a commit and report zero deletes.
     pub async fn delete_keys(
         &mut self,
         keys: impl IntoIterator<Item = crate::index::HoodieKey>,
     ) -> Result<WriteResult> {
         let keys: Vec<crate::index::HoodieKey> = keys.into_iter().collect();
         crate::write::delete_keys(self, &keys).await
+    }
+
+    /// Iceberg-style UPDATE: set columns from a single-row batch on rows matching `filter`.
+    ///
+    /// `updates` must contain exactly one row. Every non-meta data column present in
+    /// `updates` is written onto matching target rows; other columns are preserved.
+    /// Predicates may target any column. Zero matches succeed without a commit.
+    pub async fn update(&mut self, filter: &str, updates: RecordBatch) -> Result<WriteResult> {
+        let filter = parse_write_filter(filter)?;
+        crate::write::update_filter(self, filter, updates).await
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -1265,7 +1278,7 @@ fn parse_write_filter(filter: &str) -> Result<Filter> {
         }
     }
     Err(CoreError::Write(format!(
-        "delete filter must be a single comparison such as `id = 'a'`, got '{filter}'"
+        "write filter must be a single comparison such as `id = 'a'`, got '{filter}'"
     )))
 }
 
