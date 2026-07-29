@@ -690,6 +690,26 @@ async fn mor_upsert_batches(
             ..Default::default()
         });
     }
+    if table.is_metadata_table_enabled() {
+        if !files_mdt.is_empty()
+            && let Err(error) =
+                update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await
+        {
+            for path in written_paths {
+                let _ = storage.delete_file(&path).await;
+            }
+            return Err(error);
+        }
+        if is_record_index_enabled(table)
+            && !rli_entries.is_empty()
+            && let Err(error) = update_record_index(storage.as_ref(), &instant, &rli_entries).await
+        {
+            for path in written_paths {
+                let _ = storage.delete_file(&path).await;
+            }
+            return Err(error);
+        }
+    }
     if let Err(error) = write_delta_commit(table, &instant, "UPSERT", stats).await {
         for path in written_paths {
             let _ = storage.delete_file(&path).await;
@@ -698,14 +718,6 @@ async fn mor_upsert_batches(
     }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
-    if table.is_metadata_table_enabled() {
-        if !files_mdt.is_empty() {
-            update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await?;
-        }
-        if is_record_index_enabled(table) && !rli_entries.is_empty() {
-            update_record_index(storage.as_ref(), &instant, &rli_entries).await?;
-        }
-    }
     Ok(WriteResult {
         instant,
         num_writes: incoming.num_rows(),
@@ -816,15 +828,15 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             ..Default::default()
         });
     }
-    if let Err(error) = write_delta_commit(table, &instant, "DELETE", stats).await {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
     if table.is_metadata_table_enabled() {
-        if !files_mdt.is_empty() {
-            update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await?;
+        if !files_mdt.is_empty()
+            && let Err(error) =
+                update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await
+        {
+            for path in written_paths {
+                let _ = storage.delete_file(&path).await;
+            }
+            return Err(error);
         }
         if is_record_index_enabled(table) {
             let entries = delete_keys
@@ -838,10 +850,21 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
                     is_deleted: true,
                 })
                 .collect::<Vec<_>>();
-            if !entries.is_empty() {
-                update_record_index(storage.as_ref(), &instant, &entries).await?;
+            if !entries.is_empty()
+                && let Err(error) = update_record_index(storage.as_ref(), &instant, &entries).await
+            {
+                for path in written_paths {
+                    let _ = storage.delete_file(&path).await;
+                }
+                return Err(error);
             }
         }
+    }
+    if let Err(error) = write_delta_commit(table, &instant, "DELETE", stats).await {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error);
     }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
@@ -1421,12 +1444,8 @@ async fn rewrite(
     } else {
         metadata.to_json_bytes()?
     };
-    if let Err(error) = storage.put_file(&path, bytes).await {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error.into());
-    }
+
+    // Crash-consistency: MDT before completed replacecommit (see append.rs).
     if table.is_metadata_table_enabled() {
         additions.extend(old_paths.into_iter().map(|path| {
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -1436,7 +1455,14 @@ async fn rewrite(
                 .unwrap_or_default();
             (partition, name, 0, true)
         }));
-        update_files_partition_entries(storage.as_ref(), instant, &additions).await?;
+        if let Err(error) =
+            update_files_partition_entries(storage.as_ref(), instant, &additions).await
+        {
+            for path in written_paths {
+                let _ = storage.delete_file(&path).await;
+            }
+            return Err(error);
+        }
         if is_record_index_enabled(table) {
             let entries = hoodie_keys_for_batch(table, batch, Some(instant))?
                 .into_iter()
@@ -1451,8 +1477,20 @@ async fn rewrite(
                     })
                 })
                 .collect::<Vec<_>>();
-            update_record_index(storage.as_ref(), instant, &entries).await?;
+            if let Err(error) = update_record_index(storage.as_ref(), instant, &entries).await {
+                for path in written_paths {
+                    let _ = storage.delete_file(&path).await;
+                }
+                return Err(error);
+            }
         }
+    }
+
+    if let Err(error) = storage.put_file(&path, bytes).await {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error.into());
     }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();

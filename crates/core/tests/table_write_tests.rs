@@ -157,6 +157,45 @@ async fn test_create_and_append_then_read() {
 }
 
 #[tokio::test]
+async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut table = Table::create(root.to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_metadata(true)
+        .create()
+        .await
+        .unwrap();
+
+    // Corrupt MDT so the post-data MDT update fails before the data commit is finalized.
+    let mdt = root.join(".hoodie/metadata");
+    std::fs::remove_dir_all(&mdt).unwrap();
+    std::fs::write(&mdt, b"not-a-directory").unwrap();
+
+    let err = table.append([sample_batch()]).await.unwrap_err();
+    assert!(
+        matches!(err, hudi_core::error::CoreError::Storage(_))
+            || err.to_string().to_lowercase().contains("metadata")
+            || err.to_string().to_lowercase().contains("not a directory")
+            || err.to_string().to_lowercase().contains("file"),
+        "expected MDT write failure, got {err}"
+    );
+
+    let timeline = root.join(".hoodie/timeline");
+    let completed: Vec<_> = std::fs::read_dir(&timeline)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".commit") && !n.contains(".requested") && !n.contains(".inflight"))
+        .collect();
+    assert!(
+        completed.is_empty(),
+        "failed MDT update must not leave a completed data commit: {completed:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_create_rejects_existing_table() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();

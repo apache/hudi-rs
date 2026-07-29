@@ -231,17 +231,33 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         commit_metadata.to_json_bytes()?
     };
 
+    // Crash-consistency order: data files → MDT → completed data commit.
+    // Finalizing the data timeline last avoids a completed commit whose MDT lags.
+    if table.is_metadata_table_enabled() {
+        if let Err(error) =
+            update_files_partition(storage.as_ref(), &request_instant, &files_mdt).await
+        {
+            for path in &written_paths {
+                let _ = storage.delete_file(path).await;
+            }
+            return Err(error);
+        }
+        if is_record_index_enabled(table)
+            && let Err(error) =
+                update_record_index(storage.as_ref(), &request_instant, &rli_entries).await
+        {
+            for path in &written_paths {
+                let _ = storage.delete_file(path).await;
+            }
+            return Err(error);
+        }
+    }
+
     if let Err(error) = storage.put_file(&commit_relative_path, commit_bytes).await {
         for path in &written_paths {
             let _ = storage.delete_file(path).await;
         }
         return Err(error.into());
-    }
-    if table.is_metadata_table_enabled() {
-        update_files_partition(storage.as_ref(), &request_instant, &files_mdt).await?;
-        if is_record_index_enabled(table) {
-            update_record_index(storage.as_ref(), &request_instant, &rli_entries).await?;
-        }
     }
 
     table.timeline.reload_completed_commits().await?;
