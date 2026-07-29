@@ -38,6 +38,7 @@ use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::table::Table;
 use crate::timeline::instant::{Action, Instant};
+use crate::write::metadata::update_files_partition;
 
 /// Result of an append write.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +109,14 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     if let Err(error) = storage.put_file(&commit_relative_path, commit_bytes).await {
         let _ = storage.delete_file(&base_file_path).await;
         return Err(error.into());
+    }
+    if table.is_metadata_table_enabled() {
+        update_files_partition(
+            storage.as_ref(),
+            &request_instant,
+            &[(String::new(), base_file_name.clone(), file_size)],
+        )
+        .await?;
     }
 
     table.timeline.reload_completed_commits().await?;

@@ -27,6 +27,7 @@ use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::table::Table;
+use crate::write::metadata::bootstrap_metadata_table;
 
 /// Builder for creating a new Hudi table on storage (pyIceberg-style create).
 ///
@@ -42,6 +43,7 @@ pub struct TableCreateBuilder {
     populates_meta_fields: bool,
     record_key_fields: Vec<String>,
     partition_fields: Vec<String>,
+    metadata_enabled: bool,
     options: HashMap<String, String>,
     storage_options: HashMap<String, String>,
 }
@@ -57,6 +59,7 @@ impl TableCreateBuilder {
             populates_meta_fields: false,
             record_key_fields: Vec::new(),
             partition_fields: Vec::new(),
+            metadata_enabled: false,
             options: HashMap::new(),
             storage_options: HashMap::new(),
         }
@@ -105,9 +108,18 @@ impl TableCreateBuilder {
         self
     }
 
+    /// Enable the internal metadata table with the `files` partition.
+    pub fn with_metadata(mut self, enabled: bool) -> Self {
+        self.metadata_enabled = enabled;
+        if enabled {
+            self.table_version = 8;
+            self.timeline_layout_version = 2;
+        }
+        self
+    }
+
     pub fn with_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
-        self.options
-            .insert(key.as_ref().to_string(), value.into());
+        self.options.insert(key.as_ref().to_string(), value.into());
         self
     }
 
@@ -139,7 +151,7 @@ impl TableCreateBuilder {
         let mut props: HashMap<String, String> = HashMap::new();
         props.insert(
             HudiTableConfig::TableName.as_ref().to_string(),
-            table_name,
+            table_name.clone(),
         );
         props.insert(
             HudiTableConfig::TableType.as_ref().to_string(),
@@ -161,6 +173,18 @@ impl TableCreateBuilder {
             HudiTableConfig::BaseFileFormat.as_ref().to_string(),
             "parquet".to_string(),
         );
+        if self.metadata_enabled {
+            props.insert(
+                HudiTableConfig::MetadataTableEnabled.as_ref().to_string(),
+                "true".to_string(),
+            );
+            props.insert(
+                HudiTableConfig::MetadataTablePartitions
+                    .as_ref()
+                    .to_string(),
+                "files".to_string(),
+            );
+        }
         if !self.record_key_fields.is_empty() {
             props.insert(
                 HudiTableConfig::RecordKeyFields.as_ref().to_string(),
@@ -204,7 +228,9 @@ impl TableCreateBuilder {
             let value = &props[&key];
             body.push_str(&format!("{key}={value}\n"));
         }
-        storage.put_file(&properties_path, body.into_bytes()).await?;
+        storage
+            .put_file(&properties_path, body.into_bytes())
+            .await?;
 
         // Ensure layout-v2 timeline directory exists (empty marker via properties is enough for v1).
         if self.timeline_layout_version == 2 {
@@ -214,6 +240,9 @@ impl TableCreateBuilder {
                 .unwrap_or_else(|| "timeline".to_string());
             let marker = format!("{HUDI_METADATA_DIR}/{timeline_path}/.keep");
             storage.put_file(&marker, b"".as_slice()).await?;
+        }
+        if self.metadata_enabled {
+            bootstrap_metadata_table(&storage, &table_name, "00000000000000000").await?;
         }
 
         Table::new_with_options(&self.base_uri, self.storage_options).await

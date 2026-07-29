@@ -22,6 +22,7 @@
 //! This module provides methods for interacting with Hudi's metadata table,
 //! which stores file listings and other metadata for efficient table operations.
 
+pub mod encode;
 pub mod records;
 
 pub(crate) mod reader;

@@ -20,6 +20,7 @@
 
 mod append;
 mod create;
+mod metadata;
 
 pub use append::{AppendResult, append_batches};
 pub use create::TableCreateBuilder;

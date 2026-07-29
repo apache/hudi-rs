@@ -23,6 +23,7 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use hudi_core::error::CoreError;
+use hudi_core::table::partition::PartitionPruner;
 use hudi_core::table::{ReadOptions, Table};
 use tempfile::tempdir;
 
@@ -88,6 +89,32 @@ async fn test_create_rejects_existing_table() {
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::Write(_)));
+}
+
+#[tokio::test]
+async fn test_create_with_metadata_and_append_updates_files_partition() {
+    let dir = tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_metadata(true)
+        .create()
+        .await
+        .unwrap();
+    let result = table.append([sample_batch()]).await.unwrap();
+    assert!(table.is_metadata_table_enabled());
+
+    let reopened = Table::new(base_uri).await.unwrap();
+    let partition_schema = reopened.get_partition_schema().await.unwrap();
+    let pruner =
+        PartitionPruner::new(&[], &partition_schema, reopened.hudi_configs.as_ref()).unwrap();
+    let records = reopened
+        .read_metadata_table_files_partition(&pruner)
+        .await
+        .unwrap();
+    let files = records.get("").unwrap();
+    assert!(files.has_active_file(&result.base_file_path));
 }
 
 #[tokio::test]
