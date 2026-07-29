@@ -20,7 +20,8 @@
 
 mod append;
 mod create;
-mod metadata;
+mod keygen;
+pub(crate) mod metadata;
 mod rewrite;
 
 pub use append::{AppendResult, append_batches};

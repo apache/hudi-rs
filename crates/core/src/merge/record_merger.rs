@@ -65,16 +65,8 @@ impl RecordMerger {
         }
 
         let precombine_field = hudi_configs.try_get(OrderingFields)?;
-        if precombine_field.is_none()
-            && merge_strategy == RecordMergeStrategyValue::OverwriteWithLatest
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "When {:?} is {:?}, {:?} must be set.",
-                RecordMergeStrategy,
-                RecordMergeStrategyValue::OverwriteWithLatest,
-                OrderingFields
-            )));
-        }
+        // Ordering/precombine is optional: absent → COMMIT_TIME_ORDERING in Java.
+        let _ = precombine_field;
 
         Ok(())
     }
@@ -100,9 +92,18 @@ impl RecordMerger {
                     return Ok(data_batch.clone());
                 }
 
-                // Use sorting fields to get sorted indices of the data batch (inserts and updates)
-                let ordering_fields: Vec<String> = self.hudi_configs.get(OrderingFields)?.into();
-                let ordering_field = &ordering_fields[0];
+                // Use sorting fields to get sorted indices of the data batch (inserts and updates).
+                // No precombine → COMMIT_TIME_ORDERING (order by _hoodie_commit_time).
+                let ordering_fields: Vec<String> = self
+                    .hudi_configs
+                    .try_get(OrderingFields)?
+                    .map(Into::into)
+                    .unwrap_or_default();
+                let commit_time_field = MetaField::CommitTime.as_ref().to_string();
+                let ordering_field = ordering_fields
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or(commit_time_field.as_str());
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
                 let ordering_array = data_batch.get_array(ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
