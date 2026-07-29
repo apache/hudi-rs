@@ -96,6 +96,7 @@ pub mod partition;
 mod validation;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
+pub use crate::index::{HoodieKey, SimpleIndex};
 pub use crate::write::AppendResult;
 pub use crate::write::TableCreateBuilder;
 pub use crate::write::{UpsertOptions, WriteResult};
@@ -354,6 +355,9 @@ impl Table {
     }
 
     /// Upsert complete records by their configured record key.
+    ///
+    /// Only unpartitioned tables are supported. When the same key occurs more
+    /// than once in an input batch, the final occurrence is retained.
     pub async fn upsert(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
@@ -381,12 +385,18 @@ impl Table {
     }
 
     /// Delete rows matching a single binary filter such as `id = 'a'`.
+    ///
+    /// Only unpartitioned tables are supported. A filter that matches no rows
+    /// succeeds without creating a commit and reports zero deletes.
     pub async fn delete(&mut self, filter: &str) -> Result<WriteResult> {
         let filter = parse_write_filter(filter)?;
         crate::write::delete_filter(self, filter).await
     }
 
     /// Delete records identified by record key in the unpartitioned table.
+    ///
+    /// The input must contain at least one key. Unknown keys succeed without
+    /// creating a commit and report zero deletes.
     pub async fn delete_keys(
         &mut self,
         keys: impl IntoIterator<Item = crate::index::HoodieKey>,

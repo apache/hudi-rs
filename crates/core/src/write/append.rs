@@ -176,7 +176,7 @@ pub(crate) fn ensure_unpartitioned(table: &Table) -> Result<()> {
     let partition_fields: Vec<String> = table.hudi_configs.get_or_default(PartitionFields).into();
     if !partition_fields.is_empty() {
         return Err(CoreError::Unsupported(
-            "append currently supports only unpartitioned tables".to_string(),
+            "writes currently support only unpartitioned tables".to_string(),
         ));
     }
     Ok(())

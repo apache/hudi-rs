@@ -33,9 +33,8 @@ use crate::error::CoreError;
 use crate::expr::filter::{Filter, filters_to_row_mask, validate_fields_against_schemas};
 use crate::file_group::log_file::writer::LogFileWriter;
 use crate::file_group::log_file::{BlockMetadataKey, BlockType};
-use crate::file_group::reader::FileGroupReader;
 use crate::file_group::record_batches::RecordBatches;
-use crate::index::HoodieKey;
+use crate::index::{HoodieIndex, HoodieKey, SimpleIndex};
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
@@ -90,6 +89,11 @@ pub async fn upsert_batches(
     let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
     let incoming = prepare_batches_for_write(table, batches, &instant, &file_name)?;
     let incoming = concat(&incoming)?;
+    if incoming.num_rows() == 0 {
+        return Err(CoreError::Write(
+            "upsert requires at least one row".to_string(),
+        ));
+    }
     let old = old.unwrap_or_else(|| RecordBatch::new_empty(incoming.schema()));
     if old.schema() != incoming.schema() {
         return Err(CoreError::Schema(
@@ -98,6 +102,7 @@ pub async fn upsert_batches(
     }
     let key_name = record_key_name(table, &old)?;
     let old_keys = keys(&old, &key_name)?;
+    let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
     let incoming_keys = keys(&incoming, &key_name)?;
     let mut old_by_key = HashMap::with_capacity(old.num_rows());
     for (index, key) in old_keys.iter().enumerate() {
@@ -167,6 +172,9 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
         .filter_map(|(index, matches)| (!matches.unwrap_or(false)).then_some(index as u32))
         .collect::<Vec<_>>();
     let deleted = old.num_rows() - selected.len();
+    if deleted == 0 {
+        return Ok(WriteResult::default());
+    }
     let remaining = take_batch(&old, &selected)?;
     let instant = next_instant_timestamp();
     let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
@@ -177,6 +185,11 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
 }
 
 pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result<WriteResult> {
+    if delete_keys.is_empty() {
+        return Err(CoreError::Write(
+            "delete requires at least one record key".to_string(),
+        ));
+    }
     if table.is_mor() {
         return mor_delete_keys(table, delete_keys).await;
     }
@@ -196,6 +209,9 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         .filter_map(|(index, key)| (!requested.contains(key.as_str())).then_some(index as u32))
         .collect::<Vec<_>>();
     let deleted = old.num_rows() - selected.len();
+    if deleted == 0 {
+        return Ok(WriteResult::default());
+    }
     let remaining = take_batch(&old, &selected)?;
     let instant = next_instant_timestamp();
     let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
@@ -217,6 +233,11 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
     let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
     let batches = prepare_batches_for_write(table, batches, &instant, &file_name)?;
     let replacement = concat(&batches)?;
+    if replacement.num_rows() == 0 {
+        return Err(CoreError::Write(
+            "overwrite requires at least one row".to_string(),
+        ));
+    }
     rewrite(
         table,
         &instant,
@@ -281,24 +302,39 @@ struct MorFileLocation {
     base_instant: String,
 }
 
-async fn mor_file_locations(table: &Table) -> Result<HashMap<String, MorFileLocation>> {
+async fn mor_file_locations(
+    table: &Table,
+    keys: &[HoodieKey],
+) -> Result<HashMap<String, MorFileLocation>> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let reader = FileGroupReader::new_with_overrides(
-        table.hudi_configs.clone(),
-        HashMap::new(),
-        table.storage_options.as_ref().clone(),
-    )?;
-    let mut locations = HashMap::new();
+    let mut slices_by_file_id = HashMap::with_capacity(slices.len());
     for slice in slices {
-        let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
-        let key_name = record_key_name(table, &batch)?;
-        for key in keys(&batch, &key_name)? {
+        slices_by_file_id.insert(
+            slice.file_id().to_string(),
+            (
+                slice.base_file_relative_path()?,
+                slice.base_file.commit_timestamp.clone(),
+            ),
+        );
+    }
+
+    let tagged = SimpleIndex.tag_location(table, keys).await?;
+    let mut locations = HashMap::with_capacity(tagged.len());
+    for (key, location) in tagged {
+        if let Some(location) = location {
+            let (base_file_path, base_instant) =
+                slices_by_file_id.get(&location.file_id).ok_or_else(|| {
+                    CoreError::Write(format!(
+                        "SimpleIndex returned missing file group '{}'",
+                        location.file_id
+                    ))
+                })?;
             locations.insert(
-                key,
+                key.record_key,
                 MorFileLocation {
-                    file_id: slice.file_id().to_string(),
-                    base_file_path: slice.base_file_relative_path()?,
-                    base_instant: slice.base_file.commit_timestamp.clone(),
+                    file_id: location.file_id,
+                    base_file_path: base_file_path.clone(),
+                    base_instant: base_instant.clone(),
                 },
             );
         }
@@ -324,9 +360,34 @@ async fn mor_upsert_batches(
     }
 
     let incoming = concat(batches)?;
+    if incoming.num_rows() == 0 {
+        return Err(CoreError::Write(
+            "upsert requires at least one row".to_string(),
+        ));
+    }
+    let schema_check_batches =
+        prepare_batches_for_write(table, &[incoming.clone()], "schema-check", "schema-check")?;
+    let existing_batches = table.read(&ReadOptions::new()).await?;
+    if !existing_batches.is_empty() {
+        let existing = concat(&existing_batches)?;
+        if existing.schema() != schema_check_batches[0].schema() {
+            return Err(CoreError::Schema(
+                "upsert batch schema does not match the current table schema".to_string(),
+            ));
+        }
+    }
     let key_name = record_key_name(table, &incoming)?;
+    let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
     let incoming_keys = keys(&incoming, &key_name)?;
-    let locations = mor_file_locations(table).await?;
+    let tagged_keys = incoming_keys
+        .iter()
+        .cloned()
+        .map(|record_key| HoodieKey {
+            record_key,
+            partition_path: String::new(),
+        })
+        .collect::<Vec<_>>();
+    let locations = mor_file_locations(table, &tagged_keys).await?;
     let instant = next_instant_timestamp();
     let mut update_indices: HashMap<String, Vec<u32>> = HashMap::new();
     let mut insert_indices = Vec::new();
@@ -347,6 +408,7 @@ async fn mor_upsert_batches(
 
     let storage = table.file_system_view.storage.clone();
     let mut stats = Vec::new();
+    let mut written_paths = Vec::<String>::new();
     if !insert_indices.is_empty() {
         let file_id = format!("append-{instant}");
         let base_file_path = format!("{file_id}_0-0-0_{instant}.parquet");
@@ -355,7 +417,10 @@ async fn mor_upsert_batches(
             prepare_batches_for_write(table, &[insert_batch], &instant, &base_file_path)?;
         let bytes = write_parquet_bytes(&prepared)?;
         let size = bytes.len() as i64;
-        storage.put_file(&base_file_path, bytes).await?;
+        if let Err(error) = storage.put_file(&base_file_path, bytes).await {
+            return Err(error.into());
+        }
+        written_paths.push(base_file_path.clone());
         stats.push(HoodieWriteStat {
             file_id: Some(file_id),
             path: Some(base_file_path.clone()),
@@ -388,7 +453,13 @@ async fn mor_upsert_batches(
             &parquet,
         );
         let size = content.len() as i64;
-        storage.put_file(&log_file, content).await?;
+        if let Err(error) = storage.put_file(&log_file, content).await {
+            for path in written_paths {
+                let _ = storage.delete_file(&path).await;
+            }
+            return Err(error.into());
+        }
+        written_paths.push(log_file.clone());
         stats.push(HoodieWriteStat {
             file_id: Some(file_id),
             path: Some(log_file.clone()),
@@ -406,7 +477,12 @@ async fn mor_upsert_batches(
             ..Default::default()
         });
     }
-    write_delta_commit(table, &instant, "UPSERT", stats).await?;
+    if let Err(error) = write_delta_commit(table, &instant, "UPSERT", stats).await {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error);
+    }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
@@ -420,13 +496,21 @@ async fn mor_upsert_batches(
 
 async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result<WriteResult> {
     ensure_mor_merge_supported(table)?;
-    let locations = mor_file_locations(table).await?;
+    if delete_keys.is_empty() {
+        return Err(CoreError::Write(
+            "delete requires at least one record key".to_string(),
+        ));
+    }
+    let locations = mor_file_locations(table, delete_keys).await?;
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for key in delete_keys
         .iter()
         .filter(|key| key.partition_path.is_empty())
     {
-        if let Some(location) = locations.get(&key.record_key) {
+        if seen.insert(&key.record_key)
+            && let Some(location) = locations.get(&key.record_key)
+        {
             grouped
                 .entry(location.file_id.clone())
                 .or_default()
@@ -440,6 +524,7 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     let instant = next_instant_timestamp();
     let storage = table.file_system_view.storage.clone();
     let mut stats = Vec::new();
+    let mut written_paths = Vec::<String>::new();
     let mut deleted = 0;
     for (file_id, keys) in grouped {
         let location = locations
@@ -451,7 +536,13 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         let log_file = format!(".{file_id}_{instant}.log.1_0-0-0");
         let content = delete_log_block(&instant, &keys)?;
         let size = content.len() as i64;
-        storage.put_file(&log_file, content).await?;
+        if let Err(error) = storage.put_file(&log_file, content).await {
+            for path in written_paths {
+                let _ = storage.delete_file(&path).await;
+            }
+            return Err(error.into());
+        }
+        written_paths.push(log_file.clone());
         deleted += keys.len();
         stats.push(HoodieWriteStat {
             file_id: Some(file_id),
@@ -470,7 +561,12 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             ..Default::default()
         });
     }
-    write_delta_commit(table, &instant, "DELETE", stats).await?;
+    if let Err(error) = write_delta_commit(table, &instant, "DELETE", stats).await {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error);
+    }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
@@ -632,7 +728,11 @@ fn record_key_name(table: &Table, batch: &RecordBatch) -> Result<String> {
     {
         return Ok(MetaField::RecordKey.as_ref().to_string());
     }
-    let fields: Vec<String> = table.hudi_configs.get(RecordKeyFields)?.into();
+    let fields: Vec<String> = table
+        .hudi_configs
+        .try_get(RecordKeyFields)?
+        .map(Into::into)
+        .unwrap_or_default();
     if fields.len() != 1 {
         return Err(CoreError::Unsupported(
             "upsert currently requires exactly one record key field".to_string(),
@@ -643,6 +743,17 @@ fn record_key_name(table: &Table, batch: &RecordBatch) -> Result<String> {
 
 fn keys(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
     string_values(batch, field)
+}
+
+/// Keep the final occurrence of each key, in original relative order.
+fn deduplicate_last_by_key(batch: &RecordBatch, field: &str) -> Result<RecordBatch> {
+    let mut last_indices = HashMap::with_capacity(batch.num_rows());
+    for (index, key) in keys(batch, field)?.into_iter().enumerate() {
+        last_indices.insert(key, index as u32);
+    }
+    let mut indices = last_indices.into_values().collect::<Vec<_>>();
+    indices.sort_unstable();
+    take_batch(batch, &indices)
 }
 
 fn string_values(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
@@ -770,7 +881,12 @@ async fn rewrite(
     } else {
         metadata.to_json_bytes()?
     };
-    storage.put_file(&path, bytes).await?;
+    if let Err(error) = storage.put_file(&path, bytes).await {
+        if batch.num_rows() > 0 {
+            let _ = storage.delete_file(file_name).await;
+        }
+        return Err(error.into());
+    }
     if table.is_metadata_table_enabled() {
         additions.extend(old_paths.into_iter().map(|path| {
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();

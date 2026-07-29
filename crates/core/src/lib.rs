@@ -65,4 +65,7 @@ pub mod timeline;
 pub mod util;
 pub mod write;
 
+pub use index::{HoodieKey, SimpleIndex};
+pub use write::{UpsertOptions, WriteResult};
+
 use error::Result;

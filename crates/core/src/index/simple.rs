@@ -47,7 +47,11 @@ impl HoodieIndex for SimpleIndex {
         if requested.is_empty() {
             return Ok(locations);
         }
-        let record_key_fields: Vec<String> = table.hudi_configs.get(RecordKeyFields)?.into();
+        let record_key_fields: Vec<String> = table
+            .hudi_configs
+            .try_get(RecordKeyFields)?
+            .map(Into::into)
+            .unwrap_or_default();
         if record_key_fields.len() != 1 {
             return Err(CoreError::Unsupported(
                 "SimpleIndex currently requires exactly one record key field".to_string(),

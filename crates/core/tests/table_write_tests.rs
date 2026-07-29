@@ -24,9 +24,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use hudi_core::config::table::TableTypeValue;
 use hudi_core::error::CoreError;
-use hudi_core::index::HoodieKey;
+use hudi_core::index::{HoodieIndex, HoodieKey, SimpleIndex};
 use hudi_core::table::partition::PartitionPruner;
-use hudi_core::table::{ReadOptions, Table, UpsertOptions};
+use hudi_core::table::{QueryType, ReadOptions, Table, UpsertOptions};
 use tempfile::tempdir;
 
 fn sample_batch() -> RecordBatch {
@@ -330,12 +330,28 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
         .unwrap();
     assert!(append.commit_relative_path.ends_with(".deltacommit"));
     assert!(dir.path().join(&append.base_file_path).is_file());
-
-    let first_upsert = table
-        .upsert([ordered_batch(vec![("a", 10, 2), ("c", 3, 1)])])
+    let incremental = table
+        .read(
+            &ReadOptions::new()
+                .with_query_type(QueryType::Incremental)
+                .with_start_timestamp("00000000000000000"),
+        )
         .await
         .unwrap();
-    assert_eq!(first_upsert.num_updates, 1);
+    assert_eq!(
+        rows_by_id(&incremental),
+        vec![("a".to_string(), 1), ("b".to_string(), 2)]
+    );
+    table
+        .append([ordered_batch(vec![("d", 4, 1)])])
+        .await
+        .unwrap();
+
+    let first_upsert = table
+        .upsert([ordered_batch(vec![("a", 10, 2), ("c", 3, 1), ("d", 40, 2)])])
+        .await
+        .unwrap();
+    assert_eq!(first_upsert.num_updates, 2);
     assert_eq!(first_upsert.num_inserts, 1);
     let second_upsert = table
         .upsert([ordered_batch(vec![("a", 20, 3)])])
@@ -350,6 +366,7 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
             ("a".to_string(), 20),
             ("b".to_string(), 2),
             ("c".to_string(), 3),
+            ("d".to_string(), 40),
         ]
     );
 
@@ -363,6 +380,7 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
             ("a".to_string(), 1),
             ("b".to_string(), 2),
             ("c".to_string(), 3),
+            ("d".to_string(), 4),
         ]
     );
 
@@ -377,7 +395,11 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
     let snapshot = table.read(&ReadOptions::new()).await.unwrap();
     assert_eq!(
         rows_by_id(&snapshot),
-        vec![("b".to_string(), 2), ("c".to_string(), 3)]
+        vec![
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("d".to_string(), 40),
+        ]
     );
 }
 
@@ -403,4 +425,156 @@ async fn test_upsert_rejects_custom_payload_or_merger() {
             .to_string()
             .contains("hoodie.datasource.write.payload.class")
     );
+}
+
+#[tokio::test]
+async fn test_write_operations_reject_empty_inputs() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+
+    for error in [
+        table.upsert(Vec::<RecordBatch>::new()).await.unwrap_err(),
+        table
+            .overwrite(Vec::<RecordBatch>::new())
+            .await
+            .unwrap_err(),
+        table
+            .delete_keys(Vec::<HoodieKey>::new())
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(error, CoreError::Write(_)));
+        assert!(error.to_string().contains("at least one"));
+    }
+}
+
+#[tokio::test]
+async fn test_upsert_deduplicates_keys_and_delete_missing_key_is_noop() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+
+    table.upsert([batch(vec![("a", 1)])]).await.unwrap();
+    let result = table
+        .upsert([batch(vec![("a", 2), ("a", 3), ("b", 4), ("b", 5)])])
+        .await
+        .unwrap();
+    assert_eq!(result.num_updates, 1);
+    assert_eq!(result.num_inserts, 1);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 3), ("b".to_string(), 5)]
+    );
+
+    let result = table
+        .delete_keys([HoodieKey {
+            record_key: "missing".to_string(),
+            partition_path: String::new(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(result.num_deletes, 0);
+    assert!(result.instant.is_empty());
+}
+
+#[tokio::test]
+async fn test_append_multiple_commits_then_upsert() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+    table.append([batch(vec![("b", 2)])]).await.unwrap();
+    let result = table
+        .upsert([batch(vec![("b", 20), ("c", 3)])])
+        .await
+        .unwrap();
+    assert_eq!(result.num_updates, 1);
+    assert_eq!(result.num_inserts, 1);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 20),
+            ("c".to_string(), 3),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_create_requires_table_name_and_upsert_requires_record_key() {
+    let dir = tempdir().unwrap();
+    let error = Table::create(dir.path().to_str().unwrap())
+        .create()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Write(_)));
+    assert!(error.to_string().contains("Table name is required"));
+
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .create()
+        .await
+        .unwrap();
+    let error = table.upsert([batch(vec![("a", 1)])]).await.unwrap_err();
+    assert!(error.to_string().contains("record key"));
+}
+
+#[tokio::test]
+async fn test_simple_index_tags_existing_and_missing_keys() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+
+    let keys = vec![
+        HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: String::new(),
+        },
+        HoodieKey {
+            record_key: "missing".to_string(),
+            partition_path: String::new(),
+        },
+    ];
+    let locations = SimpleIndex.tag_location(&table, &keys).await.unwrap();
+    assert!(locations[&keys[0]].is_some());
+    assert!(locations[&keys[1]].is_none());
+}
+
+#[tokio::test]
+async fn test_upsert_rejects_schema_mismatch() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.upsert([batch(vec![("a", 1)])]).await.unwrap();
+
+    let mismatched = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+        vec![Arc::new(StringArray::from(vec!["a"]))],
+    )
+    .unwrap();
+    let error = table.upsert([mismatched]).await.unwrap_err();
+    assert!(matches!(error, CoreError::Schema(_)));
 }
