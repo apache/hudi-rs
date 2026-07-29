@@ -137,6 +137,19 @@ async fn test_create_and_append_then_read() {
         "commit file should exist at {}",
         result.commit_relative_path
     );
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert!(
+        timeline
+            .join(format!("{}.commit.requested", result.instant))
+            .is_file(),
+        "data timeline should fence with .commit.requested"
+    );
+    assert!(
+        timeline
+            .join(format!("{}.inflight", result.instant))
+            .is_file(),
+        "data timeline should fence with .inflight"
+    );
 
     let batches = table.read(&ReadOptions::new()).await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

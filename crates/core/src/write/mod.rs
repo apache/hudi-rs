@@ -31,9 +31,13 @@ pub use rewrite::{
     upsert_batches,
 };
 
+use std::str::FromStr;
+
 use crate::Result;
+use crate::error::CoreError;
 use crate::storage::Storage;
 use crate::table::partition::PARTITION_METAFIELD_PREFIX;
+use crate::timeline::instant::{Action, Instant};
 
 /// Write `.hoodie_partition_metadata` if missing (required for Spark FS partition listing).
 pub(crate) async fn ensure_partition_metadata(
@@ -56,5 +60,47 @@ pub(crate) async fn ensure_partition_metadata(
          partitionDepth={depth}\n"
     );
     storage.put_file(&meta_rel, body.into_bytes()).await?;
+    Ok(())
+}
+
+/// Write `{ts}.{action}.requested` then inflight markers (Java ActiveTimeline fencing).
+///
+/// COW commit inflight uses `{ts}.inflight` (no action infix); other actions use
+/// `{ts}.{action}.inflight`.
+pub(crate) async fn fence_timeline_instant(
+    storage: &Storage,
+    timeline_dir: &str,
+    timestamp: &str,
+    action: Action,
+) -> Result<()> {
+    let requested = Instant::from_str(&format!(
+        "{}.{}.requested",
+        timestamp,
+        action.as_ref()
+    ))
+    .map_err(|e| CoreError::Write(format!("invalid fencing instant: {e}")))?;
+    let inflight = if action == Action::Commit {
+        Instant::from_str(&format!("{timestamp}.inflight"))
+    } else {
+        Instant::from_str(&format!(
+            "{}.{}.inflight",
+            timestamp,
+            action.as_ref()
+        ))
+    }
+    .map_err(|e| CoreError::Write(format!("invalid fencing instant: {e}")))?;
+
+    storage
+        .put_file(
+            &requested.relative_path_with_base(timeline_dir)?,
+            b"".as_slice(),
+        )
+        .await?;
+    storage
+        .put_file(
+            &inflight.relative_path_with_base(timeline_dir)?,
+            b"".as_slice(),
+        )
+        .await?;
     Ok(())
 }

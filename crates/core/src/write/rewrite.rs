@@ -879,6 +879,15 @@ async fn write_delta_commit(
     operation: &str,
     stats: Vec<HoodieWriteStat>,
 ) -> Result<()> {
+    let storage = table.file_system_view.storage.clone();
+    let timeline = timeline_dir(table);
+    crate::write::fence_timeline_instant(
+        storage.as_ref(),
+        &timeline,
+        instant,
+        Action::DeltaCommit,
+    )
+    .await?;
     let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
     for stat in stats {
         let partition = stat.partition_path.clone().unwrap_or_default();
@@ -894,17 +903,13 @@ async fn write_delta_commit(
     let layout_two = is_layout_two(table);
     let completed = layout_two.then(|| instant.to_string());
     let commit = Instant::new_completed(instant.to_string(), Action::DeltaCommit, completed)?;
-    let path = commit.relative_path_with_base(&timeline_dir(table))?;
+    let path = commit.relative_path_with_base(&timeline)?;
     let bytes = if layout_two {
         metadata.to_avro_bytes()?
     } else {
         metadata.to_json_bytes()?
     };
-    table
-        .file_system_view
-        .storage
-        .put_file(&path, bytes)
-        .await?;
+    storage.put_file(&path, bytes).await?;
     Ok(())
 }
 
@@ -1273,6 +1278,13 @@ async fn rewrite(
     deletes: usize,
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
+    crate::write::fence_timeline_instant(
+        storage.as_ref(),
+        &timeline_dir(table),
+        instant,
+        Action::ReplaceCommit,
+    )
+    .await?;
     let mut additions = Vec::new();
     let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
     let mut partition_to_replace_file_ids = HashMap::<String, Vec<String>>::new();

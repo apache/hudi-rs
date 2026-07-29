@@ -100,9 +100,16 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     } else {
         Action::Commit
     };
-    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
     let timeline_dir = timeline_dir(table);
     let storage = table.file_system_view.storage.clone();
+    crate::write::fence_timeline_instant(
+        storage.as_ref(),
+        &timeline_dir,
+        &request_instant,
+        action.clone(),
+    )
+    .await?;
+    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
 
     // Group rows across batches by partition path and write one base file per partition.
     let mut partition_rows: HashMap<String, Vec<(usize, usize)>> = HashMap::new();

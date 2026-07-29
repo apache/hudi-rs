@@ -32,7 +32,7 @@ use crate::metadata::table::encode::{
 };
 use crate::metadata::table::records::{FilesPartitionRecord, MetadataRecordType};
 use crate::storage::Storage;
-use crate::timeline::instant::Instant;
+use crate::timeline::instant::{Action, Instant};
 
 const METADATA_BASE: &str = ".hoodie/metadata";
 const FILES_FILE_ID: &str = "files-0000-0";
@@ -347,18 +347,7 @@ async fn write_metadata_commit(
     partition_to_write_stats: HashMap<String, Vec<HoodieWriteStat>>,
 ) -> Result<()> {
     let timeline = format!("{METADATA_BASE}/.hoodie/timeline");
-    storage
-        .put_file(
-            &format!("{timeline}/{instant}.deltacommit.requested"),
-            b"".as_slice(),
-        )
-        .await?;
-    storage
-        .put_file(
-            &format!("{timeline}/{instant}.deltacommit.inflight"),
-            b"".as_slice(),
-        )
-        .await?;
+    crate::write::fence_timeline_instant(storage, &timeline, instant, Action::DeltaCommit).await?;
     let metadata = HoodieCommitMetadata {
         version: Some(1),
         operation_type: Some("UPSERT".to_string()),
