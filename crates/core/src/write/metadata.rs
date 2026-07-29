@@ -24,6 +24,7 @@ use crate::Result;
 use crate::file_group::log_file::writer::LogFileWriter;
 use crate::file_group::log_file::{BlockMetadataKey, BlockType};
 use crate::hfile::HFileWriter;
+use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::table::encode::{
     FilesMetadataEntry, RecordIndexEntry, encode_all_partitions, encode_files_record,
     encode_record_index_entry, files_metadata_avro_schema_json,
@@ -86,6 +87,7 @@ pub async fn bootstrap_metadata_table(
     )?;
     let all_partitions =
         encode_all_partitions(vec![FilesPartitionRecord::NON_PARTITIONED_NAME.to_string()])?;
+    let files_base_name = format!("{FILES_FILE_ID}_0-0-0_{instant}.hfile");
     let hfile = HFileWriter::write(
         &[
             (
@@ -103,14 +105,32 @@ pub async fn bootstrap_metadata_table(
         )]),
     )
     .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+    let files_base_size = hfile.len() as i64;
     data_table_storage
         .put_file(
-            &format!("{METADATA_BASE}/files/{FILES_FILE_ID}_0-0-0_{instant}.hfile"),
+            &format!("{METADATA_BASE}/files/{files_base_name}"),
             hfile,
         )
         .await?;
 
+    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
+    mdt_stats.insert(
+        "files".to_string(),
+        vec![HoodieWriteStat {
+            file_id: Some(FILES_FILE_ID.to_string()),
+            path: Some(format!("files/{files_base_name}")),
+            base_file: Some(files_base_name),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(2),
+            total_write_bytes: Some(files_base_size),
+            file_size_in_bytes: Some(files_base_size),
+            partition_path: Some("files".to_string()),
+            ..Default::default()
+        }],
+    );
+
     if record_index_enabled {
+        let rli_base_name = format!("{RECORD_INDEX_FILE_ID}_0-0-0_{instant}.hfile");
         let empty_rli = HFileWriter::write(
             &[],
             BTreeMap::from([(
@@ -119,17 +139,30 @@ pub async fn bootstrap_metadata_table(
             )]),
         )
         .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+        let rli_size = empty_rli.len() as i64;
         data_table_storage
             .put_file(
-                &format!(
-                    "{METADATA_BASE}/record_index/{RECORD_INDEX_FILE_ID}_0-0-0_{instant}.hfile"
-                ),
+                &format!("{METADATA_BASE}/record_index/{rli_base_name}"),
                 empty_rli,
             )
             .await?;
+        mdt_stats.insert(
+            "record_index".to_string(),
+            vec![HoodieWriteStat {
+                file_id: Some(RECORD_INDEX_FILE_ID.to_string()),
+                path: Some(format!("record_index/{rli_base_name}")),
+                base_file: Some(rli_base_name),
+                prev_commit: Some("null".to_string()),
+                num_writes: Some(0),
+                total_write_bytes: Some(rli_size),
+                file_size_in_bytes: Some(rli_size),
+                partition_path: Some("record_index".to_string()),
+                ..Default::default()
+            }],
+        );
     }
 
-    write_metadata_commit(data_table_storage, instant).await
+    write_metadata_commit(data_table_storage, instant, mdt_stats).await
 }
 
 /// Append a files-partition HFile data block to the metadata table log file.
@@ -168,9 +201,34 @@ pub async fn update_files_partition_entries(
             });
     }
     let partitions = by_partition.keys().cloned().collect::<Vec<_>>();
+    // ALL_PARTITIONS merges are map-unions: mark the bootstrap "." partition deleted
+    // whenever real partitions appear, otherwise Spark keeps listing "" / "city=".
+    let mut all_partition_entries: Vec<FilesMetadataEntry> = partitions
+        .iter()
+        .map(|name| FilesMetadataEntry {
+            name: name.clone(),
+            size: 0,
+            is_deleted: false,
+        })
+        .collect();
+    if !partitions.is_empty()
+        && !partitions
+            .iter()
+            .any(|p| p == FilesPartitionRecord::NON_PARTITIONED_NAME)
+    {
+        all_partition_entries.push(FilesMetadataEntry {
+            name: FilesPartitionRecord::NON_PARTITIONED_NAME.to_string(),
+            size: 0,
+            is_deleted: true,
+        });
+    }
     let mut entries = vec![(
         FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
-        encode_all_partitions(partitions)?,
+        encode_files_record(
+            FilesPartitionRecord::ALL_PARTITIONS_KEY,
+            MetadataRecordType::AllPartitions,
+            all_partition_entries,
+        )?,
     )];
     for (partition, files) in by_partition {
         entries.push((
@@ -178,26 +236,42 @@ pub async fn update_files_partition_entries(
             encode_files_record(&partition, MetadataRecordType::Files, files)?,
         ));
     }
+    let schema_json = files_metadata_avro_schema_json().to_string();
     let hfile = HFileWriter::write(
         &entries,
-        BTreeMap::from([(
-            "schema".to_string(),
-            files_metadata_avro_schema_json().as_bytes().to_vec(),
-        )]),
+        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
     )
     .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+    // Java HFile data blocks embed SCHEMA (ordinal 2) alongside INSTANT_TIME.
     let block = LogFileWriter::write_log_block(
         BlockType::HfileData,
-        HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())]),
+        HashMap::from([
+            (BlockMetadataKey::InstantTime, instant.to_string()),
+            (BlockMetadataKey::Schema, schema_json),
+        ]),
         &hfile,
     );
+    let log_name = format!(".{FILES_FILE_ID}_{instant}.log.1_0-0-0");
+    let log_rel = format!("files/{log_name}");
+    let log_size = block.len() as i64;
     data_storage
-        .put_file(
-            &format!("{METADATA_BASE}/files/.{FILES_FILE_ID}_{instant}.log.1_0-0-0"),
-            block,
-        )
+        .put_file(&format!("{METADATA_BASE}/{log_rel}"), block)
         .await?;
-    write_metadata_commit(data_storage, instant).await
+    let stats = HashMap::from([(
+        "files".to_string(),
+        vec![HoodieWriteStat {
+            file_id: Some(FILES_FILE_ID.to_string()),
+            path: Some(log_rel),
+            log_files: Some(vec![log_name]),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(entries.len() as i64),
+            total_write_bytes: Some(log_size),
+            file_size_in_bytes: Some(log_size),
+            partition_path: Some("files".to_string()),
+            ..Default::default()
+        }],
+    )]);
+    write_metadata_commit(data_storage, instant, stats).await
 }
 
 /// Append record-index put/delete entries as an HFile data log block.
@@ -209,6 +283,7 @@ pub async fn update_record_index(
     if entries.is_empty() {
         return Ok(());
     }
+    let schema_json = record_index_metadata_avro_schema_json().to_string();
     let mut pairs = Vec::with_capacity(entries.len());
     for entry in entries {
         let bytes = encode_record_index_entry(entry)?;
@@ -216,48 +291,74 @@ pub async fn update_record_index(
     }
     let hfile = HFileWriter::write(
         &pairs,
-        BTreeMap::from([(
-            "schema".to_string(),
-            record_index_metadata_avro_schema_json().as_bytes().to_vec(),
-        )]),
+        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
     )
     .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
     let block = LogFileWriter::write_log_block(
         BlockType::HfileData,
-        HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())]),
+        HashMap::from([
+            (BlockMetadataKey::InstantTime, instant.to_string()),
+            (BlockMetadataKey::Schema, schema_json),
+        ]),
         &hfile,
     );
+    let log_name = format!(".{RECORD_INDEX_FILE_ID}_{instant}.log.1_0-0-0");
+    let log_rel = format!("record_index/{log_name}");
+    let log_size = block.len() as i64;
     data_storage
-        .put_file(
-            &format!(
-                "{METADATA_BASE}/record_index/.{RECORD_INDEX_FILE_ID}_{instant}.log.1_0-0-0"
-            ),
-            block,
-        )
+        .put_file(&format!("{METADATA_BASE}/{log_rel}"), block)
         .await?;
-    write_metadata_commit(data_storage, instant).await
+    let stats = HashMap::from([(
+        "record_index".to_string(),
+        vec![HoodieWriteStat {
+            file_id: Some(RECORD_INDEX_FILE_ID.to_string()),
+            path: Some(log_rel),
+            log_files: Some(vec![log_name]),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(entries.len() as i64),
+            total_write_bytes: Some(log_size),
+            file_size_in_bytes: Some(log_size),
+            partition_path: Some("record_index".to_string()),
+            ..Default::default()
+        }],
+    )]);
+    write_metadata_commit(data_storage, instant, stats).await
 }
 
 /// Write MDT timeline fencing markers then a completed deltacommit (Java MOR MDT).
-async fn write_metadata_commit(storage: &Storage, instant: &str) -> Result<()> {
+///
+/// Completed deltacommit bytes must be valid Avro `HoodieCommitMetadata` — Spark skips
+/// instants whose metadata does not parse, which drops MDT log files from the file slice.
+async fn write_metadata_commit(
+    storage: &Storage,
+    instant: &str,
+    partition_to_write_stats: HashMap<String, Vec<HoodieWriteStat>>,
+) -> Result<()> {
     let timeline = format!("{METADATA_BASE}/.hoodie/timeline");
     storage
         .put_file(
             &format!("{timeline}/{instant}.deltacommit.requested"),
-            b"{}".as_slice(),
+            b"".as_slice(),
         )
         .await?;
     storage
         .put_file(
             &format!("{timeline}/{instant}.deltacommit.inflight"),
-            b"{}".as_slice(),
+            b"".as_slice(),
         )
         .await?;
-    // Completion time equals requested for v1; Spark uses a later completion timestamp.
+    let metadata = HoodieCommitMetadata {
+        version: Some(1),
+        operation_type: Some("UPSERT".to_string()),
+        partition_to_write_stats: Some(partition_to_write_stats),
+        compacted: Some(false),
+        extra_metadata: Some(HashMap::new()),
+    };
+    // Completion time equals requested for now; Spark often uses a later completion ts.
     storage
         .put_file(
             &format!("{timeline}/{instant}_{instant}.deltacommit"),
-            b"{}".as_slice(),
+            metadata.to_avro_bytes()?,
         )
         .await?;
     Ok(())

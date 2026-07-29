@@ -38,6 +38,10 @@ impl LogFileWriter {
 }
 
 /// Encode one V1 log block with raw content and an empty footer.
+///
+/// Layout matches Java `HoodieLogFormatWriter`:
+/// - header `block_length` includes the trailing size long (`getLogBlockLength`)
+/// - footer size long equals `block_length + MAGIC.len()` (reader subtracts magic)
 pub fn write_log_block(
     block_type: BlockType,
     header: HashMap<BlockMetadataKey, String>,
@@ -51,12 +55,14 @@ pub fn write_log_block(
     payload.extend_from_slice(content);
     payload.extend_from_slice(&0u32.to_be_bytes());
 
-    let block_length = payload.len() as u64;
+    // Java includes the trailing size long in the header length.
+    let block_length = (payload.len() + 8) as u64;
+    let footer_length = block_length + MAGIC.len() as u64;
     let mut output = Vec::with_capacity(MAGIC.len() + 8 + payload.len() + 8);
     output.extend_from_slice(&MAGIC);
     output.extend_from_slice(&block_length.to_be_bytes());
     output.extend_from_slice(&payload);
-    output.extend_from_slice(&block_length.to_be_bytes());
+    output.extend_from_slice(&footer_length.to_be_bytes());
     output
 }
 

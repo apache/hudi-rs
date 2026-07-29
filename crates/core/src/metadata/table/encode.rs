@@ -31,8 +31,12 @@ use crate::error::CoreError;
 use crate::metadata::table::records::{FilesPartitionRecord, MetadataRecordType};
 use crate::schema::avsc::{hoodie_metadata_schema, strip_avro_line_comments};
 
-/// JSON text of the vendored Java metadata schema (comments stripped).
-/// Embedded into HFile file-info under key `schema`, matching Java writers.
+/// JSON text of the metadata schema embedded into HFile file-info under key `schema`.
+///
+/// Matches Java `HoodieMetadataRecord.SCHEMA$`: string fields and map key types carry
+/// `"avro.java.string":"String"` so Spark's `GenericDatumReader` materializes
+/// `java.lang.String` instead of `Utf8` (required by `constructFilesMetadataPayload`
+/// and `fetchBaseFileRecordsByKeys`).
 pub fn hoodie_metadata_schema_json() -> &'static str {
     static JSON: OnceLock<String> = OnceLock::new();
     JSON.get_or_init(|| {
@@ -41,12 +45,58 @@ pub fn hoodie_metadata_schema_json() -> &'static str {
             "/schemas/HoodieMetadata.avsc"
         ));
         let cleaned = strip_avro_line_comments(raw);
-        cleaned
+        let json = cleaned
             .find('{')
             .map(|i| cleaned[i..].trim().to_string())
-            .unwrap_or(cleaned)
+            .unwrap_or(cleaned);
+        inject_avro_java_string_props(&json)
     })
     .as_str()
+}
+
+/// Annotate Avro JSON so Java readers decode strings as `java.lang.String`.
+fn inject_avro_java_string_props(schema_json: &str) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(schema_json).expect("HoodieMetadata.avsc must be valid JSON");
+    inject_avro_java_string_props_value(&mut value);
+    serde_json::to_string(&value).expect("serialize annotated metadata schema")
+}
+
+fn inject_avro_java_string_props_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            match map.get("type").cloned() {
+                Some(serde_json::Value::String(t)) if t == "string" => {
+                    // Avoid re-expanding `{"type":"string","avro.java.string":"String"}`.
+                    if !map.contains_key("avro.java.string") {
+                        map.insert(
+                            "type".to_string(),
+                            serde_json::json!({"type": "string", "avro.java.string": "String"}),
+                        );
+                    }
+                }
+                Some(serde_json::Value::String(t)) if t == "map" => {
+                    map.entry("avro.java.string".to_string()).or_insert_with(|| {
+                        serde_json::Value::String("String".to_string())
+                    });
+                }
+                _ => {}
+            }
+            for child in map.values_mut() {
+                inject_avro_java_string_props_value(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if item.as_str() == Some("string") {
+                    *item = serde_json::json!({"type": "string", "avro.java.string": "String"});
+                } else {
+                    inject_avro_java_string_props_value(item);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Alias kept for call sites that embed the files-partition schema into HFiles.
@@ -104,11 +154,19 @@ pub fn encode_all_partitions(partitions: impl IntoIterator<Item = String>) -> Re
 }
 
 /// Encode a files-partition metadata record.
+///
+/// `key` is the HFile row key and is intentionally **not** written into the Avro
+/// payload. Java's `HoodieAvroHFileWriter` clears the Avro `key` field to `""` and
+/// stores the real key only in the HFile key; on read,
+/// `HoodieAvroHFileReaderImplBase.deserialize` reinjects a Java `String` from the
+/// HFile key. Embedding a non-empty Avro key makes GenericDatumReader produce
+/// `Utf8`, and Spark then `ClassCastException`s in `fetchBaseFileRecordsByKeys`.
 pub fn encode_files_record(
     key: &str,
     record_type: MetadataRecordType,
     entries: impl IntoIterator<Item = FilesMetadataEntry>,
 ) -> Result<Vec<u8>> {
+    let _hfile_row_key = key;
     let mut filesystem_metadata = HashMap::new();
     for entry in entries {
         filesystem_metadata.insert(
@@ -120,7 +178,7 @@ pub fn encode_files_record(
         );
     }
     let value = Value::Record(vec![
-        ("key".to_string(), Value::String(key.to_string())),
+        ("key".to_string(), Value::String(String::new())),
         ("type".to_string(), Value::Int(record_type as i32)),
         (
             "filesystemMetadata".to_string(),
@@ -184,8 +242,9 @@ pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
             ])),
         )
     };
+    // Empty Avro key — real key lives only on the HFile key (see encode_files_record).
     let value = Value::Record(vec![
-        ("key".to_string(), Value::String(entry.record_key.clone())),
+        ("key".to_string(), Value::String(String::new())),
         (
             "type".to_string(),
             Value::Int(MetadataRecordType::RecordIndex as i32),
@@ -322,4 +381,67 @@ pub fn encode_partition_stats(_metadata: PartitionStatsMetadata) -> Result<Vec<u
     Err(CoreError::Unsupported(
         "partition_stats metadata writes are not implemented".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn avro_key_field(bytes: &[u8]) -> String {
+        let value = apache_avro::from_avro_datum(metadata_schema().unwrap(), &mut &bytes[..], None)
+            .unwrap();
+        let Value::Record(fields) = value else {
+            panic!("expected record");
+        };
+        for (name, field) in fields {
+            if name == "key" {
+                return match field {
+                    Value::String(s) => s,
+                    other => panic!("unexpected key value: {other:?}"),
+                };
+            }
+        }
+        panic!("missing key field");
+    }
+
+    #[test]
+    fn embedded_metadata_schema_has_java_string_props() {
+        let json = hoodie_metadata_schema_json();
+        assert!(
+            json.contains("avro.java.string"),
+            "HFile-embedded schema must request Java String decoding"
+        );
+        assert!(
+            json.contains("\"type\":\"map\"") && json.contains("avro.java.string"),
+            "map types need java.string for map-key typing: {json}"
+        );
+    }
+
+    #[test]
+    fn encode_files_record_clears_avro_key_for_hfile_interop() {
+        let bytes = encode_files_record(
+            "city=sf",
+            MetadataRecordType::Files,
+            [FilesMetadataEntry {
+                name: "f.parquet".to_string(),
+                size: 10,
+                is_deleted: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(avro_key_field(&bytes), "");
+    }
+
+    #[test]
+    fn encode_record_index_clears_avro_key_for_hfile_interop() {
+        let bytes = encode_record_index_entry(&RecordIndexEntry {
+            record_key: "id-1".to_string(),
+            partition_path: String::new(),
+            file_id: "fg-0".to_string(),
+            instant_time_millis: 1,
+            is_deleted: false,
+        })
+        .unwrap();
+        assert_eq!(avro_key_field(&bytes), "");
+    }
 }
