@@ -18,6 +18,7 @@
  */
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::compute::concat_batches;
@@ -25,10 +26,13 @@ use arrow::record_batch::RecordBatch;
 use arrow_select::take::take;
 
 use crate::Result;
-use crate::config::table::HudiTableConfig::RecordKeyFields;
+use crate::config::table::HudiTableConfig::{OrderingFields, RecordKeyFields, RecordMergeStrategy};
 use crate::error::CoreError;
 use crate::expr::filter::{Filter, filters_to_row_mask, validate_fields_against_schemas};
+use crate::file_group::record_batches::RecordBatches;
 use crate::index::HoodieKey;
+use crate::merge::RecordMergeStrategyValue;
+use crate::merge::record_merger::RecordMerger;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::meta_field::MetaField;
 use crate::table::{ReadOptions, Table};
@@ -104,15 +108,14 @@ pub async fn upsert_batches(
     let mut selected = final_indices.into_values().collect::<Vec<_>>();
     selected.sort_unstable();
     let combined = concat_batches(&old.schema(), [&old, &incoming])?;
+    let event_time_merge = uses_event_time_merge(table)?;
+    let selected = if event_time_merge {
+        merge_with_event_time(table, &old, &incoming, &combined)?
+    } else {
+        selected
+    };
     let merged = if let Some(columns) = options.update_columns {
-        partial_merge(
-            &old,
-            &incoming,
-            &old_by_key,
-            &incoming_keys,
-            &selected,
-            &columns,
-        )?
+        partial_merge(&combined, &old_by_key, &selected, &columns)?
     } else {
         take_batch(&combined, &selected)?
     };
@@ -199,7 +202,74 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
 
 fn ensure_rewrite_supported(table: &Table) -> Result<()> {
     ensure_copy_on_write(table)?;
-    ensure_unpartitioned(table)
+    ensure_unpartitioned(table)?;
+    ensure_supported_merge_configs(table)
+}
+
+fn ensure_supported_merge_configs(table: &Table) -> Result<()> {
+    const UNSUPPORTED_CUSTOM_MERGE_OPTIONS: [&str; 4] = [
+        "hoodie.compaction.payload.class",
+        "hoodie.datasource.write.payload.class",
+        "hoodie.payload.class",
+        "hoodie.record.merger.impls",
+    ];
+    let options = table.hudi_configs.as_options();
+    if let Some(option) = UNSUPPORTED_CUSTOM_MERGE_OPTIONS
+        .iter()
+        .find(|option| options.contains_key(**option))
+    {
+        return Err(CoreError::Unsupported(format!(
+            "COW rewrite does not support custom payload or record merger option '{option}'"
+        )));
+    }
+    Ok(())
+}
+
+fn uses_event_time_merge(table: &Table) -> Result<bool> {
+    let strategy: String = table
+        .hudi_configs
+        .get_or_default(RecordMergeStrategy)
+        .into();
+    let strategy = RecordMergeStrategyValue::from_str(&strategy)?;
+    Ok(strategy == RecordMergeStrategyValue::OverwriteWithLatest
+        && table.hudi_configs.try_get(OrderingFields)?.is_some())
+}
+
+fn merge_with_event_time(
+    table: &Table,
+    old: &RecordBatch,
+    incoming: &RecordBatch,
+    combined: &RecordBatch,
+) -> Result<Vec<u32>> {
+    let merger = RecordMerger::new(old.schema(), table.hudi_configs.clone());
+    let merged = merger.merge_record_batches(RecordBatches::new_with_data_batches([
+        old.clone(),
+        incoming.clone(),
+    ]))?;
+    selected_indices_for_merged(combined, &merged)
+}
+
+fn selected_indices_for_merged(combined: &RecordBatch, merged: &RecordBatch) -> Result<Vec<u32>> {
+    let combined_keys = keys(combined, MetaField::RecordKey.as_ref())?;
+    let combined_seqnos = string_values(combined, MetaField::CommitSeqno.as_ref())?;
+    let mut source_indices = HashMap::with_capacity(combined.num_rows());
+    for (index, (key, seqno)) in combined_keys.iter().zip(combined_seqnos.iter()).enumerate() {
+        source_indices.insert((key.clone(), seqno.clone()), index as u32);
+    }
+
+    let merged_keys = keys(merged, MetaField::RecordKey.as_ref())?;
+    let merged_seqnos = string_values(merged, MetaField::CommitSeqno.as_ref())?;
+    merged_keys
+        .iter()
+        .zip(merged_seqnos.iter())
+        .map(|(key, seqno)| {
+            source_indices.get(&(key.clone(), seqno.clone())).copied().ok_or_else(|| {
+                CoreError::Write(format!(
+                    "event-time merger returned unknown record '{key}' with commit sequence '{seqno}'"
+                ))
+            })
+        })
+        .collect()
 }
 
 async fn current_data(table: &Table) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>)> {
@@ -246,21 +316,23 @@ fn record_key_name(table: &Table, batch: &RecordBatch) -> Result<String> {
 }
 
 fn keys(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
+    string_values(batch, field)
+}
+
+fn string_values(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
     let array = batch
         .column_by_name(field)
-        .ok_or_else(|| CoreError::Schema(format!("record key field '{field}' is missing")))?;
+        .ok_or_else(|| CoreError::Schema(format!("field '{field}' is missing")))?;
     let array = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            CoreError::Unsupported(format!("record key field '{field}' must be Utf8"))
-        })?;
+        .ok_or_else(|| CoreError::Unsupported(format!("field '{field}' must be Utf8")))?;
     array
         .iter()
         .map(|value| {
-            value.map(str::to_string).ok_or_else(|| {
-                CoreError::Write(format!("record key field '{field}' cannot be null"))
-            })
+            value
+                .map(str::to_string)
+                .ok_or_else(|| CoreError::Write(format!("field '{field}' cannot be null")))
         })
         .collect()
 }
@@ -276,18 +348,11 @@ fn take_batch(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
 }
 
 fn partial_merge(
-    old: &RecordBatch,
-    incoming: &RecordBatch,
+    combined: &RecordBatch,
     old_by_key: &HashMap<String, u32>,
-    incoming_keys: &[String],
     selected: &[u32],
     update_columns: &[String],
 ) -> Result<RecordBatch> {
-    let combined = concat_batches(&old.schema(), [old, incoming])?;
-    let mut final_source = HashMap::new();
-    for (index, key) in incoming_keys.iter().enumerate() {
-        final_source.insert(key, (old.num_rows() + index) as u32);
-    }
     let key_column = if combined
         .column_by_name(MetaField::RecordKey.as_ref())
         .is_some()
@@ -309,7 +374,7 @@ fn partial_merge(
             .map(|index| {
                 let key = &combined_keys[*index as usize];
                 if update_columns.contains(field.name()) || !old_by_key.contains_key(key) {
-                    *final_source.get(key).unwrap_or(index)
+                    *index
                 } else {
                     *old_by_key.get(key).unwrap_or(index)
                 }

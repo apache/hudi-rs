@@ -43,6 +43,7 @@ pub struct TableCreateBuilder {
     populates_meta_fields: bool,
     record_key_fields: Vec<String>,
     partition_fields: Vec<String>,
+    ordering_fields: Vec<String>,
     metadata_enabled: bool,
     options: HashMap<String, String>,
     storage_options: HashMap<String, String>,
@@ -59,6 +60,7 @@ impl TableCreateBuilder {
             populates_meta_fields: false,
             record_key_fields: Vec::new(),
             partition_fields: Vec::new(),
+            ordering_fields: Vec::new(),
             metadata_enabled: false,
             options: HashMap::new(),
             storage_options: HashMap::new(),
@@ -105,6 +107,16 @@ impl TableCreateBuilder {
         S: Into<String>,
     {
         self.partition_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the field used to order records with the same key during merges.
+    pub fn with_ordering_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ordering_fields = fields.into_iter().map(Into::into).collect();
         self
     }
 
@@ -195,6 +207,12 @@ impl TableCreateBuilder {
             props.insert(
                 HudiTableConfig::PartitionFields.as_ref().to_string(),
                 self.partition_fields.join(","),
+            );
+        }
+        if !self.ordering_fields.is_empty() {
+            props.insert(
+                HudiTableConfig::OrderingFields.as_ref().to_string(),
+                self.ordering_fields.join(","),
             );
         }
         for (k, v) in self.options {

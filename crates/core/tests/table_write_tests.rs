@@ -62,6 +62,31 @@ fn batch(rows: Vec<(&str, i64)>) -> RecordBatch {
     .unwrap()
 }
 
+fn ordered_batch(rows: Vec<(&str, i64, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("event_time", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, value, _)| *value).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, _, event_time)| *event_time)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn test_create_and_append_then_read() {
     let dir = tempdir().unwrap();
@@ -205,4 +230,86 @@ async fn test_partial_upsert_preserves_unselected_columns() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(values.value(0), 2);
+}
+
+#[tokio::test]
+async fn test_upsert_uses_event_time_ordering() {
+    let dir = tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+
+    table
+        .upsert([ordered_batch(vec![("a", 1, 100)])])
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 2, 50)])])
+        .await
+        .unwrap();
+
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 1);
+
+    table
+        .upsert([ordered_batch(vec![("a", 3, 100)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 3);
+
+    table
+        .upsert([ordered_batch(vec![("a", 4, 200)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 4);
+}
+
+#[tokio::test]
+async fn test_upsert_rejects_custom_payload_or_merger() {
+    let dir = tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_option(
+            "hoodie.datasource.write.payload.class",
+            "example.CustomPayload",
+        )
+        .create()
+        .await
+        .unwrap();
+
+    let error = table.upsert([batch(vec![("a", 1)])]).await.unwrap_err();
+    assert!(matches!(error, CoreError::Unsupported(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("hoodie.datasource.write.payload.class")
+    );
 }
