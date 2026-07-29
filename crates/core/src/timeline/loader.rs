@@ -23,6 +23,7 @@ use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPat
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::HoodieCommitMetadata;
+use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::storage::Storage;
 use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
@@ -296,9 +297,12 @@ impl TimelineLoader {
                 })
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                // Layout 2: Avro format
-                let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
-                metadata.to_json_map()
+                // Layout 2: Avro format — replace commits use a distinct Java schema.
+                if instant.is_replacecommit() {
+                    HoodieReplaceCommitMetadata::from_avro_bytes(&bytes)?.to_json_map()
+                } else {
+                    HoodieCommitMetadata::from_avro_bytes(&bytes)?.to_json_map()
+                }
             }
         }
     }
@@ -320,11 +324,17 @@ impl TimelineLoader {
                 })
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                // Layout 2: Avro format - deserialize then serialize to JSON
-                let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
-                serde_json::to_string(&metadata).map_err(|e| {
-                    CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
-                })
+                if instant.is_replacecommit() {
+                    let metadata = HoodieReplaceCommitMetadata::from_avro_bytes(&bytes)?;
+                    serde_json::to_string(&metadata).map_err(|e| {
+                        CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
+                    })
+                } else {
+                    let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
+                    serde_json::to_string(&metadata).map_err(|e| {
+                        CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
+                    })
+                }
             }
         }
     }

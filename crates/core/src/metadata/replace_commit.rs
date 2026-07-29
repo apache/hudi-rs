@@ -20,27 +20,30 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::metadata::commit::HoodieWriteStat;
+use apache_avro::Reader as AvroReader;
+use apache_avro::from_value;
 use apache_avro_derive::AvroSchema as DeriveAvroSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::io::Cursor;
 
 /// Represents the metadata for a Hudi Replace Commit
 ///
 /// This is modeled from HoodieReplaceCommitMetadata.avsc.
-#[derive(Debug, Clone, Serialize, Deserialize, DeriveAvroSchema)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, DeriveAvroSchema)]
+#[serde(rename_all = "camelCase", default)]
 #[avro(namespace = "org.apache.hudi.avro.model")]
 pub struct HoodieReplaceCommitMetadata {
-    // version: ["int","null"] with default 1 in Avro; we model as Option<i32>
-    pub version: Option<i32>,
-    #[avro(rename = "operationType")]
-    pub operation_type: Option<String>,
+    // Field order matches Java HoodieReplaceCommitMetadata.avsc.
     #[avro(rename = "partitionToWriteStats")]
     pub partition_to_write_stats: Option<HashMap<String, Vec<HoodieWriteStat>>>,
     pub compacted: Option<bool>,
     #[avro(rename = "extraMetadata")]
     pub extra_metadata: Option<HashMap<String, String>>,
+    pub version: Option<i32>,
+    #[avro(rename = "operationType")]
+    pub operation_type: Option<String>,
     #[avro(rename = "partitionToReplaceFileIds")]
     pub partition_to_replace_file_ids: Option<HashMap<String, Vec<String>>>,
 }
@@ -56,6 +59,47 @@ impl HoodieReplaceCommitMetadata {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
         serde_json::from_slice(bytes)
             .map_err(|e| CoreError::CommitMetadata(format!("Failed to parse commit metadata: {e}")))
+    }
+
+    /// Parse replace-commit metadata from Avro OCF bytes (layout v2).
+    pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
+        let cursor = Cursor::new(bytes);
+        let reader = AvroReader::new(cursor)
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to create Avro reader: {e}")))?;
+        let mut records = reader;
+        let value = records
+            .next()
+            .ok_or_else(|| CoreError::CommitMetadata("Avro file contains no records".to_string()))?
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to read Avro record: {e}")))?;
+        from_value::<Self>(&value).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {e}"))
+        })
+    }
+
+    /// Convert to a JSON Map for timeline loaders.
+    pub fn to_json_map(&self) -> Result<Map<String, Value>> {
+        let value = serde_json::to_value(self).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to convert to JSON value: {e}"))
+        })?;
+        match value {
+            Value::Object(map) => Ok(map),
+            _ => Err(CoreError::CommitMetadata(
+                "Expected JSON object".to_string(),
+            )),
+        }
+    }
+
+    /// Serialize replace-commit metadata to Avro OCF using the vendored Java schema.
+    pub fn to_avro_bytes(&self) -> Result<Vec<u8>> {
+        use crate::schema::avsc::{encode_with_schema, hoodie_replace_commit_metadata_schema};
+        encode_with_schema(self, hoodie_replace_commit_metadata_schema()?)
+    }
+
+    /// Serialize to JSON bytes (timeline layout v1).
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to serialize replace metadata: {e}"))
+        })
     }
 
     /// Iterate over all replace file IDs across all partitions
@@ -124,5 +168,27 @@ mod tests {
         let metadata: HoodieReplaceCommitMetadata = serde_json::from_value(json).unwrap();
         let count = metadata.iter_replace_file_ids().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_avro_roundtrip_java_schema() {
+        let metadata = HoodieReplaceCommitMetadata {
+            version: Some(1),
+            operation_type: Some("INSERT_OVERWRITE".to_string()),
+            partition_to_write_stats: Some(HashMap::new()),
+            compacted: Some(false),
+            extra_metadata: Some(HashMap::new()),
+            partition_to_replace_file_ids: Some(HashMap::from([(
+                "p0".to_string(),
+                vec!["fid-0".to_string()],
+            )])),
+        };
+        let bytes = metadata.to_avro_bytes().unwrap();
+        let parsed = HoodieReplaceCommitMetadata::from_avro_bytes(&bytes).unwrap();
+        assert_eq!(parsed.operation_type, metadata.operation_type);
+        assert_eq!(
+            parsed.partition_to_replace_file_ids,
+            metadata.partition_to_replace_file_ids
+        );
     }
 }
