@@ -69,6 +69,7 @@ pub(crate) fn new_file_id() -> String {
 }
 
 /// Extract `{fileId}` from `{fileId}_{writeToken}_{instant}.parquet`.
+#[allow(dead_code)]
 pub(crate) fn file_id_from_base_name(file_name: &str) -> String {
     file_name
         .split_once('_')

@@ -868,6 +868,57 @@ async fn test_append_splits_files_by_max_file_size() {
     );
 }
 
+#[tokio::test]
+async fn test_cow_upsert_preserves_unrelated_file_groups() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut table = Table::create(root.to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_metadata(false)
+        .with_option("hoodie.parquet.max.file.size", "1")
+        .with_option("hoodie.copyonwrite.record.size.estimate", "1")
+        .create()
+        .await
+        .unwrap();
+
+    table
+        .append([partitioned_batch(vec![
+            ("a", "sf", 1),
+            ("b", "sf", 2),
+            ("c", "nyc", 3),
+            ("d", "nyc", 4),
+        ])])
+        .await
+        .unwrap();
+    let before = walkdir_count_parquet(root);
+    assert!(
+        before >= 2,
+        "expected multiple base files before upsert, got {before}"
+    );
+
+    // Touch only key `a` in city=sf — nyc file groups must remain.
+    table
+        .upsert([partitioned_batch(vec![("a", "sf", 10)])])
+        .await
+        .unwrap();
+    let after = walkdir_count_parquet(root);
+    assert!(
+        after >= before,
+        "upsert must not collapse unrelated file groups (before={before}, after={after})"
+    );
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            ("a".to_string(), 10),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("d".to_string(), 4),
+        ]
+    );
+}
+
 fn walkdir_count_parquet(root: &std::path::Path) -> usize {
     let mut n = 0;
     for entry in std::fs::read_dir(root).unwrap() {
