@@ -893,6 +893,7 @@ async fn rewrite(
             (String::new(), name, 0, true)
         }));
         update_files_partition_entries(storage.as_ref(), instant, &additions).await?;
+        table.reload_cached_metadata_table().await?;
     }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();

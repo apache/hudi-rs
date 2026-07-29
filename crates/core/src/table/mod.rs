@@ -142,7 +142,8 @@ pub struct Table {
     /// Cached metadata table instance, lazily initialized on first use.
     /// Only populated when metadata table is enabled (v8+ with files partition).
     /// Shared across clones via `Arc` so all scan() calls reuse the same instance.
-    cached_metadata_table: Arc<OnceCell<Table>>,
+    /// `Mutex` allows writers to reload the MDT timeline after mutating MDT files.
+    cached_metadata_table: Arc<tokio::sync::Mutex<Option<Table>>>,
     /// Cached file stats estimator. Materialized on first successful call to
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
     /// populate the cache, allowing later calls with newer timestamps to retry.
@@ -206,15 +207,29 @@ fn instant_time_minus_one(instant_time: &str) -> String {
 impl Table {
     /// Get or initialize the cached metadata table instance.
     ///
-    /// Returns `Ok(&Table)` if metadata table is successfully created or was already cached.
-    /// The instance is created once and reused across all subsequent calls.
-    pub(crate) async fn get_or_init_metadata_table(&self) -> Result<&Table> {
-        self.cached_metadata_table
-            .get_or_try_init(|| async {
-                log::debug!("Initializing cached metadata table instance");
-                self.new_metadata_table().await
-            })
-            .await
+    /// Returns a clone of the cached metadata [`Table`]. The underlying cache is
+    /// shared across clones of this data table and can be reloaded after writes.
+    pub(crate) async fn get_or_init_metadata_table(&self) -> Result<Table> {
+        let mut guard = self.cached_metadata_table.lock().await;
+        if guard.is_none() {
+            log::debug!("Initializing cached metadata table instance");
+            *guard = Some(self.new_metadata_table().await?);
+        }
+        Ok(guard.as_ref().expect("metadata table just initialized").clone())
+    }
+
+    /// Reload the cached metadata table timeline after writers mutate MDT files.
+    ///
+    /// Writers may call [`Self::get_or_init_metadata_table`] (via file listing)
+    /// before updating the metadata table. Without a reload, subsequent reads
+    /// keep a stale MDT timeline and can miss newly active base files.
+    pub(crate) async fn reload_cached_metadata_table(&self) -> Result<()> {
+        let mut guard = self.cached_metadata_table.lock().await;
+        if let Some(metadata_table) = guard.as_mut() {
+            metadata_table.timeline.reload_completed_commits().await?;
+            metadata_table.file_system_view.clear_cache();
+        }
+        Ok(())
     }
 
     /// Get or initialize the cached `FileStatsEstimator` for this **data table**.
@@ -658,7 +673,7 @@ impl Table {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                metadata_table,
+                metadata_table.as_ref(),
                 estimator,
             )
             .await?;

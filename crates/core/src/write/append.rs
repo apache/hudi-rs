@@ -129,6 +129,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
             &[(String::new(), base_file_name.clone(), file_size)],
         )
         .await?;
+        table.reload_cached_metadata_table().await?;
     }
 
     table.timeline.reload_completed_commits().await?;

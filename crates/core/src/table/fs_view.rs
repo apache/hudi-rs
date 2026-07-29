@@ -970,7 +970,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                Some(metadata_table),
+                Some(&metadata_table),
                 None,
             )
             .await
