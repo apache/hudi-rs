@@ -56,6 +56,7 @@ static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
 /// Append one or more record batches as a single INSERT commit.
 pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+    table.reload_timeline_for_write().await?;
     if !table.is_mor() {
         ensure_append_only(table)?;
     }
@@ -129,7 +130,6 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
             &[(String::new(), base_file_name.clone(), file_size)],
         )
         .await?;
-        table.reload_cached_metadata_table().await?;
     }
 
     table.timeline.reload_completed_commits().await?;

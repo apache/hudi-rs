@@ -75,6 +75,7 @@ pub async fn upsert_batches(
     batches: &[RecordBatch],
     options: UpsertOptions,
 ) -> Result<WriteResult> {
+    table.reload_timeline_for_write().await?;
     if table.is_mor() {
         return mor_upsert_batches(table, batches, options).await;
     }
@@ -140,6 +141,7 @@ pub async fn upsert_batches(
 }
 
 pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteResult> {
+    table.reload_timeline_for_write().await?;
     if table.is_mor() {
         ensure_mor_merge_supported(table)?;
         let (Some(old), _, _) = current_data(table).await? else {
@@ -190,6 +192,7 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             "delete requires at least one record key".to_string(),
         ));
     }
+    table.reload_timeline_for_write().await?;
     if table.is_mor() {
         return mor_delete_keys(table, delete_keys).await;
     }
@@ -222,6 +225,7 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
 }
 
 pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
+    table.reload_timeline_for_write().await?;
     ensure_rewrite_supported(table)?;
     if batches.is_empty() {
         return Err(CoreError::Write(
@@ -893,7 +897,6 @@ async fn rewrite(
             (String::new(), name, 0, true)
         }));
         update_files_partition_entries(storage.as_ref(), instant, &additions).await?;
-        table.reload_cached_metadata_table().await?;
     }
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
