@@ -38,7 +38,10 @@ impl HoodieIndex for SimpleIndex {
         table: &Table,
         keys: &[HoodieKey],
     ) -> Result<HashMap<HoodieKey, Option<RecordLocation>>> {
-        let requested = keys.iter().cloned().collect::<HashSet<_>>();
+        let requested = keys
+            .iter()
+            .map(|key| key.record_key.clone())
+            .collect::<HashSet<_>>();
         let mut locations = keys
             .iter()
             .cloned()
@@ -60,6 +63,7 @@ impl HoodieIndex for SimpleIndex {
         let fallback_key = &record_key_fields[0];
         let reader = table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+        let mut by_record_key: HashMap<String, RecordLocation> = HashMap::new();
         for slice in table.get_file_slices(&ReadOptions::new()).await? {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
             let key_name = if batch
@@ -86,13 +90,14 @@ impl HoodieIndex for SimpleIndex {
                 partition_path: slice.partition_path.clone(),
             };
             for key in key_array.iter().flatten() {
-                let hoodie_key = HoodieKey {
-                    record_key: key.to_string(),
-                    partition_path: slice.partition_path.clone(),
-                };
-                if requested.contains(&hoodie_key) {
-                    locations.insert(hoodie_key, Some(location.clone()));
+                if requested.contains(key) {
+                    by_record_key.insert(key.to_string(), location.clone());
                 }
+            }
+        }
+        for (hoodie_key, slot) in locations.iter_mut() {
+            if let Some(location) = by_record_key.get(&hoodie_key.record_key) {
+                *slot = Some(location.clone());
             }
         }
         Ok(locations)

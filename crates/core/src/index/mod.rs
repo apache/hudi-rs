@@ -18,8 +18,10 @@
  */
 //! Record-location indexes used by write operations.
 
+mod record;
 mod simple;
 
+pub use record::{RecordIndex, is_record_index_enabled};
 pub use simple::SimpleIndex;
 
 use std::collections::HashMap;
@@ -50,4 +52,32 @@ pub trait HoodieIndex {
         table: &Table,
         keys: &[HoodieKey],
     ) -> Result<HashMap<HoodieKey, Option<RecordLocation>>>;
+}
+
+/// Selected write-path index: RLI when enabled, otherwise SimpleIndex.
+pub enum TableIndex {
+    Record(RecordIndex),
+    Simple(SimpleIndex),
+}
+
+impl HoodieIndex for TableIndex {
+    async fn tag_location(
+        &self,
+        table: &Table,
+        keys: &[HoodieKey],
+    ) -> Result<HashMap<HoodieKey, Option<RecordLocation>>> {
+        match self {
+            Self::Record(index) => index.tag_location(table, keys).await,
+            Self::Simple(index) => index.tag_location(table, keys).await,
+        }
+    }
+}
+
+/// Select the write-path index: RLI when enabled, otherwise SimpleIndex.
+pub fn for_table(table: &Table) -> TableIndex {
+    if is_record_index_enabled(table) {
+        TableIndex::Record(RecordIndex)
+    } else {
+        TableIndex::Simple(SimpleIndex)
+    }
 }
