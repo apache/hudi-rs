@@ -94,6 +94,9 @@ pub enum CoreError {
     #[error("{0}")]
     Unsupported(String),
 
+    #[error("Write error: {0}")]
+    Write(String),
+
     #[error(transparent)]
     Utf8Error(#[from] std::str::Utf8Error),
 }

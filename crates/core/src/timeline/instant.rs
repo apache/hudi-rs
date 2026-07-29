@@ -139,6 +139,31 @@ impl FromStr for Instant {
 }
 
 impl Instant {
+    /// Construct a completed instant for writers.
+    ///
+    /// `timestamp` is the requested time (`yyyyMMddHHmmssSSS` or 17-digit epoch millis).
+    /// When `completion_timestamp` is set, the v8+ `{requested}_{completion}.{action}`
+    /// file name form is used.
+    pub fn new_completed(
+        timestamp: impl Into<String>,
+        action: Action,
+        completion_timestamp: Option<String>,
+    ) -> Result<Self> {
+        let timestamp = timestamp.into();
+        Self::validate_timestamp(&timestamp)?;
+        if let Some(ref completion) = completion_timestamp {
+            Self::validate_timestamp(completion)?;
+        }
+        let dt = Self::parse_datetime(&timestamp, "UTC")?;
+        Ok(Self {
+            timestamp,
+            completion_timestamp,
+            action,
+            state: State::Completed,
+            epoch_millis: dt.timestamp_millis(),
+        })
+    }
+
     pub fn try_from_file_name_and_timezone(file_name: &str, timezone: &str) -> Result<Self> {
         let (timestamp_part, action_suffix) = file_name
             .split_once('.')

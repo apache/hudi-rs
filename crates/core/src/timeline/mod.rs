@@ -121,6 +121,18 @@ impl Timeline {
         Ok(timeline)
     }
 
+    /// Reload completed commits from storage after a write.
+    pub(crate) async fn reload_completed_commits(&mut self) -> Result<()> {
+        let selector = TimelineSelector::completed_actions_in_range(
+            DEFAULT_LOADING_ACTIONS,
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        self.completed_commits = self.load_instants(&selector, false).await?;
+        Ok(())
+    }
+
     /// Load instants from the timeline based on the selector criteria.
     ///
     /// # Archived Timeline Loading

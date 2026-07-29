@@ -96,6 +96,8 @@ pub mod partition;
 mod validation;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
+pub use crate::write::AppendResult;
+pub use crate::write::TableCreateBuilder;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -318,6 +320,57 @@ impl Table {
             .with_options(options)
             .build()
             .await
+    }
+
+    /// Start creating a new Hudi table at `base_uri` (does not open until [`TableCreateBuilder::create`]).
+    ///
+    /// # Example
+    /// ```no_run
+    /// # async fn example() -> hudi_core::error::Result<()> {
+    /// use hudi_core::table::Table;
+    /// let table = Table::create("/tmp/hudi_table")
+    ///     .with_table_name("trips")
+    ///     .with_record_key_fields(["id"])
+    ///     .create()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create(base_uri: impl Into<String>) -> TableCreateBuilder {
+        TableCreateBuilder::new(base_uri)
+    }
+
+    /// Append Arrow record batches as a new INSERT commit (append-only COW, unpartitioned).
+    ///
+    /// Mirrors pyIceberg's `table.append(df)`. After a successful write the in-memory
+    /// timeline and file-system view cache are refreshed so subsequent reads see new data.
+    pub async fn append(&mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Result<AppendResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::append_batches(self, &batches).await
+    }
+
+    /// Upsert records by record key. Not yet implemented.
+    pub async fn upsert(&mut self, _batches: impl IntoIterator<Item = RecordBatch>) -> Result<()> {
+        Err(CoreError::Unsupported(
+            "Table::upsert is not yet implemented".to_string(),
+        ))
+    }
+
+    /// Overwrite table (or filtered partitions). Not yet implemented.
+    pub async fn overwrite(
+        &mut self,
+        _batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<()> {
+        Err(CoreError::Unsupported(
+            "Table::overwrite is not yet implemented".to_string(),
+        ))
+    }
+
+    /// Delete rows matching a filter. Not yet implemented.
+    pub async fn delete(&mut self, _filter: &str) -> Result<()> {
+        Err(CoreError::Unsupported(
+            "Table::delete is not yet implemented".to_string(),
+        ))
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {

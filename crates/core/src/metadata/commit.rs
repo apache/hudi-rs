@@ -178,6 +178,31 @@ impl HoodieCommitMetadata {
         }
     }
 
+    /// Serialize commit metadata to JSON bytes (timeline layout v1 / table version 6).
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to serialize commit metadata: {e}"))
+        })
+    }
+
+    /// Serialize commit metadata to Avro Object Container Format bytes (layout v2 / table v8+).
+    pub fn to_avro_bytes(&self) -> Result<Vec<u8>> {
+        use apache_avro::Writer as AvroWriter;
+        use apache_avro::schema::AvroSchema;
+
+        let schema = <Self as AvroSchema>::get_schema();
+        let mut writer = AvroWriter::new(&schema, Vec::new());
+        writer.append_ser(self).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to append Avro commit metadata: {e}"))
+        })?;
+        writer.flush().map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to flush Avro commit metadata: {e}"))
+        })?;
+        writer.into_inner().map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to finish Avro commit metadata: {e}"))
+        })
+    }
+
     /// Get the write stats for a specific partition
     pub fn get_partition_write_stats(&self, partition: &str) -> Option<&Vec<HoodieWriteStat>> {
         self.partition_to_write_stats

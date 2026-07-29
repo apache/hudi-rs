@@ -67,6 +67,11 @@ impl FileSystemView {
         })
     }
 
+    /// Drop cached partition → file-group mappings so the next planning call reloads from storage.
+    pub(crate) fn clear_cache(&self) {
+        self.partition_to_file_groups.clear();
+    }
+
     /// Load file groups from the appropriate source (storage or metadata table records)
     /// and apply stats-based pruning.
     ///
