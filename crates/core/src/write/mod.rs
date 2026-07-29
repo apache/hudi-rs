@@ -21,6 +21,10 @@
 mod append;
 mod create;
 mod metadata;
+mod rewrite;
 
 pub use append::{AppendResult, append_batches};
 pub use create::TableCreateBuilder;
+pub use rewrite::{
+    UpsertOptions, WriteResult, delete_filter, delete_keys, overwrite_batches, upsert_batches,
+};

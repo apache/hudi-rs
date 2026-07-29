@@ -23,8 +23,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use hudi_core::error::CoreError;
+use hudi_core::index::HoodieKey;
 use hudi_core::table::partition::PartitionPruner;
-use hudi_core::table::{ReadOptions, Table};
+use hudi_core::table::{ReadOptions, Table, UpsertOptions};
 use tempfile::tempdir;
 
 fn sample_batch() -> RecordBatch {
@@ -37,6 +38,25 @@ fn sample_batch() -> RecordBatch {
         vec![
             Arc::new(StringArray::from(vec!["a", "b", "c"])),
             Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap()
+}
+
+fn batch(rows: Vec<(&str, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap()
@@ -118,25 +138,71 @@ async fn test_create_with_metadata_and_append_updates_files_partition() {
 }
 
 #[tokio::test]
-async fn test_upsert_overwrite_delete_not_yet_implemented() {
+async fn test_upsert_delete_and_overwrite() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();
     let mut table = Table::create(base_uri)
         .with_table_name("trips")
+        .with_record_key_fields(["id"])
         .create()
         .await
         .unwrap();
 
-    assert!(matches!(
-        table.upsert([sample_batch()]).await.unwrap_err(),
-        CoreError::Unsupported(_)
-    ));
-    assert!(matches!(
-        table.overwrite([sample_batch()]).await.unwrap_err(),
-        CoreError::Unsupported(_)
-    ));
-    assert!(matches!(
-        table.delete("id = 'a'").await.unwrap_err(),
-        CoreError::Unsupported(_)
-    ));
+    table
+        .upsert([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    let upsert = table
+        .upsert([batch(vec![("a", 10), ("c", 3)])])
+        .await
+        .unwrap();
+    assert_eq!(upsert.num_updates, 1);
+    assert_eq!(upsert.num_inserts, 1);
+
+    let deleted = table.delete("id = 'b'").await.unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    let deleted = table
+        .delete_keys([HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: String::new(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    let overwritten = table.overwrite([batch(vec![("z", 99)])]).await.unwrap();
+    assert_eq!(overwritten.num_writes, 1);
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn test_partial_upsert_preserves_unselected_columns() {
+    let dir = tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+
+    table.upsert([batch(vec![("a", 1)])]).await.unwrap();
+    table
+        .upsert_with(
+            [batch(vec![("a", 2)])],
+            UpsertOptions {
+                update_columns: Some(vec!["value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 2);
 }

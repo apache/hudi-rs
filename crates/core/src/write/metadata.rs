@@ -102,8 +102,21 @@ pub async fn update_files_partition(
     instant: &str,
     files: &[(String, String, i64)],
 ) -> Result<()> {
+    let entries = files
+        .iter()
+        .map(|(partition, file_name, size)| (partition.clone(), file_name.clone(), *size, false))
+        .collect::<Vec<_>>();
+    update_files_partition_entries(data_storage, instant, &entries).await
+}
+
+/// Apply file additions and deletions to the metadata table files partition.
+pub async fn update_files_partition_entries(
+    data_storage: &Storage,
+    instant: &str,
+    files: &[(String, String, i64, bool)],
+) -> Result<()> {
     let mut by_partition: BTreeMap<String, Vec<FilesMetadataEntry>> = BTreeMap::new();
-    for (partition, file_name, size) in files {
+    for (partition, file_name, size, is_deleted) in files {
         let partition = if partition.is_empty() {
             FilesPartitionRecord::NON_PARTITIONED_NAME.to_string()
         } else {
@@ -115,7 +128,7 @@ pub async fn update_files_partition(
             .push(FilesMetadataEntry {
                 name: file_name.clone(),
                 size: *size,
-                is_deleted: false,
+                is_deleted: *is_deleted,
             });
     }
     let partitions = by_partition.keys().cloned().collect::<Vec<_>>();

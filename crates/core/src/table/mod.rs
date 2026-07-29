@@ -98,6 +98,7 @@ mod validation;
 pub use crate::config::read_options::{QueryType, ReadOptions};
 pub use crate::write::AppendResult;
 pub use crate::write::TableCreateBuilder;
+pub use crate::write::{UpsertOptions, WriteResult};
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -344,33 +345,54 @@ impl Table {
     ///
     /// Mirrors pyIceberg's `table.append(df)`. After a successful write the in-memory
     /// timeline and file-system view cache are refreshed so subsequent reads see new data.
-    pub async fn append(&mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Result<AppendResult> {
+    pub async fn append(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<AppendResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
         crate::write::append_batches(self, &batches).await
     }
 
-    /// Upsert records by record key. Not yet implemented.
-    pub async fn upsert(&mut self, _batches: impl IntoIterator<Item = RecordBatch>) -> Result<()> {
-        Err(CoreError::Unsupported(
-            "Table::upsert is not yet implemented".to_string(),
-        ))
+    /// Upsert complete records by their configured record key.
+    pub async fn upsert(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        self.upsert_with(batches, UpsertOptions::default()).await
     }
 
-    /// Overwrite table (or filtered partitions). Not yet implemented.
+    /// Upsert records, optionally updating only selected columns on matched rows.
+    pub async fn upsert_with(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+        options: UpsertOptions,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::upsert_batches(self, &batches, options).await
+    }
+
+    /// Replace all data in an unpartitioned copy-on-write table.
     pub async fn overwrite(
         &mut self,
-        _batches: impl IntoIterator<Item = RecordBatch>,
-    ) -> Result<()> {
-        Err(CoreError::Unsupported(
-            "Table::overwrite is not yet implemented".to_string(),
-        ))
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::overwrite_batches(self, &batches).await
     }
 
-    /// Delete rows matching a filter. Not yet implemented.
-    pub async fn delete(&mut self, _filter: &str) -> Result<()> {
-        Err(CoreError::Unsupported(
-            "Table::delete is not yet implemented".to_string(),
-        ))
+    /// Delete rows matching a single binary filter such as `id = 'a'`.
+    pub async fn delete(&mut self, filter: &str) -> Result<WriteResult> {
+        let filter = parse_write_filter(filter)?;
+        crate::write::delete_filter(self, filter).await
+    }
+
+    /// Delete records identified by record key in the unpartitioned table.
+    pub async fn delete_keys(
+        &mut self,
+        keys: impl IntoIterator<Item = crate::index::HoodieKey>,
+    ) -> Result<WriteResult> {
+        let keys: Vec<crate::index::HoodieKey> = keys.into_iter().collect();
+        crate::write::delete_keys(self, &keys).await
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -1218,6 +1240,25 @@ impl Table {
             estimated_total_byte_size.max(0) as u64,
         ))
     }
+}
+
+fn parse_write_filter(filter: &str) -> Result<Filter> {
+    const OPERATORS: [&str; 8] = ["!=", ">=", "<=", "=", ">", "<", " IN ", " NOT IN "];
+    let filter = filter.trim();
+    for operator in OPERATORS {
+        if let Some((field, value)) = filter.split_once(operator) {
+            let field = field.trim();
+            let value = value.trim().trim_matches('\'').trim_matches('"');
+            if field.is_empty() || value.is_empty() {
+                break;
+            }
+            let operator = operator.trim();
+            return Filter::try_from((field, operator, value));
+        }
+    }
+    Err(CoreError::Write(format!(
+        "delete filter must be a single comparison such as `id = 'a'`, got '{filter}'"
+    )))
 }
 
 #[cfg(test)]
