@@ -578,7 +578,7 @@ async fn mor_upsert_batches(
             .await?;
         let prepared =
             prepare_batches_for_write(table, &[insert_batch], &instant, &file_name)?;
-        let bytes = write_parquet_bytes(&prepared)?;
+        let bytes = write_parquet_bytes(table, &prepared)?;
         let size = bytes.len() as i64;
         if let Err(error) = storage.put_file(&base_file_path, bytes).await {
             return Err(error.into());
@@ -633,7 +633,7 @@ async fn mor_upsert_batches(
             .to_string();
         let update_batch = take_batch(&incoming, &indices)?;
         let prepared = prepare_batches_for_write(table, &[update_batch], &instant, &log_name)?;
-        let parquet = write_parquet_bytes(&prepared)?;
+        let parquet = write_parquet_bytes(table, &prepared)?;
         let content = LogFileWriter::write_log_block(
             BlockType::ParquetData,
             HashMap::from([(BlockMetadataKey::InstantTime, instant.clone())]),
@@ -1314,7 +1314,7 @@ async fn rewrite(
             let path = relative_data_path(&partition_path, file_name);
             crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, instant)
                 .await?;
-            let bytes = write_parquet_bytes(std::slice::from_ref(&partition_batch))?;
+            let bytes = write_parquet_bytes(table, std::slice::from_ref(&partition_batch))?;
             let size = bytes.len() as i64;
             storage.put_file(&path, bytes).await?;
             written_paths.push(path.clone());

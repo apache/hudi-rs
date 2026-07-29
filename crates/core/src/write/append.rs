@@ -171,7 +171,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
             .await?;
             let write_batches =
                 prepare_batches_for_write(table, &[chunk], &request_instant, &file_name)?;
-            let file_bytes = write_parquet_bytes(&write_batches)?;
+            let file_bytes = write_parquet_bytes(table, &write_batches)?;
             let file_size = file_bytes.len() as i64;
             if let Err(error) = storage.put_file(&base_file_path, file_bytes).await {
                 for path in &written_paths {
@@ -364,13 +364,52 @@ pub(crate) fn max_records_per_file(table: &Table) -> usize {
     ((max_file_size / record_size) as usize).max(1)
 }
 
-pub(crate) fn write_parquet_bytes(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    use parquet::basic::{Compression, ZstdLevel};
+pub(crate) fn write_parquet_bytes(table: &Table, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    use parquet::basic::{Compression, GzipLevel, ZstdLevel};
     use parquet::file::properties::WriterProperties;
 
-    // Match Java/Hudi default request: zstd (hoodie.parquet.compression.codec).
+    let options = table.hudi_configs.as_options();
+    let page_size = options
+        .get("hoodie.parquet.page.size")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024 * 1024)
+        .max(1);
+    let block_size = options
+        .get("hoodie.parquet.block.size")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_MAX_FILE_SIZE_BYTES)
+        .max(1);
+    let record_size = options
+        .get("hoodie.copyonwrite.record.size.estimate")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_RECORD_SIZE_ESTIMATE)
+        .max(1);
+    // parquet-rs row-group limit is row-count; approximate Java's byte block size.
+    let max_row_group_rows = ((block_size / record_size) as usize).max(1);
+    let dictionary_enabled = options
+        .get("hoodie.parquet.dictionary.enabled")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let codec = options
+        .get("hoodie.parquet.compression.codec")
+        .map(|s| s.as_str())
+        .unwrap_or("zstd");
+    let compression = match codec.to_ascii_lowercase().as_str() {
+        "uncompressed" | "none" => Compression::UNCOMPRESSED,
+        "snappy" => Compression::SNAPPY,
+        "gzip" | "gz" => Compression::GZIP(GzipLevel::try_new(6).unwrap_or_default()),
+        "lz4" => Compression::LZ4,
+        "brotli" => Compression::BROTLI(Default::default()),
+        // Default zstd — intentional vs Java's gzip; honor hoodie.parquet.compression.codec.
+        _ => Compression::ZSTD(ZstdLevel::try_new(3).unwrap_or_default()),
+    };
+
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap_or_default()))
+        .set_compression(compression)
+        .set_dictionary_enabled(dictionary_enabled)
+        .set_data_page_size_limit(page_size)
+        .set_dictionary_page_size_limit(page_size)
+        .set_max_row_group_size(max_row_group_rows)
         .build();
     let cursor = Cursor::new(Vec::new());
     let mut writer = ArrowWriter::try_new(cursor, batches[0].schema(), Some(props))?;
