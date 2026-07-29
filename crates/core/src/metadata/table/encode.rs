@@ -209,6 +209,8 @@ pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
     let rli_payload = if entry.is_deleted {
         null_union()
     } else {
+        let (high, low, file_index, file_id_str, encoding) =
+            encode_file_id_for_record_index(&entry.file_id);
         Value::Union(
             1,
             Box::new(Value::Record(vec![
@@ -218,26 +220,26 @@ pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
                 ),
                 (
                     "fileIdHighBits".to_string(),
-                    Value::Union(1, Box::new(Value::Long(-1))),
+                    Value::Union(1, Box::new(Value::Long(high))),
                 ),
                 (
                     "fileIdLowBits".to_string(),
-                    Value::Union(1, Box::new(Value::Long(-1))),
+                    Value::Union(1, Box::new(Value::Long(low))),
                 ),
                 (
                     "fileIndex".to_string(),
-                    Value::Union(1, Box::new(Value::Int(-1))),
+                    Value::Union(1, Box::new(Value::Int(file_index))),
                 ),
                 (
                     "fileId".to_string(),
-                    Value::Union(1, Box::new(Value::String(entry.file_id.clone()))),
+                    Value::Union(1, Box::new(Value::String(file_id_str))),
                 ),
                 (
                     "instantTime".to_string(),
                     Value::Union(1, Box::new(Value::Long(entry.instant_time_millis))),
                 ),
-                // Encoding 1 = raw fileId string (Java HoodieRecordIndexInfo).
-                ("fileIdEncoding".to_string(), Value::Int(1)),
+                // 0 = UUID bits; 1 = raw fileId string (Java HoodieRecordIndexInfo).
+                ("fileIdEncoding".to_string(), Value::Int(encoding)),
                 ("position".to_string(), null_union()),
             ])),
         )
@@ -256,6 +258,27 @@ pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
         ("SecondaryIndexMetadata".to_string(), null_union()),
     ]);
     apache_avro::to_avro_datum(metadata_schema()?, value).map_err(CoreError::from)
+}
+
+/// Match Java `HoodieMetadataPayload.createRecordIndexUpdate` fileId packing.
+fn encode_file_id_for_record_index(file_id: &str) -> (i64, i64, i32, String, i32) {
+    if let Some((uuid, file_index)) = parse_uuid_file_id(file_id) {
+        let (high, low) = uuid.as_u64_pair();
+        (high as i64, low as i64, file_index, String::new(), 0)
+    } else {
+        (-1, -1, -1, file_id.to_string(), 1)
+    }
+}
+
+/// Parse `{uuid}` or `{uuid}-{fileIndex}` as used by Java FSUtils file ids.
+fn parse_uuid_file_id(file_id: &str) -> Option<(uuid::Uuid, i32)> {
+    if file_id.len() == 36 {
+        return uuid::Uuid::parse_str(file_id).ok().map(|u| (u, -1));
+    }
+    let idx = file_id.rfind('-')?;
+    let uuid = uuid::Uuid::parse_str(&file_id[..idx]).ok()?;
+    let file_index: i32 = file_id[idx + 1..].parse().ok()?;
+    Some((uuid, file_index))
 }
 
 /// Decode a record-index Avro payload. Returns `None` when the entry is a delete.
@@ -443,5 +466,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(avro_key_field(&bytes), "");
+    }
+
+    #[test]
+    fn encode_record_index_uses_uuid_bits_when_file_id_is_uuid() {
+        let file_id = "184e0720-0b37-4e8b-b23a-5646f6c2fe94-0";
+        let bytes = encode_record_index_entry(&RecordIndexEntry {
+            record_key: "id-1".to_string(),
+            partition_path: "city=sf".to_string(),
+            file_id: file_id.to_string(),
+            instant_time_millis: 1,
+            is_deleted: false,
+        })
+        .unwrap();
+        let decoded = decode_record_index_entry("id-1", &bytes).unwrap().unwrap();
+        assert_eq!(decoded.file_id, file_id);
     }
 }

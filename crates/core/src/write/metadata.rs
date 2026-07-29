@@ -36,7 +36,24 @@ use crate::timeline::instant::{Action, Instant};
 
 const METADATA_BASE: &str = ".hoodie/metadata";
 const FILES_FILE_ID: &str = "files-0000-0";
-const RECORD_INDEX_FILE_ID: &str = "record-index-0000-0";
+/// Java `hoodie.metadata.record.index.min.filegroup.count` default.
+pub(crate) const DEFAULT_RLI_NUM_FILE_GROUPS: usize = 10;
+
+fn record_index_file_id(shard: usize) -> String {
+    format!("record-index-{shard:04}-0")
+}
+
+/// Java `HoodieTableMetadataUtil.mapRecordKeyToFileGroupIndex` (31-hash, signed i32).
+pub(crate) fn map_record_key_to_file_group_index(record_key: &str, num_file_groups: usize) -> usize {
+    if num_file_groups <= 1 {
+        return 0;
+    }
+    let mut h: i32 = 0;
+    for ch in record_key.chars() {
+        h = h.wrapping_mul(31).wrapping_add(ch as i32);
+    }
+    (h.unsigned_abs() as usize) % num_file_groups
+}
 
 /// Create the metadata table properties and its initial partitions.
 pub async fn bootstrap_metadata_table(
@@ -136,32 +153,33 @@ pub async fn bootstrap_metadata_table(
     );
 
     if record_index_enabled {
-        let rli_base_name = format!("{RECORD_INDEX_FILE_ID}_0-0-0_{instant}.hfile");
-        let empty_rli = HFileWriter::write(
-            &[],
-            BTreeMap::from([(
-                "schema".to_string(),
-                record_index_metadata_avro_schema_json().as_bytes().to_vec(),
-            )]),
-        )
-        .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
-        let rli_size = empty_rli.len() as i64;
         crate::write::ensure_partition_metadata(
             data_table_storage,
             &format!("{METADATA_BASE}/record_index"),
             instant,
         )
         .await?;
-        data_table_storage
-            .put_file(
-                &format!("{METADATA_BASE}/record_index/{rli_base_name}"),
-                empty_rli,
+        let mut rli_stats = Vec::with_capacity(DEFAULT_RLI_NUM_FILE_GROUPS);
+        for shard in 0..DEFAULT_RLI_NUM_FILE_GROUPS {
+            let file_id = record_index_file_id(shard);
+            let rli_base_name = format!("{file_id}_0-0-0_{instant}.hfile");
+            let empty_rli = HFileWriter::write(
+                &[],
+                BTreeMap::from([(
+                    "schema".to_string(),
+                    record_index_metadata_avro_schema_json().as_bytes().to_vec(),
+                )]),
             )
-            .await?;
-        mdt_stats.insert(
-            "record_index".to_string(),
-            vec![HoodieWriteStat {
-                file_id: Some(RECORD_INDEX_FILE_ID.to_string()),
+            .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+            let rli_size = empty_rli.len() as i64;
+            data_table_storage
+                .put_file(
+                    &format!("{METADATA_BASE}/record_index/{rli_base_name}"),
+                    empty_rli,
+                )
+                .await?;
+            rli_stats.push(HoodieWriteStat {
+                file_id: Some(file_id),
                 path: Some(format!("record_index/{rli_base_name}")),
                 base_file: Some(rli_base_name),
                 prev_commit: Some("null".to_string()),
@@ -170,8 +188,9 @@ pub async fn bootstrap_metadata_table(
                 file_size_in_bytes: Some(rli_size),
                 partition_path: Some("record_index".to_string()),
                 ..Default::default()
-            }],
-        );
+            });
+        }
+        mdt_stats.insert("record_index".to_string(), rli_stats);
     }
 
     write_metadata_commit(data_table_storage, instant, mdt_stats).await
@@ -286,7 +305,7 @@ pub async fn update_files_partition_entries(
     write_metadata_commit(data_storage, instant, stats).await
 }
 
-/// Append record-index put/delete entries as an HFile data log block.
+/// Append record-index put/delete entries as HFile data log blocks (one per shard).
 pub async fn update_record_index(
     data_storage: &Storage,
     instant: &str,
@@ -295,46 +314,77 @@ pub async fn update_record_index(
     if entries.is_empty() {
         return Ok(());
     }
+    let num_groups = detect_rli_num_file_groups(data_storage).await?;
     let schema_json = record_index_metadata_avro_schema_json().to_string();
-    let mut pairs = Vec::with_capacity(entries.len());
+    let mut by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
     for entry in entries {
+        let shard = map_record_key_to_file_group_index(&entry.record_key, num_groups);
         let bytes = encode_record_index_entry(entry)?;
-        pairs.push((entry.record_key.clone(), bytes));
+        by_shard
+            .entry(shard)
+            .or_default()
+            .push((entry.record_key.clone(), bytes));
     }
-    let hfile = HFileWriter::write(
-        &pairs,
-        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
-    )
-    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
-    let block = LogFileWriter::write_log_block(
-        BlockType::HfileData,
-        HashMap::from([
-            (BlockMetadataKey::InstantTime, instant.to_string()),
-            (BlockMetadataKey::Schema, schema_json),
-        ]),
-        &hfile,
-    );
-    let log_name = format!(".{RECORD_INDEX_FILE_ID}_{instant}.log.1_0-0-0");
-    let log_rel = format!("record_index/{log_name}");
-    let log_size = block.len() as i64;
-    data_storage
-        .put_file(&format!("{METADATA_BASE}/{log_rel}"), block)
-        .await?;
-    let stats = HashMap::from([(
-        "record_index".to_string(),
-        vec![HoodieWriteStat {
-            file_id: Some(RECORD_INDEX_FILE_ID.to_string()),
+
+    let mut stats = Vec::new();
+    for (shard, pairs) in by_shard {
+        let file_id = record_index_file_id(shard);
+        let hfile = HFileWriter::write(
+            &pairs,
+            BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+        )
+        .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+        let block = LogFileWriter::write_log_block(
+            BlockType::HfileData,
+            HashMap::from([
+                (BlockMetadataKey::InstantTime, instant.to_string()),
+                (BlockMetadataKey::Schema, schema_json.clone()),
+            ]),
+            &hfile,
+        );
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let log_rel = format!("record_index/{log_name}");
+        let log_size = block.len() as i64;
+        data_storage
+            .put_file(&format!("{METADATA_BASE}/{log_rel}"), block)
+            .await?;
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
             path: Some(log_rel),
             log_files: Some(vec![log_name]),
             prev_commit: Some("null".to_string()),
-            num_writes: Some(entries.len() as i64),
+            num_writes: Some(pairs.len() as i64),
             total_write_bytes: Some(log_size),
             file_size_in_bytes: Some(log_size),
             partition_path: Some("record_index".to_string()),
             ..Default::default()
-        }],
-    )]);
-    write_metadata_commit(data_storage, instant, stats).await
+        });
+    }
+    write_metadata_commit(
+        data_storage,
+        instant,
+        HashMap::from([("record_index".to_string(), stats)]),
+    )
+    .await
+}
+
+async fn detect_rli_num_file_groups(storage: &Storage) -> Result<usize> {
+    let dir = format!("{METADATA_BASE}/record_index");
+    let listed = match storage.list_files(Some(&dir)).await {
+        Ok(files) => files,
+        Err(_) => return Ok(DEFAULT_RLI_NUM_FILE_GROUPS),
+    };
+    let mut shards = std::collections::BTreeSet::new();
+    for file in listed {
+        let name = file.name.trim_start_matches('.');
+        if let Some(rest) = name.strip_prefix("record-index-")
+            && let Some(shard_str) = rest.get(..4)
+            && let Ok(shard) = shard_str.parse::<usize>()
+        {
+            shards.insert(shard);
+        }
+    }
+    Ok(shards.len().max(1))
 }
 
 /// Write MDT timeline fencing markers then a completed deltacommit (Java MOR MDT).

@@ -82,6 +82,7 @@ paste = { version = "1" }
 strum = { version = "0.28", features = ["derive"] }
 strum_macros = { version = "0.28" }
 url = { version = "2" }
+uuid = { version = "1" }
 
 # runtime / async
 async-recursion = { version = "1" }

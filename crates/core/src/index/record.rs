@@ -36,7 +36,6 @@ use crate::timeline::selector::InstantRange;
 use crate::write::metadata::epoch_millis_to_instant;
 
 const METADATA_BASE: &str = ".hoodie/metadata";
-const RECORD_INDEX_FILE_ID: &str = "record-index-0000-0";
 
 /// Metadata-table record-level index (global: key = record key).
 #[derive(Clone, Debug, Default)]
@@ -92,22 +91,23 @@ async fn load_record_index_map(
         Err(_) => return Ok(HashMap::new()),
     };
 
-    let mut base_path: Option<String> = None;
+    let mut base_paths = Vec::new();
     let mut log_paths = Vec::new();
     for file in listed {
         let name = file.name;
-        if name.ends_with(".hfile") && name.starts_with(RECORD_INDEX_FILE_ID) {
+        if name.ends_with(".hfile") && name.starts_with("record-index-") {
             let relative = PathBuf::from(&dir).join(&name);
-            base_path = Some(relative.to_string_lossy().to_string());
+            base_paths.push(relative.to_string_lossy().to_string());
         } else if name.starts_with('.') && name.contains(".log.") {
             let relative = PathBuf::from(&dir).join(&name);
             log_paths.push(relative.to_string_lossy().to_string());
         }
     }
+    base_paths.sort();
     log_paths.sort();
 
     let mut merged: HashMap<String, Option<LoadedLocation>> = HashMap::new();
-    if let Some(base) = base_path {
+    for base in base_paths {
         let mut reader = HFileReader::open(storage.as_ref(), &base)
             .await
             .map_err(|e| CoreError::HFile(format!("failed to open record_index base: {e:?}")))?;

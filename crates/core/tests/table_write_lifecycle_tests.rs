@@ -241,7 +241,7 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
         "MDT should list the replacement base only: {mdt_after:?}"
     );
     assert!(
-        mdt_after[0].starts_with("rewrite-"),
+        mdt_after[0].ends_with(".parquet") && mdt_after[0].contains('_'),
         "MDT active file should be the rewrite base: {mdt_after:?}"
     );
     assert_snapshot_async(&table, vec![("a", 10), ("b", 2), ("c", 3), ("d", 4)]).await;
@@ -566,6 +566,17 @@ async fn test_create_defaults_enable_mdt_and_record_index() {
         dir.path()
             .join(".hoodie/metadata/record_index")
             .is_dir()
+    );
+    let rli_bases: Vec<_> = std::fs::read_dir(dir.path().join(".hoodie/metadata/record_index"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".hfile") && n.starts_with("record-index-"))
+        .collect();
+    assert_eq!(
+        rli_bases.len(),
+        10,
+        "Java default RLI min file groups is 10: {rli_bases:?}"
     );
 }
 

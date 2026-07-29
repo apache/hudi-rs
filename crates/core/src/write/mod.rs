@@ -63,6 +63,19 @@ pub(crate) async fn ensure_partition_metadata(
     Ok(())
 }
 
+/// Java-style data file id: `{uuid}-0` (FSUtils.createNewFileId).
+pub(crate) fn new_file_id() -> String {
+    format!("{}-0", uuid::Uuid::new_v4())
+}
+
+/// Extract `{fileId}` from `{fileId}_{writeToken}_{instant}.parquet`.
+pub(crate) fn file_id_from_base_name(file_name: &str) -> String {
+    file_name
+        .split_once('_')
+        .map(|(file_id, _)| file_id.to_string())
+        .unwrap_or_else(|| file_name.to_string())
+}
+
 /// Write `{ts}.{action}.requested` then inflight markers (Java ActiveTimeline fencing).
 ///
 /// COW commit inflight uses `{ts}.inflight` (no action infix); other actions use

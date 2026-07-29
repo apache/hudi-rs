@@ -94,7 +94,8 @@ pub async fn upsert_batches(
     }
     let (old, file_ids, old_paths) = current_data(table).await?;
     let instant = next_instant_timestamp();
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
+    let file_id = crate::write::new_file_id();
+    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let incoming = prepare_batches_for_write(table, batches, &instant, &file_name)?;
     let incoming = concat(&incoming)?;
     if incoming.num_rows() == 0 {
@@ -217,7 +218,8 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
     }
     let remaining = take_batch(&old, &selected)?;
     let instant = next_instant_timestamp();
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
+    let file_id = crate::write::new_file_id();
+    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let result = rewrite(
         table, &instant, &file_name, &remaining, file_ids, old_paths, "DELETE", 0, 0, deleted,
     )
@@ -279,7 +281,8 @@ pub async fn update_filter(
         return Ok(WriteResult::default());
     }
     let instant = next_instant_timestamp();
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
+    let file_id = crate::write::new_file_id();
+    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let data_only = strip_meta_columns(&merged)?;
     let prepared = prepare_batches_for_write(table, &[data_only], &instant, &file_name)?;
     let merged = concat(&prepared)?;
@@ -332,7 +335,8 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     }
     let remaining = take_batch(&old, &selected)?;
     let instant = next_instant_timestamp();
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
+    let file_id = crate::write::new_file_id();
+    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let result = rewrite(
         table, &instant, &file_name, &remaining, file_ids, old_paths, "DELETE", 0, 0, deleted,
     )
@@ -369,7 +373,8 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
     }
     let (_, file_ids, old_paths) = current_data(table).await?;
     let instant = next_instant_timestamp();
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
+    let file_id = crate::write::new_file_id();
+    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let batches = prepare_batches_for_write(table, batches, &instant, &file_name)?;
     let replacement = concat(&batches)?;
     if replacement.num_rows() == 0 {
@@ -564,14 +569,8 @@ async fn mor_upsert_batches(
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
-    let mut insert_ordinal = 0usize;
     for (partition_path, insert_indices) in insert_indices_by_partition {
-        let file_id = if partition_path.is_empty() {
-            format!("append-{instant}")
-        } else {
-            format!("append-{instant}-{insert_ordinal}")
-        };
-        insert_ordinal += 1;
+        let file_id = crate::write::new_file_id();
         let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
         let insert_batch = take_batch(&incoming, &insert_indices)?;
         let base_file_path = relative_data_path(&partition_path, &file_name);
@@ -1324,7 +1323,7 @@ async fn rewrite(
                 .entry(partition_path.clone())
                 .or_default()
                 .push(HoodieWriteStat {
-                    file_id: Some(format!("rewrite-{instant}")),
+                    file_id: Some(crate::write::file_id_from_base_name(file_name)),
                     path: Some(path),
                     base_file: Some(file_name.to_string()),
                     prev_commit: Some("null".to_string()),
@@ -1381,7 +1380,7 @@ async fn rewrite(
                 .map(|key| RecordIndexEntry {
                     record_key: key.record_key,
                     partition_path: key.partition_path,
-                    file_id: format!("rewrite-{instant}"),
+                    file_id: crate::write::file_id_from_base_name(file_name),
                     instant_time_millis: instant_to_epoch_millis(instant),
                     is_deleted: false,
                 })

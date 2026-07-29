@@ -128,7 +128,6 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     let mut rli_entries = Vec::new();
     let mut written_paths: Vec<String> = Vec::new();
     let mut primary_base_path = String::new();
-    let mut partition_ordinal = 0usize;
     let max_records = max_records_per_file(table);
 
     for (partition_path, row_refs) in partition_rows {
@@ -152,20 +151,12 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         // Split oversized partitions into multiple base files (Java max.file.size).
         let total_rows = partition_batch.num_rows();
         let mut offset = 0usize;
-        let mut part_file_idx = 0usize;
         while offset < total_rows {
             let end = (offset + max_records).min(total_rows);
             let indices: Vec<u32> = (offset as u32..end as u32).collect();
             let chunk = take_rows(&partition_batch, &indices)?;
             let chunk_keys = hoodie_keys_for_batch(table, &chunk, Some(&request_instant))?;
-            let file_id = if partition_path.is_empty() && part_file_idx == 0 && partition_ordinal == 0
-            {
-                format!("append-{request_instant}")
-            } else {
-                format!("append-{request_instant}-{partition_ordinal}")
-            };
-            partition_ordinal += 1;
-            part_file_idx += 1;
+            let file_id = crate::write::new_file_id();
             let file_name = format!("{file_id}_0-0-0_{request_instant}.parquet");
             let base_file_path = relative_data_path(&partition_path, &file_name);
             if primary_base_path.is_empty() {
