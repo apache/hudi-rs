@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Write APIs for Hudi tables (pyIceberg-style Table verbs).
+//! Write APIs for Hudi tables (`Table` verbs).
 
 mod append;
 mod create;
@@ -24,11 +24,11 @@ mod keygen;
 pub(crate) mod metadata;
 mod rewrite;
 
-pub use append::{AppendResult, append_batches};
+pub use append::{AppendResult, append_batches, append_batches_only};
 pub use create::TableCreateBuilder;
 pub use rewrite::{
-    UpsertOptions, WriteResult, delete_filter, delete_keys, overwrite_batches, update_filter,
-    upsert_batches,
+    UpsertOptions, WriteResult, delete_filter, delete_keys, dynamic_partition_overwrite_batches,
+    overwrite_batches, update_filter, upsert_batches,
 };
 
 use std::str::FromStr;

@@ -267,7 +267,7 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
     Ok(result)
 }
 
-/// Iceberg-style UPDATE: set columns from a single-row `updates` batch on rows matching `filter`.
+/// UPDATE: set columns from a single-row `updates` batch on rows matching `filter`.
 pub async fn update_filter(
     table: &mut Table,
     filter: Filter,
@@ -402,6 +402,63 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
             "overwrite requires at least one row".to_string(),
         ));
     }
+    rewrite(
+        table,
+        &instant,
+        &file_name,
+        &replacement,
+        file_ids,
+        old_paths,
+        "INSERT_OVERWRITE_TABLE",
+        0,
+        replacement.num_rows(),
+        0,
+    )
+    .await
+}
+
+pub async fn dynamic_partition_overwrite_batches(
+    table: &mut Table,
+    batches: &[RecordBatch],
+) -> Result<WriteResult> {
+    table.reload_timeline_for_write().await?;
+    ensure_rewrite_supported(table)?;
+    if batches.is_empty() {
+        return Err(CoreError::Write(
+            "dynamic_partition_overwrite requires at least one RecordBatch".to_string(),
+        ));
+    }
+    let instant = next_instant_timestamp();
+    let prepared = prepare_batches_for_write(table, batches, &instant, "pending")?;
+    let replacement = concat(&prepared)?;
+    if replacement.num_rows() == 0 {
+        return Err(CoreError::Write(
+            "dynamic_partition_overwrite requires at least one row".to_string(),
+        ));
+    }
+    let partition_paths = hoodie_keys_for_batch(table, &replacement, Some(&instant))?
+        .into_iter()
+        .map(|key| key.partition_path)
+        .collect::<HashSet<_>>();
+    if partition_paths.is_empty() || partition_paths.iter().all(|path| path.is_empty()) {
+        return Err(CoreError::Unsupported(
+            "dynamic_partition_overwrite requires a partitioned table; use overwrite() for unpartitioned tables"
+                .to_string(),
+        ));
+    }
+    let (old, file_ids, old_paths) = data_for_partitions(table, &partition_paths).await?;
+    let replacement = if let Some(old) = old {
+        if old.schema() != replacement.schema() {
+            return Err(CoreError::Schema(
+                "overwrite batch schema does not match the current table schema".to_string(),
+            ));
+        }
+        replacement
+    } else {
+        replacement
+    };
+    let file_id = crate::write::new_file_id();
+    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     rewrite(
         table,
         &instant,
@@ -1049,6 +1106,38 @@ async fn data_for_file_ids(
                 .read_file_slice(&slice, &ReadOptions::new())
                 .await?,
         );
+    }
+    Ok((
+        (!batches.is_empty())
+            .then(|| concat(&batches))
+            .transpose()?,
+        kept_ids,
+        kept_paths,
+    ))
+}
+
+async fn data_for_partitions(
+    table: &Table,
+    partitions: &HashSet<String>,
+) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>)> {
+    if partitions.is_empty() {
+        return Ok((None, Vec::new(), Vec::new()));
+    }
+    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let reader = table.create_file_group_reader_with_options(
+        Some(&ReadOptions::new()),
+        std::iter::empty::<(&str, String)>(),
+    )?;
+    let mut batches = Vec::new();
+    let mut kept_ids = Vec::new();
+    let mut kept_paths = Vec::new();
+    for slice in slices {
+        if !partitions.contains(&slice.partition_path) {
+            continue;
+        }
+        kept_ids.push(slice.file_id().to_string());
+        kept_paths.push(slice.base_file_relative_path()?);
+        batches.push(reader.read_file_slice(&slice, &ReadOptions::new()).await?);
     }
     Ok((
         (!batches.is_empty())

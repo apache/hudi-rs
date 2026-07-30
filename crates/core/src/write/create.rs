@@ -29,7 +29,7 @@ use crate::storage::Storage;
 use crate::table::Table;
 use crate::write::metadata::bootstrap_metadata_table;
 
-/// Builder for creating a new Hudi table on storage (pyIceberg-style create).
+/// Builder for creating a new Hudi table on storage.
 ///
 /// Defaults: metadata table on, record index on, table version 8 / timeline layout 2,
 /// hive-style partitioning on, partition columns retained in data files.

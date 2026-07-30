@@ -342,14 +342,25 @@ impl Table {
 
     /// Append Arrow record batches as a new INSERT commit (unpartitioned COW or MOR).
     ///
-    /// Mirrors pyIceberg's `table.append(df)`. After a successful write the in-memory
-    /// timeline and file-system view cache are refreshed so subsequent reads see new data.
+    /// After a successful write the in-memory timeline and file-system view cache
+    /// are refreshed so subsequent reads see new data.
     pub async fn append(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<AppendResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
         crate::write::append_batches(self, &batches).await
+    }
+
+    /// Append Arrow record batches using strict append-only merge mode.
+    ///
+    /// Requires the table to be configured with append-only record merge strategy.
+    pub async fn append_only(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<AppendResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::append_batches_only(self, &batches).await
     }
 
     /// Upsert complete records by their configured record key.
@@ -373,13 +384,22 @@ impl Table {
         crate::write::upsert_batches(self, &batches, options).await
     }
 
-    /// Replace all data in an unpartitioned copy-on-write table.
+    /// Replace all data in a copy-on-write table.
     pub async fn overwrite(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<WriteResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
         crate::write::overwrite_batches(self, &batches).await
+    }
+
+    /// Replace only the partitions present in `batches` in a partitioned copy-on-write table.
+    pub async fn dynamic_partition_overwrite(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::dynamic_partition_overwrite_batches(self, &batches).await
     }
 
     /// Delete rows matching a single binary filter such as `id = 'a'` or `value = 2`.
@@ -406,7 +426,7 @@ impl Table {
         crate::write::delete_keys(self, &keys).await
     }
 
-    /// Iceberg-style UPDATE: set columns from a single-row batch on rows matching `filter`.
+    /// UPDATE: set columns from a single-row batch on rows matching `filter`.
     ///
     /// `updates` must contain exactly one row. Every non-meta data column present in
     /// `updates` is written onto matching target rows; other columns are preserved.

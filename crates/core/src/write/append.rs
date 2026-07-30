@@ -62,9 +62,29 @@ static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
 /// Append one or more record batches as a single INSERT commit.
 pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+    append_batches_inner(table, batches, false).await
+}
+
+/// Append one or more record batches, requiring append-only merge mode.
+pub async fn append_batches_only(
+    table: &mut Table,
+    batches: &[RecordBatch],
+) -> Result<AppendResult> {
+    append_batches_inner(table, batches, true).await
+}
+
+async fn append_batches_inner(
+    table: &mut Table,
+    batches: &[RecordBatch],
+    require_append_only: bool,
+) -> Result<AppendResult> {
     table.reload_timeline_for_write().await?;
     if !table.is_mor() {
-        ensure_append_only(table)?;
+        if require_append_only {
+            ensure_append_only_strategy(table)?;
+        } else {
+            ensure_insert_allowed(table)?;
+        }
     }
     ensure_supported_table_type(table)?;
 
@@ -281,7 +301,7 @@ fn take_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
     RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
 }
 
-fn ensure_append_only(table: &Table) -> Result<()> {
+fn ensure_insert_allowed(table: &Table) -> Result<()> {
     let strategy: String = table
         .hudi_configs
         .get_or_default(RecordMergeStrategy)
@@ -292,6 +312,19 @@ fn ensure_append_only(table: &Table) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn ensure_append_only_strategy(table: &Table) -> Result<()> {
+    let strategy: String = table
+        .hudi_configs
+        .get_or_default(RecordMergeStrategy)
+        .into();
+    if RecordMergeStrategyValue::from_str(&strategy)? != RecordMergeStrategyValue::AppendOnly {
+        return Err(CoreError::Unsupported(
+            "append_only requires hoodie.record.merge.mode=append_only".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_copy_on_write(table: &Table) -> Result<()> {

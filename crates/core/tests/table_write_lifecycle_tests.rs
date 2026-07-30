@@ -17,7 +17,7 @@
  * under the License.
  */
 
-//! Lifecycle write tests inspired by pyIceberg write coverage:
+//! Lifecycle write tests:
 //! append → upsert → delete → overwrite, with on-disk file-layout assertions
 //! (base vs log) and metadata-table consistency checks.
 
@@ -262,7 +262,7 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
     assert_eq!(deleted.num_deletes, 1);
     assert_snapshot_async(&table, vec![("a", 10), ("d", 4)]).await;
 
-    // 4) Overwrite replaces table contents (pyIceberg-style).
+    // 4) Overwrite replaces table contents.
     table
         .overwrite([batch(vec![("z", 99), ("y", 98)])])
         .await
@@ -437,8 +437,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
 }
 
 #[tokio::test]
-async fn test_cow_and_mor_mutable_ops_roundtrip_like_pyiceberg() {
-    // Mirrors pyIceberg-style verb coverage: append, upsert, delete, overwrite
+async fn test_cow_and_mor_mutable_ops_roundtrip() {
+    // Verb coverage: append, upsert, delete, overwrite
     // for both table types, asserting read-after-write consistency.
     for table_type in [
         TableTypeValue::CopyOnWrite,
@@ -917,6 +917,62 @@ async fn test_cow_upsert_preserves_unrelated_file_groups() {
             ("d".to_string(), 4),
         ]
     );
+}
+
+#[tokio::test]
+async fn test_partitioned_cow_dynamic_then_full_overwrite_lifecycle() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let mut table = Table::create(root.to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+
+    table
+        .append([partitioned_batch(vec![
+            ("a", "sf", 1),
+            ("b", "sf", 2),
+            ("c", "nyc", 3),
+            ("d", "la", 4),
+        ])])
+        .await
+        .unwrap();
+    let before = walkdir_count_parquet(root);
+    assert!(before >= 3, "expected partitioned append bases, got {before}");
+
+    table
+        .dynamic_partition_overwrite([partitioned_batch(vec![
+            ("x", "sf", 10),
+            ("y", "sf", 11),
+        ])])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            ("c".to_string(), 3),
+            ("d".to_string(), 4),
+            ("x".to_string(), 10),
+            ("y".to_string(), 11),
+        ]
+    );
+
+    table
+        .overwrite([partitioned_batch(vec![
+            ("m", "chi", 20),
+            ("n", "bos", 21),
+        ])])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("m".to_string(), 20), ("n".to_string(), 21)]
+    );
+    let layout = data_layout(root);
+    assert!(layout.replacecommits >= 2, "expected replacecommits, got {layout:?}");
 }
 
 fn walkdir_count_parquet(root: &std::path::Path) -> usize {

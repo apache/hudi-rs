@@ -88,6 +88,29 @@ fn ordered_batch(rows: Vec<(&str, i64, i64)>) -> RecordBatch {
     .unwrap()
 }
 
+fn partitioned_batch(rows: Vec<(&str, &str, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, city, _)| *city).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
 fn rows_by_id(batches: &[RecordBatch]) -> Vec<(String, i64)> {
     let mut rows = batches
         .iter()
@@ -154,6 +177,30 @@ async fn test_create_and_append_then_read() {
     let batches = table.read(&ReadOptions::new()).await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3);
+}
+
+#[tokio::test]
+async fn test_append_only_requires_append_only_merge_mode() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_populates_meta_fields(false)
+        .create()
+        .await
+        .unwrap();
+    table.append_only([sample_batch()]).await.unwrap();
+
+    let dir = tempdir().unwrap();
+    let mut upsertable = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+    let err = upsertable.append_only([ordered_batch(vec![("a", 1, 1)])]).await;
+    assert!(matches!(err, Err(CoreError::Unsupported(_))));
 }
 
 #[tokio::test]
@@ -270,6 +317,76 @@ async fn test_upsert_delete_and_overwrite() {
     assert_eq!(overwritten.num_writes, 1);
     let batches = table.read(&ReadOptions::new()).await.unwrap();
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn test_overwrite_replaces_all_partitions() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([partitioned_batch(vec![
+            ("a", "sf", 1),
+            ("b", "nyc", 2),
+            ("c", "la", 3),
+        ])])
+        .await
+        .unwrap();
+
+    let overwritten = table
+        .overwrite([partitioned_batch(vec![("z", "chi", 99), ("y", "bos", 98)])])
+        .await
+        .unwrap();
+    assert_eq!(overwritten.num_writes, 2);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("y".to_string(), 98), ("z".to_string(), 99)]
+    );
+}
+
+#[tokio::test]
+async fn test_dynamic_partition_overwrite_replaces_only_touched_partitions() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([partitioned_batch(vec![
+            ("a", "sf", 1),
+            ("b", "sf", 2),
+            ("c", "nyc", 3),
+            ("d", "la", 4),
+        ])])
+        .await
+        .unwrap();
+
+    let result = table
+        .dynamic_partition_overwrite([partitioned_batch(vec![
+            ("x", "sf", 10),
+            ("y", "sf", 11),
+        ])])
+        .await
+        .unwrap();
+    assert_eq!(result.num_writes, 2);
+    let rows = rows_by_id(&table.read(&ReadOptions::new()).await.unwrap());
+    assert_eq!(
+        rows,
+        vec![
+            ("c".to_string(), 3),
+            ("d".to_string(), 4),
+            ("x".to_string(), 10),
+            ("y".to_string(), 11),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -713,7 +830,7 @@ async fn test_delete_by_record_key_equality_routes_keyed_path() {
 }
 
 #[tokio::test]
-async fn test_iceberg_style_update_by_non_key_filter() {
+async fn test_update_by_non_key_filter() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
