@@ -146,7 +146,9 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_group::reader::FileGroupReader;
     use crate::file_group::reader_v2::reader_context::ReaderParameters;
+    use std::sync::Arc;
 
     /// Configs with just enough set for the resolver to succeed. Includes an
     /// ordering field so the table derives `overwrite_with_latest` rather than
@@ -175,6 +177,41 @@ mod tests {
                 .filter(|(k, _)| k != key)
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// [`resolve_instant_range`] deliberately reproduces the bounds the legacy
+    /// file group reader computes, so that a read through either path admits
+    /// the same log blocks. Nothing but this test enforces that: the two live
+    /// in different modules and neither calls the other, so an edit to one
+    /// would otherwise drift silently.
+    ///
+    /// Compares the `Debug` rendering rather than the fields because
+    /// `InstantRange`'s fields are private — which also means a field added to
+    /// the struct is covered here for free, instead of being silently skipped
+    /// by an explicit field-by-field comparison.
+    #[test]
+    fn instant_range_matches_the_legacy_reader() {
+        let mut options = minimal_configs();
+        options.push((
+            HudiReadConfig::StartTimestamp.as_ref().to_string(),
+            "20230101000000000".to_string(),
+        ));
+        let configs = HudiConfigs::new(options);
+
+        let legacy = FileGroupReader::new_with_overrides(
+            Arc::new(configs.clone()),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap()
+        .create_instant_range_for_log_file_scan()
+        .unwrap();
+
+        let resolved = resolve_reader_context(&configs, true)
+            .unwrap()
+            .instant_range;
+
+        assert_eq!(format!("{legacy:?}"), format!("{resolved:?}"));
     }
 
     #[test]

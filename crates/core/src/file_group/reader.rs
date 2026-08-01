@@ -177,7 +177,9 @@ impl FileGroupReader {
         apply_commit_time_filter(&self.hudi_configs, records)
     }
 
-    fn create_instant_range_for_log_file_scan(&self) -> Result<InstantRange> {
+    /// Visible to the crate so the merge-on-read context resolver can assert it
+    /// derives the same range; see `reader_v2::resolver`.
+    pub(crate) fn create_instant_range_for_log_file_scan(&self) -> Result<InstantRange> {
         let timezone = self
             .hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
