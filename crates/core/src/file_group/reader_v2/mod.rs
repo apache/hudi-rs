@@ -28,5 +28,6 @@
 //! is what the allow below silences. Remove it once the reader wires in.
 #![allow(dead_code)]
 
+pub(crate) mod reader;
 pub(crate) mod reader_context;
 pub(crate) mod resolver;
