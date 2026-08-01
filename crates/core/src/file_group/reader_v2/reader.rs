@@ -38,11 +38,13 @@ use arrow_array::RecordBatch;
 /// Serves both table types: a merge-on-read slice merges its log records onto
 /// the base file, and a copy-on-write slice is the same read with no log files
 /// to merge.
+#[allow(dead_code)]
 pub(crate) struct FileGroupReader {
     context: ReaderContext,
     parameters: ReaderParameters,
 }
 
+#[allow(dead_code)]
 impl FileGroupReader {
     pub(crate) fn new(context: ReaderContext, parameters: ReaderParameters) -> Self {
         Self {
@@ -110,13 +112,20 @@ mod tests {
         );
     }
 
-    /// Constructing is deliberately separate from reading: later changes fill in
-    /// the engine behind `read`, and callers wiring up a reader should not have
-    /// to handle a failure until they actually ask for rows.
+    /// The reader hands back what it was built with, rather than re-deriving or
+    /// defaulting it. Uses non-default parameters so that substituting defaults
+    /// somewhere in construction would fail this rather than pass unnoticed.
     #[test]
-    fn construction_succeeds_even_though_reading_does_not() {
-        let reader = FileGroupReader::new(context(), ReaderParameters::default());
+    fn holds_the_context_and_parameters_it_was_built_with() {
+        let parameters = ReaderParameters {
+            emit_delete: true,
+            sort_output: true,
+            allow_inflight_instants: true,
+        };
+
+        let reader = FileGroupReader::new(context(), parameters);
 
         assert_eq!(reader.context().table_path, "file:///tmp/t");
+        assert_eq!(*reader.parameters(), parameters);
     }
 }

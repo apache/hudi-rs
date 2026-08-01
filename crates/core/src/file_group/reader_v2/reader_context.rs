@@ -27,9 +27,15 @@ use std::collections::HashMap;
 ///
 /// The string forms match the merge modes the Hudi Java reader uses, so the
 /// values survive a round trip through engine integrations unchanged.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MergeMode {
     /// Latest commit wins.
+    ///
+    /// Nothing selects this yet. A table with no ordering field derives
+    /// `append_only`, which the resolver rejects rather than mapping — see
+    /// `resolver::resolve_merge_mode`. Settling that question is what makes
+    /// this reachable, since commit-time ordering is what such a table wants.
     CommitTimeOrdering,
     /// Highest ordering-field value wins.
     EventTimeOrdering,
@@ -46,6 +52,7 @@ impl AsRef<str> for MergeMode {
 
 /// Everything the MOR reader needs that is derived from table state rather
 /// than from the file slice itself.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct ReaderContext {
     /// Table base path, as configured.
@@ -72,6 +79,7 @@ pub(crate) struct ReaderContext {
 }
 
 /// Flags controlling what the reader emits, independent of table state.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReaderParameters {
     /// Emit delete records to the caller instead of only applying them.

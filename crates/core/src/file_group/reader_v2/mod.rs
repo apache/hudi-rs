@@ -24,9 +24,11 @@
 //! itself lands in later changes, and the existing read path is untouched
 //! until it does.
 //!
-//! Everything here is therefore unreachable from the crate's call graph, which
-//! is what the allow below silences. Remove it once the reader wires in.
-#![allow(dead_code)]
+//! Everything here is therefore unreachable from the crate's call graph. Each
+//! item that needs it carries its own `allow(dead_code)`, rather than a blanket
+//! allow on the module: a module-wide one would also silence an item that is
+//! dead by mistake, and this module has a lot of growing left to do. Drop the
+//! per-item allows as the reader wires in.
 
 pub(crate) mod reader;
 pub(crate) mod reader_context;

@@ -33,6 +33,7 @@ use std::str::FromStr;
 
 /// Resolve the MOR reader context from `hudi_configs`, which the caller has
 /// already merged read options into.
+#[allow(dead_code)]
 pub(crate) fn resolve_reader_context(
     hudi_configs: &HudiConfigs,
     has_log_files: bool,
@@ -68,11 +69,23 @@ pub(crate) fn resolve_reader_context(
     })
 }
 
-/// Prefix identifying a per-read config; everything else is a table property.
+/// Prefix identifying a per-read config.
+#[allow(dead_code)]
 const READ_CONFIG_PREFIX: &str = "hoodie.read.";
 
-/// Split the merged config bag back into table properties and per-read
-/// overrides, so the merge code can tell one from the other.
+/// Prefixes identifying configs that steer this crate's own behavior. They are
+/// neither something the table declares about itself nor a per-read override,
+/// so they reach the reader through neither map.
+#[allow(dead_code)]
+const CRATE_CONFIG_PREFIXES: [&str; 2] = ["hoodie.internal.", "hoodie.plan."];
+
+/// Split the merged config bag into the table's own properties and the
+/// per-read overrides, so the merge code can tell one from the other.
+///
+/// Anything belonging to neither is dropped rather than swept into the table
+/// properties: a reader has no way to tell a swept-in crate config from
+/// something the table actually declared.
+#[allow(dead_code)]
 fn partition_configs(
     hudi_configs: &HudiConfigs,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
@@ -82,7 +95,10 @@ fn partition_configs(
     for (key, value) in hudi_configs.as_options() {
         if key.starts_with(READ_CONFIG_PREFIX) {
             reader_config.insert(key, value);
-        } else {
+        } else if !CRATE_CONFIG_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
             table_config.insert(key, value);
         }
     }
@@ -94,6 +110,7 @@ fn partition_configs(
 ///
 /// Mirrors the bounds the legacy file group reader applies, so a v2 read sees
 /// the same log blocks: exclusive at the start, inclusive at the pinned commit.
+#[allow(dead_code)]
 fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
     let timezone: String = hudi_configs
         .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -127,6 +144,7 @@ fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
 /// ordering field is set, which makes it reachable for ordinary tables — so
 /// this returns an error rather than picking a mode that would change which
 /// rows a query returns.
+#[allow(dead_code)]
 fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
     let strategy: String = hudi_configs
         .get_or_default(HudiTableConfig::RecordMergeStrategy)
@@ -146,6 +164,8 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::internal::HudiInternalConfig;
+    use crate::config::plan::HudiPlanConfig;
     use crate::file_group::reader::FileGroupReader;
     use crate::file_group::reader_v2::reader_context::ReaderParameters;
     use std::sync::Arc;
@@ -328,6 +348,38 @@ mod tests {
                 .contains_key(HudiTableConfig::OrderingFields.as_ref()),
             "table configs must not leak into reader config"
         );
+    }
+
+    /// Neither map is a catch-all. Configs that steer this crate's own behavior
+    /// are not table properties and are not per-read overrides, so they belong
+    /// in neither — sweeping them into the table properties would leave a
+    /// reader unable to tell them from something the table declared about
+    /// itself.
+    #[test]
+    fn drops_configs_that_are_neither_table_nor_read() {
+        let crate_configs = [
+            HudiInternalConfig::SkipConfigValidation.as_ref(),
+            HudiInternalConfig::TimelineArchivedReadEnabled.as_ref(),
+            HudiPlanConfig::ListingParallelism.as_ref(),
+        ];
+        let mut options = minimal_configs();
+        for key in crate_configs {
+            options.push((key.to_string(), "1".to_string()));
+        }
+        let configs = HudiConfigs::new(options);
+
+        let ctx = resolve_reader_context(&configs, true).unwrap();
+
+        for key in crate_configs {
+            assert!(
+                !ctx.table_config.contains_key(key),
+                "{key} is not a table property"
+            );
+            assert!(
+                !ctx.hoodie_reader_config.contains_key(key),
+                "{key} is not a per-read override"
+            );
+        }
     }
 
     /// Log blocks carry record positions, but nothing reads them yet. Keeping
