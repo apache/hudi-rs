@@ -31,6 +31,7 @@
 //! allows as the reader wires in.
 
 pub(crate) mod buffer;
+pub(crate) mod buffered_record;
 pub(crate) mod delete_context;
 pub(crate) mod input_split;
 pub(crate) mod iterator_mode;
