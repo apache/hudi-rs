@@ -26,6 +26,8 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::file_group::reader_v2::reader_context::{MergeMode, ReaderContext};
+use crate::file_group::reader_v2::record_context::RecordContext;
+use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
 use crate::merge::RecordMergeStrategyValue;
 use crate::timeline::selector::InstantRange;
 use std::collections::HashMap;
@@ -56,16 +58,33 @@ pub(crate) fn resolve_reader_context(
     Ok(ReaderContext {
         table_path,
         latest_commit_time,
-        merge_mode,
-        base_file_format,
+        merge_mode: merge_mode.as_ref().to_string(),
+        base_file_format: base_file_format.as_ref().to_string(),
         has_log_files,
-        instant_range,
+        instant_range: Some(instant_range),
         table_config,
         hoodie_reader_config,
         // Log blocks carry record positions, but no code reads them yet.
         // Merging by key is what the legacy reader does, so that is what a v2
         // read must do until the position-based merge lands.
         should_merge_use_record_position: false,
+        // Only one iterator mode is implemented.
+        iterator_mode: "ENGINE_RECORD".to_string(),
+        // Dispatch is on `merge_mode`; the strategy id is carried, not consulted.
+        merge_strategy_id: String::new(),
+        // No bootstrap support in this crate.
+        has_bootstrap_base_file: false,
+        needs_bootstrap_merge: false,
+        enable_logical_timestamp_field_repair: false,
+        // Predicate pushdown into the merge path has no caller here, so no
+        // filter is installed and the primary-key-safety gate is irrelevant.
+        row_filter_builder: None,
+        mor_pk_safe: false,
+        // The table-version < 8 completion gate needs a timeline the caller
+        // has not loaded; leaving it unset keeps the gate a no-op.
+        completion_gate_inputs: None,
+        record_context: RecordContext::default(),
+        schema_handler: FileGroupReaderSchemaHandler::new(),
     })
 }
 
@@ -229,7 +248,8 @@ mod tests {
 
         let resolved = resolve_reader_context(&configs, true)
             .unwrap()
-            .instant_range;
+            .instant_range
+            .expect("the resolver always derives a range");
 
         assert_eq!(format!("{legacy:?}"), format!("{resolved:?}"));
     }
@@ -289,7 +309,7 @@ mod tests {
 
         let ctx = resolve_reader_context(&configs, true).unwrap();
 
-        assert_eq!(ctx.base_file_format, BaseFileFormatValue::Parquet);
+        assert_eq!(ctx.base_file_format, BaseFileFormatValue::Parquet.as_ref());
     }
 
     /// The log scan is bounded by the same window the legacy reader uses, so a
@@ -305,7 +325,7 @@ mod tests {
 
         let ctx = resolve_reader_context(&configs, true).unwrap();
 
-        let rendered = format!("{:?}", ctx.instant_range);
+        let rendered = format!("{:?}", ctx.instant_range.expect("always derived"));
         assert!(rendered.contains("20230101000000000"), "got: {rendered}");
         assert!(rendered.contains("20240101000000000"), "got: {rendered}");
         assert!(
@@ -412,7 +432,7 @@ mod tests {
 
         let ctx = resolve_reader_context(&configs, true).unwrap();
 
-        assert_eq!(ctx.merge_mode, MergeMode::EventTimeOrdering);
+        assert_eq!(ctx.merge_mode, MergeMode::EventTimeOrdering.as_ref());
     }
 
     /// `append_only` has no counterpart in the MOR merge modes — the reader

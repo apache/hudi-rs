@@ -280,8 +280,7 @@ mod tests {
         // Upstream routes this through arrow-avro; here it goes through the
         // crate's own Avro-to-Arrow conversion, which is the same shape.
         let avro = apache_avro::Schema::parse_str(avro_json).unwrap();
-        let target: SchemaRef =
-            Arc::new(crate::avro_to_arrow::to_arrow_schema(&avro).unwrap());
+        let target: SchemaRef = Arc::new(crate::avro_to_arrow::to_arrow_schema(&avro).unwrap());
 
         // Log-file-like row (arrow-avro decode): element field "item", nullable,
         // data [1, NULL, 3].

@@ -1057,8 +1057,9 @@ mod tests {
         // Target drops `key`, keeping only `v`.
         let target_schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let converter =
-            crate::file_group::reader_v2::output_converter::ProjectionConverter::new(&target_schema);
+        let converter = crate::file_group::reader_v2::output_converter::ProjectionConverter::new(
+            &target_schema,
+        );
         // 5 records, batch_size 2 → 3 chunks, so per-chunk projection is exercised.
         let it = FileGroupMergeIterator::new_buffered(
             MockBuffer::boxed(batch_ref_seq(&merge_schema, 5), UpdateStats::default()),
