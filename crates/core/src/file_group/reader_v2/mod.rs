@@ -24,12 +24,16 @@
 //! itself lands in later changes, and the existing read path is untouched
 //! until it does.
 //!
-//! Everything here is therefore unreachable from the crate's call graph. Each
-//! item that needs it carries its own `allow(dead_code)`, rather than a blanket
-//! allow on the module: a module-wide one would also silence an item that is
-//! dead by mistake, and this module has a lot of growing left to do. Drop the
-//! per-item allows as the reader wires in.
+//! Everything here is therefore unreachable from the crate's call graph, which
+//! the `allow(dead_code)` on each file silences. Hand-written items carry the
+//! allow per item so a mistakenly-dead one still warns; files ported wholesale
+//! carry it at file scope, since every item in them is live upstream. Drop the
+//! allows as the reader wires in.
 
+pub(crate) mod input_split;
+pub(crate) mod iterator_mode;
+pub(crate) mod profiling;
+pub(crate) mod read_stats;
 pub(crate) mod reader;
 pub(crate) mod reader_context;
 pub(crate) mod resolver;
