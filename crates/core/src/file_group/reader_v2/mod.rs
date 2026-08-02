@@ -30,13 +30,24 @@
 //! carry it at file scope, since every item in them is live upstream. Drop the
 //! allows as the reader wires in.
 
+/// Far-future instant standing in for "no upper bound on the timeline": every
+/// real instant sorts before it, so a read watermarked here sees the whole
+/// snapshot and no log block counts as a future block.
+///
+/// Comparison is lexicographic on purpose — instant times are zero-padded
+/// fixed-width strings.
+#[allow(dead_code)]
+pub(crate) const MAX_INSTANT_TIME: &str = "99991231235959999";
+
 pub(crate) mod buffer;
 pub(crate) mod buffered_record;
 pub(crate) mod buffered_record_converter;
 pub(crate) mod delete_context;
 pub(crate) mod input_split;
 pub(crate) mod iterator_mode;
+pub(crate) mod log_record_reader;
 pub(crate) mod merge_iterator;
+pub(crate) mod merged_log_record_reader;
 pub(crate) mod output_converter;
 pub(crate) mod profiling;
 pub(crate) mod read_stats;

@@ -41,6 +41,7 @@
 //!       └── [UnmergedFileGroupRecordBuffer]          (future)
 //! ```
 
+pub mod key_based;
 pub mod record_buffer;
 pub mod record_positions;
 pub mod row_extraction;

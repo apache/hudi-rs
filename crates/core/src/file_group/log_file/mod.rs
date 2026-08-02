@@ -27,7 +27,7 @@ use std::str::FromStr;
 mod avro;
 mod content;
 pub mod log_block;
-mod log_format;
+pub mod log_format;
 pub mod reader;
 pub mod scanner;
 
