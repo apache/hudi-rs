@@ -20,4 +20,5 @@
 //! Record buffers that hold log records while a file slice is merged.
 
 pub(crate) mod record_positions;
+pub(crate) mod spillable_map;
 pub(crate) mod row_extraction;

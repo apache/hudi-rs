@@ -94,6 +94,14 @@ prost = { version = "0.14" }
 
 # record positions: log blocks store them as a base64-encoded roaring bitmap
 base64 = { version = "0.22" }
+# Spill backend for the merge-on-read merge map. Bundles RocksDB 8.10 and needs
+# libclang to build (bindgen). Licenses: rocksdb Apache-2.0; librocksdb-sys
+# MIT/Apache-2.0/BSD-3-Clause.
+rocksdb = { version = "0.22" }
+# Fast hasher for the merge map (folded multiply, no hardware-AES dependency).
+foldhash = { version = "0.2" }
+# Collision-free per-read spill subdirectory names.
+uuid = { version = "1", features = ["v4"] }
 roaring = { version = "0.11" }
 
 # compression

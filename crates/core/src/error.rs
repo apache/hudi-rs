@@ -39,6 +39,10 @@ pub enum CoreError {
     #[error("{0}")]
     MergeRecordError(String),
 
+    /// The merge map exceeded its configured peak-memory ceiling.
+    #[error("{0}")]
+    MemoryLimitExceeded(String),
+
     #[error("Data type error: {0}")]
     Schema(String),
 
