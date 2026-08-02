@@ -32,6 +32,7 @@
 
 pub(crate) mod buffer;
 pub(crate) mod buffered_record;
+pub(crate) mod buffered_record_converter;
 pub(crate) mod delete_context;
 pub(crate) mod input_split;
 pub(crate) mod iterator_mode;
@@ -39,6 +40,8 @@ pub(crate) mod profiling;
 pub(crate) mod output_converter;
 pub(crate) mod read_stats;
 pub(crate) mod reader;
+pub(crate) mod record_merger;
 pub(crate) mod reader_context;
 pub(crate) mod resolver;
 pub(crate) mod row_serde;
+pub(crate) mod update_processor;
