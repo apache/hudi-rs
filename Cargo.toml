@@ -92,6 +92,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 # protobuf
 prost = { version = "0.14" }
 
+# record positions: log blocks store them as a base64-encoded roaring bitmap
+base64 = { version = "0.22" }
+roaring = { version = "0.11" }
+
 # compression
 flate2 = { version = "1" }
 
