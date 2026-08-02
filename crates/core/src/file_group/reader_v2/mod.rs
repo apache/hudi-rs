@@ -45,4 +45,5 @@ pub(crate) mod record_merger;
 pub(crate) mod reader_context;
 pub(crate) mod resolver;
 pub(crate) mod row_serde;
+pub(crate) mod schema_handler;
 pub(crate) mod update_processor;
