@@ -30,9 +30,11 @@
 //! carry it at file scope, since every item in them is live upstream. Drop the
 //! allows as the reader wires in.
 
+pub(crate) mod delete_context;
 pub(crate) mod input_split;
 pub(crate) mod iterator_mode;
 pub(crate) mod profiling;
+pub(crate) mod output_converter;
 pub(crate) mod read_stats;
 pub(crate) mod reader;
 pub(crate) mod reader_context;
