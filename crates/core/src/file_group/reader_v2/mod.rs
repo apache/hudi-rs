@@ -53,6 +53,7 @@ pub(crate) mod profiling;
 pub(crate) mod read_stats;
 pub(crate) mod reader;
 pub(crate) mod reader_context;
+pub(crate) mod reader_parameters;
 pub(crate) mod record_context;
 pub(crate) mod record_merger;
 pub(crate) mod resolver;

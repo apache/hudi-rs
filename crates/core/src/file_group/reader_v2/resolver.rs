@@ -186,7 +186,7 @@ mod tests {
     use crate::config::internal::HudiInternalConfig;
     use crate::config::plan::HudiPlanConfig;
     use crate::file_group::reader::FileGroupReader;
-    use crate::file_group::reader_v2::reader_context::ReaderParameters;
+    use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
     use std::sync::Arc;
 
     /// Configs with just enough set for the resolver to succeed. Includes an

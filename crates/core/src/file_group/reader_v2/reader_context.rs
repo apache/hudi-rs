@@ -419,15 +419,3 @@ impl AsRef<str> for MergeMode {
         }
     }
 }
-
-/// Flags controlling what the reader emits, independent of table state.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ReaderParameters {
-    /// Emit delete records to the caller instead of only applying them.
-    pub emit_delete: bool,
-    /// Sort the merged output.
-    pub sort_output: bool,
-    /// Admit log blocks from instants that have not completed.
-    pub allow_inflight_instants: bool,
-}

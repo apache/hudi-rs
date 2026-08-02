@@ -30,7 +30,8 @@
 
 use crate::Result;
 use crate::error::CoreError;
-use crate::file_group::reader_v2::reader_context::{ReaderContext, ReaderParameters};
+use crate::file_group::reader_v2::reader_context::ReaderContext;
+use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use arrow_array::RecordBatch;
 
 /// Reads one file slice.
@@ -85,7 +86,7 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::config::read::HudiReadConfig;
     use crate::config::table::HudiTableConfig;
-    use crate::file_group::reader_v2::reader_context::ReaderParameters;
+    use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
     use crate::file_group::reader_v2::resolver::resolve_reader_context;
 
     fn context() -> ReaderContext {
@@ -121,11 +122,15 @@ mod tests {
             emit_delete: true,
             sort_output: true,
             allow_inflight_instants: true,
+            ..Default::default()
         };
 
-        let reader = FileGroupReader::new(context(), parameters);
+        let reader = FileGroupReader::new(context(), parameters.clone());
 
         assert_eq!(reader.context().table_path, "file:///tmp/t");
-        assert_eq!(*reader.parameters(), parameters);
+        assert_eq!(
+            format!("{:?}", reader.parameters()),
+            format!("{parameters:?}")
+        );
     }
 }

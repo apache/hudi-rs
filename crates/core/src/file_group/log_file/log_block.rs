@@ -381,6 +381,26 @@ impl LogBlock {
         v.parse::<CommandBlock>()
     }
 
+    /// The `RECORD_POSITIONS` header value: the positions this block's records
+    /// occupy in the base file, as a base64-encoded Roaring64 bitmap, if the
+    /// writer recorded them.
+    #[must_use]
+    pub fn record_positions_header(&self) -> Option<&str> {
+        self.header
+            .get(&BlockMetadataKey::RecordPositions)
+            .map(String::as_str)
+    }
+
+    /// The `BASE_FILE_INSTANT_TIME_OF_RECORD_POSITIONS` header value: the base
+    /// file instant time this block's record positions were computed against.
+    /// Positions are only usable when it matches the base file being merged.
+    #[must_use]
+    pub fn base_file_instant_time_of_positions(&self) -> Option<&str> {
+        self.header
+            .get(&BlockMetadataKey::BaseFileInstantTimeOfRecordPositions)
+            .map(String::as_str)
+    }
+
     #[must_use]
     pub fn is_data_block(&self) -> bool {
         matches!(
