@@ -40,7 +40,6 @@ use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use crate::file_group::reader_v2::resolver::resolve_reader_context;
 use crate::storage::Storage;
 use arrow_array::RecordBatch;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -170,20 +169,30 @@ const GOLD_FIXTURES: &[&str] = &[
 
 /// Fixtures the reader does not read yet, with what stops each one.
 ///
-/// Three separate causes, none of them in the merge:
+/// Two causes remain, neither in the merge:
 ///
-/// - **Avro maps are modelled as a malformed Arrow type.** `avro_to_arrow`
-///   turns an Avro map into `Dictionary(Utf8, V)`, but an Arrow dictionary key
-///   must be an integer, so the array builder rejects it. Avro maps belong in
-///   Arrow's `Map` type. Changing that alters the schema of every table with a
-///   map column, including on the existing read path, so it is not folded in
-///   here.
-/// - **Delete blocks carrying a typed ordering value mis-decode.** The errors
-///   are an Avro decoder reading at the wrong offset, so the delete record
-///   schema being handed to it does not match what was written.
-/// - **A corrupt tail block is not recognised.** `LogFileReader` has no
-///   corrupt-block detection — `create_corrupted_block_if_needed` returns
-///   `None` — so it parses the trailing garbage as a block.
+/// **Avro maps are modelled as a malformed Arrow type.** `avro_to_arrow` turns
+/// an Avro map into `Dictionary(Utf8, V)`, but an Arrow dictionary key must be
+/// an integer, so the array builder rejects it. Avro maps belong in Arrow's
+/// `Map` type. Changing that alters the schema of every table with a map
+/// column, including on the existing read path.
+///
+/// **The delete record's ordering value has two shapes in the wild.** Hudi
+/// moved it into per-type wrapper records — `IntWrapper`, `DecimalWrapper` and
+/// so on — because Avro forbids a union holding two branches of the same
+/// underlying type. This crate carries only the older primitive union, so a log
+/// file written the newer way resolves each branch index to the wrong type.
+///
+/// The two shapes cannot be told apart by decoding: a wrapper is a record whose
+/// single field is the primitive, so `IntWrapper` and a bare `long` encode to
+/// the same bytes. Only the branch index differs. Reading both therefore needs
+/// to key off the writer version rather than the payload, which is a design
+/// question rather than a decoding one — and swapping to the newer schema
+/// outright breaks the fixtures written the older way.
+///
+/// **A corrupt tail block is not recognised.** `LogFileReader` has no
+/// corrupt-block detection — `create_corrupted_block_if_needed` returns `None`
+/// — so it parses the trailing garbage as a block.
 const KNOWN_GAPS: &[(&str, &str)] = &[
     (
         "table_column_projection",
@@ -199,33 +208,37 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ),
     ("table_corrupt_tail_block", "no corrupt-block detection"),
     (
+        "table_delete_ord_int",
+        "delete ordering value written wrapped",
+    ),
+    (
         "table_delete_ord_long",
-        "delete block mis-decode: negative length",
+        "delete ordering value written wrapped",
     ),
     (
         "table_delete_ord_double",
-        "delete block mis-decode: bad metadata key",
+        "delete ordering value written wrapped",
     ),
     (
         "table_delete_ord_decimal",
-        "delete block mis-decode: union index",
+        "delete ordering value written wrapped",
+    ),
+    (
+        "table_delete_ord_string",
+        "delete ordering value written wrapped",
     ),
     (
         "table_delete_ord_timestamp",
-        "delete block mis-decode: union index",
+        "delete ordering value written wrapped",
     ),
 ];
 
-/// Fixtures carrying no gold snapshot, so there is nothing to compare against.
+/// Ships no snapshot and has no settled expectation.
 ///
 /// `table_hfile_log_block` was dumped against a reader with no HFile support,
 /// where the expectation was a loud failure; this crate does read HFile, so
 /// what it should assert is an open question.
-const NO_GOLD: &[&str] = &[
-    "table_delete_ord_int",
-    "table_delete_ord_string",
-    "table_hfile_log_block",
-];
+const NO_GOLD: &[&str] = &["table_hfile_log_block"];
 
 fn fixture_zip(name: &str) -> String {
     format!(
