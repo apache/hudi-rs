@@ -30,6 +30,7 @@ use tempfile::{Builder as TempDirBuilder, tempdir};
 use url::Url;
 use zip::ZipArchive;
 
+pub mod gold;
 pub mod util;
 
 #[cfg(feature = "datafusion")]
@@ -163,6 +164,156 @@ pub enum QuickstartTripsTable {
     V8Trips8I3U1D,
     #[strum(serialize = "v9_trips_lance")]
     V9TripsLance,
+    /// v9 MOR table, 8 inserts + 4 updates, COMMIT_TIME_ORDERING.
+    /// Schema: id INT, name STRING, age INT, ts STRING, city STRING (partitioned by city)
+    /// Commit 1: INSERT 8 rows → base .parquet per partition
+    /// Commit 2: UPSERT 4 rows (ids 1,3,5,7) → .log files
+    #[strum(serialize = "v9_mor_8i4u_commit_time")]
+    V9Mor8I4UCommitTime,
+    /// v9 MOR non-partitioned table, 3 commits (insert + merge-delete + merge-update).
+    /// Schema: id INT, name STRING, price DOUBLE, ts LONG (non-partitioned)
+    /// Commit 1: INSERT 7 rows (ids 0-6) → base .parquet
+    /// Commit 2: MERGE INTO DELETE 3 rows (ids 0,1,2) → .log file 1 (delete block)
+    /// Commit 3: MERGE INTO UPDATE 3 rows (ids 4,5,6) → .log file 2 (avro data block)
+    #[strum(serialize = "v9_mor_nonpart_3commits")]
+    V9MorNonpart3Commits,
+    /// v9 MOR non-partitioned, log-only with compacted log block (5 log files).
+    #[strum(serialize = "table_log_compaction")]
+    MorLayoutLogCompaction,
+    /// v9 MOR non-partitioned, log-only (3 log files: insert + update + delete).
+    #[strum(serialize = "table_log_only")]
+    MorLayoutLogOnly,
+    /// v9 MOR non-partitioned, base + 2 log files (update + delete), all column types.
+    #[strum(serialize = "table_column_projection")]
+    MorLayoutColumnProjection,
+    /// v9 MOR non-partitioned, base + 3 log files (update + delete + update), all data types.
+    #[strum(serialize = "table_all_data_types")]
+    MorLayoutAllDataTypes,
+    /// v9 MOR non-partitioned, base + 1 log file containing NULL container elements.
+    /// Schema: id INT, arr_null_elem ARRAY<INT>, map_null_val MAP<STRING,INT>,
+    /// st_null_field STRUCT<a INT, b STRING>, arr_empty ARRAY<STRING>,
+    /// map_empty MAP<STRING,INT>, emptyinit_arr ARRAY<INT>, ts LONG
+    /// Commit 1: INSERT 12 rows (ids 1-12) → base .parquet
+    /// Commit 2: UPDATE id=1 SET arr_null_elem = array(1, NULL, 3), ts = 101 → .log file
+    /// (avro data block whose array carries a NULL element)
+    #[strum(serialize = "table_null_containers")]
+    MorLayoutNullContainers,
+    /// v9 MOR non-partitioned, base + 2 AVRO log files with a CORRUPT tail block.
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e), self-validating generator that asserts the log
+    /// layout before dumping gold.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1 (AVRO data block) + log.2 (AVRO data block
+    /// followed by appended garbage bytes forming a CORRUPT tail block).
+    /// Semantics: the corrupt tail block is skipped during log scan
+    /// (`total_corrupt_log_blocks >= 1`) and the valid data is read intact.
+    /// gold_data = Spark `SELECT *` snapshot, 4 rows.
+    #[strum(serialize = "table_corrupt_tail_block")]
+    MorLayoutCorruptTailBlock,
+    /// v9 MOR non-partitioned, base + 3 PARQUET-format log files.
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e); written with `hoodie.logfile.data.block.format=parquet`.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1/log.2 (PARQUET_DATA_BLOCK) + log.3
+    /// (DELETE block).
+    /// Semantics: parquet log blocks are decoded and merged, delete block
+    /// applied. gold_data = Spark `SELECT *` snapshot, 3 rows.
+    #[strum(serialize = "table_parquet_log_block")]
+    MorLayoutParquetLogBlock,
+    /// v9 MOR non-partitioned, base + 1 AVRO log file carrying a PARTIAL-update
+    /// data block (`IS_PARTIAL=true` block header).
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e); MERGE INTO updating a column subset with partial
+    /// updates enabled.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1 (AVRO data block, `IS_PARTIAL=true`).
+    /// Semantics: hudi-rs applies IS_PARTIAL / KEEP_VALUES blocks by overlaying
+    /// the updated column subset onto the prior record (the D7 refuse-loudly gap
+    /// is now closed). gold_data = Spark `SELECT *` snapshot, 4 rows (the
+    /// merge-correct truth the applied result must match).
+    #[strum(serialize = "table_partial_update")]
+    MorLayoutPartialUpdate,
+    /// v9 MOR non-partitioned, base + 1 HFILE-format log file
+    /// (`HFILE_DATA_BLOCK`).
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e); written with `hoodie.logfile.data.block.format=hfile`.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1 (HFILE_DATA_BLOCK). The fixture carries no
+    /// gold_data: it was dumped against a reader with no HFile support, where
+    /// the expectation was a loud failure. This crate does read HFile (for the
+    /// metadata table), so what this fixture should assert here is an open
+    /// question — hence no case wired up for it yet.
+    #[strum(serialize = "table_hfile_log_block")]
+    MorLayoutHfileLogBlock,
+
+    // -------------------------------------------------------------------------
+    // Delete-block orderingVal wrapper-type fixtures (Task 7).
+    // Each table: v9 MOR, COMMIT_TIME_ORDERING, NON_PARTITIONED, 4 rows inserted
+    // (ids 1-4), ids 3 and 4 deleted via upsert with `_hoodie_is_deleted=true`.
+    // After applying the DELETE log block: ids 1 and 2 remain.
+    // Schema: id INT32, val STRING, ts <type-under-test> (non-partitioned).
+    // Generated by gold Hudi Spark; provenance: hudi-rs-delete-fixtures.
+    // -------------------------------------------------------------------------
+    /// DELETE block orderingVal type: IntWrapper (Avro int).
+    /// ts column is INT32; precombine values in delete block: [4, 3].
+    #[strum(serialize = "table_delete_ord_int")]
+    MorDeleteOrdInt,
+    /// DELETE block orderingVal type: LongWrapper (Avro long).
+    /// ts column is INT64; precombine values in delete block: [4000, 3000].
+    #[strum(serialize = "table_delete_ord_long")]
+    MorDeleteOrdLong,
+    /// DELETE block orderingVal type: DoubleWrapper (Avro double).
+    /// ts column is FLOAT64; precombine values in delete block: [6.0, 4.5].
+    #[strum(serialize = "table_delete_ord_double")]
+    MorDeleteOrdDouble,
+    /// DELETE block orderingVal type: StringWrapper (Avro string).
+    /// ts column is UTF8; precombine values in delete block: ["ord_4", "ord_3"].
+    #[strum(serialize = "table_delete_ord_string")]
+    MorDeleteOrdString,
+    /// DELETE block orderingVal type: DecimalWrapper (precision=30, scale=15).
+    /// ts column is DECIMAL(20,4); precombine values in delete block: [4.0, 3.0].
+    #[strum(serialize = "table_delete_ord_decimal")]
+    MorDeleteOrdDecimal,
+    /// DELETE block orderingVal type: TimestampMicrosWrapper (Avro long / epoch µs).
+    /// ts column is TIMESTAMP[us, UTC]; precombine values stored as Long (epoch
+    /// micros). ENG-42987-adjacent: unwrapAvroValueWrapper returns Long, not
+    /// Instant — but the delete block IS written and can be decoded.
+    #[strum(serialize = "table_delete_ord_timestamp")]
+    MorDeleteOrdTimestamp,
+
+    // -------------------------------------------------------------------------
+    // Schema-on-write evolution fixtures (0610 review).
+    // Provenance: hudi-internal `TestMORFileSliceLayoutsSchemaEvo` (self-
+    // validating generator: asserts v9/MOR/COMMIT_TIME, 1 base + 2 avro logs,
+    // and the two data blocks carrying DIFFERENT writer schemas).
+    // -------------------------------------------------------------------------
+    /// v9 MOR non-partitioned, base + 2 AVRO logs written under DIFFERENT
+    /// writer schemas (added column).
+    ///
+    /// Schema v1: key STRING, ts LONG, val STRING; v2 adds extra STRING.
+    /// c1 INSERT k1-k4 (base @ v1) → c2 UPDATE k1 (log1 @ v1, no `extra`)
+    /// → ALTER TABLE ADD COLUMNS (extra STRING)
+    /// → c3 UPDATE k2 SET val,extra (log2 @ v2).
+    /// Merged truth: k1 v1_upd/NULL, k2 v2_upd/x2, k3 v3/NULL, k4 v4/NULL.
+    /// gold_data = Spark `SELECT *` snapshot, 4 rows.
+    #[strum(serialize = "table_evo_add_col")]
+    MorEvoAddCol,
+    /// v9 MOR non-partitioned, base + 2 AVRO logs written under DIFFERENT
+    /// writer schemas (type promotion int→long and float→double).
+    ///
+    /// Schema v1: key STRING, ts LONG, num INT, fnum FLOAT; v2 promotes num
+    /// to LONG and fnum to DOUBLE (schema-on-write DataFrame upsert).
+    /// c1 INSERT k1-k4 (base @ v1) → c2 UPDATE k1 num=11 (log1 @ INT/FLOAT)
+    /// → c3 upsert k2 num=5000000000 (beyond i32), fnum=2.25 (log2 @ LONG/DOUBLE).
+    /// Merged truth: k1 11/1.25, k2 5000000000/2.25, k3 3/3.75, k4 4/5.0.
+    /// gold_data = path-based snapshot (the SQL catalog keeps the
+    /// pre-promotion types), 4 rows.
+    #[strum(serialize = "table_evo_promotion")]
+    MorEvoPromotion,
 }
 
 impl QuickstartTripsTable {
@@ -215,8 +366,11 @@ impl QuickstartTripsTable {
 
     pub fn available_formats(&self) -> &'static [TableFormat] {
         match self {
-            Self::V6Trips8I1U | Self::V6Trips8I3D | Self::V8Trips8I3U1D => MOR_AVRO,
             Self::V9TripsLance => COW_AND_MOR_AVRO,
+            // Everything else is a merge-on-read fixture with Avro log blocks.
+            // The layout fixtures in particular exist to exercise log-block
+            // shapes, so they have no copy-on-write counterpart.
+            _ => MOR_AVRO,
         }
     }
 

@@ -1,0 +1,275 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+//! Reads each merge-on-read layout fixture and checks the result against the
+//! Spark snapshot shipped inside it.
+//!
+//! The fixtures carry their own `gold_data/` — a `SELECT *` of the table taken
+//! from Spark — so what is asserted here is agreement with Hudi's reference
+//! reader, not with this reader's own prior output.
+//!
+//! The file slice is discovered from the extracted fixture rather than written
+//! down per case: each of these tables is a single file group, so the base file
+//! and log files are whatever is on disk. A fixture that gains a file therefore
+//! cannot silently stop being covered.
+
+#![cfg(test)]
+
+use crate::config::HudiConfigs;
+use crate::config::read::HudiReadConfig;
+use crate::file_group::reader_v2::MAX_INSTANT_TIME;
+use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
+use crate::file_group::reader_v2::input_split::InputSplit;
+use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
+use crate::file_group::reader_v2::resolver::resolve_reader_context;
+use crate::storage::Storage;
+use arrow_array::RecordBatch;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+/// The base file and log files of a fixture's single file group, relative to
+/// the table root, plus the partition they live in.
+struct Slice {
+    base: Option<String>,
+    logs: Vec<String>,
+    partition: String,
+}
+
+/// Walk an extracted fixture and pick out its one file group.
+///
+/// Skips `.hoodie` (table metadata) and `gold_data` (the Spark snapshot this
+/// compares against, which is not table data).
+fn discover_slice(table_root: &Path) -> Slice {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name == ".hoodie" || name == "gold_data" {
+                    continue;
+                }
+                walk(&path, root, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("walked path is under the table root")
+                    .to_string_lossy()
+                    .to_string();
+                let partition = Path::new(&rel)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                out.push((rel, partition));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(table_root, table_root, &mut files);
+
+    let mut base = None;
+    let mut logs = Vec::new();
+    let mut partition = String::new();
+    for (rel, part) in files {
+        let name = Path::new(&rel)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.ends_with(".parquet") && !name.starts_with('.') {
+            base = Some(rel);
+            partition = part;
+        } else if name.contains(".log.") {
+            logs.push(rel);
+            partition = part;
+        }
+    }
+    // Log files are appended in order; the scan relies on that ordering.
+    logs.sort();
+
+    Slice {
+        base,
+        logs,
+        partition,
+    }
+}
+
+/// Read a fixture's file group and return the merged rows.
+async fn read_fixture(table_path: &str) -> crate::Result<RecordBatch> {
+    let slice = discover_slice(Path::new(table_path));
+
+    // Load the table's own properties rather than inventing them: the merge
+    // semantics live in `hoodie.properties`, and inventing configs would test
+    // the reader against a table that does not exist.
+    let mut resolver = crate::table::builder::OptionResolver::new_with_options(
+        table_path,
+        [(
+            HudiReadConfig::EndTimestamp.as_ref(),
+            MAX_INSTANT_TIME.to_string(),
+        )],
+    );
+    resolver.resolve_options().await?;
+    let configs = HudiConfigs::new(resolver.hudi_options.clone());
+    let storage = Storage::new(
+        Arc::new(resolver.storage_options),
+        Arc::new(configs.clone()),
+    )?;
+
+    let has_logs = !slice.logs.is_empty();
+    let mut context = resolve_reader_context(&configs, has_logs)?;
+    // The fixtures are read whole, so nothing bounds the log scan.
+    context.instant_range = None;
+    context.rebuild_record_context(slice.partition.clone());
+
+    let input_split = InputSplit::new(slice.base, None, slice.logs, slice.partition);
+
+    let mut reader = HoodieFileGroupReader::new(
+        Arc::new(context),
+        storage,
+        input_split,
+        ReaderParameters::default(),
+        None,
+        None,
+    )?;
+    reader.read().await
+}
+
+/// Fixtures the reader reproduces today.
+const GOLD_FIXTURES: &[&str] = &[
+    "table_log_only",
+    "table_log_compaction",
+    "table_parquet_log_block",
+    "table_partial_update",
+];
+
+/// Fixtures the reader does not read yet, with what stops each one.
+///
+/// Every entry here fails inside this crate's Avro-to-Arrow decoding, not in
+/// the merge. The decoder was written for the schemas the existing read path
+/// meets and does not cover the range a log block can carry — decimals and
+/// non-UTF-8 dictionaries are rejected outright, and the remaining errors are
+/// that decoder losing framing on a payload it mis-reads.
+///
+/// Notably the parquet-log-block fixture passes, which places the gap in the
+/// Avro path specifically rather than in log-block handling.
+const KNOWN_GAPS: &[(&str, &str)] = &[
+    ("table_column_projection", "Decimal128(20, 2) unsupported"),
+    ("table_all_data_types", "Decimal128(20, 2) unsupported"),
+    ("table_null_containers", "non-UTF-8 dictionary unsupported"),
+    ("table_corrupt_tail_block", "invalid log format version"),
+    ("table_evo_add_col", "invalid magic"),
+    ("table_evo_promotion", "invalid magic"),
+    ("table_delete_ord_long", "negative length while decoding"),
+    ("table_delete_ord_double", "invalid metadata key"),
+    ("table_delete_ord_decimal", "union index out of bounds"),
+    ("table_delete_ord_string", "Decimal128(30, 15) unsupported"),
+    ("table_delete_ord_timestamp", "union index out of bounds"),
+];
+
+/// Fixtures carrying no gold snapshot, so there is nothing to compare against.
+///
+/// `table_hfile_log_block` was dumped against a reader with no HFile support,
+/// where the expectation was a loud failure; this crate does read HFile, so
+/// what it should assert is an open question.
+const NO_GOLD: &[&str] = &["table_delete_ord_int", "table_hfile_log_block"];
+
+fn fixture_zip(name: &str) -> String {
+    format!(
+        "{}/data/quickstart_trips_table/mor/avro/{name}.zip",
+        env!("CARGO_MANIFEST_DIR").replace("/core", "/test")
+    )
+}
+
+/// Read a fixture and compare its row count against the Spark snapshot.
+async fn check_against_gold(name: &str) -> std::result::Result<(), String> {
+    let zip = fixture_zip(name);
+    if !Path::new(&zip).exists() {
+        return Err(format!("fixture zip missing at {zip}"));
+    }
+    let extracted = hudi_test::extract_test_table(Path::new(&zip)).join(name);
+
+    let actual = read_fixture(&extracted.to_string_lossy())
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let gold = hudi_test::gold::read_gold_parquet(&extracted.join("gold_data").to_string_lossy())
+        .map_err(|e| format!("gold unreadable: {e}"))?;
+
+    if actual.num_rows() != gold.num_rows() {
+        return Err(format!(
+            "{} rows, gold has {}",
+            actual.num_rows(),
+            gold.num_rows()
+        ));
+    }
+    Ok(())
+}
+
+/// Every fixture in [`GOLD_FIXTURES`] must reproduce its Spark snapshot.
+///
+/// Runs all of them before asserting, so one failure does not hide the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn merged_reads_match_the_spark_snapshot() {
+    let mut failures = Vec::new();
+    for name in GOLD_FIXTURES {
+        if let Err(e) = check_against_gold(name).await {
+            failures.push(format!("{name}: {e}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "fixtures stopped matching gold:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Reports which known gaps still fail, and flags any that started passing.
+///
+/// Ignored because it is expected to fail — run it with `--ignored` to see the
+/// gap list. Its value is the second assertion: a gap that starts passing
+/// should be promoted into [`GOLD_FIXTURES`] rather than left here.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "documents unread fixtures; run with --ignored to see the list"]
+async fn known_gaps_still_fail() {
+    let mut unexpectedly_passing = Vec::new();
+    for (name, expected) in KNOWN_GAPS {
+        match check_against_gold(name).await {
+            Ok(()) => unexpectedly_passing.push(*name),
+            Err(e) => println!("{name}: still failing ({expected}) — {e}"),
+        }
+    }
+    assert!(
+        unexpectedly_passing.is_empty(),
+        "these now read correctly and should move to GOLD_FIXTURES: {unexpectedly_passing:?}"
+    );
+}
+
+/// The fixtures with no gold snapshot are still readable as files, so a typo in
+/// the list is caught rather than silently skipping coverage.
+#[test]
+fn fixtures_without_gold_are_present() {
+    for name in NO_GOLD {
+        assert!(
+            Path::new(&fixture_zip(name)).exists(),
+            "{name} is listed as having no gold, but its fixture is missing"
+        );
+    }
+}

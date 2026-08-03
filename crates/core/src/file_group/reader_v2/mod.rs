@@ -44,6 +44,8 @@ pub(crate) mod buffered_record;
 pub(crate) mod buffered_record_converter;
 pub(crate) mod delete_context;
 pub(crate) mod engine;
+#[cfg(test)]
+mod gold_tests;
 pub(crate) mod input_split;
 pub(crate) mod iterator_mode;
 pub(crate) mod log_record_reader;

@@ -88,6 +88,12 @@ pub(crate) fn resolve_reader_context(
     })
 }
 
+/// How a v9 table states its merge semantics. Not modelled as a
+/// [`HudiTableConfig`] yet — this crate does not otherwise read it — so it is
+/// looked up by name.
+#[allow(dead_code)]
+const RECORD_MERGE_MODE: &str = "hoodie.record.merge.mode";
+
 /// Prefix identifying a per-read config.
 #[allow(dead_code)]
 const READ_CONFIG_PREFIX: &str = "hoodie.read.";
@@ -165,6 +171,19 @@ fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
 /// rows a query returns.
 #[allow(dead_code)]
 fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
+    // A v9 table states its merge semantics directly. Prefer that over
+    // inferring them: the inference below predates the key and gets a
+    // commit-time-ordered table with no ordering field wrong.
+    if let Some(mode) = hudi_configs.as_options().get(RECORD_MERGE_MODE) {
+        return match mode.to_ascii_uppercase().as_str() {
+            "COMMIT_TIME_ORDERING" => Ok(MergeMode::CommitTimeOrdering),
+            "EVENT_TIME_ORDERING" => Ok(MergeMode::EventTimeOrdering),
+            other => Err(CoreError::Unsupported(format!(
+                "Record merge mode '{other}' is not supported."
+            ))),
+        };
+    }
+
     let strategy: String = hudi_configs
         .get_or_default(HudiTableConfig::RecordMergeStrategy)
         .into();
