@@ -18,7 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::read::HudiReadConfig;
+use crate::config::read::{HudiReadConfig, MergeEngineValue};
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
@@ -46,6 +46,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// The reader that handles all read operations against a file group.
@@ -198,6 +199,100 @@ impl FileGroupReader {
         ))
     }
 
+    /// Which merge implementation should serve this read.
+    ///
+    /// Defaults to the one that has always served it. A metadata table always
+    /// uses that one regardless of the setting: its base files and log blocks
+    /// are HFile, which the merge-on-read reader cannot read at all.
+    fn merge_engine(&self) -> Result<MergeEngineValue> {
+        if self.is_metadata_table() {
+            return Ok(MergeEngineValue::Legacy);
+        }
+        // Read the raw value rather than going through `get_or_default`, which
+        // falls back to the default when a value fails to parse. A typo in the
+        // engine name would then silently read with the other engine, which is
+        // the one outcome this switch must not produce.
+        match self
+            .hudi_configs
+            .as_options()
+            .get(HudiReadConfig::MergeEngine.as_ref())
+        {
+            Some(raw) => MergeEngineValue::from_str(raw).map_err(CoreError::Config),
+            None => Ok(MergeEngineValue::default()),
+        }
+    }
+
+    /// The table schema, as the merge-on-read reader requires it up front.
+    ///
+    /// Taken from `hoodie.table.create.schema`, which `OptionResolver` already
+    /// loads, so this costs no extra I/O. `None` means the table did not record
+    /// one; the caller refuses rather than guessing.
+    ///
+    /// A schema that is present but does not parse is an error, not a `None`.
+    /// The two are different situations and the second one is a broken table —
+    /// reporting it as "no schema was resolved" would send the reader looking
+    /// in the wrong place.
+    fn resolved_data_schema(&self) -> Result<Option<arrow_schema::SchemaRef>> {
+        let Some(value) = self.hudi_configs.try_get(HudiTableConfig::CreateSchema)? else {
+            return Ok(None);
+        };
+        let avro: String = value.into();
+        // The value arrives as it was written to `hoodie.properties`, where Java
+        // escapes `:` as `\:`. Left in place it is not valid JSON.
+        let avro = crate::schema::resolver::sanitize_avro_schema_str(&avro);
+        let schema = crate::schema::resolver::avro_json_to_arrow_schema(&avro)?;
+
+        // The create schema is the schema the user wrote, so it stops short of
+        // the `_hoodie_*` columns the writer adds. The files have them, and the
+        // merge needs the record key among them.
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        let schema = if populates_meta_fields {
+            crate::schema::prepend_meta_fields(std::sync::Arc::new(schema))?
+        } else {
+            schema
+        };
+        Ok(Some(std::sync::Arc::new(schema)))
+    }
+
+    /// Read one slice through the merge-on-read reader.
+    ///
+    /// Filters and projection are not applied here: the caller runs the result
+    /// through the same `apply_eager_options` the other paths use, so the two
+    /// engines cannot disagree about what a filter means.
+    async fn read_via_v2(
+        &self,
+        base_file_path: &str,
+        log_file_paths: Vec<String>,
+    ) -> Result<RecordBatch> {
+        let data_schema = self.resolved_data_schema()?;
+        if let Some(reason) = crate::file_group::reader_v2::adapter::refuse_reason(
+            self.is_metadata_table(),
+            data_schema.as_ref(),
+        ) {
+            return Err(reason);
+        }
+
+        // The partition a slice lives in is the directory its base file sits
+        // in; a non-partitioned table yields an empty path, which is correct.
+        let partition_path = std::path::Path::new(base_file_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        crate::file_group::reader_v2::adapter::read_file_slice(
+            self.hudi_configs.clone(),
+            self.storage.clone(),
+            base_file_path,
+            log_file_paths,
+            partition_path,
+            data_schema,
+        )
+        .await
+    }
+
     /// Reads the data from the given file slice.
     ///
     /// See [`Self::read_file_slice_from_paths`] for how `options` is applied.
@@ -243,7 +338,21 @@ impl FileGroupReader {
             .collect();
         let base_file_only = log_file_paths.is_empty() || options.is_read_optimized()?;
 
-        let merged = if base_file_only {
+        // With no log files there is nothing to merge, so the setting has
+        // nothing to select and both engines read the base file the same way.
+        //
+        // The merge-on-read engine can serve these reads — it reduces to a base
+        // file read — but it takes its schema from `hoodie.table.create.schema`
+        // where this path takes it from the base file itself, and the Avro
+        // conversion in between models a map as `Dictionary(Utf8, V)`. That is
+        // not a valid Arrow type (dictionary keys must be integers) and does not
+        // reconcile against the `Map` the base file really has. Routing these
+        // reads through it would turn working reads into failures for the sake
+        // of uniformity. Deriving its schema from the base file instead would
+        // remove the difference; that is a change on its own.
+        let merged = if self.merge_engine()? == MergeEngineValue::V2 && !base_file_only {
+            self.read_via_v2(base_file_path, log_file_paths).await?
+        } else if base_file_only {
             self.read_base_file_eager(base_file_path).await?
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan()?;
@@ -1393,6 +1502,160 @@ mod tests {
             total_rows += batch?.num_rows();
         }
         assert!(total_rows > 0);
+        Ok(())
+    }
+
+    /// The default must keep using the reader that has always served reads. If
+    /// this ever flips by accident, every other test still passes — they do not
+    /// say which engine produced their result — so it is asserted directly.
+    #[tokio::test]
+    async fn merge_engine_defaults_to_legacy() -> Result<()> {
+        use hudi_test::SampleTable;
+        let base_url = SampleTable::V9TxnsSimpleMeta.url_to_mor_avro();
+        let reader = FileGroupReader::new_with_options(base_url.as_ref(), empty_options()).await?;
+        assert_eq!(reader.merge_engine()?, MergeEngineValue::Legacy);
+        Ok(())
+    }
+
+    /// A metadata table ignores the setting. Its base files and log blocks are
+    /// HFile, which the merge-on-read reader cannot read, so honoring `v2`
+    /// there would fail somewhere deeper and less clearly.
+    #[tokio::test]
+    async fn metadata_table_stays_on_the_legacy_engine() -> Result<()> {
+        let configs = Arc::new(HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref(),
+                get_metadata_table_base_uri(),
+            ),
+            (HudiReadConfig::MergeEngine.as_ref(), "v2".to_string()),
+        ]));
+        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        assert!(reader.is_metadata_table());
+        assert_eq!(reader.merge_engine()?, MergeEngineValue::Legacy);
+        Ok(())
+    }
+
+    /// Asking for the merge-on-read engine routes to it. Without this the
+    /// switch could be wired to nothing and every test would still pass.
+    #[tokio::test]
+    async fn v2_engine_is_selected_when_asked_for() -> Result<()> {
+        use hudi_test::SampleTable;
+        let base_url = SampleTable::V9TxnsSimpleMeta.url_to_mor_avro();
+        let reader = FileGroupReader::new_with_options(
+            base_url.as_ref(),
+            [(HudiReadConfig::MergeEngine.as_ref(), "v2")],
+        )
+        .await?;
+        assert_eq!(reader.merge_engine()?, MergeEngineValue::V2);
+        Ok(())
+    }
+
+    /// Selecting the merge-on-read engine must not change what a base-file-only
+    /// read returns. There is no merge for the setting to select, so the read
+    /// takes the same path either way.
+    ///
+    /// This is the one comparison the two engines can be held to today: with no
+    /// log files there is nothing for them to disagree about, so it does not
+    /// wait on the merge-mode question. It also fails if the base-file-only
+    /// reads are ever routed through the merge-on-read engine without first
+    /// giving it the base file's schema — see the note on the dispatch.
+    #[tokio::test]
+    async fn asking_for_v2_does_not_change_a_base_file_only_read() -> Result<()> {
+        let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
+
+        let legacy = FileGroupReader::new_with_options(&base_uri, empty_options())
+            .await?
+            .read_file_slice_from_paths(&base_file_name, Vec::<&str>::new(), &ReadOptions::new())
+            .await?;
+
+        let v2_reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [(HudiReadConfig::MergeEngine.as_ref(), "v2")],
+        )
+        .await?;
+        assert_eq!(v2_reader.merge_engine()?, MergeEngineValue::V2);
+        let v2 = v2_reader
+            .read_file_slice_from_paths(&base_file_name, Vec::<&str>::new(), &ReadOptions::new())
+            .await?;
+
+        assert_eq!(v2.num_rows(), legacy.num_rows());
+        assert_eq!(v2.schema(), legacy.schema());
+        assert_eq!(v2, legacy);
+        Ok(())
+    }
+
+    /// Read-optimized mode means the log files are not read, and asking for the
+    /// merge-on-read engine must not resurrect them.
+    #[tokio::test]
+    async fn asking_for_v2_does_not_defeat_read_optimized_mode() -> Result<()> {
+        let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [
+                (HudiReadConfig::MergeEngine.as_ref(), "v2"),
+                (HudiReadConfig::UseReadOptimizedMode.as_ref(), "true"),
+            ],
+        )
+        .await?;
+
+        // A path that cannot be read: the call only succeeds if the log files
+        // were dropped rather than handed to the engine.
+        let bogus_log = vec![".does-not-exist.log.1_0-0-0".to_string()];
+        let batch = reader
+            .read_file_slice_from_paths(&base_file_name, bogus_log, &ReadOptions::new())
+            .await?;
+        assert!(batch.num_rows() > 0);
+        Ok(())
+    }
+
+    /// A slice with log files, read with the merge-on-read engine, actually
+    /// reads.
+    ///
+    /// Selecting an engine and reaching it are different things: every other
+    /// test here asserts the selection, which a dispatch wired to nothing would
+    /// still satisfy. This one goes through the dispatch to the engine and back
+    /// out through `apply_eager_options`.
+    #[tokio::test]
+    async fn v2_reads_a_slice_with_log_files_through_the_dispatch() -> Result<()> {
+        let (base_uri, partition, base_file_name, log_file_name) = v8_trips_mor_first_slice();
+        let base_path = format!("{partition}/{base_file_name}");
+        let log_path = format!("{partition}/{log_file_name}");
+
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [(HudiReadConfig::MergeEngine.as_ref(), "v2")],
+        )
+        .await?;
+        let batch = reader
+            .read_file_slice_from_paths(&base_path, vec![log_path.clone()], &ReadOptions::new())
+            .await?;
+
+        assert!(batch.num_rows() > 0, "expected a merged result");
+
+        let legacy = FileGroupReader::new_with_options(&base_uri, empty_options())
+            .await?
+            .read_file_slice_from_paths(&base_path, vec![log_path.clone()], &ReadOptions::new())
+            .await?;
+        assert_eq!(batch.num_rows(), legacy.num_rows(), "row count differs");
+        Ok(())
+    }
+
+    /// An unknown value fails at the read rather than silently falling back to
+    /// a different engine than the caller asked for.
+    #[tokio::test]
+    async fn unknown_merge_engine_is_an_error() -> Result<()> {
+        use hudi_test::SampleTable;
+        let base_url = SampleTable::V9TxnsSimpleMeta.url_to_mor_avro();
+        let reader = FileGroupReader::new_with_options(
+            base_url.as_ref(),
+            [(HudiReadConfig::MergeEngine.as_ref(), "turbo")],
+        )
+        .await?;
+        let err = reader.merge_engine().unwrap_err();
+        assert!(
+            err.to_string().contains("turbo"),
+            "error should name the value, got: {err}"
+        );
         Ok(())
     }
 }

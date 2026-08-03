@@ -39,6 +39,7 @@
 #[allow(dead_code)]
 pub(crate) const MAX_INSTANT_TIME: &str = "99991231235959999";
 
+pub(crate) mod adapter;
 pub(crate) mod buffer;
 pub(crate) mod buffered_record;
 pub(crate) mod buffered_record_converter;
@@ -54,7 +55,6 @@ pub(crate) mod merged_log_record_reader;
 pub(crate) mod output_converter;
 pub(crate) mod profiling;
 pub(crate) mod read_stats;
-pub(crate) mod reader;
 pub(crate) mod reader_context;
 pub(crate) mod reader_parameters;
 pub(crate) mod record_context;
