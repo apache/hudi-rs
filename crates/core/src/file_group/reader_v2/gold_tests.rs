@@ -95,6 +95,11 @@ fn discover_slice(table_root: &Path) -> Slice {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        // Hadoop writes a `..<file>.crc` checksum sidecar next to each data
+        // file. It is not table data and must not reach the readers.
+        if name.ends_with(".crc") {
+            continue;
+        }
         if name.ends_with(".parquet") && !name.starts_with('.') {
             base = Some(rel);
             partition = part;
@@ -159,30 +164,56 @@ const GOLD_FIXTURES: &[&str] = &[
     "table_log_compaction",
     "table_parquet_log_block",
     "table_partial_update",
+    "table_evo_add_col",
+    "table_evo_promotion",
 ];
 
 /// Fixtures the reader does not read yet, with what stops each one.
 ///
-/// Every entry here fails inside this crate's Avro-to-Arrow decoding, not in
-/// the merge. The decoder was written for the schemas the existing read path
-/// meets and does not cover the range a log block can carry — decimals and
-/// non-UTF-8 dictionaries are rejected outright, and the remaining errors are
-/// that decoder losing framing on a payload it mis-reads.
+/// Three separate causes, none of them in the merge:
 ///
-/// Notably the parquet-log-block fixture passes, which places the gap in the
-/// Avro path specifically rather than in log-block handling.
+/// - **Avro maps are modelled as a malformed Arrow type.** `avro_to_arrow`
+///   turns an Avro map into `Dictionary(Utf8, V)`, but an Arrow dictionary key
+///   must be an integer, so the array builder rejects it. Avro maps belong in
+///   Arrow's `Map` type. Changing that alters the schema of every table with a
+///   map column, including on the existing read path, so it is not folded in
+///   here.
+/// - **Delete blocks carrying a typed ordering value mis-decode.** The errors
+///   are an Avro decoder reading at the wrong offset, so the delete record
+///   schema being handed to it does not match what was written.
+/// - **A corrupt tail block is not recognised.** `LogFileReader` has no
+///   corrupt-block detection — `create_corrupted_block_if_needed` returns
+///   `None` — so it parses the trailing garbage as a block.
 const KNOWN_GAPS: &[(&str, &str)] = &[
-    ("table_column_projection", "Decimal128(20, 2) unsupported"),
-    ("table_all_data_types", "Decimal128(20, 2) unsupported"),
-    ("table_null_containers", "non-UTF-8 dictionary unsupported"),
-    ("table_corrupt_tail_block", "invalid log format version"),
-    ("table_evo_add_col", "invalid magic"),
-    ("table_evo_promotion", "invalid magic"),
-    ("table_delete_ord_long", "negative length while decoding"),
-    ("table_delete_ord_double", "invalid metadata key"),
-    ("table_delete_ord_decimal", "union index out of bounds"),
-    ("table_delete_ord_string", "Decimal128(30, 15) unsupported"),
-    ("table_delete_ord_timestamp", "union index out of bounds"),
+    (
+        "table_column_projection",
+        "avro map modelled as Dictionary(Utf8, _)",
+    ),
+    (
+        "table_all_data_types",
+        "avro map modelled as Dictionary(Utf8, _)",
+    ),
+    (
+        "table_null_containers",
+        "avro map modelled as Dictionary(Utf8, _)",
+    ),
+    ("table_corrupt_tail_block", "no corrupt-block detection"),
+    (
+        "table_delete_ord_long",
+        "delete block mis-decode: negative length",
+    ),
+    (
+        "table_delete_ord_double",
+        "delete block mis-decode: bad metadata key",
+    ),
+    (
+        "table_delete_ord_decimal",
+        "delete block mis-decode: union index",
+    ),
+    (
+        "table_delete_ord_timestamp",
+        "delete block mis-decode: union index",
+    ),
 ];
 
 /// Fixtures carrying no gold snapshot, so there is nothing to compare against.
@@ -190,7 +221,11 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
 /// `table_hfile_log_block` was dumped against a reader with no HFile support,
 /// where the expectation was a loud failure; this crate does read HFile, so
 /// what it should assert is an open question.
-const NO_GOLD: &[&str] = &["table_delete_ord_int", "table_hfile_log_block"];
+const NO_GOLD: &[&str] = &[
+    "table_delete_ord_int",
+    "table_delete_ord_string",
+    "table_hfile_log_block",
+];
 
 fn fixture_zip(name: &str) -> String {
     format!(

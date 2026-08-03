@@ -24,6 +24,9 @@ use arrow::datatypes::{Field, UnionFields};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Timezone an Avro `timestamp-*` logical type denotes, per the Avro spec.
+const UTC_TIMEZONE: &str = "UTC";
+
 /// Converts an avro schema to an arrow schema
 pub fn to_arrow_schema(avro_schema: &apache_avro::Schema) -> Result<Schema> {
     let mut schema_fields = vec![];
@@ -140,9 +143,20 @@ fn schema_to_field_with_props(
         AvroSchema::Date => DataType::Date32,
         AvroSchema::TimeMillis => DataType::Time32(TimeUnit::Millisecond),
         AvroSchema::TimeMicros => DataType::Time64(TimeUnit::Microsecond),
-        AvroSchema::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
-        AvroSchema::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
-        AvroSchema::TimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        // Avro's `timestamp-*` logical types are instants in UTC; the
+        // timezone-naive variants are `local-timestamp-*` below. Carrying the
+        // zone matters beyond correctness: a parquet base file reads back as
+        // `Timestamp(_, "UTC")`, so dropping it here makes a log batch fail to
+        // concatenate with the base batch it is merged against.
+        AvroSchema::TimestampMillis => {
+            DataType::Timestamp(TimeUnit::Millisecond, Some(UTC_TIMEZONE.into()))
+        }
+        AvroSchema::TimestampMicros => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into()))
+        }
+        AvroSchema::TimestampNanos => {
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIMEZONE.into()))
+        }
         AvroSchema::LocalTimestampMillis => todo!(),
         AvroSchema::LocalTimestampMicros => todo!(),
         AvroSchema::LocalTimestampNanos => todo!(),
