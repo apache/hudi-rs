@@ -51,18 +51,6 @@ use arrow_schema::SchemaRef;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// Far-future instant sentinel meaning "no upper bound on the timeline" — every
-/// real instant sorts strictly before it, so a watermark of this value reads the
-/// full snapshot (no log block is treated as a future block by Gate 2). Mirrors
-/// gold's `HoodieTimeline` far-future constant; kept here as the single source so
-/// the value can't drift between the loader's empty-watermark default and the
-/// merged-log-record-reader's no-watermark default. Lexicographic comparison is
-/// intentional (instant times are zero-padded fixed-width strings).
-///
-/// Exposed (`pub`) so cross-crate test harnesses (integration tests, cpp/python
-/// bindings) that drive a reader with a "read everything" watermark reference
-/// this single source instead of re-hardcoding the literal.
-
 /// The top-level file group reader orchestrator.
 ///
 /// Mirrors Java's `org.apache.hudi.common.table.read.HoodieFileGroupReader<T>`.
@@ -359,6 +347,46 @@ impl HoodieFileGroupReader {
             BaseFileFormatValue::from_str(&self.reader_context.base_file_format)?
         };
         Ok(create_base_file_reader(&self.storage, &format)?)
+    }
+
+    /// Stream the merged output to an async caller.
+    ///
+    /// [`Self::read`] returns the whole file group as one batch, so peak memory
+    /// tracks the base file. This reads the base file one row group at a time
+    /// instead.
+    ///
+    /// The merge loop is synchronous and has to block on the base stream, which
+    /// is only legal off the async worker threads. So it runs on a
+    /// blocking-pool thread and hands batches back over a channel; the caller
+    /// gets an ordinary stream and never sees the blocking.
+    ///
+    /// The channel holds one batch. That lets the producer decode row group
+    /// N+1 while the consumer works on N, while bounding the extra memory to a
+    /// single row group — a deeper channel would multiply peak memory by its
+    /// depth, which is what streaming is meant to avoid.
+    pub(crate) async fn open_blocking_stream(
+        &mut self,
+    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use futures::StreamExt;
+
+        let iter = self.init_record_iterators(/* streaming */ true).await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
+        tokio::task::spawn_blocking(move || {
+            for batch in iter {
+                let item = batch.map_err(CoreError::ArrowError);
+                // A send error means the consumer dropped the stream; stop
+                // rather than decoding row groups nobody will take.
+                if tx.blocking_send(item).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed())
     }
 
     /// Read the file group and return the merged output as a single
@@ -820,13 +848,13 @@ impl HoodieFileGroupReader {
         // filter currently needs a materialised Vec. A streaming per-batch
         // variant is a follow-up (ENG-42992 follow-up).
         let instant_range_active = self.reader_context.instant_range.is_some();
-        // Always eager for now. Upstream's streaming source is consumed
-        // synchronously (`block_on` per row group), which deadlocks inside the
-        // async contexts this crate reads from. `streaming` is kept in the
-        // signature so the async-native iterator can switch it back on without
-        // changing callers.
-        let _ = streaming;
-        let force_eager = true || instant_range_active;
+        // Streaming reads the base file one row group at a time, but the merge
+        // loop is synchronous, so it has to block on the stream. That is only
+        // safe off the async worker threads — `open_blocking_stream` is the one
+        // caller that arranges it, and it is the only one that passes
+        // `streaming = true`. The instant-range filter still forces eager: it
+        // needs the batches materialized to filter them.
+        let force_eager = !streaming || instant_range_active;
 
         if force_eager {
             // Async drain to the intersection, evolve to `required_schema`,
@@ -868,14 +896,41 @@ impl HoodieFileGroupReader {
             );
             Ok(Box::new(iter))
         } else {
-            // Unreachable while `force_eager` is pinned true above. Kept as an
-            // error rather than a panic so that flipping it back before the
-            // async-native iterator exists fails loudly instead of deadlocking.
-            Err(CoreError::Unsupported(
-                "Streaming base file reads are not implemented for the \
-                 merge-on-read reader yet."
-                    .to_string(),
-            ))
+            // Open the base file as a stream and adapt it back to the iterator
+            // the merge loop wants. The whole file never lives in memory; one
+            // row group does.
+            let base_stream = self
+                .base_file_reader()?
+                .read_stream(
+                    &path,
+                    BaseFileReadOptions::new()
+                        .with_projection(intersection.fields().iter().map(|f| f.name())),
+                )
+                .await
+                .map_err(|e| {
+                    CoreError::ReadFileSliceError(format!(
+                        "Failed to open base file stream '{path}': {e:?}"
+                    ))
+                })?;
+
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                CoreError::Unsupported(
+                    "A streaming base file read needs a tokio runtime to block on.".to_string(),
+                )
+            })?;
+            let evolve_to = base_read_schema.clone();
+            let evolved = futures::StreamExt::map(base_stream.into_stream(), move |b| match b {
+                Ok(batch) => {
+                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+                }
+                Err(e) => Err(CoreError::from(e)),
+            });
+
+            Ok(Box::new(BlockingBatchReader {
+                schema: base_read_schema,
+                stream: futures::StreamExt::boxed(evolved),
+                handle,
+            }))
         }
     }
 
@@ -1203,6 +1258,38 @@ impl HoodieFileGroupReaderBuilder {
     }
 }
 
+/// Pulls an async base file stream from a synchronous caller, one batch per
+/// `next()`.
+///
+/// The merge loop is synchronous, so a streaming base file has to be turned
+/// back into an iterator somewhere. Doing that means blocking on the stream,
+/// which is only legal off the async worker threads — so this must be driven
+/// from a blocking-pool thread, which is what
+/// [`FileGroupReader::open_blocking_stream`] arranges. Driving it from a worker
+/// would deadlock.
+struct BlockingBatchReader {
+    schema: SchemaRef,
+    stream: futures::stream::BoxStream<'static, Result<RecordBatch>>,
+    handle: tokio::runtime::Handle,
+}
+
+impl Iterator for BlockingBatchReader {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use futures::StreamExt;
+        self.handle
+            .block_on(self.stream.next())
+            .map(|r| r.map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e))))
+    }
+}
+
+impl arrow_array::RecordBatchReader for BlockingBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,7 +1462,7 @@ mod tests {
     /// which panics if driven from inside an async runtime. Async setup runs on
     /// `OBJECT_STORE_RUNTIME` then we drain from this sync context — mirroring
     /// the FFI driver's `open()` → sync `get_next` call shape.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_make_base_file_source_schema_on_write_evolution() {
         use arrow_array::{Float32Array, Int32Array};
         // -- write a parquet base file with OLD schema --
@@ -1448,9 +1535,12 @@ mod tests {
         let eager_out = drain_base_source(eager_src);
         assert_evolved(&eager_out);
 
-        // `streaming=true` resolves to the same eager source for now; asserting
-        // it matches keeps the two honest once they diverge again.
-        let stream_out = drain_base_source(stream_src);
+        // The streaming source blocks on its base stream, so it has to be
+        // drained off the worker threads — the same contract every real caller
+        // honors via `open_blocking_stream`.
+        let stream_out = tokio::task::spawn_blocking(move || drain_base_source(stream_src))
+            .await
+            .unwrap();
         assert_evolved(&stream_out);
         assert_eq!(
             eager_out, stream_out,
@@ -1822,6 +1912,58 @@ mod tests {
         assert!(
             reader.reader_context.can_push_row_filter(),
             "CoW path always pushes regardless of mor_pk_safe"
+        );
+    }
+
+    /// The streaming path must return exactly what the eager one does. It reads
+    /// the base file a row group at a time instead of whole, which is a memory
+    /// difference, not a data one — so any divergence here is a bug rather than
+    /// a tradeoff.
+    ///
+    /// Multi-threaded flavor on purpose: the merge loop blocks on the base
+    /// stream from a blocking-pool thread, which needs worker threads still
+    /// available to drive it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_and_eager_reads_agree() {
+        use futures::StreamExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, true),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c", "d"])),
+            ],
+        )
+        .unwrap();
+        let base_name = "base.parquet";
+        let file = std::fs::File::create(tmp.path().join(base_name)).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let mut eager_reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+        let eager = eager_reader.read().await.unwrap();
+
+        let mut stream_reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+        let mut stream = stream_reader.open_blocking_stream().await.unwrap();
+        let mut streamed_rows = 0usize;
+        let mut streamed_batches = 0usize;
+        while let Some(b) = stream.next().await {
+            streamed_rows += b.unwrap().num_rows();
+            streamed_batches += 1;
+        }
+
+        assert_eq!(streamed_rows, eager.num_rows());
+        assert!(
+            streamed_batches > 0,
+            "the stream yielded nothing; it should emit at least one batch"
         );
     }
 }
