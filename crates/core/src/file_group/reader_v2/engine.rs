@@ -136,6 +136,18 @@ pub struct HoodieFileGroupReader {
     // `make_base_file_source` below.
 }
 
+/// Base-file read options carrying an optional pushdown predicate.
+///
+/// The three base reads below differ only in projection, so the filter is
+/// attached in one place — a read that silently lost it would return extra rows
+/// rather than fail, which is the hard kind of bug to notice.
+fn base_read_options(row_filter: Option<RowFilterBuilder>) -> BaseFileReadOptions {
+    match row_filter {
+        Some(f) => BaseFileReadOptions::new().with_row_filter(f),
+        None => BaseFileReadOptions::new(),
+    }
+}
+
 impl HoodieFileGroupReader {
     /// Create a new file group reader.
     ///
@@ -732,8 +744,7 @@ impl HoodieFileGroupReader {
         //        mirroring Java's `filterIsSafeForPrimaryKey`).
         //   Otherwise: drop the filter; the post-merge filter (Velox/Spark above
         //        the FG reader) evaluates the predicate after base+log merge.
-        // Unused: nothing pushes predicates into the merge path here.
-        let _row_filter = if self.reader_context.can_push_row_filter() {
+        let row_filter = if self.reader_context.can_push_row_filter() {
             self.reader_context.row_filter_builder.clone()
         } else {
             if self.reader_context.row_filter_builder.is_some() {
@@ -756,7 +767,7 @@ impl HoodieFileGroupReader {
         let Some(required_schema) = self.schema_handler.required_schema.clone() else {
             let batch = self
                 .base_file_reader()?
-                .read_data(&path, BaseFileReadOptions::new())
+                .read_data(&path, base_read_options(row_filter.clone()))
                 .await
                 .map_err(|e| {
                     CoreError::ReadFileSliceError(format!(
@@ -863,16 +874,14 @@ impl HoodieFileGroupReader {
             // row groups can be pruned via column-index stats (the builder
             // resolves predicate columns by name and returns None when any
             // referenced column is absent — safe even for evolved/added cols).
-            // Upstream also threads a row filter and a row-number column through
-            // this read. Neither has a caller here yet: nothing pushes predicates
-            // into the merge path, and the row-number column exists for
-            // position-based merging, which is not wired up. Both are dropped
-            // rather than faked — see the note on `make_base_file_source`.
+            // Upstream also threads a row-number column through this read, for
+            // position-based merging. That is not wired up here, so it is
+            // dropped rather than faked.
             let raw = self
                 .base_file_reader()?
                 .read_data(
                     &path,
-                    BaseFileReadOptions::new()
+                    base_read_options(row_filter.clone())
                         .with_projection(intersection.fields().iter().map(|f| f.name())),
                 )
                 .await
@@ -903,7 +912,7 @@ impl HoodieFileGroupReader {
                 .base_file_reader()?
                 .read_stream(
                     &path,
-                    BaseFileReadOptions::new()
+                    base_read_options(row_filter.clone())
                         .with_projection(intersection.fields().iter().map(|f| f.name())),
                 )
                 .await

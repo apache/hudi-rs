@@ -1348,8 +1348,7 @@ fg_case_test!(
             rows: &[&["1", "Alice-V2", "31"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // (2) PK range filter under MOR merge: `_hoodie_record_key` Lt "2",
@@ -1387,8 +1386,7 @@ fg_case_test!(
             rows: &[&["1", "Alice-V2", "31"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // (3) Data-column filter on the CoW path (base-only, no logs -> is_cow gate):
@@ -1414,8 +1412,7 @@ fg_case_test!(
             rows: &[&["1", "Alice", "30"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // (4) Logical/typed-column filter on the CoW path: MorLayoutAllDataTypes
@@ -1446,8 +1443,7 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // (5) NEGATIVE gate case: data-column filter under MOR merge with
@@ -1787,8 +1783,7 @@ fg_case_test!(
             rows: &[&["1", "A", "10.0"], &["4", "D", "40.0"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // Logical/typed-column filters on the CoW path (MorLayoutAllDataTypes
@@ -1817,8 +1812,7 @@ fg_case_test!(
             rows: &[&["k2", "2"], &["k4", "4"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // Date32 Gt: days > 19754 (2024-02-01) are k3, k4, k5.
@@ -1842,8 +1836,7 @@ fg_case_test!(
             rows: &[&["k3", "3"], &["k4", "4"], &["k5", "5"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // Timestamp(us, UTC) Lt: strictly before k3's 2024-03-01T00:00:03Z are k1, k2.
@@ -1867,8 +1860,7 @@ fg_case_test!(
             rows: &[&["k1", "1"], &["k2", "2"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // Decimal128(20,2) Gt: values > 300.30 are k4 (400.40), k5 (500.50).
@@ -1892,8 +1884,7 @@ fg_case_test!(
             rows: &[&["k4", "4"], &["k5", "5"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // Float32 Gt: 3.4f32 equals k3's stored value exactly (same literal), so the
@@ -1918,8 +1909,7 @@ fg_case_test!(
             rows: &[&["k4", "4"], &["k5", "5"]],
         },
         ..Default::default()
-    },
-    ignore = "parquet RowFilter pushdown is built but never installed on the base read (see engine.rs); it applied upstream and was lost when base reads were routed through this crate's parquet reader"
+    }
 );
 
 // =============================================================================
