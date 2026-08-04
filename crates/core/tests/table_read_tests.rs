@@ -1617,17 +1617,16 @@ mod v9_tables {
                 "Expected at least one MOR file slice with log files"
             );
 
+            // This table's log records carry a decimal and a timestamp. Both used
+            // to stop the read — the decimal had no Avro-to-Arrow conversion, and
+            // the timestamp came back without the UTC zone its parquet base file
+            // has, so the two could not be concatenated. This asserted that
+            // failure; it now asserts the read.
             let options = ReadOptions::new();
             let stream = hudi_table.read_stream(&options).await?;
-            let err = match collect_stream_batches(stream).await {
-                Ok(_) => panic!("Expected MOR streaming read with decimal log records to fail"),
-                Err(err) => err,
-            };
-            let err_message = err.to_string();
-            assert!(
-                err_message.contains("Decimal128(15, 2) not supported"),
-                "Unexpected error for MOR log-file streaming path: {err_message}"
-            );
+            let batches = collect_stream_batches(stream).await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(rows > 0, "MOR log-file streaming read returned no rows");
             Ok(())
         }
 

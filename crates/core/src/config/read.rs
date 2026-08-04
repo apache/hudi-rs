@@ -61,6 +61,37 @@ impl FromStr for QueryType {
     }
 }
 
+/// Config value for [`HudiReadConfig::MergeEngine`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, AsRefStr)]
+pub enum MergeEngineValue {
+    /// The merge that has always served reads: whole-batch sort and dedup.
+    #[default]
+    #[strum(serialize = "legacy")]
+    Legacy,
+    /// The ported merge-on-read reader: per-record merge, spillable, able to
+    /// merge by record position.
+    #[strum(serialize = "v2")]
+    V2,
+}
+
+impl Display for MergeEngineValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
+    }
+}
+
+impl FromStr for MergeEngineValue {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "v2" => Ok(Self::V2),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
 /// Configurations for reading Hudi tables.
 ///
 /// **Example**
@@ -104,6 +135,13 @@ pub enum HudiReadConfig {
 
     /// Maximum number of file-slice streams to poll concurrently within one scan partition.
     FileSliceReadConcurrency,
+
+    /// Which merge implementation reads a file slice. Accepted values:
+    /// `legacy` (default), `v2`.
+    ///
+    /// `v2` is the ported merge-on-read reader. It is not yet at parity with
+    /// the default — see [`MergeEngineValue`] — so it is opt-in.
+    MergeEngine,
 }
 
 impl HudiReadConfig {
@@ -120,6 +158,7 @@ impl HudiReadConfig {
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
+            Self::MergeEngine => "hoodie.read.merge.engine",
         }
     }
 }
@@ -144,6 +183,9 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::QueryType => Some(HudiConfigValue::String(
                 QueryType::default().as_ref().to_string(),
             )),
+            HudiReadConfig::MergeEngine => Some(HudiConfigValue::String(
+                MergeEngineValue::default().as_ref().to_string(),
+            )),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
@@ -161,6 +203,9 @@ impl ConfigParser for HudiReadConfig {
         match self {
             Self::QueryType => get_result
                 .and_then(QueryType::from_str)
+                .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
+            Self::MergeEngine => get_result
+                .and_then(MergeEngineValue::from_str)
                 .map(|v| HudiConfigValue::String(v.as_ref().to_string())),
             Self::AsOfTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::StartTimestamp => get_result.map(|v| HudiConfigValue::String(v.to_string())),

@@ -74,6 +74,35 @@ impl InstantRange {
         )
     }
 
+    /// Lexicographic variant of [`Self::is_in_range`], with the same
+    /// inclusivity, for instants that cannot be parsed as datetimes.
+    ///
+    /// Mirrors the JVM reader's `InstantComparison`, which compares instant
+    /// strings directly and never parses. Hudi instants are fixed-format
+    /// numeric strings, so lexicographic order matches chronological order, and
+    /// short instants still bound correctly rather than being kept
+    /// unconditionally.
+    pub fn is_in_range_lexicographic(&self, timestamp: &str) -> bool {
+        if let Some(start) = self.start_timestamp.as_deref() {
+            if self.start_inclusive {
+                if timestamp < start {
+                    return false;
+                }
+            } else if timestamp <= start {
+                return false;
+            }
+        }
+        if let Some(end) = self.end_timestamp.as_deref() {
+            if self.end_inclusive {
+                if timestamp > end {
+                    return false;
+                }
+            } else if timestamp >= end {
+                return false;
+            }
+        }
+        true
+    }
     /// Create a new [InstantRange] with an open start and closed end timestamp range.
     pub fn within_open_closed(start_timestamp: &str, end_timestamp: &str, timezone: &str) -> Self {
         Self::new(

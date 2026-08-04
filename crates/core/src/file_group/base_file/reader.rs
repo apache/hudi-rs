@@ -29,12 +29,12 @@ use futures::stream::BoxStream;
 
 use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
-use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
+use crate::storage::{RowFilterBuilder, Storage};
 
 /// Options for reading a base file.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BaseFileReadOptions {
     /// Target batch size (number of rows per batch) for streaming reads.
     pub batch_size: Option<usize>,
@@ -42,11 +42,38 @@ pub struct BaseFileReadOptions {
     pub projection: Option<Vec<String>>,
     /// Known base-file size in bytes, when the caller already has file metadata.
     pub known_file_size: Option<u64>,
+    /// A predicate to evaluate while reading, so whole row groups can be
+    /// skipped rather than read and discarded.
+    ///
+    /// Only the Parquet reader honors this; other formats ignore it. It is a
+    /// builder rather than a filter because the predicate has to be resolved
+    /// against the file's own schema, which the caller does not have until the
+    /// footer is open.
+    pub row_filter: Option<RowFilterBuilder>,
+}
+
+// `row_filter` holds a closure, which has no `Debug`. Report whether one is set
+// rather than dropping the derive from the whole struct.
+impl std::fmt::Debug for BaseFileReadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseFileReadOptions")
+            .field("batch_size", &self.batch_size)
+            .field("projection", &self.projection)
+            .field("known_file_size", &self.known_file_size)
+            .field("row_filter", &self.row_filter.is_some())
+            .finish()
+    }
 }
 
 impl BaseFileReadOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets a predicate to push into the read. See [`Self::row_filter`].
+    pub fn with_row_filter(mut self, row_filter: RowFilterBuilder) -> Self {
+        self.row_filter = Some(row_filter);
+        self
     }
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {

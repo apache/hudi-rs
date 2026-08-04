@@ -32,6 +32,11 @@ repository.workspace = true
 # arrow
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+parquet = { workspace = true }
 
 # datafusion (optional, for verification helpers)
 datafusion = { workspace = true, optional = true }
