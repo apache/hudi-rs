@@ -47,9 +47,15 @@ pub(crate) mod delete_context;
 pub(crate) mod engine;
 #[cfg(test)]
 mod gold_tests;
+#[cfg(test)]
+mod harness;
+#[cfg(test)]
+mod harness_tests;
 pub(crate) mod input_split;
 pub(crate) mod iterator_mode;
 pub(crate) mod log_record_reader;
+#[cfg(test)]
+mod memory_limit_tests;
 pub(crate) mod merge_iterator;
 pub(crate) mod merged_log_record_reader;
 pub(crate) mod output_converter;
