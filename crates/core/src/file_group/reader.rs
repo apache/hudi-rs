@@ -222,39 +222,30 @@ impl FileGroupReader {
         }
     }
 
-    /// The table schema, as the merge-on-read reader requires it up front.
+    /// The schema the merge-on-read reader needs up front, taken from the base
+    /// file itself.
     ///
-    /// Taken from `hoodie.table.create.schema`, which `OptionResolver` already
-    /// loads, so this costs no extra I/O. `None` means the table did not record
-    /// one; the caller refuses rather than guessing.
+    /// This is what the existing path effectively reads with, so the two engines
+    /// start from the same types. It is also what the data actually has: under
+    /// schema evolution `hoodie.table.create.schema` records the table as it was
+    /// created, and the engine evolves each batch to the required schema anyway.
     ///
-    /// A schema that is present but does not parse is an error, not a `None`.
-    /// The two are different situations and the second one is a broken table —
-    /// reporting it as "no schema was resolved" would send the reader looking
-    /// in the wrong place.
-    fn resolved_data_schema(&self) -> Result<Option<arrow_schema::SchemaRef>> {
-        let Some(value) = self.hudi_configs.try_get(HudiTableConfig::CreateSchema)? else {
-            return Ok(None);
-        };
-        let avro: String = value.into();
-        // The value arrives as it was written to `hoodie.properties`, where Java
-        // escapes `:` as `\:`. Left in place it is not valid JSON.
-        let avro = crate::schema::resolver::sanitize_avro_schema_str(&avro);
-        let schema = crate::schema::resolver::avro_json_to_arrow_schema(&avro)?;
-
-        // The create schema is the schema the user wrote, so it stops short of
-        // the `_hoodie_*` columns the writer adds. The files have them, and the
-        // merge needs the record key among them.
-        let populates_meta_fields: bool = self
-            .hudi_configs
-            .get_or_default(HudiTableConfig::PopulatesMetaFields)
-            .into();
-        let schema = if populates_meta_fields {
-            crate::schema::prepend_meta_fields(std::sync::Arc::new(schema))?
-        } else {
-            schema
-        };
-        Ok(Some(std::sync::Arc::new(schema)))
+    /// Reading the footer costs one request. The engine reads it again when it
+    /// opens the file; collapsing the two is worth doing but is not this change.
+    async fn resolved_data_schema(
+        &self,
+        base_file_path: &str,
+    ) -> Result<Option<arrow_schema::SchemaRef>> {
+        let stream = self
+            .reader_for_path(base_file_path)?
+            .read_stream(base_file_path, BaseFileReadOptions::default())
+            .await
+            .map_err(|e| {
+                ReadFileSliceError(format!(
+                    "Failed to read base file schema '{base_file_path}': {e:?}"
+                ))
+            })?;
+        Ok(Some(stream.schema().clone()))
     }
 
     /// Read one slice through the merge-on-read reader.
@@ -267,7 +258,7 @@ impl FileGroupReader {
         base_file_path: &str,
         log_file_paths: Vec<String>,
     ) -> Result<RecordBatch> {
-        let data_schema = self.resolved_data_schema()?;
+        let data_schema = self.resolved_data_schema(base_file_path).await?;
         if let Some(reason) = crate::file_group::reader_v2::adapter::refuse_reason(
             self.is_metadata_table(),
             data_schema.as_ref(),
@@ -338,19 +329,15 @@ impl FileGroupReader {
             .collect();
         let base_file_only = log_file_paths.is_empty() || options.is_read_optimized()?;
 
-        // With no log files there is nothing to merge, so the setting has
-        // nothing to select and both engines read the base file the same way.
-        //
-        // The merge-on-read engine can serve these reads — it reduces to a base
-        // file read — but it takes its schema from `hoodie.table.create.schema`
-        // where this path takes it from the base file itself, and the Avro
-        // conversion in between models a map as `Dictionary(Utf8, V)`. That is
-        // not a valid Arrow type (dictionary keys must be integers) and does not
-        // reconcile against the `Map` the base file really has. Routing these
-        // reads through it would turn working reads into failures for the sake
-        // of uniformity. Deriving its schema from the base file instead would
-        // remove the difference; that is a change on its own.
-        let merged = if self.merge_engine()? == MergeEngineValue::V2 && !base_file_only {
+        // Read-optimized means the log files are not read at all, so hand the
+        // engine none rather than letting it merge them. A slice with no log
+        // files reduces to a base file read either way.
+        let merged = if self.merge_engine()? == MergeEngineValue::V2 {
+            let log_file_paths = if base_file_only {
+                Vec::new()
+            } else {
+                log_file_paths
+            };
             self.read_via_v2(base_file_path, log_file_paths).await?
         } else if base_file_only {
             self.read_base_file_eager(base_file_path).await?
@@ -1551,14 +1538,12 @@ mod tests {
     }
 
     /// Selecting the merge-on-read engine must not change what a base-file-only
-    /// read returns. There is no merge for the setting to select, so the read
-    /// takes the same path either way.
+    /// read returns.
     ///
-    /// This is the one comparison the two engines can be held to today: with no
-    /// log files there is nothing for them to disagree about, so it does not
-    /// wait on the merge-mode question. It also fails if the base-file-only
-    /// reads are ever routed through the merge-on-read engine without first
-    /// giving it the base file's schema — see the note on the dispatch.
+    /// Both engines now serve this read — the merge-on-read one reduces to a
+    /// base file read — so this compares their output directly. It is the one
+    /// comparison they can be held to without settling the merge-mode question
+    /// first: with no log files there is no merge to disagree about.
     #[tokio::test]
     async fn asking_for_v2_does_not_change_a_base_file_only_read() -> Result<()> {
         let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
