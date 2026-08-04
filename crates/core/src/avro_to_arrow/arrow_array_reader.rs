@@ -17,6 +17,7 @@
 
 //! Avro to Arrow array readers
 
+use crate::avro_to_arrow::schema::MAP_ENTRIES_FIELD;
 use crate::avro_to_arrow::to_arrow_schema;
 use crate::error::Result;
 use apache_avro::schema::RecordSchema;
@@ -40,7 +41,7 @@ use arrow::datatypes::{
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
-use arrow::datatypes::{Fields, SchemaRef};
+use arrow::datatypes::{FieldRef, Fields, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::error::ArrowError::SchemaError;
 use arrow::error::Result as ArrowResult;
@@ -125,6 +126,19 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             AvroSchema::Array(schema) => {
                 let sub_parent_field_name = format!("{parent_field_name}.element");
                 Self::child_schema_lookup(&sub_parent_field_name, &schema.items, schema_lookup)?;
+            }
+            AvroSchema::Map(schema) => {
+                // Map entries are synthesized as two-field records (`key`, `value`)
+                // when the array is built, so register those positions here. The
+                // recursion then covers a struct-valued map's own fields.
+                let entries = format!("{parent_field_name}.{MAP_ENTRIES_FIELD}");
+                schema_lookup.insert(format!("{entries}.key"), 0);
+                schema_lookup.insert(format!("{entries}.value"), 1);
+                Self::child_schema_lookup(
+                    &format!("{entries}.value"),
+                    &schema.types,
+                    schema_lookup,
+                )?;
             }
             _ => (),
         }
@@ -716,6 +730,9 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     DataType::Dictionary(key_ty, val_ty) => {
                         self.build_string_dictionary_array(rows, &field_path, key_ty, val_ty)?
                     }
+                    DataType::Map(entries_field, sorted) => {
+                        self.build_map_array(rows, &field_path, entries_field, *sorted)?
+                    }
                     DataType::Decimal128(precision, scale) => {
                         let values = rows.iter().map(|row| {
                             self.field_lookup(&field_path, row)
@@ -797,6 +814,76 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
             .collect::<Vec<Option<T::Native>>>();
         let array = values.iter().collect::<PrimitiveArray<T>>();
         array.to_data()
+    }
+
+    /// Build a [`MapArray`] from Avro map values.
+    ///
+    /// Entries are materialized as two-field records (`key`, `value`) so the
+    /// existing struct machinery builds both children — that is also why
+    /// `child_schema_lookup` registers those two positions.
+    ///
+    /// Entries are emitted in key order. Avro maps are unordered and the Arrow
+    /// type says `sorted = false`, but a stable order keeps a read reproducible
+    /// rather than dependent on hash iteration.
+    fn build_map_array(
+        &self,
+        rows: RecordSlice,
+        field_path: &str,
+        entries_field: &FieldRef,
+        sorted: bool,
+    ) -> ArrowResult<ArrayRef> {
+        let entry_fields = match entries_field.data_type() {
+            DataType::Struct(fields) => fields,
+            other => {
+                return Err(SchemaError(format!(
+                    "map entries must be a struct, got {other} for field '{field_path}'"
+                )));
+            }
+        };
+
+        let len = rows.len();
+        let num_bytes = bit_util::ceil(len, 8);
+        let mut null_buffer = MutableBuffer::from_len_zeroed(num_bytes);
+        let mut offsets: Vec<i32> = Vec::with_capacity(len + 1);
+        let mut entry_rows: Vec<Vec<(String, Value)>> = Vec::new();
+        let mut cur_offset = 0i32;
+        offsets.push(cur_offset);
+
+        for (i, row) in rows.iter().enumerate() {
+            let value = self.field_lookup(field_path, row).map(maybe_resolve_union);
+            if let Some(Value::Map(entries)) = value {
+                bit_util::set_bit(&mut null_buffer, i);
+                let mut keys: Vec<&String> = entries.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let Some(v) = entries.get(key) else { continue };
+                    entry_rows.push(vec![
+                        ("key".to_string(), Value::String(key.clone())),
+                        ("value".to_string(), v.clone()),
+                    ]);
+                    cur_offset += 1;
+                }
+            }
+            offsets.push(cur_offset);
+        }
+
+        let entry_refs: Vec<&Vec<(String, Value)>> = entry_rows.iter().collect();
+        let entries_path = format!("{field_path}.{MAP_ENTRIES_FIELD}");
+        let children = self.build_struct_array(&entry_refs, &entries_path, entry_fields)?;
+
+        let entries_data = ArrayDataBuilder::new(entries_field.data_type().clone())
+            .len(entry_rows.len())
+            .child_data(children.into_iter().map(|a| a.to_data()).collect())
+            .build()?;
+
+        let map_data = ArrayDataBuilder::new(DataType::Map(entries_field.clone(), sorted))
+            .len(len)
+            .add_buffer(Buffer::from_slice_ref(&offsets))
+            .null_bit_buffer(Some(null_buffer.into()))
+            .child_data(vec![entries_data])
+            .build()?;
+
+        Ok(make_array(map_data))
     }
 
     fn field_lookup<'b>(&self, name: &str, row: &'b [(String, Value)]) -> Option<&'b Value> {
