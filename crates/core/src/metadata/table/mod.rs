@@ -24,7 +24,12 @@
 
 pub mod records;
 
+pub(crate) mod reader;
+
+use crate::config::HudiConfigs;
+use crate::storage::Storage;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow_schema::Schema;
 
@@ -259,13 +264,16 @@ impl Table {
 
         let file_slice = file_slices.into_iter().next().unwrap();
         let opts = ReadOptions::new().with_end_timestamp(timestamp);
-        let fg_reader = self.create_file_group_reader_with_options(
-            Some(&opts),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
+        let configs = Arc::new(HudiConfigs::new(
+            self.hudi_configs
+                .as_options()
+                .into_iter()
+                .chain(opts.hudi_options.clone()),
+        ));
+        let storage = Storage::new(Arc::new(self.storage_options()), configs.clone())?;
 
-        fg_reader
-            .read_metadata_table_files_partition(&file_slice, keys)
+        reader::MetadataTableFileGroupReader::new(configs, storage)
+            .read_files_partition(&file_slice, keys)
             .await
     }
 }

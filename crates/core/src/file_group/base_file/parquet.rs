@@ -106,6 +106,19 @@ impl ParquetBaseFileReader {
             builder = builder.with_projection(projection_mask);
         }
 
+        // Built here rather than by the caller because the predicate has to be
+        // resolved against the file's own schema, which only exists once the
+        // footer is open. A builder that returns `None` — typically because the
+        // file does not have a column the predicate names — means no filter,
+        // which reads every row rather than guessing at the predicate.
+        let row_filter = options
+            .row_filter
+            .as_ref()
+            .and_then(|build| build(builder.parquet_schema(), builder.schema().as_ref()));
+        if let Some(row_filter) = row_filter {
+            builder = builder.with_row_filter(row_filter);
+        }
+
         Ok(builder)
     }
 
@@ -226,6 +239,40 @@ mod tests {
         assert_eq!(projected.num_columns(), 1);
         assert_eq!(projected.schema().field(0).name(), &first_col);
         assert_eq!(projected.num_rows(), full.num_rows());
+    }
+
+    /// The filter reaches the reader and prunes. Asserted with an always-false
+    /// predicate so the result is unambiguous whatever the fixture holds — a
+    /// filter that was silently dropped would return every row instead.
+    #[tokio::test]
+    async fn test_read_data_applies_the_row_filter() {
+        use arrow_array::BooleanArray;
+        use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let opts = BaseFileReadOptions::default().with_row_filter(Arc::new(|descr, _| {
+            let mask = ProjectionMask::roots(descr, [0]);
+            Some(RowFilter::new(vec![Box::new(ArrowPredicateFn::new(
+                mask,
+                |batch| Ok(BooleanArray::from(vec![false; batch.num_rows()])),
+            ))]))
+        }));
+
+        let batch = reader.read_data("a.parquet", opts).await.unwrap();
+        assert_eq!(batch.num_rows(), 0, "the predicate rejected every row");
+    }
+
+    /// A builder that declines — typically because the file has none of the
+    /// columns the predicate names — reads every row. Returning no rows would
+    /// silently drop data on a file the predicate cannot speak about.
+    #[tokio::test]
+    async fn test_row_filter_builder_that_declines_reads_every_row() {
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let opts = BaseFileReadOptions::default().with_row_filter(Arc::new(|_, _| None));
+
+        let batch = reader.read_data("a.parquet", opts).await.unwrap();
+        assert_eq!(batch.num_rows(), 5);
     }
 
     #[tokio::test]

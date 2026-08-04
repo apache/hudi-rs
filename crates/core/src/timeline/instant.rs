@@ -222,6 +222,15 @@ impl Instant {
     }
 
     fn parse_naive_datetime(timestamp: &str) -> Result<NaiveDateTime> {
+        // Guard the slice: a timestamp shorter than the date-time prefix would
+        // otherwise panic here. Callers reach this with values read from data
+        // (a `_hoodie_commit_time` cell), not just with instants parsed from
+        // well-formed file names, so a short value has to be an error.
+        if timestamp.len() < 14 {
+            return Err(CoreError::Timeline(format!(
+                "Cannot parse timestamp '{timestamp}': shorter than yyyyMMddHHmmss"
+            )));
+        }
         let naive_dt = NaiveDateTime::parse_from_str(&timestamp[..14], "%Y%m%d%H%M%S")
             .map_err(|e| CoreError::Timeline(format!("Failed to parse timestamp: {e}")))?;
 

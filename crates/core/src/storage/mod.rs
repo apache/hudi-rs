@@ -42,6 +42,21 @@ pub mod file_metadata;
 pub mod reader;
 pub mod util;
 
+/// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
+/// the Arrow schema it maps to. Returning `None` means no filter is pushed.
+///
+/// `Arc` rather than `Box` so options holding it stay `Clone`. The captured
+/// state must be `Send + Sync` because the parquet stream may evaluate the
+/// filter on any worker thread.
+pub type RowFilterBuilder = Arc<
+    dyn Fn(
+            &parquet::schema::types::SchemaDescriptor,
+            &arrow_schema::Schema,
+        ) -> Option<parquet::arrow::arrow_reader::RowFilter>
+        + Send
+        + Sync,
+>;
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Storage {

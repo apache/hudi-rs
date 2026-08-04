@@ -31,7 +31,7 @@ use arrow::array::{
     ListBuilder, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StringBuilder,
     StringDictionaryBuilder, make_array,
 };
-use arrow::array::{BinaryArray, FixedSizeBinaryArray, GenericListArray};
+use arrow::array::{BinaryArray, Decimal128Array, FixedSizeBinaryArray, GenericListArray};
 use arrow::buffer::{Buffer, MutableBuffer};
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNumericType, ArrowPrimitiveType, DataType, Date32Type, Date64Type,
@@ -605,18 +605,37 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     DataType::UInt16 => self.build_primitive_array::<UInt16Type>(rows, &field_path),
                     DataType::UInt8 => self.build_primitive_array::<UInt8Type>(rows, &field_path),
                     // TODO: this is incomplete
-                    DataType::Timestamp(unit, _) => match unit {
-                        TimeUnit::Second => {
-                            self.build_primitive_array::<TimestampSecondType>(rows, &field_path)
+                    DataType::Timestamp(unit, tz) => {
+                        let values = match unit {
+                            TimeUnit::Second => {
+                                self.build_primitive_array::<TimestampSecondType>(rows, &field_path)
+                            }
+                            TimeUnit::Microsecond => self
+                                .build_primitive_array::<TimestampMicrosecondType>(
+                                    rows,
+                                    &field_path,
+                                ),
+                            TimeUnit::Millisecond => self
+                                .build_primitive_array::<TimestampMillisecondType>(
+                                    rows,
+                                    &field_path,
+                                ),
+                            TimeUnit::Nanosecond => self
+                                .build_primitive_array::<TimestampNanosecondType>(
+                                    rows,
+                                    &field_path,
+                                ),
+                        };
+                        // The builders produce a timezone-naive array. The field
+                        // knows the zone, and a batch whose column type disagrees
+                        // with its schema cannot be built — nor concatenated with
+                        // a base file batch that does carry one.
+                        if tz.is_some() {
+                            arrow::compute::cast(&values, field.data_type())?
+                        } else {
+                            values
                         }
-                        TimeUnit::Microsecond => self
-                            .build_primitive_array::<TimestampMicrosecondType>(rows, &field_path),
-                        TimeUnit::Millisecond => self
-                            .build_primitive_array::<TimestampMillisecondType>(rows, &field_path),
-                        TimeUnit::Nanosecond => {
-                            self.build_primitive_array::<TimestampNanosecondType>(rows, &field_path)
-                        }
-                    },
+                    }
                     DataType::Date64 => self.build_primitive_array::<Date64Type>(rows, &field_path),
                     DataType::Date32 => self.build_primitive_array::<Date32Type>(rows, &field_path),
                     DataType::Time64(unit) => {
@@ -696,6 +715,17 @@ impl<I: Iterator<Item = AvroResult<Value>>> AvroArrowArrayReader<I> {
                     }
                     DataType::Dictionary(key_ty, val_ty) => {
                         self.build_string_dictionary_array(rows, &field_path, key_ty, val_ty)?
+                    }
+                    DataType::Decimal128(precision, scale) => {
+                        let values = rows.iter().map(|row| {
+                            self.field_lookup(&field_path, row)
+                                .map(maybe_resolve_union)
+                                .and_then(resolve_decimal128)
+                        });
+                        Arc::new(
+                            Decimal128Array::from_iter(values)
+                                .with_precision_and_scale(*precision, *scale)?,
+                        ) as ArrayRef
                     }
                     DataType::Struct(fields) => {
                         let len = rows.len();
@@ -847,6 +877,30 @@ fn resolve_u8(v: &Value) -> Option<u8> {
         Value::Long(n) => u8::try_from(*n).ok(),
         _ => None,
     }
+}
+
+/// Decode an Avro decimal into the `i128` an Arrow `Decimal128Array` holds.
+///
+/// Avro carries a decimal as the unscaled value in big-endian two's-complement
+/// bytes, with the scale living in the schema rather than the value — so the
+/// scale is applied by the array's type, not here. The bytes are narrower than
+/// 16 whenever the value fits in fewer, so they are sign-extended.
+///
+/// Returns `None` for a value that is not a decimal, or whose unscaled value is
+/// too wide for `i128`; the row then reads as null rather than as a wrong number.
+fn resolve_decimal128(v: &Value) -> Option<i128> {
+    let bytes: &[u8] = match v {
+        Value::Bytes(b) => b,
+        Value::Fixed(_, b) => b,
+        _ => return None,
+    };
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    let mut buf = [if negative { 0xFF } else { 0x00 }; 16];
+    buf[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf))
 }
 
 fn resolve_bytes(v: &Value) -> Option<Vec<u8>> {
