@@ -27,7 +27,9 @@ use crate::file_group::log_file::log_block::{
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
+use crate::schema::delete::{
+    avro_schema_for_delete_record, avro_schema_for_delete_record_list, unwrap_ordering_value,
+};
 use apache_avro::{Schema as AvroSchema, from_avro_datum};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
@@ -204,9 +206,19 @@ impl Decoder {
             return Ok(RecordBatches::new());
         }
 
-        // Generate schema based on the first delete record
+        // Generate schema based on the first delete record. This reads the union
+        // position of the wrapper Hudi wrote, so it must run before unwrapping —
+        // unwrapping rewrites that position to suit the narrowed schema.
         let first_record = &delete_records[0];
         let delete_record_schema = avro_schema_for_delete_record(first_record)?;
+
+        // Hudi wraps the ordering value in a per-type record (`LongWrapper` and
+        // friends). Unwrap to the primitive so the Arrow conversion sees a scalar
+        // column, matching the schema just narrowed.
+        let delete_records = delete_records
+            .into_iter()
+            .map(unwrap_ordering_value)
+            .collect::<Result<Vec<_>>>()?;
 
         let num_delete_batches = delete_records.len() / self.batch_size + 1;
         let mut batches = RecordBatches::new_with_capacity(0, num_delete_batches);

@@ -180,8 +180,7 @@ fg_case_test!(
         reader_config: &[(MERGE_MAX_PEAK_SIZE_KEY, "100")],
         expected: Expected::ErrContains(MERGE_MAX_PEAK_SIZE_KEY),
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // Companion no-op case: the SAME fixture with the peak cap UNSET (default) reads
@@ -209,8 +208,7 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // Base-file-only (no-merge) path: `log_files: &[]` bypasses merge entirely;
@@ -274,8 +272,7 @@ fg_case_test!(
             Ok(())
         }),
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // =============================================================================
@@ -1080,8 +1077,7 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // (b) Watermark = c1: BOTH log blocks (c2 delete, c3 update) are future blocks
@@ -1109,8 +1105,7 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // (c) instant_range up_to(c2) (inclusive end): the c3 UPDATE block's
@@ -1141,8 +1136,7 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // (d) instant_range within_open_closed(base, log] on V9Mor8I4UCommitTime sf:
@@ -1647,8 +1641,7 @@ fg_case_test!(
             rows: &[&["1", "val_1"], &["2", "val_2"]],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // DELETE block orderingVal: DoubleWrapper (Avro double, Java Double).
@@ -1716,8 +1709,7 @@ fg_case_test!(
             rows: &[&["1", "val_1"], &["2", "val_2"]],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // DELETE block orderingVal: TimestampMicrosWrapper (Avro long / epoch micros).
@@ -1739,8 +1731,7 @@ fg_case_test!(
             rows: &[&["1", "val_1"], &["2", "val_2"]],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // =============================================================================
@@ -2211,8 +2202,7 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
 
 // A lowercase merge mode must be accepted (gold's getMergeMode is
@@ -2240,6 +2230,5 @@ fg_case_test!(
             ],
         },
         ..Default::default()
-    },
-    ignore = "the delete record's ordering value has two shapes in the wild; this crate carries only the older primitive union, so the wrapper-record shape reads as an out-of-range union index"
+    }
 );
