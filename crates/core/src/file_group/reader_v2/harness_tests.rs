@@ -341,7 +341,7 @@ fg_case_test!(
         expected: Expected::GoldParquet,
         ..Default::default()
     },
-    ignore = "Avro maps are modelled as Dictionary(Utf8, V), which is not a valid Arrow type and does not reconcile against the Map the base file carries"
+    ignore = "a decimal column in a log block reads as NULL where the Spark snapshot has a value; surfaced once the Avro map conversion stopped failing these cases earlier"
 );
 
 // All data types incl. logical types: base + 3 logs (update + delete + update);
@@ -361,7 +361,7 @@ fg_case_test!(
         expected: Expected::GoldParquet,
         ..Default::default()
     },
-    ignore = "Avro maps are modelled as Dictionary(Utf8, V), which is not a valid Arrow type and does not reconcile against the Map the base file carries"
+    ignore = "a decimal column in a log block reads as NULL where the Spark snapshot has a value; surfaced once the Avro map conversion stopped failing these cases earlier"
 );
 
 // =============================================================================
@@ -988,11 +988,7 @@ fn case_null_containers() -> FgReaderCase {
     }
 }
 
-fg_case_test!(
-    harness_null_container_elements,
-    case_null_containers(),
-    ignore = "Avro maps are modelled as Dictionary(Utf8, V), which is not a valid Arrow type and does not reconcile against the Map the base file carries"
-);
+fg_case_test!(harness_null_container_elements, case_null_containers());
 
 // Unhappy path: a log file that does not exist must surface a loud read
 // error (storage-level), never an empty/partial result. P3 adds the
