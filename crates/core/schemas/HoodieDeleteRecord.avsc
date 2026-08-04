@@ -24,21 +24,31 @@
     },
     {
       "name": "orderingVal",
-      "doc": "Ordering value determining the order of merging on the same key",
+      "doc": "Ordering value determining the order of merging on the same key. Position i holds the primitive that Hudi's wrapper record at union position i carries, so narrowing to [null, i] yields a primitive column. This is a lookup table read as JSON, never parsed as Avro, so repeated types are fine.",
       "type": [
         "null",
+        "boolean",
         "int",
         "long",
         "float",
         "double",
         "bytes",
         "string",
-        { "type": "bytes", "logicalType": "decimal", "precision":  30, "scale": 15 },
-        { "type": "int", "logicalType": "date" },
-        { "type": "int", "logicalType": "time-millis" },
-        { "type": "long", "logicalType": "time-micros" },
-        { "type": "long", "logicalType": "timestamp-millis" },
-        { "type": "long", "logicalType": "timestamp-micros" }
+        {
+          "type": "int",
+          "logicalType": "date"
+        },
+        {
+          "type": "bytes",
+          "logicalType": "decimal",
+          "precision": 30,
+          "scale": 15
+        },
+        {
+          "type": "long",
+          "logicalType": "time-micros"
+        },
+        "long"
       ],
       "default": null
     }
