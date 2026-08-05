@@ -22,11 +22,11 @@
 //! organized by table version (v6, v8+) and query type.
 
 use arrow::compute::concat_batches;
-use arrow_array::RecordBatch;
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
-use hudi_core::error::Result;
+use hudi_core::error::{CoreError, Result};
 use hudi_core::table::{QueryType, ReadOptions, Table};
 use hudi_test::{QuickstartTripsTable, SampleTable};
 
@@ -38,6 +38,80 @@ async fn collect_stream_batches(
         batches.push(result?);
     }
     Ok(batches)
+}
+
+fn sample_rows(records: &[RecordBatch]) -> Result<Vec<(i32, String, bool)>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = records[0].schema();
+    let batch = concat_batches(&schema, records)?;
+    Ok(SampleTable::sample_data_order_by_id(&batch)
+        .into_iter()
+        .map(|(id, name, is_active)| (id, name.to_string(), is_active))
+        .collect())
+}
+
+fn txn_rows(records: &[RecordBatch]) -> Vec<(String, String, i64)> {
+    let mut rows = Vec::new();
+    for record_batch in records {
+        let txn_ids = record_batch
+            .column_by_name("txn_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let txn_types = record_batch
+            .column_by_name("txn_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let txn_timestamps = record_batch
+            .column_by_name("txn_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for row_idx in 0..record_batch.num_rows() {
+            rows.push((
+                txn_ids.value(row_idx).to_string(),
+                txn_types.value(row_idx).to_string(),
+                txn_timestamps.value(row_idx),
+            ));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+fn assert_batch_size_respected(
+    batches: &[RecordBatch],
+    batch_size: usize,
+    expected_rows: usize,
+    context: &str,
+) {
+    assert!(
+        !batches.is_empty(),
+        "{context}: expected at least one batch"
+    );
+    assert!(
+        batches.iter().all(|batch| batch.num_rows() <= batch_size),
+        "{context}: each batch must have at most {batch_size} rows, got {:?}",
+        batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect::<Vec<_>>()
+    );
+    if expected_rows > batch_size {
+        assert!(
+            batches.len() > 1,
+            "{context}: batch_size={batch_size} should split {expected_rows} rows"
+        );
+    }
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total_rows, expected_rows, "{context}: total rows");
 }
 
 /// Test helper module for v6 tables (pre-1.0 spec)
@@ -192,6 +266,30 @@ mod v6_tables {
                 let sample_data = SampleTable::sample_data_order_by_id(&records);
                 assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true),]);
             }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_partition_filter_reduces_file_slices() -> Result<()> {
+            let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+            let hudi_table = Table::new(base_url.path()).await?;
+
+            let all_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+            let filtered_options = ReadOptions::new().with_filters([("byteField", "=", "10")])?;
+            let filtered_slices = hudi_table.get_file_slices(&filtered_options).await?;
+
+            assert!(
+                filtered_slices.len() < all_slices.len(),
+                "partition filter must reduce file slices: {} filtered vs {} unfiltered",
+                filtered_slices.len(),
+                all_slices.len()
+            );
+
+            let records = hudi_table.read(&filtered_options).await?;
+            let schema = records[0].schema();
+            let records = concat_batches(&schema, &records)?;
+            let sample_data = SampleTable::sample_data_order_by_id(&records);
+            assert_eq!(sample_data, vec![(1, "Alice", false), (3, "Carol", true)]);
             Ok(())
         }
 
@@ -770,21 +868,15 @@ mod v8_tables {
             let base_url = SampleTable::V8Nonpartitioned.url_to_cow();
             let hudi_table = Table::new(base_url.path()).await?;
 
-            // Request small batch size
             let options = ReadOptions::new().with_batch_size(1)?;
             let mut stream = hudi_table.read_stream(&options).await?;
 
-            // Collect all batches from stream
             let mut batches = Vec::new();
             while let Some(result) = stream.next().await {
                 batches.push(result?);
             }
 
-            // With batch_size=1 and 4 rows, we expect multiple batches, but the
-            // exact number depends on both the batch_size setting and the Parquet
-            // file's internal row group structure.
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 4, "Total rows should match expected count");
+            assert_batch_size_respected(&batches, 1, 4, "V8 snapshot stream batch_size=1");
             Ok(())
         }
 
@@ -834,6 +926,7 @@ mod v8_tables {
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
+            let expected = fg_reader.read_file_slice(file_slice, &options).await?;
             let mut stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
@@ -845,10 +938,11 @@ mod v8_tables {
             }
 
             assert!(!batches.is_empty(), "Should produce at least one batch");
-
-            // Verify we got records
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert!(total_rows > 0, "Should read at least one row");
+            assert_eq!(
+                sample_rows(&[expected])?,
+                sample_rows(&batches)?,
+                "file-slice streaming should match eager file-slice read"
+            );
             Ok(())
         }
 
@@ -873,8 +967,7 @@ mod v8_tables {
                 batches.push(result?);
             }
 
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 4, "Should read all 4 rows");
+            assert_batch_size_respected(&batches, 1, 4, "V8 file-slice stream batch_size=1");
             Ok(())
         }
 
@@ -886,6 +979,7 @@ mod v8_tables {
             let hudi_table = Table::new(base_url.path()).await?;
 
             let options = ReadOptions::new();
+            let file_slices = hudi_table.get_file_slices(&options).await?;
             let mut stream = hudi_table.read_stream(&options).await?;
 
             let mut batches = Vec::new();
@@ -894,7 +988,11 @@ mod v8_tables {
             }
 
             assert!(!batches.is_empty(), "Should produce batches from MOR table");
-
+            assert_eq!(
+                batches.len(),
+                file_slices.len(),
+                "MOR snapshot stream should emit one merged batch per file slice"
+            );
             // Verify total row count - should have 6 rows (8 inserts - 2 deletes)
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 6, "Should have 6 rows (8 inserts - 2 deleted)");
@@ -922,41 +1020,6 @@ mod v8_tables {
 /// Test helper module for v9 tables (1.1 spec)
 mod v9_tables {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
-
-    fn txn_rows(records: &[RecordBatch]) -> Vec<(String, String, i64)> {
-        let mut rows = Vec::new();
-        for record_batch in records {
-            let txn_ids = record_batch
-                .column_by_name("txn_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let txn_types = record_batch
-                .column_by_name("txn_type")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let txn_timestamps = record_batch
-                .column_by_name("txn_ts")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-
-            for i in 0..record_batch.num_rows() {
-                rows.push((
-                    txn_ids.value(i).to_string(),
-                    txn_types.value(i).to_string(),
-                    txn_timestamps.value(i),
-                ));
-            }
-        }
-        rows.sort_unstable();
-        rows
-    }
 
     fn read_optimized_options() -> ReadOptions {
         ReadOptions::new().with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")
@@ -1440,9 +1503,8 @@ mod v9_tables {
             let options = ReadOptions::new().with_batch_size(1)?;
             let stream = hudi_table.read_stream(&options).await?;
             let batches = collect_stream_batches(stream).await?;
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-            assert_eq!(total_rows, 3, "Total rows should match expected count");
+            assert_batch_size_respected(&batches, 1, 3, "V9 snapshot stream batch_size=1");
             Ok(())
         }
 
@@ -1498,13 +1560,17 @@ mod v9_tables {
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
+            let expected = fg_reader.read_file_slice(file_slice, &options).await?;
             let stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
             let batches = collect_stream_batches(stream).await?;
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-            assert!(total_rows > 0, "Should read at least one row");
+            assert_eq!(
+                txn_rows(&[expected]),
+                txn_rows(&batches),
+                "file-slice streaming should match eager file-slice read"
+            );
             Ok(())
         }
 
@@ -1518,14 +1584,21 @@ mod v9_tables {
 
             let fg_reader = hudi_table
                 .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            let expected = fg_reader
+                .read_file_slice(file_slice, &ReadOptions::new())
+                .await?;
             let options = ReadOptions::new().with_batch_size(1)?;
             let stream = fg_reader
                 .read_file_slice_stream(file_slice, &options)
                 .await?;
             let batches = collect_stream_batches(stream).await?;
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-            assert!(total_rows > 0, "Should read at least one row");
+            assert_batch_size_respected(
+                &batches,
+                1,
+                expected.num_rows(),
+                "V9 file-slice stream batch_size=1",
+            );
             Ok(())
         }
 
@@ -1631,16 +1704,11 @@ mod streaming_queries {
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
 
-        // Request small batch size
         let options = ReadOptions::new().with_batch_size(1)?;
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
-        // With batch_size=1 and 4 rows, we expect multiple batches, but the
-        // exact number depends on both the batch_size setting and the Parquet
-        // file's internal row group structure.
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 4, "Total rows should match expected count");
+        assert_batch_size_respected(&batches, 1, 4, "V6 snapshot stream batch_size=1");
         Ok(())
     }
 
@@ -1685,16 +1753,18 @@ mod streaming_queries {
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
+        let expected = fg_reader.read_file_slice(file_slice, &options).await?;
         let stream = fg_reader
             .read_file_slice_stream(file_slice, &options)
             .await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce at least one batch");
-
-        // Verify we got records
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert!(total_rows > 0, "Should read at least one row");
+        assert_eq!(
+            sample_rows(&[expected])?,
+            sample_rows(&batches)?,
+            "file-slice streaming should match eager file-slice read"
+        );
         Ok(())
     }
 
@@ -1708,15 +1778,13 @@ mod streaming_queries {
 
         let fg_reader = hudi_table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
-        // Test with small batch size
         let options = ReadOptions::new().with_batch_size(1)?;
         let stream = fg_reader
             .read_file_slice_stream(file_slice, &options)
             .await?;
         let batches = collect_stream_batches(stream).await?;
 
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 4, "Should read all 4 rows");
+        assert_batch_size_respected(&batches, 1, 4, "V6 file-slice stream batch_size=1");
         Ok(())
     }
 
@@ -1727,14 +1795,39 @@ mod streaming_queries {
         let hudi_table = Table::new(base_url.path()).await?;
 
         let options = ReadOptions::new();
+        let file_slices = hudi_table.get_file_slices(&options).await?;
         let stream = hudi_table.read_stream(&options).await?;
         let batches = collect_stream_batches(stream).await?;
 
         assert!(!batches.is_empty(), "Should produce batches from MOR table");
-
+        assert_eq!(
+            batches.len(),
+            file_slices.len(),
+            "MOR snapshot stream should emit one merged batch per file slice"
+        );
         // Verify total row count
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 8, "Should have 8 rows (8 inserts)");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_stream_incremental_returns_unsupported() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let err = match hudi_table
+            .read_stream(&ReadOptions::new().with_query_type(QueryType::Incremental))
+            .await
+        {
+            Ok(_) => panic!("incremental streaming should be unsupported"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, CoreError::Unsupported(_)),
+            "expected Unsupported for incremental streaming, got: {err}"
+        );
         Ok(())
     }
 
@@ -1876,9 +1969,9 @@ mod streaming_queries {
 
     #[tokio::test]
     async fn test_read_snapshot_stream_with_as_of_timestamp() -> Result<()> {
-        // Cross-validate streaming time-travel against the eager API: with the
-        // same `as_of_timestamp`, both must return the same row count. (Before
-        // the fix, streaming silently used the latest commit and could diverge.)
+        // Cross-validate streaming time-travel against the eager API. The
+        // fixture intentionally has fewer rows at the first commit than at the
+        // latest commit, so a stream that silently reads latest would diverge.
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await?;
         let first_commit = hudi_table
@@ -1891,12 +1984,21 @@ mod streaming_queries {
         let options = ReadOptions::new().with_as_of_timestamp(&first_commit);
 
         let eager = hudi_table.read(&options).await?;
-        let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
+        let eager_rows = sample_rows(&eager)?;
+
+        let latest = hudi_table.read(&ReadOptions::new()).await?;
+        let latest_rows = sample_rows(&latest)?;
 
         let stream = hudi_table.read_stream(&options).await?;
         let stream_batches = collect_stream_batches(stream).await?;
-        let stream_rows: usize = stream_batches.iter().map(|b| b.num_rows()).sum();
+        let stream_rows = sample_rows(&stream_batches)?;
 
+        assert_eq!(eager_rows.len(), 3, "first commit should have 3 rows");
+        assert_ne!(
+            eager_rows.len(),
+            latest_rows.len(),
+            "fixture must differ between first commit and latest snapshot"
+        );
         assert_eq!(eager_rows, stream_rows);
         Ok(())
     }
@@ -2175,11 +2277,10 @@ mod manual_reader_matches_table_read {
         let expected = hudi_table.read(&options).await?;
         let actual = read_via_manual_reader(&hudi_table, &options).await?;
 
-        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
-        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            expected_rows, actual_rows,
-            "incremental (explicit range up to first commit): row counts must match"
+            txn_rows(&expected),
+            txn_rows(&actual),
+            "incremental (explicit range up to first commit): rows must match"
         );
 
         let options = ReadOptions::new()
@@ -2190,11 +2291,10 @@ mod manual_reader_matches_table_read {
         let expected = hudi_table.read(&options).await?;
         let actual = read_via_manual_reader(&hudi_table, &options).await?;
 
-        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
-        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            expected_rows, actual_rows,
-            "incremental (first..second commit): row counts must match"
+            txn_rows(&expected),
+            txn_rows(&actual),
+            "incremental (first..second commit): rows must match"
         );
 
         Ok(())
@@ -2218,12 +2318,376 @@ mod manual_reader_matches_table_read {
         let expected = hudi_table.read(&options).await?;
         let actual = read_via_manual_reader(&hudi_table, &options).await?;
 
-        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
-        let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            expected_rows, actual_rows,
-            "incremental (start only, end defaults to latest): row counts must match"
+            txn_rows(&expected),
+            txn_rows(&actual),
+            "incremental (start only, end defaults to latest): rows must match"
         );
+
+        Ok(())
+    }
+}
+
+mod lance_tables {
+    use super::*;
+    use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use std::collections::HashMap;
+    use url::Url;
+
+    async fn read_lance_table(
+        base_url: Url,
+        projection: impl IntoIterator<Item = &'static str>,
+    ) -> Result<RecordBatch> {
+        let hudi_table = Table::new(base_url.path()).await?;
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_projection(projection))
+            .await?;
+        let schema = batches[0].schema();
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
+    fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+    }
+
+    fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+    }
+
+    fn float64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Float64Array {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+    }
+
+    fn sorted_string_values(batch: &RecordBatch, name: &str) -> Vec<String> {
+        let values = string_column(batch, name);
+        let mut strings = (0..batch.num_rows())
+            .map(|row| values.value(row).to_string())
+            .collect::<Vec<_>>();
+        strings.sort_unstable();
+        strings
+    }
+
+    fn assert_float_eq(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn txn_rows(batch: &RecordBatch) -> HashMap<String, (String, i64, Option<String>)> {
+        let txn_ids = string_column(batch, "txn_id");
+        let txn_types = string_column(batch, "txn_type");
+        let txn_timestamps = int64_column(batch, "txn_ts");
+        let regions = batch
+            .column_by_name("region")
+            .map(|column| column.as_any().downcast_ref::<StringArray>().unwrap());
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                txn_ids.value(row_idx).to_string(),
+                (
+                    txn_types.value(row_idx).to_string(),
+                    txn_timestamps.value(row_idx),
+                    regions.map(|column| column.value(row_idx).to_string()),
+                ),
+            );
+        }
+        rows
+    }
+
+    fn assert_lance_txn_table_rows(batch: &RecordBatch, partitioned: bool) {
+        let rows = txn_rows(batch);
+        let mut actual_ids = rows.keys().cloned().collect::<Vec<_>>();
+        actual_ids.sort_unstable();
+        assert_eq!(
+            actual_ids,
+            [
+                "TXN-001", "TXN-003", "TXN-004", "TXN-006", "TXN-007", "TXN-008", "TXN-009",
+                "TXN-010", "TXN-011", "TXN-012", "TXN-013", "TXN-014", "TXN-015", "TXN-016",
+            ]
+        );
+        assert!(
+            !rows.contains_key("TXN-002"),
+            "deleted TXN-002 must be absent"
+        );
+        assert!(
+            !rows.contains_key("TXN-005"),
+            "deleted TXN-005 must be absent"
+        );
+        assert_eq!(rows.get("TXN-001").unwrap().0, "reversal");
+        assert_eq!(rows.get("TXN-001").unwrap().1, 1700100000001);
+        assert_eq!(rows.get("TXN-007").unwrap().1, 1700300000007);
+        assert_eq!(rows.get("TXN-016").unwrap().0, "debit");
+
+        if partitioned {
+            let region_rows = rows
+                .iter()
+                .map(|(txn_id, (_, _, region))| {
+                    (txn_id.as_str(), region.as_ref().unwrap().as_str())
+                })
+                .collect::<HashMap<_, _>>();
+            assert_eq!(region_rows.get("TXN-001"), Some(&"us"));
+            assert_eq!(region_rows.get("TXN-004"), Some(&"eu"));
+            assert_eq!(region_rows.get("TXN-007"), Some(&"apac"));
+            assert_eq!(region_rows.get("TXN-016"), Some(&"apac"));
+        }
+    }
+
+    fn trips_rows(batch: &RecordBatch) -> HashMap<String, (String, f64, i64)> {
+        let riders = string_column(batch, "rider");
+        let drivers = string_column(batch, "driver");
+        let fares = float64_column(batch, "fare");
+        let timestamps = int64_column(batch, "ts");
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                riders.value(row_idx).to_string(),
+                (
+                    drivers.value(row_idx).to_string(),
+                    fares.value(row_idx),
+                    timestamps.value(row_idx),
+                ),
+            );
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonpartitioned_cow_snapshot_applies_hudi_updates_deletes_and_inserts()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceNonpartitioned.url_to_cow(),
+            ["id", "name", "score", "updated_at"],
+        )
+        .await?;
+
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let updated_at = batch
+            .column_by_name("updated_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                ids.value(row_idx),
+                (
+                    names.value(row_idx).to_string(),
+                    scores.value(row_idx),
+                    updated_at.value(row_idx),
+                ),
+            );
+        }
+
+        let mut actual_ids = rows.keys().copied().collect::<Vec<_>>();
+        actual_ids.sort_unstable();
+        assert_eq!(actual_ids, vec![1, 2, 3, 5, 6, 7, 8, 9, 10]);
+        assert!(!rows.contains_key(&4), "deleted id 4 must be absent");
+        assert!(
+            (rows.get(&1).unwrap().1 - 0.96).abs() < 1e-9,
+            "id 1 should reflect the score update"
+        );
+        assert_eq!(rows.get(&1).unwrap().2, 1700100000000);
+        assert!(
+            (rows.get(&2).unwrap().1 - 0.93).abs() < 1e-9,
+            "id 2 should reflect the score update"
+        );
+        assert_eq!(rows.get(&2).unwrap().2, 1700100000001);
+        assert_eq!(rows.get(&9).unwrap().0, "feature-set-iota");
+        assert_eq!(rows.get(&10).unwrap().0, "feature-set-kappa");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_txns_nonpart_cow_snapshot_applies_updates_deletes_and_inserts()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceTxnsNonpart.url_to_cow(),
+            ["txn_id", "txn_type", "txn_ts"],
+        )
+        .await?;
+        assert_lance_txn_table_rows(&batch, false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_txns_simple_cow_snapshot_applies_updates_deletes_and_inserts()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceTxnsSimple.url_to_cow(),
+            ["txn_id", "txn_type", "txn_ts", "region"],
+        )
+        .await?;
+        assert_lance_txn_table_rows(&batch, true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_trips_lance_cow_snapshot_applies_updates_deletes_and_inserts() -> Result<()> {
+        let batch = read_lance_table(
+            QuickstartTripsTable::V9TripsLance.url_to_cow(),
+            ["rider", "driver", "fare", "ts"],
+        )
+        .await?;
+        let rows = trips_rows(&batch);
+        let mut riders = rows.keys().cloned().collect::<Vec<_>>();
+        riders.sort_unstable();
+        assert_eq!(
+            riders,
+            [
+                "rider-A", "rider-C", "rider-D", "rider-E", "rider-G", "rider-I", "rider-J",
+                "rider-K", "rider-L", "rider-M", "rider-N",
+            ]
+        );
+        assert!(
+            !rows.contains_key("rider-F"),
+            "deleted rider-F must be absent"
+        );
+        assert_float_eq(rows.get("rider-A").unwrap().1, 0.0);
+        assert_eq!(rows.get("rider-A").unwrap().2, 1695200000000);
+        assert_float_eq(rows.get("rider-G").unwrap().1, 0.0);
+        assert_eq!(rows.get("rider-K").unwrap().0, "driver-U");
+        assert_eq!(rows.get("rider-N").unwrap().0, "driver-X");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonhivestyle_mor_snapshot_merges_available_log_update_and_base_files()
+    -> Result<()> {
+        let batch = read_lance_table(
+            SampleTable::V9LanceNonhivestyle.url_to_mor_avro(),
+            ["event_id", "user_id", "payload", "event_ts", "event_date"],
+        )
+        .await?;
+        let event_ids = sorted_string_values(&batch, "event_id");
+        assert_eq!(
+            event_ids,
+            [
+                "evt-001", "evt-002", "evt-003", "evt-004", "evt-005", "evt-006", "evt-007",
+                "evt-008", "evt-009", "evt-010", "evt-011", "evt-012", "evt-013", "evt-014",
+            ]
+        );
+
+        let event_id_col = string_column(&batch, "event_id");
+        let user_id_col = string_column(&batch, "user_id");
+        let payload_col = string_column(&batch, "payload");
+        let event_ts_col = int64_column(&batch, "event_ts");
+        let mut rows = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            rows.insert(
+                event_id_col.value(row_idx).to_string(),
+                (
+                    user_id_col.value(row_idx).to_string(),
+                    payload_col.value(row_idx).to_string(),
+                    event_ts_col.value(row_idx),
+                ),
+            );
+        }
+
+        assert_eq!(
+            rows.get("evt-001").unwrap().1,
+            r#"{"page": "/home", "session": "sess-abc123"}"#
+        );
+        assert_eq!(rows.get("evt-001").unwrap().2, 1700000000001);
+        assert_eq!(rows.get("evt-002").unwrap().1, r#"{"button": "signup"}"#);
+        assert_eq!(rows.get("evt-013").unwrap().0, "user-100");
+        assert_eq!(rows.get("evt-014").unwrap().0, "user-101");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_trips_lance_mor_snapshot_merges_available_log_update_and_base_files()
+    -> Result<()> {
+        let batch = read_lance_table(
+            QuickstartTripsTable::V9TripsLance.url_to_mor_avro(),
+            ["rider", "driver", "fare", "ts"],
+        )
+        .await?;
+        let rows = trips_rows(&batch);
+        let mut riders = rows.keys().cloned().collect::<Vec<_>>();
+        riders.sort_unstable();
+        assert_eq!(
+            riders,
+            [
+                "rider-A", "rider-C", "rider-D", "rider-E", "rider-F", "rider-G", "rider-I",
+                "rider-J", "rider-M", "rider-N", "rider-O", "rider-P",
+            ]
+        );
+        assert_float_eq(rows.get("rider-A").unwrap().1, 0.0);
+        assert_eq!(rows.get("rider-A").unwrap().2, 1695200000000);
+        assert_float_eq(rows.get("rider-C").unwrap().1, 27.70);
+        assert_float_eq(rows.get("rider-G").unwrap().1, 43.40);
+        assert_eq!(rows.get("rider-O").unwrap().0, "driver-Y");
+        assert_eq!(rows.get("rider-P").unwrap().0, "driver-Z");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v9_lance_nonpartitioned_cow_read_uses_extension_fallback_without_format_config()
+    -> Result<()> {
+        // Safe because this test asks for a fresh extraction before mutating
+        // hoodie.properties in place.
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow_fresh();
+        let props_path = std::path::Path::new(&table_path).join(".hoodie/hoodie.properties");
+        let props = std::fs::read_to_string(&props_path).unwrap();
+        let props_without_format = props
+            .lines()
+            .filter(|line| !line.starts_with("hoodie.table.base.file.format="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&props_path, props_without_format).unwrap();
+
+        let hudi_table = Table::new(&table_path).await?;
+        let file_slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(
+            file_slices.iter().any(|slice| slice
+                .base_file_relative_path()
+                .is_ok_and(|path| path.ends_with(".lance"))),
+            "table listing should discover .lance base files without an explicit format config"
+        );
+
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_projection(["id"]))
+            .await?;
+        let total_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(total_rows, 9);
 
         Ok(())
     }
@@ -2271,6 +2735,32 @@ mod mdt_enabled_tables {
                 );
             }
 
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_mdt_read_matches_nometa_read() -> Result<()> {
+            let mdt_url = SampleTable::V9TxnsNonpartMeta.url_to_mor_avro();
+            let mdt_table = Table::new(mdt_url.path()).await?;
+            assert!(
+                mdt_table.is_metadata_table_enabled(),
+                "metadata-enabled fixture should use MDT listing"
+            );
+
+            let nometa_url = SampleTable::V9TxnsNonpartNometa.url_to_mor_avro();
+            let nometa_table = Table::new(nometa_url.path()).await?;
+            assert!(
+                !nometa_table.is_metadata_table_enabled(),
+                "nometa fixture should use storage listing"
+            );
+
+            let mdt_rows = txn_rows(&mdt_table.read(&ReadOptions::new()).await?);
+            let nometa_rows = txn_rows(&nometa_table.read(&ReadOptions::new()).await?);
+
+            assert_eq!(
+                mdt_rows, nometa_rows,
+                "MDT-backed read should return the same rows as storage listing"
+            );
             Ok(())
         }
 

@@ -27,6 +27,7 @@ use datafusion::prelude::SessionContext;
 use hudi_datafusion::HudiDataSource;
 
 use crate::SampleTable;
+use crate::util::explain_physical_plan;
 
 pub const EXPECTED_PARTITIONED_TXN_IDS: &[&str] = &[
     "TXN-001", "TXN-003", "TXN-007", "TXN-008", "TXN-011", "TXN-012", "TXN-013", "TXN-014",
@@ -144,14 +145,19 @@ pub async fn verify_nonpart_records(ctx: &SessionContext) {
 }
 
 /// Register a v9 txns table with a DataFusion session context.
-async fn register_v9_table(ctx: &SessionContext, table: &SampleTable, cow: bool) {
+async fn register_v9_table(
+    ctx: &SessionContext,
+    table: &SampleTable,
+    cow: bool,
+    mor_read_optimized: bool,
+) {
     let url = if cow {
         table.url_to_cow()
     } else {
         table.url_to_mor_avro()
     };
     let mut opts: Vec<(&str, &str)> = vec![];
-    if !cow {
+    if !cow && mor_read_optimized {
         opts.push(("hoodie.read.use.read_optimized.mode", "true"));
     }
     let hudi = HudiDataSource::new_with_options(url.as_str(), opts)
@@ -168,7 +174,36 @@ async fn register_v9_table(ctx: &SessionContext, table: &SampleTable, cow: bool)
 /// Entry point for v9 txns table verification, used by both Rust and Python tests.
 pub async fn verify_v9_txns_table(table: &SampleTable, cow: bool, partitioned: bool) {
     let ctx = SessionContext::new();
-    register_v9_table(&ctx, table, cow).await;
+    register_v9_table(&ctx, table, cow, !cow).await;
+    if partitioned {
+        verify_partitioned_records(&ctx).await;
+    } else {
+        verify_nonpart_records(&ctx).await;
+    }
+}
+
+/// Verify v9 txns MOR tables in snapshot mode.
+///
+/// These fixtures currently have the same surviving rows in snapshot and
+/// read-optimized mode: compaction and clustering materialize the update/delete
+/// history into base files, and the post-clustering inserts are base-file
+/// records rather than log-only records.
+pub async fn verify_v9_txns_table_snapshot(table: &SampleTable, partitioned: bool) {
+    let ctx = SessionContext::new();
+    register_v9_table(&ctx, table, false, false).await;
+    let plan = explain_physical_plan(&ctx, "SELECT txn_id FROM txns").await;
+    assert!(
+        plan.contains("HudiScanExec"),
+        "MOR snapshot should use HudiScanExec. Plan: {plan}"
+    );
+    assert!(
+        !plan.contains("DataSourceExec"),
+        "MOR snapshot should not use DataSourceExec. Plan: {plan}"
+    );
+    assert!(
+        !plan.contains("ParquetSource"),
+        "MOR snapshot should not use ParquetSource. Plan: {plan}"
+    );
     if partitioned {
         verify_partitioned_records(&ctx).await;
     } else {

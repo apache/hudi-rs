@@ -192,17 +192,21 @@ impl Table {
             return Some(estimator);
         }
 
-        // SINGLE point of parquet validation for the estimator concern.
-        if !matches!(
-            self.file_system_view.base_file_format(),
-            BaseFileFormatValue::Parquet
-        ) {
+        let configured_base_file_format =
+            self.file_system_view.configured_base_file_format().ok()?;
+        if configured_base_file_format
+            .as_ref()
+            .is_some_and(|format| !matches!(format, BaseFileFormatValue::Parquet))
+        {
             return None;
         }
 
         let path = self
             .sample_base_file_path_at_or_before(sample_at_timestamp)
             .await?;
+        if !BaseFileFormatValue::Parquet.matches_extension(&path) {
+            return None;
+        }
 
         self.cached_estimator
             .get_or_try_init(|| async {
@@ -791,8 +795,8 @@ impl Table {
     /// Snapshot streams batches as they are read from each file slice. Incremental
     /// streaming is not yet supported and returns an `Unsupported` error.
     ///
-    /// For MOR tables with log files, streaming falls back to a collect-and-merge that
-    /// yields the merged result as a single batch.
+    /// For MOR file slices with log files, streaming falls back to a collect-and-merge
+    /// that yields that file slice's merged result as a single batch.
     ///
     /// # Example
     /// ```ignore
@@ -917,13 +921,19 @@ impl Table {
             .await
             .ok()?;
 
-        let base_file_format = self.file_system_view.base_file_format();
-        let base_file_suffix = format!(".{}", base_file_format.as_ref());
+        let configured_base_file_format =
+            self.file_system_view.configured_base_file_format().ok()?;
+        if configured_base_file_format
+            .as_ref()
+            .is_some_and(|format| !matches!(format, BaseFileFormatValue::Parquet))
+        {
+            return None;
+        }
         let total_on_disk_size = records
             .values()
             .filter(|record| !record.is_all_partitions())
             .flat_map(|record| record.active_files_with_sizes())
-            .filter(|(name, _)| name.ends_with(&base_file_suffix))
+            .filter(|(name, _)| BaseFileFormatValue::Parquet.matches_extension(name))
             .map(|(_, size)| size)
             .sum::<u64>();
 
@@ -950,8 +960,8 @@ mod tests {
     use crate::config::table::BaseFileFormatValue;
     use crate::config::table::HudiTableConfig::{
         BaseFileFormat, Checksum, DatabaseName, DropsPartitionFields, IsHiveStylePartitioning,
-        IsPartitionPathUrlencoded, KeyGeneratorClass, PartitionFields, PopulatesMetaFields,
-        PrecombineField, RecordKeyFields, TableName, TableType, TableVersion,
+        IsPartitionPathUrlencoded, KeyGeneratorClass, OrderingFields, PartitionFields,
+        PopulatesMetaFields, RecordKeyFields, TableName, TableType, TableVersion,
         TimelineLayoutVersion, TimelineTimezone,
     };
     use crate::config::util::empty_options;
@@ -1227,7 +1237,7 @@ mod tests {
             "non-required config is missing"
         );
         assert!(
-            configs.validate(PrecombineField).is_ok(),
+            configs.validate(OrderingFields).is_ok(),
             "non-required config is missing"
         );
         assert!(
@@ -1266,7 +1276,7 @@ mod tests {
         assert!(configs.get(IsPartitionPathUrlencoded).is_err());
         assert!(configs.get(KeyGeneratorClass).is_err());
         assert!(configs.get(PartitionFields).is_err());
-        assert!(configs.get(PrecombineField).is_err());
+        assert!(configs.get(OrderingFields).is_err());
         assert!(configs.get(PopulatesMetaFields).is_err());
         assert!(configs.get(RecordKeyFields).is_err());
         assert!(configs.get(TableName).is_err());
@@ -1294,7 +1304,7 @@ mod tests {
         assert!(panic::catch_unwind(|| configs.get_or_default(KeyGeneratorClass)).is_err());
         let actual: Vec<String> = configs.get_or_default(PartitionFields).into();
         assert!(actual.is_empty());
-        assert!(panic::catch_unwind(|| configs.get_or_default(PrecombineField)).is_err());
+        assert!(panic::catch_unwind(|| configs.get_or_default(OrderingFields)).is_err());
         let actual: bool = configs.get_or_default(PopulatesMetaFields).into();
         assert!(actual);
         assert!(panic::catch_unwind(|| configs.get_or_default(RecordKeyFields)).is_err());
@@ -1328,8 +1338,8 @@ mod tests {
         assert_eq!(actual, "org.apache.hudi.keygen.SimpleKeyGenerator");
         let actual: Vec<String> = configs.get(PartitionFields).unwrap().into();
         assert_eq!(actual, vec!["city"]);
-        let actual: String = configs.get(PrecombineField).unwrap().into();
-        assert_eq!(actual, "ts");
+        let actual: Vec<String> = configs.get(OrderingFields).unwrap().into();
+        assert_eq!(actual, vec!["ts"]);
         let actual: bool = configs.get(PopulatesMetaFields).unwrap().into();
         assert!(actual);
         let actual: Vec<String> = configs.get(RecordKeyFields).unwrap().into();

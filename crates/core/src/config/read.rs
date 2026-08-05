@@ -101,6 +101,9 @@ pub enum HudiReadConfig {
     /// Target number of rows per batch for streaming reads.
     /// This controls the batch size when using streaming APIs.
     StreamBatchSize,
+
+    /// Maximum number of file-slice streams to poll concurrently within one scan partition.
+    FileSliceReadConcurrency,
 }
 
 impl HudiReadConfig {
@@ -116,6 +119,7 @@ impl HudiReadConfig {
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
+            Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
         }
     }
 }
@@ -143,6 +147,7 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
+            HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
             _ => None,
         }
     }
@@ -181,6 +186,17 @@ impl ConfigParser for HudiReadConfig {
                     Ok(parsed)
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::FileSliceReadConcurrency => get_result
+                .and_then(|v| {
+                    let key = self.key();
+                    let parsed =
+                        usize::from_str(v).map_err(|e| ParseInt(key.clone(), v.to_string(), e))?;
+                    if parsed == 0 {
+                        return Err(InvalidValue(format!("{key}=0 (must be > 0)")));
+                    }
+                    Ok(parsed)
+                })
+                .map(HudiConfigValue::UInteger),
         }
     }
 }
@@ -189,8 +205,8 @@ impl ConfigParser for HudiReadConfig {
 mod tests {
     use super::*;
     use crate::config::read::HudiReadConfig::{
-        AsOfTimestamp, EndTimestamp, InputPartitions, QueryType as QueryTypeKey, StartTimestamp,
-        StreamBatchSize, UseReadOptimizedMode,
+        AsOfTimestamp, EndTimestamp, FileSliceReadConcurrency, InputPartitions,
+        QueryType as QueryTypeKey, StartTimestamp, StreamBatchSize, UseReadOptimizedMode,
     };
 
     #[test]
@@ -206,6 +222,10 @@ mod tests {
                 "true".to_string(),
             ),
             (StreamBatchSize.as_ref().to_string(), "2048".to_string()),
+            (
+                FileSliceReadConcurrency.as_ref().to_string(),
+                "8".to_string(),
+            ),
         ]);
         let actual: String = QueryTypeKey.parse_value(&options).unwrap().into();
         assert_eq!(actual, "incremental");
@@ -221,6 +241,11 @@ mod tests {
         assert!(actual);
         let actual: usize = StreamBatchSize.parse_value(&options).unwrap().into();
         assert_eq!(actual, 2048);
+        let actual: usize = FileSliceReadConcurrency
+            .parse_value(&options)
+            .unwrap()
+            .into();
+        assert_eq!(actual, 8);
     }
 
     #[test]
@@ -230,6 +255,10 @@ mod tests {
             (InputPartitions.as_ref().to_string(), "foo".to_string()),
             (UseReadOptimizedMode.as_ref().to_string(), "1".to_string()),
             (StreamBatchSize.as_ref().to_string(), "abc".to_string()),
+            (
+                FileSliceReadConcurrency.as_ref().to_string(),
+                "abc".to_string(),
+            ),
         ]);
         assert!(matches!(
             QueryTypeKey.parse_value(&options).unwrap_err(),
@@ -255,6 +284,23 @@ mod tests {
         ));
         let actual: usize = StreamBatchSize.parse_value_or_default(&options).into();
         assert_eq!(actual, 1024);
+        assert!(matches!(
+            FileSliceReadConcurrency.parse_value(&options).unwrap_err(),
+            ParseInt(_, _, _)
+        ));
+        let actual: usize = FileSliceReadConcurrency
+            .parse_value_or_default(&options)
+            .into();
+        assert_eq!(actual, 4);
+
+        let zero = HashMap::from([(
+            FileSliceReadConcurrency.as_ref().to_string(),
+            "0".to_string(),
+        )]);
+        assert!(matches!(
+            FileSliceReadConcurrency.parse_value(&zero).unwrap_err(),
+            InvalidValue(_)
+        ));
     }
 
     #[test]

@@ -115,7 +115,9 @@ impl RecordBatches {
         &self,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<RecordBatch> {
-        let ordering_field: String = hudi_configs.get(HudiTableConfig::PrecombineField)?.into();
+        let ordering_fields: Vec<String> =
+            hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
+        let ordering_field = &ordering_fields[0];
 
         if self.num_delete_rows == 0 {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
@@ -123,7 +125,7 @@ impl RecordBatches {
 
         let mut delete_batches = Vec::with_capacity(self.delete_batches.len());
         for (batch, instant_time) in &self.delete_batches {
-            let batch = transform_delete_record_batch(batch, instant_time, &ordering_field)?;
+            let batch = transform_delete_record_batch(batch, instant_time, ordering_field)?;
             delete_batches.push(batch);
         }
 
@@ -506,7 +508,7 @@ mod tests {
     fn test_concat_delete_batches_transformed_empty() {
         let record_batches = RecordBatches::new();
         let hudi_configs = Arc::new(HudiConfigs::new([(
-            HudiTableConfig::PrecombineField.as_ref(),
+            HudiTableConfig::OrderingFields.as_ref(),
             "any_ordering_field",
         )]));
 
@@ -533,7 +535,7 @@ mod tests {
         record_batches.push_delete_batch(create_test_delete_batch(3), "20240101000000".to_string());
 
         let hudi_configs = Arc::new(HudiConfigs::new([(
-            HudiTableConfig::PrecombineField.as_ref(),
+            HudiTableConfig::OrderingFields.as_ref(),
             ordering_field,
         )]));
 
@@ -569,7 +571,7 @@ mod tests {
         record_batches.push_delete_batch(create_test_delete_batch(1), "20240103000000".to_string());
 
         let hudi_configs = Arc::new(HudiConfigs::new([(
-            HudiTableConfig::PrecombineField.as_ref(),
+            HudiTableConfig::OrderingFields.as_ref(),
             ordering_field,
         )]));
 
@@ -613,7 +615,7 @@ mod tests {
         record_batches.push_delete_batch(create_test_delete_batch(2), "20240101000000".to_string());
 
         let hudi_configs = Arc::new(HudiConfigs::new([(
-            HudiTableConfig::PrecombineField.as_ref(),
+            HudiTableConfig::OrderingFields.as_ref(),
             ordering_field,
         )]));
 
@@ -635,14 +637,14 @@ mod tests {
         record_batches.push_data_batch(create_test_data_batch(1));
         record_batches.push_delete_batch(create_test_delete_batch(1), "20240101000000".to_string());
 
-        // Create config without PrecombineField
+        // Create config without OrderingFields
         let hudi_configs = Arc::new(HudiConfigs::empty());
 
         // This should return an error
         let result = record_batches.concat_delete_batches_transformed(hudi_configs);
         match result {
             Err(CoreError::Config(ConfigError::NotFound(s))) => {
-                assert_eq!(s, HudiTableConfig::PrecombineField.as_ref());
+                assert_eq!(s, HudiTableConfig::OrderingFields.as_ref());
             }
             _ => panic!(
                 "Expected ConfigError::NotFound, got {:?}",

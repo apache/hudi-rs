@@ -28,7 +28,7 @@ resolver = "2"
 version = "0.5.0-dev"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.91.1"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
 readme = "README.md"
 description = "The native Rust implementation for Apache Hudi"
@@ -74,6 +74,7 @@ chrono = { version = "0.4" }
 chrono-tz = { version = "0.10" }
 lazy_static = { version = "1" }
 log = { version = "0.4" }
+log-once = { version = "0.4" }
 num-traits = { version = "0.2" }
 once_cell = { version = "1" }
 paste = { version = "1" }

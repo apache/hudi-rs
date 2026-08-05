@@ -18,7 +18,9 @@
  */
 
 use crate::Result;
+use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::storage::Storage;
+use std::sync::Arc;
 
 /// Cached ratios derived from a single base file sample.
 /// Used to estimate `byte_size` and `num_records` for all files.
@@ -42,10 +44,12 @@ impl FileStatsEstimator {
 
     /// Build an estimator by reading a single Parquet footer.
     pub(crate) async fn from_parquet_footer(
-        storage: &Storage,
+        storage: &Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
-        let parquet_meta = storage.get_parquet_file_metadata(relative_path).await?;
+        let parquet_meta = ParquetBaseFileReader::new(storage.clone())
+            .get_parquet_metadata(relative_path)
+            .await?;
         let on_disk: i64 = parquet_meta
             .row_groups()
             .iter()

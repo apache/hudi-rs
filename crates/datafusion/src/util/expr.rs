@@ -18,6 +18,7 @@
  */
 
 use datafusion::logical_expr::Operator;
+use datafusion_common::ScalarValue;
 use datafusion_expr::expr::InList;
 use datafusion_expr::{Between, BinaryExpr, Expr};
 use hudi_core::expr::filter::{Filter as HudiFilter, col};
@@ -108,7 +109,7 @@ fn binary_expr_to_filter(binary_expr: &BinaryExpr) -> Option<HudiFilter> {
     };
 
     let field = col(column.name());
-    let lit_str = literal.to_string();
+    let lit_str = scalar_to_filter_value(literal);
 
     let filter = match binary_expr.op {
         Operator::Eq => field.eq(lit_str),
@@ -153,7 +154,7 @@ fn between_to_filters(between: &Between) -> Vec<HudiFilter> {
 
     // Extract literal values from low and high bounds
     let low_str = match &*between.low {
-        Expr::Literal(lit, _) => lit.to_string(),
+        Expr::Literal(lit, _) => scalar_to_filter_value(lit),
         _ => {
             warn!(
                 "BETWEEN low bound is not a literal for column '{column_name}', skipping pushdown"
@@ -163,7 +164,7 @@ fn between_to_filters(between: &Between) -> Vec<HudiFilter> {
     };
 
     let high_str = match &*between.high {
-        Expr::Literal(lit, _) => lit.to_string(),
+        Expr::Literal(lit, _) => scalar_to_filter_value(lit),
         _ => {
             warn!(
                 "BETWEEN high bound is not a literal for column '{column_name}', skipping pushdown"
@@ -201,7 +202,7 @@ fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
         .list
         .iter()
         .filter_map(|expr| match expr {
-            Expr::Literal(lit, _) => Some(lit.to_string()),
+            Expr::Literal(lit, _) => Some(scalar_to_filter_value(lit)),
             _ => None,
         })
         .collect();
@@ -216,6 +217,69 @@ fn inlist_expr_to_filter(in_list: &InList) -> Option<HudiFilter> {
         Some(field.not_in_list(values))
     } else {
         Some(field.in_list(values))
+    }
+}
+
+/// Stringifies a DataFusion literal for Hudi's string-typed `Filter` API.
+///
+/// `ScalarValue::Display` is lossy for decimals — it prints the unscaled
+/// integer (e.g. `Decimal128(7500, 10, 2)` becomes `"7500"` rather than
+/// `"75.00"`) — so those are formatted explicitly here. Other types fall
+/// through to `to_string()`.
+///
+/// Tracking the typed-value refactor that would eliminate this round trip:
+/// <https://github.com/apache/hudi-rs/issues/609>.
+fn scalar_to_filter_value(literal: &ScalarValue) -> String {
+    match literal {
+        ScalarValue::Decimal32(Some(value), _, scale) => {
+            format_decimal_value(*value as i128, *scale)
+        }
+        ScalarValue::Decimal64(Some(value), _, scale) => {
+            format_decimal_value(*value as i128, *scale)
+        }
+        ScalarValue::Decimal128(Some(value), _, scale) => format_decimal_value(*value, *scale),
+        ScalarValue::Decimal256(Some(value), _, scale) => {
+            format_decimal_digits(value.to_string(), *scale)
+        }
+        ScalarValue::Decimal32(None, _, _)
+        | ScalarValue::Decimal64(None, _, _)
+        | ScalarValue::Decimal128(None, _, _)
+        | ScalarValue::Decimal256(None, _, _) => "NULL".to_string(),
+        _ => literal.to_string(),
+    }
+}
+
+fn format_decimal_value(value: i128, scale: i8) -> String {
+    format_decimal_digits(value.to_string(), scale)
+}
+
+fn format_decimal_digits(mut digits: String, scale: i8) -> String {
+    let negative = digits.starts_with('-');
+    if negative {
+        digits.remove(0);
+    }
+
+    if scale <= 0 {
+        digits.push_str(&"0".repeat((-scale) as usize));
+        return if negative {
+            format!("-{digits}")
+        } else {
+            digits
+        };
+    }
+
+    let scale = scale as usize;
+    if digits.len() <= scale {
+        let padding = "0".repeat(scale + 1 - digits.len());
+        digits = format!("{padding}{digits}");
+    }
+
+    let split_at = digits.len() - scale;
+    let (whole, fractional) = digits.split_at(split_at);
+    if negative {
+        format!("-{whole}.{fractional}")
+    } else {
+        format!("{whole}.{fractional}")
     }
 }
 
@@ -478,6 +542,25 @@ mod tests {
         assert_eq!(result[1].0, "count");
         assert_eq!(result[1].1, "<=");
         assert_eq!(result[1].2, "20");
+    }
+
+    #[test]
+    fn test_convert_decimal_literal() {
+        let expr = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("amount")),
+            Operator::Eq,
+            Box::new(Expr::Literal(
+                ScalarValue::Decimal128(Some(7500), 10, 2),
+                None,
+            )),
+        ));
+
+        let result = exprs_to_filters(&[expr]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "amount");
+        assert_eq!(result[0].1, "=");
+        assert_eq!(result[0].2, "75.00");
     }
 
     #[test]

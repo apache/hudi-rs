@@ -18,6 +18,8 @@
  */
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
+#[cfg(feature = "datafusion")]
+use datafusion::prelude::SessionContext;
 use std::env;
 
 pub fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
@@ -54,6 +56,17 @@ pub fn get_bool_column(record_batch: &RecordBatch, name: &str) -> Vec<bool> {
         .iter()
         .map(|s| s.unwrap())
         .collect::<Vec<_>>()
+}
+
+#[cfg(feature = "datafusion")]
+pub async fn explain_physical_plan(ctx: &SessionContext, sql: &str) -> String {
+    let explaining_df = ctx.sql(sql).await.unwrap().explain(false, true).unwrap();
+    let explaining_rb = explaining_df.collect().await.unwrap();
+    explaining_rb
+        .iter()
+        .flat_map(|batch| get_str_column(batch, "plan"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Sets a fixed timezone by setting the TZ environment variable.

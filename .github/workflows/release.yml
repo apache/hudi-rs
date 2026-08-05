@@ -51,6 +51,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -71,6 +76,9 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Install protobuf compiler
+        run: brew install protobuf
+
       - name: Publish to pypi (without sdist)
         uses: PyO3/maturin-action@v1
         env:
@@ -90,6 +98,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+
+      - name: Install protobuf compiler
+        run: choco install protoc --yes
 
       - name: Publish to pypi (without sdist)
         uses: PyO3/maturin-action@v1
@@ -120,8 +131,9 @@ jobs:
           target: x86_64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml
-          # for openssl build
-          before-script-linux: yum install -y perl-IPC-Cmd
+          # protobuf-compiler is needed by lance-encoding/lance-file's prost-build;
+          # perl-IPC-Cmd is needed by openssl.
+          before-script-linux: yum install -y protobuf-compiler perl-IPC-Cmd
 
       - name: Publish manylinux to pypi aarch64 (without sdist)
         uses: PyO3/maturin-action@v1
@@ -133,6 +145,7 @@ jobs:
           command: publish
           args: --skip-existing -m python/Cargo.toml --no-sdist
           before-script-linux: |
+            yum install -y protobuf-compiler
             # We can remove this once we upgrade to 2_28.
             # https://github.com/briansmith/ring/issues/1728
             export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"

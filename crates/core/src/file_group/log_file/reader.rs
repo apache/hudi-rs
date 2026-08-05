@@ -316,7 +316,7 @@ mod tests {
         file_name: &str,
     ) -> Result<LogFileReader<StorageReader>> {
         let dir_url = parse_uri(dir)?;
-        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::PrecombineField, "ts")]));
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
         LogFileReader::new(hudi_configs, storage, file_name).await
     }
