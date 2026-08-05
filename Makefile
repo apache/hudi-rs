@@ -205,3 +205,7 @@ endif
 .PHONY: tpch-compare
 tpch-compare: ## Compare persisted TPC-H benchmark results (ENGINES=datafusion,spark SF=0.001)
 	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(ENGINES) --format $(FORMAT)
+
+.PHONY: parity
+parity: ## Run Spark-in-the-loop parity tests (needs SPARK_HOME; see scripts/parity/README.md)
+	HUDI_SPARK_PARITY=1 ./build-wrapper.sh cargo test -p hudi-core --test spark_parity_tests -- --test-threads=1 --nocapture

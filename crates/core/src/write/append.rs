@@ -44,9 +44,12 @@ use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::Table;
 use crate::timeline::instant::{Action, Instant};
-use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
+use crate::write::keygen::{
+    hoodie_keys_for_batch, hoodie_keys_for_batch_with_offset, relative_data_path,
+};
 use crate::write::metadata::{
-    epoch_millis_to_instant, instant_to_epoch_millis, update_files_partition, update_record_index,
+    instant_to_epoch_millis, is_column_stats_enabled, update_column_stats_partitions,
+    update_files_partition, update_record_index,
 };
 
 /// Result of an append write.
@@ -101,6 +104,7 @@ async fn append_batches_inner(
             ));
         }
     }
+    ensure_append_schema_matches_table(table, schema.as_ref()).await?;
     let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if num_rows == 0 {
         return Err(CoreError::Write(
@@ -108,13 +112,7 @@ async fn append_batches_inner(
         ));
     }
 
-    let request_instant = next_instant_timestamp();
     let layout_two = is_layout_two(table);
-    let completion = if layout_two {
-        Some(request_instant.clone())
-    } else {
-        None
-    };
     let action = if table.is_mor() {
         Action::DeltaCommit
     } else {
@@ -122,14 +120,20 @@ async fn append_batches_inner(
     };
     let timeline_dir = timeline_dir(table);
     let storage = table.file_system_view.storage.clone();
+    let lock = crate::write::lock::lock_provider_for(table);
+    // Critical section 1: mint the instant and fence it, then work unlocked.
+    let cs1 = lock.lock().await?;
+    let request_instant = generate_instant_time().await;
     crate::write::fence_timeline_instant(
         storage.as_ref(),
         &timeline_dir,
         &request_instant,
         action.clone(),
+        Vec::new(),
+        crate::write::inflight_commit_metadata_bytes("INSERT", layout_two)?,
     )
     .await?;
-    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
+    drop(cs1);
 
     // Group rows across batches by partition path and write one base file per partition.
     let mut partition_rows: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
@@ -146,11 +150,52 @@ async fn append_batches_inner(
     let mut write_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
+    let mut stats_updates = Vec::new();
     let mut written_paths: Vec<String> = Vec::new();
     let mut primary_base_path = String::new();
     let max_records = max_records_per_file(table);
+    // Monotonic auto-key row id across partitions and size-split chunks in this commit.
+    let mut auto_key_row_offset = 0usize;
+    let mut auto_key_partition_id = 0u32;
 
-    for (partition_path, row_refs) in partition_rows {
+    // Stable partition iteration so partition_id assignment is deterministic.
+    let mut partition_rows_sorted: Vec<_> = partition_rows.into_iter().collect();
+    partition_rows_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Plan every output file name up front and write markers before any data
+    // file is put — rollback of a crashed write is driven by these markers.
+    let mut file_plan: HashMap<String, std::collections::VecDeque<(String, String)>> =
+        HashMap::new();
+    let mut planned_markers = Vec::new();
+    for (partition_path, row_refs) in &partition_rows_sorted {
+        let chunks = row_refs.len().div_ceil(max_records).max(1);
+        let entries = file_plan.entry(partition_path.clone()).or_default();
+        for _ in 0..chunks {
+            let file_id = crate::write::new_file_id();
+            let file_name = format!("{file_id}_0-0-0_{request_instant}.parquet");
+            planned_markers.push(crate::write::markers::Marker::create(
+                partition_path,
+                &file_name,
+            ));
+            entries.push_back((file_id, file_name));
+        }
+    }
+    crate::write::markers::write_markers(storage.as_ref(), &request_instant, &planned_markers)
+        .await?;
+
+    // Phase 1 (sequential): slice + prepare every chunk, keeping table borrows
+    // out of the parallel phase.
+    struct ChunkPlan {
+        partition_path: String,
+        file_id: String,
+        file_name: String,
+        base_file_path: String,
+        row_count: i64,
+        chunk_keys: Vec<crate::index::HoodieKey>,
+        prepared: Vec<RecordBatch>,
+    }
+    let mut chunk_plans: Vec<ChunkPlan> = Vec::new();
+    for (partition_path, row_refs) in partition_rows_sorted {
         let batch_indices: HashMap<usize, Vec<u32>> = {
             let mut map: HashMap<usize, Vec<u32>> = HashMap::new();
             for (batch_idx, row_idx) in &row_refs {
@@ -167,6 +212,12 @@ async fn append_batches_inner(
         } else {
             arrow::compute::concat_batches(&schema, &partition_batches)?
         };
+        crate::write::ensure_partition_metadata(
+            storage.as_ref(),
+            &partition_path,
+            &request_instant,
+        )
+        .await?;
 
         // Split oversized partitions into multiple base files (Java max.file.size).
         let total_rows = partition_batch.num_rows();
@@ -175,62 +226,124 @@ async fn append_batches_inner(
             let end = (offset + max_records).min(total_rows);
             let indices: Vec<u32> = (offset as u32..end as u32).collect();
             let chunk = take_rows(&partition_batch, &indices)?;
-            let chunk_keys = hoodie_keys_for_batch(table, &chunk, Some(&request_instant))?;
-            let file_id = crate::write::new_file_id();
-            let file_name = format!("{file_id}_0-0-0_{request_instant}.parquet");
+            let chunk_row_offset = auto_key_row_offset;
+            let chunk_keys = hoodie_keys_for_batch_with_offset(
+                table,
+                &chunk,
+                Some(&request_instant),
+                chunk_row_offset,
+                auto_key_partition_id,
+            )?;
+            auto_key_row_offset += chunk.num_rows();
+            let (file_id, file_name) = file_plan
+                .get_mut(&partition_path)
+                .and_then(std::collections::VecDeque::pop_front)
+                .ok_or_else(|| {
+                    CoreError::Write(format!(
+                        "file plan exhausted for partition '{partition_path}'"
+                    ))
+                })?;
             let base_file_path = relative_data_path(&partition_path, &file_name);
             if primary_base_path.is_empty() {
                 primary_base_path = base_file_path.clone();
             }
-
-            crate::write::ensure_partition_metadata(
-                storage.as_ref(),
-                &partition_path,
+            let prepared = prepare_batches_for_write_with_offset(
+                table,
+                &[chunk],
                 &request_instant,
-            )
-            .await?;
-            let write_batches =
-                prepare_batches_for_write(table, &[chunk], &request_instant, &file_name)?;
-            let file_bytes = write_parquet_bytes(table, &write_batches)?;
-            let file_size = file_bytes.len() as i64;
-            if let Err(error) = storage.put_file(&base_file_path, file_bytes).await {
-                for path in &written_paths {
-                    let _ = storage.delete_file(path).await;
-                }
-                return Err(error.into());
-            }
-            written_paths.push(base_file_path.clone());
-
-            let row_count = indices.len() as i64;
-            write_stats
-                .entry(partition_path.clone())
-                .or_default()
-                .push(HoodieWriteStat {
-                    file_id: Some(file_id.clone()),
-                    path: Some(base_file_path.clone()),
-                    // Basename only — FileGroup builder joins partition_path + name.
-                    base_file: Some(file_name.clone()),
-                    prev_commit: Some("null".to_string()),
-                    num_writes: Some(row_count),
-                    num_inserts: Some(row_count),
-                    total_write_bytes: Some(file_size),
-                    file_size_in_bytes: Some(file_size),
-                    partition_path: Some(partition_path.clone()),
-                    ..Default::default()
-                });
-            files_mdt.push((partition_path.clone(), file_name, file_size));
-
-            for key in chunk_keys {
-                rli_entries.push(RecordIndexEntry {
-                    record_key: key.record_key,
-                    partition_path: partition_path.clone(),
-                    file_id: file_id.clone(),
-                    instant_time_millis: instant_to_epoch_millis(&request_instant),
-                    is_deleted: false,
-                });
-            }
+                &file_name,
+                chunk_row_offset,
+                auto_key_partition_id,
+            )?;
+            chunk_plans.push(ChunkPlan {
+                partition_path: partition_path.clone(),
+                file_id,
+                file_name,
+                base_file_path,
+                row_count: indices.len() as i64,
+                chunk_keys,
+                prepared,
+            });
             offset = end;
         }
+        auto_key_partition_id = auto_key_partition_id.saturating_add(1);
+    }
+
+    // Phase 2 (parallel): encode + put each file on the write task pool.
+    let props = parquet_writer_props(table);
+    let collect_ranges = is_column_stats_enabled(table);
+    let tasks = chunk_plans
+        .iter()
+        .map(|plan| {
+            crate::write::parquet_file_task(
+                storage.clone(),
+                props.clone(),
+                plan.prepared.clone(),
+                plan.base_file_path.clone(),
+                collect_ranges,
+            )
+        })
+        .collect();
+    let results =
+        crate::write::run_write_tasks(tasks, crate::write::write_task_parallelism(table)).await;
+
+    // Phase 3 (sequential): assemble outputs in plan order; clean up on error.
+    let mut first_error = None;
+    for (plan, result) in chunk_plans.iter().zip(results) {
+        match result {
+            Ok(output) => {
+                written_paths.push(plan.base_file_path.clone());
+                if let Some(ranges) = output.ranges {
+                    stats_updates.push(crate::write::metadata::StatsFileUpdate {
+                        partition_path: plan.partition_path.clone(),
+                        file_name: plan.file_name.clone(),
+                        is_deleted: false,
+                        ranges,
+                    });
+                }
+                write_stats
+                    .entry(plan.partition_path.clone())
+                    .or_default()
+                    .push(HoodieWriteStat {
+                        file_id: Some(plan.file_id.clone()),
+                        path: Some(plan.base_file_path.clone()),
+                        // Basename only — FileGroup builder joins partition_path + name.
+                        base_file: Some(plan.file_name.clone()),
+                        prev_commit: Some("null".to_string()),
+                        num_writes: Some(plan.row_count),
+                        num_inserts: Some(plan.row_count),
+                        total_write_bytes: Some(output.size),
+                        file_size_in_bytes: Some(output.size),
+                        partition_path: Some(plan.partition_path.clone()),
+                        ..Default::default()
+                    });
+                files_mdt.push((
+                    plan.partition_path.clone(),
+                    plan.file_name.clone(),
+                    output.size,
+                ));
+                for key in &plan.chunk_keys {
+                    rli_entries.push(RecordIndexEntry {
+                        record_key: key.record_key.clone(),
+                        partition_path: plan.partition_path.clone(),
+                        file_id: plan.file_id.clone(),
+                        instant_time_millis: instant_to_epoch_millis(&request_instant),
+                        is_deleted: false,
+                    });
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        for path in &written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
     }
 
     let commit_metadata = HoodieCommitMetadata {
@@ -241,31 +354,48 @@ async fn append_batches_inner(
         // Java HoodieCommitMetadata.extraMetadata is non-null; null → NPE in Spark.
         extra_metadata: Some(HashMap::from([(
             "schema".to_string(),
-            arrow_schema_to_avro_json(&schema),
+            arrow_schema_to_avro_json(&schema)?,
         )])),
     };
-    let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
     let commit_bytes = if layout_two {
         commit_metadata.to_avro_bytes()?
     } else {
         commit_metadata.to_json_bytes()?
     };
 
-    // Crash-consistency order: data files → MDT → completed data commit.
-    // Finalizing the data timeline last avoids a completed commit whose MDT lags.
+    // Crash-consistency order: data files → MDT files → MDT deltacommit →
+    // completed data commit. Finalizing the data timeline last means readers
+    // fence MDT contents by completed data instants. MDT log-file writes are
+    // "work" (unlocked); only completion runs in critical section 2.
+    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     if table.is_metadata_table_enabled() {
-        if let Err(error) =
-            update_files_partition(storage.as_ref(), &request_instant, &files_mdt).await
-        {
-            for path in &written_paths {
-                let _ = storage.delete_file(path).await;
+        let mdt_result = async {
+            mdt_stats.insert(
+                "files".to_string(),
+                update_files_partition(storage.as_ref(), &request_instant, &files_mdt).await?,
+            );
+            if is_record_index_enabled(table) {
+                let stats =
+                    update_record_index(storage.as_ref(), &request_instant, &rli_entries).await?;
+                if !stats.is_empty() {
+                    mdt_stats.insert("record_index".to_string(), stats);
+                }
             }
-            return Err(error);
+            if is_column_stats_enabled(table) && !stats_updates.is_empty() {
+                let stats = update_column_stats_partitions(
+                    table,
+                    &request_instant,
+                    &stats_updates,
+                    schema.as_ref(),
+                    &[],
+                )
+                .await?;
+                mdt_stats.extend(stats);
+            }
+            Ok::<(), crate::error::CoreError>(())
         }
-        if is_record_index_enabled(table)
-            && let Err(error) =
-                update_record_index(storage.as_ref(), &request_instant, &rli_entries).await
-        {
+        .await;
+        if let Err(error) = mdt_result {
             for path in &written_paths {
                 let _ = storage.delete_file(path).await;
             }
@@ -273,12 +403,37 @@ async fn append_batches_inner(
         }
     }
 
+    // Critical section 2: complete the action (MDT deltacommit + data commit
+    // with a completion time minted under the lock), then bookkeeping.
+    let cs2 = lock.lock().await?;
+    if table.is_metadata_table_enabled()
+        && let Err(error) = crate::write::metadata::write_metadata_commit(
+            storage.as_ref(),
+            &request_instant,
+            mdt_stats,
+        )
+        .await
+    {
+        for path in &written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
+    }
+    let completion = if layout_two {
+        Some(generate_instant_time().await)
+    } else {
+        None
+    };
+    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
+    let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
     if let Err(error) = storage.put_file(&commit_relative_path, commit_bytes).await {
         for path in &written_paths {
             let _ = storage.delete_file(path).await;
         }
         return Err(error.into());
     }
+    crate::write::post_complete_bookkeeping(table, storage.as_ref(), &request_instant).await?;
+    drop(cs2);
 
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
@@ -365,27 +520,50 @@ pub(crate) fn timeline_dir(table: &Table) -> String {
     }
 }
 
-pub(crate) fn next_instant_timestamp() -> String {
-    // Match Java HoodieInstantTimeGenerator: yyyyMMddHHmmssSSS (UTC).
-    // Monotonic within-process so rapid commits never collide.
+/// Java `HoodieTimeGeneratorConfig` infers a 1 ms max expected clock skew when
+/// the (default) `InProcessLockProvider` is used — the single-writer case.
+const MAX_EXPECTED_CLOCK_SKEW_MS: u64 = 1;
+
+/// Skew-adjusting monotonic instant time generator (Java
+/// `SkewAdjustingTimeGenerator` + `HoodieInstantTimeGenerator.createNewInstantTime`).
+///
+/// Under a process-wide lock: capture the clock, wait out the max expected
+/// clock skew, and return the captured time — retrying (never bumping +1) until
+/// it exceeds every previously minted instant. Used for both requested and
+/// completion timestamps, so completion times are strictly greater than the
+/// requested times minted before them. Format `yyyyMMddHHmmssSSS` (UTC).
+/// Whether instants are formatted in local time (Java's
+/// `HoodieTimelineTimeZone.LOCAL`, the Hudi default) or UTC. Process-wide,
+/// mirroring `HoodieInstantTimeGenerator.setCommitTimeZone`; set from the
+/// table's `hoodie.table.timeline.timezone` when a table is created or
+/// loaded for writes. Spark writers mint LOCAL-time instants by default, so
+/// matching the table's declared zone keeps mixed-writer timelines ordered.
+static COMMIT_TIME_IS_LOCAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_commit_timezone(timezone: &str) {
+    COMMIT_TIME_IS_LOCAL.store(
+        !timezone.eq_ignore_ascii_case("utc"),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub(crate) async fn generate_instant_time() -> String {
+    static TIME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = TIME_LOCK.lock().await;
     loop {
         let now = Utc::now();
-        let candidate = now.format("%Y%m%d%H%M%S%3f").to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(MAX_EXPECTED_CLOCK_SKEW_MS)).await;
         let candidate_millis = now.timestamp_millis();
-        let last = LAST_EPOCH_MILLIS.load(Ordering::Relaxed);
-        let next_millis = if candidate_millis <= last {
-            last + 1
-        } else {
-            candidate_millis
-        };
-        if LAST_EPOCH_MILLIS
-            .compare_exchange(last, next_millis, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            if next_millis == candidate_millis {
-                return candidate;
-            }
-            return epoch_millis_to_instant(next_millis);
+        // Store is race-free: all mints serialize through TIME_LOCK.
+        if candidate_millis > LAST_EPOCH_MILLIS.load(Ordering::Acquire) {
+            LAST_EPOCH_MILLIS.store(candidate_millis, Ordering::Release);
+            let format = "%Y%m%d%H%M%S%3f";
+            return if COMMIT_TIME_IS_LOCAL.load(std::sync::atomic::Ordering::Acquire) {
+                now.with_timezone(&chrono::Local).format(format).to_string()
+            } else {
+                now.format(format).to_string()
+            };
         }
     }
 }
@@ -413,7 +591,8 @@ pub(crate) fn max_records_per_file(table: &Table) -> usize {
     ((max_file_size / record_size) as usize).max(1)
 }
 
-pub(crate) fn write_parquet_bytes(table: &Table, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+/// Parquet `WriterProperties` resolved from `hoodie.parquet.*` configs.
+pub(crate) fn parquet_writer_props(table: &Table) -> parquet::file::properties::WriterProperties {
     use parquet::basic::{Compression, GzipLevel, ZstdLevel};
     use parquet::file::properties::WriterProperties;
 
@@ -453,13 +632,21 @@ pub(crate) fn write_parquet_bytes(table: &Table, batches: &[RecordBatch]) -> Res
         _ => Compression::ZSTD(ZstdLevel::try_new(3).unwrap_or_default()),
     };
 
-    let props = WriterProperties::builder()
+    WriterProperties::builder()
         .set_compression(compression)
         .set_dictionary_enabled(dictionary_enabled)
         .set_data_page_size_limit(page_size)
         .set_dictionary_page_size_limit(page_size)
         .set_max_row_group_size(max_row_group_rows)
-        .build();
+        .build()
+}
+
+/// Encode batches to parquet bytes with pre-resolved properties (safe to run
+/// on a blocking thread with owned inputs).
+pub(crate) fn write_parquet_bytes_with_props(
+    props: parquet::file::properties::WriterProperties,
+    batches: &[RecordBatch],
+) -> Result<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut writer = ArrowWriter::try_new(cursor, batches[0].schema(), Some(props))?;
     for batch in batches {
@@ -469,42 +656,148 @@ pub(crate) fn write_parquet_bytes(table: &Table, batches: &[RecordBatch]) -> Res
     Ok(cursor.into_inner())
 }
 
-/// Minimal Arrow→Avro schema JSON for `HoodieCommitMetadata.extraMetadata.schema`.
+/// Arrow→Avro schema JSON for `HoodieCommitMetadata.extraMetadata.schema`.
 ///
-/// Spark resolves table schema from this key; a missing/null `extraMetadata` NPEs.
-pub(crate) fn arrow_schema_to_avro_json(schema: &arrow_schema::Schema) -> String {
+/// Unmapped Arrow types error out — silent `"string"` fallback corrupts Spark's
+/// TableSchemaResolver (Parquet types diverge from commit schema).
+pub(crate) fn arrow_schema_to_avro_json(schema: &arrow_schema::Schema) -> Result<String> {
     let fields: Vec<String> = schema
         .fields()
         .iter()
         .map(|f| {
-            let avro_type = match f.data_type() {
-                arrow_schema::DataType::Boolean => "\"boolean\"",
-                arrow_schema::DataType::Int32 => "\"int\"",
-                arrow_schema::DataType::Int64 => "\"long\"",
-                arrow_schema::DataType::Float32 => "\"float\"",
-                arrow_schema::DataType::Float64 => "\"double\"",
-                arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8 => "\"string\"",
-                arrow_schema::DataType::Binary | arrow_schema::DataType::LargeBinary => {
-                    "\"bytes\""
-                }
-                _ => "\"string\"",
-            };
+            let avro_type = arrow_type_to_avro_type_json(f.data_type())?;
             let ty = if f.is_nullable() {
                 format!("[\"null\",{avro_type}]")
             } else {
-                avro_type.to_string()
+                avro_type
             };
-            format!(
+            Ok(format!(
                 "{{\"name\":\"{}\",\"type\":{}}}",
                 f.name().replace('\"', "\\\""),
                 ty
-            )
+            ))
         })
-        .collect();
-    format!(
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(
         "{{\"type\":\"record\",\"name\":\"hoodie_record\",\"fields\":[{}]}}",
         fields.join(",")
-    )
+    ))
+}
+
+fn arrow_type_to_avro_type_json(dt: &arrow_schema::DataType) -> Result<String> {
+    use arrow_schema::DataType;
+    match dt {
+        DataType::Boolean => Ok("\"boolean\"".to_string()),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => Ok("\"int\"".to_string()),
+        DataType::Int64 => Ok("\"long\"".to_string()),
+        DataType::Float32 => Ok("\"float\"".to_string()),
+        DataType::Float64 => Ok("\"double\"".to_string()),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            Ok("{\"type\":\"string\",\"avro.java.string\":\"String\"}".to_string())
+        }
+        DataType::Binary | DataType::LargeBinary => Ok("\"bytes\"".to_string()),
+        DataType::Date32 => Ok("{\"type\":\"int\",\"logicalType\":\"date\"}".to_string()),
+        DataType::Timestamp(unit, _) => {
+            let logical = match unit {
+                arrow_schema::TimeUnit::Millisecond => "timestamp-millis",
+                arrow_schema::TimeUnit::Microsecond => "timestamp-micros",
+                other => {
+                    return Err(CoreError::Unsupported(format!(
+                        "commit schema does not support Arrow timestamp unit {other:?}"
+                    )));
+                }
+            };
+            Ok(format!(
+                "{{\"type\":\"long\",\"logicalType\":\"{logical}\"}}"
+            ))
+        }
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            Ok(format!(
+                "{{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":{precision},\"scale\":{scale}}}"
+            ))
+        }
+        DataType::List(field) | DataType::LargeList(field) => {
+            let item = arrow_type_to_avro_type_json(field.data_type())?;
+            let item = if field.is_nullable() {
+                format!("[\"null\",{item}]")
+            } else {
+                item
+            };
+            Ok(format!("{{\"type\":\"array\",\"items\":{item}}}"))
+        }
+        DataType::Struct(fields) => {
+            let nested: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    let avro_type = arrow_type_to_avro_type_json(f.data_type())?;
+                    let ty = if f.is_nullable() {
+                        format!("[\"null\",{avro_type}]")
+                    } else {
+                        avro_type
+                    };
+                    Ok(format!(
+                        "{{\"name\":\"{}\",\"type\":{}}}",
+                        f.name().replace('\"', "\\\""),
+                        ty
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!(
+                "{{\"type\":\"record\",\"name\":\"nested_record\",\"fields\":[{}]}}",
+                nested.join(",")
+            ))
+        }
+        other => Err(CoreError::Unsupported(format!(
+            "cannot map Arrow type {other:?} to Avro for commit metadata schema"
+        ))),
+    }
+}
+
+async fn ensure_append_schema_matches_table(
+    table: &Table,
+    batch_schema: &arrow_schema::Schema,
+) -> Result<()> {
+    if table.timeline.completed_commits.is_empty() {
+        return Ok(());
+    }
+    let table_schema = table.get_schema().await?;
+    let batch_data = strip_meta_fields_from_schema(batch_schema);
+    if schemas_equal_by_fields(&table_schema, &batch_data) {
+        return Ok(());
+    }
+    Err(CoreError::Write(format!(
+        "append batch schema does not match table schema (table fields={:?}, batch fields={:?})",
+        table_schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect::<Vec<_>>(),
+        batch_data
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect::<Vec<_>>(),
+    )))
+}
+
+pub(crate) fn strip_meta_fields_from_schema(schema: &arrow_schema::Schema) -> arrow_schema::Schema {
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|f| !f.name().starts_with("_hoodie_"))
+        .cloned()
+        .collect();
+    arrow_schema::Schema::new(fields)
+}
+
+fn schemas_equal_by_fields(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -> bool {
+    if a.fields().len() != b.fields().len() {
+        return false;
+    }
+    a.fields()
+        .iter()
+        .zip(b.fields().iter())
+        .all(|(fa, fb)| fa.name() == fb.name() && fa.data_type() == fb.data_type())
 }
 
 pub(crate) fn prepare_batches_for_write(
@@ -512,6 +805,17 @@ pub(crate) fn prepare_batches_for_write(
     batches: &[RecordBatch],
     instant: &str,
     file_name: &str,
+) -> Result<Vec<RecordBatch>> {
+    prepare_batches_for_write_with_offset(table, batches, instant, file_name, 0, 0)
+}
+
+pub(crate) fn prepare_batches_for_write_with_offset(
+    table: &Table,
+    batches: &[RecordBatch],
+    instant: &str,
+    file_name: &str,
+    row_id_offset: usize,
+    partition_id: u32,
 ) -> Result<Vec<RecordBatch>> {
     let populates_meta_fields: bool = table
         .hudi_configs
@@ -524,10 +828,19 @@ pub(crate) fn prepare_batches_for_write(
     batches
         .iter()
         .map(|batch| {
-            if batch.column_by_name(MetaField::RecordKey.as_ref()).is_some() {
+            if batch
+                .column_by_name(MetaField::RecordKey.as_ref())
+                .is_some()
+            {
                 return Ok(batch.clone());
             }
-            let keys = hoodie_keys_for_batch(table, batch, Some(instant))?;
+            let keys = hoodie_keys_for_batch_with_offset(
+                table,
+                batch,
+                Some(instant),
+                row_id_offset,
+                partition_id,
+            )?;
             let key_strs: Vec<Option<&str>> =
                 keys.iter().map(|k| Some(k.record_key.as_str())).collect();
             let partition_strs: Vec<Option<&str>> = keys
@@ -541,7 +854,7 @@ pub(crate) fn prepare_batches_for_write(
                 Arc::new(StringArray::from(vec![instant; rows])),
                 Arc::new(StringArray::from(
                     (0..rows)
-                        .map(|row| format!("{instant}_0-{row}-0"))
+                        .map(|row| format!("{instant}_{partition_id}-{}-0", row_id_offset + row))
                         .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(key_strs)),

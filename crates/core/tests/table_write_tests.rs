@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use hudi_core::config::table::TableTypeValue;
@@ -199,7 +199,9 @@ async fn test_append_only_requires_append_only_merge_mode() {
         .create()
         .await
         .unwrap();
-    let err = upsertable.append_only([ordered_batch(vec![("a", 1, 1)])]).await;
+    let err = upsertable
+        .append_only([ordered_batch(vec![("a", 1, 1)])])
+        .await;
     assert!(matches!(err, Err(CoreError::Unsupported(_))));
 }
 
@@ -288,6 +290,47 @@ async fn test_create_with_metadata_and_append_updates_files_partition() {
 }
 
 #[tokio::test]
+async fn test_append_writes_column_stats_and_partition_stats_mdt() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([sample_batch()]).await.unwrap();
+
+    let col_stats_dir = dir.path().join(".hoodie/metadata/column_stats");
+    let part_stats_dir = dir.path().join(".hoodie/metadata/partition_stats");
+    assert!(col_stats_dir.is_dir());
+    // Java disables partition_stats for non-partitioned tables.
+    assert!(!part_stats_dir.exists());
+
+    let col_bases: Vec<_> = std::fs::read_dir(&col_stats_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".hfile") && n.starts_with("col-stats-"))
+        .collect();
+    assert_eq!(
+        col_bases.len(),
+        2,
+        "Java default column_stats FG count is 2"
+    );
+
+    let col_logs: Vec<_> = std::fs::read_dir(&col_stats_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".log."))
+        .collect();
+    assert!(
+        !col_logs.is_empty(),
+        "append should write column_stats HFile log blocks: {col_logs:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_upsert_delete_and_overwrite() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();
@@ -370,10 +413,7 @@ async fn test_dynamic_partition_overwrite_replaces_only_touched_partitions() {
         .unwrap();
 
     let result = table
-        .dynamic_partition_overwrite([partitioned_batch(vec![
-            ("x", "sf", 10),
-            ("y", "sf", 11),
-        ])])
+        .dynamic_partition_overwrite([partitioned_batch(vec![("x", "sf", 10), ("y", "sf", 11)])])
         .await
         .unwrap();
     assert_eq!(result.num_writes, 2);
@@ -543,12 +583,13 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
         .read(&ReadOptions::new().with_hudi_option("hoodie.read.use.read_optimized.mode", "true"))
         .await
         .unwrap();
+    // `c` was a packed insert (small-file routing) living only in log files,
+    // so read-optimized mode cannot see it until compaction — Java parity.
     assert_eq!(
         rows_by_id(&read_optimized),
         vec![
             ("a".to_string(), 1),
             ("b".to_string(), 2),
-            ("c".to_string(), 3),
             ("d".to_string(), 4),
         ]
     );
@@ -573,27 +614,20 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
 }
 
 #[tokio::test]
-async fn test_upsert_rejects_custom_payload_or_merger() {
+async fn test_upsert_rejects_custom_merge_mode() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();
     let mut table = Table::create(base_uri)
         .with_table_name("trips")
         .with_record_key_fields(["id"])
-        .with_option(
-            "hoodie.datasource.write.payload.class",
-            "example.CustomPayload",
-        )
+        .with_option("hoodie.record.merge.mode", "CUSTOM")
         .create()
         .await
         .unwrap();
 
     let error = table.upsert([batch(vec![("a", 1)])]).await.unwrap_err();
     assert!(matches!(error, CoreError::Unsupported(_)));
-    assert!(
-        error
-            .to_string()
-            .contains("hoodie.datasource.write.payload.class")
-    );
+    assert!(error.to_string().contains("CUSTOM"), "{error}");
 }
 
 #[tokio::test]
@@ -754,7 +788,11 @@ async fn test_upsert_rejects_schema_mismatch() {
 }
 
 fn set_value(value: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
 }
 
@@ -782,7 +820,11 @@ fn city_batch(rows: Vec<(&str, &str, i64)>) -> RecordBatch {
 }
 
 fn set_fare(value: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
 }
 
@@ -795,7 +837,10 @@ async fn test_delete_by_non_key_column_scan() {
         .create()
         .await
         .unwrap();
-    table.append([batch(vec![("a", 1), ("b", 2), ("c", 2)])]).await.unwrap();
+    table
+        .append([batch(vec![("a", 1), ("b", 2), ("c", 2)])])
+        .await
+        .unwrap();
 
     let deleted = table.delete("value = 2").await.unwrap();
     assert_eq!(deleted.num_deletes, 2);
@@ -814,7 +859,10 @@ async fn test_delete_by_record_key_equality_routes_keyed_path() {
         .create()
         .await
         .unwrap();
-    table.append([batch(vec![("a", 1), ("b", 2)])]).await.unwrap();
+    table
+        .append([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
 
     let deleted = table.delete("id = 'b'").await.unwrap();
     assert_eq!(deleted.num_deletes, 1);
@@ -826,7 +874,12 @@ async fn test_delete_by_record_key_equality_routes_keyed_path() {
     // Meta record-key predicate also routes through keyed delete.
     let deleted = table.delete("_hoodie_record_key = 'a'").await.unwrap();
     assert_eq!(deleted.num_deletes, 1);
-    assert!(table.read(&ReadOptions::new()).await.unwrap().is_empty());
+    // Delete-all keeps an empty base slice under the same file group (commit, not
+    // replacecommit), so read may return empty batches — assert on row content.
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        Vec::<(String, i64)>::new()
+    );
 }
 
 #[tokio::test]
@@ -892,15 +945,16 @@ async fn test_update_rejects_multi_row_set_batch() {
     table.append([batch(vec![("a", 1)])]).await.unwrap();
 
     let multi = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)])),
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
         vec![Arc::new(Int64Array::from(vec![1, 2]))],
     )
     .unwrap();
     let error = table.update("id = 'a'", multi).await.unwrap_err();
-    assert!(
-        error.to_string().contains("single-row"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("single-row"), "{error}");
 }
 
 #[tokio::test]
@@ -945,13 +999,373 @@ async fn test_mor_update_by_filter() {
         .await
         .unwrap();
 
-    let result = table
-        .update("id = 'a'", set_value(10))
-        .await
-        .unwrap();
+    let result = table.update("id = 'a'", set_value(10)).await.unwrap();
     assert!(result.num_updates >= 1);
     assert_eq!(
         rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
         vec![("a".to_string(), 10), ("b".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn test_partitioned_cow_filter_delete_by_record_key() {
+    // P0-5: empty partition_path from filter must still delete via key-only match.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([city_batch(vec![("a", "sf", 1), ("b", "nyc", 2)])])
+        .await
+        .unwrap();
+
+    let deleted = table.delete("id = 'b'").await.unwrap();
+    assert_eq!(deleted.num_deletes, 1);
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn test_append_rejects_schema_mismatch() {
+    // P0-8: divergent append schema must error, not silently rewrite commit schema.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+
+    let bad_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("other", DataType::Int64, false),
+    ]));
+    let bad = RecordBatch::try_new(
+        bad_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["b"])),
+            Arc::new(Int64Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    let err = table.append([bad]).await.unwrap_err();
+    assert!(
+        err.to_string().contains("does not match table schema"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn test_default_create_uses_commit_time_merge_mode() {
+    // Payload classes are deprecated; merge mode is the source of truth.
+    let dir = tempdir().unwrap();
+    let _table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+    assert!(props.contains("hoodie.record.merge.mode=COMMIT_TIME_ORDERING"));
+    assert!(!props.contains("hoodie.compaction.payload.class="));
+    assert!(props.contains("hoodie.table.timeline.timezone=LOCAL"));
+}
+
+#[tokio::test]
+async fn test_auto_keys_unique_across_size_split_chunks() {
+    // P0-4: auto keys must not restart per size-split chunk within a commit.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_option("hoodie.parquet.max.file.size", "1")
+        .create()
+        .await
+        .unwrap();
+    // No record key fields → auto keys. Force tiny files so one append splits.
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let data =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))]).unwrap();
+    table.append([data]).await.unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for rows in &batches {
+        let key_col = rows.column_by_name("_hoodie_record_key").expect("meta key");
+        let keys = key_col.as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..rows.num_rows() {
+            assert!(
+                seen.insert(keys.value(i).to_string()),
+                "duplicate auto key {}",
+                keys.value(i)
+            );
+        }
+    }
+    assert_eq!(seen.len(), 4);
+}
+
+#[tokio::test]
+async fn test_cow_delete_then_rli_lookup_misses_deleted_key() {
+    // P0-1: RLI deletes must not poison subsequent index lookups.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    table
+        .delete_keys([HoodieKey {
+            record_key: "b".to_string(),
+            partition_path: String::new(),
+        }])
+        .await
+        .unwrap();
+
+    let tagged = hudi_core::index::for_table(&table)
+        .tag_location(
+            &table,
+            &[
+                HoodieKey {
+                    record_key: "a".to_string(),
+                    partition_path: String::new(),
+                },
+                HoodieKey {
+                    record_key: "b".to_string(),
+                    partition_path: String::new(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        tagged
+            .get(&HoodieKey {
+                record_key: "a".to_string(),
+                partition_path: String::new(),
+            })
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        tagged
+            .get(&HoodieKey {
+                record_key: "b".to_string(),
+                partition_path: String::new(),
+            })
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_mor_delete_then_upsert_same_key_visible() {
+    // P0-7: delete orderingVal must not permanently shadow a later upsert.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_batch(vec![("a", 1, 10)])])
+        .await
+        .unwrap();
+    table.delete("id = 'a'").await.unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 2, 5)])])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn test_mor_overwrite_replaces_file_groups() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .upsert([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    // Log files exist for the group after an update.
+    table.upsert([batch(vec![("a", 10)])]).await.unwrap();
+
+    let result = table.overwrite([batch(vec![("z", 99)])]).await.unwrap();
+    assert_eq!(result.num_writes, 1);
+
+    // Replacecommit (not deltacommit) with the plan in requested.
+    let timeline = dir.path().join(".hoodie/timeline");
+    let names: Vec<String> = std::fs::read_dir(&timeline)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with(".replacecommit") && n.contains('_')),
+        "MOR overwrite must complete a replacecommit: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with(".replacecommit.requested")),
+        "replacecommit plan must be requested: {names:?}"
+    );
+
+    // Old file groups (base + logs) replaced: only the new row reads back.
+    assert_eq!(
+        rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("z".to_string(), 99)]
+    );
+}
+
+#[tokio::test]
+async fn test_mor_dynamic_partition_overwrite() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let city_batch = |rows: Vec<(&str, &str, i64)>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, city, _)| *city).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    table
+        .upsert([city_batch(vec![("a", "sf", 1), ("c", "nyc", 7)])])
+        .await
+        .unwrap();
+    table
+        .dynamic_partition_overwrite([city_batch(vec![("d", "sf", 5)])])
+        .await
+        .unwrap();
+
+    // Touched partition replaced; untouched partition intact.
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let mut ids: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..b.num_rows())
+                .map(|i| ids.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["c".to_string(), "d".to_string()]);
+}
+
+#[tokio::test]
+async fn test_cow_delete_emptying_one_group_writes_empty_base() {
+    // Regression: a delete that empties one file group while another affected
+    // group keeps rows must still write an empty base for the emptied group.
+    // Without it the old base stays the group's latest slice and the deleted
+    // row resurfaces on a fresh table open.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_partition_fields(["city"])
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    // Two file groups: sf holds only "a"; nyc holds "b1" and "b2".
+    table
+        .append([partitioned_batch(vec![
+            ("a", "sf", 1),
+            ("b1", "nyc", 2),
+            ("b2", "nyc", 3),
+        ])])
+        .await
+        .unwrap();
+    // One delete touching both groups: empties sf, leaves b2 in nyc.
+    let result = table.delete("id IN ('a', 'b1')").await.unwrap();
+    assert_eq!(result.num_deletes, 2);
+
+    // Fresh open (cold file-system view) must not resurrect "a".
+    let table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let mut ids: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["b2".to_string()]);
+
+    // The emptied sf group must have a second (empty) base file version.
+    let sf_files: Vec<String> = std::fs::read_dir(dir.path().join("city=sf"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".parquet"))
+        .collect();
+    assert_eq!(
+        sf_files.len(),
+        2,
+        "sf group should have the original base plus an empty rewrite, saw {sf_files:?}"
     );
 }

@@ -210,6 +210,12 @@ impl Table {
 
     /// Reload the active timeline and drop listing caches before a write plans.
     pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
+        // Instants must be minted in the table's declared timeline timezone
+        // (Spark writers default to LOCAL); set before any instant is minted.
+        crate::write::set_commit_timezone(&self.timezone());
+        // Eager rollback of crashed writes (Java rollbackFailedWrites) before
+        // any new instant is minted.
+        crate::write::rollback::rollback_failed_writes(self).await?;
         self.timeline.reload_completed_commits().await?;
         self.file_system_view.clear_cache();
         Ok(())
@@ -1109,7 +1115,7 @@ impl Table {
         else {
             return Ok(None);
         };
-        let end = format_timestamp(end, &timezone)?;
+        let end = format_timestamp(&end, &timezone)?;
         let start = options
             .start_timestamp()
             .unwrap_or(EARLIEST_START_TIMESTAMP);
@@ -1246,9 +1252,15 @@ impl Table {
         let partition_schema = self.get_partition_schema().await.ok()?;
         let hudi_configs = self.hudi_configs.as_ref();
         let partition_pruner = PartitionPruner::new(&[], &partition_schema, hudi_configs).ok()?;
+        let valid_instants = crate::metadata::table::valid_metadata_instants(
+            &self.file_system_view.storage,
+            &self.hudi_configs,
+        )
+        .await
+        .ok()?;
         let mdt = self.get_or_init_metadata_table().await.ok()?;
         let records = mdt
-            .fetch_files_partition_records(&partition_pruner)
+            .fetch_files_partition_records(&partition_pruner, Some(&valid_instants))
             .await
             .ok()?;
 
@@ -1284,16 +1296,45 @@ impl Table {
 }
 
 fn parse_write_filter(filter: &str) -> Result<Filter> {
-    const OPERATORS: [&str; 8] = ["!=", ">=", "<=", "=", ">", "<", " IN ", " NOT IN "];
+    // `NOT IN` must be tried before `IN`, which it contains as a substring.
+    const OPERATORS: [&str; 8] = ["!=", ">=", "<=", "=", ">", "<", " NOT IN ", " IN "];
     let filter = filter.trim();
     for operator in OPERATORS {
         if let Some((field, value)) = filter.split_once(operator) {
             let field = field.trim();
-            let value = value.trim().trim_matches('\'').trim_matches('"');
-            if field.is_empty() || value.is_empty() {
+            let raw = value.trim();
+            if field.is_empty() || raw.is_empty() {
                 break;
             }
             let operator = operator.trim();
+            if matches!(operator, "IN" | "NOT IN") {
+                // Accept both `IN ('a', 'b')` and `IN a,b`.
+                let inner = raw
+                    .strip_prefix('(')
+                    .and_then(|v| v.strip_suffix(')'))
+                    .unwrap_or(raw);
+                let values: Vec<String> = inner
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                if values.is_empty() {
+                    break;
+                }
+                use std::str::FromStr;
+                let operator = crate::expr::ExprOperator::from_str(operator)?;
+                return Filter::new(field.to_string(), operator, values);
+            }
+            let value = raw.trim_matches('\'').trim_matches('"');
+            // Leftover quotes mean the input was more than one comparison
+            // (e.g. `id = 'a' OR id = 'b'`); erroring beats silently matching
+            // nothing.
+            if value.contains('\'') || value.contains('"') {
+                return Err(CoreError::Write(format!(
+                    "write filter must be a single comparison (AND/OR are not supported; \
+                     use `IN` for multiple keys), got '{filter}'"
+                )));
+            }
             return Filter::try_from((field, operator, value));
         }
     }
@@ -1354,6 +1395,39 @@ mod tests {
             "a window inside the active timeline must not warn"
         );
         Ok(())
+    }
+
+    mod test_parse_write_filter {
+        use super::super::parse_write_filter;
+        use crate::expr::ExprOperator;
+
+        #[test]
+        fn test_parse_write_filter_in_with_parens_strips_quotes() {
+            let filter = parse_write_filter("id IN ('a', 'b')").unwrap();
+            assert_eq!(filter.operator, ExprOperator::In);
+            assert_eq!(filter.values, vec!["a".to_string(), "b".to_string()]);
+        }
+
+        #[test]
+        fn test_parse_write_filter_not_in_parses_as_not_in() {
+            let filter = parse_write_filter("id NOT IN ('a')").unwrap();
+            assert_eq!(filter.operator, ExprOperator::NotIn);
+            assert_eq!(filter.field, "id");
+            assert_eq!(filter.values, vec!["a".to_string()]);
+        }
+
+        #[test]
+        fn test_parse_write_filter_or_clause_errors_instead_of_silent_no_match() {
+            let err = parse_write_filter("id = 'a' OR id = 'b'").unwrap_err();
+            assert!(err.to_string().contains("single comparison"), "{err}");
+        }
+
+        #[test]
+        fn test_parse_write_filter_simple_equality() {
+            let filter = parse_write_filter("id = 'a'").unwrap();
+            assert_eq!(filter.operator, ExprOperator::Eq);
+            assert_eq!(filter.values, vec!["a".to_string()]);
+        }
     }
     use crate::config::HUDI_CONF_DIR;
     use crate::config::internal::HudiInternalConfig;
@@ -2945,7 +3019,7 @@ mod tests {
         let partition_pruner =
             PartitionPruner::new(&[], &partition_schema, table.hudi_configs.as_ref()).unwrap();
         let records = metadata_table
-            .fetch_files_partition_records(&partition_pruner)
+            .fetch_files_partition_records(&partition_pruner, None)
             .await
             .unwrap();
         assert!(!records.is_empty());

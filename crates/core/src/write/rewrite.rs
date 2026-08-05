@@ -20,8 +20,6 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
-use apache_avro::to_avro_datum;
-use apache_avro::types::Value as AvroValue;
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray, UInt32Array};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -33,25 +31,23 @@ use crate::config::table::HudiTableConfig::{OrderingFields, RecordKeyFields, Rec
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, filters_to_row_mask, validate_fields_against_schemas};
-use crate::file_group::log_file::writer::LogFileWriter;
-use crate::file_group::log_file::{BlockMetadataKey, BlockType};
 use crate::file_group::record_batches::RecordBatches;
 use crate::index::{HoodieIndex, HoodieKey, for_table, is_record_index_enabled};
-use crate::metadata::table::encode::RecordIndexEntry;
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::meta_field::MetaField;
-use crate::schema::delete::avro_schema_for_delete_record_list;
+use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::{ReadOptions, Table};
 use crate::timeline::instant::{Action, Instant};
 use crate::write::append::{
-    ensure_copy_on_write, is_layout_two, next_instant_timestamp,
-    prepare_batches_for_write, timeline_dir, write_parquet_bytes,
+    ensure_copy_on_write, generate_instant_time, is_layout_two, prepare_batches_for_write,
+    timeline_dir,
 };
 use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
 use crate::write::metadata::{
-    instant_to_epoch_millis, update_files_partition_entries, update_record_index,
+    instant_to_epoch_millis, is_column_stats_enabled, update_column_stats_partitions,
+    update_files_partition_entries, update_record_index,
 };
 
 /// Result of an upsert, delete, or overwrite write.
@@ -76,6 +72,68 @@ pub struct UpsertOptions {
     pub update_columns: Option<Vec<String>>,
 }
 
+/// How a COW rewrite commits: same file-group slice vs replacecommit overwrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RewriteKind {
+    /// New base file slice in the same file group(s); timeline action = commit.
+    Commit,
+    /// Replace file groups; timeline action = replacecommit (overwrite only for now).
+    Replace,
+}
+
+/// Critical section 1: request the action — mint the instant time and fence
+/// it (requested + inflight) under the table lock, then release; the write's
+/// heavy work runs unlocked. `request_commit` / `request_replacecommit` pick
+/// the timeline action from the rewrite kind.
+async fn request_rewrite_instant(
+    table: &Table,
+    operation: &str,
+    kind: RewriteKind,
+) -> Result<String> {
+    let storage = table.file_system_view.storage.clone();
+    let lock = crate::write::lock::lock_provider_for(table);
+    let _cs1 = lock.lock().await?;
+    let instant = generate_instant_time().await;
+    let action = match kind {
+        RewriteKind::Commit => Action::Commit,
+        RewriteKind::Replace => Action::ReplaceCommit,
+    };
+    let requested_bytes = if kind == RewriteKind::Replace {
+        crate::metadata::replace_commit::HoodieRequestedReplaceMetadata::for_operation(operation)
+            .to_avro_bytes()?
+    } else {
+        Vec::new()
+    };
+    crate::write::fence_timeline_instant(
+        storage.as_ref(),
+        &timeline_dir(table),
+        &instant,
+        action,
+        requested_bytes,
+        crate::write::inflight_commit_metadata_bytes(operation, is_layout_two(table))?,
+    )
+    .await?;
+    Ok(instant)
+}
+
+/// Critical section 1 for MOR deltacommits.
+async fn request_deltacommit(table: &Table, operation: &str) -> Result<String> {
+    let storage = table.file_system_view.storage.clone();
+    let lock = crate::write::lock::lock_provider_for(table);
+    let _cs1 = lock.lock().await?;
+    let instant = generate_instant_time().await;
+    crate::write::fence_timeline_instant(
+        storage.as_ref(),
+        &timeline_dir(table),
+        &instant,
+        Action::DeltaCommit,
+        Vec::new(),
+        crate::write::inflight_commit_metadata_bytes(operation, is_layout_two(table))?,
+    )
+    .await?;
+    Ok(instant)
+}
+
 pub async fn upsert_batches(
     table: &mut Table,
     batches: &[RecordBatch],
@@ -92,7 +150,7 @@ pub async fn upsert_batches(
             "upsert requires at least one RecordBatch".to_string(),
         ));
     }
-    let instant = next_instant_timestamp();
+    let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let incoming = prepare_batches_for_write(table, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
     if incoming.num_rows() == 0 {
@@ -111,13 +169,72 @@ pub async fn upsert_batches(
         .values()
         .filter_map(|loc| loc.as_ref().map(|l| l.file_id.clone()))
         .collect::<HashSet<_>>();
-    let (old, file_ids, old_paths) = data_for_file_ids(table, &affected_file_ids).await?;
-    let old = old.unwrap_or_else(|| RecordBatch::new_empty(incoming.schema()));
-    if old.schema() != incoming.schema() && old.num_rows() > 0 {
-        return Err(CoreError::Schema(
-            "upsert batch schema does not match the current table schema".to_string(),
-        ));
+
+    // Small-file packing (Java UpsertPartitioner.assignInserts): assign insert
+    // rows to existing small file groups first; chosen groups join the read
+    // set so their rows are preserved through the rewrite.
+    let sizing = crate::write::sizing::SizingConfig::from_table(table);
+    let avg_record_size = crate::write::sizing::average_record_size(
+        table,
+        table.file_system_view.storage.as_ref(),
+        &sizing,
+    )
+    .await;
+    let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
+    let mut insert_rows_by_partition: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
+        if locations.get(hoodie_key).and_then(Option::as_ref).is_none() {
+            insert_rows_by_partition
+                .entry(hoodie_key.partition_path.clone())
+                .or_default()
+                .push(index);
+        }
     }
+    let mut insert_target_by_row: HashMap<usize, Option<String>> = HashMap::new();
+    let mut packed_group_ids: HashSet<String> = HashSet::new();
+    for (partition, rows) in &insert_rows_by_partition {
+        let slices: Vec<&crate::file_group::file_slice::FileSlice> = slices_by_partition
+            .get(partition)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        let small = crate::write::sizing::small_file_groups(&slices, false, &sizing);
+        let assignments = crate::write::sizing::assign_insert_buckets(
+            rows.len(),
+            &small,
+            avg_record_size,
+            &sizing,
+        );
+        let mut cursor = 0usize;
+        for (bucket, count) in assignments {
+            for row in &rows[cursor..cursor + count] {
+                match &bucket {
+                    crate::write::sizing::InsertBucket::Existing { file_id } => {
+                        insert_target_by_row.insert(*row, Some(file_id.clone()));
+                        packed_group_ids.insert(file_id.clone());
+                    }
+                    crate::write::sizing::InsertBucket::New => {
+                        insert_target_by_row.insert(*row, None);
+                    }
+                }
+            }
+            cursor += count;
+        }
+    }
+    let read_ids: HashSet<String> = affected_file_ids
+        .union(&packed_group_ids)
+        .cloned()
+        .collect();
+    let (old, file_ids, old_paths, old_row_file_ids) = data_for_file_ids(table, &read_ids).await?;
+    let old = old.unwrap_or_else(|| RecordBatch::new_empty(incoming.schema()));
+    let incoming = if old.num_rows() > 0 {
+        crate::write::align_batch_to_schema(&incoming, &old.schema()).ok_or_else(|| {
+            CoreError::Schema(
+                "upsert batch schema does not match the current table schema".to_string(),
+            )
+        })?
+    } else {
+        incoming
+    };
     let old_keys = if old.num_rows() > 0 {
         keys(&old, &key_name)?
     } else {
@@ -160,10 +277,42 @@ pub async fn upsert_batches(
     } else {
         take_batch(&combined, &selected)?
     };
-    // Placeholder name — rewrite assigns a unique UUID file id per partition file.
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
+    // Route each surviving row: old rows and tagged updates back to their file
+    // groups; packed inserts to their assigned small groups; the rest ("") to
+    // new size-split groups inside rewrite().
+    let row_targets: Vec<String> = selected
+        .iter()
+        .map(|&combined_index| {
+            let combined_index = combined_index as usize;
+            if combined_index < old.num_rows() {
+                old_row_file_ids[combined_index].clone()
+            } else {
+                let incoming_index = combined_index - old.num_rows();
+                if let Some(Some(location)) = locations.get(&incoming_hoodie_keys[incoming_index]) {
+                    location.file_id.clone()
+                } else {
+                    insert_target_by_row
+                        .get(&incoming_index)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_default()
+                }
+            }
+        })
+        .collect();
     rewrite(
-        table, &instant, &file_name, &merged, file_ids, old_paths, "UPSERT", updates, inserts, 0,
+        table,
+        &instant,
+        &merged,
+        Some(row_targets),
+        file_ids,
+        old_paths,
+        "UPSERT",
+        updates,
+        inserts,
+        0,
+        Vec::new(),
+        RewriteKind::Commit,
     )
     .await
 }
@@ -179,10 +328,10 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
 
     if table.is_mor() {
         ensure_mor_merge_supported(table)?;
-        let (Some(old), _, _) = current_data(table).await? else {
+        let (Some(old), _, _, _) = current_data(table).await? else {
             return Ok(WriteResult::default());
         };
-        validate_fields_against_schemas(&[filter.clone()], [old.schema().as_ref()])?;
+        validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
         let mask = filters_to_row_mask(&[filter], &old)?;
         let key_name = record_key_name(table, &old).map_err(|_| {
             CoreError::Unsupported(
@@ -209,10 +358,10 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
 
     // COW scan path — any column; no configured record key required.
     ensure_rewrite_supported(table)?;
-    let (Some(old), file_ids, old_paths) = current_data(table).await? else {
+    let (Some(old), file_ids, old_paths, old_row_file_ids) = current_data(table).await? else {
         return Ok(WriteResult::default());
     };
-    validate_fields_against_schemas(&[filter.clone()], [old.schema().as_ref()])?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
     let mask = filters_to_row_mask(&[filter], &old)?;
     let deleted_indices = mask
         .iter()
@@ -229,14 +378,12 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
         return Ok(WriteResult::default());
     }
     let remaining = take_batch(&old, &selected)?;
-    let instant = next_instant_timestamp();
-    let file_id = crate::write::new_file_id();
-    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
-    let result = rewrite(
-        table, &instant, &file_name, &remaining, file_ids, old_paths, "DELETE", 0, 0, deleted,
-    )
-    .await?;
-    // Tombstone deleted keys in RLI when keys are recoverable from the snapshot.
+    let row_targets: Vec<String> = selected
+        .iter()
+        .map(|i| old_row_file_ids[*i as usize].clone())
+        .collect();
+    let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
+    let mut rli_deletes = Vec::new();
     if table.is_metadata_table_enabled()
         && is_record_index_enabled(table)
         && let Ok(key_name) = record_key_name(table, &old)
@@ -244,7 +391,7 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
         let deleted_batch = take_batch(&old, &deleted_indices)?;
         let deleted_record_keys = keys(&deleted_batch, &key_name)?;
         let partitions = partition_paths_for_batch(&deleted_batch);
-        let entries = deleted_record_keys
+        rli_deletes = deleted_record_keys
             .into_iter()
             .zip(partitions)
             .map(|(record_key, partition_path)| RecordIndexEntry {
@@ -254,17 +401,23 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
                 instant_time_millis: instant_to_epoch_millis(&instant),
                 is_deleted: true,
             })
-            .collect::<Vec<_>>();
-        if !entries.is_empty() {
-            update_record_index(
-                table.file_system_view.storage.as_ref(),
-                &instant,
-                &entries,
-            )
-            .await?;
-        }
+            .collect();
     }
-    Ok(result)
+    rewrite(
+        table,
+        &instant,
+        &remaining,
+        Some(row_targets),
+        file_ids,
+        old_paths,
+        "DELETE",
+        0,
+        0,
+        deleted,
+        rli_deletes,
+        RewriteKind::Commit,
+    )
+    .await
 }
 
 /// UPDATE: set columns from a single-row `updates` batch on rows matching `filter`.
@@ -283,32 +436,33 @@ pub async fn update_filter(
         return mor_update_filter(table, filter, updates).await;
     }
     ensure_rewrite_supported(table)?;
-    let (Some(old), file_ids, old_paths) = current_data(table).await? else {
+    let (Some(old), file_ids, old_paths, old_row_file_ids) = current_data(table).await? else {
         return Ok(WriteResult::default());
     };
-    validate_fields_against_schemas(&[filter.clone()], [old.schema().as_ref()])?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
     let mask = filters_to_row_mask(&[filter], &old)?;
     let (merged, num_updates) = apply_set_updates(&old, &mask, &updates)?;
     if num_updates == 0 {
         return Ok(WriteResult::default());
     }
-    let instant = next_instant_timestamp();
-    let file_id = crate::write::new_file_id();
-    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
+    let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let data_only = strip_meta_columns(&merged)?;
-    let prepared = prepare_batches_for_write(table, &[data_only], &instant, &file_name)?;
+    let prepared = prepare_batches_for_write(table, &[data_only], &instant, "pending")?;
     let merged = concat(&prepared)?;
+    // Rows keep their origin file groups (`merged` is `old` updated in place).
     rewrite(
         table,
         &instant,
-        &file_name,
         &merged,
+        Some(old_row_file_ids),
         file_ids,
         old_paths,
         "UPSERT",
         num_updates,
         0,
         0,
+        Vec::new(),
+        RewriteKind::Commit,
     )
     .await
 }
@@ -333,38 +487,45 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     if affected_file_ids.is_empty() {
         return Ok(WriteResult::default());
     }
-    let (Some(old), file_ids, old_paths) = data_for_file_ids(table, &affected_file_ids).await?
+    let (Some(old), file_ids, old_paths, old_row_file_ids) =
+        data_for_file_ids(table, &affected_file_ids).await?
     else {
         return Ok(WriteResult::default());
     };
-    let requested = delete_keys
+    let requested_exact = delete_keys
         .iter()
-        .map(|key| (key.record_key.as_str(), key.partition_path.as_str()))
-        .collect::<std::collections::HashSet<_>>();
+        .filter(|key| !key.partition_path.is_empty())
+        .map(|key| (key.record_key.clone(), key.partition_path.clone()))
+        .collect::<HashSet<_>>();
+    let requested_keys_only = delete_keys
+        .iter()
+        .filter(|key| key.partition_path.is_empty())
+        .map(|key| key.record_key.clone())
+        .collect::<HashSet<_>>();
     let old_keys = hoodie_keys_for_batch(table, &old, None)?;
+    let is_requested = |key: &HoodieKey| {
+        requested_keys_only.contains(&key.record_key)
+            || requested_exact.contains(&(key.record_key.clone(), key.partition_path.clone()))
+    };
     let selected = old_keys
         .iter()
         .enumerate()
-        .filter_map(|(index, key)| {
-            (!requested.contains(&(key.record_key.as_str(), key.partition_path.as_str())))
-                .then_some(index as u32)
-        })
+        .filter_map(|(index, key)| (!is_requested(key)).then_some(index as u32))
         .collect::<Vec<_>>();
     let deleted = old.num_rows() - selected.len();
     if deleted == 0 {
         return Ok(WriteResult::default());
     }
     let remaining = take_batch(&old, &selected)?;
-    let instant = next_instant_timestamp();
-    let file_name = format!("rewrite-{instant}_0-0-0_{instant}.parquet");
-    let result = rewrite(
-        table, &instant, &file_name, &remaining, file_ids, old_paths, "DELETE", 0, 0, deleted,
-    )
-    .await?;
-    if table.is_metadata_table_enabled() && is_record_index_enabled(table) {
-        let deleted_keys = old_keys
+    let row_targets: Vec<String> = selected
+        .iter()
+        .map(|i| old_row_file_ids[*i as usize].clone())
+        .collect();
+    let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
+    let rli_deletes = if table.is_metadata_table_enabled() && is_record_index_enabled(table) {
+        old_keys
             .into_iter()
-            .filter(|key| requested.contains(&(key.record_key.as_str(), key.partition_path.as_str())))
+            .filter(|key| is_requested(key))
             .map(|key| RecordIndexEntry {
                 record_key: key.record_key,
                 partition_path: key.partition_path,
@@ -372,27 +533,40 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
                 instant_time_millis: instant_to_epoch_millis(&instant),
                 is_deleted: true,
             })
-            .collect::<Vec<_>>();
-        update_record_index(
-            table.file_system_view.storage.as_ref(),
-            &instant,
-            &deleted_keys,
-        )
-        .await?;
-    }
-    Ok(result)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    rewrite(
+        table,
+        &instant,
+        &remaining,
+        Some(row_targets),
+        file_ids,
+        old_paths,
+        "DELETE",
+        0,
+        0,
+        deleted,
+        rli_deletes,
+        RewriteKind::Commit,
+    )
+    .await
 }
 
 pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
     table.reload_timeline_for_write().await?;
-    ensure_rewrite_supported(table)?;
+    // Insert-overwrite writes new BASE file groups + a replacecommit on both
+    // COW and MOR (Java uses the same executor for either table type).
+    ensure_supported_merge_configs(table)?;
     if batches.is_empty() {
         return Err(CoreError::Write(
             "overwrite requires at least one RecordBatch".to_string(),
         ));
     }
-    let (_, file_ids, old_paths) = current_data(table).await?;
-    let instant = next_instant_timestamp();
+    let (_, file_ids, old_paths, _) = current_data(table).await?;
+    let instant =
+        request_rewrite_instant(table, "INSERT_OVERWRITE_TABLE", RewriteKind::Replace).await?;
     let file_id = crate::write::new_file_id();
     let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let batches = prepare_batches_for_write(table, batches, &instant, &file_name)?;
@@ -405,14 +579,16 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
     rewrite(
         table,
         &instant,
-        &file_name,
         &replacement,
+        None,
         file_ids,
         old_paths,
         "INSERT_OVERWRITE_TABLE",
         0,
         replacement.num_rows(),
         0,
+        Vec::new(),
+        RewriteKind::Replace,
     )
     .await
 }
@@ -422,13 +598,14 @@ pub async fn dynamic_partition_overwrite_batches(
     batches: &[RecordBatch],
 ) -> Result<WriteResult> {
     table.reload_timeline_for_write().await?;
-    ensure_rewrite_supported(table)?;
+    // Works on COW and MOR alike (see overwrite_batches).
+    ensure_supported_merge_configs(table)?;
     if batches.is_empty() {
         return Err(CoreError::Write(
             "dynamic_partition_overwrite requires at least one RecordBatch".to_string(),
         ));
     }
-    let instant = next_instant_timestamp();
+    let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
     let prepared = prepare_batches_for_write(table, batches, &instant, "pending")?;
     let replacement = concat(&prepared)?;
     if replacement.num_rows() == 0 {
@@ -448,28 +625,27 @@ pub async fn dynamic_partition_overwrite_batches(
     }
     let (old, file_ids, old_paths) = data_for_partitions(table, &partition_paths).await?;
     let replacement = if let Some(old) = old {
-        if old.schema() != replacement.schema() {
-            return Err(CoreError::Schema(
+        crate::write::align_batch_to_schema(&replacement, &old.schema()).ok_or_else(|| {
+            CoreError::Schema(
                 "overwrite batch schema does not match the current table schema".to_string(),
-            ));
-        }
-        replacement
+            )
+        })?
     } else {
         replacement
     };
-    let file_id = crate::write::new_file_id();
-    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     rewrite(
         table,
         &instant,
-        &file_name,
         &replacement,
+        None,
         file_ids,
         old_paths,
         "INSERT_OVERWRITE",
         0,
         replacement.num_rows(),
         0,
+        Vec::new(),
+        RewriteKind::Replace,
     )
     .await
 }
@@ -505,24 +681,32 @@ fn ensure_mor_merge_supported(table: &Table) -> Result<()> {
 }
 
 fn ensure_supported_merge_configs(table: &Table) -> Result<()> {
-    const UNSUPPORTED_CUSTOM_MERGE_OPTIONS: [&str; 4] = [
-        "hoodie.compaction.payload.class",
-        "hoodie.datasource.write.payload.class",
-        "hoodie.payload.class",
-        "hoodie.record.merger.impls",
-    ];
-    const DEFAULT_PAYLOAD: &str = "org.apache.hudi.common.model.DefaultHoodieRecordPayload";
+    // Payload classes are deprecated; writers only honor merge mode / strategy.
+    // Reject CUSTOM merge and custom merger impls — support COMMIT_TIME, EVENT_TIME,
+    // and append-only (derived strategy).
     let options = table.hudi_configs.as_options();
-    for option in UNSUPPORTED_CUSTOM_MERGE_OPTIONS {
-        if let Some(value) = options.get(option) {
-            // Java tables always persist the default payload class; only reject customs.
-            if option.ends_with("payload.class") && value == DEFAULT_PAYLOAD {
-                continue;
+    if let Some(mode) = options.get("hoodie.record.merge.mode") {
+        let normalized = mode.to_ascii_uppercase();
+        match normalized.as_str() {
+            "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING" => {}
+            "CUSTOM" => {
+                return Err(CoreError::Unsupported(
+                    "writes do not support hoodie.record.merge.mode=CUSTOM".to_string(),
+                ));
             }
-            return Err(CoreError::Unsupported(format!(
-                "writes do not support custom payload or record merger option '{option}'"
-            )));
+            other => {
+                return Err(CoreError::Unsupported(format!(
+                    "writes only support COMMIT_TIME_ORDERING or EVENT_TIME_ORDERING merge modes, got '{other}'"
+                )));
+            }
         }
+    }
+    if let Some(merger) = options.get("hoodie.record.merger.impls")
+        && !merger.trim().is_empty()
+    {
+        return Err(CoreError::Unsupported(
+            "writes do not support custom hoodie.record.merger.impls".to_string(),
+        ));
     }
     Ok(())
 }
@@ -554,10 +738,9 @@ async fn mor_file_locations(
     let mut locations = HashMap::with_capacity(tagged.len());
     for (key, location) in tagged {
         if let Some(location) = location {
-            let (base_file_path, base_instant) =
-                slices_by_file_id
-                    .get(&(location.partition_path.clone(), location.file_id.clone()))
-                    .ok_or_else(|| {
+            let (base_file_path, base_instant) = slices_by_file_id
+                .get(&(location.partition_path.clone(), location.file_id.clone()))
+                .ok_or_else(|| {
                     CoreError::Write(format!(
                         "record index returned missing file group '{}'",
                         location.file_id
@@ -600,12 +783,18 @@ async fn mor_upsert_batches(
             "upsert requires at least one row".to_string(),
         ));
     }
-    let schema_check_batches =
-        prepare_batches_for_write(table, &[incoming.clone()], "schema-check", "schema-check")?;
+    let schema_check_batches = prepare_batches_for_write(
+        table,
+        std::slice::from_ref(&incoming),
+        "schema-check",
+        "schema-check",
+    )?;
     let existing_batches = table.read(&ReadOptions::new()).await?;
     if !existing_batches.is_empty() {
         let existing = concat(&existing_batches)?;
-        if existing.schema() != schema_check_batches[0].schema() {
+        if crate::write::align_batch_to_schema(&schema_check_batches[0], &existing.schema())
+            .is_none()
+        {
             return Err(CoreError::Schema(
                 "upsert batch schema does not match the current table schema".to_string(),
             ));
@@ -614,7 +803,7 @@ async fn mor_upsert_batches(
     let key_name = record_key_name(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
     let incoming_keys = keys(&incoming, &key_name)?;
-    let instant = next_instant_timestamp();
+    let instant = request_deltacommit(table, "UPSERT").await?;
     let tagged_keys = hoodie_keys_for_batch(table, &incoming, Some(&instant))?;
     let locations = mor_file_locations(table, &tagged_keys).await?;
     let mut update_indices: HashMap<(String, String), Vec<u32>> = HashMap::new();
@@ -642,27 +831,208 @@ async fn mor_upsert_batches(
     }
 
     let storage = table.file_system_view.storage.clone();
+    // Small-file packing (Java SparkUpsertDeltaCommitPartitioner): inserts
+    // fill existing small file slices (base + logs at parquet-equivalent
+    // size) as log appends, then overflow into new base file groups of
+    // ~max.file.size records each.
+    let sizing = crate::write::sizing::SizingConfig::from_table(table);
+    let avg_record_size =
+        crate::write::sizing::average_record_size(table, storage.as_ref(), &sizing).await;
+    let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
+    let mut packed_inserts: HashMap<(String, String), Vec<u32>> = HashMap::new();
+    let mut new_group_inserts: Vec<(String, String, String, Vec<u32>)> = Vec::new();
+    for (partition, indices) in insert_indices_by_partition {
+        let slices: Vec<&crate::file_group::file_slice::FileSlice> = slices_by_partition
+            .get(&partition)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        let small = crate::write::sizing::small_file_groups(&slices, true, &sizing);
+        let assignments = crate::write::sizing::assign_insert_buckets(
+            indices.len(),
+            &small,
+            avg_record_size,
+            &sizing,
+        );
+        let mut cursor = 0usize;
+        for (bucket, count) in assignments {
+            let chunk = indices[cursor..cursor + count].to_vec();
+            cursor += count;
+            match bucket {
+                crate::write::sizing::InsertBucket::Existing { file_id } => {
+                    packed_inserts
+                        .entry((partition.clone(), file_id))
+                        .or_default()
+                        .extend(chunk);
+                }
+                crate::write::sizing::InsertBucket::New => {
+                    let file_id = crate::write::new_file_id();
+                    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
+                    new_group_inserts.push((partition.clone(), file_id, file_name, chunk));
+                }
+            }
+        }
+    }
+    // Log-append targets: tagged updates plus packed inserts, per file group.
+    let mut log_tasks: HashMap<(String, String), (Vec<u32>, Vec<u32>)> = HashMap::new();
+    for (key, indices) in update_indices {
+        log_tasks.entry(key).or_default().0.extend(indices);
+    }
+    for (key, indices) in packed_inserts {
+        log_tasks.entry(key).or_default().1.extend(indices);
+    }
+    // (partition, file_id) -> (base file name, base instant) from latest slices,
+    // for groups reachable only via packed inserts.
+    let mut base_by_group: HashMap<(String, String), (String, String)> = HashMap::new();
+    for (partition, slices) in &slices_by_partition {
+        for slice in slices {
+            base_by_group.insert(
+                (partition.clone(), slice.file_id().to_string()),
+                (
+                    slice.base_file.file_name(),
+                    slice.base_file.commit_timestamp.clone(),
+                ),
+            );
+        }
+    }
+
+    // Plan markers before any data file is put: new base files and (tv8+)
+    // new log files are both CREATE markers.
+    let mut planned_markers = Vec::new();
+    for (partition_path, _, file_name, _) in &new_group_inserts {
+        planned_markers.push(crate::write::markers::Marker::create(
+            partition_path,
+            file_name,
+        ));
+    }
+    for (partition_path, file_id) in log_tasks.keys() {
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        planned_markers.push(crate::write::markers::Marker::create(
+            partition_path,
+            &log_name,
+        ));
+    }
+    crate::write::markers::write_markers(storage.as_ref(), &instant, &planned_markers).await?;
+
     let mut stats = Vec::new();
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
-    for (partition_path, insert_indices) in insert_indices_by_partition {
-        let file_id = crate::write::new_file_id();
-        let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
-        let insert_batch = take_batch(&incoming, &insert_indices)?;
-        let base_file_path = relative_data_path(&partition_path, &file_name);
+    let mut stats_updates = Vec::new();
+    let props = crate::write::append::parquet_writer_props(table);
+    let collect_ranges = is_column_stats_enabled(table);
+    let parallelism = crate::write::write_task_parallelism(table);
+
+    // New base file groups: prepare sequentially, encode + put in parallel.
+    let mut insert_prepared: Vec<(usize, Vec<RecordBatch>, String)> = Vec::new();
+    for (index, (partition_path, _, file_name, insert_indices)) in
+        new_group_inserts.iter().enumerate()
+    {
+        let insert_batch = take_batch(&incoming, insert_indices)?;
+        crate::write::ensure_partition_metadata(storage.as_ref(), partition_path, &instant).await?;
+        let prepared = prepare_batches_for_write(table, &[insert_batch], &instant, file_name)?;
+        let base_file_path = relative_data_path(partition_path, file_name);
+        insert_prepared.push((index, prepared, base_file_path));
+    }
+    let insert_tasks = insert_prepared
+        .iter()
+        .map(|(_, prepared, path)| {
+            crate::write::parquet_file_task(
+                storage.clone(),
+                props.clone(),
+                prepared.clone(),
+                path.clone(),
+                collect_ranges,
+            )
+        })
+        .collect();
+    let insert_results = crate::write::run_write_tasks(insert_tasks, parallelism).await;
+    let mut first_error = None;
+    for ((index, _, path), result) in insert_prepared.iter().zip(insert_results) {
+        let (partition_path, file_id, file_name, insert_indices) = &new_group_inserts[*index];
+        match result {
+            Ok(output) => {
+                written_paths.push(path.clone());
+                if let Some(ranges) = output.ranges {
+                    stats_updates.push(crate::write::metadata::StatsFileUpdate {
+                        partition_path: partition_path.clone(),
+                        file_name: file_name.clone(),
+                        is_deleted: false,
+                        ranges,
+                    });
+                }
+                files_mdt.push((
+                    partition_path.clone(),
+                    file_name.clone(),
+                    output.size,
+                    false,
+                ));
+                rli_entries.extend(insert_indices.iter().map(|row| {
+                    let key = &tagged_keys[*row as usize];
+                    RecordIndexEntry {
+                        record_key: key.record_key.clone(),
+                        partition_path: partition_path.clone(),
+                        file_id: file_id.clone(),
+                        instant_time_millis: instant_to_epoch_millis(&instant),
+                        is_deleted: false,
+                    }
+                }));
+                stats.push(HoodieWriteStat {
+                    file_id: Some(file_id.clone()),
+                    path: Some(path.clone()),
+                    // Basename only — FileGroup builder joins partition_path + name.
+                    base_file: Some(file_name.clone()),
+                    prev_commit: Some("null".to_string()),
+                    num_writes: Some(insert_indices.len() as i64),
+                    num_inserts: Some(insert_indices.len() as i64),
+                    total_write_bytes: Some(output.size),
+                    file_size_in_bytes: Some(output.size),
+                    partition_path: Some(partition_path.clone()),
+                    ..Default::default()
+                });
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        for path in &written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
+    }
+
+    // Log-append tasks: prepare sequentially, encode + wrap + put in parallel.
+    struct LogTaskPlan {
+        partition_path: String,
+        file_id: String,
+        log_name: String,
+        log_file: String,
+        base_basename: String,
+        base_instant: String,
+        update_count: usize,
+        packed_count: usize,
+        prepared: Vec<RecordBatch>,
+    }
+    let mut log_plans: Vec<LogTaskPlan> = Vec::new();
+    for ((partition_path, file_id), (update_rows, packed_rows)) in log_tasks {
+        let (base_basename, base_instant) = base_by_group
+            .get(&(partition_path.clone(), file_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                CoreError::Write(format!(
+                    "missing latest file slice for file group '{file_id}' in '{partition_path}'"
+                ))
+            })?;
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
-        let prepared =
-            prepare_batches_for_write(table, &[insert_batch], &instant, &file_name)?;
-        let bytes = write_parquet_bytes(table, &prepared)?;
-        let size = bytes.len() as i64;
-        if let Err(error) = storage.put_file(&base_file_path, bytes).await {
-            return Err(error.into());
-        }
-        written_paths.push(base_file_path.clone());
-        files_mdt.push((partition_path.clone(), file_name.clone(), size, false));
-        rli_entries.extend(insert_indices.iter().map(|index| {
+        // Packed inserts are written as log records into the small slice and
+        // must be registered in the RLI under this file group.
+        rli_entries.extend(packed_rows.iter().map(|index| {
             let key = &tagged_keys[*index as usize];
             RecordIndexEntry {
                 record_key: key.record_key.clone(),
@@ -672,107 +1042,153 @@ async fn mor_upsert_batches(
                 is_deleted: false,
             }
         }));
-        stats.push(HoodieWriteStat {
-            file_id: Some(file_id),
-            path: Some(base_file_path),
-            // Basename only — FileGroup builder joins partition_path + name.
-            base_file: Some(file_name),
-            prev_commit: Some("null".to_string()),
-            num_writes: Some(insert_indices.len() as i64),
-            num_inserts: Some(insert_indices.len() as i64),
-            total_write_bytes: Some(size),
-            file_size_in_bytes: Some(size),
-            partition_path: Some(partition_path),
-            ..Default::default()
-        });
-    }
-
-    for ((_partition_path, file_id), indices) in update_indices {
-        let location = locations
-            .get(
-                incoming_keys
-                    .get(indices[0] as usize)
-                    .ok_or_else(|| CoreError::Write("missing upsert key".to_string()))?,
-            )
-            .ok_or_else(|| CoreError::Write("missing file location for upsert key".to_string()))?;
-        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
-        let log_file = relative_data_path(&location.partition_path, &log_name);
-        crate::write::ensure_partition_metadata(
-            storage.as_ref(),
-            &location.partition_path,
-            &instant,
-        )
-        .await?;
-        let base_basename = std::path::Path::new(&location.base_file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(location.base_file_path.as_str())
-            .to_string();
+        let mut indices = update_rows.clone();
+        indices.extend(&packed_rows);
         let update_batch = take_batch(&incoming, &indices)?;
         let prepared = prepare_batches_for_write(table, &[update_batch], &instant, &log_name)?;
-        let parquet = write_parquet_bytes(table, &prepared)?;
-        let content = LogFileWriter::write_log_block(
-            BlockType::ParquetData,
-            HashMap::from([(BlockMetadataKey::InstantTime, instant.clone())]),
-            &parquet,
-        );
-        let size = content.len() as i64;
-        if let Err(error) = storage.put_file(&log_file, content).await {
-            for path in written_paths {
-                let _ = storage.delete_file(&path).await;
-            }
-            return Err(error.into());
-        }
-        written_paths.push(log_file.clone());
-        files_mdt.push((
-            location.partition_path.clone(),
-            log_name.clone(),
-            size,
-            false,
-        ));
-        stats.push(HoodieWriteStat {
-            file_id: Some(file_id),
-            path: Some(log_file.clone()),
-            base_file: Some(base_basename),
-            log_files: Some(vec![log_name]),
-            prev_commit: Some(location.base_instant.clone()),
-            num_writes: Some(indices.len() as i64),
-            num_update_writes: Some(indices.len() as i64),
-            total_write_bytes: Some(size),
-            file_size_in_bytes: Some(size),
-            total_log_records: Some(indices.len() as i64),
-            total_log_files: Some(1),
-            total_log_blocks: Some(1),
-            partition_path: Some(location.partition_path.clone()),
-            ..Default::default()
+        log_plans.push(LogTaskPlan {
+            partition_path,
+            file_id,
+            log_name,
+            log_file,
+            base_basename,
+            base_instant,
+            update_count: update_rows.len(),
+            packed_count: packed_rows.len(),
+            prepared,
         });
     }
-    if table.is_metadata_table_enabled() {
-        if !files_mdt.is_empty()
-            && let Err(error) =
-                update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await
-        {
-            for path in written_paths {
-                let _ = storage.delete_file(&path).await;
+    let log_write_tasks = log_plans
+        .iter()
+        .map(|plan| -> Result<_> {
+            let schema_json = crate::write::append::arrow_schema_to_avro_json(
+                plan.prepared[0].schema().as_ref(),
+            )?;
+            Ok(crate::write::log_file_task(
+                storage.clone(),
+                props.clone(),
+                plan.prepared.clone(),
+                plan.log_file.clone(),
+                instant.clone(),
+                schema_json,
+                collect_ranges,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let log_results = crate::write::run_write_tasks(log_write_tasks, parallelism).await;
+    let mut first_error = None;
+    for (plan, result) in log_plans.iter().zip(log_results) {
+        match result {
+            Ok(output) => {
+                written_paths.push(plan.log_file.clone());
+                // Java HoodieAppendHandle collects column ranges for log
+                // appends; keyed by the log file name in column_stats.
+                if let Some(ranges) = output.ranges {
+                    stats_updates.push(crate::write::metadata::StatsFileUpdate {
+                        partition_path: plan.partition_path.clone(),
+                        file_name: plan.log_name.clone(),
+                        is_deleted: false,
+                        ranges,
+                    });
+                }
+                files_mdt.push((
+                    plan.partition_path.clone(),
+                    plan.log_name.clone(),
+                    output.size,
+                    false,
+                ));
+                let total = (plan.update_count + plan.packed_count) as i64;
+                stats.push(HoodieWriteStat {
+                    file_id: Some(plan.file_id.clone()),
+                    path: Some(plan.log_file.clone()),
+                    base_file: Some(plan.base_basename.clone()),
+                    log_files: Some(vec![plan.log_name.clone()]),
+                    prev_commit: Some(plan.base_instant.clone()),
+                    num_writes: Some(total),
+                    num_update_writes: Some(plan.update_count as i64),
+                    num_inserts: Some(plan.packed_count as i64),
+                    total_write_bytes: Some(output.size),
+                    file_size_in_bytes: Some(output.size),
+                    total_log_records: Some(total),
+                    total_log_files: Some(1),
+                    total_log_blocks: Some(1),
+                    partition_path: Some(plan.partition_path.clone()),
+                    ..Default::default()
+                });
             }
-            return Err(error);
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        if is_record_index_enabled(table)
-            && !rli_entries.is_empty()
-            && let Err(error) = update_record_index(storage.as_ref(), &instant, &rli_entries).await
-        {
+    }
+    if let Some(error) = first_error {
+        for path in &written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
+    }
+    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
+    if table.is_metadata_table_enabled() {
+        let mdt_result = async {
+            if !files_mdt.is_empty() {
+                mdt_stats.insert(
+                    "files".to_string(),
+                    update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await?,
+                );
+            }
+            if is_record_index_enabled(table) && !rli_entries.is_empty() {
+                let rli_stats =
+                    update_record_index(storage.as_ref(), &instant, &rli_entries).await?;
+                if !rli_stats.is_empty() {
+                    mdt_stats.insert("record_index".to_string(), rli_stats);
+                }
+            }
+            if is_column_stats_enabled(table) && !stats_updates.is_empty() {
+                let stats_map = update_column_stats_partitions(
+                    table,
+                    &instant,
+                    &stats_updates,
+                    incoming.schema().as_ref(),
+                    &[],
+                )
+                .await?;
+                mdt_stats.extend(stats_map);
+            }
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        if let Err(error) = mdt_result {
             for path in written_paths {
                 let _ = storage.delete_file(&path).await;
             }
             return Err(error);
         }
     }
-    if let Err(error) = write_delta_commit(table, &instant, "UPSERT", stats).await {
+    // Critical section 2: complete deltacommit + MDT, then bookkeeping.
+    let lock = crate::write::lock::lock_provider_for(table);
+    let cs2 = lock.lock().await?;
+    if table.is_metadata_table_enabled()
+        && let Err(error) =
+            crate::write::metadata::write_metadata_commit(storage.as_ref(), &instant, mdt_stats)
+                .await
+    {
         for path in written_paths {
             let _ = storage.delete_file(&path).await;
         }
         return Err(error);
     }
+    if let Err(error) =
+        complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await
+    {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error);
+    }
+    crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await?;
+    drop(cs2);
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
@@ -791,10 +1207,10 @@ async fn mor_update_filter(
 ) -> Result<WriteResult> {
     ensure_mor_merge_supported(table)?;
     ensure_configured_record_key(table)?;
-    let (Some(old), _, _) = current_data(table).await? else {
+    let (Some(old), _, _, _) = current_data(table).await? else {
         return Ok(WriteResult::default());
     };
-    validate_fields_against_schemas(&[filter.clone()], [old.schema().as_ref()])?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
     let mask = filters_to_row_mask(&[filter], &old)?;
     let (merged, num_updates) = apply_set_updates(&old, &mask, &updates)?;
     if num_updates == 0 {
@@ -835,8 +1251,19 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         return Ok(WriteResult::default());
     }
 
-    let instant = next_instant_timestamp();
+    let instant = request_deltacommit(table, "DELETE").await?;
     let storage = table.file_system_view.storage.clone();
+    // Markers for the delete log blocks before any data file is put.
+    let mut planned_markers = Vec::new();
+    for (partition_path, file_id) in grouped.keys() {
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        planned_markers.push(crate::write::markers::Marker::create(
+            partition_path,
+            &log_name,
+        ));
+    }
+    crate::write::markers::write_markers(storage.as_ref(), &instant, &planned_markers).await?;
+
     let mut stats = Vec::new();
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
@@ -852,7 +1279,14 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
-        let content = delete_log_block(&instant, &keys)?;
+        let content = {
+            let pairs: Vec<(String, String)> = keys
+                .iter()
+                .map(|key| (key.record_key.clone(), key.partition_path.clone()))
+                .collect();
+            // orderingVal=0: Java commit-time / unknown-ordering fallback (not i64::MAX).
+            crate::write::build_delete_log_block(&instant, &pairs, 0)?
+        };
         let size = content.len() as i64;
         if let Err(error) = storage.put_file(&log_file, content).await {
             for path in written_paths {
@@ -885,44 +1319,74 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             ..Default::default()
         });
     }
+    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     if table.is_metadata_table_enabled() {
-        if !files_mdt.is_empty()
-            && let Err(error) =
-                update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await
-        {
+        let mdt_result = async {
+            if !files_mdt.is_empty() {
+                mdt_stats.insert(
+                    "files".to_string(),
+                    update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await?,
+                );
+            }
+            if is_record_index_enabled(table) {
+                let entries = delete_keys
+                    .iter()
+                    .filter(|key| locations.contains_key(&key.record_key))
+                    .map(|key| RecordIndexEntry {
+                        record_key: key.record_key.clone(),
+                        partition_path: key.partition_path.clone(),
+                        file_id: String::new(),
+                        instant_time_millis: instant_to_epoch_millis(&instant),
+                        is_deleted: true,
+                    })
+                    .collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    let rli_stats =
+                        update_record_index(storage.as_ref(), &instant, &entries).await?;
+                    if !rli_stats.is_empty() {
+                        mdt_stats.insert("record_index".to_string(), rli_stats);
+                    }
+                }
+            }
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        if let Err(error) = mdt_result {
             for path in written_paths {
                 let _ = storage.delete_file(&path).await;
             }
             return Err(error);
         }
-        if is_record_index_enabled(table) {
-            let entries = delete_keys
-                .iter()
-                .filter(|key| locations.contains_key(&key.record_key))
-                .map(|key| RecordIndexEntry {
-                    record_key: key.record_key.clone(),
-                    partition_path: key.partition_path.clone(),
-                    file_id: String::new(),
-                    instant_time_millis: instant_to_epoch_millis(&instant),
-                    is_deleted: true,
-                })
-                .collect::<Vec<_>>();
-            if !entries.is_empty()
-                && let Err(error) = update_record_index(storage.as_ref(), &instant, &entries).await
-            {
-                for path in written_paths {
-                    let _ = storage.delete_file(&path).await;
-                }
-                return Err(error);
-            }
-        }
     }
-    if let Err(error) = write_delta_commit(table, &instant, "DELETE", stats).await {
+    // Critical section 2: complete deltacommit + MDT, then bookkeeping.
+    let lock = crate::write::lock::lock_provider_for(table);
+    let cs2 = lock.lock().await?;
+    if table.is_metadata_table_enabled()
+        && let Err(error) =
+            crate::write::metadata::write_metadata_commit(storage.as_ref(), &instant, mdt_stats)
+                .await
+    {
         for path in written_paths {
             let _ = storage.delete_file(&path).await;
         }
         return Err(error);
     }
+    if let Err(error) = complete_deltacommit(
+        table,
+        &instant,
+        "DELETE",
+        stats,
+        table.get_schema_with_meta_fields().await?.as_ref(),
+    )
+    .await
+    {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error);
+    }
+    crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await?;
+    drop(cs2);
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
@@ -934,73 +1398,45 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     })
 }
 
-fn delete_log_block(instant: &str, keys: &[HoodieKey]) -> Result<Vec<u8>> {
-    let records = keys
-        .iter()
-        .map(|key| {
-            AvroValue::Record(vec![
-                (
-                    "recordKey".to_string(),
-                    AvroValue::Union(1, Box::new(AvroValue::String(key.record_key.clone()))),
-                ),
-                (
-                    "partitionPath".to_string(),
-                    AvroValue::Union(1, Box::new(AvroValue::String(key.partition_path.clone()))),
-                ),
-                (
-                    "orderingVal".to_string(),
-                    AvroValue::Union(2, Box::new(AvroValue::Long(i64::MAX))),
-                ),
-            ])
-        })
-        .collect();
-    let payload = to_avro_datum(
-        avro_schema_for_delete_record_list()?,
-        AvroValue::Record(vec![(
-            "deleteRecordList".to_string(),
-            AvroValue::Array(records),
-        )]),
-    )?;
-    let mut content = Vec::with_capacity(8 + payload.len());
-    content.extend_from_slice(&3u32.to_be_bytes());
-    content.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    content.extend_from_slice(&payload);
-    Ok(LogFileWriter::write_log_block(
-        BlockType::Delete,
-        HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())]),
-        &content,
-    ))
-}
-
-async fn write_delta_commit(
+async fn complete_deltacommit(
     table: &Table,
     instant: &str,
     operation: &str,
     stats: Vec<HoodieWriteStat>,
+    schema: &arrow_schema::Schema,
 ) -> Result<()> {
     let storage = table.file_system_view.storage.clone();
     let timeline = timeline_dir(table);
-    crate::write::fence_timeline_instant(
-        storage.as_ref(),
-        &timeline,
-        instant,
-        Action::DeltaCommit,
-    )
-    .await?;
+    // Fencing happened at write start (before data files); this only completes.
     let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
     for stat in stats {
         let partition = stat.partition_path.clone().unwrap_or_default();
-        partition_to_write_stats.entry(partition).or_default().push(stat);
+        partition_to_write_stats
+            .entry(partition)
+            .or_default()
+            .push(stat);
     }
     let metadata = HoodieCommitMetadata {
         version: Some(1),
         operation_type: Some(operation.to_string()),
         partition_to_write_stats: Some(partition_to_write_stats),
         compacted: Some(false),
-        extra_metadata: Some(HashMap::new()),
+        extra_metadata: Some(HashMap::from([(
+            "schema".to_string(),
+            // Commit metadata carries the data schema (no _hoodie_* meta
+            // fields), matching the Java writer; some callers pass batches
+            // that were read back with meta fields.
+            crate::write::append::arrow_schema_to_avro_json(
+                &crate::write::append::strip_meta_fields_from_schema(schema),
+            )?,
+        )])),
     };
     let layout_two = is_layout_two(table);
-    let completed = layout_two.then(|| instant.to_string());
+    let completed = if layout_two {
+        Some(generate_instant_time().await)
+    } else {
+        None
+    };
     let commit = Instant::new_completed(instant.to_string(), Action::DeltaCommit, completed)?;
     let path = commit.relative_path_with_base(&timeline)?;
     let bytes = if layout_two {
@@ -1059,33 +1495,26 @@ fn selected_indices_for_merged(combined: &RecordBatch, merged: &RecordBatch) -> 
         .collect()
 }
 
-async fn current_data(table: &Table) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>)> {
+/// All current data plus per-row origin file ids (parallel to the batch rows).
+async fn current_data(
+    table: &Table,
+) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>, Vec<String>)> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let file_ids = slices
+    let file_ids: HashSet<String> = slices
         .iter()
         .map(|slice| slice.file_id().to_string())
         .collect();
-    let old_paths = slices
-        .iter()
-        .map(|slice| slice.base_file_relative_path())
-        .collect::<Result<Vec<_>>>()?;
-    let batches = table.read(&ReadOptions::new()).await?;
-    Ok((
-        (!batches.is_empty())
-            .then(|| concat(&batches))
-            .transpose()?,
-        file_ids,
-        old_paths,
-    ))
+    data_for_file_ids(table, &file_ids).await
 }
 
-/// Load only the listed file groups (for location-scoped COW rewrites).
+/// Load only the listed file groups (for location-scoped COW rewrites),
+/// returning per-row origin file ids parallel to the concatenated batch.
 async fn data_for_file_ids(
     table: &Table,
     file_ids: &HashSet<String>,
-) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>)> {
+) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>, Vec<String>)> {
     if file_ids.is_empty() {
-        return Ok((None, Vec::new(), Vec::new()));
+        return Ok((None, Vec::new(), Vec::new(), Vec::new()));
     }
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
     let reader = table.create_file_group_reader_with_options(
@@ -1095,17 +1524,19 @@ async fn data_for_file_ids(
     let mut batches = Vec::new();
     let mut kept_ids = Vec::new();
     let mut kept_paths = Vec::new();
+    let mut row_file_ids = Vec::new();
     for slice in slices {
         if !file_ids.contains(slice.file_id()) {
             continue;
         }
         kept_ids.push(slice.file_id().to_string());
         kept_paths.push(slice.base_file_relative_path()?);
-        batches.push(
-            reader
-                .read_file_slice(&slice, &ReadOptions::new())
-                .await?,
-        );
+        let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
+        row_file_ids.extend(std::iter::repeat_n(
+            slice.file_id().to_string(),
+            batch.num_rows(),
+        ));
+        batches.push(batch);
     }
     Ok((
         (!batches.is_empty())
@@ -1113,6 +1544,7 @@ async fn data_for_file_ids(
             .transpose()?,
         kept_ids,
         kept_paths,
+        row_file_ids,
     ))
 }
 
@@ -1191,10 +1623,7 @@ fn configured_record_key_field(table: &Table) -> Result<Option<String>> {
 
 /// If `filter` is `=` / `IN` on the configured record key or `_hoodie_record_key`,
 /// return keys for the RLI/SimpleIndex delete path.
-fn keys_from_record_key_filter(
-    table: &Table,
-    filter: &Filter,
-) -> Result<Option<Vec<HoodieKey>>> {
+fn keys_from_record_key_filter(table: &Table, filter: &Filter) -> Result<Option<Vec<HoodieKey>>> {
     let configured = configured_record_key_field(table)?;
     let is_key_field = filter.field == MetaField::RecordKey.as_ref()
         || configured.as_deref() == Some(filter.field.as_str());
@@ -1256,8 +1685,11 @@ fn strip_meta_columns(batch: &RecordBatch) -> Result<RecordBatch> {
         .filter(|(f, _)| !meta.contains(f.name().as_str()))
         .map(|(_, c)| c.clone())
         .collect();
-    RecordBatch::try_new(std::sync::Arc::new(arrow_schema::Schema::new(fields)), columns)
-        .map_err(Into::into)
+    RecordBatch::try_new(
+        std::sync::Arc::new(arrow_schema::Schema::new(fields)),
+        columns,
+    )
+    .map_err(Into::into)
 }
 
 /// Overlay single-row SET values onto rows where `matched` is true.
@@ -1292,19 +1724,16 @@ fn apply_set_updates(
             "update requires at least one data column to set".to_string(),
         ));
     }
-    let num_updates = matched
-        .iter()
-        .filter(|v| v.unwrap_or(false))
-        .count();
+    let num_updates = matched.iter().filter(|v| v.unwrap_or(false)).count();
     if num_updates == 0 {
         return Ok((old.clone(), 0));
     }
     let zeros = UInt32Array::from(vec![0u32; old.num_rows()]);
     let mut columns = Vec::with_capacity(old.num_columns());
     for field in old.schema().fields() {
-        let old_col = old.column_by_name(field.name()).ok_or_else(|| {
-            CoreError::Schema(format!("missing column '{}'", field.name()))
-        })?;
+        let old_col = old
+            .column_by_name(field.name())
+            .ok_or_else(|| CoreError::Schema(format!("missing column '{}'", field.name())))?;
         if set_names.iter().any(|n| n == field.name()) {
             let update_col = updates.column_by_name(field.name()).ok_or_else(|| {
                 CoreError::Schema(format!("missing update column '{}'", field.name()))
@@ -1323,10 +1752,7 @@ fn apply_set_updates(
             columns.push(old_col.clone());
         }
     }
-    Ok((
-        RecordBatch::try_new(old.schema(), columns)?,
-        num_updates,
-    ))
+    Ok((RecordBatch::try_new(old.schema(), columns)?, num_updates))
 }
 
 /// Upsert/delete need a configured `hoodie.table.recordkey.fields` (Java auto keys are insert-only).
@@ -1404,7 +1830,7 @@ fn partial_merge(
             "partial updates require populated Hudi meta fields".to_string(),
         ));
     };
-    let combined_keys = keys(&combined, key_column)?;
+    let combined_keys = keys(combined, key_column)?;
     let update_columns = update_columns
         .iter()
         .collect::<std::collections::HashSet<_>>();
@@ -1433,154 +1859,387 @@ fn partial_merge(
     RecordBatch::try_new(combined.schema(), columns).map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite(
     table: &mut Table,
     instant: &str,
-    _file_name: &str,
     batch: &RecordBatch,
+    row_targets: Option<Vec<String>>,
     replaced_file_ids: Vec<String>,
     old_paths: Vec<String>,
     operation: &str,
     updates: usize,
     inserts: usize,
     deletes: usize,
+    mut rli_deletes: Vec<RecordIndexEntry>,
+    kind: RewriteKind,
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
-    crate::write::fence_timeline_instant(
-        storage.as_ref(),
-        &timeline_dir(table),
-        instant,
-        Action::ReplaceCommit,
-    )
-    .await?;
-    let mut additions = Vec::new();
-    let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
+    let action = match kind {
+        RewriteKind::Commit => Action::Commit,
+        RewriteKind::Replace => Action::ReplaceCommit,
+    };
+    // The instant was already requested (fenced) under critical section 1 by
+    // request_rewrite_instant in the calling verb.
+
+    // Per-file-id prev commit / per-partition replaced ids.
+    let mut prev_commit_by_file_id = HashMap::<String, String>::new();
+    let mut partition_by_file_id = HashMap::<String, String>::new();
     let mut partition_to_replace_file_ids = HashMap::<String, Vec<String>>::new();
     for (file_id, old_path) in replaced_file_ids.iter().zip(&old_paths) {
         let partition = old_path
             .rsplit_once('/')
             .map(|(partition, _)| partition.to_string())
             .unwrap_or_default();
-        partition_to_replace_file_ids
-            .entry(partition)
-            .or_default()
-            .push(file_id.clone());
+        prev_commit_by_file_id.insert(file_id.clone(), prev_commit_from_base_path(old_path));
+        partition_by_file_id.insert(file_id.clone(), partition.clone());
+        if kind == RewriteKind::Replace {
+            partition_to_replace_file_ids
+                .entry(partition)
+                .or_default()
+                .push(file_id.clone());
+        }
     }
-    let mut written_paths = Vec::new();
-    let mut rli_file_id_by_partition = HashMap::<String, String>::new();
+
+    // Group planning: rows with a named target rewrite that file group (same
+    // fileId, MERGE marker); untargeted rows form NEW file groups, split into
+    // buckets of ~max.file.size records (Java UpsertPartitioner overflow /
+    // insert-overwrite sizing).
+    struct GroupPlan {
+        partition: String,
+        file_id: String,
+        out_name: String,
+        existing: bool,
+        rows: Vec<u32>,
+    }
+    let mut groups: Vec<GroupPlan> = Vec::new();
     if batch.num_rows() > 0 {
-        let mut rows_by_partition = HashMap::<String, Vec<u32>>::new();
-        for (row, key) in hoodie_keys_for_batch(table, batch, Some(instant))?
-            .iter()
-            .enumerate()
-        {
-            rows_by_partition
-                .entry(key.partition_path.clone())
-                .or_default()
-                .push(row as u32);
+        let row_keys = hoodie_keys_for_batch(table, batch, Some(instant))?;
+        let mut existing_groups: HashMap<String, usize> = HashMap::new();
+        let mut new_rows_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
+        for (row, key) in row_keys.iter().enumerate() {
+            let target = if kind == RewriteKind::Replace {
+                ""
+            } else {
+                row_targets
+                    .as_ref()
+                    .and_then(|t| t.get(row).map(String::as_str))
+                    .unwrap_or("")
+            };
+            if target.is_empty() {
+                new_rows_by_partition
+                    .entry(key.partition_path.clone())
+                    .or_default()
+                    .push(row as u32);
+            } else {
+                let index = *existing_groups
+                    .entry(target.to_string())
+                    .or_insert_with(|| {
+                        let out_name = format!("{target}_0-0-0_{instant}.parquet");
+                        groups.push(GroupPlan {
+                            partition: key.partition_path.clone(),
+                            file_id: target.to_string(),
+                            out_name,
+                            existing: true,
+                            rows: Vec::new(),
+                        });
+                        groups.len() - 1
+                    });
+                groups[index].rows.push(row as u32);
+            }
         }
-        for (partition_path, rows) in rows_by_partition {
-            let partition_batch = take_batch(batch, &rows)?;
-            let file_id = crate::write::new_file_id();
-            let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
-            let path = relative_data_path(&partition_path, &out_name);
-            crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, instant)
-                .await?;
-            let prepared =
-                prepare_batches_for_write(table, &[partition_batch.clone()], instant, &out_name)?;
-            let bytes = write_parquet_bytes(table, &prepared)?;
-            let size = bytes.len() as i64;
-            storage.put_file(&path, bytes).await?;
-            written_paths.push(path.clone());
-            additions.push((partition_path.clone(), out_name.clone(), size, false));
-            rli_file_id_by_partition.insert(partition_path.clone(), file_id.clone());
-            partition_to_write_stats
-                .entry(partition_path.clone())
-                .or_default()
-                .push(HoodieWriteStat {
-                    file_id: Some(file_id),
-                    path: Some(path),
-                    base_file: Some(out_name),
-                    prev_commit: Some("null".to_string()),
-                    num_writes: Some(partition_batch.num_rows() as i64),
-                    num_deletes: Some(deletes as i64),
-                    num_update_writes: Some(updates as i64),
-                    num_inserts: Some(inserts as i64),
-                    total_write_bytes: Some(size),
-                    file_size_in_bytes: Some(size),
-                    partition_path: Some(partition_path),
-                    ..Default::default()
+        // Untargeted rows: new file groups sized by the insert bucket size.
+        let sizing = crate::write::sizing::SizingConfig::from_table(table);
+        let avg = crate::write::sizing::average_record_size(table, storage.as_ref(), &sizing).await;
+        let per_bucket = sizing.insert_records_per_bucket(avg);
+        let mut sorted_new: Vec<_> = new_rows_by_partition.into_iter().collect();
+        sorted_new.sort_by(|a, b| a.0.cmp(&b.0));
+        for (partition, rows) in sorted_new {
+            for chunk in rows.chunks(per_bucket.max(1)) {
+                let file_id = crate::write::new_file_id();
+                let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+                groups.push(GroupPlan {
+                    partition: partition.clone(),
+                    file_id,
+                    out_name,
+                    existing: false,
+                    rows: chunk.to_vec(),
                 });
+            }
         }
     }
-    let metadata = crate::metadata::replace_commit::HoodieReplaceCommitMetadata {
-        version: Some(1),
-        operation_type: Some(operation.to_string()),
-        partition_to_write_stats: Some(partition_to_write_stats),
-        compacted: Some(false),
-        extra_metadata: Some(HashMap::from([(
-            "schema".to_string(),
-            crate::write::append::arrow_schema_to_avro_json(batch.schema().as_ref()),
-        )])),
-        partition_to_replace_file_ids: Some(partition_to_replace_file_ids),
-    };
+    if kind == RewriteKind::Commit {
+        // Any affected file group left with zero surviving rows (a delete
+        // emptied it) still needs an empty base file: without a new slice
+        // the old base stays the group's latest version and deleted rows
+        // resurface — especially once the deleting commit is archived.
+        let planned: HashSet<String> = groups.iter().map(|g| g.file_id.clone()).collect();
+        for file_id in &replaced_file_ids {
+            if planned.contains(file_id) {
+                continue;
+            }
+            let partition = partition_by_file_id
+                .get(file_id)
+                .cloned()
+                .unwrap_or_default();
+            let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+            groups.push(GroupPlan {
+                partition,
+                file_id: file_id.clone(),
+                out_name,
+                existing: true,
+                rows: Vec::new(),
+            });
+        }
+    }
+
+    let mut additions = Vec::new();
+    let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
+    let mut written_paths = Vec::new();
+    let mut row_group_file_ids: HashMap<u32, String> = HashMap::new();
+    let mut stats_updates = Vec::new();
+
+    // Markers before any data file is put: MERGE for same-file-group rewrites,
+    // CREATE for new groups.
+    let mut planned_markers = Vec::new();
+    for group in &groups {
+        planned_markers.push(if group.existing {
+            crate::write::markers::Marker::merge(&group.partition, &group.out_name)
+        } else {
+            crate::write::markers::Marker::create(&group.partition, &group.out_name)
+        });
+    }
+    crate::write::markers::write_markers(storage.as_ref(), instant, &planned_markers).await?;
+
+    // Phase 1 (sequential): slice + prepare each group.
+    let mut group_prepared: Vec<(usize, Vec<RecordBatch>, String)> = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let partition_batch = if group.rows.is_empty() {
+            RecordBatch::new_empty(batch.schema())
+        } else {
+            take_batch(batch, &group.rows)?
+        };
+        for row in &group.rows {
+            row_group_file_ids.insert(*row, group.file_id.clone());
+        }
+        crate::write::ensure_partition_metadata(storage.as_ref(), &group.partition, instant)
+            .await?;
+        let prepared = prepare_batches_for_write(
+            table,
+            std::slice::from_ref(&partition_batch),
+            instant,
+            &group.out_name,
+        )?;
+        let path = relative_data_path(&group.partition, &group.out_name);
+        group_prepared.push((index, prepared, path));
+    }
+
+    // Phase 2 (parallel): encode + put on the write task pool.
+    let props = crate::write::append::parquet_writer_props(table);
+    let collect_ranges = is_column_stats_enabled(table);
+    let tasks = group_prepared
+        .iter()
+        .map(|(_, prepared, path)| {
+            crate::write::parquet_file_task(
+                storage.clone(),
+                props.clone(),
+                prepared.clone(),
+                path.clone(),
+                collect_ranges,
+            )
+        })
+        .collect();
+    let results =
+        crate::write::run_write_tasks(tasks, crate::write::write_task_parallelism(table)).await;
+
+    // Phase 3 (sequential): assemble in plan order; clean up on error.
+    let mut first_error = None;
+    for ((index, prepared, path), result) in group_prepared.iter().zip(results) {
+        let group = &groups[*index];
+        match result {
+            Ok(output) => {
+                written_paths.push(path.clone());
+                if let Some(ranges) = output.ranges {
+                    stats_updates.push(crate::write::metadata::StatsFileUpdate {
+                        partition_path: group.partition.clone(),
+                        file_name: group.out_name.clone(),
+                        is_deleted: false,
+                        ranges,
+                    });
+                }
+                additions.push((
+                    group.partition.clone(),
+                    group.out_name.clone(),
+                    output.size,
+                    false,
+                ));
+                let prev_commit = prev_commit_by_file_id
+                    .get(&group.file_id)
+                    .cloned()
+                    .unwrap_or_else(|| "null".to_string());
+                let num_rows: usize = prepared.iter().map(RecordBatch::num_rows).sum();
+                partition_to_write_stats
+                    .entry(group.partition.clone())
+                    .or_default()
+                    .push(HoodieWriteStat {
+                        file_id: Some(group.file_id.clone()),
+                        path: Some(path.clone()),
+                        base_file: Some(group.out_name.clone()),
+                        prev_commit: Some(prev_commit),
+                        num_writes: Some(num_rows as i64),
+                        num_deletes: Some(deletes as i64),
+                        num_update_writes: Some(updates as i64),
+                        num_inserts: Some(inserts as i64),
+                        total_write_bytes: Some(output.size),
+                        file_size_in_bytes: Some(output.size),
+                        partition_path: Some(group.partition.clone()),
+                        ..Default::default()
+                    });
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        for path in &written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
+    }
+
+    // Data schema only (no _hoodie_* meta fields) in commit metadata, like
+    // the Java writer; delete/update paths pass batches read with meta fields.
+    let schema_json = crate::write::append::arrow_schema_to_avro_json(
+        &crate::write::append::strip_meta_fields_from_schema(batch.schema().as_ref()),
+    )?;
     let layout_two = is_layout_two(table);
-    let completed = layout_two.then(|| instant.to_string());
-    let commit = Instant::new_completed(instant.to_string(), Action::ReplaceCommit, completed)?;
-    let path = commit.relative_path_with_base(&timeline_dir(table))?;
-    let bytes = if layout_two {
-        metadata.to_avro_bytes()?
-    } else {
-        metadata.to_json_bytes()?
+    let bytes = match kind {
+        RewriteKind::Replace => {
+            let metadata = crate::metadata::replace_commit::HoodieReplaceCommitMetadata {
+                version: Some(1),
+                operation_type: Some(operation.to_string()),
+                partition_to_write_stats: Some(partition_to_write_stats),
+                compacted: Some(false),
+                extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
+                partition_to_replace_file_ids: Some(partition_to_replace_file_ids),
+            };
+            if layout_two {
+                metadata.to_avro_bytes()?
+            } else {
+                metadata.to_json_bytes()?
+            }
+        }
+        RewriteKind::Commit => {
+            let metadata = HoodieCommitMetadata {
+                version: Some(1),
+                operation_type: Some(operation.to_string()),
+                partition_to_write_stats: Some(partition_to_write_stats),
+                compacted: Some(false),
+                extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
+            };
+            if layout_two {
+                metadata.to_avro_bytes()?
+            } else {
+                metadata.to_json_bytes()?
+            }
+        }
     };
 
-    // Crash-consistency: MDT before completed replacecommit (see append.rs).
+    // Crash-consistency: MDT files + MDT deltacommit before completed data commit.
+    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     if table.is_metadata_table_enabled() {
-        additions.extend(old_paths.into_iter().map(|path| {
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            let partition = path
-                .rsplit_once('/')
-                .map(|(partition, _)| partition.to_string())
-                .unwrap_or_default();
-            (partition, name, 0, true)
-        }));
-        if let Err(error) =
-            update_files_partition_entries(storage.as_ref(), instant, &additions).await
-        {
+        let mdt_result = async {
+            // Replaced bases stay listed in MDT files/column_stats until clean,
+            // like Java: readers exclude replaced file groups via replacecommit
+            // metadata, and deleting here would break time-travel before clean.
+            if !additions.is_empty() {
+                mdt_stats.insert(
+                    "files".to_string(),
+                    update_files_partition_entries(storage.as_ref(), instant, &additions).await?,
+                );
+            }
+            if is_record_index_enabled(table) {
+                let mut entries = if batch.num_rows() > 0 {
+                    hoodie_keys_for_batch(table, batch, Some(instant))?
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(row, key)| {
+                            let file_id = row_group_file_ids.get(&(row as u32))?.clone();
+                            Some(RecordIndexEntry {
+                                record_key: key.record_key,
+                                partition_path: key.partition_path,
+                                file_id,
+                                instant_time_millis: instant_to_epoch_millis(instant),
+                                is_deleted: false,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                entries.append(&mut rli_deletes);
+                if !entries.is_empty() {
+                    let stats = update_record_index(storage.as_ref(), instant, &entries).await?;
+                    if !stats.is_empty() {
+                        mdt_stats.insert("record_index".to_string(), stats);
+                    }
+                }
+            }
+            if is_column_stats_enabled(table) && !stats_updates.is_empty() {
+                // Replaced/rewritten bases are excluded from the tight-bound
+                // partition_stats scan; survivors come from latest file slices.
+                let stats = update_column_stats_partitions(
+                    table,
+                    instant,
+                    &stats_updates,
+                    batch.schema().as_ref(),
+                    &old_paths,
+                )
+                .await?;
+                mdt_stats.extend(stats);
+            }
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        if let Err(error) = mdt_result {
             for path in written_paths {
                 let _ = storage.delete_file(&path).await;
             }
             return Err(error);
         }
-        if is_record_index_enabled(table) {
-            let entries = hoodie_keys_for_batch(table, batch, Some(instant))?
-                .into_iter()
-                .filter_map(|key| {
-                    let file_id = rli_file_id_by_partition.get(&key.partition_path)?.clone();
-                    Some(RecordIndexEntry {
-                        record_key: key.record_key,
-                        partition_path: key.partition_path,
-                        file_id,
-                        instant_time_millis: instant_to_epoch_millis(instant),
-                        is_deleted: false,
-                    })
-                })
-                .collect::<Vec<_>>();
-            if let Err(error) = update_record_index(storage.as_ref(), instant, &entries).await {
-                for path in written_paths {
-                    let _ = storage.delete_file(&path).await;
-                }
-                return Err(error);
-            }
-        }
     }
 
+    // Critical section 2: complete the action, then bookkeeping under lock.
+    let lock = crate::write::lock::lock_provider_for(table);
+    let cs2 = lock.lock().await?;
+    if table.is_metadata_table_enabled()
+        && let Err(error) =
+            crate::write::metadata::write_metadata_commit(storage.as_ref(), instant, mdt_stats)
+                .await
+    {
+        for path in written_paths {
+            let _ = storage.delete_file(&path).await;
+        }
+        return Err(error);
+    }
+    let completed = if layout_two {
+        Some(generate_instant_time().await)
+    } else {
+        None
+    };
+    let commit = Instant::new_completed(instant.to_string(), action, completed)?;
+    let path = commit.relative_path_with_base(&timeline_dir(table))?;
     if let Err(error) = storage.put_file(&path, bytes).await {
         for path in written_paths {
             let _ = storage.delete_file(&path).await;
         }
         return Err(error.into());
     }
+    crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await?;
+    drop(cs2);
     table.timeline.reload_completed_commits().await?;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
@@ -1590,4 +2249,13 @@ async fn rewrite(
         num_inserts: inserts,
         num_deletes: deletes,
     })
+}
+
+fn prev_commit_from_base_path(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    // `{fileId}_{writeToken}_{instant}.parquet`
+    name.rsplit_once('_')
+        .map(|(_, instant_ext)| instant_ext.trim_end_matches(".parquet").to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "null".to_string())
 }

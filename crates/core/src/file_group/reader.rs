@@ -193,10 +193,13 @@ impl FileGroupReader {
     /// Visible to the crate so the merge-on-read context resolver can assert it
     /// derives the same range; see `reader_v2::resolver`.
     pub(crate) fn create_instant_range_for_log_file_scan(&self) -> Result<InstantRange> {
-        let timezone = self
+        let timezone: String = self
             .hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into();
+        if let Some(instants) = incremental_instant_set(&self.hudi_configs)? {
+            return Ok(InstantRange::exact_match(instants, &timezone));
+        }
         let start_timestamp = self
             .hudi_configs
             .try_get(HudiReadConfig::StartTimestamp)?
@@ -1024,11 +1027,112 @@ impl FileGroupReader {
             .into();
         crate::util::path::is_metadata_table_path(&base_path)
     }
+
+    /// Read records from metadata table files partition.
+    ///
+    /// # Arguments
+    /// * `file_slice` - The file slice to read from
+    /// * `keys` - Only read records with these keys. If empty, reads all records.
+    /// * `valid_instants` - When set, only log blocks whose instant is in this
+    ///   data-timeline-fenced set are applied (Java `getValidInstantTimestamps`).
+    ///
+    /// # Returns
+    /// HashMap containing the requested keys (or all keys if `keys` is empty).
+    pub(crate) async fn read_metadata_table_files_partition(
+        &self,
+        file_slice: &FileSlice,
+        keys: &[&str],
+        valid_instants: Option<&std::collections::HashSet<String>>,
+    ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let log_file_paths: Vec<String> = if file_slice.has_log_file() {
+            file_slice
+                .log_files
+                .iter()
+                .map(|log_file| file_slice.log_file_relative_path(log_file))
+                .collect::<Result<Vec<String>>>()?
+        } else {
+            vec![]
+        };
+
+        // Open HFile
+        let mut hfile_reader = HFileReader::open(&self.storage, &base_file_path)
+            .await
+            .map_err(|e| {
+                ReadFileSliceError(format!(
+                    "Failed to read metadata table base file {base_file_path}: {e:?}"
+                ))
+            })?;
+
+        // Get Avro schema from HFile
+        let schema = hfile_reader
+            .get_avro_schema()
+            .map_err(|e| ReadFileSliceError(format!("Failed to get Avro schema: {e:?}")))?
+            .ok_or_else(|| ReadFileSliceError("No Avro schema found in HFile".to_string()))?
+            .clone();
+
+        let hfile_keys: Vec<&str> = if keys.is_empty() {
+            vec![]
+        } else {
+            let mut sorted = keys.to_vec();
+            sorted.sort();
+            sorted
+        };
+
+        let base_records: Vec<HFileRecord> = if hfile_keys.is_empty() {
+            hfile_reader.collect_records().map_err(|e| {
+                ReadFileSliceError(format!("Failed to collect HFile records: {e:?}"))
+            })?
+        } else {
+            hfile_reader
+                .lookup_records(&hfile_keys)
+                .map_err(|e| ReadFileSliceError(format!("Failed to lookup HFile records: {e:?}")))?
+                .into_iter()
+                .filter_map(|(_, r)| r)
+                .collect()
+        };
+
+        let log_records = if log_file_paths.is_empty() {
+            vec![]
+        } else {
+            let instant_range = match valid_instants {
+                Some(instants) => {
+                    let timezone: String = self
+                        .hudi_configs
+                        .get_or_default(HudiTableConfig::TimelineTimezone)
+                        .into();
+                    InstantRange::exact_match(instants.clone(), &timezone)
+                }
+                None => self.create_instant_range_for_log_file_scan()?,
+            };
+            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                .scan(log_file_paths, &instant_range)
+                .await?;
+
+            match scan_result {
+                ScanResult::HFileRecords(records) => records,
+                ScanResult::Empty => vec![],
+                ScanResult::RecordBatches(_) => {
+                    return Err(CoreError::LogBlockError(
+                        "Unexpected RecordBatches in metadata table log file".to_string(),
+                    ));
+                }
+            }
+        };
+
+        // The MDT's declared merge strategy id (hoodie.properties) picks the
+        // payload merger; only the payload-based strategy exists today and
+        // resolution errors on anything else.
+        let payload_merger =
+            crate::metadata::payload_merger::MetadataPayloadMerger::for_metadata_table(
+                self.storage.as_ref(),
+            )
+            .await?;
+        let merger = FilesPartitionMerger::with_payload_merger(schema, payload_merger);
+        merger.merge_for_keys(&base_records, &log_records, &hfile_keys)
+    }
 }
 
-/// Creates a commit time filtering mask based on the provided configs.
-///
-/// Returns `None` if no filtering is needed (meta fields disabled or no start timestamp).
 /// A mask keeping rows whose `_hoodie_commit_time` is one of `instant_times`
 /// (comma-separated).
 ///
@@ -1056,6 +1160,26 @@ fn commit_time_membership_mask(instant_times: &str, batch: &RecordBatch) -> Resu
         .collect::<BooleanArray>())
 }
 
+/// The exact instant set for incremental reads, when present.
+fn incremental_instant_set(
+    hudi_configs: &HudiConfigs,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let raw: Option<String> = hudi_configs
+        .try_get(HudiInternalConfig::IncrementalInstantTimes)?
+        .map(|v| v.into());
+    Ok(raw.map(|joined| {
+        joined
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }))
+}
+
+/// Creates a commit time filtering mask based on the provided configs.
+///
+/// Returns `None` if no filtering is needed (meta fields disabled or no start timestamp).
 fn create_commit_time_filter_mask(
     hudi_configs: &HudiConfigs,
     batch: &RecordBatch,
@@ -1948,6 +2072,104 @@ mod tests {
         assert_eq!(version_two.num_rows(), version_one.num_rows());
         assert_eq!(version_two.schema(), version_one.schema());
         assert_eq!(version_two, version_one);
+        Ok(())
+    }
+
+    /// Create a FileGroupReader for the metadata table without resolving
+    /// options from storage.
+    fn create_metadata_table_reader() -> Result<FileGroupReader> {
+        let metadata_table_uri = get_metadata_table_base_uri();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath,
+            metadata_table_uri.as_str(),
+        )]));
+        FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())
+    }
+
+    /// Initial HFile base file for the files partition (all zeros timestamp).
+    const METADATA_TABLE_FILES_BASE_FILE: &str =
+        "files/files-0000-0_0-955-2690_00000000000000000.hfile";
+
+    /// Log files for the V8Trips8I3U1D test table's files partition.
+    const METADATA_TABLE_FILES_LOG_FILES: &[&str] = &[
+        "files/.files-0000-0_20251220210108078.log.1_10-999-2838",
+        "files/.files-0000-0_20251220210123755.log.1_3-1032-2950",
+        "files/.files-0000-0_20251220210125441.log.1_5-1057-3024",
+        "files/.files-0000-0_20251220210127080.log.1_3-1082-3100",
+        "files/.files-0000-0_20251220210128625.log.1_5-1107-3174",
+        "files/.files-0000-0_20251220210129235.log.1_3-1118-3220",
+        "files/.files-0000-0_20251220210130911.log.1_3-1149-3338",
+    ];
+
+    fn create_test_file_slice() -> Result<FileSlice> {
+        use crate::file_group::FileGroup;
+
+        let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
+        let base_file_name = METADATA_TABLE_FILES_BASE_FILE
+            .strip_prefix("files/")
+            .unwrap();
+        fg.add_base_file_from_name(base_file_name)?;
+        let log_file_names: Vec<_> = METADATA_TABLE_FILES_LOG_FILES
+            .iter()
+            .map(|s| s.strip_prefix("files/").unwrap())
+            .collect();
+        fg.add_log_files_from_names(log_file_names)?;
+
+        Ok(fg
+            .get_file_slice_as_of("99999999999999999")
+            .expect("Should have file slice")
+            .clone())
+    }
+
+    #[tokio::test]
+    async fn test_read_metadata_table_files_partition() -> Result<()> {
+        use crate::metadata::table_record::{FilesPartitionRecord, MetadataRecordType};
+
+        let reader = create_metadata_table_reader()?;
+        let file_slice = create_test_file_slice()?;
+
+        // Test 1: Read all records (empty keys)
+        let all_records = reader
+            .read_metadata_table_files_partition(&file_slice, &[], None)
+            .await?;
+
+        // Should have 4 keys after merging
+        assert_eq!(
+            all_records.len(),
+            4,
+            "Should have 4 partition keys after merge"
+        );
+
+        // Validate all partition keys have correct record types
+        for (key, record) in &all_records {
+            if key == FilesPartitionRecord::ALL_PARTITIONS_KEY {
+                assert_eq!(record.record_type, MetadataRecordType::AllPartitions);
+            } else {
+                assert_eq!(record.record_type, MetadataRecordType::Files);
+            }
+        }
+
+        // Validate chennai partition has files
+        let chennai = all_records.get("city=chennai").unwrap();
+        assert!(
+            chennai.active_file_names().len() >= 2,
+            "Chennai should have at least 2 active files"
+        );
+        assert!(chennai.total_size() > 0, "Total size should be > 0");
+
+        // Test 2: Read specific keys
+        let keys = vec![FilesPartitionRecord::ALL_PARTITIONS_KEY, "city=chennai"];
+        let filtered_records = reader
+            .read_metadata_table_files_partition(&file_slice, &keys, None)
+            .await?;
+
+        // Should only contain the requested keys
+        assert_eq!(filtered_records.len(), 2);
+        assert!(filtered_records.contains_key(FilesPartitionRecord::ALL_PARTITIONS_KEY));
+        assert!(filtered_records.contains_key("city=chennai"));
+        assert!(!filtered_records.contains_key("city=san_francisco"));
+        assert!(!filtered_records.contains_key("city=sao_paulo"));
+
         Ok(())
     }
 

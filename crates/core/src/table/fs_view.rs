@@ -293,7 +293,15 @@ impl FileSystemView {
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
         let files_partition_records = if let Some(mdt) = metadata_table {
-            Some(mdt.fetch_files_partition_records(partition_pruner).await?)
+            // Fence MDT log blocks by the data timeline (self is the data
+            // table's view; its storage roots both timelines).
+            let valid_instants =
+                crate::metadata::table::valid_metadata_instants(&self.storage, &self.hudi_configs)
+                    .await?;
+            Some(
+                mdt.fetch_files_partition_records(partition_pruner, Some(&valid_instants))
+                    .await?,
+            )
         } else {
             None
         };

@@ -251,7 +251,6 @@ impl HoodieCommitMetadata {
             }
         })
     }
-
 }
 
 #[cfg(test)]

@@ -67,8 +67,8 @@ fn parse_vendored(avsc: &str, name: &str) -> Result<Schema> {
 /// field order match the schema (unlike `to_value`/`append_ser`, which assume
 /// null-first Option unions and Serialize field order).
 pub fn encode_with_schema<T: serde::Serialize>(value: &T, schema: &Schema) -> Result<Vec<u8>> {
-    use apache_avro::types::Value as AvroValue;
     use apache_avro::Writer as AvroWriter;
+    use apache_avro::types::Value as AvroValue;
 
     let json = serde_json::to_value(value)
         .map_err(|e| CoreError::CommitMetadata(format!("Failed to JSON-encode for Avro: {e}")))?;
@@ -76,15 +76,15 @@ pub fn encode_with_schema<T: serde::Serialize>(value: &T, schema: &Schema) -> Re
         CoreError::CommitMetadata(format!("Failed to resolve Avro value against schema: {e}"))
     })?;
     let mut writer = AvroWriter::new(schema, Vec::new());
-    writer.append(resolved).map_err(|e| {
-        CoreError::CommitMetadata(format!("Failed to append Avro record: {e}"))
-    })?;
-    writer.flush().map_err(|e| {
-        CoreError::CommitMetadata(format!("Failed to flush Avro writer: {e}"))
-    })?;
-    writer.into_inner().map_err(|e| {
-        CoreError::CommitMetadata(format!("Failed to finish Avro writer: {e}"))
-    })
+    writer
+        .append(resolved)
+        .map_err(|e| CoreError::CommitMetadata(format!("Failed to append Avro record: {e}")))?;
+    writer
+        .flush()
+        .map_err(|e| CoreError::CommitMetadata(format!("Failed to flush Avro writer: {e}")))?;
+    writer
+        .into_inner()
+        .map_err(|e| CoreError::CommitMetadata(format!("Failed to finish Avro writer: {e}")))
 }
 
 macro_rules! vendored_schema {
@@ -115,6 +115,24 @@ vendored_schema!(
     hoodie_commit_metadata_schema,
     "HoodieCommitMetadata.avsc",
     "HoodieCommitMetadata"
+);
+// clusteringPlan is inlined as an empty stub record: our writers never populate
+// it (null branch), and Avro union resolution only inspects the branch in use.
+vendored_schema!(
+    hoodie_requested_replace_metadata_schema,
+    "HoodieRequestedReplaceMetadata.avsc",
+    "HoodieRequestedReplaceMetadata"
+);
+// HoodieInstantInfo is inlined (Java keeps it in its own avsc file).
+vendored_schema!(
+    hoodie_rollback_plan_schema,
+    "HoodieRollbackPlan.avsc",
+    "HoodieRollbackPlan"
+);
+vendored_schema!(
+    hoodie_rollback_metadata_schema,
+    "HoodieRollbackMetadata.avsc",
+    "HoodieRollbackMetadata"
 );
 
 /// Java `HoodieReplaceCommitMetadata.avsc` references nested `HoodieWriteStat`

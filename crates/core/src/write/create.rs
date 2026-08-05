@@ -31,7 +31,8 @@ use crate::write::metadata::bootstrap_metadata_table;
 
 /// Builder for creating a new Hudi table on storage.
 ///
-/// Defaults: metadata table on, record index on, table version 8 / timeline layout 2,
+/// Defaults: metadata table on, record index on, table version 9 (1.1.x/1.2
+/// format; use `with_table_version(8)` for 1.0.x) / timeline layout 2,
 /// hive-style partitioning on, partition columns retained in data files.
 #[derive(Debug, Clone)]
 pub struct TableCreateBuilder {
@@ -46,6 +47,8 @@ pub struct TableCreateBuilder {
     ordering_fields: Vec<String>,
     metadata_enabled: bool,
     record_index_enabled: bool,
+    column_stats_enabled: bool,
+    partition_stats_enabled: bool,
     hive_style_partitioning: bool,
     options: HashMap<String, String>,
     storage_options: HashMap<String, String>,
@@ -57,7 +60,7 @@ impl TableCreateBuilder {
             base_uri: base_uri.into(),
             table_name: None,
             table_type: TableTypeValue::CopyOnWrite,
-            table_version: 8,
+            table_version: 9,
             timeline_layout_version: 2,
             // Match Java HoodieTableConfig default (Spark writers persist true).
             populates_meta_fields: true,
@@ -66,6 +69,9 @@ impl TableCreateBuilder {
             ordering_fields: Vec::new(),
             metadata_enabled: true,
             record_index_enabled: true,
+            // Match Spark engine defaults: column stats on when MDT is on.
+            column_stats_enabled: true,
+            partition_stats_enabled: true,
             hive_style_partitioning: true,
             options: HashMap::new(),
             storage_options: HashMap::new(),
@@ -125,17 +131,23 @@ impl TableCreateBuilder {
         self
     }
 
-    /// Enable/disable the internal metadata table (`files`, and optionally `record_index`).
+    /// Enable/disable the internal metadata table (`files`, and optionally indexes).
     ///
-    /// Defaults to enabled. Disabling also turns off record index and falls back to
-    /// table version 6 / timeline layout 1 unless the caller overrides versions later.
+    /// Defaults to enabled. Disabling also turns off record/column/partition stats
+    /// indexes and falls back to table version 6 / timeline layout 1 unless the
+    /// caller overrides versions later.
     pub fn with_metadata(mut self, enabled: bool) -> Self {
         self.metadata_enabled = enabled;
         if enabled {
-            self.table_version = 8;
+            // MDT requires v8+; never downgrade an explicit v9 choice.
+            if self.table_version < 8 {
+                self.table_version = 8;
+            }
             self.timeline_layout_version = 2;
         } else {
             self.record_index_enabled = false;
+            self.column_stats_enabled = false;
+            self.partition_stats_enabled = false;
             self.table_version = 6;
             self.timeline_layout_version = 1;
         }
@@ -148,6 +160,27 @@ impl TableCreateBuilder {
     /// Requires metadata table enabled.
     pub fn with_record_index(mut self, enabled: bool) -> Self {
         self.record_index_enabled = enabled;
+        self
+    }
+
+    /// Enable/disable MDT `column_stats` (file-level column ranges).
+    ///
+    /// Defaults to enabled when metadata is on (Spark-aligned). Disabling also
+    /// disables `partition_stats`.
+    pub fn with_column_stats(mut self, enabled: bool) -> Self {
+        self.column_stats_enabled = enabled;
+        if !enabled {
+            self.partition_stats_enabled = false;
+        }
+        self
+    }
+
+    /// Enable/disable MDT `partition_stats` (requires `column_stats`).
+    ///
+    /// Defaults to enabled when metadata is on. Ignored for non-partitioned
+    /// tables, matching Java's metadata writer.
+    pub fn with_partition_stats(mut self, enabled: bool) -> Self {
+        self.partition_stats_enabled = enabled;
         self
     }
 
@@ -182,6 +215,22 @@ impl TableCreateBuilder {
                     .to_string(),
             ));
         }
+        if self.column_stats_enabled && !self.metadata_enabled {
+            return Err(CoreError::Write(
+                "column_stats requires the metadata table; call with_metadata(true) or with_column_stats(false)"
+                    .to_string(),
+            ));
+        }
+        if self.partition_stats_enabled && !self.column_stats_enabled {
+            return Err(CoreError::Write(
+                "partition_stats requires column_stats; call with_column_stats(true) or with_partition_stats(false)"
+                    .to_string(),
+            ));
+        }
+        // Java HoodieBackedTableMetadataWriter removes PARTITION_STATS for
+        // non-partitioned tables; mirror that instead of erroring.
+        let partition_stats_enabled =
+            self.partition_stats_enabled && !self.partition_fields.is_empty();
 
         if self.table_version >= 8 && self.timeline_layout_version != 2 {
             return Err(CoreError::Write(format!(
@@ -231,7 +280,9 @@ impl TableCreateBuilder {
             "PARQUET".to_string(),
         );
         props.insert(
-            HudiTableConfig::IsHiveStylePartitioning.as_ref().to_string(),
+            HudiTableConfig::IsHiveStylePartitioning
+                .as_ref()
+                .to_string(),
             self.hive_style_partitioning.to_string(),
         );
         // Partition columns stay in data files (never strip hive-style values).
@@ -257,15 +308,20 @@ impl TableCreateBuilder {
             HudiTableConfig::ArchiveLogFolder.as_ref().to_string(),
             "history".to_string(),
         );
-        // Match Spark-written tables (HoodieTimelineTimeZone.LOCAL).
+        // LOCAL like the Spark writer default: Spark table services mint
+        // LOCAL-time instants regardless of the table property, so declaring
+        // (and minting) LOCAL keeps mixed-writer timelines ordered.
+        let timeline_timezone = self
+            .options
+            .get(HudiTableConfig::TimelineTimezone.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "LOCAL".to_string());
+        crate::write::set_commit_timezone(&timeline_timezone);
         props.insert(
             HudiTableConfig::TimelineTimezone.as_ref().to_string(),
-            "LOCAL".to_string(),
+            timeline_timezone,
         );
-        props.insert(
-            "hoodie.table.cdc.enabled".to_string(),
-            "false".to_string(),
-        );
+        props.insert("hoodie.table.cdc.enabled".to_string(), "false".to_string());
         props.insert(
             "hoodie.partition.metafile.use.base.format".to_string(),
             "false".to_string(),
@@ -286,6 +342,14 @@ impl TableCreateBuilder {
             if self.record_index_enabled {
                 partitions.push("record_index".to_string());
             }
+            if self.column_stats_enabled {
+                partitions.push("column_stats".to_string());
+            }
+            if partition_stats_enabled {
+                partitions.push("partition_stats".to_string());
+            }
+            // Java HoodieTableConfig persists the list alphabetically sorted.
+            partitions.sort();
             props.insert(
                 HudiTableConfig::MetadataTablePartitions
                     .as_ref()
@@ -334,10 +398,14 @@ impl TableCreateBuilder {
                     HudiTableConfig::OrderingFields.as_ref().to_string(),
                     self.ordering_fields.join(","),
                 );
-                props.insert(
-                    "hoodie.table.precombine.field".to_string(),
-                    self.ordering_fields.join(","),
-                );
+                // tv9 replaces the deprecated precombine key with ordering
+                // fields (Java EightToNineUpgradeHandler removes it).
+                if self.table_version < 9 {
+                    props.insert(
+                        "hoodie.table.precombine.field".to_string(),
+                        self.ordering_fields.join(","),
+                    );
+                }
                 props.insert(
                     "hoodie.record.merge.mode".to_string(),
                     "EVENT_TIME_ORDERING".to_string(),
@@ -356,10 +424,7 @@ impl TableCreateBuilder {
                     "ce9acb64-bde0-424c-9b91-f6ebba25356d".to_string(),
                 );
             }
-            props.insert(
-                "hoodie.compaction.payload.class".to_string(),
-                "org.apache.hudi.common.model.DefaultHoodieRecordPayload".to_string(),
-            );
+            // Payload classes are deprecated in favor of merge mode / strategy; do not persist them.
         }
         for (k, v) in self.options {
             props.insert(k, v);
@@ -426,8 +491,10 @@ impl TableCreateBuilder {
             bootstrap_metadata_table(
                 &storage,
                 &table_name,
-                "00000000000000000",
+                self.table_version,
                 self.record_index_enabled,
+                self.column_stats_enabled,
+                partition_stats_enabled,
             )
             .await?;
         }

@@ -83,6 +83,9 @@ strum = { version = "0.28", features = ["derive"] }
 strum_macros = { version = "0.28" }
 url = { version = "2" }
 uuid = { version = "1" }
+base64 = { version = "0.22" }
+md-5 = { version = "0.10" }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # runtime / async
 async-recursion = { version = "1" }

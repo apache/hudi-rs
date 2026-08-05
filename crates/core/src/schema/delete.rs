@@ -164,6 +164,11 @@ static DELETE_RECORD_LIST_AVRO_SCHEMA_STR: &str = include_str!(concat!(
     "/schemas/HoodieDeleteRecordList.avsc"
 ));
 
+/// Avro schema JSON for HoodieDeleteRecordList (MOR/MDT delete log block SCHEMA header).
+pub(crate) fn delete_record_list_avro_schema_json() -> &'static str {
+    DELETE_RECORD_LIST_AVRO_SCHEMA_STR
+}
+
 static DELETE_RECORD_LIST_AVRO_SCHEMA: Lazy<Result<AvroSchema>> = Lazy::new(|| {
     AvroSchema::parse_str(DELETE_RECORD_LIST_AVRO_SCHEMA_STR).map_err(CoreError::AvroError)
 });

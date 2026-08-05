@@ -25,6 +25,10 @@ pub(crate) mod selector;
 pub(crate) mod util;
 pub mod view;
 
+// `LogFileScanner::scan` takes an `InstantRange`; export it so external callers
+// can actually invoke that public API.
+pub use selector::InstantRange;
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;

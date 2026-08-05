@@ -34,6 +34,10 @@ use crate::table::Table;
 /// When `hoodie.table.recordkey.fields` is unset/empty, keys are auto-generated
 /// like Java `AutoRecordGenWrapper*KeyGenerator`: `{instant}_{partitionId}_{rowId}`.
 ///
+/// `row_id_offset` continues the auto-key row counter across size-split chunks and
+/// partitions within one commit. `partition_id` distinguishes writer partitions
+/// (Java `HoodieRecord.generateSequenceId`).
+///
 /// Partition paths use hive-style (`field=value/...`) when
 /// `hoodie.datasource.write.hive_style_partitioning` is true; otherwise value-only
 /// segments. Null partition values are rejected. Partition columns are not stripped
@@ -42,6 +46,17 @@ pub fn hoodie_keys_for_batch(
     table: &Table,
     batch: &RecordBatch,
     instant: Option<&str>,
+) -> Result<Vec<HoodieKey>> {
+    hoodie_keys_for_batch_with_offset(table, batch, instant, 0, 0)
+}
+
+/// Like [`hoodie_keys_for_batch`], with an explicit auto-key row offset and partition id.
+pub fn hoodie_keys_for_batch_with_offset(
+    table: &Table,
+    batch: &RecordBatch,
+    instant: Option<&str>,
+    row_id_offset: usize,
+    partition_id: u32,
 ) -> Result<Vec<HoodieKey>> {
     let record_key_fields: Option<Vec<String>> = table
         .hudi_configs
@@ -67,10 +82,8 @@ pub fn hoodie_keys_for_batch(
         let mut keys = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             // Match Java HoodieRecord.generateSequenceId(instant, partitionId, rowId).
-            // Single-threaded writer → partitionId = 0.
-            let record_key = format!("{instant}_0_{row}");
-            let partition_path =
-                partition_path_for_row(batch, row, &partition_fields, hive_style)?;
+            let record_key = format!("{instant}_{partition_id}_{}", row_id_offset + row);
+            let partition_path = partition_path_for_row(batch, row, &partition_fields, hive_style)?;
             keys.push(HoodieKey {
                 record_key,
                 partition_path,
@@ -90,7 +103,9 @@ pub fn hoodie_keys_for_batch(
     let key_array = batch
         .column_by_name(key_name)
         .ok_or_else(|| {
-            CoreError::Schema(format!("record key field '{key_name}' is missing from write batch"))
+            CoreError::Schema(format!(
+                "record key field '{key_name}' is missing from write batch"
+            ))
         })?
         .as_any()
         .downcast_ref::<StringArray>()
@@ -108,8 +123,7 @@ pub fn hoodie_keys_for_batch(
             ));
         }
         let record_key = key_array.value(row).to_string();
-        let partition_path =
-            partition_path_for_row(batch, row, &partition_fields, hive_style)?;
+        let partition_path = partition_path_for_row(batch, row, &partition_fields, hive_style)?;
         keys.push(HoodieKey {
             record_key,
             partition_path,

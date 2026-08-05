@@ -88,7 +88,10 @@ async fn load_record_index_map(
     let dir = format!("{METADATA_BASE}/{partition}");
     let listed = match storage.list_files(Some(&dir)).await {
         Ok(files) => files,
-        Err(_) => return Ok(HashMap::new()),
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
     };
 
     let mut base_paths = Vec::new();
@@ -117,8 +120,15 @@ async fn load_record_index_map(
         apply_hfile_records(&mut merged, &records)?;
     }
     if !log_paths.is_empty() {
+        // Only trust log blocks whose instant completed on the data timeline
+        // (Java getValidInstantTimestamps) — orphan MDT commits are skipped.
+        let valid = crate::metadata::table::valid_metadata_instants(
+            &table.file_system_view.storage,
+            &table.hudi_configs,
+        )
+        .await?;
         let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage);
-        let range = InstantRange::up_to("99991231235959999", "UTC");
+        let range = InstantRange::exact_match(valid, "UTC");
         match scanner.scan(log_paths, &range).await? {
             ScanResult::HFileRecords(records) => apply_hfile_records(&mut merged, &records)?,
             ScanResult::Empty => {}
@@ -145,7 +155,7 @@ fn apply_hfile_records(
             .key_as_str()
             .ok_or_else(|| CoreError::MetadataTable("record_index key must be utf8".to_string()))?
             .to_string();
-        match decode_record_index_entry(&key, record.value())? {
+        match decode_record_index_entry(&key, record.value(), record.avro_schema())? {
             Some(entry) => {
                 merged.insert(
                     key,
@@ -178,8 +188,5 @@ pub fn is_record_index_enabled(table: &Table) -> bool {
     if from_partitions.iter().any(|p| p == "record_index") {
         return true;
     }
-    table
-        .hudi_configs
-        .get_or_default(RecordIndexEnabled)
-        .into()
+    table.hudi_configs.get_or_default(RecordIndexEnabled).into()
 }

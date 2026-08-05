@@ -204,7 +204,10 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
         .await
         .unwrap();
     assert!(table.is_metadata_table_enabled());
-    assert!(root.join(".hoodie/metadata/.hoodie/hoodie.properties").is_file());
+    assert!(
+        root.join(".hoodie/metadata/.hoodie/hoodie.properties")
+            .is_file()
+    );
 
     let append = table
         .append([batch(vec![("a", 1), ("b", 2), ("c", 3)])])
@@ -220,7 +223,11 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
             replacecommits: 0,
         }
     );
-    assert!(mdt_active_files(&table).await.contains(&append.base_file_path));
+    assert!(
+        mdt_active_files(&table)
+            .await
+            .contains(&append.base_file_path)
+    );
     assert_snapshot_async(&table, vec![("a", 1), ("b", 2), ("c", 3)]).await;
 
     // 2) Upsert over time: update + insert; state stays consistent.
@@ -230,19 +237,18 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
         .unwrap();
     assert_eq!(upsert.num_updates, 1);
     assert_eq!(upsert.num_inserts, 1);
-    // COW rewrite replaces bases via replacecommit — still no log files.
+    // COW upsert writes a new base slice under commit (same file group), not replacecommit.
     let layout = data_layout(root);
     assert_eq!(layout.log_files, 0);
-    assert!(layout.replacecommits >= 1 || layout.commits >= 2);
-    let mdt_after = mdt_active_files(&table).await;
-    assert_eq!(
-        mdt_after.len(),
-        1,
-        "MDT should list the replacement base only: {mdt_after:?}"
-    );
+    assert_eq!(layout.replacecommits, 0);
     assert!(
-        mdt_after[0].ends_with(".parquet") && mdt_after[0].contains('_'),
-        "MDT active file should be the rewrite base: {mdt_after:?}"
+        layout.commits >= 2,
+        "expected commits after upsert, got {layout:?}"
+    );
+    let mdt_after = mdt_active_files(&table).await;
+    assert!(
+        mdt_after.iter().any(|p| p.ends_with(".parquet")),
+        "MDT should list parquet bases: {mdt_after:?}"
     );
     assert_snapshot_async(&table, vec![("a", 10), ("b", 2), ("c", 3), ("d", 4)]).await;
 
@@ -318,7 +324,10 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     assert_eq!(update.num_updates, 1);
     assert_eq!(update.num_inserts, 0);
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 1, "update-only upsert must not add bases");
+    assert_eq!(
+        layout.base_parquet, 1,
+        "update-only upsert must not add bases"
+    );
     assert_eq!(layout.log_files, 1, "MOR update must append a parquet log");
     assert_eq!(layout.deltacommits, 2);
     assert_snapshot_async(&table, vec![("a", 10), ("b", 2)]).await;
@@ -345,12 +354,18 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     assert_eq!(insert.num_updates, 0);
     assert_eq!(insert.num_inserts, 1);
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 2, "MOR insert should create a new base");
-    assert_eq!(layout.log_files, 1, "insert-only upsert should not add logs");
+    assert_eq!(
+        layout.base_parquet, 1,
+        "small-file packing routes the insert into the existing slice"
+    );
+    assert_eq!(
+        layout.log_files, 2,
+        "packed insert lands as a log append (Java small-file routing)"
+    );
     assert_eq!(layout.deltacommits, 3);
     assert_snapshot_async(&table, vec![("a", 10), ("b", 2), ("c", 3)]).await;
 
-    // Mixed upsert: update existing + insert new → +1 log and +1 base.
+    // Mixed upsert: update + packed insert both land in the same group's log.
     let mixed = table
         .upsert([ordered_batch(vec![("b", 20, 2), ("d", 4, 1)])])
         .await
@@ -358,8 +373,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     assert_eq!(mixed.num_updates, 1);
     assert_eq!(mixed.num_inserts, 1);
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 3);
-    assert_eq!(layout.log_files, 2);
+    assert_eq!(layout.base_parquet, 1);
+    assert_eq!(layout.log_files, 3);
     assert_eq!(layout.deltacommits, 4);
     assert_snapshot_async(&table, vec![("a", 10), ("b", 20), ("c", 3), ("d", 4)]).await;
 
@@ -369,8 +384,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .await
         .unwrap();
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 3);
-    assert_eq!(layout.log_files, 3);
+    assert_eq!(layout.base_parquet, 1);
+    assert_eq!(layout.log_files, 4);
     assert_snapshot_async(&table, vec![("a", 11), ("b", 20), ("c", 3), ("d", 4)]).await;
 
     // Delete → delete log block file(s), snapshot excludes key.
@@ -383,8 +398,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .unwrap();
     assert_eq!(deleted.num_deletes, 1);
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 3);
-    assert_eq!(layout.log_files, 4, "MOR delete must append a log file");
+    assert_eq!(layout.base_parquet, 1);
+    assert_eq!(layout.log_files, 5, "MOR delete must append a log file");
     assert_snapshot_async(&table, vec![("a", 11), ("b", 20), ("d", 4)]).await;
 
     // Read-optimized should ignore logs and still see pre-log base values for updated keys.
@@ -392,15 +407,11 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .read(&ReadOptions::new().with_hudi_option("hoodie.read.use.read_optimized.mode", "true"))
         .await
         .unwrap();
-    // RO sees bases only: append(a=1,b=2) + insert(c=3) + insert(d=4); updates in logs ignored.
+    // RO sees bases only: the original append(a=1,b=2); packed inserts c/d
+    // live in logs (small-file routing) and are invisible until compaction.
     assert_eq!(
         rows_by_id(&ro),
-        vec![
-            ("a".to_string(), 1),
-            ("b".to_string(), 2),
-            ("c".to_string(), 3),
-            ("d".to_string(), 4),
-        ]
+        vec![("a".to_string(), 1), ("b".to_string(), 2)]
     );
 
     // Incremental from earliest includes all committed data as of latest (merged).
@@ -433,17 +444,14 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     // Durable after reopen.
     let reopened = Table::new(base_uri).await.unwrap();
     assert_snapshot_async(&reopened, vec![("a", 11), ("b", 20), ("d", 4)]).await;
-    assert_eq!(data_layout(root).log_files, 4);
+    assert_eq!(data_layout(root).log_files, 5);
 }
 
 #[tokio::test]
 async fn test_cow_and_mor_mutable_ops_roundtrip() {
     // Verb coverage: append, upsert, delete, overwrite
     // for both table types, asserting read-after-write consistency.
-    for table_type in [
-        TableTypeValue::CopyOnWrite,
-        TableTypeValue::MergeOnRead,
-    ] {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
         let dir = tempdir().unwrap();
         let base_uri = dir.path().to_str().unwrap();
         let mut builder = Table::create(base_uri)
@@ -539,7 +547,9 @@ fn partitioned_ordered_batch(rows: Vec<(&str, &str, i64, i64)>) -> RecordBatch {
                 rows.iter().map(|(_, city, _, _)| *city).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
-                rows.iter().map(|(_, _, value, _)| *value).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|(_, _, value, _)| *value)
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
                 rows.iter()
@@ -562,11 +572,7 @@ async fn test_create_defaults_enable_mdt_and_record_index() {
         .unwrap();
     assert!(table.is_metadata_table_enabled());
     assert!(hudi_core::index::is_record_index_enabled(&table));
-    assert!(
-        dir.path()
-            .join(".hoodie/metadata/record_index")
-            .is_dir()
-    );
+    assert!(dir.path().join(".hoodie/metadata/record_index").is_dir());
     let rli_bases: Vec<_> = std::fs::read_dir(dir.path().join(".hoodie/metadata/record_index"))
         .unwrap()
         .filter_map(|e| e.ok())
@@ -577,6 +583,20 @@ async fn test_create_defaults_enable_mdt_and_record_index() {
         rli_bases.len(),
         10,
         "Java default RLI min file groups is 10: {rli_bases:?}"
+    );
+    assert!(dir.path().join(".hoodie/metadata/column_stats").is_dir());
+    // Java removes partition_stats for non-partitioned tables at MDT init.
+    assert!(!dir.path().join(".hoodie/metadata/partition_stats").exists());
+    let col_bases: Vec<_> = std::fs::read_dir(dir.path().join(".hoodie/metadata/column_stats"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".hfile") && n.starts_with("col-stats-"))
+        .collect();
+    assert_eq!(
+        col_bases.len(),
+        2,
+        "Java default column_stats FG count is 2"
     );
 }
 
@@ -606,11 +626,7 @@ async fn test_record_index_off_falls_back_to_simple_index() {
         .unwrap();
     assert!(table.is_metadata_table_enabled());
     assert!(!hudi_core::index::is_record_index_enabled(&table));
-    assert!(
-        !dir.path()
-            .join(".hoodie/metadata/record_index")
-            .is_dir()
-    );
+    assert!(!dir.path().join(".hoodie/metadata/record_index").is_dir());
 
     table
         .append([batch(vec![("a", 1), ("b", 2)])])
@@ -637,10 +653,7 @@ async fn test_partitioned_cow_hive_style_keeps_partition_columns() {
         .unwrap();
 
     table
-        .append([partitioned_batch(vec![
-            ("a", "sf", 1),
-            ("b", "nyc", 2),
-        ])])
+        .append([partitioned_batch(vec![("a", "sf", 1), ("b", "nyc", 2)])])
         .await
         .unwrap();
     assert!(root.join("city=sf").is_dir());
@@ -655,10 +668,7 @@ async fn test_partitioned_cow_hive_style_keeps_partition_columns() {
     assert!(meta.contains("partitionDepth=1"));
 
     table
-        .upsert([partitioned_batch(vec![
-            ("a", "sf", 10),
-            ("c", "sf", 3),
-        ])])
+        .upsert([partitioned_batch(vec![("a", "sf", 10), ("c", "sf", 3)])])
         .await
         .unwrap();
     table
@@ -675,13 +685,16 @@ async fn test_partitioned_cow_hive_style_keeps_partition_columns() {
         vec![("a".to_string(), 10), ("c".to_string(), 3)]
     );
     // Partition column retained in data files (not stripped).
-    let city = batches[0]
-        .column_by_name("city")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert!(city.iter().flatten().any(|v| v == "sf"));
+    let mut saw_sf = false;
+    for batch in &batches {
+        if let Some(city) = batch
+            .column_by_name("city")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            saw_sf |= city.iter().flatten().any(|v| v == "sf");
+        }
+    }
+    assert!(saw_sf, "expected city=sf in snapshot batches");
 
     let index = hudi_core::index::RecordIndex;
     use hudi_core::index::HoodieIndex;
@@ -741,7 +754,6 @@ async fn test_partitioned_mor_writes_logs_under_partition() {
     assert_snapshot_async(&table, vec![("a", 10), ("b", 2)]).await;
 }
 
-
 #[tokio::test]
 async fn test_create_props_match_spark_shape() {
     let dir = tempdir().unwrap();
@@ -764,8 +776,8 @@ async fn test_create_props_match_spark_shape() {
         "hoodie.timeline.path=timeline",
         "hoodie.timeline.history.path=history",
         "hoodie.table.keygenerator.type=SIMPLE",
-        "hoodie.table.metadata.partitions=files,record_index",
-        "hoodie.table.version=8",
+        "hoodie.table.metadata.partitions=column_stats,files,partition_stats,record_index",
+        "hoodie.table.version=9",
         "hoodie.timeline.layout.version=2",
         "hoodie.record.merge.mode=EVENT_TIME_ORDERING",
     ] {
@@ -780,12 +792,17 @@ async fn test_create_props_match_spark_shape() {
         "must not invent write-side hoodie.metadata.record.index.enable in table props:\n{props}"
     );
     // Checksum must match Java CRC32("default.trips")
-    assert!(props.contains("hoodie.table.checksum=2200697520"), "{props}");
+    assert!(
+        props.contains("hoodie.table.checksum=2200697520"),
+        "{props}"
+    );
 
     let mdt_props =
         std::fs::read_to_string(root.join(".hoodie/metadata/.hoodie/hoodie.properties")).unwrap();
     assert!(mdt_props.contains("hoodie.table.keygenerator.type=HOODIE_TABLE_METADATA"));
-    assert!(mdt_props.contains("hoodie.compaction.payload.class=org.apache.hudi.metadata.HoodieMetadataPayload"));
+    assert!(mdt_props.contains(
+        "hoodie.compaction.payload.class=org.apache.hudi.metadata.HoodieMetadataPayload"
+    ));
     assert!(mdt_props.contains("hoodie.table.checksum=1249152950"));
 
     let mdt_timeline = std::fs::read_dir(root.join(".hoodie/metadata/.hoodie/timeline"))
@@ -793,7 +810,9 @@ async fn test_create_props_match_spark_shape() {
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect::<Vec<_>>();
     assert!(
-        mdt_timeline.iter().any(|n| n.ends_with(".deltacommit.requested")),
+        mdt_timeline
+            .iter()
+            .any(|n| n.ends_with(".deltacommit.requested")),
         "{mdt_timeline:?}"
     );
     assert!(
@@ -941,13 +960,13 @@ async fn test_partitioned_cow_dynamic_then_full_overwrite_lifecycle() {
         .await
         .unwrap();
     let before = walkdir_count_parquet(root);
-    assert!(before >= 3, "expected partitioned append bases, got {before}");
+    assert!(
+        before >= 3,
+        "expected partitioned append bases, got {before}"
+    );
 
     table
-        .dynamic_partition_overwrite([partitioned_batch(vec![
-            ("x", "sf", 10),
-            ("y", "sf", 11),
-        ])])
+        .dynamic_partition_overwrite([partitioned_batch(vec![("x", "sf", 10), ("y", "sf", 11)])])
         .await
         .unwrap();
     assert_eq!(
@@ -961,10 +980,7 @@ async fn test_partitioned_cow_dynamic_then_full_overwrite_lifecycle() {
     );
 
     table
-        .overwrite([partitioned_batch(vec![
-            ("m", "chi", 20),
-            ("n", "bos", 21),
-        ])])
+        .overwrite([partitioned_batch(vec![("m", "chi", 20), ("n", "bos", 21)])])
         .await
         .unwrap();
     assert_eq!(
@@ -972,7 +988,10 @@ async fn test_partitioned_cow_dynamic_then_full_overwrite_lifecycle() {
         vec![("m".to_string(), 20), ("n".to_string(), 21)]
     );
     let layout = data_layout(root);
-    assert!(layout.replacecommits >= 2, "expected replacecommits, got {layout:?}");
+    assert!(
+        layout.replacecommits >= 2,
+        "expected replacecommits, got {layout:?}"
+    );
 }
 
 fn walkdir_count_parquet(root: &std::path::Path) -> usize {

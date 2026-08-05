@@ -59,7 +59,7 @@ pub fn write_log_block(
     let block_length = (payload.len() + 8) as u64;
     let footer_length = block_length + MAGIC.len() as u64;
     let mut output = Vec::with_capacity(MAGIC.len() + 8 + payload.len() + 8);
-    output.extend_from_slice(&MAGIC);
+    output.extend_from_slice(MAGIC);
     output.extend_from_slice(&block_length.to_be_bytes());
     output.extend_from_slice(&payload);
     output.extend_from_slice(&footer_length.to_be_bytes());

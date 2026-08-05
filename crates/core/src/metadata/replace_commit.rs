@@ -48,6 +48,50 @@ pub struct HoodieReplaceCommitMetadata {
     pub partition_to_replace_file_ids: Option<HashMap<String, Vec<String>>>,
 }
 
+/// Java `HoodieRequestedReplaceMetadata`: the "plan" persisted into a
+/// `.replacecommit.requested` instant. Our writers only produce
+/// insert-overwrite operations, so `clusteringPlan` is always null.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HoodieRequestedReplaceMetadata {
+    pub operation_type: Option<String>,
+    pub clustering_plan: Option<Value>,
+    pub extra_metadata: Option<HashMap<String, String>>,
+    pub version: Option<i32>,
+}
+
+impl HoodieRequestedReplaceMetadata {
+    /// Requested-replace plan for an insert-overwrite operation.
+    pub fn for_operation(operation: &str) -> Self {
+        Self {
+            operation_type: Some(operation.to_string()),
+            clustering_plan: None,
+            extra_metadata: Some(HashMap::new()),
+            version: Some(1),
+        }
+    }
+
+    /// Serialize to Avro OCF using the vendored Java schema.
+    pub fn to_avro_bytes(&self) -> Result<Vec<u8>> {
+        use crate::schema::avsc::{encode_with_schema, hoodie_requested_replace_metadata_schema};
+        encode_with_schema(self, hoodie_requested_replace_metadata_schema()?)
+    }
+
+    /// Parse a requested-replace plan from Avro OCF bytes.
+    pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
+        let reader = AvroReader::new(Cursor::new(bytes))
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to create Avro reader: {e}")))?;
+        let mut records = reader;
+        let value = records
+            .next()
+            .ok_or_else(|| CoreError::CommitMetadata("Avro file contains no records".to_string()))?
+            .map_err(|e| CoreError::CommitMetadata(format!("Failed to read Avro record: {e}")))?;
+        from_value::<Self>(&value).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {e}"))
+        })
+    }
+}
+
 impl HoodieReplaceCommitMetadata {
     /// Parse replace commit metadata from a serde_json Map
     pub fn from_json_map(map: &Map<String, Value>) -> Result<Self> {

@@ -22,7 +22,9 @@
 //! This module provides methods for interacting with Hudi's metadata table,
 //! which stores file listings and other metadata for efficient table operations.
 
+pub mod column_stats;
 pub mod encode;
+pub mod hash;
 pub mod records;
 
 pub(crate) mod reader;
@@ -48,6 +50,90 @@ use crate::table::file_pruner::FilePruner;
 use crate::table::partition::PartitionPruner;
 
 use records::FilesPartitionRecord;
+
+/// Java `HoodieTableMetadata.SOLO_COMMIT_TIMESTAMP`: MDT bootstrap instants are
+/// `00000000000000` plus a millis offset and are always valid to read.
+const SOLO_COMMIT_TIMESTAMP_PREFIX: &str = "00000000000000";
+
+/// MDT instants readers may trust: completed MDT deltacommits whose requested
+/// time is **completed on the data timeline**, plus bootstrap
+/// (`00000000000000`-prefixed) instants.
+///
+/// Stricter than Java's `getValidInstantTimestamps` ("not pending on the data
+/// timeline"): requiring data-timeline completion also excludes an MDT commit
+/// whose data instant was never even fenced (no `.requested`/`.inflight`),
+/// which the pending-based rule would wrongly trust. The MDT-only instants
+/// Java's looser rule serves are MDT compactions — those are `.commit`
+/// instants on the MDT timeline and never enter this `.deltacommit`-only scan.
+///
+/// Must be called with a DATA table's storage/configs (its storage roots both
+/// timelines).
+pub(crate) async fn valid_metadata_instants(
+    storage: &crate::storage::Storage,
+    hudi_configs: &crate::config::HudiConfigs,
+) -> Result<std::collections::HashSet<String>> {
+    // Data timeline: completed requested-times.
+    let timeline_layout: isize = hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::TimelineLayoutVersion)
+        .into();
+    let data_timeline_dir = if timeline_layout >= 2 {
+        let timeline_path: String = hudi_configs
+            .get_or_default(crate::config::table::HudiTableConfig::TimelinePath)
+            .into();
+        format!("{}/{timeline_path}", crate::metadata::HUDI_METADATA_DIR)
+    } else {
+        crate::metadata::HUDI_METADATA_DIR.to_string()
+    };
+    let mut data_completed = std::collections::HashSet::new();
+    for file in storage.list_files(Some(&data_timeline_dir)).await? {
+        let name = file.name;
+        let Some(first) = name.chars().next() else {
+            continue;
+        };
+        if !first.is_ascii_digit() {
+            continue;
+        }
+        if name.ends_with(".requested") || name.ends_with(".inflight") {
+            continue;
+        }
+        let requested: String = name.chars().take_while(char::is_ascii_digit).collect();
+        data_completed.insert(requested);
+    }
+    // Archived instants were completed before leaving the active timeline;
+    // without them, archival would fence out perfectly valid MDT records.
+    data_completed
+        .extend(crate::write::archival::archived_instant_times(storage, &data_timeline_dir).await?);
+
+    // MDT timeline: completed deltacommits' requested times.
+    let mdt_timeline_dir = format!(
+        "{}/metadata/.hoodie/timeline",
+        crate::metadata::HUDI_METADATA_DIR
+    );
+    let mdt_files = match storage.list_files(Some(&mdt_timeline_dir)).await {
+        Ok(files) => files,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut valid = std::collections::HashSet::new();
+    for file in mdt_files {
+        let name = file.name;
+        if !name.ends_with(".deltacommit") {
+            continue;
+        }
+        let requested: String = name.chars().take_while(char::is_ascii_digit).collect();
+        if requested.is_empty() {
+            continue;
+        }
+        if requested.starts_with(SOLO_COMMIT_TIMESTAMP_PREFIX)
+            || data_completed.contains(&requested)
+        {
+            valid.insert(requested);
+        }
+    }
+    Ok(valid)
+}
 
 impl Table {
     /// Check if this table is a metadata table.
@@ -159,9 +245,11 @@ impl Table {
         &self,
         partition_pruner: &PartitionPruner,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        let valid_instants =
+            valid_metadata_instants(&self.file_system_view.storage, &self.hudi_configs).await?;
         let metadata_table = self.get_or_init_metadata_table().await?;
         metadata_table
-            .fetch_files_partition_records(partition_pruner)
+            .fetch_files_partition_records(partition_pruner, Some(&valid_instants))
             .await
     }
 
@@ -172,28 +260,34 @@ impl Table {
     ///
     /// # Arguments
     /// * `partition_pruner` - Data table's partition pruner to filter partitions.
+    /// * `valid_instants` - Data-timeline-fenced MDT instants; `None` trusts all
+    ///   log blocks (only for callers without data-table access, e.g. tests).
     ///
     /// # Note
     /// Must be called on a METADATA table instance.
     pub async fn fetch_files_partition_records(
         &self,
         partition_pruner: &PartitionPruner,
+        valid_instants: Option<&std::collections::HashSet<String>>,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         // Non-partitioned table: directly fetch "." record
         if !partition_pruner.is_table_partitioned() {
             return self
-                .read_files_partition(&[FilesPartitionRecord::NON_PARTITIONED_NAME])
+                .read_files_partition(
+                    &[FilesPartitionRecord::NON_PARTITIONED_NAME],
+                    valid_instants,
+                )
                 .await;
         }
 
         // Partitioned table without filters: read all records
         if partition_pruner.is_empty() {
-            return self.read_files_partition(&[]).await;
+            return self.read_files_partition(&[], valid_instants).await;
         }
 
         // Partitioned table with filters: prune partitions first, then read only matching records
         let all_partitions_records = self
-            .read_files_partition(&[FilesPartitionRecord::ALL_PARTITIONS_KEY])
+            .read_files_partition(&[FilesPartitionRecord::ALL_PARTITIONS_KEY], valid_instants)
             .await?;
 
         let partition_names: Vec<&str> = all_partitions_records
@@ -210,7 +304,7 @@ impl Table {
             return Ok(HashMap::new());
         }
 
-        self.read_files_partition(&pruned).await
+        self.read_files_partition(&pruned, valid_instants).await
     }
 
     /// Read records from the `files` partition.
@@ -222,6 +316,7 @@ impl Table {
     async fn read_files_partition(
         &self,
         keys: &[&str],
+        valid_instants: Option<&std::collections::HashSet<String>>,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
             return Ok(HashMap::new());
@@ -265,16 +360,12 @@ impl Table {
 
         let file_slice = file_slices.into_iter().next().unwrap();
         let opts = ReadOptions::new().with_end_timestamp(timestamp);
-        let configs = Arc::new(HudiConfigs::new(
-            self.hudi_configs
-                .as_options()
-                .into_iter()
-                .chain(opts.hudi_options.clone()),
-        ));
-        let storage = Storage::new(Arc::new(self.storage_options()), configs.clone())?;
+        let fg_reader = self
+            .create_file_group_reader_with_options(Some(&opts), std::iter::empty::<(&str, &str)>())
+            .await?;
 
-        reader::MetadataTableFileGroupReader::new(configs, storage)
-            .read_files_partition(&file_slice, keys)
+        fg_reader
+            .read_metadata_table_files_partition(&file_slice, keys, valid_instants)
             .await
     }
 }
