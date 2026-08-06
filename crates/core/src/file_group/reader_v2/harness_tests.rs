@@ -1515,8 +1515,7 @@ fg_case_test!(
         }),
         expected: Expected::GoldParquet,
         ..Default::default()
-    },
-    ignore = "corrupt log blocks are not detected; create_corrupted_block_if_needed returns None"
+    }
 );
 
 // (b) Parquet log blocks: base + 2 PARQUET_DATA_BLOCK logs + 1 DELETE block.
@@ -1657,8 +1656,7 @@ fg_case_test!(
             rows: &[&["1", "val_1"], &["2", "val_2"]],
         },
         ..Default::default()
-    },
-    ignore = "corrupt log blocks are not detected; create_corrupted_block_if_needed returns None"
+    }
 );
 
 // DELETE block orderingVal: StringWrapper (Avro string, Java String).
