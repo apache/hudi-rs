@@ -23,11 +23,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use object_store::path::Path as ObjPath;
-use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
+use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use crate::statistics::StatisticsContainer;
 use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
@@ -58,9 +60,22 @@ impl ParquetBaseFileReader {
         obj_path: ObjPath,
         file_size: u64,
     ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>> {
-        let reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
+        let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
             .with_file_size(file_size);
-        Ok(ParquetRecordBatchStreamBuilder::new(reader).await?)
+
+        // A parquet-avro writer with `write-old-list-structure=true` encodes an
+        // `array<map>` as a legacy 2-level list whose element is a REPEATED map
+        // group, which parquet-rs rejects outright when it builds the Arrow
+        // schema — "Map cannot be repeated". The footer parse itself does not,
+        // so the schema is rewritten in between and every reader built from this
+        // metadata accepts the file. The column chunks are untouched.
+        let raw = reader.get_metadata(None).await?;
+        let normalized = normalize_parquet_metadata(raw);
+        let arrow_metadata = ArrowReaderMetadata::try_new(normalized, ArrowReaderOptions::new())?;
+        Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
+            reader,
+            arrow_metadata,
+        ))
     }
 
     async fn open_builder(
@@ -210,6 +225,36 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         Storage::new_with_base_url(base_url).unwrap()
+    }
+
+    /// A base file written by parquet-avro with `write-old-list-structure=true`
+    /// must read. Its `array<map>` column is encoded as a legacy 2-level list
+    /// whose element is a REPEATED map group, which the parquet→arrow builder
+    /// rejects with "Map cannot be repeated" unless the schema is normalized
+    /// first. Without that step this read fails outright rather than returning
+    /// wrong data, so the assertion is that it returns rows at all.
+    #[tokio::test]
+    async fn test_read_data_accepts_a_legacy_two_level_list() {
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let batch = reader
+            .read_data(
+                "i3/legacy_2level_repeated_map.parquet",
+                BaseFileReadOptions::default(),
+            )
+            .await
+            .expect("a legacy 2-level list encoding must be readable");
+
+        assert!(batch.num_rows() > 0);
+        let field = batch
+            .schema()
+            .field_with_name("obj_ids")
+            .expect("the array<map> column")
+            .clone();
+        assert!(
+            matches!(field.data_type(), arrow_schema::DataType::List(_)),
+            "obj_ids should surface as a List, got {:?}",
+            field.data_type()
+        );
     }
 
     #[tokio::test]
