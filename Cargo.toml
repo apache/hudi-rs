@@ -52,6 +52,7 @@ object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
 parquet = { version = "57", features = ["async", "object_store"] }
 
 # avro
+arrow-avro = { version = "57" }
 apache-avro = { version = "0.21", features = ["derive"] }
 apache-avro-derive = { version = "0.21" }
 

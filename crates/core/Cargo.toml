@@ -47,6 +47,7 @@ object_store = { workspace = true }
 parquet = { workspace = true }
 
 # avro
+arrow-avro = { workspace = true }
 apache-avro = { workspace = true }
 apache-avro-derive = { workspace = true }
 

@@ -340,8 +340,7 @@ fg_case_test!(
         ],
         expected: Expected::GoldParquet,
         ..Default::default()
-    },
-    ignore = "a decimal column in a log block reads as NULL where the Spark snapshot has a value; surfaced once the Avro map conversion stopped failing these cases earlier"
+    }
 );
 
 // All data types incl. logical types: base + 3 logs (update + delete + update);
@@ -360,8 +359,7 @@ fg_case_test!(
         ],
         expected: Expected::GoldParquet,
         ..Default::default()
-    },
-    ignore = "a decimal column in a log block reads as NULL where the Spark snapshot has a value; surfaced once the Avro map conversion stopped failing these cases earlier"
+    }
 );
 
 // =============================================================================
