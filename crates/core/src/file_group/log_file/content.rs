@@ -20,7 +20,7 @@ use crate::Result;
 use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::log_file::avro::AvroDataBlockContentReader;
+use crate::file_group::log_file::avro::AvroBlockDecoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
 };
@@ -30,7 +30,7 @@ use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{
     avro_schema_for_delete_record, avro_schema_for_delete_record_list, unwrap_ordering_value,
 };
-use apache_avro::{Schema as AvroSchema, from_avro_datum};
+use apache_avro::from_avro_datum;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use std::collections::HashMap;
@@ -112,23 +112,35 @@ impl Decoder {
     ) -> Result<RecordBatches> {
         Decoder::validate_log_block_version(&mut reader)?;
 
-        let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+        let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
             CoreError::LogBlockError("Schema not found in block header".to_string())
         })?;
-        let writer_schema = Arc::new(AvroSchema::parse_str(writer_schema)?);
 
         let mut record_count_buf = [0u8; 4];
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let record_content_reader =
-            AvroDataBlockContentReader::new(reader, writer_schema.as_ref(), record_count);
-        let mut avro_arrow_array_reader =
-            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref())?;
+        let mut decoder = AvroBlockDecoder::try_new(writer_schema_json, self.batch_size)?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
-        while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
-            let batch = batch.map_err(CoreError::ArrowError)?;
+
+        // Each datum is framed by Hudi with a four-byte length, so the bodies
+        // are read here and handed over one at a time.
+        let mut body = Vec::new();
+        for _ in 0..record_count {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf)?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            body.clear();
+            body.resize(len, 0);
+            reader.read_exact(&mut body)?;
+            if let Some(batch) = decoder.decode(&body)? {
+                batches.push_data_batch(batch);
+            }
+        }
+        if let Some(batch) = decoder.flush()?
+            && batch.num_rows() > 0
+        {
             batches.push_data_batch(batch);
         }
         Ok(batches)
@@ -299,7 +311,7 @@ mod tests {
                 {"name": "name", "type": ["null", "string"]}
             ]
         }"#;
-        let writer_schema = AvroSchema::parse_str(schema_str)?;
+        let writer_schema = apache_avro::Schema::parse_str(schema_str)?;
 
         // Create in-memory buffer and write the data
         let mut buf = Vec::new();
