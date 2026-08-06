@@ -30,9 +30,13 @@ use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{
     avro_schema_for_delete_record, avro_schema_for_delete_record_list, unwrap_ordering_value,
 };
+use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use apache_avro::from_avro_datum;
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use parquet::file::metadata::ParquetMetaDataReader;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -150,7 +154,18 @@ impl Decoder {
         let mut content_bytes = Vec::new();
         reader.read_to_end(&mut content_bytes)?;
         let content_bytes = Bytes::from(content_bytes);
-        let parquet_reader = ParquetRecordBatchReader::try_new(content_bytes, self.batch_size)?;
+
+        // Same legacy `array<map>` encoding the base file path has to handle:
+        // parse the footer, rewrite the 2-level list, then build the reader from
+        // that metadata. The Arrow build is what rejects the original, so the
+        // rewrite has to land between the two.
+        let raw = Arc::new(ParquetMetaDataReader::new().parse_and_finish(&content_bytes)?);
+        let normalized = normalize_parquet_metadata(raw);
+        let arrow_metadata = ArrowReaderMetadata::try_new(normalized, ArrowReaderOptions::new())?;
+        let parquet_reader =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(content_bytes, arrow_metadata)
+                .with_batch_size(self.batch_size)
+                .build()?;
         let mut batches = RecordBatches::new();
         for item in parquet_reader {
             let batch = item.map_err(CoreError::ArrowError)?;
@@ -381,6 +396,26 @@ mod tests {
         assert_eq!(name_array.value(0), "Alice");
         assert!(name_array.is_null(1), "Second name value should be null");
 
+        Ok(())
+    }
+
+    /// A parquet log block written by the Hudi Avro write path carries its
+    /// `array<map>` column as a legacy 2-level list, which the parquet→arrow
+    /// builder rejects with "Map cannot be repeated" unless the schema is
+    /// normalized first. The block is unreadable without it, so returning rows
+    /// at all is the assertion.
+    #[test]
+    fn test_decode_parquet_content_accepts_a_legacy_two_level_list() -> Result<()> {
+        const LEGACY_2LEVEL: &[u8] =
+            include_bytes!("../../../tests/data/i3/legacy_2level_repeated_map.parquet");
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let batches = decoder.decode_parquet_record_content(LEGACY_2LEVEL)?;
+
+        assert!(
+            batches.num_data_rows() > 0,
+            "a legacy 2-level list block must decode"
+        );
         Ok(())
     }
 
