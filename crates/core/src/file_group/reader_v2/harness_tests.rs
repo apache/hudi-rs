@@ -1519,6 +1519,56 @@ fg_case_test!(
 // (b) Parquet log blocks: base + 2 PARQUET_DATA_BLOCK logs + 1 DELETE block.
 // Exercises the parquet-format log decode path plus delete handling; gold has
 // 3 rows. Gold comparison sorts by "key" (harness default).
+/// A primary-key predicate is pushed into the parquet log blocks themselves.
+///
+/// The fixture holds three keys; filtering to one has to return exactly that
+/// row. This is the whole chain — the merge-on-read reader decides the predicate
+/// is safe, hands it to the log file reader, which hands it to the block decoder
+/// — so it fails if any link drops it, which is how the base-file pushdown was
+/// lost before.
+fn case_parquet_log_block_pk_filter() -> FgReaderCase {
+    let mut case = FgReaderCase {
+        name: "parquet_log_block_pk_filter",
+        fixture: QuickstartTripsTable::MorLayoutParquetLogBlock,
+        partition: "",
+        base_file: "9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_0-79-130_20260607061232259.parquet",
+        log_files: &[
+            ".9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_20260607061234788.log.1_0-93-156",
+            ".9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_20260607061236403.log.1_0-107-185",
+            ".9c161c05-86e5-46cc-85ab-14ce5326cfb0-0_20260607061238120.log.1_0-121-217",
+        ],
+        expect_output_columns: Some(&["key", "ts", "value", "num"]),
+        ..Default::default()
+    };
+    case.row_filter = Some(RowFilterSpec {
+        column: "_hoodie_record_key",
+        predicate: FilterPredicate::Eq("k2"),
+        mor_pk_safe: true,
+    });
+    case.expected = Expected::Custom {
+        rows: 1,
+        validate: |batch| {
+            let keys = batch
+                .column_by_name("key")
+                .ok_or_else(|| "no `key` column".to_string())?;
+            let keys = keys
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| "`key` should be a string column".to_string())?;
+            if keys.value(0) != "k2" {
+                return Err(format!("expected only k2, got {}", keys.value(0)));
+            }
+            Ok(())
+        },
+    };
+    case
+}
+
+fg_case_test!(
+    harness_parquet_log_block_pk_filter,
+    case_parquet_log_block_pk_filter()
+);
+
 fg_case_test!(
     harness_parquet_log_blocks_merge,
     FgReaderCase {

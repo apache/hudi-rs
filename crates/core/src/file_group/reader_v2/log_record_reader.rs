@@ -512,8 +512,21 @@ impl BaseHoodieLogRecordReader {
                 // existing read path already uses. The range is left unbounded so
                 // the gates below decide what is admitted, rather than filtering
                 // twice with different rules.
+                // A log record can update a row, so a predicate may only be
+                // evaluated before the merge when the merge cannot change its
+                // answer. Log blocks exist only on merge-on-read, so the gate
+                // reduces to a predicate over primary keys, which are immutable
+                // across upserts. Anything else is left for the post-merge
+                // filter.
+                let row_filter = if self.reader_context.can_push_row_filter() {
+                    self.reader_context.row_filter_builder.clone()
+                } else {
+                    None
+                };
                 let mut reader =
-                    LogFileReader::new(hudi_configs.clone(), self.storage.clone(), path).await?;
+                    LogFileReader::new(hudi_configs.clone(), self.storage.clone(), path)
+                        .await?
+                        .with_row_filter(row_filter);
                 let blocks = reader.read_all_blocks(&unbounded_range)?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
