@@ -428,6 +428,52 @@ mod tests {
         Ok(())
     }
 
+    /// A partial-update block carries only the columns that were written, and
+    /// must stay that way.
+    ///
+    /// The merge distinguishes "this column was not in the update" from "this
+    /// column was set to null", and the block's own schema is the only place
+    /// that signal exists. Decoding is against that schema and never against a
+    /// wider table schema, so the narrowness survives.
+    ///
+    /// If a reader schema is ever supplied here — for Avro resolution or
+    /// extended promotion — a block carrying `IsPartial` has to keep decoding
+    /// against its own schema, or the absent columns get fabricated and the
+    /// signal is gone.
+    #[test]
+    fn test_decode_avro_partial_update_block_keeps_narrow_schema() -> Result<()> {
+        // The table has id + name; this block carries only id.
+        let partial_schema_str =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"long"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(partial_schema_str)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("id", 7i64);
+        let record_bytes = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(record_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&record_bytes);
+
+        let header = HashMap::from([
+            (BlockMetadataKey::Schema, partial_schema_str.to_string()),
+            (BlockMetadataKey::IsPartial, "true".to_string()),
+        ]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        assert_eq!(batches.num_data_rows(), 1);
+        let batch = &batches.data_batches[0];
+        assert_eq!(
+            batch.num_columns(),
+            1,
+            "a partial block must not be widened to the table schema"
+        );
+        assert_eq!(batch.schema().field(0).name(), "id");
+        Ok(())
+    }
+
     /// A parquet log block written by the Hudi Avro write path carries its
     /// `array<map>` column as a legacy 2-level list, which the parquet→arrow
     /// builder rejects with "Map cannot be repeated" unless the schema is
