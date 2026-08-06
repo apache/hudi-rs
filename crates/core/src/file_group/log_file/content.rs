@@ -31,6 +31,7 @@ use crate::schema::delete::{
     avro_schema_for_delete_record, avro_schema_for_delete_record_list, unwrap_ordering_value,
 };
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
+use crate::storage::RowFilterBuilder;
 use apache_avro::from_avro_datum;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
@@ -45,13 +46,30 @@ use std::sync::Arc;
 pub struct Decoder {
     batch_size: usize,
     hudi_configs: Arc<HudiConfigs>,
+    /// Predicate to push into a parquet log block, when the caller has decided
+    /// it is safe to evaluate before the merge. See
+    /// [`Decoder::with_row_filter`].
+    row_filter: Option<RowFilterBuilder>,
 }
 
 impl Decoder {
+    /// Push a predicate into parquet log blocks.
+    ///
+    /// The caller decides whether this is sound: a log record can update a row,
+    /// so filtering before the merge is only safe when the merge cannot change
+    /// the predicate's outcome. Log blocks exist only on merge-on-read, so in
+    /// practice that means a predicate over primary keys, which are immutable
+    /// across upserts.
+    pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
+        self.row_filter = row_filter;
+        self
+    }
+
     pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             batch_size: 1024,
             hudi_configs,
+            row_filter: None,
         }
     }
     pub fn decode_content(
@@ -162,10 +180,21 @@ impl Decoder {
         let raw = Arc::new(ParquetMetaDataReader::new().parse_and_finish(&content_bytes)?);
         let normalized = normalize_parquet_metadata(raw);
         let arrow_metadata = ArrowReaderMetadata::try_new(normalized, ArrowReaderOptions::new())?;
-        let parquet_reader =
+        let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(content_bytes, arrow_metadata)
-                .with_batch_size(self.batch_size)
-                .build()?;
+                .with_batch_size(self.batch_size);
+
+        // Resolved here rather than by the caller because the predicate has to
+        // be matched against this block's own schema, which does not exist until
+        // its footer is read. A builder that declines reads every row.
+        let row_filter = self
+            .row_filter
+            .as_ref()
+            .and_then(|build| build(builder.parquet_schema(), builder.schema().as_ref()));
+        if let Some(row_filter) = row_filter {
+            builder = builder.with_row_filter(row_filter);
+        }
+        let parquet_reader = builder.build()?;
         let mut batches = RecordBatches::new();
         for item in parquet_reader {
             let batch = item.map_err(CoreError::ArrowError)?;

@@ -26,8 +26,8 @@ use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock, LogBlockContent,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
-use crate::storage::Storage;
 use crate::storage::reader::StorageReader;
+use crate::storage::{RowFilterBuilder, Storage};
 use crate::timeline::selector::InstantRange;
 use std::collections::HashMap;
 use std::io::SeekFrom;
@@ -61,11 +61,25 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-#[derive(Debug)]
 pub struct LogFileReader<R: Read + Seek> {
     hudi_configs: Arc<HudiConfigs>,
     reader: R,
     timezone: String,
+    /// Predicate to push into parquet log blocks. Unset by default, so a caller
+    /// that has not decided whether pushing is sound reads every row.
+    row_filter: Option<RowFilterBuilder>,
+}
+
+// `row_filter` holds a closure, which has no `Debug`. Report whether one is set
+// rather than dropping the derive from the whole struct.
+impl<R: Read + Seek> std::fmt::Debug for LogFileReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogFileReader")
+            .field("hudi_configs", &self.hudi_configs)
+            .field("timezone", &self.timezone)
+            .field("row_filter", &self.row_filter.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LogFileReader<StorageReader> {
@@ -82,6 +96,7 @@ impl LogFileReader<StorageReader> {
             hudi_configs,
             reader,
             timezone,
+            row_filter: None,
         })
     }
 
@@ -124,6 +139,15 @@ impl<R: Read + Seek> LogFileReader<R> {
         let mut size_buf = [0u8; 8];
         self.reader.read_exact(&mut size_buf)?;
         Ok(u64::from_be_bytes(size_buf))
+    }
+
+    /// Push a predicate into this file's parquet log blocks.
+    ///
+    /// Left unset, no predicate is pushed and every row is read. Whether pushing
+    /// is sound is the caller's decision — see [`Decoder::with_row_filter`].
+    pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
+        self.row_filter = row_filter;
+        self
     }
 
     /// Window used when scanning for the next MAGIC after a corrupt block.
@@ -418,7 +442,8 @@ impl<R: Read + Seek> LogFileReader<R> {
             )));
         }
 
-        let decoder = Decoder::new(self.hudi_configs.clone());
+        let decoder =
+            Decoder::new(self.hudi_configs.clone()).with_row_filter(self.row_filter.clone());
         let content = decoder.decode_content(
             self.reader.by_ref(),
             &format_version,
