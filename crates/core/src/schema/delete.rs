@@ -166,6 +166,11 @@ static DELETE_RECORD_LIST_AVRO_SCHEMA: Lazy<Result<AvroSchema>> = Lazy::new(|| {
     AvroSchema::parse_str(DELETE_RECORD_LIST_AVRO_SCHEMA_STR).map_err(CoreError::AvroError)
 });
 
+/// The delete-record list schema as Avro JSON, for decoders that take one.
+pub fn delete_record_list_schema_json() -> &'static str {
+    DELETE_RECORD_LIST_AVRO_SCHEMA_STR
+}
+
 pub fn avro_schema_for_delete_record_list() -> Result<&'static AvroSchema> {
     DELETE_RECORD_LIST_AVRO_SCHEMA
         .as_ref()
