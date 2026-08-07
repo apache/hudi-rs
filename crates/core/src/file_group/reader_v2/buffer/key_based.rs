@@ -5333,7 +5333,11 @@ mod tests {
             assert_eq!(c.num_rows(), 2, "non-final chunks are full (2 rows)");
         }
         let last = chunks.last().unwrap().num_rows();
-        let expected_last = if total % 2 == 0 { 2 } else { total % 2 };
+        let expected_last = if total.is_multiple_of(2) {
+            2
+        } else {
+            total % 2
+        };
         assert_eq!(last, expected_last, "final chunk is the partial remainder");
 
         let chunk_refs: Vec<&RecordBatch> = chunks.iter().collect();
