@@ -179,6 +179,18 @@ impl Storage {
             .map_err(StorageError::ReaderError)
     }
 
+    /// A reader that fetches bounded windows instead of the whole file.
+    ///
+    /// Only the object metadata is fetched here; no file bytes are read until
+    /// the caller reads.
+    pub async fn get_streaming_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        Ok(StorageReader::new_streaming(obj_store, obj_meta))
+    }
+
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
         let dir_paths = self.list_dirs_as_obj_paths(subdir).await?;
         let mut dirs = Vec::new();

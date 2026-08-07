@@ -19,9 +19,11 @@
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
+use crate::storage::reader::LogBlockFetcher;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -275,6 +277,18 @@ impl LogBlockContent {
     }
 }
 
+/// Where a block's content sits, for reading it later.
+///
+/// A scan that only needs headers records this instead of decoding, so a block
+/// the gates then discard costs nothing beyond its header.
+#[derive(Debug, Clone)]
+pub struct LogBlockContentLocation {
+    /// Byte offset where the content starts.
+    pub content_position: u64,
+    /// Length of the content in bytes.
+    pub content_length: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogBlock {
     pub format_version: LogFormatVersion,
@@ -282,10 +296,48 @@ pub struct LogBlock {
     pub header: HashMap<BlockMetadataKey, String>,
     pub content: LogBlockContent,
     pub footer: HashMap<BlockMetadataKey, String>,
+    /// Set when the block was read headers-only; `content` is then `Empty`
+    /// until [`LogBlock::inflate`] runs.
+    pub content_location: Option<LogBlockContentLocation>,
+    /// Reads this block's own content range, holding no file bytes.
+    pub content_fetcher: Option<LogBlockFetcher>,
     pub skipped: bool,
 }
 
 impl LogBlock {
+    /// Read and decode this block's content, if it was left behind by a
+    /// headers-only scan.
+    ///
+    /// Reads only this block's own range, so a scan can walk a file without
+    /// holding it and each admitted block costs its own content and no more.
+    /// A block that already has content is left alone.
+    pub fn inflate(&mut self, decoder: &Decoder) -> Result<()> {
+        if !self.content.is_empty() {
+            return Ok(());
+        }
+        let (Some(location), Some(fetcher)) = (
+            self.content_location.as_ref(),
+            self.content_fetcher.as_ref(),
+        ) else {
+            return Err(CoreError::LogBlockError(
+                "Cannot inflate a block that was not read headers-only".to_string(),
+            ));
+        };
+
+        let bytes = fetcher
+            .read_content(location.content_position, location.content_length)
+            .map_err(CoreError::ReadLogFileError)?;
+        let mut reader = std::io::Cursor::new(bytes);
+        self.content = decoder.decode_content(
+            &mut reader,
+            &self.format_version,
+            location.content_length,
+            &self.block_type,
+            &self.header,
+        )?;
+        Ok(())
+    }
+
     /// Create a new log block with the given content.
     pub fn new(
         format_version: LogFormatVersion,
@@ -300,6 +352,8 @@ impl LogBlock {
             header,
             content,
             footer,
+            content_location: None,
+            content_fetcher: None,
             skipped: false,
         }
     }
@@ -318,6 +372,8 @@ impl LogBlock {
             header,
             content: LogBlockContent::Empty,
             footer: HashMap::new(),
+            content_location: None,
+            content_fetcher: None,
             skipped: true,
         }
     }
