@@ -27,7 +27,9 @@ use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::delete_record_list_schema_json;
+use crate::schema::extended_promotion::record_needs_rewrite_for_extended_promotion;
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
+use crate::schema::resolver::avro_json_to_arrow_schema;
 use crate::storage::RowFilterBuilder;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -218,11 +220,32 @@ impl Decoder {
         } else {
             self.required_schema_json.as_deref()
         };
+        // Avro resolves what it defines as a promotion; Hudi permits more than
+        // that — a number, or anything with a logical type, to string — and Avro
+        // refuses to build a reader for those at all. Such a block is decoded at
+        // the schema it was written with and converted afterwards, which is what
+        // the Java reader does when `recordNeedsRewriteForExtendedAvroTypePromotion`
+        // says so.
+        let (reader_schema_json, rewrite_to) = match reader_schema_json {
+            Some(required_json) => {
+                let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
+                let required = apache_avro::Schema::parse_str(required_json)?;
+                if record_needs_rewrite_for_extended_promotion(&writer, &required)? {
+                    let target = avro_json_to_arrow_schema(required_json)?;
+                    (None, Some(Arc::new(target)))
+                } else {
+                    (Some(required_json), None)
+                }
+            }
+            None => (None, None),
+        };
+
         let mut decoder = AvroBlockDecoder::try_new_with_reader(
             writer_schema_json,
             reader_schema_json,
             self.batch_size,
-        )?;
+        )?
+        .with_rewrite_to(rewrite_to);
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
 
@@ -497,6 +520,82 @@ mod tests {
     /// extended promotion — a block carrying `IsPartial` has to keep decoding
     /// against its own schema, or the absent columns get fabricated and the
     /// signal is gone.
+    /// A block written before a column was promoted to string still reads.
+    ///
+    /// Avro refuses to build a reader for `int -> string`, so this is the case
+    /// that used to fail outright with "Illegal promotion Int to String". The
+    /// block decodes at its own schema and is converted afterwards.
+    #[test]
+    fn test_extended_promotion_int_to_string_rewrites() -> Result<()> {
+        let writer_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"num","type":"int"}]}"#;
+        let required_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"num","type":"string"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("num", 42i32);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_required_schema(Some(required_json.to_string()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let batch = &batches.data_batches[0];
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("promoted to string");
+        assert_eq!(col.value(0), "42");
+        Ok(())
+    }
+
+    /// A float promoted to string has to read the way Java renders it. A plain
+    /// cast of `1.1f32` gives `1.100000023841858`, which is not what the table
+    /// says.
+    #[test]
+    fn test_extended_promotion_float_to_string_matches_java() -> Result<()> {
+        let writer_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"f","type":"float"}]}"#;
+        let required_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"f","type":"string"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("f", 1.1f32);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_required_schema(Some(required_json.to_string()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let col = batches.data_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("promoted to string");
+        assert_eq!(
+            col.value(0),
+            "1.1",
+            "a plain f32 cast would give 1.100000023841858"
+        );
+        Ok(())
+    }
+
     /// The ordering value arrives wrapped in a union of per-type records; the
     /// merge wants the value. One populated branch, unwrapped to its `value`.
     #[test]
