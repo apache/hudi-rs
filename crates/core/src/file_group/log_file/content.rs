@@ -215,6 +215,9 @@ impl Decoder {
         // the merge needs to know which those are. Resolving it up to the table
         // schema would fabricate the rest, so it decodes against its own schema.
         let is_partial = header.contains_key(&BlockMetadataKey::IsPartial);
+        if is_partial {
+            log::debug!("partial-update block: decoding at its own schema, not the table's");
+        }
         let reader_schema_json = if is_partial {
             None
         } else {
@@ -231,6 +234,13 @@ impl Decoder {
                 let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
                 let required = apache_avro::Schema::parse_str(required_json)?;
                 if record_needs_rewrite_for_extended_promotion(&writer, &required)? {
+                    // Worth saying out loud: the table evolved in a way Avro
+                    // cannot express, so the block is read at its own schema and
+                    // converted, rather than resolved as it is read.
+                    log::warn!(
+                        "log block rewritten rather than resolved: its schema differs from the \
+                         table's in a way Avro does not define a promotion for"
+                    );
                     let target = avro_json_to_arrow_schema(required_json)?;
                     (None, Some(Arc::new(target)))
                 } else {
