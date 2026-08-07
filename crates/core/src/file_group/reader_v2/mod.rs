@@ -45,6 +45,7 @@ pub(crate) mod buffered_record;
 pub(crate) mod buffered_record_converter;
 pub(crate) mod delete_context;
 pub(crate) mod engine;
+pub(crate) mod gaps;
 #[cfg(test)]
 mod gold_tests;
 #[cfg(test)]
