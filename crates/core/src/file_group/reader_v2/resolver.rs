@@ -28,10 +28,8 @@ use crate::error::CoreError;
 use crate::file_group::reader_v2::reader_context::{MergeMode, ReaderContext};
 use crate::file_group::reader_v2::record_context::RecordContext;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
-use crate::merge::RecordMergeStrategyValue;
 use crate::timeline::selector::InstantRange;
 use std::collections::HashMap;
-use std::str::FromStr;
 
 /// Resolve the MOR reader context from `hudi_configs`, which the caller has
 /// already merged read options into.
@@ -156,24 +154,123 @@ fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
     ))
 }
 
-/// Map the table's record merge strategy onto a MOR [`MergeMode`].
+/// Keys Hudi writes the merge inputs under. None is modelled as a
+/// [`HudiTableConfig`] — this crate does not otherwise read them.
+const RECORD_MERGE_STRATEGY_ID: &str = "hoodie.record.merge.strategy.id";
+const PAYLOAD_CLASS_KEYS: [&str; 3] = [
+    "hoodie.compaction.payload.class",
+    "hoodie.datasource.write.payload.class",
+    "hoodie.table.legacy.payload.class",
+];
+
+/// The strategy ids Hudi assigns to its built-in mergers.
+const EVENT_TIME_STRATEGY_ID: &str = "eeb8d96f-b1e4-49fd-bbf8-28ac514178e5";
+const COMMIT_TIME_STRATEGY_ID: &str = "ce9acb64-bde0-424c-9b91-f6ebba25356d";
+
+/// Payload classes that imply one of the built-in orderings.
+const EVENT_TIME_PAYLOADS: [&str; 2] = [
+    "org.apache.hudi.common.model.DefaultHoodieRecordPayload",
+    "org.apache.hudi.common.model.EventTimeAvroPayload",
+];
+const COMMIT_TIME_PAYLOAD: &str = "org.apache.hudi.common.model.OverwriteWithLatestAvroPayload";
+
+/// What a merge mode can be inferred to, including the case this reader cannot
+/// serve.
+#[derive(Debug, PartialEq, Eq)]
+enum InferredMode {
+    CommitTime,
+    EventTime,
+    /// A merger of the table's own. Not something this reader can reproduce.
+    Custom,
+}
+
+/// The mode implied by a payload class, if it implies one.
+fn mode_from_payload_class(payload_class: &str) -> Option<InferredMode> {
+    if payload_class.is_empty() {
+        return None;
+    }
+    if EVENT_TIME_PAYLOADS.contains(&payload_class) {
+        Some(InferredMode::EventTime)
+    } else if payload_class == COMMIT_TIME_PAYLOAD {
+        Some(InferredMode::CommitTime)
+    } else {
+        Some(InferredMode::Custom)
+    }
+}
+
+/// The mode implied by a merge strategy id, if it implies one.
+fn mode_from_strategy_id(strategy_id: &str) -> Option<InferredMode> {
+    if strategy_id.is_empty() {
+        return None;
+    }
+    match strategy_id {
+        EVENT_TIME_STRATEGY_ID => Some(InferredMode::EventTime),
+        COMMIT_TIME_STRATEGY_ID => Some(InferredMode::CommitTime),
+        _ => Some(InferredMode::Custom),
+    }
+}
+
+/// Work out how a table that predates `hoodie.record.merge.mode` merges.
 ///
-/// | `hoodie.table.record.merge.strategy` | [`MergeMode`]           |
-/// |-------------------------------------|-------------------------|
-/// | `overwrite_with_latest`             | `EventTimeOrdering`     |
-/// | `append_only`                       | unsupported — see below |
+/// Mirrors Java's `HoodieTableConfig.inferMergingConfigsForPreV9Table`, which is
+/// what the engine integrations call for the same tables:
 ///
-/// `append_only` has no MOR counterpart: the reader always merges by record
-/// key, so there is no mode that reproduces "keep every version". The table
-/// config derives `append_only` whenever meta fields are disabled or no
-/// ordering field is set, which makes it reachable for ordinary tables — so
-/// this returns an error rather than picking a mode that would change which
-/// rows a query returns.
-#[allow(dead_code)]
+/// - nothing set at all → the ordering field decides. A table with one orders by
+///   event time; a table without one orders by commit time.
+/// - a payload class or a strategy id → the mode each implies, and anything not
+///   built in is a merger of the table's own.
+/// - from table version 8 the strategy id is authoritative; before that the
+///   payload class is.
+fn infer_merge_mode(hudi_configs: &HudiConfigs) -> Result<InferredMode> {
+    let options = hudi_configs.as_options();
+    let payload_class = PAYLOAD_CLASS_KEYS
+        .iter()
+        .find_map(|key| options.get(*key))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let strategy_id = options
+        .get(RECORD_MERGE_STRATEGY_ID)
+        .map(String::as_str)
+        .unwrap_or_default();
+
+    if payload_class.is_empty() && strategy_id.is_empty() {
+        let has_ordering_field = hudi_configs
+            .try_get(HudiTableConfig::OrderingFields)?
+            .map(|v| -> Vec<String> { v.into() })
+            .is_some_and(|fields| fields.iter().any(|f| !f.trim().is_empty()));
+        return Ok(if has_ordering_field {
+            InferredMode::EventTime
+        } else {
+            InferredMode::CommitTime
+        });
+    }
+
+    let from_payload = mode_from_payload_class(payload_class);
+    let from_strategy = mode_from_strategy_id(strategy_id);
+    let table_version: isize = hudi_configs
+        .try_get(HudiTableConfig::TableVersion)?
+        .map(|v| v.into())
+        .unwrap_or(6);
+
+    let inferred = if table_version >= 8 {
+        from_strategy.or(from_payload)
+    } else {
+        from_payload.or(from_strategy)
+    };
+    inferred.ok_or_else(|| {
+        CoreError::Unsupported(format!(
+            "Cannot infer a merge mode from payload class '{payload_class}' \
+             or merge strategy '{strategy_id}'."
+        ))
+    })
+}
+
+/// How this table merges records.
+///
+/// A table from version 9 on states it outright. Older ones are inferred the way
+/// Java infers them, from the payload class, the merge strategy id, and finally
+/// whether an ordering field is set.
 fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
-    // A v9 table states its merge semantics directly. Prefer that over
-    // inferring them: the inference below predates the key and gets a
-    // commit-time-ordered table with no ordering field wrong.
     if let Some(mode) = hudi_configs.as_options().get(RECORD_MERGE_MODE) {
         return match mode.to_ascii_uppercase().as_str() {
             "COMMIT_TIME_ORDERING" => Ok(MergeMode::CommitTimeOrdering),
@@ -184,18 +281,20 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         };
     }
 
-    let strategy: String = hudi_configs
-        .get_or_default(HudiTableConfig::RecordMergeStrategy)
-        .into();
-
-    match RecordMergeStrategyValue::from_str(&strategy)? {
-        RecordMergeStrategyValue::OverwriteWithLatest => Ok(MergeMode::EventTimeOrdering),
-        RecordMergeStrategyValue::AppendOnly => Err(CoreError::Unsupported(format!(
-            "Record merge strategy '{}' has no merge-on-read equivalent. \
-             The merge-on-read reader merges by record key, which does not \
-             preserve every record version.",
-            RecordMergeStrategyValue::AppendOnly.as_ref(),
-        ))),
+    match infer_merge_mode(hudi_configs)? {
+        InferredMode::CommitTime => Ok(MergeMode::CommitTimeOrdering),
+        InferredMode::EventTime => Ok(MergeMode::EventTimeOrdering),
+        // A table with its own merger cannot be reproduced by merging on key and
+        // ordering value alone. Engines that know better — gluten remaps a
+        // Debezium payload to event-time ordering, having injected the delete
+        // marker its merge needs — say so by setting the merge mode outright,
+        // which is handled above. Inferring the same thing here would read such
+        // a table without those configs and drop its deletes silently.
+        InferredMode::Custom => Err(CoreError::Unsupported(
+            "This table merges with a merger of its own, which the merge-on-read \
+             reader cannot reproduce."
+                .to_string(),
+        )),
     }
 }
 
@@ -454,23 +553,27 @@ mod tests {
         assert_eq!(ctx.merge_mode, MergeMode::EventTimeOrdering.as_ref());
     }
 
-    /// `append_only` has no counterpart in the MOR merge modes — the reader
-    /// always merges by record key. Mapping it to a merge mode silently drops
-    /// rows, so the resolver refuses rather than guessing.
+    /// With nothing else set, the ordering field decides — and its absence
+    /// means commit-time ordering, not "cannot merge".
+    ///
+    /// This is the case that refused every v6 table: the strategy this crate
+    /// used to derive has no counterpart in Hudi's merge modes, and the reader
+    /// rejected it. Java infers commit-time ordering here, which is a table this
+    /// reader can serve.
     #[test]
-    fn rejects_append_only_derived_from_missing_ordering_fields() {
+    fn infers_commit_time_ordering_without_an_ordering_field() {
         let configs = configs_without(HudiTableConfig::OrderingFields.as_ref());
 
-        let err = resolve_reader_context(&configs, true).unwrap_err();
+        let ctx = resolve_reader_context(&configs, true).unwrap();
 
-        assert!(
-            err.to_string().contains("append_only"),
-            "error should name the unmapped strategy, got: {err}"
-        );
+        assert_eq!(ctx.merge_mode, MergeMode::CommitTimeOrdering.as_ref());
     }
 
+    /// Whether meta fields are populated says nothing about how records merge.
+    /// A virtual-key table with an ordering field is ordered by event time like
+    /// any other.
     #[test]
-    fn rejects_append_only_derived_from_disabled_meta_fields() {
+    fn infers_event_time_ordering_for_a_virtual_key_table() {
         let mut options = minimal_configs();
         options.push((
             HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
@@ -478,11 +581,156 @@ mod tests {
         ));
         let configs = HudiConfigs::new(options);
 
+        let ctx = resolve_reader_context(&configs, true).unwrap();
+
+        assert_eq!(ctx.merge_mode, MergeMode::EventTimeOrdering.as_ref());
+    }
+
+    /// The inputs Hudi actually writes, and what each implies. Mirrors the cases
+    /// Java's own inference is tested against.
+    #[test]
+    fn infers_the_mode_java_infers() {
+        // (payload class, strategy id, ordering field, table version, expected)
+        let cases: Vec<(&str, &str, Option<&str>, &str, InferredMode)> = vec![
+            // nothing set — the ordering field decides
+            ("", "", None, "6", InferredMode::CommitTime),
+            ("", "", Some("ts"), "6", InferredMode::EventTime),
+            // built-in payload classes
+            (
+                "org.apache.hudi.common.model.DefaultHoodieRecordPayload",
+                "",
+                None,
+                "6",
+                InferredMode::EventTime,
+            ),
+            (
+                "org.apache.hudi.common.model.EventTimeAvroPayload",
+                "",
+                None,
+                "6",
+                InferredMode::EventTime,
+            ),
+            (
+                "org.apache.hudi.common.model.OverwriteWithLatestAvroPayload",
+                "",
+                None,
+                "6",
+                InferredMode::CommitTime,
+            ),
+            // a payload class of the table's own
+            ("com.example.MyPayload", "", None, "6", InferredMode::Custom),
+            // built-in strategy ids
+            (
+                "",
+                EVENT_TIME_STRATEGY_ID,
+                None,
+                "8",
+                InferredMode::EventTime,
+            ),
+            (
+                "",
+                COMMIT_TIME_STRATEGY_ID,
+                None,
+                "8",
+                InferredMode::CommitTime,
+            ),
+            // the payload-based sentinel is a merger of the table's own
+            (
+                "",
+                "00000000-0000-0000-0000-000000000000",
+                None,
+                "8",
+                InferredMode::Custom,
+            ),
+            // from version 8 the strategy id wins over the payload class
+            (
+                "org.apache.hudi.common.model.OverwriteWithLatestAvroPayload",
+                EVENT_TIME_STRATEGY_ID,
+                None,
+                "8",
+                InferredMode::EventTime,
+            ),
+            // before it, the payload class does
+            (
+                "org.apache.hudi.common.model.OverwriteWithLatestAvroPayload",
+                EVENT_TIME_STRATEGY_ID,
+                None,
+                "6",
+                InferredMode::CommitTime,
+            ),
+        ];
+
+        for (payload, strategy, ordering, version, expected) in cases {
+            let mut options = vec![
+                (
+                    HudiTableConfig::BasePath.as_ref().to_string(),
+                    "file:///tmp/t".to_string(),
+                ),
+                (
+                    HudiTableConfig::TableVersion.as_ref().to_string(),
+                    version.to_string(),
+                ),
+            ];
+            if !payload.is_empty() {
+                options.push((PAYLOAD_CLASS_KEYS[0].to_string(), payload.to_string()));
+            }
+            if !strategy.is_empty() {
+                options.push((RECORD_MERGE_STRATEGY_ID.to_string(), strategy.to_string()));
+            }
+            if let Some(field) = ordering {
+                options.push((
+                    HudiTableConfig::OrderingFields.as_ref().to_string(),
+                    field.to_string(),
+                ));
+            }
+
+            let inferred = infer_merge_mode(&HudiConfigs::new(options)).unwrap();
+            assert_eq!(
+                inferred, expected,
+                "payload={payload:?} strategy={strategy:?} ordering={ordering:?} version={version}"
+            );
+        }
+    }
+
+    /// A real table this reader used to refuse now resolves.
+    ///
+    /// Its meta fields are off, which the previous rule read as "append only" —
+    /// a strategy with no merge-mode counterpart, so the read was rejected.
+    /// Nothing about meta fields says how records merge; its payload class does,
+    /// and it says commit-time ordering.
+    #[tokio::test]
+    async fn resolves_a_v6_table_that_was_refused_before() {
+        use hudi_test::SampleTable;
+        let url = SampleTable::V6SimplekeygenHivestyleNoMetafields.url_to_mor_parquet();
+        let table = crate::table::Table::new(url.as_ref()).await.unwrap();
+
+        let mut options = table.hudi_configs.as_options();
+        options.insert(
+            "hoodie.read.end.timestamp".to_string(),
+            "99991231235959999".to_string(),
+        );
+        let ctx = resolve_reader_context(&HudiConfigs::new(options), true).unwrap();
+
+        assert_eq!(ctx.merge_mode, MergeMode::CommitTimeOrdering.as_ref());
+    }
+
+    /// A table with its own merger is refused rather than merged as if it had
+    /// none. An engine that knows the merge is reproducible says so by setting
+    /// the mode outright, which is read before any of this runs.
+    #[test]
+    fn refuses_a_table_with_its_own_merger() {
+        let mut options = minimal_configs();
+        options.push((
+            PAYLOAD_CLASS_KEYS[0].to_string(),
+            "com.example.MyPayload".to_string(),
+        ));
+        let configs = HudiConfigs::new(options);
+
         let err = resolve_reader_context(&configs, true).unwrap_err();
 
         assert!(
-            err.to_string().contains("append_only"),
-            "error should name the unmapped strategy, got: {err}"
+            err.to_string().contains("merger of its own"),
+            "error should say why, got: {err}"
         );
     }
 }
