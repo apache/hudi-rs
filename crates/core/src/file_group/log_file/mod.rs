@@ -477,3 +477,6 @@ mod tests {
         assert_eq!(logs, vec![log1, log2, log3]);
     }
 }
+
+#[cfg(test)]
+mod memory_bench;
