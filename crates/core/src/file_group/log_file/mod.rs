@@ -25,7 +25,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 mod avro;
-mod content;
+pub(crate) mod content;
 pub mod log_block;
 pub mod log_format;
 pub mod reader;

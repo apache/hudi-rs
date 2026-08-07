@@ -24,8 +24,10 @@ use crate::error::CoreError;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, LogBlock, LogBlockContent,
+    LogBlockContentLocation,
 };
 use crate::file_group::log_file::log_format::{LogFormatVersion, MAGIC};
+use crate::storage::reader::LogBlockFetcher;
 use crate::storage::reader::StorageReader;
 use crate::storage::{RowFilterBuilder, Storage};
 use crate::timeline::selector::InstantRange;
@@ -103,6 +105,43 @@ impl LogFileReader<StorageReader> {
             row_filter: None,
             required_schema_json: None,
         })
+    }
+
+    /// Open a reader that fetches bounded windows rather than the whole file.
+    ///
+    /// Pairs with [`Self::read_all_blocks_metadata_only`]: the scan walks
+    /// headers out of the window and each admitted block reads its own content
+    /// later, so neither step holds the file.
+    pub async fn new_streaming(
+        hudi_configs: Arc<HudiConfigs>,
+        storage: Arc<Storage>,
+        relative_path: &str,
+    ) -> Result<Self> {
+        let reader = storage.get_streaming_storage_reader(relative_path).await?;
+        let timezone: String = hudi_configs
+            .get_or_default(HudiTableConfig::TimelineTimezone)
+            .into();
+        Ok(Self {
+            hudi_configs,
+            reader,
+            timezone,
+            row_filter: None,
+            required_schema_json: None,
+        })
+    }
+
+    /// Walk every block reading only its header, recording where the content
+    /// sits so an admitted block can read it later.
+    ///
+    /// `instant_range` is not applied here — the caller decides what to admit
+    /// from the headers, which is the point of not decoding yet.
+    pub fn read_all_blocks_metadata_only(&mut self) -> Result<Vec<LogBlock>> {
+        let fetcher = self.reader.block_fetcher();
+        let mut blocks = Vec::new();
+        while let Some(block) = self.read_next_block_metadata_only(&fetcher)? {
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     pub fn read_all_blocks(&mut self, instant_range: &InstantRange) -> Result<Vec<LogBlock>> {
@@ -409,6 +448,80 @@ impl<R: Read + Seek> LogFileReader<R> {
         instant_range.not_in_range(instant_time, &self.timezone)
     }
 
+    /// Read one block's header, recording where its content sits and seeking
+    /// past it without decoding.
+    ///
+    /// Corruption is still detected — a corrupt block cannot be trusted to say
+    /// where the next one starts, so the check has to happen during the sweep
+    /// rather than being deferred with the content.
+    fn read_next_block_metadata_only(
+        &mut self,
+        fetcher: &LogBlockFetcher,
+    ) -> Result<Option<LogBlock>> {
+        let magic_pos = self
+            .reader
+            .stream_position()
+            .map_err(CoreError::ReadLogFileError)?;
+        if !self.read_magic()? {
+            return Ok(None);
+        }
+
+        let block_length = self.read_block_length()?;
+        if self.is_block_corrupted(magic_pos, block_length)? {
+            return Ok(Some(self.create_corrupted_block(magic_pos)?));
+        }
+
+        let format_version = self.read_log_format_version()?;
+        let block_type = self.read_block_type(&format_version)?;
+        let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+
+        // The range starts at the content-length field, not after it, because
+        // decoding reads that field itself — inflate hands the same bytes to the
+        // same decoder the eager path uses.
+        let content_position = self
+            .reader
+            .stream_position()
+            .map_err(CoreError::ReadLogFileError)?;
+        let payload_length = if format_version.has_content_length() {
+            let mut buf = [0u8; 8];
+            self.reader
+                .read_exact(&mut buf)
+                .map_err(CoreError::ReadLogFileError)?;
+            u64::from_be_bytes(buf)
+        } else {
+            block_length
+        };
+        let content_length = if format_version.has_content_length() {
+            payload_length + 8
+        } else {
+            payload_length
+        };
+
+        // Skip the content; the footer and trailing length follow it.
+        let after_content = content_position
+            .checked_add(content_length)
+            .ok_or_else(|| CoreError::LogFormatError("Content length overflow".to_string()))?;
+        self.reader
+            .seek(SeekFrom::Start(after_content))
+            .map_err(CoreError::ReadLogFileError)?;
+        let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
+        let _ = self.read_total_block_length(&format_version)?;
+
+        let mut block = LogBlock::new(
+            format_version,
+            block_type,
+            header,
+            LogBlockContent::Empty,
+            footer,
+        );
+        block.content_location = Some(LogBlockContentLocation {
+            content_position,
+            content_length,
+        });
+        block.content_fetcher = Some(fetcher.clone());
+        Ok(Some(block))
+    }
+
     fn read_next_block(&mut self, instant_range: &InstantRange) -> Result<Option<LogBlock>> {
         // The magic's own offset — where a corrupt block's span starts.
         let magic_pos = self
@@ -532,6 +645,63 @@ mod tests {
     /// A block whose recorded length disagrees with its trailing reverse
     /// pointer is corrupt. Both sizes are written by the same writer, so a
     /// mismatch means the span cannot be trusted.
+    /// Sweeping headers and inflating afterwards has to produce exactly what
+    /// reading the file eagerly produces. This is the property the whole lazy
+    /// path rests on: if it holds, nothing downstream can tell which way the
+    /// blocks were read.
+    async fn assert_lazy_matches_eager(dir: &str, file_name: &str) -> Result<()> {
+        let dir_url = parse_uri(dir)?;
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(dir_url)?;
+
+        let mut eager =
+            LogFileReader::new(hudi_configs.clone(), storage.clone(), file_name).await?;
+        let eager_blocks =
+            eager.read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))?;
+
+        let mut lazy =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, file_name).await?;
+        let mut lazy_blocks = lazy.read_all_blocks_metadata_only()?;
+
+        assert_eq!(
+            lazy_blocks.len(),
+            eager_blocks.len(),
+            "the sweep must find the same blocks"
+        );
+
+        let decoder = Decoder::new(hudi_configs);
+        for (lazy_block, eager_block) in lazy_blocks.iter_mut().zip(eager_blocks.iter()) {
+            assert_eq!(lazy_block.block_type, eager_block.block_type);
+            assert_eq!(lazy_block.header, eager_block.header);
+            lazy_block.inflate(&decoder)?;
+            assert_eq!(
+                lazy_block.content.as_records().map(|b| b.num_data_rows()),
+                eager_block.content.as_records().map(|b| b.num_data_rows()),
+                "inflated content must match the eager read for a {:?} block",
+                eager_block.block_type
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lazy_sweep_matches_eager_for_avro_blocks() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        assert_lazy_matches_eager(&dir, &file_name).await
+    }
+
+    #[tokio::test]
+    async fn test_lazy_sweep_matches_eager_for_parquet_blocks() -> Result<()> {
+        let (dir, file_name) = get_valid_log_parquet_data();
+        assert_lazy_matches_eager(&dir, &file_name).await
+    }
+
+    #[tokio::test]
+    async fn test_lazy_sweep_matches_eager_for_delete_blocks() -> Result<()> {
+        let (dir, file_name) = get_valid_log_delete();
+        assert_lazy_matches_eager(&dir, &file_name).await
+    }
+
     #[tokio::test]
     async fn test_corrupt_block_detected_when_trailing_length_disagrees() -> Result<()> {
         let (dir, file_name) = get_valid_log_avro_data();

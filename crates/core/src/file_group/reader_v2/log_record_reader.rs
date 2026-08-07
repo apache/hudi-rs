@@ -638,6 +638,22 @@ impl BaseHoodieLogRecordReader {
             log_blocks.len(),
         );
         let mut block_num = 0u64;
+        // The same settings the sweep would have decoded with, so an inflated
+        // block is identical to one that was read eagerly.
+        let block_decoder = crate::file_group::log_file::content::Decoder::new(Arc::new(
+            crate::config::HudiConfigs::new(self.reader_context.table_config.clone()),
+        ))
+        .with_row_filter(if self.reader_context.can_push_row_filter() {
+            self.reader_context.row_filter_builder.clone()
+        } else {
+            None
+        })
+        .with_required_schema(
+            self.reader_context
+                .schema_handler
+                .required_schema_json
+                .clone(),
+        );
 
         while let Some(mut block) = log_blocks.pop_back() {
             block_num += 1;
@@ -646,6 +662,15 @@ impl BaseHoodieLogRecordReader {
                 "[Pass3] block #{block_num}: type={:?} instant={instant_time}",
                 block.block_type,
             );
+
+            // Read this block's content now that it is known to be admitted. A
+            // block that already has content passes straight through.
+            match block.block_type {
+                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
+                    block.inflate(&block_decoder)?;
+                }
+                _ => {}
+            }
 
             match block.block_type {
                 BlockType::AvroData | BlockType::ParquetData => {
