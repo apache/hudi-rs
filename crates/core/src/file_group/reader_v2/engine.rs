@@ -412,6 +412,12 @@ impl HoodieFileGroupReader {
     /// New consumers that can use a sync iterator should prefer
     /// [`Self::open`] for true streaming.
     pub async fn read(&mut self) -> Result<RecordBatch> {
+        // Anything this read expects that is quietly not done, said once, before
+        // the rows come back looking unremarkable.
+        crate::file_group::reader_v2::gaps::report_for_read(
+            &self.reader_context,
+            &self.reader_parameters,
+        );
         // A3 (ENG-42992): eager mode — the base parquet stream is drained
         // async during `init_record_iterators` (streaming=false), so the
         // returned iterator's `next()` is pure in-memory work and can be driven

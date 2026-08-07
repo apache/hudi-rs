@@ -239,7 +239,7 @@ pub fn transform_delete_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apache_avro::schema::{DecimalSchema, RecordField, RecordSchema};
+    use apache_avro::schema::{RecordField, RecordSchema};
     use arrow_array::{Array, Int64Array};
 
     fn validate_delete_fields(
