@@ -45,8 +45,22 @@ pub struct AvroBlockDecoder {
 }
 
 impl AvroBlockDecoder {
-    /// Build a decoder for a block written with `writer_schema_json`.
-    pub fn try_new(writer_schema_json: &str, batch_size: usize) -> Result<Self> {
+    /// Build a decoder that resolves the block up to `reader_schema_json`.
+    ///
+    /// A log block records the schema it was written with, which may predate a
+    /// schema change on the table — an added column, or a column promoted from
+    /// `int` to `long`. Handing the reader schema to the decoder resolves the
+    /// block as it is read: absent columns are filled from their defaults and
+    /// promoted columns arrive in the promoted type.
+    ///
+    /// Only promotions Avro itself defines are handled this way. A block whose
+    /// writer schema differs in a way Avro does not allow is rejected here
+    /// rather than silently mis-read.
+    pub fn try_new_with_reader(
+        writer_schema_json: &str,
+        reader_schema_json: Option<&str>,
+        batch_size: usize,
+    ) -> Result<Self> {
         let mut store = SchemaStore::new();
         let fingerprint = store
             .register(ArrowAvroSchema::new(writer_schema_json.to_string()))
@@ -60,14 +74,17 @@ impl AvroBlockDecoder {
             )));
         };
 
-        let decoder = ReaderBuilder::new()
+        let mut builder = ReaderBuilder::new()
             .with_writer_schema_store(store)
             .with_active_fingerprint(fingerprint)
-            .with_batch_size(batch_size)
-            .build_decoder()
-            .map_err(|e| {
-                CoreError::LogBlockError(format!("Failed to build the Avro decoder: {e}"))
-            })?;
+            .with_batch_size(batch_size);
+        if let Some(reader_schema_json) = reader_schema_json {
+            builder =
+                builder.with_reader_schema(ArrowAvroSchema::new(reader_schema_json.to_string()));
+        }
+        let decoder = builder.build_decoder().map_err(|e| {
+            CoreError::LogBlockError(format!("Failed to build the Avro decoder: {e}"))
+        })?;
 
         let mut prefix = [0u8; 10];
         prefix[..2].copy_from_slice(&SINGLE_OBJECT_MAGIC);
@@ -160,4 +177,68 @@ fn normalize_utc_timestamps(batch: RecordBatch) -> Result<RecordBatch> {
         }
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(CoreError::ArrowError)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AvroBlockDecoder;
+
+    /// A block written before a column was promoted still reads at the promoted
+    /// type. Avro defines int → long as a promotion, so the decoder resolves it
+    /// while reading rather than leaving a narrow column to be reconciled later.
+    #[test]
+    fn test_reader_schema_promotes_int_to_long() {
+        let writer = r#"{"type":"record","name":"r","fields":[{"name":"num","type":"int"}]}"#;
+        let reader = r#"{"type":"record","name":"r","fields":[{"name":"num","type":"long"}]}"#;
+
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(writer, Some(reader), 1024).unwrap();
+        decoder.decode(&[0x0E]).unwrap(); // int 7, zigzag encoded
+        let batch = decoder.flush().unwrap().expect("a batch");
+
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow_schema::DataType::Int64
+        );
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("promoted to i64");
+        assert_eq!(col.value(0), 7);
+    }
+
+    /// Hudi writes nullable columns as `["null", T]`, so the promotion has to
+    /// survive the union wrapper — which is the shape every real table has.
+    #[test]
+    fn test_reader_schema_promotes_through_a_nullable_union() {
+        let writer = r#"{"type":"record","name":"r","fields":[{"name":"num","type":["null","int"],"default":null}]}"#;
+        let reader = r#"{"type":"record","name":"r","fields":[{"name":"num","type":["null","long"],"default":null}]}"#;
+
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(writer, Some(reader), 1024).unwrap();
+        decoder.decode(&[0x02, 0x0E]).unwrap(); // union branch 1, then int 7
+        let batch = decoder.flush().unwrap().expect("a batch");
+
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow_schema::DataType::Int64
+        );
+    }
+
+    /// Without a reader schema the block reads at the schema it was written
+    /// with, which is what a partial-update block relies on.
+    #[test]
+    fn test_no_reader_schema_keeps_the_writer_type() {
+        let writer = r#"{"type":"record","name":"r","fields":[{"name":"num","type":"int"}]}"#;
+
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(writer, None, 1024).unwrap();
+        decoder.decode(&[0x0E]).unwrap();
+        let batch = decoder.flush().unwrap().expect("a batch");
+
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow_schema::DataType::Int32
+        );
+    }
 }

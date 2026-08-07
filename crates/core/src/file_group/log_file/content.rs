@@ -50,6 +50,9 @@ pub struct Decoder {
     /// it is safe to evaluate before the merge. See
     /// [`Decoder::with_row_filter`].
     row_filter: Option<RowFilterBuilder>,
+    /// Schema an Avro block is resolved up to, as Avro JSON. See
+    /// [`Decoder::with_required_schema`].
+    required_schema_json: Option<String>,
 }
 
 impl Decoder {
@@ -65,11 +68,26 @@ impl Decoder {
         self
     }
 
+    /// Resolve Avro blocks up to this schema as they are read.
+    ///
+    /// A block records the schema it was written with, which may predate a
+    /// change to the table. Supplying the current schema lets the decoder fill
+    /// added columns from their defaults and deliver promoted columns in the
+    /// promoted type, rather than leaving both to be reconciled after the fact.
+    ///
+    /// Blocks carrying `IsPartial` are excluded — see
+    /// [`Self::decode_avro_record_content`].
+    pub fn with_required_schema(mut self, required_schema_json: Option<String>) -> Self {
+        self.required_schema_json = required_schema_json;
+        self
+    }
+
     pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             batch_size: 1024,
             hudi_configs,
             row_filter: None,
+            required_schema_json: None,
         }
     }
     pub fn decode_content(
@@ -142,7 +160,20 @@ impl Decoder {
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let mut decoder = AvroBlockDecoder::try_new(writer_schema_json, self.batch_size)?;
+        // A partial-update block carries only the columns that were written, and
+        // the merge needs to know which those are. Resolving it up to the table
+        // schema would fabricate the rest, so it decodes against its own schema.
+        let is_partial = header.contains_key(&BlockMetadataKey::IsPartial);
+        let reader_schema_json = if is_partial {
+            None
+        } else {
+            self.required_schema_json.as_deref()
+        };
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(
+            writer_schema_json,
+            reader_schema_json,
+            self.batch_size,
+        )?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
 
