@@ -269,12 +269,12 @@ impl FileGroupRecordBuffer {
     pub fn next_base_row(&mut self) -> Result<Option<(Arc<RecordBatch>, usize)>> {
         loop {
             // Slice + advance from the current batch if rows remain.
-            if let Some(batch) = self.current_base_batch.as_ref() {
-                if self.base_row_idx < batch.num_rows() {
-                    let row_idx = self.base_row_idx;
-                    self.base_row_idx += 1;
-                    return Ok(Some((batch.clone(), row_idx)));
-                }
+            if let Some(batch) = self.current_base_batch.as_ref()
+                && self.base_row_idx < batch.num_rows()
+            {
+                let row_idx = self.base_row_idx;
+                self.base_row_idx += 1;
+                return Ok(Some((batch.clone(), row_idx)));
             }
 
             // Current batch exhausted (or unset) — pull from source.

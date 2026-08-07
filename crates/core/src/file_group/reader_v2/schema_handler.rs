@@ -200,12 +200,13 @@ impl FileGroupReaderSchemaHandler {
         //     return requestedSchema;
         //   }
         if !has_log_files {
-            if has_instant_range && base_schema.column_with_name(COMMIT_TIME_FIELD).is_none() {
-                if let Some((_, field)) = field_source.column_with_name(COMMIT_TIME_FIELD) {
-                    let mut fields: Vec<Arc<Field>> = base_schema.fields().to_vec();
-                    fields.push(Arc::new(field.clone()));
-                    return Ok(Some(Arc::new(Schema::new(fields))));
-                }
+            if has_instant_range
+                && base_schema.column_with_name(COMMIT_TIME_FIELD).is_none()
+                && let Some((_, field)) = field_source.column_with_name(COMMIT_TIME_FIELD)
+            {
+                let mut fields: Vec<Arc<Field>> = base_schema.fields().to_vec();
+                fields.push(Arc::new(field.clone()));
+                return Ok(Some(Arc::new(Schema::new(fields))));
             }
             return Ok(Some(base_schema.clone()));
         }
@@ -265,12 +266,12 @@ impl FileGroupReaderSchemaHandler {
         // Append only fields not already in the base schema (Java line 219).
         let mut extra_fields: Vec<Arc<Field>> = Vec::new();
         for &field_name in &mandatory_field_names {
-            if base_schema.column_with_name(field_name).is_none() {
-                if let Some((_, field)) = field_source.column_with_name(field_name) {
-                    // Deduplicate: only add if not already in extra_fields.
-                    if !extra_fields.iter().any(|f| f.name() == field_name) {
-                        extra_fields.push(Arc::new(field.clone()));
-                    }
+            if base_schema.column_with_name(field_name).is_none()
+                && let Some((_, field)) = field_source.column_with_name(field_name)
+            {
+                // Deduplicate: only add if not already in extra_fields.
+                if !extra_fields.iter().any(|f| f.name() == field_name) {
+                    extra_fields.push(Arc::new(field.clone()));
                 }
             }
         }

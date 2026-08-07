@@ -990,17 +990,17 @@ fn fill_unavailable_from_base(
             cols.push(log_col.clone());
             continue;
         }
-        if array_value_equals_sentinel(log_col.as_ref(), sentinel) {
-            if let Ok(bidx) = base_schema.index_of(field.name()) {
-                let base_col = base_row.column(bidx);
-                // Only substitute when the base carries the same-typed column;
-                // otherwise leave the (sentinel) log value rather than risk a
-                // type-mismatched batch.
-                if base_col.data_type() == field.data_type() {
-                    cols.push(base_col.clone());
-                    changed = true;
-                    continue;
-                }
+        if array_value_equals_sentinel(log_col.as_ref(), sentinel)
+            && let Ok(bidx) = base_schema.index_of(field.name())
+        {
+            let base_col = base_row.column(bidx);
+            // Only substitute when the base carries the same-typed column;
+            // otherwise leave the (sentinel) log value rather than risk a
+            // type-mismatched batch.
+            if base_col.data_type() == field.data_type() {
+                cols.push(base_col.clone());
+                changed = true;
+                continue;
             }
         }
         cols.push(log_col.clone());
@@ -1071,17 +1071,17 @@ fn reconcile_defaults_from_prior(
         let retain = default_retains
             .get(field.name())
             .unwrap_or(&DefaultRetain::OnNull);
-        if value_is_default(log_col.as_ref(), retain) {
-            if let Ok(pidx) = prior_schema.index_of(field.name()) {
-                let prior_col = prior_row.column(pidx);
-                // Only substitute when the prior carries the same-typed column;
-                // otherwise leave the (default) log value rather than risk a
-                // type-mismatched batch.
-                if prior_col.data_type() == field.data_type() {
-                    cols.push(prior_col.clone());
-                    changed = true;
-                    continue;
-                }
+        if value_is_default(log_col.as_ref(), retain)
+            && let Ok(pidx) = prior_schema.index_of(field.name())
+        {
+            let prior_col = prior_row.column(pidx);
+            // Only substitute when the prior carries the same-typed column;
+            // otherwise leave the (default) log value rather than risk a
+            // type-mismatched batch.
+            if prior_col.data_type() == field.data_type() {
+                cols.push(prior_col.clone());
+                changed = true;
+                continue;
             }
         }
         cols.push(log_col.clone());
@@ -3602,10 +3602,10 @@ mod tests {
             std::collections::HashSet::new();
         let mut total = 0;
         for r in records.values() {
-            if let RecordPayload::BatchRef { batch, .. } = &r.payload {
-                if seen.insert(Arc::as_ptr(batch)) {
-                    total += batch.get_array_memory_size();
-                }
+            if let RecordPayload::BatchRef { batch, .. } = &r.payload
+                && seen.insert(Arc::as_ptr(batch))
+            {
+                total += batch.get_array_memory_size();
             }
         }
         total

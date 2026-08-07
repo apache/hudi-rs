@@ -1208,23 +1208,22 @@ impl RecordContext {
         delete_context: Option<&DeleteContext>,
     ) -> bool {
         // Fast path: if DeleteContext says the field doesn't exist, skip
-        if let Some(ctx) = delete_context {
-            if !ctx.has_built_in_delete_field {
-                return false;
-            }
+        if let Some(ctx) = delete_context
+            && !ctx.has_built_in_delete_field
+        {
+            return false;
         }
 
         let schema = batch.schema();
-        if let Some((idx, _)) = schema.column_with_name("_hoodie_is_deleted") {
-            if let Some(arr) = batch
+        if let Some((idx, _)) = schema.column_with_name("_hoodie_is_deleted")
+            && let Some(arr) = batch
                 .column(idx)
                 .as_any()
                 .downcast_ref::<arrow_array::BooleanArray>()
-            {
-                if !arr.is_null(row_idx) && arr.value(row_idx) {
-                    return true;
-                }
-            }
+            && !arr.is_null(row_idx)
+            && arr.value(row_idx)
+        {
+            return true;
         }
         false
     }
@@ -1252,17 +1251,17 @@ impl RecordContext {
             }
         };
 
-        if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
-            if !arr.is_null(row_idx) {
-                // The persisted value is the HoodieOperation NAME ("D" / "-U"),
-                // NOT the enum identifier ("DELETE" / "UPDATE_BEFORE"). Java maps
-                // it back with HoodieOperation.fromName; comparing against the
-                // long names silently misses every operation-field delete and
-                // resurrects the deleted rows.
-                let op = arr.value(row_idx);
-                if op == HOODIE_OPERATION_DELETE || op == HOODIE_OPERATION_UPDATE_BEFORE {
-                    return true;
-                }
+        if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>()
+            && !arr.is_null(row_idx)
+        {
+            // The persisted value is the HoodieOperation NAME ("D" / "-U"),
+            // NOT the enum identifier ("DELETE" / "UPDATE_BEFORE"). Java maps
+            // it back with HoodieOperation.fromName; comparing against the
+            // long names silently misses every operation-field delete and
+            // resurrects the deleted rows.
+            let op = arr.value(row_idx);
+            if op == HOODIE_OPERATION_DELETE || op == HOODIE_OPERATION_UPDATE_BEFORE {
+                return true;
             }
         }
         false
@@ -1290,22 +1289,25 @@ impl RecordContext {
         if let Some((idx, _)) = schema.column_with_name(key_field) {
             let col = batch.column(idx);
             // String column
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                if !arr.is_null(row_idx) && arr.value(row_idx) == marker_value {
-                    return true;
-                }
+            if let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+                && !arr.is_null(row_idx)
+                && arr.value(row_idx) == marker_value
+            {
+                return true;
             }
             // Int32 column — compare stringified value against marker
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
-                if !arr.is_null(row_idx) && arr.value(row_idx).to_string() == marker_value {
-                    return true;
-                }
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int32Array>()
+                && !arr.is_null(row_idx)
+                && arr.value(row_idx).to_string() == marker_value
+            {
+                return true;
             }
             // Int64 column — compare stringified value against marker
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
-                if !arr.is_null(row_idx) && arr.value(row_idx).to_string() == marker_value {
-                    return true;
-                }
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>()
+                && !arr.is_null(row_idx)
+                && arr.value(row_idx).to_string() == marker_value
+            {
+                return true;
             }
         }
         false
