@@ -273,6 +273,7 @@ impl FileGroupReader {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        log::info!("reading '{base_file_path}' with the merge-on-read engine");
         let merged = crate::file_group::reader_v2::adapter::read_file_slice(
             self.hudi_configs.clone(),
             self.storage.clone(),

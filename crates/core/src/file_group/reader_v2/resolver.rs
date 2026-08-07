@@ -184,6 +184,18 @@ enum InferredMode {
     Custom,
 }
 
+impl InferredMode {
+    /// The name Hudi uses, so a log line reads the same whether the mode was
+    /// stated by the table or worked out here.
+    fn as_hudi_name(&self) -> &'static str {
+        match self {
+            Self::CommitTime => "COMMIT_TIME_ORDERING",
+            Self::EventTime => "EVENT_TIME_ORDERING",
+            Self::Custom => "CUSTOM",
+        }
+    }
+}
+
 /// The mode implied by a payload class, if it implies one.
 fn mode_from_payload_class(payload_class: &str) -> Option<InferredMode> {
     if payload_class.is_empty() {
@@ -238,11 +250,22 @@ fn infer_merge_mode(hudi_configs: &HudiConfigs) -> Result<InferredMode> {
             .try_get(HudiTableConfig::OrderingFields)?
             .map(|v| -> Vec<String> { v.into() })
             .is_some_and(|fields| fields.iter().any(|f| !f.trim().is_empty()));
-        return Ok(if has_ordering_field {
+        let mode = if has_ordering_field {
             InferredMode::EventTime
         } else {
             InferredMode::CommitTime
-        });
+        };
+        log::info!(
+            "merge mode {}: the table names no payload class or merge strategy, so it was \
+             inferred from {} an ordering field",
+            mode.as_hudi_name(),
+            if has_ordering_field {
+                "having"
+            } else {
+                "not having"
+            }
+        );
+        return Ok(mode);
     }
 
     let from_payload = mode_from_payload_class(payload_class);
@@ -252,11 +275,24 @@ fn infer_merge_mode(hudi_configs: &HudiConfigs) -> Result<InferredMode> {
         .map(|v| v.into())
         .unwrap_or(6);
 
-    let inferred = if table_version >= 8 {
-        from_strategy.or(from_payload)
+    let (inferred, source) = if table_version >= 8 {
+        match from_strategy {
+            Some(mode) => (Some(mode), "merge strategy"),
+            None => (from_payload, "payload class"),
+        }
     } else {
-        from_payload.or(from_strategy)
+        match from_payload {
+            Some(mode) => (Some(mode), "payload class"),
+            None => (from_strategy, "merge strategy"),
+        }
     };
+    if let Some(ref mode) = inferred {
+        log::info!(
+            "merge mode {}: inferred from the {source} of a version {table_version} table \
+             (payload class {payload_class:?}, merge strategy {strategy_id:?})",
+            mode.as_hudi_name()
+        );
+    }
     inferred.ok_or_else(|| {
         CoreError::Unsupported(format!(
             "Cannot infer a merge mode from payload class '{payload_class}' \
@@ -272,6 +308,7 @@ fn infer_merge_mode(hudi_configs: &HudiConfigs) -> Result<InferredMode> {
 /// whether an ordering field is set.
 fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
     if let Some(mode) = hudi_configs.as_options().get(RECORD_MERGE_MODE) {
+        log::info!("merge mode {mode}: stated by the table");
         return match mode.to_ascii_uppercase().as_str() {
             "COMMIT_TIME_ORDERING" => Ok(MergeMode::CommitTimeOrdering),
             "EVENT_TIME_ORDERING" => Ok(MergeMode::EventTimeOrdering),
