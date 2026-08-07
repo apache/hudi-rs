@@ -526,7 +526,13 @@ impl BaseHoodieLogRecordReader {
                 let mut reader =
                     LogFileReader::new(hudi_configs.clone(), self.storage.clone(), path)
                         .await?
-                        .with_row_filter(row_filter);
+                        .with_row_filter(row_filter)
+                        .with_required_schema(
+                            self.reader_context
+                                .schema_handler
+                                .required_schema_json
+                                .clone(),
+                        );
                 let blocks = reader.read_all_blocks(&unbounded_range)?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);

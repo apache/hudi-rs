@@ -2210,8 +2210,7 @@ fg_case_test!(
         },
         expected: Expected::GoldParquet,
         ..Default::default()
-    },
-    ignore = "int -> long promotion does not reconcile in the merged-batch evolution path"
+    }
 );
 
 // =============================================================================

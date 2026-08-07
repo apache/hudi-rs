@@ -68,6 +68,9 @@ pub struct LogFileReader<R: Read + Seek> {
     /// Predicate to push into parquet log blocks. Unset by default, so a caller
     /// that has not decided whether pushing is sound reads every row.
     row_filter: Option<RowFilterBuilder>,
+    /// Schema Avro blocks are resolved up to. Unset by default, so a caller that
+    /// has none reads each block at the schema it was written with.
+    required_schema_json: Option<String>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -78,6 +81,7 @@ impl<R: Read + Seek> std::fmt::Debug for LogFileReader<R> {
             .field("hudi_configs", &self.hudi_configs)
             .field("timezone", &self.timezone)
             .field("row_filter", &self.row_filter.is_some())
+            .field("required_schema_json", &self.required_schema_json.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -97,6 +101,7 @@ impl LogFileReader<StorageReader> {
             reader,
             timezone,
             row_filter: None,
+            required_schema_json: None,
         })
     }
 
@@ -147,6 +152,13 @@ impl<R: Read + Seek> LogFileReader<R> {
     /// is sound is the caller's decision — see [`Decoder::with_row_filter`].
     pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
         self.row_filter = row_filter;
+        self
+    }
+
+    /// Resolve Avro blocks up to this schema. See
+    /// [`Decoder::with_required_schema`].
+    pub fn with_required_schema(mut self, required_schema_json: Option<String>) -> Self {
+        self.required_schema_json = required_schema_json;
         self
     }
 
@@ -442,8 +454,9 @@ impl<R: Read + Seek> LogFileReader<R> {
             )));
         }
 
-        let decoder =
-            Decoder::new(self.hudi_configs.clone()).with_row_filter(self.row_filter.clone());
+        let decoder = Decoder::new(self.hudi_configs.clone())
+            .with_row_filter(self.row_filter.clone())
+            .with_required_schema(self.required_schema_json.clone());
         let content = decoder.decode_content(
             self.reader.by_ref(),
             &format_version,

@@ -125,6 +125,11 @@ fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<ArrayRef> {
                 .map_err(|e| CoreError::Schema(format!("evolution f32->f64: {e}")))
         }
         // numeric → string with Java String.valueOf formatting.
+        // Widening an integer is exact, so a direct cast matches Java. Avro
+        // permits int → long as a spec promotion, and a base file written before
+        // the column was promoted still holds the narrow type.
+        (DataType::Int32, DataType::Int64) => arrow_cast::cast(src, &DataType::Int64)
+            .map_err(|e| CoreError::Schema(format!("evolution i32->i64: {e}"))),
         (DataType::Float32 | DataType::Float64, DataType::Utf8) => float_to_java_string_array(src),
         (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64, DataType::Utf8) => {
             arrow_cast::cast(src, &DataType::Utf8)
