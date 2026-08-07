@@ -273,7 +273,7 @@ impl FileGroupReader {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        crate::file_group::reader_v2::adapter::read_file_slice(
+        let merged = crate::file_group::reader_v2::adapter::read_file_slice(
             self.hudi_configs.clone(),
             self.storage.clone(),
             base_file_path,
@@ -281,7 +281,19 @@ impl FileGroupReader {
             partition_path,
             data_schema,
         )
-        .await
+        .await?;
+
+        // An incremental read wants the rows that changed in its window, and
+        // the engine decides that per file rather than per row: a base file
+        // written by compaction carries records from every commit it merged, so
+        // admitting the file admits all of them. The same mask the existing
+        // reader applies narrows it back to the window.
+        //
+        // Applied after the merge rather than before it, because a row's commit
+        // time is whichever record won. A base row updated inside the window
+        // keeps the update's time and stays; one updated outside it keeps the
+        // base's time and goes.
+        apply_commit_time_filter(&self.hudi_configs, merged)
     }
 
     /// Reads the data from the given file slice.
@@ -1622,6 +1634,68 @@ mod tests {
             .read_file_slice_from_paths(&base_path, vec![log_path.clone()], &ReadOptions::new())
             .await?;
         assert_eq!(batch.num_rows(), legacy.num_rows(), "row count differs");
+        Ok(())
+    }
+
+    /// No row an incremental read returns may sit outside its window.
+    ///
+    /// The slice is a compacted base file with a later log file. Compaction
+    /// merges records from many commits into one file while keeping each
+    /// record's own commit time, so a window that admits the *file* still has to
+    /// exclude most of its rows — the merge-on-read engine decides per file and
+    /// would otherwise return them all.
+    ///
+    /// This asserts the property rather than proving the difference: the
+    /// fixture's compacted slice holds a single record, and the log record in
+    /// the window replaces it, so the stale row is collapsed by the merge either
+    /// way. No fixture here has a compacted base row that survives unmatched,
+    /// which is what would make the two engines visibly disagree.
+    #[tokio::test]
+    async fn incremental_reads_return_nothing_outside_the_window() -> Result<()> {
+        use arrow_array::Array;
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let base_uri = Url::from_directory_path(&table_path).unwrap().to_string();
+
+        // Compaction wrote this base file; the log file came after it.
+        let base_path = "city=sao_paulo/\
+8aa68f7e-afd6-4c94-b86c-8a886552e08d-0_2-1112-3192_20251220210129235.parquet";
+        let log_path = "city=sao_paulo/\
+.8aa68f7e-afd6-4c94-b86c-8a886552e08d-0_20251220210130911.log.1_0-1139-3316";
+
+        // Opens just before the compaction, so the base file is in range while
+        // the records it merged from earlier commits are not.
+        let start = "20251220210129000";
+        let end = "20251220210131000";
+
+        let reader = FileGroupReader::new_with_options(
+            &base_uri,
+            [
+                (HudiReadConfig::MergeEngine.as_ref(), "v2"),
+                (HudiReadConfig::StartTimestamp.as_ref(), start),
+                (HudiReadConfig::EndTimestamp.as_ref(), end),
+            ],
+        )
+        .await?;
+        let batch = reader
+            .read_file_slice_from_paths(base_path, vec![log_path], &ReadOptions::new())
+            .await?;
+
+        assert!(batch.num_rows() > 0, "the window has to contain something");
+        let times = batch
+            .column_by_name(MetaField::CommitTime.as_ref())
+            .expect("commit time column");
+        let times = times
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("commit time is a string");
+        for i in 0..times.len() {
+            assert!(
+                times.value(i) > start && times.value(i) <= end,
+                "row {i} has commit time {} outside ({start}, {end}]",
+                times.value(i)
+            );
+        }
         Ok(())
     }
 
