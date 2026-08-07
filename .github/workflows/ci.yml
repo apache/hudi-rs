@@ -61,9 +61,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install system dependencies
+        # librocksdb-sys generates its bindings with bindgen at build time, which
+        # needs libclang. The hosted runners ship it; this container does not.
         run: |
           apt-get update
-          apt-get install -y protobuf-compiler
+          apt-get install -y protobuf-compiler clang libclang-dev
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
