@@ -22,7 +22,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_avro::reader::{Decoder as ArrowAvroDecoder, ReaderBuilder};
 use arrow_avro::schema::{AvroSchema as ArrowAvroSchema, SINGLE_OBJECT_MAGIC, SchemaStore};
 use arrow_cast::cast;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
 /// Decodes the bare Avro record bodies in a Hudi log block straight into Arrow.
@@ -42,6 +42,9 @@ pub struct AvroBlockDecoder {
     prefix: [u8; 10],
     /// Reused across records so framing costs one copy, not one allocation.
     framed: Vec<u8>,
+    /// When set, each batch is projected to this schema after decoding. See
+    /// [`AvroBlockDecoder::with_rewrite_to`].
+    rewrite_to: Option<SchemaRef>,
 }
 
 impl AvroBlockDecoder {
@@ -94,7 +97,22 @@ impl AvroBlockDecoder {
             decoder,
             prefix,
             framed: Vec::new(),
+            rewrite_to: None,
         })
+    }
+
+    /// Project each decoded batch to `schema` instead of resolving during the
+    /// read.
+    ///
+    /// Hudi permits promotions Avro does not — a number, or anything with a
+    /// logical type, to string. Avro refuses to build a reader for those, so a
+    /// block carrying one is decoded at the schema it was written with and
+    /// converted afterwards. Mirrors what the Java reader does when
+    /// `recordNeedsRewriteForExtendedAvroTypePromotion` says so: read
+    /// writer-to-writer, then promote.
+    pub fn with_rewrite_to(mut self, schema: Option<SchemaRef>) -> Self {
+        self.rewrite_to = schema;
+        self
     }
 
     /// Decode one record body, returning a batch once enough rows have accrued.
@@ -126,7 +144,13 @@ impl AvroBlockDecoder {
         let batch = self.decoder.flush().map_err(|e| {
             CoreError::LogBlockError(format!("Failed to flush decoded records: {e}"))
         })?;
-        batch.map(normalize_utc_timestamps).transpose()
+        let batch = batch.map(normalize_utc_timestamps).transpose()?;
+        match (batch, self.rewrite_to.as_ref()) {
+            (Some(batch), Some(target)) => {
+                crate::schema::batch_evolution::project_batch_to_schema(&batch, target).map(Some)
+            }
+            (batch, _) => Ok(batch),
+        }
     }
 }
 
