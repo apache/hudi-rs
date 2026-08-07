@@ -18,6 +18,7 @@
  */
 //! This module is responsible for interacting with the storage layer.
 
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,6 +59,29 @@ pub type RowFilterBuilder = Arc<
 >;
 
 #[allow(dead_code)]
+/// Runtime that owns every ranged object-store read issued from synchronous
+/// code.
+///
+/// A log file is read through `std::io::Read`, which is synchronous, while
+/// `object_store` is async. Bridging the two needs somewhere to drive the
+/// future, and the obvious choices do not work: the sync read can be reached
+/// from inside another runtime, where `block_on` panics with "Cannot start a
+/// runtime from within a runtime", and a runtime built per read would take
+/// hyper's connection dispatcher down with it when dropped, failing every
+/// subsequent request against the same cached store.
+///
+/// So reads are spawned here and the calling thread waits on a channel. The
+/// runtime outlives any individual caller, which is what keeps the dispatcher
+/// alive.
+pub static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .thread_name("hudi-rs-objstore")
+        .build()
+        .expect("the object-store runtime must build")
+});
+
 #[derive(Clone, Debug)]
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
