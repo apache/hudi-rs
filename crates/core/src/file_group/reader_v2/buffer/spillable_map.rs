@@ -626,11 +626,11 @@ impl SpillableRecordMap {
             self.enforce_memory_limits()?;
             return Ok(());
         }
-        if let Some(disk) = self.disk.as_mut() {
-            if disk.contains_key(&key)? {
-                disk.put(&key, &value)?;
-                return Ok(());
-            }
+        if let Some(disk) = self.disk.as_mut()
+            && disk.contains_key(&key)?
+        {
+            disk.put(&key, &value)?;
+            return Ok(());
         }
 
         // New key. A `BatchRef` participates in evict-by-source-batch (A6e); an

@@ -215,27 +215,25 @@ pub fn forward_scan_pass1(
         // "straddling" instant (time < latest completed, no in-log rollback block)
         // is wrongly merged (C-INFLIGHT-DELTA). Command (rollback) blocks are never
         // gated here so they can still remove their target instant below.
-        if block.block_type != BlockType::Command {
-            if let Some(gate) = completion_gate {
-                if !gate.admits(&instant_time) {
-                    log::debug!(
-                        "[Pass1] Gate3: block #{total_log_blocks} instant={instant_time} uncommitted/inflight, skipped"
-                    );
-                    continue;
-                }
-            }
+        if block.block_type != BlockType::Command
+            && let Some(gate) = completion_gate
+            && !gate.admits(&instant_time)
+        {
+            log::debug!(
+                "[Pass1] Gate3: block #{total_log_blocks} instant={instant_time} uncommitted/inflight, skipped"
+            );
+            continue;
         }
 
         // Gate 4: Instant range filter (not for command blocks)
-        if block.block_type != BlockType::Command {
-            if let Some(range) = instant_range {
-                if range.not_in_range(&instant_time, timezone)? {
-                    log::debug!(
-                        "[Pass1] Gate4: block #{total_log_blocks} instant={instant_time} out of range, skipped"
-                    );
-                    continue;
-                }
-            }
+        if block.block_type != BlockType::Command
+            && let Some(range) = instant_range
+            && range.not_in_range(&instant_time, timezone)?
+        {
+            log::debug!(
+                "[Pass1] Gate4: block #{total_log_blocks} instant={instant_time} out of range, skipped"
+            );
+            continue;
         }
 
         log::debug!(

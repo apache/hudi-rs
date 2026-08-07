@@ -290,10 +290,9 @@ impl PositionBasedFileGroupRecordBuffer {
             if self
                 .inner
                 .has_next_base_record_at(&base_batch, row_idx, BaseMatch::RecordKey)?
+                && let Some(record) = self.inner.base.next_record.take()
             {
-                if let Some(record) = self.inner.base.next_record.take() {
-                    records.push(record);
-                }
+                records.push(record);
             }
         }
         if records.is_empty() {
