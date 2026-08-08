@@ -258,8 +258,18 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Boolean),
             Self::KeyGeneratorClass => get_result.map(|v| HudiConfigValue::String(v.to_string())),
             Self::KeyGeneratorType => get_result.map(|v| HudiConfigValue::String(v.to_string())),
-            Self::PartitionFields => get_result
-                .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
+            // A table written without partitioning records the key with an
+            // empty value rather than omitting it; splitting that yields one
+            // field named "", which no schema contains.
+            Self::PartitionFields => get_result.map(|v| {
+                HudiConfigValue::List(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|field| !field.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                )
+            }),
             Self::OrderingFields => get_result.and_then(|v| {
                 let fields: Vec<String> = v.split(',').map(str::to_string).collect();
                 if fields.len() > 1 {

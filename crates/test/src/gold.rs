@@ -81,14 +81,28 @@ pub fn read_gold_parquet(gold_dir: &str) -> Result<RecordBatch, String> {
 
 /// Sort `batch` by the [`SORT_KEY`] column (ascending) so rows line up
 /// positionally for comparison.
+/// Order rows by the key columns so gold and actual line up positionally.
+///
+/// `sort_key` may name several comma-separated columns: a Hudi record key is
+/// unique only within a partition, so a partitioned table needs the partition
+/// column alongside it to identify a row.
 fn sort_by_key(batch: &RecordBatch, sort_key: &str) -> Result<RecordBatch, String> {
-    let idx = batch
-        .schema()
-        .index_of(sort_key)
-        .map_err(|e| format!("sort key column '{sort_key}' not found: {e}"))?;
-    let key_col = batch.column(idx).clone();
-    let indices = arrow_ord::sort::sort_to_indices(&key_col, None, None)
-        .map_err(|e| format!("sort_to_indices on '{sort_key}' failed: {e}"))?;
+    let mut columns = Vec::new();
+    for name in sort_key.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .map_err(|e| format!("sort key column '{name}' not found: {e}"))?;
+        columns.push(arrow_ord::sort::SortColumn {
+            values: batch.column(idx).clone(),
+            options: None,
+        });
+    }
+    if columns.is_empty() {
+        return Err(format!("sort key '{sort_key}' names no columns"));
+    }
+    let indices = arrow_ord::sort::lexsort_to_indices(&columns, None)
+        .map_err(|e| format!("lexsort on '{sort_key}' failed: {e}"))?;
     let columns: Result<Vec<_>, String> = batch
         .columns()
         .iter()
@@ -119,17 +133,32 @@ fn cells_equal(col: &dyn Array, lhs: usize, rhs: usize) -> Result<bool, String> 
 /// Enforcing uniqueness here keeps the comparison honest — a fixture that needs
 /// a non-unique key must add a tiebreaker rather than silently misalign.
 fn ensure_unique_sort_key(batch: &RecordBatch, side: &str, sort_key: &str) -> Result<(), String> {
-    let idx = batch
-        .schema()
-        .index_of(sort_key)
-        .map_err(|e| format!("sort key column '{sort_key}' not found: {e}"))?;
-    let col = batch.column(idx);
+    let mut cols = Vec::new();
+    for name in sort_key.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .map_err(|e| format!("sort key column '{name}' not found: {e}"))?;
+        cols.push(batch.column(idx).clone());
+    }
     for row in 1..batch.num_rows() {
-        if cells_equal(col.as_ref(), row - 1, row)? {
-            let dup = render_cell(col.as_ref(), row)?;
+        // A composite key repeats only when every one of its columns does.
+        let mut all_equal = true;
+        for col in &cols {
+            if !cells_equal(col.as_ref(), row - 1, row)? {
+                all_equal = false;
+                break;
+            }
+        }
+        if all_equal {
+            let dup: Vec<String> = cols
+                .iter()
+                .map(|col| render_cell(col.as_ref(), row))
+                .collect::<Result<_, _>>()?;
             return Err(format!(
-                "{side} has a duplicate '{sort_key}' value ('{dup}'); positional \
-                 comparison against gold requires a unique sort key"
+                "{side} has a duplicate '{sort_key}' value ('{}'); positional \
+                 comparison against gold requires a unique sort key",
+                dup.join(",")
             ));
         }
     }

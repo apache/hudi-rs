@@ -258,8 +258,12 @@ async fn check_against_gold(name: &str) -> std::result::Result<(), String> {
     let actual = read_fixture(&extracted.to_string_lossy())
         .await
         .map_err(|e| format!("read failed: {e}"))?;
-    let gold = hudi_test::gold::read_gold_parquet(&extracted.join("gold_data").to_string_lossy())
-        .map_err(|e| format!("gold unreadable: {e}"))?;
+    let gold = hudi_test::gold::read_gold_parquet(
+        &hudi_test::extract_test_table(Path::new(&zip))
+            .join("gold_data")
+            .to_string_lossy(),
+    )
+    .map_err(|e| format!("gold unreadable: {e}"))?;
 
     if actual.num_rows() != gold.num_rows() {
         return Err(format!(
