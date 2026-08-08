@@ -36,6 +36,8 @@ use arrow_schema::{DataType, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Column the gold and actual batches are sorted on before comparison.
+/// Column the gold and actual batches are sorted on when the caller does not
+/// name one. Most fixtures key on `key`; those that do not pass their own.
 const SORT_KEY: &str = "key";
 
 /// Prefix of Hudi metadata columns, excluded from the comparison.
@@ -79,14 +81,14 @@ pub fn read_gold_parquet(gold_dir: &str) -> Result<RecordBatch, String> {
 
 /// Sort `batch` by the [`SORT_KEY`] column (ascending) so rows line up
 /// positionally for comparison.
-fn sort_by_key(batch: &RecordBatch) -> Result<RecordBatch, String> {
+fn sort_by_key(batch: &RecordBatch, sort_key: &str) -> Result<RecordBatch, String> {
     let idx = batch
         .schema()
-        .index_of(SORT_KEY)
-        .map_err(|e| format!("sort key column '{SORT_KEY}' not found: {e}"))?;
+        .index_of(sort_key)
+        .map_err(|e| format!("sort key column '{sort_key}' not found: {e}"))?;
     let key_col = batch.column(idx).clone();
     let indices = arrow_ord::sort::sort_to_indices(&key_col, None, None)
-        .map_err(|e| format!("sort_to_indices on '{SORT_KEY}' failed: {e}"))?;
+        .map_err(|e| format!("sort_to_indices on '{sort_key}' failed: {e}"))?;
     let columns: Result<Vec<_>, String> = batch
         .columns()
         .iter()
@@ -116,17 +118,17 @@ fn cells_equal(col: &dyn Array, lhs: usize, rhs: usize) -> Result<bool, String> 
 /// be permuted differently on each side and mask (or fabricate) a mismatch.
 /// Enforcing uniqueness here keeps the comparison honest — a fixture that needs
 /// a non-unique key must add a tiebreaker rather than silently misalign.
-fn ensure_unique_sort_key(batch: &RecordBatch, side: &str) -> Result<(), String> {
+fn ensure_unique_sort_key(batch: &RecordBatch, side: &str, sort_key: &str) -> Result<(), String> {
     let idx = batch
         .schema()
-        .index_of(SORT_KEY)
-        .map_err(|e| format!("sort key column '{SORT_KEY}' not found: {e}"))?;
+        .index_of(sort_key)
+        .map_err(|e| format!("sort key column '{sort_key}' not found: {e}"))?;
     let col = batch.column(idx);
     for row in 1..batch.num_rows() {
         if cells_equal(col.as_ref(), row - 1, row)? {
             let dup = render_cell(col.as_ref(), row)?;
             return Err(format!(
-                "{side} has a duplicate '{SORT_KEY}' value ('{dup}'); positional \
+                "{side} has a duplicate '{sort_key}' value ('{dup}'); positional \
                  comparison against gold requires a unique sort key"
             ));
         }
@@ -320,11 +322,21 @@ fn has_container_internal_null(col: &dyn Array) -> bool {
 /// row-count mismatch, missing column, dtype mismatch, failed timestamp cast,
 /// null/non-null mismatch, render error, or differing cell value).
 pub fn compare_against_gold(actual: &RecordBatch, gold: &RecordBatch) -> Result<(), String> {
-    let actual_sorted = sort_by_key(actual)?;
-    let gold_sorted = sort_by_key(gold)?;
+    compare_against_gold_keyed(actual, gold, SORT_KEY)
+}
 
-    ensure_unique_sort_key(&actual_sorted, "actual")?;
-    ensure_unique_sort_key(&gold_sorted, "gold")?;
+/// [`compare_against_gold`] for a fixture whose rows are identified by a column
+/// other than `key`.
+pub fn compare_against_gold_keyed(
+    actual: &RecordBatch,
+    gold: &RecordBatch,
+    sort_key: &str,
+) -> Result<(), String> {
+    let actual_sorted = sort_by_key(actual, sort_key)?;
+    let gold_sorted = sort_by_key(gold, sort_key)?;
+
+    ensure_unique_sort_key(&actual_sorted, "actual", sort_key)?;
+    ensure_unique_sort_key(&gold_sorted, "gold", sort_key)?;
 
     if actual_sorted.num_rows() != gold_sorted.num_rows() {
         return Err(format!(

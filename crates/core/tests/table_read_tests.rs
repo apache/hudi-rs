@@ -2913,3 +2913,99 @@ mod incremental_over_append_only_delta_commits {
         Ok(())
     }
 }
+
+/// Incremental windows checked against what Hudi's own reader returns.
+///
+/// The gold files under the fixture's `gold_incremental/<window>` were produced
+/// by Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT reading the same table with
+/// `hoodie.datasource.read.begin.instanttime` / `end.instanttime`. Comparing
+/// against them checks this crate against the reference implementation rather
+/// than against its own incumbent reader.
+mod incremental_windows_match_hudi {
+    use super::*;
+
+    async fn read_window(start: &str, end: &str) -> Result<RecordBatch> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(RecordBatch::new_empty(std::sync::Arc::new(
+                arrow_schema::Schema::empty(),
+            )));
+        }
+        let schema = records[0].schema();
+        Ok(concat_batches(&schema, &records)?)
+    }
+
+    fn gold_for(window: &str) -> Result<RecordBatch> {
+        let dir = format!(
+            "{}/gold_incremental/{window}",
+            QuickstartTripsTable::V9MorCompactedIncremental.path_to_mor_avro()
+        );
+        hudi_test::gold::read_gold_parquet(&dir)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("gold '{window}': {e}")))
+    }
+
+    async fn assert_matches_gold(window: &str, start: &str, end: &str) -> Result<()> {
+        let actual = read_window(start, end).await?;
+        let gold = gold_for(window)?;
+        hudi_test::gold::compare_against_gold_keyed(&actual, &gold, "uuid")
+            .map_err(|e| CoreError::ReadFileSliceError(format!("window '{window}': {e}")))?;
+        Ok(())
+    }
+
+    /// Opens after the insert, closes on `c`'s update: `a`, `b`, `c` changed.
+    #[tokio::test]
+    async fn a_window_spanning_the_compaction_and_a_later_update() -> Result<()> {
+        assert_matches_gold(
+            "after_insert_through_c",
+            "20260807223524868",
+            "20260807223530767",
+        )
+        .await
+    }
+
+    /// Closes on the compaction: only `a` and `b` had changed by then.
+    #[tokio::test]
+    async fn a_window_closing_on_the_compaction() -> Result<()> {
+        assert_matches_gold(
+            "through_compaction",
+            "20260807223524868",
+            "20260807223529586",
+        )
+        .await
+    }
+
+    /// A window whose bounds fall between one commit's requested and completion
+    /// times, where this crate and Hudi disagree.
+    ///
+    /// Hudi ranges on **completion** time and includes both ends: `b`'s update
+    /// completed at …529143, so it is returned. This crate ranges on
+    /// **requested** time and excludes the start, so …528666 — that same
+    /// commit's requested time — falls outside and nothing is returned.
+    ///
+    /// Two independent differences, both real: closed-vs-open start, and
+    /// completion-vs-requested time. Asserting the current behaviour rather than
+    /// ignoring the case, so that closing either gap trips this test.
+    #[tokio::test]
+    async fn a_window_between_requested_and_completion_time_disagrees() -> Result<()> {
+        let actual = read_window("20260807223528666", "20260807223529143").await?;
+        assert_eq!(
+            actual.num_rows(),
+            0,
+            "this crate returns nothing here; when it starts returning Hudi's \
+             one row, delete this test and fold the window into the gold set"
+        );
+
+        let gold = gold_for("only_b")?;
+        assert_eq!(gold.num_rows(), 1, "Hudi returns b for this window");
+        Ok(())
+    }
+}
