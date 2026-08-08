@@ -2808,3 +2808,79 @@ mod mdt_enabled_tables {
         }
     }
 }
+
+/// A base file written by compaction carries records from every commit it
+/// merged, so an incremental read that admits the file must still drop the
+/// records outside its window.
+///
+/// The fixture's compacted base file holds `a@…526409`, `b@…528666` and
+/// `c`/`d@…522627`. Reading `(…522627, …530452]` admits that file, but `d` has
+/// never been touched inside the window and must not come back. A reader that
+/// decides per file rather than per row returns it, which is the regression
+/// this pins.
+///
+/// Both tests are ignored because they cannot run yet: an incremental read over
+/// *any* MOR table errors first with `Failed to parse file name '' for base
+/// file.` A delta commit that writes only log files records an empty `baseFile`
+/// in its write stat, and `file_groups_from_commit_metadata` treats that as a
+/// base file name (`builder.rs:105`), so it never reaches the merge. The
+/// pre-existing `v9_mor_nonpart_3commits` fixture fails the same way, so this is
+/// not new here; MOR incremental is simply untested — every incremental test in
+/// this file reads a copy-on-write table. Un-ignore once log-only file slices
+/// are modelled.
+mod incremental_over_a_compacted_base_file {
+    use super::*;
+
+    const C1_INSERT_ALL: &str = "20260807223522627";
+    const C5_UPDATE_C: &str = "20260807223530452";
+
+    async fn read_window(merge_engine: Option<&str>) -> Result<Vec<(String, String, f64)>> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let options: Vec<(&str, String)> = match merge_engine {
+            Some(engine) => vec![(HudiReadConfig::MergeEngine.as_ref(), engine.to_string())],
+            None => Vec::new(),
+        };
+        let table = Table::new_with_options(base_url.path(), options).await?;
+
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT_ALL)
+                    .with_end_timestamp(C5_UPDATE_C),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = &records[0].schema();
+        let merged = concat_batches(schema, &records)?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|l, r| l.0.cmp(&r.0));
+        Ok(rows)
+    }
+
+    /// `d` sits in the compacted base file at a commit before the window opens.
+    #[tokio::test]
+    #[ignore = "blocked: incremental reads fail on any MOR table whose delta commits write log-only file slices - see the module comment"]
+    async fn the_engine_drops_a_base_record_from_outside_the_window() -> Result<()> {
+        let rows = read_window(Some("v2")).await?;
+
+        let ids: Vec<&str> = rows.iter().map(|(uuid, _, _)| uuid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b", "c"],
+            "the compacted base file is inside the window, but d's only commit is not"
+        );
+        Ok(())
+    }
+
+    /// The reader in use today reaches the same answer, so the fixture pins
+    /// behaviour rather than one engine's interpretation of it.
+    #[tokio::test]
+    #[ignore = "blocked: incremental reads fail on any MOR table whose delta commits write log-only file slices - see the module comment"]
+    async fn both_engines_agree_on_the_window() -> Result<()> {
+        assert_eq!(read_window(Some("v2")).await?, read_window(None).await?);
+        Ok(())
+    }
+}
