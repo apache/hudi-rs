@@ -2986,14 +2986,12 @@ mod incremental_windows_match_hudi {
     /// A window whose bounds fall between one commit's requested and completion
     /// times, where this crate and Hudi disagree.
     ///
-    /// Hudi ranges on **completion** time and includes both ends: `b`'s update
-    /// completed at …529143, so it is returned. This crate ranges on
-    /// **requested** time and excludes the start, so …528666 — that same
-    /// commit's requested time — falls outside and nothing is returned.
-    ///
-    /// Two independent differences, both real: closed-vs-open start, and
-    /// completion-vs-requested time. Asserting the current behaviour rather than
-    /// ignoring the case, so that closing either gap trips this test.
+    /// Both readers range `(start, end]`; they differ in *which* timestamp they
+    /// compare. Hudi uses the commit's **completion** time (…529143, inside the
+    /// window, so `b` is returned); this crate uses its **requested** time
+    /// (…528666, which is the window's own exclusive start, so nothing is).
+    /// See `v8_mor_boundary_windows` for the four boundary positions that pin
+    /// this down.
     #[tokio::test]
     async fn a_window_between_requested_and_completion_time_disagrees() -> Result<()> {
         let actual = read_window("20260807223528666", "20260807223529143").await?;
@@ -3006,6 +3004,120 @@ mod incremental_windows_match_hudi {
 
         let gold = gold_for("only_b")?;
         assert_eq!(gold.num_rows(), 1, "Hudi returns b for this window");
+        Ok(())
+    }
+}
+
+/// Incremental windows whose bounds land on a commit's requested or completion
+/// time, checked against what Hudi returns for the same window.
+///
+/// Requires a table version 8 or later: only timeline layout v2 names completed
+/// instants `{requested}_{completion}`, so only there can the two disagree.
+///
+/// Measured against Hudi 1.2.0-SNAPSHOT, the two readers follow the same shape
+/// and differ in one input:
+///
+/// | | range | timestamp compared |
+/// |---|---|---|
+/// | Hudi | `(start, end]` | **completion** |
+/// | this crate | `(start, end]` | **requested** |
+///
+/// So they agree whenever a window's bounds fall in the gaps between commits,
+/// and disagree exactly when a bound lands between one commit's requested and
+/// completion times. Hudi's config docs describe the start as inclusive
+/// (`completion_time >= START_COMMIT`); the observed behaviour is exclusive,
+/// which `starting_on_a_completion_time` pins.
+mod incremental_window_boundaries {
+    use super::*;
+
+    /// c3 (`UPDATE b`) is the pivot: requested …723246, completed …723734.
+    const C3_REQUESTED: &str = "20260808010723246";
+    const C3_COMPLETED: &str = "20260808010723734";
+
+    async fn uuids_in_window(start: &str, end: &str) -> Result<Vec<String>> {
+        let base_url = QuickstartTripsTable::V8MorBoundaryWindows.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = records[0].schema();
+        let merged = concat_batches(&schema, &records)?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(uuid, _, _)| uuid).collect())
+    }
+
+    /// What Hudi returned for the same window, read from the fixture's gold.
+    fn hudi_uuids(window: &str) -> Result<Vec<String>> {
+        let dir = format!(
+            "{}/gold_incremental/{window}",
+            QuickstartTripsTable::V8MorBoundaryWindows.path_to_mor_avro()
+        );
+        let gold = hudi_test::gold::read_gold_parquet(&dir)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("gold '{window}': {e}")))?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&gold);
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(uuid, _, _)| uuid).collect())
+    }
+
+    /// Neither bound touches a commit's timestamps, so requested and completion
+    /// time pick the same commits and the readers agree.
+    #[tokio::test]
+    async fn a_window_between_commits_agrees_with_hudi() -> Result<()> {
+        assert_eq!(
+            uuids_in_window("20260808010722500", "20260808010724000").await?,
+            hudi_uuids("between_commits")?,
+        );
+        Ok(())
+    }
+
+    /// Starting on c3's *completion* time excludes c3 from both readers — Hudi
+    /// because its start is exclusive on completion time, this crate because
+    /// c3's requested time is earlier still. Agreement by different routes.
+    #[tokio::test]
+    async fn starting_on_a_completion_time_agrees_with_hudi() -> Result<()> {
+        assert_eq!(
+            uuids_in_window(C3_COMPLETED, "20260808010725000").await?,
+            hudi_uuids("start_on_completion")?,
+        );
+        Ok(())
+    }
+
+    /// Starting on c3's *requested* time: Hudi keeps c3, since it completed
+    /// after the window opened. This crate drops it, since the window's start is
+    /// exclusive and c3's requested time is exactly that start.
+    #[tokio::test]
+    async fn starting_on_a_requested_time_differs_from_hudi() -> Result<()> {
+        assert_eq!(hudi_uuids("start_on_requested")?, vec!["b".to_string()]);
+        assert_eq!(
+            uuids_in_window(C3_REQUESTED, "20260808010724000").await?,
+            Vec::<String>::new(),
+            "when this returns b, fold the window into the agreeing set above"
+        );
+        Ok(())
+    }
+
+    /// A window that opens at c3's requested time and closes at its completion
+    /// time contains exactly that one commit for Hudi, and nothing here.
+    #[tokio::test]
+    async fn a_window_spanning_one_commit_differs_from_hudi() -> Result<()> {
+        assert_eq!(
+            hudi_uuids("requested_to_completion")?,
+            vec!["b".to_string()]
+        );
+        assert_eq!(
+            uuids_in_window(C3_REQUESTED, C3_COMPLETED).await?,
+            Vec::<String>::new(),
+            "when this returns b, fold the window into the agreeing set above"
+        );
         Ok(())
     }
 }
