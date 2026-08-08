@@ -257,10 +257,10 @@ async fn every_fixture_matches_hudi_on_both_engines() {
     // disagreement fails the build, and one that starts passing has to be
     // removed from here, so this list cannot quietly go stale.
     let known: &[(&str, &str)] = &[
-        // A file slice with no base file has no representation yet, so a
-        // log-only table reads as empty.
-        ("table_log_compaction", "log-only file slice"),
-        ("table_log_only", "log-only file slice"),
+        // Legacy only: it now reads a log-only slice but returns it without the
+        // base columns.
+        ("table_log_compaction", "legacy drops the base columns"),
+        ("table_log_only", "legacy drops the base columns"),
         // Legacy only: the partition column comes back as Utf8 from one file
         // slice and Int64 from another, so the batches cannot be concatenated.
         // The merge-on-read engine reads both as Int64 now that it takes the

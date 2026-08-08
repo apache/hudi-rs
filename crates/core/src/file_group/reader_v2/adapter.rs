@@ -63,7 +63,9 @@ pub(crate) async fn read_file_slice(
     context.rebuild_record_context(partition_path.clone());
 
     let input_split = InputSplit::new(
-        Some(base_file_path.to_string()),
+        // A slice with no base file reports an empty path; the engine keys its
+        // log-only handling on `None`, not on an empty string.
+        (!base_file_path.is_empty()).then(|| base_file_path.to_string()),
         None,
         log_file_paths,
         partition_path,

@@ -593,8 +593,18 @@ impl From<&FileSlice> for HudiFileSlice {
         let file_id = f.file_id().to_string();
         let partition_path = f.partition_path.to_string();
         let creation_instant_time = f.creation_instant_time().to_string();
-        let base_file_name = f.base_file.file_name();
-        let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
+        // A slice with no base file reports an empty name and zero sizes rather
+        // than changing the shape of what Python already receives.
+        let base_file_name = f
+            .base_file
+            .as_ref()
+            .map(|b| b.file_name())
+            .unwrap_or_default();
+        let file_metadata = f
+            .base_file
+            .as_ref()
+            .and_then(|b| b.file_metadata.clone())
+            .unwrap_or_default();
         let base_file_size = file_metadata.size;
         let base_file_byte_size = file_metadata.byte_size;
         let log_file_names = f.log_files.iter().map(|l| l.file_name()).collect();

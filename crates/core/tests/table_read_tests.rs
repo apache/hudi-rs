@@ -2678,7 +2678,7 @@ mod lance_tables {
         assert!(
             file_slices.iter().any(|slice| slice
                 .base_file_relative_path()
-                .is_ok_and(|path| path.ends_with(".lance"))),
+                .is_ok_and(|path| path.is_some_and(|p| p.ends_with(".lance")))),
             "table listing should discover .lance base files without an explicit format config"
         );
 

@@ -380,6 +380,10 @@ impl HudiDataSource {
                     e,
                 )
             })?;
+            // No base file: nothing with a parquet footer to prune on.
+            let Some(relative_path) = relative_path else {
+                return Ok(true);
+            };
             if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
                 return Ok(false);
             }
@@ -645,9 +649,18 @@ impl HudiDataSource {
                         e,
                     )
                 })?;
+                // A slice with no base file contributes no parquet file here;
+                // its records come from log files, which this path does not read.
+                let Some(relative_path) = relative_path else {
+                    continue;
+                };
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| external_error("Failed to join URL segments", e))?;
-                let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
+                let size = f
+                    .base_file
+                    .as_ref()
+                    .and_then(|b| b.file_metadata.as_ref())
+                    .map_or(0, |m| m.size);
                 let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }
