@@ -177,6 +177,23 @@ pub enum QuickstartTripsTable {
     /// Commit 3: MERGE INTO UPDATE 3 rows (ids 4,5,6) → .log file 2 (avro data block)
     #[strum(serialize = "v9_mor_nonpart_3commits")]
     V9MorNonpart3Commits,
+    /// v9 MOR non-partitioned, base file written by COMPACTION so it carries
+    /// records from three commits at once.
+    ///
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Timeline (see the sibling `.sql`):
+    ///   `20260807223522627` deltacommit — INSERT a, b, c, d
+    ///   `20260807223526409` deltacommit — UPDATE a  → log
+    ///   `20260807223528666` deltacommit — UPDATE b  → log
+    ///   `20260807223529164` **commit**  — inline COMPACTION; the base file it
+    ///       writes holds a@…526409, b@…528666, c@…522627, d@…522627
+    ///   `20260807223530452` deltacommit — UPDATE c  → log
+    ///   `20260807223531562` deltacommit — UPDATE d  → log
+    ///
+    /// Exists so an incremental read has a base file whose records span the
+    /// window boundary: admitting the file must not admit every record in it.
+    #[strum(serialize = "v9_mor_compacted_incremental")]
+    V9MorCompactedIncremental,
     /// v9 MOR non-partitioned, log-only with compacted log block (5 log files).
     #[strum(serialize = "table_log_compaction")]
     MorLayoutLogCompaction,
