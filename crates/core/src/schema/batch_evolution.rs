@@ -111,7 +111,25 @@ fn is_container(dt: &DataType) -> bool {
     )
 }
 
-fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<ArrayRef> {
+/// Whether `from` -> `to` is a promotion [`evolve_array`] performs, rather than
+/// a difference in how a nested type is named.
+///
+/// A base file written before its column was widened still holds the narrow
+/// type; rebuilding its buffer under the wider one reads past the end.
+pub(crate) fn is_promotion(from: &DataType, to: &DataType) -> bool {
+    matches!(
+        (from, to),
+        (DataType::Int32, DataType::Int64)
+            | (DataType::Float32, DataType::Float64)
+            | (
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+                DataType::Utf8
+            )
+            | (DataType::Float32 | DataType::Float64, DataType::Utf8)
+    )
+}
+
+pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<ArrayRef> {
     let st = src.data_type();
     let tt = target_field.data_type();
     if st == tt {
