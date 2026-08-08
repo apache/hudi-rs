@@ -118,10 +118,15 @@ async fn read_with(engine: &str, table_path: &str) -> Result<RecordBatch, String
     };
     let first = shape(&schema);
     if let Some(odd) = batches.iter().find(|b| shape(&b.schema()) != first) {
+        let diffs: Vec<String> = first
+            .iter()
+            .zip(shape(&odd.schema()))
+            .filter(|(a, b)| *a != b)
+            .map(|(a, b)| format!("{}: {:?} vs {:?}", a.0, a.1, b.1))
+            .collect();
         return Err(format!(
-            "reader returned batches of differing shape: {} columns then {} columns",
-            first.len(),
-            odd.schema().fields().len()
+            "reader returned batches of differing shape: {}",
+            diffs.join("; ")
         ));
     }
     concat_batches(&schema, &batches).map_err(|e| format!("concat failed: {e}"))
@@ -256,8 +261,10 @@ async fn every_fixture_matches_hudi_on_both_engines() {
         // log-only table reads as empty.
         ("table_log_compaction", "log-only file slice"),
         ("table_log_only", "log-only file slice"),
-        // Undiagnosed: 18 columns on both sides, so a type or nested-field
-        // difference between the batches one read returns.
+        // Legacy only: the partition column comes back as Utf8 from one file
+        // slice and Int64 from another, so the batches cannot be concatenated.
+        // The merge-on-read engine reads both as Int64 now that it takes the
+        // table's schema rather than each base file's.
         (
             "v9_timebasedkeygen_epochmillis",
             "batches of differing shape",
