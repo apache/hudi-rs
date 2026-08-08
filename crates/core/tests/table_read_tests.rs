@@ -2818,21 +2818,15 @@ mod mdt_enabled_tables {
 /// never been touched inside the window and must not come back. A reader that
 /// decides per file rather than per row returns it, which is the regression
 /// this pins.
-///
-/// Both tests are ignored because they cannot run yet: an incremental read over
-/// *any* MOR table errors first with `Failed to parse file name '' for base
-/// file.` A delta commit that writes only log files records an empty `baseFile`
-/// in its write stat, and `file_groups_from_commit_metadata` treats that as a
-/// base file name (`builder.rs:105`), so it never reaches the merge. The
-/// pre-existing `v9_mor_nonpart_3commits` fixture fails the same way, so this is
-/// not new here; MOR incremental is simply untested — every incremental test in
-/// this file reads a copy-on-write table. Un-ignore once log-only file slices
-/// are modelled.
 mod incremental_over_a_compacted_base_file {
     use super::*;
 
     const C1_INSERT_ALL: &str = "20260807223522627";
-    const C5_UPDATE_C: &str = "20260807223530452";
+    /// Between `c`'s update completing (…530767) and `d`'s starting (…531562).
+    /// Slice selection compares completion times while the row mask compares
+    /// requested times, so a boundary landing between the two would make the
+    /// test about that difference rather than about the compacted base file.
+    const AFTER_C_BEFORE_D: &str = "20260807223531000";
 
     async fn read_window(merge_engine: Option<&str>) -> Result<Vec<(String, String, f64)>> {
         let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
@@ -2847,7 +2841,7 @@ mod incremental_over_a_compacted_base_file {
                 &ReadOptions::new()
                     .with_query_type(QueryType::Incremental)
                     .with_start_timestamp(C1_INSERT_ALL)
-                    .with_end_timestamp(C5_UPDATE_C),
+                    .with_end_timestamp(AFTER_C_BEFORE_D),
             )
             .await?;
         if records.is_empty() {
@@ -2862,7 +2856,6 @@ mod incremental_over_a_compacted_base_file {
 
     /// `d` sits in the compacted base file at a commit before the window opens.
     #[tokio::test]
-    #[ignore = "blocked: incremental reads fail on any MOR table whose delta commits write log-only file slices - see the module comment"]
     async fn the_engine_drops_a_base_record_from_outside_the_window() -> Result<()> {
         let rows = read_window(Some("v2")).await?;
 
@@ -2878,9 +2871,45 @@ mod incremental_over_a_compacted_base_file {
     /// The reader in use today reaches the same answer, so the fixture pins
     /// behaviour rather than one engine's interpretation of it.
     #[tokio::test]
-    #[ignore = "blocked: incremental reads fail on any MOR table whose delta commits write log-only file slices - see the module comment"]
     async fn both_engines_agree_on_the_window() -> Result<()> {
         assert_eq!(read_window(Some("v2")).await?, read_window(None).await?);
+        Ok(())
+    }
+}
+
+/// Incremental reads over a merge-on-read table whose delta commits only append.
+///
+/// Every update to a merge-on-read table writes a log file and nothing else, and
+/// such a write stat records an empty `baseFile`. Reading one used to fail
+/// outright with `Failed to parse file name '' for base file.`, so no
+/// merge-on-read table could be read incrementally at all — unnoticed because
+/// every other incremental test here reads a copy-on-write table.
+mod incremental_over_append_only_delta_commits {
+    use super::*;
+
+    /// Commit 1 inserts ids 0-6, commit 2 deletes 0,1,2, commit 3 updates 4,5,6.
+    const C1_INSERT: &str = "20260409002001492";
+    const C3_UPDATE: &str = "20260409002003963";
+
+    #[tokio::test]
+    async fn a_log_only_delta_commit_no_longer_breaks_the_read() -> Result<()> {
+        let base_url = QuickstartTripsTable::V9MorNonpart3Commits.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT)
+                    .with_end_timestamp(C3_UPDATE),
+            )
+            .await?;
+
+        let rows: usize = records.iter().map(|batch| batch.num_rows()).sum();
+        assert!(
+            rows > 0,
+            "the window covers a delete and an update commit, so it cannot be empty"
+        );
         Ok(())
     }
 }

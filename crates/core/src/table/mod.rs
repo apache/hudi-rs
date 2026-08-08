@@ -120,7 +120,7 @@ use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
@@ -546,33 +546,31 @@ impl Table {
             .get_file_groups_between(Some(start_timestamp), Some(end_timestamp), estimator)
             .await?;
 
-        // Skip schema fetch and pruner construction when there are no filters.
-        let partition_pruner = if filters.is_empty() {
-            None
-        } else {
-            let partition_schema = self.get_partition_schema().await?;
-            // See `get_file_slices_inner` for why validation uses the
-            // meta-inclusive schema.
-            let table_schema = self.get_schema_with_meta_fields().await?;
-            validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
-            Some(PartitionPruner::new(
-                filters,
-                &partition_schema,
-                self.hudi_configs.as_ref(),
-            )?)
-        };
+        // The commits in range say *which* file groups changed; they are not a
+        // reliable source for the slices themselves. A delta commit that only
+        // appends names no base file, and a commit that writes one does not know
+        // about log files appended after it — so a slice assembled from range
+        // metadata alone is missing either its base file or its newest logs.
+        //
+        // Read the slice that is live at the end of the range instead, exactly
+        // as a snapshot read at `end_timestamp` would. The commit-time mask then
+        // narrows its rows back to the window.
+        let touched: HashSet<(&str, &str)> = file_groups
+            .iter()
+            .map(|file_group| {
+                (
+                    file_group.partition_path.as_str(),
+                    file_group.file_id.as_str(),
+                )
+            })
+            .collect();
 
-        let mut file_slices: Vec<FileSlice> = Vec::new();
-        for file_group in file_groups {
-            if let Some(ref pruner) = partition_pruner
-                && !pruner.should_include(&file_group.partition_path)
-            {
-                continue;
-            }
-            if let Some(file_slice) = file_group.get_file_slice_as_of(end_timestamp) {
-                file_slices.push(file_slice.clone());
-            }
-        }
+        let mut file_slices: Vec<FileSlice> = self
+            .get_file_slices_inner(end_timestamp, filters, base_file_only)
+            .await?
+            .into_iter()
+            .filter(|slice| touched.contains(&(slice.partition_path.as_str(), slice.file_id())))
+            .collect();
 
         if base_file_only {
             for fs in &mut file_slices {

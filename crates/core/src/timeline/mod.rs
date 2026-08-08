@@ -367,11 +367,23 @@ impl Timeline {
 
         for commit in commits {
             let commit_metadata = self.get_instant_metadata(&commit).await?;
-            file_groups.merge(file_groups_from_commit_metadata_with_estimator(
+            let contribution = file_groups_from_commit_metadata_with_estimator(
                 &commit_metadata,
                 &completion_time_view,
                 estimator,
-            )?)?;
+            )?;
+            file_groups.merge(contribution.file_groups)?;
+
+            // A delta commit that only appends names no base file, so it
+            // contributes no slice — but the file group it touched still
+            // changed in the range, and the caller reads it as of the range's
+            // end. Carry the identity alone.
+            for unattached in contribution.unattached_log_files {
+                let touched = FileGroup::new(unattached.file_id, unattached.partition);
+                if !file_groups.contains(&touched) {
+                    file_groups.insert(touched);
+                }
+            }
 
             if commit.is_replacecommit() {
                 replaced_file_groups
