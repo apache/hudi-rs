@@ -66,6 +66,17 @@ pub struct LogFile {
 const LOG_FILE_PREFIX: char = '.';
 
 impl LogFile {
+    /// Whether a file name is a log file's rather than a base file's.
+    ///
+    /// A log-only write stat names its log file in `path`, where a base file
+    /// name would otherwise be expected, so the two have to be told apart
+    /// before either is parsed.
+    pub fn is_log_file_name(file_name: &str) -> bool {
+        file_name.starts_with(LOG_FILE_PREFIX)
+    }
+}
+
+impl LogFile {
     /// Parse a log file's name into parts.
     ///
     /// File name format:
