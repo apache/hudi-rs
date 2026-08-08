@@ -194,6 +194,26 @@ pub enum QuickstartTripsTable {
     /// window boundary: admitting the file must not admit every record in it.
     #[strum(serialize = "v9_mor_compacted_incremental")]
     V9MorCompactedIncremental,
+    /// v8 MOR non-partitioned, four delta commits, for incremental windows whose
+    /// bounds land on a commit's requested or completion time.
+    ///
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Table version 8, timeline layout v2 — so every completed instant is named
+    /// `{requested}_{completion}` and the two differ. That is what makes the
+    /// boundary cases expressible; a v6 table has no completion time to disagree
+    /// about.
+    ///
+    ///   `20260808010716256_20260808010719396` INSERT a, b, c, d
+    ///   `20260808010720902_20260808010722082` UPDATE a
+    ///   `20260808010723246_20260808010723734` UPDATE b   <- the pivot
+    ///   `20260808010724567_20260808010724916` UPDATE c
+    ///
+    /// `gold_incremental/` holds what Hudi returns for four windows placed
+    /// around that third commit: between commits, starting on its requested
+    /// time, starting on its completion time, and spanning requested to
+    /// completion.
+    #[strum(serialize = "v8_mor_boundary_windows")]
+    V8MorBoundaryWindows,
     /// v9 MOR non-partitioned, log-only with compacted log block (5 log files).
     #[strum(serialize = "table_log_compaction")]
     MorLayoutLogCompaction,
