@@ -2828,20 +2828,19 @@ mod incremental_over_a_compacted_base_file {
     /// test about that difference rather than about the compacted base file.
     const AFTER_C_BEFORE_D: &str = "20260807223531000";
 
-    async fn read_window(merge_engine: Option<&str>) -> Result<Vec<(String, String, f64)>> {
+    async fn read_window(merge_engine: &str) -> Result<Vec<(String, String, f64)>> {
         let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
-        let options: Vec<(&str, String)> = match merge_engine {
-            Some(engine) => vec![(HudiReadConfig::MergeEngine.as_ref(), engine.to_string())],
-            None => Vec::new(),
-        };
-        let table = Table::new_with_options(base_url.path(), options).await?;
+        let table = Table::new(base_url.path()).await?;
 
+        // The engine has to travel with the read: `Table::build` strips every
+        // `hoodie.read.*` key from the table's own configs.
         let records = table
             .read(
                 &ReadOptions::new()
                     .with_query_type(QueryType::Incremental)
                     .with_start_timestamp(C1_INSERT_ALL)
-                    .with_end_timestamp(AFTER_C_BEFORE_D),
+                    .with_end_timestamp(AFTER_C_BEFORE_D)
+                    .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), merge_engine),
             )
             .await?;
         if records.is_empty() {
@@ -2857,7 +2856,7 @@ mod incremental_over_a_compacted_base_file {
     /// `d` sits in the compacted base file at a commit before the window opens.
     #[tokio::test]
     async fn the_engine_drops_a_base_record_from_outside_the_window() -> Result<()> {
-        let rows = read_window(Some("v2")).await?;
+        let rows = read_window("v2").await?;
 
         let ids: Vec<&str> = rows.iter().map(|(uuid, _, _)| uuid.as_str()).collect();
         assert_eq!(
@@ -2872,7 +2871,7 @@ mod incremental_over_a_compacted_base_file {
     /// behaviour rather than one engine's interpretation of it.
     #[tokio::test]
     async fn both_engines_agree_on_the_window() -> Result<()> {
-        assert_eq!(read_window(Some("v2")).await?, read_window(None).await?);
+        assert_eq!(read_window("v2").await?, read_window("legacy").await?);
         Ok(())
     }
 }
@@ -2924,15 +2923,22 @@ mod incremental_over_append_only_delta_commits {
 mod incremental_windows_match_hudi {
     use super::*;
 
-    async fn read_window(start: &str, end: &str) -> Result<RecordBatch> {
+    /// Both engines, so the comparison covers the reader being shipped as well
+    /// as the one it replaces.
+    const ENGINES: [&str; 2] = ["legacy", "v2"];
+
+    async fn read_window(engine: &str, start: &str, end: &str) -> Result<RecordBatch> {
         let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
         let table = Table::new(base_url.path()).await?;
+        // The engine has to travel with the read: `Table::build` strips every
+        // `hoodie.read.*` key from the table's own configs.
         let records = table
             .read(
                 &ReadOptions::new()
                     .with_query_type(QueryType::Incremental)
                     .with_start_timestamp(start)
-                    .with_end_timestamp(end),
+                    .with_end_timestamp(end)
+                    .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine),
             )
             .await?;
         if records.is_empty() {
@@ -2954,10 +2960,13 @@ mod incremental_windows_match_hudi {
     }
 
     async fn assert_matches_gold(window: &str, start: &str, end: &str) -> Result<()> {
-        let actual = read_window(start, end).await?;
         let gold = gold_for(window)?;
-        hudi_test::gold::compare_against_gold_keyed(&actual, &gold, "uuid")
-            .map_err(|e| CoreError::ReadFileSliceError(format!("window '{window}': {e}")))?;
+        for engine in ENGINES {
+            let actual = read_window(engine, start, end).await?;
+            hudi_test::gold::compare_against_gold_keyed(&actual, &gold, "uuid").map_err(|e| {
+                CoreError::ReadFileSliceError(format!("window '{window}', engine '{engine}': {e}"))
+            })?;
+        }
         Ok(())
     }
 
@@ -2994,14 +3003,15 @@ mod incremental_windows_match_hudi {
     /// this down.
     #[tokio::test]
     async fn a_window_between_requested_and_completion_time_disagrees() -> Result<()> {
-        let actual = read_window("20260807223528666", "20260807223529143").await?;
-        assert_eq!(
-            actual.num_rows(),
-            0,
-            "this crate returns nothing here; when it starts returning Hudi's \
-             one row, delete this test and fold the window into the gold set"
-        );
-
+        for engine in ENGINES {
+            let actual = read_window(engine, "20260807223528666", "20260807223529143").await?;
+            assert_eq!(
+                actual.num_rows(),
+                0,
+                "engine '{engine}': this crate returns nothing here; when it starts \
+                 returning Hudi's one row, fold the window into the gold set"
+            );
+        }
         let gold = gold_for("only_b")?;
         assert_eq!(gold.num_rows(), 1, "Hudi returns b for this window");
         Ok(())
@@ -3034,15 +3044,22 @@ mod incremental_window_boundaries {
     const C3_REQUESTED: &str = "20260808010723246";
     const C3_COMPLETED: &str = "20260808010723734";
 
-    async fn uuids_in_window(start: &str, end: &str) -> Result<Vec<String>> {
+    /// Both engines, so the comparison covers the reader being shipped as well
+    /// as the one it replaces.
+    const ENGINES: [&str; 2] = ["legacy", "v2"];
+
+    async fn uuids_in_window(engine: &str, start: &str, end: &str) -> Result<Vec<String>> {
         let base_url = QuickstartTripsTable::V8MorBoundaryWindows.url_to_mor_avro();
         let table = Table::new(base_url.path()).await?;
+        // The engine has to travel with the read: `Table::build` strips every
+        // `hoodie.read.*` key from the table's own configs.
         let records = table
             .read(
                 &ReadOptions::new()
                     .with_query_type(QueryType::Incremental)
                     .with_start_timestamp(start)
-                    .with_end_timestamp(end),
+                    .with_end_timestamp(end)
+                    .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine),
             )
             .await?;
         if records.is_empty() {
@@ -3072,10 +3089,14 @@ mod incremental_window_boundaries {
     /// time pick the same commits and the readers agree.
     #[tokio::test]
     async fn a_window_between_commits_agrees_with_hudi() -> Result<()> {
-        assert_eq!(
-            uuids_in_window("20260808010722500", "20260808010724000").await?,
-            hudi_uuids("between_commits")?,
-        );
+        let hudi = hudi_uuids("between_commits")?;
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, "20260808010722500", "20260808010724000").await?,
+                hudi,
+                "engine '{engine}'"
+            );
+        }
         Ok(())
     }
 
@@ -3084,10 +3105,14 @@ mod incremental_window_boundaries {
     /// c3's requested time is earlier still. Agreement by different routes.
     #[tokio::test]
     async fn starting_on_a_completion_time_agrees_with_hudi() -> Result<()> {
-        assert_eq!(
-            uuids_in_window(C3_COMPLETED, "20260808010725000").await?,
-            hudi_uuids("start_on_completion")?,
-        );
+        let hudi = hudi_uuids("start_on_completion")?;
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, C3_COMPLETED, "20260808010725000").await?,
+                hudi,
+                "engine '{engine}'"
+            );
+        }
         Ok(())
     }
 
@@ -3097,11 +3122,14 @@ mod incremental_window_boundaries {
     #[tokio::test]
     async fn starting_on_a_requested_time_differs_from_hudi() -> Result<()> {
         assert_eq!(hudi_uuids("start_on_requested")?, vec!["b".to_string()]);
-        assert_eq!(
-            uuids_in_window(C3_REQUESTED, "20260808010724000").await?,
-            Vec::<String>::new(),
-            "when this returns b, fold the window into the agreeing set above"
-        );
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, C3_REQUESTED, "20260808010724000").await?,
+                Vec::<String>::new(),
+                "engine '{engine}': when this returns b, fold the window into \
+                 the agreeing set above"
+            );
+        }
         Ok(())
     }
 
@@ -3113,11 +3141,14 @@ mod incremental_window_boundaries {
             hudi_uuids("requested_to_completion")?,
             vec!["b".to_string()]
         );
-        assert_eq!(
-            uuids_in_window(C3_REQUESTED, C3_COMPLETED).await?,
-            Vec::<String>::new(),
-            "when this returns b, fold the window into the agreeing set above"
-        );
+        for engine in ENGINES {
+            assert_eq!(
+                uuids_in_window(engine, C3_REQUESTED, C3_COMPLETED).await?,
+                Vec::<String>::new(),
+                "engine '{engine}': when this returns b, fold the window into \
+                 the agreeing set above"
+            );
+        }
         Ok(())
     }
 }
