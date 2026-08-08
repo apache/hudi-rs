@@ -158,6 +158,16 @@ pub(crate) fn reconcile_batch_to_schema(
             if source_col.data_type() == target_field.data_type() {
                 return Ok(source_col.clone());
             }
+            // A base file written before a column was promoted holds the narrow
+            // type, and the target is the table's current one. That is a real
+            // value conversion, not a naming difference, so cast it the way the
+            // evolution path does rather than reinterpreting the buffer.
+            if crate::schema::batch_evolution::is_promotion(
+                source_col.data_type(),
+                target_field.data_type(),
+            ) {
+                return crate::schema::batch_evolution::evolve_array(source_col, target_field);
+            }
             // ONLY name-metadata reconciliation (arrow-avro "item"/"entries" vs
             // parquet "element"/"key_value" child field names, plus avro.name/
             // avro.namespace metadata on nested fields): rebuild ArrayData under
