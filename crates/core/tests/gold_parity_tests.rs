@@ -252,16 +252,12 @@ async fn every_fixture_matches_hudi_on_both_engines() {
     // disagreement fails the build, and one that starts passing has to be
     // removed from here, so this list cannot quietly go stale.
     let known: &[(&str, &str)] = &[
-        // The read schema comes from the base file, which is stale whenever a
-        // later writer widened a column or added one. Values are silently
-        // truncated (i64 into i32) or dropped.
-        ("table_evo_add_col", "schema resolved from the base file"),
-        ("table_evo_promotion", "schema resolved from the base file"),
-        // A file slice with no base file has no representation yet.
+        // A file slice with no base file has no representation yet, so a
+        // log-only table reads as empty.
         ("table_log_compaction", "log-only file slice"),
         ("table_log_only", "log-only file slice"),
         // Undiagnosed: 18 columns on both sides, so a type or nested-field
-        // difference between batches.
+        // difference between the batches one read returns.
         (
             "v9_timebasedkeygen_epochmillis",
             "batches of differing shape",
@@ -270,8 +266,10 @@ async fn every_fixture_matches_hudi_on_both_engines() {
             "v9_timebasedkeygen_unixtimestamp",
             "batches of differing shape",
         ),
-        // The legacy merger concatenates a partial-update log block onto a
-        // wider base batch without checking, and panics.
+        // Legacy only, all fixed in the merge-on-read engine:
+        // it concatenates a partial-update log block onto a wider base batch
+        // without checking and panics; it models an avro map's entries field
+        // differently between base and log; and it keeps a superseded row.
         (
             "table_partial_update",
             "legacy panics on a partial-update block",
@@ -287,6 +285,14 @@ async fn every_fixture_matches_hudi_on_both_engines() {
         (
             "table_null_containers",
             "legacy models an avro map's entries field",
+        ),
+        (
+            "table_evo_promotion",
+            "legacy cannot widen a promoted column",
+        ),
+        (
+            "table_evo_add_col",
+            "legacy drops a column added by a later writer",
         ),
         ("v9_mor_nonpart_3commits", "legacy returns a stale row"),
     ];

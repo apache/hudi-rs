@@ -376,6 +376,19 @@ impl Table {
         self.get_schema_inner(true).await
     }
 
+    /// The schema a file slice's records actually carry.
+    ///
+    /// Meta fields are only in the data when the table populates them; handing
+    /// a reader a schema that names columns the files do not have fails the
+    /// evolution step rather than helping it.
+    async fn data_schema_for_read(&self) -> Result<Schema> {
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        self.get_schema_inner(populates_meta_fields).await
+    }
+
     async fn get_schema_inner(&self, includes_meta_fields: bool) -> Result<Schema> {
         if includes_meta_fields {
             resolve_schema(self).await
@@ -682,10 +695,14 @@ impl Table {
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.build_file_group_reader(
+        let mut fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
+        // The table's current schema, not the base file's: a base file written
+        // before a column was widened or added would otherwise force the newer
+        // records back into its own narrower shape.
+        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
         let fg_options = self.options_for_file_group(prepared);
         let batches = futures::future::try_join_all(
             file_slices
@@ -705,10 +722,14 @@ impl Table {
         let file_slices = self
             .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
-        let fg_reader = self.build_file_group_reader(
+        let mut fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
+        // The table's current schema, not the base file's: a base file written
+        // before a column was widened or added would otherwise force the newer
+        // records back into its own narrower shape.
+        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
         let fg_options = self.options_for_file_group(prepared);
 
         let batches = futures::future::try_join_all(
@@ -841,10 +862,14 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let fg_reader = self.build_file_group_reader(
+        let mut fg_reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
+        // The table's current schema, not the base file's: a base file written
+        // before a column was widened or added would otherwise force the newer
+        // records back into its own narrower shape.
+        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
