@@ -79,6 +79,9 @@ impl MetadataTableFileGroupReader {
         };
 
         // Open HFile
+        let base_file_path = base_file_path.ok_or_else(|| {
+            ReadFileSliceError("Metadata table file slice has no base file".to_string())
+        })?;
         let mut hfile_reader = HFileReader::open(&self.storage, &base_file_path)
             .await
             .map_err(|e| {

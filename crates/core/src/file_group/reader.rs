@@ -177,6 +177,11 @@ impl FileGroupReader {
     /// Used by the merge path so options aren't applied prematurely before merging
     /// with log files.
     async fn read_base_file_eager(&self, relative_path: &str) -> Result<RecordBatch> {
+        // A file slice whose records live entirely in log files has no base
+        // file, and reports its path as empty.
+        if relative_path.is_empty() {
+            return Ok(RecordBatch::new_empty(MetaField::schema()));
+        }
         let reader = self.reader_for_path(relative_path)?;
         let records: RecordBatch = reader
             .read_data(relative_path, BaseFileReadOptions::default())
@@ -333,8 +338,14 @@ impl FileGroupReader {
         } else {
             vec![]
         };
-        self.read_file_slice_from_paths(&base_file_path, log_file_paths, options)
-            .await
+        // A slice with no base file reads entirely from its logs; the engine
+        // takes an empty base path for that.
+        self.read_file_slice_from_paths(
+            base_file_path.as_deref().unwrap_or(""),
+            log_file_paths,
+            options,
+        )
+        .await
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -448,8 +459,8 @@ impl FileGroupReader {
         let base_file_path = file_slice.base_file_relative_path()?;
         let known_base_file_size = file_slice
             .base_file
-            .file_metadata
             .as_ref()
+            .and_then(|f| f.file_metadata.as_ref())
             .map(|metadata| metadata.size);
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
             file_slice
@@ -462,7 +473,7 @@ impl FileGroupReader {
         };
 
         self.read_file_slice_from_paths_stream_inner(
-            &base_file_path,
+            base_file_path.as_deref().unwrap_or(""),
             log_file_paths,
             options,
             known_base_file_size,
@@ -1214,7 +1225,7 @@ mod tests {
 
         // Sanity-check: same call without populated metadata reads the same rows.
         let mut bare_slice = file_slice.clone();
-        bare_slice.base_file.file_metadata = None;
+        bare_slice.base_file.as_mut().unwrap().file_metadata = None;
         let bare_total: usize = {
             let mut s = reader.read_file_slice_stream(&bare_slice, &options).await?;
             let mut sum = 0;

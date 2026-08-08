@@ -152,7 +152,6 @@ impl FileLister {
         }
 
         let mut file_groups: Vec<FileGroup> = Vec::new();
-        // TODO support creating file groups without base files
         for (file_id, base_files) in file_id_to_base_files.into_iter() {
             let mut file_group = FileGroup::new(file_id.to_owned(), partition_path.to_string());
 
@@ -161,6 +160,17 @@ impl FileLister {
             let log_files = file_id_to_log_files.remove(&file_id).unwrap_or_default();
             file_group.add_log_files(log_files)?;
 
+            file_groups.push(file_group);
+        }
+
+        // Whatever log files are left belong to file groups with no base file:
+        // inserts that went straight to a log file, which is what Flink
+        // ingestion, a bucket index's first write to a bucket, and any
+        // merge-on-read file group before its first compaction all produce.
+        // Dropping them loses every record in the group.
+        for (file_id, log_files) in file_id_to_log_files.into_iter() {
+            let mut file_group = FileGroup::new(file_id, partition_path.to_string());
+            file_group.add_log_files(log_files)?;
             file_groups.push(file_group);
         }
         Ok(file_groups)
@@ -332,7 +342,7 @@ mod test {
         let extensions: HashSet<_> = file_groups
             .iter()
             .flat_map(|fg| fg.file_slices.values())
-            .map(|slice| slice.base_file.extension.as_str())
+            .map(|slice| slice.base_file.as_ref().unwrap().extension.as_str())
             .collect();
 
         assert_eq!(extensions, HashSet::from(["lance", "parquet"]));

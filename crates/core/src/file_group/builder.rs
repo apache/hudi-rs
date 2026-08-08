@@ -110,12 +110,13 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
 
         let Some(base_file_name) = base_file_name else {
             for log_file_name in log_file_names_in(write_stat) {
-                let mut log_file = LogFile::from_str(&log_file_name)?;
-                log_file.set_completion_time(completion_time_view);
+                // Parsed to reject a malformed name here rather than later; the
+                // file group's identity is all the incremental path needs, since
+                // it reads the slice live at the range's end.
+                LogFile::from_str(&log_file_name)?;
                 unattached_log_files.push(UnattachedLogFile {
                     partition: partition.clone(),
                     file_id: file_id.clone(),
-                    log_file,
                 });
             }
             continue;
@@ -175,7 +176,6 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
 pub(crate) struct UnattachedLogFile {
     pub partition: String,
     pub file_id: String,
-    pub log_file: LogFile,
 }
 
 /// What one commit's metadata contributes to an incremental read.
@@ -613,7 +613,7 @@ mod tests {
             assert_eq!(file_group.file_slices.len(), 1);
             let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
             assert_eq!(
-                file_slice.base_file.file_name(),
+                file_slice.base_file.as_ref().unwrap().file_name(),
                 "file-id-0_0-7-24_20240418173200000.parquet"
             );
             assert_eq!(file_slice.log_files.len(), 2);
@@ -691,7 +691,7 @@ mod tests {
             let file_group = file_groups.iter().next().unwrap();
             let file_slice = file_group.file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -720,7 +720,13 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(file_slice.log_files.is_empty());
-            let m = file_slice.base_file.file_metadata.as_ref().unwrap();
+            let m = file_slice
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert_eq!(m.name, "fid-0_0-7-24_20240418173200000.parquet");
             assert_eq!(m.size, 4096);
             assert_eq!(m.byte_size, 0);
@@ -761,6 +767,8 @@ mod tests {
                 .next()
                 .unwrap()
                 .base_file
+                .as_ref()
+                .unwrap()
                 .file_metadata
                 .as_ref()
                 .unwrap();
@@ -804,7 +812,14 @@ mod tests {
                 .unwrap();
 
             assert_eq!(file_slice.log_files.len(), 1);
-            assert!(file_slice.base_file.file_metadata.is_none());
+            assert!(
+                file_slice
+                    .base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .is_none()
+            );
         }
 
         #[test]
@@ -828,7 +843,7 @@ mod tests {
                 .values()
                 .next()
                 .unwrap();
-            assert!(fs.base_file.file_metadata.is_none());
+            assert!(fs.base_file.as_ref().unwrap().file_metadata.is_none());
         }
     }
 
@@ -1241,7 +1256,7 @@ mod tests {
             // Verify completion timestamp was set
             let file_slice = file_groups[0].file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -1463,7 +1478,7 @@ mod tests {
             let extensions: HashSet<_> = file_groups
                 .iter()
                 .flat_map(|fg| fg.file_slices.values())
-                .map(|slice| slice.base_file.extension.as_str())
+                .map(|slice| slice.base_file.as_ref().unwrap().extension.as_str())
                 .collect();
 
             assert_eq!(extensions, HashSet::from(["lance", "parquet"]));
@@ -1495,7 +1510,13 @@ mod tests {
             let file_groups = file_groups_map.get("partition1").unwrap();
             let fg = &file_groups[0];
             let (_, file_slice) = fg.file_slices.iter().next().unwrap();
-            let metadata = file_slice.base_file.file_metadata.as_ref().unwrap();
+            let metadata = file_slice
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert_eq!(metadata.size, 5000); // on-disk size
             assert_eq!(metadata.byte_size, 10000); // 5000 * 2.0
             assert_eq!(metadata.num_records, 20); // 5000 / 250
