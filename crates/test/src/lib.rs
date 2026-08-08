@@ -417,6 +417,20 @@ impl QuickstartTripsTable {
         path_buf.to_str().unwrap().to_string()
     }
 
+    /// Where this fixture's Spark snapshot lives.
+    ///
+    /// Beside the table directory, never inside it: a full-table read lists the
+    /// table's own directory, and a stray parquet under it is picked up as a
+    /// base file (or a partition) and fails the read.
+    pub fn gold_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_data")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
     pub fn path_to_cow(&self) -> String {
         self.path(TableFormat::Cow)
     }
@@ -561,6 +575,20 @@ impl SampleTable {
         let zip_path = self.zip_path_for(format);
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
+    }
+
+    /// Where this fixture's Spark snapshot lives.
+    ///
+    /// Beside the table directory, never inside it: a full-table read lists the
+    /// table's own directory, and a stray parquet under it is picked up as a
+    /// base file (or a partition) and fails the read.
+    pub fn gold_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_data")
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     pub fn path_fresh(&self, format: TableFormat) -> String {

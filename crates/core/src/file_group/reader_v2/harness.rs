@@ -962,7 +962,7 @@ pub async fn try_run_case(case: &FgReaderCase) -> std::result::Result<(), String
             rows,
         } => validate_rows(&batch, sort_key, columns, rows),
         Expected::GoldParquet => {
-            let gold_dir = format!("{}/gold_data", case.fixture.path_to_mor_avro());
+            let gold_dir = case.fixture.gold_dir(hudi_test::TableFormat::MorAvro);
             validate_gold(&batch, &gold_dir)
         }
         Expected::Custom { rows, validate } => {
