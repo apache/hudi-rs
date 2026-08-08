@@ -56,6 +56,14 @@ pub struct FileGroupReader {
     storage: Arc<Storage>,
     base_file_format: BaseFileFormatValue,
     base_file_reader: Option<Arc<dyn BaseFileReader>>,
+    /// The schema to read a slice with, when the caller knows the table's
+    /// current one.
+    ///
+    /// The base file's own schema is stale whenever a later writer widened a
+    /// column or added one: its values would be forced back into the narrower
+    /// base types. A caller holding the timeline knows better; one reading from
+    /// paths alone (the cxx bridge) does not, and falls back to the base file.
+    data_schema_override: Option<arrow_schema::SchemaRef>,
 }
 
 impl std::fmt::Debug for FileGroupReader {
@@ -96,6 +104,7 @@ impl FileGroupReader {
             storage,
             base_file_format: format,
             base_file_reader,
+            data_schema_override: None,
         })
     }
 
@@ -125,6 +134,7 @@ impl FileGroupReader {
             storage,
             base_file_format: format,
             base_file_reader,
+            data_schema_override: None,
         })
     }
 
@@ -222,6 +232,11 @@ impl FileGroupReader {
         }
     }
 
+    /// Read slices with `schema` rather than whatever the base file carries.
+    pub(crate) fn set_data_schema(&mut self, schema: arrow_schema::SchemaRef) {
+        self.data_schema_override = Some(schema);
+    }
+
     /// The schema the merge-on-read reader needs up front, taken from the base
     /// file itself.
     ///
@@ -236,6 +251,9 @@ impl FileGroupReader {
         &self,
         base_file_path: &str,
     ) -> Result<Option<arrow_schema::SchemaRef>> {
+        if let Some(schema) = &self.data_schema_override {
+            return Ok(Some(schema.clone()));
+        }
         let stream = self
             .reader_for_path(base_file_path)?
             .read_stream(base_file_path, BaseFileReadOptions::default())
