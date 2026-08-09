@@ -31,6 +31,7 @@ use url::Url;
 use zip::ZipArchive;
 
 pub mod gold;
+pub mod gold_options;
 pub mod util;
 
 #[cfg(feature = "datafusion")]
@@ -431,6 +432,18 @@ impl QuickstartTripsTable {
             .to_string()
     }
 
+    /// Where this fixture's per-read-option snapshots live, one subdirectory per
+    /// case plus the manifest naming them. Beside the table directory for the
+    /// same reason [`Self::gold_dir`] is. See [`crate::gold_options`].
+    pub fn option_cases_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_options")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
     pub fn path_to_cow(&self) -> String {
         self.path(TableFormat::Cow)
     }
@@ -586,6 +599,18 @@ impl SampleTable {
         let zip_path = self.zip_path_for(format);
         extract_test_table(zip_path.as_ref())
             .join("gold_data")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Where this fixture's per-read-option snapshots live, one subdirectory per
+    /// case plus the manifest naming them. Beside the table directory for the
+    /// same reason [`Self::gold_dir`] is. See [`crate::gold_options`].
+    pub fn option_cases_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_options")
             .to_str()
             .unwrap()
             .to_string()

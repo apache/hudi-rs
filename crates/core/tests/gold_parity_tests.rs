@@ -28,22 +28,98 @@
 //! the version / keygen / partitioning / log-format grid rather than the handful
 //! of fixtures that happened to get attention.
 //!
-//! A fixture with no `gold_data/` is skipped and counted. Skipping silently is
-//! how a corpus ends up looking covered when it is not, so the count is
-//! asserted at the end.
+//! # The option matrix
+//!
+//! A `SELECT *` snapshot only proves the engines agree when nothing is asked of
+//! them. Projection is where they differ structurally — it reaches the base file
+//! read, the log-block decode and the post-merge trim by different routes — so a
+//! fixture may additionally ship `gold_options/`: one Spark snapshot per read
+//! option case, plus a manifest naming the cases.
+//!
+//! That manifest is written by the generator that produces the snapshots
+//! (`crates/test/data/quickstart_trips_table/mor/avro/gold_options.scala`) and
+//! is only *read* here. A case is therefore never spelled out twice, so this
+//! test and the generator cannot come to disagree about what a case means. Which
+//! cases a fixture ships depends on the fixture — a table declaring no ordering
+//! field has no `drop_ordering` case — so nothing here may assume a fixed set.
+//!
+//! # Skipping
+//!
+//! A fixture with no `gold_data/` is skipped, and so is one with no
+//! `gold_options/`. Skipping silently is how a corpus ends up looking covered
+//! when it is not, so both sets are asserted against a written-down expectation
+//! rather than merely printed.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use arrow::compute::concat_batches;
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use hudi_core::config::read::HudiReadConfig;
 use hudi_core::table::{ReadOptions, Table};
+use hudi_test::gold_options::{OptionCase, has_option_manifest, read_option_manifest};
 use hudi_test::{QuickstartTripsTable, SampleTable, TableFormat};
 use strum::IntoEnumIterator;
 
 /// The readers under comparison. `legacy` is what ships today.
 const ENGINES: [&str; 2] = ["legacy", "v2"];
+
+/// Rendered stand-in for a NULL, at any depth.
+///
+/// Rendering with an explicit token is what lets a null be told apart from an
+/// empty value: with the default options both a NULL cell and `""` render to
+/// `""`, and — the case that matters for the container fixtures — so do a null
+/// list element and an empty one. `FormatOptions` is handed to nested child
+/// formatters too, so this reaches inside lists, maps and structs, where a
+/// positional `is_null` check cannot.
+const NULL_TOKEN: &str = "<null>";
+
+/// Fixtures shipping no `gold_data/`, and why.
+///
+/// Lance fixtures have no Spark snapshot; `table_hfile_log_block` was dumped
+/// against a reader with no HFile support, so what it should assert is still an
+/// open question. Asserted rather than printed so a fixture cannot quietly stop
+/// being compared.
+const EXPECTED_WITHOUT_GOLD: &[&str] = &[
+    "table_hfile_log_block [MorAvro]",
+    "v9_lance_nonhivestyle [MorAvro]",
+    "v9_lance_nonpartitioned [Cow]",
+    "v9_lance_txns_nonpart [Cow]",
+    "v9_lance_txns_simple [Cow]",
+    "v9_trips_lance [Cow]",
+    "v9_trips_lance [MorAvro]",
+];
+
+/// Fixtures shipping a `gold_options/` manifest.
+///
+/// The option matrix currently covers the merge-on-read corpus; a fixture that
+/// stops shipping a manifest, or one that starts, has to be reflected here.
+const EXPECTED_OPTION_FIXTURES: &[&str] = &[
+    "table_all_data_types [MorAvro]",
+    "table_column_projection [MorAvro]",
+    "table_corrupt_tail_block [MorAvro]",
+    "table_delete_ord_decimal [MorAvro]",
+    "table_delete_ord_double [MorAvro]",
+    "table_delete_ord_int [MorAvro]",
+    "table_delete_ord_long [MorAvro]",
+    "table_delete_ord_string [MorAvro]",
+    "table_delete_ord_timestamp [MorAvro]",
+    "table_evo_add_col [MorAvro]",
+    "table_evo_promotion [MorAvro]",
+    "table_log_compaction [MorAvro]",
+    "table_log_only [MorAvro]",
+    "table_null_containers [MorAvro]",
+    "table_parquet_log_block [MorAvro]",
+    "table_partial_update [MorAvro]",
+    "v6_trips_8i1u [MorAvro]",
+    "v6_trips_8i3d [MorAvro]",
+    "v8_mor_boundary_windows [MorAvro]",
+    "v8_trips_8i3u1d [MorAvro]",
+    "v9_mor_8i4u_commit_time [MorAvro]",
+    "v9_mor_compacted_incremental [MorAvro]",
+    "v9_mor_nonpart_3commits [MorAvro]",
+];
 
 /// One fixture in one on-disk format.
 struct Fixture {
@@ -51,6 +127,7 @@ struct Fixture {
     format: TableFormat,
     table_path: String,
     gold_dir_owned: String,
+    options_dir_owned: String,
 }
 
 impl Fixture {
@@ -65,6 +142,10 @@ impl Fixture {
     fn has_gold(&self) -> bool {
         Path::new(&self.gold_dir()).is_dir()
     }
+
+    fn has_option_cases(&self) -> bool {
+        has_option_manifest(&self.options_dir_owned)
+    }
 }
 
 /// Every fixture on disk, in every format it ships in.
@@ -77,6 +158,7 @@ fn all_fixtures() -> Vec<Fixture> {
                 format,
                 table_path: table.path(format),
                 gold_dir_owned: table.gold_dir(format),
+                options_dir_owned: table.option_cases_dir(format),
             });
         }
     }
@@ -87,18 +169,28 @@ fn all_fixtures() -> Vec<Fixture> {
                 format,
                 table_path: table.path(format),
                 gold_dir_owned: table.gold_dir(format),
+                options_dir_owned: table.option_cases_dir(format),
             });
         }
     }
     fixtures
 }
 
-async fn read_with(engine: &str, table_path: &str) -> Result<RecordBatch, String> {
+async fn read_with(
+    engine: &str,
+    table_path: &str,
+    projection: Option<&[String]>,
+) -> Result<RecordBatch, String> {
     let table = Table::new(table_path)
         .await
         .map_err(|e| format!("open failed: {e}"))?;
+    let mut options =
+        ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine);
+    if let Some(columns) = projection {
+        options = options.with_projection(columns.to_vec());
+    }
     let batches = table
-        .read(&ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine))
+        .read(&options)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     if batches.is_empty() {
@@ -132,13 +224,14 @@ async fn read_with(engine: &str, table_path: &str) -> Result<RecordBatch, String
     concat_batches(&schema, &batches).map_err(|e| format!("concat failed: {e}"))
 }
 
-/// Compare one fixture under one engine, returning a failure description.
+/// Compare one fixture's full read under one engine, returning a failure
+/// description.
 ///
 /// Rows are compared as a multiset — every user column rendered, then both
 /// sides sorted — rather than positionally against a key. Several fixtures
 /// carry duplicate record keys, so there is no column that identifies a row.
 async fn compare_owned(table_path: &str, gold_dir: &str, engine: &str) -> Result<(), String> {
-    let actual = read_with(engine, table_path).await?;
+    let actual = read_with(engine, table_path, None).await?;
     let gold = match hudi_test::gold::read_gold_parquet(gold_dir) {
         Ok(gold) => gold,
         // Spark writes a snapshot with no row groups for an empty table, which
@@ -156,8 +249,56 @@ async fn compare_owned(table_path: &str, gold_dir: &str, engine: &str) -> Result
         .filter(|n| !n.starts_with("_hoodie_"))
         .collect();
 
-    let gold_rows = render_rows(&gold, &columns, "gold")?;
-    let actual_rows = render_rows(&actual, &columns, "actual")?;
+    compare_rows(&actual, &gold, &columns)
+}
+
+/// Compare one read-option case under one engine.
+///
+/// Unlike the full read, the column *set* is itself under test: the case's
+/// projection is the exact contract, so both sides must have precisely those
+/// columns in precisely that order. Comparing only the columns gold happens to
+/// carry would let a reader that fails to strip an internal column — the record
+/// key it merged on, say — pass unnoticed, which is the main thing these cases
+/// exist to catch.
+async fn compare_option_case_owned(
+    table_path: &str,
+    options_dir: String,
+    case: OptionCase,
+    engine: &str,
+) -> Result<(), String> {
+    let actual = read_with(engine, table_path, Some(&case.projection)).await?;
+    let gold_dir = hudi_test::gold_options::case_gold_dir(&options_dir, &case.name);
+    let gold = match hudi_test::gold::read_gold_parquet(&gold_dir) {
+        Ok(gold) => gold,
+        Err(e) if e.contains("produced no batches") && actual.num_rows() == 0 => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    exact_columns(&gold, &case.projection, "gold")?;
+    exact_columns(&actual, &case.projection, "actual")?;
+    compare_rows(&actual, &gold, &case.projection)
+}
+
+/// Fail unless `batch` has exactly `expected` columns, in order.
+fn exact_columns(batch: &RecordBatch, expected: &[String], side: &str) -> Result<(), String> {
+    let schema = batch.schema();
+    let actual: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    if actual != expected {
+        return Err(format!(
+            "{side} columns mismatch: {side}={actual:?} projection={expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Render both sides and compare them row for row.
+fn compare_rows(
+    actual: &RecordBatch,
+    gold: &RecordBatch,
+    columns: &[String],
+) -> Result<(), String> {
+    let gold_rows = render_rows(gold, columns, "gold")?;
+    let actual_rows = render_rows(actual, columns, "actual")?;
 
     if gold_rows.len() != actual_rows.len() {
         return Err(format!(
@@ -178,29 +319,29 @@ async fn compare_owned(table_path: &str, gold_dir: &str, engine: &str) -> Result
 
 /// Every row rendered to a comparable string, sorted.
 fn render_rows(batch: &RecordBatch, columns: &[String], side: &str) -> Result<Vec<String>, String> {
-    let mut indices = Vec::with_capacity(columns.len());
+    // One formatter per column, built with an explicit null token so a NULL is
+    // never conflated with an empty value — at the top level or nested inside a
+    // list, map or struct.
+    let format_options = FormatOptions::new().with_null(NULL_TOKEN);
+    let mut formatters = Vec::with_capacity(columns.len());
     for name in columns {
         let idx = batch.schema().index_of(name).map_err(|_| {
             format!("column '{name}' present in gold but missing from {side} output")
         })?;
-        indices.push(idx);
+        formatters.push(
+            ArrayFormatter::try_new(batch.column(idx).as_ref(), &format_options)
+                .map_err(|e| format!("build {side} formatter for '{name}': {e}"))?,
+        );
     }
     let mut rows = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let mut cells = Vec::with_capacity(indices.len());
-        for &idx in &indices {
-            let col = batch.column(idx);
-            let cell = if col.is_null(row) {
-                "NULL".to_string()
-            } else {
-                let rendered = arrow_cast::display::array_value_to_string(col.as_ref(), row)
-                    .map_err(|e| format!("render {side} cell: {e}"))?;
-                // A timestamp carrying a zone renders with a trailing `Z` and
-                // one without does not, for the same instant. The zone is
-                // schema metadata, not a value difference.
-                rendered.strip_suffix('Z').unwrap_or(&rendered).to_string()
-            };
-            cells.push(cell);
+        let mut cells = Vec::with_capacity(formatters.len());
+        for formatter in &formatters {
+            let rendered = formatter.value(row).to_string();
+            // A timestamp carrying a zone renders with a trailing `Z` and one
+            // without does not, for the same instant. The zone is schema
+            // metadata, not a value difference.
+            cells.push(rendered.strip_suffix('Z').unwrap_or(&rendered).to_string());
         }
         rows.push(cells.join(" | "));
     }
@@ -208,37 +349,332 @@ fn render_rows(batch: &RecordBatch, columns: &[String], side: &str) -> Result<Ve
     Ok(rows)
 }
 
+/// One comparison that disagreed with Hudi.
+struct Failure {
+    fixture: String,
+    /// The option case, or `None` for the full `SELECT *` read.
+    case: Option<String>,
+    engine: &'static str,
+    message: String,
+}
+
+impl Failure {
+    fn describe(&self, format: TableFormat) -> String {
+        match &self.case {
+            Some(case) => format!(
+                "{} [{format:?}] case '{case}' engine '{}': {}",
+                self.fixture, self.engine, self.message
+            ),
+            None => format!(
+                "{} [{format:?}] engine '{}': {}",
+                self.fixture, self.engine, self.message
+            ),
+        }
+    }
+}
+
+/// Which comparisons a [`Known`] entry speaks for.
+enum CaseScope {
+    /// The full `SELECT *` read only. An option case on the same fixture is
+    /// still held to account.
+    SelectStar,
+    /// One named option case.
+    Case(&'static str),
+    /// Every comparison for this fixture.
+    ///
+    /// Deliberate blanket coverage, and only defensible when the reader fails
+    /// on the fixture *whatever* is asked of it — every case failing for the one
+    /// cause. Where a fixture fails only for some cases, name them with
+    /// [`CaseScope::Case`] instead: a blanket there would absorb a later
+    /// regression in the cases that pass today, which is the hole this ratchet
+    /// exists to close.
+    Any,
+}
+
+/// A disagreement we have already explained.
+///
+/// The engine is part of the identity: nearly every entry below describes a
+/// *legacy* failure, and without naming the engine the same entry would quietly
+/// absorb a merge-on-read regression on that fixture too.
+struct Known {
+    fixture: &'static str,
+    scope: CaseScope,
+    engine: &'static str,
+    reason: &'static str,
+}
+
+impl Known {
+    fn covers(&self, failure: &Failure) -> bool {
+        if self.fixture != failure.fixture || self.engine != failure.engine {
+            return false;
+        }
+        match self.scope {
+            CaseScope::Any => true,
+            CaseScope::SelectStar => failure.case.is_none(),
+            CaseScope::Case(name) => failure.case.as_deref() == Some(name),
+        }
+    }
+}
+
+/// Known disagreements, each with a cause. The sweep is a ratchet: a new
+/// disagreement fails the build, and one that starts passing has to be removed
+/// from here, so this list cannot quietly go stale.
+const KNOWN: &[Known] = &[
+    // Legacy only: it now reads a log-only slice but returns it without the
+    // base columns. Nothing it is asked to project changes that, so the
+    // fixture is blanketed.
+    Known {
+        fixture: "table_log_compaction",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy drops the base columns",
+    },
+    Known {
+        fixture: "table_log_only",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy drops the base columns",
+    },
+    // Legacy only: the partition column comes back as Utf8 from one file slice
+    // and Int64 from another, so the batches cannot be concatenated. The
+    // merge-on-read engine reads both as Int64 now that it takes the table's
+    // schema rather than each base file's.
+    Known {
+        fixture: "v9_timebasedkeygen_epochmillis",
+        scope: CaseScope::SelectStar,
+        engine: "legacy",
+        reason: "batches of differing shape",
+    },
+    Known {
+        fixture: "v9_timebasedkeygen_unixtimestamp",
+        scope: CaseScope::SelectStar,
+        engine: "legacy",
+        reason: "batches of differing shape",
+    },
+    // Legacy only, all fixed in the merge-on-read engine: it concatenates a
+    // partial-update log block onto a wider base batch without checking and
+    // panics; it models an avro map's entries field differently between base
+    // and log; and it keeps a superseded row.
+    Known {
+        fixture: "table_partial_update",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy panics on a partial-update block",
+    },
+    Known {
+        fixture: "table_all_data_types",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy models an avro map's entries field",
+    },
+    Known {
+        fixture: "table_column_projection",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy models an avro map's entries field",
+    },
+    Known {
+        fixture: "table_null_containers",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy models an avro map's entries field",
+    },
+    Known {
+        fixture: "table_evo_promotion",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy cannot widen a promoted column",
+    },
+    // Legacy only, and only partly: it never sees the column a later writer
+    // added, so the full read comes back without it and any projection naming it
+    // fails outright. The cases that don't name `extra` read correctly, so they
+    // are held to account rather than blanketed.
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::SelectStar,
+        engine: "legacy",
+        reason: "legacy drops a column added by a later writer",
+    },
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::Case("drop_key"),
+        engine: "legacy",
+        reason: "legacy cannot project a column added by a later writer",
+    },
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::Case("drop_ordering"),
+        engine: "legacy",
+        reason: "legacy cannot project a column added by a later writer",
+    },
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::Case("reordered"),
+        engine: "legacy",
+        reason: "legacy cannot project a column added by a later writer",
+    },
+    Known {
+        fixture: "v9_mor_nonpart_3commits",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy returns a stale row",
+    },
+];
+
+/// Run one comparison on its own task, so a reader that panics is reported like
+/// any other disagreement rather than aborting the sweep and hiding every
+/// fixture after it.
+async fn record<F>(failures: &mut Vec<Failure>, compared: &mut usize, failure: Failure, work: F)
+where
+    F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(Ok(())) => *compared += 1,
+        Ok(Err(message)) => failures.push(Failure { message, ..failure }),
+        Err(join) if join.is_panic() => failures.push(Failure {
+            message: "PANICKED during read".to_string(),
+            ..failure
+        }),
+        Err(join) => failures.push(Failure {
+            message: join.to_string(),
+            ..failure
+        }),
+    }
+}
+
+/// A null *inside* a container must not render the same as an empty value.
+///
+/// This is the one thing the sweep cannot prove by passing: if both sides render
+/// a null element and an empty one to the same text, a genuine null-vs-empty
+/// divergence compares equal and the container fixtures pass vacuously. The
+/// check has to be made directly, on two batches that differ only in that way.
+#[test]
+fn a_null_list_element_renders_differently_from_an_empty_one() {
+    use arrow_array::Array;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+
+    let list_batch = |empty_instead_of_null: bool| {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value("a");
+        if empty_instead_of_null {
+            builder.values().append_value("");
+        } else {
+            builder.values().append_null();
+        }
+        builder.append(true);
+        let array = builder.finish();
+        let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "arr",
+            array.data_type().clone(),
+            true,
+        )]);
+        RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(array)],
+        )
+        .unwrap()
+    };
+
+    let columns = vec!["arr".to_string()];
+    let with_null = render_rows(&list_batch(false), &columns, "test").unwrap();
+    let with_empty = render_rows(&list_batch(true), &columns, "test").unwrap();
+
+    assert!(
+        with_null[0].contains(NULL_TOKEN),
+        "a null element must render as the null token, got {:?}",
+        with_null[0]
+    );
+    assert_ne!(
+        with_null, with_empty,
+        "a null list element and an empty one rendered identically, so a \
+         null-vs-empty divergence inside a container would compare equal"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn every_fixture_matches_hudi_on_both_engines() {
     let fixtures = all_fixtures();
     let mut without_gold: Vec<String> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
+    let mut with_options: Vec<String> = Vec::new();
+    let mut all_failures: Vec<(TableFormat, Failure)> = Vec::new();
     let mut compared: HashMap<&str, usize> = HashMap::new();
+    let mut case_compared: HashMap<&str, usize> = HashMap::new();
 
     for fixture in &fixtures {
         if !fixture.has_gold() {
             without_gold.push(fixture.label());
             continue;
         }
+
+        let mut failures: Vec<Failure> = Vec::new();
+
         for engine in ENGINES {
-            // Run each comparison on its own task: a reader that panics should
-            // be reported like any other disagreement, not abort the sweep and
-            // hide every fixture after it.
             let path = fixture.table_path.clone();
             let gold_dir = fixture.gold_dir();
-            let outcome =
-                tokio::spawn(async move { compare_owned(&path, &gold_dir, engine).await }).await;
-            match outcome {
-                Ok(Ok(())) => *compared.entry(engine).or_default() += 1,
-                Ok(Err(e)) => failures.push(format!("{} engine '{engine}': {e}", fixture.label())),
-                Err(join) if join.is_panic() => failures.push(format!(
-                    "{} engine '{engine}': PANICKED during read",
-                    fixture.label()
-                )),
-                Err(join) => {
-                    failures.push(format!("{} engine '{engine}': {join}", fixture.label()))
+            let counter = compared.entry(engine).or_default();
+            record(
+                &mut failures,
+                counter,
+                Failure {
+                    fixture: fixture.name.clone(),
+                    case: None,
+                    engine,
+                    message: String::new(),
+                },
+                async move { compare_owned(&path, &gold_dir, engine).await },
+            )
+            .await;
+        }
+
+        if fixture.has_option_cases() {
+            with_options.push(fixture.label());
+            let manifest = match read_option_manifest(&fixture.options_dir_owned) {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    // A malformed manifest is not a comparison failure that can
+                    // be explained away; it means the fixture is wrong.
+                    panic!("{}: {e}", fixture.label());
+                }
+            };
+            for case in &manifest.cases {
+                for engine in ENGINES {
+                    let path = fixture.table_path.clone();
+                    let options_dir = fixture.options_dir_owned.clone();
+                    let case = case.clone();
+                    let case_name = case.name.clone();
+                    let counter = case_compared.entry(engine).or_default();
+                    record(
+                        &mut failures,
+                        counter,
+                        Failure {
+                            fixture: fixture.name.clone(),
+                            case: Some(case_name),
+                            engine,
+                            message: String::new(),
+                        },
+                        async move {
+                            compare_option_case_owned(&path, options_dir, case, engine).await
+                        },
+                    )
+                    .await;
                 }
             }
+        }
+
+        all_failures.extend(failures.into_iter().map(|f| (fixture.format, f)));
+    }
+
+    // Match each disagreement against the known list, tracking which entries
+    // actually spoke for something. An entry that matches nothing describes a
+    // disagreement that no longer happens, and has to go — otherwise the list
+    // accumulates explanations for behaviour that has since been fixed, and
+    // stops being a description of what is actually wrong.
+    let mut entry_used = vec![false; KNOWN.len()];
+    let mut reported: Vec<String> = Vec::new();
+    for (format, failure) in &all_failures {
+        match KNOWN.iter().position(|known| known.covers(failure)) {
+            Some(index) => entry_used[index] = true,
+            None => reported.push(failure.describe(*format)),
         }
     }
 
@@ -249,72 +685,53 @@ async fn every_fixture_matches_hudi_on_both_engines() {
         compared.get("v2").copied().unwrap_or(0),
         without_gold.len(),
     );
-    if !without_gold.is_empty() {
-        println!("without gold:\n  {}", without_gold.join("\n  "));
-    }
+    println!(
+        "option cases on {} fixtures — legacy {}, v2 {}",
+        with_options.len(),
+        case_compared.get("legacy").copied().unwrap_or(0),
+        case_compared.get("v2").copied().unwrap_or(0),
+    );
 
-    // Known disagreements, each with a cause. The sweep is a ratchet: a new
-    // disagreement fails the build, and one that starts passing has to be
-    // removed from here, so this list cannot quietly go stale.
-    let known: &[(&str, &str)] = &[
-        // Legacy only: it now reads a log-only slice but returns it without the
-        // base columns.
-        ("table_log_compaction", "legacy drops the base columns"),
-        ("table_log_only", "legacy drops the base columns"),
-        // Legacy only: the partition column comes back as Utf8 from one file
-        // slice and Int64 from another, so the batches cannot be concatenated.
-        // The merge-on-read engine reads both as Int64 now that it takes the
-        // table's schema rather than each base file's.
-        (
-            "v9_timebasedkeygen_epochmillis",
-            "batches of differing shape",
-        ),
-        (
-            "v9_timebasedkeygen_unixtimestamp",
-            "batches of differing shape",
-        ),
-        // Legacy only, all fixed in the merge-on-read engine:
-        // it concatenates a partial-update log block onto a wider base batch
-        // without checking and panics; it models an avro map's entries field
-        // differently between base and log; and it keeps a superseded row.
-        (
-            "table_partial_update",
-            "legacy panics on a partial-update block",
-        ),
-        (
-            "table_all_data_types",
-            "legacy models an avro map's entries field",
-        ),
-        (
-            "table_column_projection",
-            "legacy models an avro map's entries field",
-        ),
-        (
-            "table_null_containers",
-            "legacy models an avro map's entries field",
-        ),
-        (
-            "table_evo_promotion",
-            "legacy cannot widen a promoted column",
-        ),
-        (
-            "table_evo_add_col",
-            "legacy drops a column added by a later writer",
-        ),
-        ("v9_mor_nonpart_3commits", "legacy returns a stale row"),
-    ];
-    let unexpected: Vec<&String> = failures
+    // Coverage first: a fixture that silently stopped being compared would
+    // otherwise look like a pass.
+    without_gold.sort();
+    let without_gold: Vec<&str> = without_gold.iter().map(String::as_str).collect();
+    assert_eq!(
+        without_gold, EXPECTED_WITHOUT_GOLD,
+        "the set of fixtures shipping no gold_data changed; update \
+         EXPECTED_WITHOUT_GOLD with the reason"
+    );
+    with_options.sort();
+    let with_options: Vec<&str> = with_options.iter().map(String::as_str).collect();
+    assert_eq!(
+        with_options, EXPECTED_OPTION_FIXTURES,
+        "the set of fixtures shipping a gold_options manifest changed; update \
+         EXPECTED_OPTION_FIXTURES"
+    );
+
+    assert!(
+        reported.is_empty(),
+        "{} comparison(s) disagree with Hudi for a reason not on the known list:\n  {}",
+        reported.len(),
+        reported.join("\n  ")
+    );
+
+    let stale: Vec<String> = KNOWN
         .iter()
-        .filter(|f| !known.iter().any(|(name, _)| f.starts_with(name)))
+        .zip(&entry_used)
+        .filter(|(_, used)| !**used)
+        .map(|(known, _)| {
+            format!(
+                "{} engine '{}': {}",
+                known.fixture, known.engine, known.reason
+            )
+        })
         .collect();
     assert!(
-        unexpected.is_empty(),
-        "{} comparison(s) disagree with Hudi for a reason not on the known list:\n  {}",
-        unexpected.len(),
-        unexpected
-            .iter()
-            .map(|f| f.as_str())
-            .collect::<Vec<_>>()
-            .join("\n  ")
+        stale.is_empty(),
+        "{} known-disagreement entr(ies) matched nothing — the disagreement is \
+         gone, so remove them:\n  {}",
+        stale.len(),
+        stale.join("\n  ")
     );
 }
