@@ -112,13 +112,11 @@ def deriveWindows(completions: Seq[String]): Seq[(String, String, String)] = {
   // or be one of the bootstrapping sentinels, so `"0"` and a row of nines are
   // both rejected outright and the bounds have to be real instants.
   //
-  // `HoodieTimeline.INIT_INSTANT_TS` ("00000000000000") would be the idiomatic
-  // "before everything", and Hudi whitelists it — but hudi-rs rejects it, so it
-  // cannot be used here. Its parser falls back to epoch millis only for a
-  // 17-character value (for metadata-table instants like 17 zeros), leaving the
-  // 14-character sentinel matching neither branch. An epoch-zero date works on
-  // both sides and orders the same way.
-  val beforeAll = "19700101000000"
+  // `HoodieTimeline.INIT_INSTANT_TS` is the idiomatic "before everything", so
+  // the sweep uses it rather than an arbitrary early date — every fixture's
+  // incremental cases then exercise the sentinel a caller would actually reach
+  // for. The far end has no sentinel, so it is a real far-future date.
+  val beforeAll = "00000000000000"
   val afterAll = "99991231235959999"
   val full = Seq(("incr_all", beforeAll, afterAll))
   if (completions.length < 2) full
