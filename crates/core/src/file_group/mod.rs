@@ -171,15 +171,20 @@ impl FileGroup {
 
     /// Add multiple [LogFile]s based on the file names to the corresponding [FileSlice]s in the
     /// [FileGroup].
+    ///
+    /// Parses every name first and places them through [`Self::add_log_files`],
+    /// so callers handing over names in listing order get the same ordering
+    /// guarantee — see that method for why placement depends on it.
     pub fn add_log_files_from_names<I, S>(&mut self, log_file_names: I) -> Result<&Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        for file_name in log_file_names {
-            self.add_log_file_from_name(file_name.as_ref())?;
-        }
-        Ok(self)
+        let log_files = log_file_names
+            .into_iter()
+            .map(|name| LogFile::from_str(name.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        self.add_log_files(log_files)
     }
 
     /// Add a [LogFile] to the corresponding [FileSlice] in the [FileGroup].
@@ -264,10 +269,24 @@ impl FileGroup {
     }
 
     /// Add multiple [LogFile]s to the corresponding [FileSlice]s in the [FileGroup].
+    /// Add several [LogFile]s, in the order [`add_log_file`](Self::add_log_file)
+    /// needs rather than the order they arrive in.
+    ///
+    /// Placement consults the slices already present, so a log file added before
+    /// an earlier one finds nothing to attach to and starts a slice of its own.
+    /// Callers list a directory, which returns files in arbitrary order, so the
+    /// sort belongs here rather than in an instruction each caller has to
+    /// remember: getting it wrong splits a log-only file group in two, and a
+    /// read as of an instant then sees only the later half.
+    ///
+    /// [`LogFile`]'s own ordering is the right one — it keys on completion time,
+    /// which is what placement looks up.
     pub fn add_log_files<I>(&mut self, log_files: I) -> Result<&Self>
     where
         I: IntoIterator<Item = LogFile>,
     {
+        let mut log_files: Vec<LogFile> = log_files.into_iter().collect();
+        log_files.sort();
         for log_file in log_files {
             self.add_log_file(log_file)?;
         }
@@ -301,6 +320,85 @@ impl FileGroup {
 mod tests {
     use super::*;
     use crate::table::partition::EMPTY_PARTITION_PATH;
+
+    /// A log file group whose files are handed over out of order must still form
+    /// ONE slice.
+    ///
+    /// Regression: placement consults the slices already present, so a log file
+    /// arriving before an earlier one found nothing to attach to and started a
+    /// slice of its own. A directory listing returns files in arbitrary order,
+    /// so this happened on real tables: the group split in two, a read as of an
+    /// instant picked only the later slice, and every record written by the
+    /// earlier log files vanished.
+    #[test]
+    fn test_add_log_files_out_of_order_forms_one_slice() {
+        const FILE_ID: &str = "7483a08a-02f1-4510-bc1d-1317924f4189-0";
+        // (requested, completion) of five delta commits appending to one
+        // log-only file group.
+        let instants = [
+            ("20260409030511461", "20260409030516371"),
+            ("20260409030518232", "20260409030519484"),
+            ("20260409030519923", "20260409030520896"),
+            ("20260409030521407", "20260409030522349"),
+            ("20260409030522412", "20260409030523365"),
+        ];
+        let log_file = |requested: &str, completion: &str| {
+            let mut lf =
+                LogFile::from_str(&format!(".{FILE_ID}_{requested}.log.1_0-16-23")).unwrap();
+            lf.completion_timestamp = Some(completion.to_string());
+            lf
+        };
+
+        // The order a listing happened to return them in: the fourth and fifth
+        // first, then the rest.
+        let scrambled = [4, 5, 1, 3, 2];
+        let log_files: Vec<LogFile> = scrambled
+            .iter()
+            .map(|&n| {
+                let (requested, completion) = instants[n - 1];
+                log_file(requested, completion)
+            })
+            .collect();
+
+        let mut fg = FileGroup::new(FILE_ID.to_string(), EMPTY_PARTITION_PATH.to_string());
+        fg.add_log_files(log_files).unwrap();
+
+        assert_eq!(
+            fg.file_slices.len(),
+            1,
+            "log files of one group must form a single slice however they are \
+             ordered, got slices keyed {:?}",
+            fg.file_slices.keys().collect::<Vec<_>>()
+        );
+        let slice = fg.file_slices.values().next().unwrap();
+        assert_eq!(
+            slice.log_files.len(),
+            5,
+            "the slice must hold every log file"
+        );
+        assert_eq!(
+            slice.creation_instant_time(),
+            instants[0].0,
+            "the slice is created by the EARLIEST log file's instant"
+        );
+
+        // The name-taking entry point must give the same guarantee: it is what
+        // the metadata table reader and both language bindings call.
+        let mut by_name = FileGroup::new(FILE_ID.to_string(), EMPTY_PARTITION_PATH.to_string());
+        by_name
+            .add_log_files_from_names(
+                scrambled
+                    .iter()
+                    .map(|&n| format!(".{FILE_ID}_{}.log.1_0-16-23", instants[n - 1].0)),
+            )
+            .unwrap();
+        assert_eq!(
+            by_name.file_slices.len(),
+            1,
+            "add_log_files_from_names must order its input too, got slices keyed {:?}",
+            by_name.file_slices.keys().collect::<Vec<_>>()
+        );
+    }
 
     // ============================================================================
     // FileGroup tests (v6 tables)

@@ -575,21 +575,6 @@ const KNOWN: &[Known] = &[
         engine: "legacy",
         reason: "legacy drops a column added by a later writer",
     },
-    // NOT an engine bug: incremental planning is shared, and both readers
-    // return the same wrong answer here. Widening the window makes the result
-    // SMALLER — reading through commit 3 returns k1, k2 and k3, and reading
-    // through commit 4 returns k3 alone, where Hudi returns all three. Commit 5
-    // writes this fixture's log-compaction block; a window that stops just short
-    // of it loses the records the earlier log blocks carry. Only the v2 entry is
-    // spelled out because legacy's failures on this fixture are already
-    // blanketed above.
-    Known {
-        fixture: "table_log_compaction",
-        scope: CaseScope::Case("incr_through_penultimate"),
-        engine: "v2",
-        reason: "incremental window ending before a log-compaction commit loses \
-                 earlier log blocks (shared planning, not the merge engine)",
-    },
     Known {
         fixture: "v9_mor_nonpart_3commits",
         scope: CaseScope::Any,
