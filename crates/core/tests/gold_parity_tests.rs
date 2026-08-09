@@ -32,7 +32,8 @@
 //!
 //! A `SELECT *` snapshot only proves the engines agree when nothing is asked of
 //! them. Projection is where they differ structurally — it reaches the base file
-//! read, the log-block decode and the post-merge trim by different routes — so a
+//! read, the log-block decode and the post-merge trim by different routes — and
+//! read-optimized and incremental change which files are even considered. So a
 //! fixture may additionally ship `gold_options/`: one Spark snapshot per read
 //! option case, plus a manifest naming the cases.
 //!
@@ -57,7 +58,7 @@ use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use hudi_core::config::read::HudiReadConfig;
-use hudi_core::table::{ReadOptions, Table};
+use hudi_core::table::{QueryType, ReadOptions, Table};
 use hudi_test::gold_options::{OptionCase, has_option_manifest, read_option_manifest};
 use hudi_test::{QuickstartTripsTable, SampleTable, TableFormat};
 use strum::IntoEnumIterator;
@@ -176,19 +177,36 @@ fn all_fixtures() -> Vec<Fixture> {
     fixtures
 }
 
+/// Build the read for a case: the engine under test, plus whichever options the
+/// case sets. `None` is the full `SELECT *` read.
+fn options_for(engine: &str, case: Option<&OptionCase>) -> ReadOptions {
+    let mut options =
+        ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine);
+    let Some(case) = case else { return options };
+    if let Some(columns) = &case.projection {
+        options = options.with_projection(columns.clone());
+    }
+    if case.read_optimized {
+        options = options.with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+    }
+    if let (Some(start), Some(end)) = (&case.start_timestamp, &case.end_timestamp) {
+        options = options
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(start)
+            .with_end_timestamp(end);
+    }
+    options
+}
+
 async fn read_with(
     engine: &str,
     table_path: &str,
-    projection: Option<&[String]>,
+    case: Option<&OptionCase>,
 ) -> Result<RecordBatch, String> {
     let table = Table::new(table_path)
         .await
         .map_err(|e| format!("open failed: {e}"))?;
-    let mut options =
-        ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine);
-    if let Some(columns) = projection {
-        options = options.with_projection(columns.to_vec());
-    }
+    let options = options_for(engine, case);
     let batches = table
         .read(&options)
         .await
@@ -254,19 +272,22 @@ async fn compare_owned(table_path: &str, gold_dir: &str, engine: &str) -> Result
 
 /// Compare one read-option case under one engine.
 ///
-/// Unlike the full read, the column *set* is itself under test: the case's
+/// When the case projects, the column *set* is itself under test: the
 /// projection is the exact contract, so both sides must have precisely those
 /// columns in precisely that order. Comparing only the columns gold happens to
 /// carry would let a reader that fails to strip an internal column — the record
-/// key it merged on, say — pass unnoticed, which is the main thing these cases
-/// exist to catch.
+/// key it merged on, say — pass unnoticed, which is the main thing the
+/// projection cases exist to catch.
+///
+/// A case that does not project (read-optimized, incremental) has no such
+/// contract, so its columns come from gold the way the full read's do.
 async fn compare_option_case_owned(
     table_path: &str,
     options_dir: String,
     case: OptionCase,
     engine: &str,
 ) -> Result<(), String> {
-    let actual = read_with(engine, table_path, Some(&case.projection)).await?;
+    let actual = read_with(engine, table_path, Some(&case)).await?;
     let gold_dir = hudi_test::gold_options::case_gold_dir(&options_dir, &case.name);
     let gold = match hudi_test::gold::read_gold_parquet(&gold_dir) {
         Ok(gold) => gold,
@@ -274,9 +295,20 @@ async fn compare_option_case_owned(
         Err(e) => return Err(e),
     };
 
-    exact_columns(&gold, &case.projection, "gold")?;
-    exact_columns(&actual, &case.projection, "actual")?;
-    compare_rows(&actual, &gold, &case.projection)
+    let Some(projection) = &case.projection else {
+        let columns: Vec<String> = gold
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| !n.starts_with("_hoodie_"))
+            .collect();
+        return compare_rows(&actual, &gold, &columns);
+    };
+
+    exact_columns(&gold, projection, "gold")?;
+    exact_columns(&actual, projection, "actual")?;
+    compare_rows(&actual, &gold, projection)
 }
 
 /// Fail unless `batch` has exactly `expected` columns, in order.
@@ -301,10 +333,20 @@ fn compare_rows(
     let actual_rows = render_rows(actual, columns, "actual")?;
 
     if gold_rows.len() != actual_rows.len() {
+        // Show the rows themselves: a bare count leaves no way to tell a
+        // dropped row from a duplicated one without rerunning by hand.
+        let sample = |rows: &[String]| {
+            rows.iter()
+                .take(6)
+                .map(|r| format!("\n        {r}"))
+                .collect::<String>()
+        };
         return Err(format!(
-            "row count mismatch: actual={} gold={}",
+            "row count mismatch: actual={} gold={}\n      actual rows:{}\n      gold rows:{}",
             actual_rows.len(),
-            gold_rows.len()
+            gold_rows.len(),
+            sample(&actual_rows),
+            sample(&gold_rows)
         ));
     }
     for (actual_row, gold_row) in actual_rows.iter().zip(gold_rows.iter()) {
@@ -512,6 +554,41 @@ const KNOWN: &[Known] = &[
         scope: CaseScope::Case("reordered"),
         engine: "legacy",
         reason: "legacy cannot project a column added by a later writer",
+    },
+    // Same cause again — the column is simply absent from what legacy returns,
+    // whatever query type asks for it.
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::Case("read_optimized"),
+        engine: "legacy",
+        reason: "legacy drops a column added by a later writer",
+    },
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::Case("incr_all"),
+        engine: "legacy",
+        reason: "legacy drops a column added by a later writer",
+    },
+    Known {
+        fixture: "table_evo_add_col",
+        scope: CaseScope::Case("incr_through_penultimate"),
+        engine: "legacy",
+        reason: "legacy drops a column added by a later writer",
+    },
+    // NOT an engine bug: incremental planning is shared, and both readers
+    // return the same wrong answer here. Widening the window makes the result
+    // SMALLER — reading through commit 3 returns k1, k2 and k3, and reading
+    // through commit 4 returns k3 alone, where Hudi returns all three. Commit 5
+    // writes this fixture's log-compaction block; a window that stops just short
+    // of it loses the records the earlier log blocks carry. Only the v2 entry is
+    // spelled out because legacy's failures on this fixture are already
+    // blanketed above.
+    Known {
+        fixture: "table_log_compaction",
+        scope: CaseScope::Case("incr_through_penultimate"),
+        engine: "v2",
+        reason: "incremental window ending before a log-compaction commit loses \
+                 earlier log blocks (shared planning, not the merge engine)",
     },
     Known {
         fixture: "v9_mor_nonpart_3commits",

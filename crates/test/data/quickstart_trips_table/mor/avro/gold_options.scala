@@ -66,6 +66,66 @@ def orderingFields(props: Properties): Seq[String] =
   csvProp(props, "hoodie.table.ordering.fields", "hoodie.table.precombine.field")
 
 /**
+ * Completion times of the fixture's completed commits, in timeline order.
+ *
+ * A completed instant is named `<requested>_<completion>.<action>` under
+ * timeline layout v2 (table version 8+) and plain `<requested>.<action>` before
+ * it, so the completion time is the half after the underscore where there is
+ * one. Inflight and requested markers are excluded — an incremental read only
+ * ever sees completed commits.
+ */
+def completionTimes(tablePath: File): Seq[String] = {
+  val v2 = new File(tablePath, ".hoodie/timeline")
+  val dir = if (v2.isDirectory) v2 else new File(tablePath, ".hoodie")
+  val completed = Option(dir.listFiles).getOrElse(Array.empty[File])
+    .map(_.getName)
+    .filter(n => n.endsWith(".commit") || n.endsWith(".deltacommit") || n.endsWith(".replacecommit"))
+  completed
+    .map { name =>
+      val stem = name.substring(0, name.lastIndexOf('.'))
+      val parts = stem.split("_")
+      (parts.head, parts.last) // (requested, completion); equal pre-layout-v2
+    }
+    .sortBy(_._1)
+    .map(_._2)
+    .toSeq
+}
+
+/**
+ * The incremental windows for one fixture.
+ *
+ * Both windows open at `0` — before any commit — rather than at a commit's own
+ * timestamp. That is deliberate. Hudi ranges incremental reads on a commit's
+ * COMPLETION time and includes the lower bound; hudi-rs ranges on its REQUESTED
+ * time and excludes it. A window whose start sits on a commit boundary
+ * therefore disagrees by construction on every table version 8+ fixture, which
+ * would bury the sweep in dozens of entries for one already-known difference.
+ * The `v8_mor_boundary_windows` fixture probes that difference deliberately and
+ * is where it belongs.
+ *
+ * Opening at `0` and varying only the END bound still exercises the incremental
+ * planning path across the corpus, and still asks a real question: the second
+ * window must drop exactly the last commit's changes.
+ */
+def deriveWindows(completions: Seq[String]): Seq[(String, String, String)] = {
+  // Hudi validates a query instant: it must parse as a date (14 or 17 digits)
+  // or be one of the bootstrapping sentinels, so `"0"` and a row of nines are
+  // both rejected outright and the bounds have to be real instants.
+  //
+  // `HoodieTimeline.INIT_INSTANT_TS` ("00000000000000") would be the idiomatic
+  // "before everything", and Hudi whitelists it — but hudi-rs rejects it, so it
+  // cannot be used here. Its parser falls back to epoch millis only for a
+  // 17-character value (for metadata-table instants like 17 zeros), leaving the
+  // 14-character sentinel matching neither branch. An epoch-zero date works on
+  // both sides and orders the same way.
+  val beforeAll = "19700101000000"
+  val afterAll = "99991231235959999"
+  val full = Seq(("incr_all", beforeAll, afterAll))
+  if (completions.length < 2) full
+  else full :+ ("incr_through_penultimate", beforeAll, completions(completions.length - 2))
+}
+
+/**
  * The projection cases for one fixture, in a stable order.
  *
  * A case whose column list would be empty is dropped rather than emitted, so a
@@ -108,10 +168,29 @@ def jsonEscape(s: String): String = s.flatMap {
   case c    => c.toString
 }
 
-def writeManifest(dir: File, fixture: String, cases: Seq[(String, Seq[String])]): Unit = {
-  val entries = cases.map { case (name, projection) =>
-    val cols = projection.map(c => "\"" + jsonEscape(c) + "\"").mkString(", ")
-    s"""    { "name": "${jsonEscape(name)}", "projection": [$cols] }"""
+/**
+ * One case: a name plus the read options that produce its gold. Only the
+ * options a case is about are set; the rest stay at their defaults and are
+ * omitted from the manifest entirely.
+ */
+case class Case(
+    name: String,
+    projection: Seq[String] = Seq.empty,
+    readOptimized: Boolean = false,
+    startTs: Option[String] = None,
+    endTs: Option[String] = None)
+
+def writeManifest(dir: File, fixture: String, cases: Seq[Case]): Unit = {
+  val entries = cases.map { c =>
+    val fields = scala.collection.mutable.ArrayBuffer(s""""name": "${jsonEscape(c.name)}"""")
+    if (c.projection.nonEmpty) {
+      val cols = c.projection.map(x => "\"" + jsonEscape(x) + "\"").mkString(", ")
+      fields += s""""projection": [$cols]"""
+    }
+    if (c.readOptimized) fields += """"read_optimized": true"""
+    c.startTs.foreach(t => fields += s""""start_timestamp": "${jsonEscape(t)}"""")
+    c.endTs.foreach(t => fields += s""""end_timestamp": "${jsonEscape(t)}"""")
+    s"""    { ${fields.mkString(", ")} }"""
   }
   val json =
     s"""{
@@ -145,18 +224,55 @@ for (root <- roots) {
       case _ => false
     }).map(_.name).toSeq
 
-    val cases = deriveCases(cols, nested, recordKeyFields(props), orderingFields(props))
+    val projectionCases = deriveCases(cols, nested, recordKeyFields(props), orderingFields(props))
+      .map { case (name, projection) => Case(name, projection = projection) }
+    val windowCases = deriveWindows(completionTimes(tablePath)).map {
+      case (name, start, end) => Case(name, startTs = Some(start), endTs = Some(end))
+    }
+    val candidates = projectionCases ++ Seq(Case("read_optimized", readOptimized = true)) ++
+      windowCases
+
     val goldOptions = new File(root, "gold_options")
     goldOptions.mkdirs()
 
-    for ((name, projection) <- cases) {
-      df.select(projection.head, projection.tail: _*)
-        .coalesce(1)
-        .write.mode("overwrite")
-        .parquet(new File(goldOptions, name).getPath)
-      println(s"GOLD_OPTION\t$fixture\t$name\t${projection.mkString(",")}")
-      totalCases += 1
+    // A case that Hudi refuses to read at all is dropped with a loud line rather
+    // than silently: the manifest is authoritative, so an absent case is absent
+    // coverage and must be visible in the generator's output.
+    val written = candidates.flatMap { c =>
+      // Gold carries the user columns only: the sweep never compares `_hoodie_`
+      // columns, and keeping them would bloat every fixture.
+      val selected = if (c.projection.nonEmpty) c.projection else cols
+      try {
+        // Inside the try: Hudi rejects some reads at load time (an unsupported
+        // query type for the table, say), and that must skip the case rather
+        // than abort the whole run.
+        val loaded =
+          if (c.readOptimized) {
+            spark.read.format("hudi")
+              .option("hoodie.datasource.query.type", "read_optimized")
+              .load(tablePath.getPath)
+          } else if (c.startTs.isDefined) {
+            spark.read.format("hudi")
+              .option("hoodie.datasource.query.type", "incremental")
+              .option("hoodie.datasource.read.begin.instanttime", c.startTs.get)
+              .option("hoodie.datasource.read.end.instanttime", c.endTs.get)
+              .load(tablePath.getPath)
+          } else df
+
+        loaded.select(selected.head, selected.tail: _*)
+          .coalesce(1)
+          .write.mode("overwrite")
+          .parquet(new File(goldOptions, c.name).getPath)
+        println(s"GOLD_OPTION\t$fixture\t${c.name}\t${selected.mkString(",")}")
+        totalCases += 1
+        Some(c)
+      } catch {
+        case e: Exception =>
+          println(s"GOLD_OPTIONS_SKIP\t$fixture\t${c.name}\t${e.getClass.getName}: ${e.getMessage}")
+          None
+      }
     }
+    val cases = written
     writeManifest(goldOptions, fixture, cases)
     println(s"GOLD_OPTIONS_DONE\t$fixture\tcases=${cases.length}")
   }

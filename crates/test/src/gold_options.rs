@@ -40,15 +40,42 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-/// One read-option case: the projection that produced this case's gold.
+/// One read-option case: the read options that produced this case's gold.
 ///
-/// `projection` is passed verbatim to `ReadOptions::with_projection`, so the
-/// output's column order is expected to match it element-for-element — the
-/// `reordered` case exists precisely to assert that.
+/// Every field beyond `name` is optional and defaults to "not set", so a case
+/// carries only the options it is about. A case must set at least one — one
+/// setting nothing would be the full read under another name, asserting nothing
+/// new — which [`read_option_manifest`] enforces.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OptionCase {
     pub name: String,
-    pub projection: Vec<String>,
+    /// Columns to select. Passed verbatim to `ReadOptions::with_projection`, so
+    /// the output's column order is expected to match element-for-element — the
+    /// `reordered` case exists precisely to assert that. `None` reads every
+    /// column.
+    #[serde(default)]
+    pub projection: Option<Vec<String>>,
+    /// Read base files only, skipping log merge.
+    #[serde(default)]
+    pub read_optimized: bool,
+    /// Incremental window lower bound. Set together with [`Self::end_timestamp`].
+    #[serde(default)]
+    pub start_timestamp: Option<String>,
+    /// Incremental window upper bound.
+    #[serde(default)]
+    pub end_timestamp: Option<String>,
+}
+
+impl OptionCase {
+    /// Whether this case reads incrementally.
+    pub fn is_incremental(&self) -> bool {
+        self.start_timestamp.is_some() || self.end_timestamp.is_some()
+    }
+
+    /// Whether the case sets any read option at all.
+    fn sets_any_option(&self) -> bool {
+        self.projection.is_some() || self.read_optimized || self.is_incremental()
+    }
 }
 
 /// Every case one fixture ships.
@@ -127,9 +154,29 @@ pub fn read_option_manifest(options_dir: &str) -> Result<OptionManifest, String>
 
     let mut seen = std::collections::HashSet::new();
     for case in &manifest.cases {
-        if case.projection.is_empty() {
+        if !case.sets_any_option() {
+            return Err(format!(
+                "manifest '{}' case '{}' sets no read option; it would repeat the \
+                 full read under another name",
+                path.display(),
+                case.name
+            ));
+        }
+        if case.projection.as_ref().is_some_and(Vec::is_empty) {
             return Err(format!(
                 "manifest '{}' case '{}' has an empty projection",
+                path.display(),
+                case.name
+            ));
+        }
+        // Both bounds or neither: a half-open window would silently pick up the
+        // reader's default for the missing end, which is not what the generator
+        // asked Hudi for.
+        if case.is_incremental() && (case.start_timestamp.is_none() || case.end_timestamp.is_none())
+        {
+            return Err(format!(
+                "manifest '{}' case '{}' sets only one incremental bound; both are \
+                 required",
                 path.display(),
                 case.name
             ));
@@ -199,7 +246,61 @@ mod tests {
         assert_eq!(manifest.cases[1].name, "drop_key");
         // Projection order is the contract with `with_projection`, so it must
         // survive the round trip exactly rather than as a set.
-        assert_eq!(manifest.cases[1].projection, vec!["ts", "value"]);
+        assert_eq!(
+            manifest.cases[1].projection.as_deref(),
+            Some(["ts".to_string(), "value".to_string()].as_slice())
+        );
+        // Options a case does not mention stay unset.
+        assert!(!manifest.cases[1].read_optimized);
+        assert!(!manifest.cases[1].is_incremental());
+    }
+
+    /// The non-projection option kinds round trip, and a case may combine them.
+    #[test]
+    fn test_read_option_manifest_reads_every_option_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = r#"{"fixture": "t", "cases": [
+            {"name": "ro", "read_optimized": true},
+            {"name": "incr", "start_timestamp": "0", "end_timestamp": "99"},
+            {"name": "both", "projection": ["key"], "read_optimized": true}
+        ]}"#;
+        let dir = write_options_dir(tmp.path(), "t", json, &["ro", "incr", "both"]);
+
+        let manifest = read_option_manifest(&dir).expect("every option kind must load");
+        assert!(manifest.cases[0].read_optimized && !manifest.cases[0].is_incremental());
+        assert!(manifest.cases[1].is_incremental());
+        assert_eq!(manifest.cases[1].start_timestamp.as_deref(), Some("0"));
+        assert_eq!(manifest.cases[1].end_timestamp.as_deref(), Some("99"));
+        assert!(manifest.cases[2].read_optimized && manifest.cases[2].projection.is_some());
+    }
+
+    /// A case setting nothing would silently repeat the full read.
+    #[test]
+    fn test_read_option_manifest_optionless_case_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = r#"{"fixture": "t", "cases": [{"name": "c"}]}"#;
+        let dir = write_options_dir(tmp.path(), "t", json, &["c"]);
+
+        let err = read_option_manifest(&dir).expect_err("a case with no options must error");
+        assert!(
+            err.contains("sets no read option"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Half a window would take the reader's default for the other bound, which
+    /// is not what the generator asked Hudi for.
+    #[test]
+    fn test_read_option_manifest_half_open_window_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = r#"{"fixture": "t", "cases": [{"name": "c", "start_timestamp": "0"}]}"#;
+        let dir = write_options_dir(tmp.path(), "t", json, &["c"]);
+
+        let err = read_option_manifest(&dir).expect_err("a half-open window must error");
+        assert!(
+            err.contains("only one incremental bound"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A case naming gold that isn't there must fail loudly. Skipping it would
