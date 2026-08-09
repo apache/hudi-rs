@@ -65,7 +65,7 @@ jobs:
           apt-get update
           apt-get install -y protobuf-compiler
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Only cache cargo registry and git, not target directory
           # Tarpaulin needs clean builds for accurate coverage
@@ -120,7 +120,7 @@ jobs:
 
       # Cache Rust dependencies and build artifacts
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Cache based on Python version and OS for better hit rate
           shared-key: "python-binding-${{ matrix.os }}-py${{ matrix.python-version }}"
@@ -128,7 +128,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
 
       - name: install uv and set the python version
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           version: "0.7.19"
           python-version: ${{ matrix.python-version }}
@@ -181,7 +181,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Pre-pull base images
         run: |
           docker pull quay.io/minio/minio:latest

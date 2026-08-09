@@ -15,51 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Code
+# An action ref that is not on the ASF allowlist does not fail loudly — the run
+# ends in "Startup failure" with no logs and no notification, and the pull
+# request looks green because no check ever reported. This job is the only thing
+# that makes such a ref visible. See
+# https://github.com/apache/infrastructure-actions/issues/574
+name: ASF Allowlist Check
 
 on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
       - release/**
-  pull_request:
-    branches:
-      - main
+
+permissions:
+  contents: read
 
 jobs:
-  check-code:
+  asf-allowlist-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Check license header
-        uses: apache/skywalking-eyes/header@v0.8.0
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
-          version: "0.7.19"
-
-      - name: Check rust code style
-        run: make check-rust
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.10'
-
-      - name: Install python linter dependencies
-        run: |
-          make setup-venv
-          source .venv/bin/activate
-          uv pip install -r python/pyproject.toml --extra lint
-
-      - name: Check python code style
-        run: |
-          source .venv/bin/activate
-          make check-python
+          persist-credentials: false
+      - uses: apache/infrastructure-actions/allowlist-check@main
