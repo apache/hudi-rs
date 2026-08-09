@@ -75,10 +75,12 @@
 //!         for file_slice_vec in file_slices {
 //!             let file_group_vec = file_slice_vec
 //!                 .iter()
-//!                 .map(|f| {
-//!                     let relative_path = f.base_file_relative_path().unwrap();
+//!                 .filter_map(|f| {
+//!                     // None when the slice's records live entirely in log
+//!                     // files, so there is no base file to read.
+//!                     let relative_path = f.base_file_relative_path().unwrap()?;
 //!                     let url = join_url_segments(&base_uri, &[relative_path.as_str()]).unwrap();
-//!                     url.path().to_string()
+//!                     Some(url.path().to_string())
 //!                 })
 //!                 .collect();
 //!             parquet_file_groups.push(file_group_vec)
