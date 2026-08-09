@@ -83,7 +83,7 @@ pub trait FileGroupRecordBufferLoader: Send + Sync + std::fmt::Debug {
 /// ```text
 /// is_skip_merge?  → UnmergedFileGroupRecordBuffer (not implemented)
 /// sort_outputs?   → SortedKeyBasedFileGroupRecordBuffer (not implemented)
-/// use_record_position && base_file?  → PositionBasedFileGroupRecordBuffer (not impl)
+/// use_record_position && base_file?  → PositionBasedFileGroupRecordBuffer ★
 /// DEFAULT         → KeyBasedFileGroupRecordBuffer ★
 /// ```
 #[derive(Debug)]

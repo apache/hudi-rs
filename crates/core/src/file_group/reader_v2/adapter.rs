@@ -62,28 +62,53 @@ pub(crate) async fn read_file_slice(
     let mut context = resolve_reader_context(&hudi_configs, has_log_files)?;
     context.rebuild_record_context(partition_path.clone());
 
+    // A slice with no base file reports an empty path; the engine keys its
+    // log-only handling on `None`, not on an empty string.
+    let base_file_path = (!base_file_path.is_empty()).then(|| base_file_path.to_string());
+    let base_file_commit_time = base_file_path.as_deref().and_then(base_file_commit_time);
+
     let input_split = InputSplit::new(
-        // A slice with no base file reports an empty path; the engine keys its
-        // log-only handling on `None`, not on an empty string.
-        (!base_file_path.is_empty()).then(|| base_file_path.to_string()),
-        None,
+        base_file_path,
+        base_file_commit_time,
         log_file_paths,
         partition_path,
     );
 
     // Defaults chosen to match what the existing reader returns: deletes are
     // applied but never emitted, output keeps merge order, and only completed
-    // instants are read.
+    // instants are read. Position-based merge is the one flag a caller can turn
+    // on, through `hoodie.merge.use.record.positions`.
+    let reader_parameters = ReaderParameters {
+        use_record_position: context.should_merge_use_record_position,
+        ..ReaderParameters::default()
+    };
+
     let mut reader = HoodieFileGroupReader::new(
         Arc::new(context),
         storage,
         input_split,
-        ReaderParameters::default(),
+        reader_parameters,
         data_schema,
         None,
     )?;
 
     reader.read().await
+}
+
+/// The instant a base file was written at, taken from its name
+/// (`<fileId>_<writeToken>_<commit>.<ext>`).
+///
+/// Position-based merge needs it: a log block's positions are only meaningful
+/// against the base file they were computed over, and the block names that file
+/// by its instant. Without it the reader merges by key instead, so an
+/// unparseable name costs correctness nothing — it just declines the faster
+/// path rather than trusting positions it cannot check.
+fn base_file_commit_time(base_file_path: &str) -> Option<String> {
+    let file_name = base_file_path.rsplit('/').next().unwrap_or(base_file_path);
+    file_name
+        .parse::<crate::file_group::base_file::BaseFile>()
+        .ok()
+        .map(|base_file| base_file.commit_timestamp)
 }
 
 /// Pin the read to the end of the timeline when the caller did not bound it.
@@ -172,6 +197,31 @@ mod tests {
     #[test]
     fn accepts_a_regular_table_with_a_schema() {
         assert!(refuse_reason(false, Some(&schema())).is_none());
+    }
+
+    /// Position-based merge only engages when the base file's instant is known,
+    /// and the only place it is written down for a slice read by path is the
+    /// file name. Passing `None` here — as this adapter used to — makes every
+    /// read fall back to key-based merge no matter what was configured.
+    #[test]
+    fn reads_the_base_file_instant_out_of_its_name() {
+        assert_eq!(
+            base_file_commit_time(
+                "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet"
+            )
+            .as_deref(),
+            Some("20260408053032350")
+        );
+    }
+
+    /// A name this crate cannot parse costs correctness nothing — the read
+    /// merges by key instead — so it must not fail the read.
+    #[test]
+    fn declines_an_unparseable_base_file_name() {
+        assert_eq!(
+            base_file_commit_time("city=sf/not-a-hudi-name.parquet"),
+            None
+        );
     }
 
     /// The reader context comes from table configs, so a slice with no log

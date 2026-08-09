@@ -17,8 +17,8 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
+//! Ported from the merge-on-read reader. Some items exist only for parity
+//! with the Java reader and have no caller here.
 #![allow(dead_code)]
 
 //! Position-based file-group record buffer.

@@ -1240,17 +1240,20 @@ fg_case_test!(
 );
 
 // use_record_position=true on a MOR fixture with a base file.
-// Position-based merging is implemented, so the loader would take the position-buffer
-// arm — but that arm needs the base file's commit time. The harness supplies only file
-// paths (no base_file_commit_time — the real FFI derives it from the base file name), so
-// the position-merge gate is not satisfied and the read gracefully falls back to
-// key-based merge (always correct, needs no commit time) instead of hard-erroring.
-// The result must therefore match the plain key-based read of this exact slice
-// (`case_sf_merge`): id=1 updated to Alice-V2/31, id=2 (Bob/25) carried from the base.
+// This slice satisfies every condition for position-based merge: a parquet base file
+// whose instant the harness derives from its name, log files to merge, and a log block
+// carrying a RECORD_POSITIONS header recorded against that same instant. So the loader
+// builds a PositionBasedFileGroupRecordBuffer and the base read attaches the row-position
+// column the buffer matches on — without it the read fails outright, because the buffer
+// looks the column up by name.
+// The rows are the same ones key-based merge produces (`case_sf_merge`): id=1 updated to
+// Alice-V2/31, id=2 (Bob/25) carried from the base — this file group has no duplicate
+// record keys, which is the only thing the two strategies disagree about. The
+// `table_duplicate_keys` fixture (gold_parity_tests.rs) is the one that does.
 fg_case_test!(
-    harness_record_position_falls_back_key_based,
+    harness_record_position_merges_by_position,
     FgReaderCase {
-        name: "record_position_falls_back_key_based",
+        name: "record_position_merges_by_position",
         fixture: QuickstartTripsTable::V9Mor8I4UCommitTime,
         partition: "city=sf",
         base_file: "fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet",

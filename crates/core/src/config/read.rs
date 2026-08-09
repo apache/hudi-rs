@@ -142,6 +142,17 @@ pub enum HudiReadConfig {
     /// `v2` is the ported merge-on-read reader. It is not yet at parity with
     /// the default — see [`MergeEngineValue`] — so it is opt-in.
     MergeEngine,
+
+    /// Match a log record to the base row it updates by that row's position in
+    /// the base file rather than by record key. Defaults to `false`.
+    ///
+    /// Only the writer knows whether it recorded positions; a log block that did
+    /// not is merged by key regardless of this setting. The two agree except in a
+    /// file group holding duplicate record keys, where merging by key cannot say
+    /// which of them a log record updates.
+    ///
+    /// Honored only by the `v2` merge engine — see [`Self::MergeEngine`].
+    MergeUseRecordPositions,
 }
 
 impl HudiReadConfig {
@@ -159,6 +170,10 @@ impl HudiReadConfig {
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
             Self::MergeEngine => "hoodie.read.merge.engine",
+            // Hudi's own key, not a `hoodie.read.*` one: a table written with
+            // record positions is read with this set, and a reader that invented
+            // its own spelling would ignore what the writer was told.
+            Self::MergeUseRecordPositions => "hoodie.merge.use.record.positions",
         }
     }
 }
@@ -188,6 +203,7 @@ impl ConfigParser for HudiReadConfig {
             )),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
+            HudiReadConfig::MergeUseRecordPositions => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
             _ => None,
@@ -215,7 +231,7 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
-            Self::UseReadOptimizedMode => get_result
+            Self::UseReadOptimizedMode | Self::MergeUseRecordPositions => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })

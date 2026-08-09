@@ -129,6 +129,10 @@ struct Fixture {
     table_path: String,
     gold_dir_owned: String,
     options_dir_owned: String,
+    /// The snapshot Hudi returns when merging by record position, for the one
+    /// fixture where that differs from merging by key. Absent means the two
+    /// agree and `gold_dir_owned` is the answer for both.
+    gold_positions_dir: Option<String>,
 }
 
 impl Fixture {
@@ -136,12 +140,16 @@ impl Fixture {
         format!("{} [{:?}]", self.name, self.format)
     }
 
-    fn gold_dir(&self) -> String {
-        self.gold_dir_owned.clone()
+    /// The snapshot to compare against for one way of merging.
+    fn gold_dir(&self, merge_by_position: bool) -> String {
+        match (merge_by_position, &self.gold_positions_dir) {
+            (true, Some(dir)) => dir.clone(),
+            _ => self.gold_dir_owned.clone(),
+        }
     }
 
     fn has_gold(&self) -> bool {
-        Path::new(&self.gold_dir()).is_dir()
+        Path::new(&self.gold_dir_owned).is_dir()
     }
 
     fn has_option_cases(&self) -> bool {
@@ -160,6 +168,7 @@ fn all_fixtures() -> Vec<Fixture> {
                 table_path: table.path(format),
                 gold_dir_owned: table.gold_dir(format),
                 options_dir_owned: table.option_cases_dir(format),
+                gold_positions_dir: None,
             });
         }
     }
@@ -171,17 +180,22 @@ fn all_fixtures() -> Vec<Fixture> {
                 table_path: table.path(format),
                 gold_dir_owned: table.gold_dir(format),
                 options_dir_owned: table.option_cases_dir(format),
+                gold_positions_dir: table.gold_positions_dir(format),
             });
         }
     }
     fixtures
 }
 
-/// Build the read for a case: the engine under test, plus whichever options the
-/// case sets. `None` is the full `SELECT *` read.
-fn options_for(engine: &str, case: Option<&OptionCase>) -> ReadOptions {
-    let mut options =
-        ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine);
+/// Build the read for a case: the engine under test, how it merges, plus
+/// whichever options the case sets. `None` is the full `SELECT *` read.
+fn options_for(engine: &str, merge_by_position: bool, case: Option<&OptionCase>) -> ReadOptions {
+    let mut options = ReadOptions::new()
+        .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine)
+        .with_hudi_option(
+            HudiReadConfig::MergeUseRecordPositions.as_ref(),
+            merge_by_position.to_string(),
+        );
     let Some(case) = case else { return options };
     if let Some(columns) = &case.projection {
         options = options.with_projection(columns.clone());
@@ -200,13 +214,14 @@ fn options_for(engine: &str, case: Option<&OptionCase>) -> ReadOptions {
 
 async fn read_with(
     engine: &str,
+    merge_by_position: bool,
     table_path: &str,
     case: Option<&OptionCase>,
 ) -> Result<RecordBatch, String> {
     let table = Table::new(table_path)
         .await
         .map_err(|e| format!("open failed: {e}"))?;
-    let options = options_for(engine, case);
+    let options = options_for(engine, merge_by_position, case);
     let batches = table
         .read(&options)
         .await
@@ -248,8 +263,13 @@ async fn read_with(
 /// Rows are compared as a multiset — every user column rendered, then both
 /// sides sorted — rather than positionally against a key. Several fixtures
 /// carry duplicate record keys, so there is no column that identifies a row.
-async fn compare_owned(table_path: &str, gold_dir: &str, engine: &str) -> Result<(), String> {
-    let actual = read_with(engine, table_path, None).await?;
+async fn compare_owned(
+    table_path: &str,
+    gold_dir: &str,
+    engine: &str,
+    merge_by_position: bool,
+) -> Result<(), String> {
+    let actual = read_with(engine, merge_by_position, table_path, None).await?;
     let gold = match hudi_test::gold::read_gold_parquet(gold_dir) {
         Ok(gold) => gold,
         // Spark writes a snapshot with no row groups for an empty table, which
@@ -287,7 +307,7 @@ async fn compare_option_case_owned(
     case: OptionCase,
     engine: &str,
 ) -> Result<(), String> {
-    let actual = read_with(engine, table_path, Some(&case)).await?;
+    let actual = read_with(engine, false, table_path, Some(&case)).await?;
     let gold_dir = hudi_test::gold_options::case_gold_dir(&options_dir, &case.name);
     let gold = match hudi_test::gold::read_gold_parquet(&gold_dir) {
         Ok(gold) => gold,
@@ -397,19 +417,31 @@ struct Failure {
     /// The option case, or `None` for the full `SELECT *` read.
     case: Option<String>,
     engine: &'static str,
+    /// Whether the read merged by record position rather than by record key.
+    merge_by_position: bool,
     message: String,
 }
 
 impl Failure {
+    /// The engine as the sweep reports it, distinguishing the two merges.
+    fn engine_label(&self) -> String {
+        if self.merge_by_position {
+            format!("{}+positions", self.engine)
+        } else {
+            self.engine.to_string()
+        }
+    }
+
     fn describe(&self, format: TableFormat) -> String {
+        let engine = self.engine_label();
         match &self.case {
             Some(case) => format!(
-                "{} [{format:?}] case '{case}' engine '{}': {}",
-                self.fixture, self.engine, self.message
+                "{} [{format:?}] case '{case}' engine '{engine}': {}",
+                self.fixture, self.message
             ),
             None => format!(
-                "{} [{format:?}] engine '{}': {}",
-                self.fixture, self.engine, self.message
+                "{} [{format:?}] engine '{engine}': {}",
+                self.fixture, self.message
             ),
         }
     }
@@ -581,6 +613,16 @@ const KNOWN: &[Known] = &[
         engine: "legacy",
         reason: "legacy returns a stale row",
     },
+    // Legacy only: it merges whole batches by sorting and de-duplicating on
+    // record key, so a file group holding a key more than once collapses to one
+    // row per key. Hudi keeps every base row. The merge-on-read engine matches
+    // Hudi both by key and by position.
+    Known {
+        fixture: "table_duplicate_keys",
+        scope: CaseScope::Any,
+        engine: "legacy",
+        reason: "legacy collapses duplicate record keys",
+    },
 ];
 
 /// Run one comparison on its own task, so a reader that panics is reported like
@@ -653,13 +695,27 @@ fn a_null_list_element_renders_differently_from_an_empty_one() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn every_fixture_matches_hudi_on_both_engines() {
+/// What one pass over the corpus found: the disagreements no [`KNOWN`] entry
+/// explains, which entries did explain something, and what was skipped.
+struct SweepResult {
+    reported: Vec<String>,
+    entry_used: Vec<bool>,
+    without_gold: Vec<String>,
+    with_options: Vec<String>,
+}
+
+/// Read every fixture that ships gold under each of `engines`, where an entry is
+/// an engine and whether it merges by record position.
+///
+/// Option cases run only for an entry that merges by key: a case's gold is a
+/// single Spark snapshot taken without record positions, so there is nothing to
+/// compare a position-merged option read against.
+async fn sweep(engines: &[(&'static str, bool)]) -> SweepResult {
     let fixtures = all_fixtures();
     let mut without_gold: Vec<String> = Vec::new();
     let mut with_options: Vec<String> = Vec::new();
     let mut all_failures: Vec<(TableFormat, Failure)> = Vec::new();
-    let mut compared: HashMap<&str, usize> = HashMap::new();
+    let mut compared: HashMap<String, usize> = HashMap::new();
     let mut case_compared: HashMap<&str, usize> = HashMap::new();
 
     for fixture in &fixtures {
@@ -670,10 +726,15 @@ async fn every_fixture_matches_hudi_on_both_engines() {
 
         let mut failures: Vec<Failure> = Vec::new();
 
-        for engine in ENGINES {
+        for &(engine, merge_by_position) in engines {
+            let label = if merge_by_position {
+                format!("{engine}+positions")
+            } else {
+                engine.to_string()
+            };
             let path = fixture.table_path.clone();
-            let gold_dir = fixture.gold_dir();
-            let counter = compared.entry(engine).or_default();
+            let gold_dir = fixture.gold_dir(merge_by_position);
+            let counter = compared.entry(label).or_default();
             record(
                 &mut failures,
                 counter,
@@ -681,14 +742,18 @@ async fn every_fixture_matches_hudi_on_both_engines() {
                     fixture: fixture.name.clone(),
                     case: None,
                     engine,
+                    merge_by_position,
                     message: String::new(),
                 },
-                async move { compare_owned(&path, &gold_dir, engine).await },
+                async move { compare_owned(&path, &gold_dir, engine, merge_by_position).await },
             )
             .await;
         }
 
-        if fixture.has_option_cases() {
+        // Option cases compare against snapshots taken without record positions,
+        // so they run once per key-merging engine and not at all under position
+        // merge.
+        if fixture.has_option_cases() && engines.iter().any(|&(_, positions)| !positions) {
             with_options.push(fixture.label());
             let manifest = match read_option_manifest(&fixture.options_dir_owned) {
                 Ok(manifest) => manifest,
@@ -699,7 +764,10 @@ async fn every_fixture_matches_hudi_on_both_engines() {
                 }
             };
             for case in &manifest.cases {
-                for engine in ENGINES {
+                for &(engine, positions) in engines {
+                    if positions {
+                        continue;
+                    }
                     let path = fixture.table_path.clone();
                     let options_dir = fixture.options_dir_owned.clone();
                     let case = case.clone();
@@ -712,6 +780,7 @@ async fn every_fixture_matches_hudi_on_both_engines() {
                             fixture: fixture.name.clone(),
                             case: Some(case_name),
                             engine,
+                            merge_by_position: false,
                             message: String::new(),
                         },
                         async move {
@@ -740,11 +809,22 @@ async fn every_fixture_matches_hudi_on_both_engines() {
         }
     }
 
+    let counts: Vec<String> = engines
+        .iter()
+        .map(|&(engine, positions)| {
+            let label = if positions {
+                format!("{engine}+positions")
+            } else {
+                engine.to_string()
+            };
+            let n = compared.get(&label).copied().unwrap_or(0);
+            format!("{label} {n}")
+        })
+        .collect();
     println!(
-        "compared {} fixtures — legacy {}, v2 {}; {} without gold",
+        "compared {} fixtures — {}; {} without gold",
         fixtures.len() - without_gold.len(),
-        compared.get("legacy").copied().unwrap_or(0),
-        compared.get("v2").copied().unwrap_or(0),
+        counts.join(", "),
         without_gold.len(),
     );
     println!(
@@ -753,6 +833,24 @@ async fn every_fixture_matches_hudi_on_both_engines() {
         case_compared.get("legacy").copied().unwrap_or(0),
         case_compared.get("v2").copied().unwrap_or(0),
     );
+
+    SweepResult {
+        reported,
+        entry_used,
+        without_gold,
+        with_options,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_fixture_matches_hudi_on_both_engines() {
+    let engines: Vec<(&str, bool)> = ENGINES.iter().map(|&e| (e, false)).collect();
+    let SweepResult {
+        reported,
+        entry_used,
+        mut without_gold,
+        mut with_options,
+    } = sweep(&engines).await;
 
     // Coverage first: a fixture that silently stopped being compared would
     // otherwise look like a pass.
@@ -795,5 +893,85 @@ async fn every_fixture_matches_hudi_on_both_engines() {
          gone, so remove them:\n  {}",
         stale.len(),
         stale.join("\n  ")
+    );
+}
+
+/// The two merge strategies are not the same read.
+///
+/// Everywhere else in the corpus they agree, which means the position sweep
+/// below would still pass if position merge quietly fell back to key merge. This
+/// is the fixture that can tell them apart: one file group holding `k1` twice
+/// and `k2` three times, an upsert of `k1` and a delete of `k2`. Hudi's writer
+/// tags an incoming record with every base row its index matches, so those
+/// become two and three log records; keyed by record key they collapse to one
+/// entry each and only the first base row of each key is merged.
+///
+/// Both expected answers are Hudi's own, taken from the same table with only
+/// `hoodie.merge.use.record.positions` differing. Asserting they differ is what
+/// keeps the fixture honest: if a regenerated one ever made them equal, the
+/// position sweep would go back to proving nothing and this would say so.
+#[tokio::test(flavor = "multi_thread")]
+async fn merging_by_position_and_by_key_disagree_on_duplicate_record_keys() {
+    let fixture = QuickstartTripsTable::MorLayoutDuplicateKeys;
+    let table_path = fixture.path(TableFormat::MorAvro);
+    let by_key = fixture.gold_dir(TableFormat::MorAvro);
+    let by_position = fixture
+        .gold_positions_dir(TableFormat::MorAvro)
+        .expect("the duplicate-key fixture ships a position-merge snapshot");
+
+    let rows = |gold: &str| {
+        let batch = hudi_test::gold::read_gold_parquet(gold).expect("gold readable");
+        let columns = vec!["id".to_string(), "val".to_string()];
+        render_rows(&batch, &columns, "gold").expect("gold renderable")
+    };
+    assert_eq!(
+        rows(&by_key),
+        vec![
+            "k1 | k1-row-b",
+            "k1 | k1-updated",
+            "k2 | k2-row-b",
+            "k2 | k2-row-c",
+            "k3 | k3-row-a",
+        ],
+        "merging by key leaves a stale k1 row and two undeleted k2 rows"
+    );
+    assert_eq!(
+        rows(&by_position),
+        vec!["k1 | k1-updated", "k1 | k1-updated", "k3 | k3-row-a"],
+        "merging by position reaches every duplicate"
+    );
+
+    // And the reader lands on whichever of the two it was asked for.
+    compare_owned(&table_path, &by_key, "v2", false)
+        .await
+        .expect("v2 merging by key must match Hudi merging by key");
+    compare_owned(&table_path, &by_position, "v2", true)
+        .await
+        .expect("v2 merging by position must match Hudi merging by position");
+}
+
+/// The same corpus read with `hoodie.merge.use.record.positions` on.
+///
+/// Position-based merge matches a log record to the base row it updates by that
+/// row's index in the base file rather than by record key, and several of these
+/// fixtures were written by Hudi with `RECORD_POSITIONS` headers in their log
+/// blocks — so this is the path actually running, not a configuration that gets
+/// ignored. None of these tables has duplicate record keys inside one file
+/// group, which is the only case where the two strategies can disagree, so the
+/// answer must be the one Hudi gives either way.
+///
+/// Only the merge-on-read engine is swept: the legacy reader has no
+/// position-based merge and ignores the setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_fixture_matches_hudi_when_merging_by_record_position() {
+    // No entry on the known list describes a position-merged read, so anything
+    // this reports is unexplained by construction.
+    let SweepResult { reported, .. } = sweep(&[("v2", true)]).await;
+
+    assert!(
+        reported.is_empty(),
+        "{} comparison(s) disagree with Hudi under position-based merge:\n  {}",
+        reported.len(),
+        reported.join("\n  ")
     );
 }

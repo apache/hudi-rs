@@ -62,10 +62,7 @@ pub(crate) fn resolve_reader_context(
         instant_range: Some(instant_range),
         table_config,
         hoodie_reader_config,
-        // Log blocks carry record positions, but no code reads them yet.
-        // Merging by key is what the legacy reader does, so that is what a v2
-        // read must do until the position-based merge lands.
-        should_merge_use_record_position: false,
+        should_merge_use_record_position: resolve_use_record_position(hudi_configs)?,
         // Only one iterator mode is implemented.
         iterator_mode: "ENGINE_RECORD".to_string(),
         // Dispatch is on `merge_mode`; the strategy id is carried, not consulted.
@@ -152,6 +149,20 @@ fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
         false,
         true,
     ))
+}
+
+/// Whether this read should match log records to base rows by position.
+///
+/// Read strictly rather than through `get_or_default`, which falls back to the
+/// default when a value fails to parse: a typo would silently merge by key and
+/// return rows that look ordinary, which is exactly what this setting exists to
+/// change.
+#[allow(dead_code)]
+fn resolve_use_record_position(hudi_configs: &HudiConfigs) -> Result<bool> {
+    Ok(hudi_configs
+        .try_get(HudiReadConfig::MergeUseRecordPositions)?
+        .map(|v| -> bool { v.into() })
+        .unwrap_or(false))
 }
 
 /// Keys Hudi writes the merge inputs under. None is modelled as a
@@ -557,9 +568,8 @@ mod tests {
         }
     }
 
-    /// Log blocks carry record positions, but nothing reads them yet. Keeping
-    /// this off means a v2 read merges by key exactly as a legacy read does;
-    /// the position-based merge turns it on when it lands.
+    /// Position-based merge is off unless asked for, so a v2 read merges by key
+    /// exactly as a legacy read does by default.
     #[test]
     fn leaves_position_based_merge_off() {
         let configs = HudiConfigs::new(minimal_configs());
@@ -567,6 +577,39 @@ mod tests {
         let ctx = resolve_reader_context(&configs, true).unwrap();
 
         assert!(!ctx.should_merge_use_record_position);
+    }
+
+    #[test]
+    fn turns_position_based_merge_on_from_hudis_own_config_key() {
+        let mut options = minimal_configs();
+        options.push((
+            HudiReadConfig::MergeUseRecordPositions.as_ref().to_string(),
+            "true".to_string(),
+        ));
+
+        let ctx = resolve_reader_context(&HudiConfigs::new(options), true).unwrap();
+
+        assert!(ctx.should_merge_use_record_position);
+    }
+
+    /// A value that is not a boolean fails the read rather than falling back to
+    /// the default — a typo would otherwise merge by key and return rows that
+    /// look ordinary, which is the one outcome this setting exists to change.
+    #[test]
+    fn rejects_a_non_boolean_position_merge_setting() {
+        let mut options = minimal_configs();
+        options.push((
+            HudiReadConfig::MergeUseRecordPositions.as_ref().to_string(),
+            "yes".to_string(),
+        ));
+
+        let err = resolve_reader_context(&HudiConfigs::new(options), true).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("hoodie.merge.use.record.positions"),
+            "the error should name the offending key, got: {err}"
+        );
     }
 
     /// Defaults chosen to match what the legacy reader returns today: deletes
