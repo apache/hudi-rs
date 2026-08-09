@@ -565,14 +565,21 @@ async fn read_case(
         .map(|lf| join_partition(case.partition, lf))
         .collect();
 
-    // Leave base_file_commit_time None here: the harness mirrors only the paths.
-    // The instant-range filter derives the base file's instant from base_file_path
-    // when this is None (reader/mod.rs), so instant-range cases still work; the
-    // real FFI populates it (cpp/src/lib.rs), and the position-based loader path
-    // (loader.rs) keeps its existing None behavior for the non-instant cases.
+    // Derive the base file's instant from its name, as the adapter and the FFI
+    // (cpp/src/lib.rs) both do. Position-based merge needs it to check that a log
+    // block's positions were recorded against this base file; leaving it unset
+    // would make every harness case decline that path regardless of what it asked
+    // for, and a case written to exercise position merge would pass while
+    // exercising key merge.
+    let base_file_commit_time = case
+        .base_file
+        .parse::<crate::file_group::base_file::BaseFile>()
+        .ok()
+        .map(|base_file| base_file.commit_timestamp);
+
     let input_split = InputSplit::new(
         base_path.clone(),
-        None,
+        base_file_commit_time,
         log_paths,
         case.partition.to_string(),
     );

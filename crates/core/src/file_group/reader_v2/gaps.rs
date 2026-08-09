@@ -49,28 +49,31 @@ pub(crate) enum ComparedWith {
 /// Something another reader does that this one does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gap {
-    /// Merging by a record's position in the base file rather than by key. The
-    /// row-number column the buffer needs is never attached, so a read that
-    /// asks for it is merged by key instead — the same rows, reached a
-    /// different way, except where duplicate keys exist.
-    PositionBasedMerge,
+    /// A slice this reader cannot merge by record position even though the read
+    /// asked for it — the base file's instant could not be read from its name,
+    /// or its format is not parquet. Hudi's reader is handed the instant by the
+    /// file slice and never has to decline. Merging by key instead returns the
+    /// same rows unless the file group holds duplicate record keys.
+    PositionBasedMergeDeclined,
 }
 
 impl Gap {
     /// Which reader this differs from.
     pub(crate) fn compared_with(&self) -> ComparedWith {
         match self {
-            // The legacy reader has no position-based merge either.
-            Gap::PositionBasedMerge => ComparedWith::Jvm,
+            // The legacy reader has no position-based merge at all, so it is not
+            // the reader this is measured against.
+            Gap::PositionBasedMergeDeclined => ComparedWith::Jvm,
         }
     }
 
     /// What a reader would see, said plainly enough to act on.
     pub(crate) fn describe(&self) -> &'static str {
         match self {
-            Gap::PositionBasedMerge => {
-                "this read asked to merge by record position; merging by record key instead, \
-                 which differs only where a file group holds duplicate keys"
+            Gap::PositionBasedMergeDeclined => {
+                "this read asked to merge by record position but the base file's instant or \
+                 format could not support it; merging by record key instead, which differs only \
+                 where a file group holds duplicate keys"
             }
         }
     }
@@ -79,9 +82,15 @@ impl Gap {
 /// Report every gap this read runs into.
 ///
 /// Called once per read. Only gaps that are *silently* not done belong here —
-/// anything refused already says so through its error.
-pub(crate) fn report_for_read(context: &ReaderContext, parameters: &ReaderParameters) {
-    for gap in applicable(context, parameters) {
+/// anything refused already says so through its error. `merging_by_position` is
+/// the reader's own decision for this slice, which is what makes the difference
+/// between doing the thing and quietly not doing it.
+pub(crate) fn report_for_read(
+    context: &ReaderContext,
+    parameters: &ReaderParameters,
+    merging_by_position: bool,
+) {
+    for gap in applicable(context, parameters, merging_by_position) {
         log::warn!(
             "{} (differs from: {:?})",
             gap.describe(),
@@ -91,12 +100,19 @@ pub(crate) fn report_for_read(context: &ReaderContext, parameters: &ReaderParame
 }
 
 /// The gaps that apply to a read, given how it was set up.
-fn applicable(context: &ReaderContext, parameters: &ReaderParameters) -> Vec<Gap> {
+fn applicable(
+    context: &ReaderContext,
+    parameters: &ReaderParameters,
+    merging_by_position: bool,
+) -> Vec<Gap> {
     let mut gaps = Vec::new();
-    // The context flag is what the engine would act on; the parameter is what the
+    // The context flag is what the engine acts on; the parameter is what the
     // caller asked for. Either one means the read expected position merging.
-    if parameters.use_record_position || context.should_merge_use_record_position {
-        gaps.push(Gap::PositionBasedMerge);
+    let asked = parameters.use_record_position || context.should_merge_use_record_position;
+    // With no log files there is nothing to merge, so the two strategies cannot
+    // disagree — reporting there would fire on every base-only read.
+    if asked && context.has_log_files && !merging_by_position {
+        gaps.push(Gap::PositionBasedMergeDeclined);
     }
     gaps
 }
@@ -105,29 +121,45 @@ fn applicable(context: &ReaderContext, parameters: &ReaderParameters) -> Vec<Gap
 mod tests {
     use super::*;
 
+    fn mor_context() -> ReaderContext {
+        let mut context = ReaderContext::empty();
+        context.has_log_files = true;
+        context
+    }
+
+    fn asked_for_positions() -> ReaderParameters {
+        ReaderParameters {
+            use_record_position: true,
+            ..Default::default()
+        }
+    }
+
     /// A read that does not ask for anything missing reports nothing. Without
     /// this the warning could fire on every read and be tuned out.
     #[test]
     fn test_an_ordinary_read_has_no_gaps() {
-        let context = ReaderContext::empty();
-        let parameters = ReaderParameters::default();
+        let gaps = applicable(&mor_context(), &ReaderParameters::default(), false);
 
-        assert!(applicable(&context, &parameters).is_empty());
+        assert!(gaps.is_empty());
     }
 
-    /// Asking to merge by position is reported, because the read still succeeds
-    /// and returns something a reader that has it would not.
+    /// A read that asked for position merge and got it is not a gap — this is
+    /// what closes the entry, and what would start failing if the wiring broke.
     #[test]
-    fn test_asking_to_merge_by_position_is_reported() {
-        let context = ReaderContext::empty();
-        let parameters = ReaderParameters {
-            use_record_position: true,
-            ..Default::default()
-        };
+    fn test_merging_by_position_is_not_reported() {
+        let gaps = applicable(&mor_context(), &asked_for_positions(), true);
 
-        let gaps = applicable(&context, &parameters);
+        assert!(gaps.is_empty());
+    }
 
-        assert_eq!(gaps, vec![Gap::PositionBasedMerge]);
+    /// Asking and being declined is reported, because the read still succeeds
+    /// and returns something Hudi's reader would not on a file group with
+    /// duplicate keys.
+    #[test]
+    fn test_declining_to_merge_by_position_is_reported() {
+        let gaps = applicable(&mor_context(), &asked_for_positions(), false);
+
+        assert_eq!(gaps, vec![Gap::PositionBasedMergeDeclined]);
         assert_eq!(gaps[0].compared_with(), ComparedWith::Jvm);
         assert!(gaps[0].describe().contains("record position"));
     }
@@ -136,11 +168,21 @@ mod tests {
     /// caller's parameters — the engine reads the context, so both have to count.
     #[test]
     fn test_a_context_asking_for_position_merge_is_reported() {
-        let mut context = ReaderContext::empty();
+        let mut context = mor_context();
         context.should_merge_use_record_position = true;
 
-        let gaps = applicable(&context, &ReaderParameters::default());
+        let gaps = applicable(&context, &ReaderParameters::default(), false);
 
-        assert_eq!(gaps, vec![Gap::PositionBasedMerge]);
+        assert_eq!(gaps, vec![Gap::PositionBasedMergeDeclined]);
+    }
+
+    /// A slice with no log files has nothing to merge, so neither strategy can
+    /// win — reporting there would fire on every base-only read of a table
+    /// configured for position merge.
+    #[test]
+    fn test_a_slice_with_no_log_files_is_not_reported() {
+        let gaps = applicable(&ReaderContext::empty(), &asked_for_positions(), false);
+
+        assert!(gaps.is_empty());
     }
 }

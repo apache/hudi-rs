@@ -51,6 +51,10 @@ struct Fixture {
     format: TableFormat,
     table_path: String,
     gold_dir_owned: String,
+    /// The snapshot Hudi returns when merging by record position, for the one
+    /// fixture where that differs from merging by key. Absent means the two
+    /// agree and `gold_dir_owned` is the answer for both.
+    gold_positions_dir: Option<String>,
 }
 
 impl Fixture {
@@ -58,12 +62,16 @@ impl Fixture {
         format!("{} [{:?}]", self.name, self.format)
     }
 
-    fn gold_dir(&self) -> String {
-        self.gold_dir_owned.clone()
+    /// The snapshot to compare against for one way of merging.
+    fn gold_dir(&self, merge_by_position: bool) -> String {
+        match (merge_by_position, &self.gold_positions_dir) {
+            (true, Some(dir)) => dir.clone(),
+            _ => self.gold_dir_owned.clone(),
+        }
     }
 
     fn has_gold(&self) -> bool {
-        Path::new(&self.gold_dir()).is_dir()
+        Path::new(&self.gold_dir_owned).is_dir()
     }
 }
 
@@ -77,6 +85,7 @@ fn all_fixtures() -> Vec<Fixture> {
                 format,
                 table_path: table.path(format),
                 gold_dir_owned: table.gold_dir(format),
+                gold_positions_dir: None,
             });
         }
     }
@@ -87,18 +96,30 @@ fn all_fixtures() -> Vec<Fixture> {
                 format,
                 table_path: table.path(format),
                 gold_dir_owned: table.gold_dir(format),
+                gold_positions_dir: table.gold_positions_dir(format),
             });
         }
     }
     fixtures
 }
 
-async fn read_with(engine: &str, table_path: &str) -> Result<RecordBatch, String> {
+async fn read_with(
+    engine: &str,
+    merge_by_position: bool,
+    table_path: &str,
+) -> Result<RecordBatch, String> {
     let table = Table::new(table_path)
         .await
         .map_err(|e| format!("open failed: {e}"))?;
     let batches = table
-        .read(&ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine))
+        .read(
+            &ReadOptions::new()
+                .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine)
+                .with_hudi_option(
+                    HudiReadConfig::MergeUseRecordPositions.as_ref(),
+                    merge_by_position.to_string(),
+                ),
+        )
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     if batches.is_empty() {
@@ -137,8 +158,13 @@ async fn read_with(engine: &str, table_path: &str) -> Result<RecordBatch, String
 /// Rows are compared as a multiset — every user column rendered, then both
 /// sides sorted — rather than positionally against a key. Several fixtures
 /// carry duplicate record keys, so there is no column that identifies a row.
-async fn compare_owned(table_path: &str, gold_dir: &str, engine: &str) -> Result<(), String> {
-    let actual = read_with(engine, table_path).await?;
+async fn compare_owned(
+    table_path: &str,
+    gold_dir: &str,
+    engine: &str,
+    merge_by_position: bool,
+) -> Result<(), String> {
+    let actual = read_with(engine, merge_by_position, table_path).await?;
     let gold = match hudi_test::gold::read_gold_parquet(gold_dir) {
         Ok(gold) => gold,
         // Spark writes a snapshot with no row groups for an empty table, which
@@ -208,50 +234,75 @@ fn render_rows(batch: &RecordBatch, columns: &[String], side: &str) -> Result<Ve
     Ok(rows)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn every_fixture_matches_hudi_on_both_engines() {
+/// Read every fixture that ships gold under each of `engines`, returning one
+/// description per disagreement.
+async fn sweep(engines: &[(&'static str, bool)]) -> Vec<String> {
     let fixtures = all_fixtures();
     let mut without_gold: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    let mut compared: HashMap<&str, usize> = HashMap::new();
+    let mut compared: HashMap<String, usize> = HashMap::new();
 
     for fixture in &fixtures {
         if !fixture.has_gold() {
             without_gold.push(fixture.label());
             continue;
         }
-        for engine in ENGINES {
+        for &(engine, merge_by_position) in engines {
+            let label = if merge_by_position {
+                format!("{engine}+positions")
+            } else {
+                engine.to_string()
+            };
             // Run each comparison on its own task: a reader that panics should
             // be reported like any other disagreement, not abort the sweep and
             // hide every fixture after it.
             let path = fixture.table_path.clone();
-            let gold_dir = fixture.gold_dir();
-            let outcome =
-                tokio::spawn(async move { compare_owned(&path, &gold_dir, engine).await }).await;
+            let gold_dir = fixture.gold_dir(merge_by_position);
+            let outcome = tokio::spawn(async move {
+                compare_owned(&path, &gold_dir, engine, merge_by_position).await
+            })
+            .await;
             match outcome {
-                Ok(Ok(())) => *compared.entry(engine).or_default() += 1,
-                Ok(Err(e)) => failures.push(format!("{} engine '{engine}': {e}", fixture.label())),
+                Ok(Ok(())) => *compared.entry(label).or_default() += 1,
+                Ok(Err(e)) => failures.push(format!("{} engine '{label}': {e}", fixture.label())),
                 Err(join) if join.is_panic() => failures.push(format!(
-                    "{} engine '{engine}': PANICKED during read",
+                    "{} engine '{label}': PANICKED during read",
                     fixture.label()
                 )),
-                Err(join) => {
-                    failures.push(format!("{} engine '{engine}': {join}", fixture.label()))
-                }
+                Err(join) => failures.push(format!("{} engine '{label}': {join}", fixture.label())),
             }
         }
     }
 
+    let counts: Vec<String> = engines
+        .iter()
+        .map(|&(engine, positions)| {
+            let label = if positions {
+                format!("{engine}+positions")
+            } else {
+                engine.to_string()
+            };
+            let n = compared.get(&label).copied().unwrap_or(0);
+            format!("{label} {n}")
+        })
+        .collect();
     println!(
-        "compared {} fixtures — legacy {}, v2 {}; {} without gold",
+        "compared {} fixtures — {}; {} without gold",
         fixtures.len() - without_gold.len(),
-        compared.get("legacy").copied().unwrap_or(0),
-        compared.get("v2").copied().unwrap_or(0),
+        counts.join(", "),
         without_gold.len(),
     );
     if !without_gold.is_empty() {
         println!("without gold:\n  {}", without_gold.join("\n  "));
     }
+
+    failures
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_fixture_matches_hudi_on_both_engines() {
+    let engines: Vec<(&str, bool)> = ENGINES.iter().map(|&e| (e, false)).collect();
+    let failures = sweep(&engines).await;
 
     // Known disagreements, each with a cause. The sweep is a ratchet: a new
     // disagreement fails the build, and one that starts passing has to be
@@ -302,6 +353,14 @@ async fn every_fixture_matches_hudi_on_both_engines() {
             "legacy drops a column added by a later writer",
         ),
         ("v9_mor_nonpart_3commits", "legacy returns a stale row"),
+        // Legacy only: it merges whole batches by sorting and de-duplicating on
+        // record key, so a file group holding a key more than once collapses to
+        // one row per key. Hudi keeps every base row. The merge-on-read engine
+        // matches Hudi both by key and by position.
+        (
+            "table_duplicate_keys",
+            "legacy collapses duplicate record keys",
+        ),
     ];
     let unexpected: Vec<&String> = failures
         .iter()
@@ -312,6 +371,88 @@ async fn every_fixture_matches_hudi_on_both_engines() {
         "{} comparison(s) disagree with Hudi for a reason not on the known list:\n  {}",
         unexpected.len(),
         unexpected
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+/// The two merge strategies are not the same read.
+///
+/// Everywhere else in the corpus they agree, which means the position sweep
+/// below would still pass if position merge quietly fell back to key merge. This
+/// is the fixture that can tell them apart: one file group holding `k1` twice
+/// and `k2` three times, an upsert of `k1` and a delete of `k2`. Hudi's writer
+/// tags an incoming record with every base row its index matches, so those
+/// become two and three log records; keyed by record key they collapse to one
+/// entry each and only the first base row of each key is merged.
+///
+/// Both expected answers are Hudi's own, taken from the same table with only
+/// `hoodie.merge.use.record.positions` differing. Asserting they differ is what
+/// keeps the fixture honest: if a regenerated one ever made them equal, the
+/// position sweep would go back to proving nothing and this would say so.
+#[tokio::test(flavor = "multi_thread")]
+async fn merging_by_position_and_by_key_disagree_on_duplicate_record_keys() {
+    let fixture = QuickstartTripsTable::MorLayoutDuplicateKeys;
+    let table_path = fixture.path(TableFormat::MorAvro);
+    let by_key = fixture.gold_dir(TableFormat::MorAvro);
+    let by_position = fixture
+        .gold_positions_dir(TableFormat::MorAvro)
+        .expect("the duplicate-key fixture ships a position-merge snapshot");
+
+    let rows = |gold: &str| {
+        let batch = hudi_test::gold::read_gold_parquet(gold).expect("gold readable");
+        let columns = vec!["id".to_string(), "val".to_string()];
+        render_rows(&batch, &columns, "gold").expect("gold renderable")
+    };
+    assert_eq!(
+        rows(&by_key),
+        vec![
+            "k1 | k1-row-b",
+            "k1 | k1-updated",
+            "k2 | k2-row-b",
+            "k2 | k2-row-c",
+            "k3 | k3-row-a",
+        ],
+        "merging by key leaves a stale k1 row and two undeleted k2 rows"
+    );
+    assert_eq!(
+        rows(&by_position),
+        vec!["k1 | k1-updated", "k1 | k1-updated", "k3 | k3-row-a"],
+        "merging by position reaches every duplicate"
+    );
+
+    // And the reader lands on whichever of the two it was asked for.
+    compare_owned(&table_path, &by_key, "v2", false)
+        .await
+        .expect("v2 merging by key must match Hudi merging by key");
+    compare_owned(&table_path, &by_position, "v2", true)
+        .await
+        .expect("v2 merging by position must match Hudi merging by position");
+}
+
+/// The same corpus read with `hoodie.merge.use.record.positions` on.
+///
+/// Position-based merge matches a log record to the base row it updates by that
+/// row's index in the base file rather than by record key, and several of these
+/// fixtures were written by Hudi with `RECORD_POSITIONS` headers in their log
+/// blocks — so this is the path actually running, not a configuration that gets
+/// ignored. None of these tables has duplicate record keys inside one file
+/// group, which is the only case where the two strategies can disagree, so the
+/// answer must be the one Hudi gives either way.
+///
+/// Only the merge-on-read engine is swept: the legacy reader has no
+/// position-based merge and ignores the setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_fixture_matches_hudi_when_merging_by_record_position() {
+    let failures = sweep(&[("v2", true)]).await;
+
+    assert!(
+        failures.is_empty(),
+        "{} comparison(s) disagree with Hudi under position-based merge:\n  {}",
+        failures.len(),
+        failures
             .iter()
             .map(|f| f.as_str())
             .collect::<Vec<_>>()

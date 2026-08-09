@@ -286,6 +286,28 @@ pub enum QuickstartTripsTable {
     /// question — hence no case wired up for it yet.
     #[strum(serialize = "table_hfile_log_block")]
     MorLayoutHfileLogBlock,
+    /// v9 MOR non-partitioned, one file group holding the same record key more
+    /// than once — the only fixture where merging by record position and
+    /// merging by record key give different answers.
+    ///
+    /// Provenance: `table_duplicate_keys.scala` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.1.1), written with `hoodie.write.record.positions`
+    /// on so the log blocks carry `RECORD_POSITIONS` headers.
+    /// Schema: id STRING, val STRING, ts LONG (non-partitioned).
+    /// Layout: base .parquet (6 rows — k1 ×2, k2 ×3, k3 ×1, inserted in one
+    /// commit without combining) + log.1 (AVRO data block, one UPSERT of k1
+    /// expanded to one record per matched base row) + log.2 (DELETE block, one
+    /// delete of k2 expanded to three).
+    /// Semantics: Hudi's writer tags an incoming record with *every* base row
+    /// its index matches. Keyed by record key those expansions collapse to one
+    /// entry per key and only the first base row of each key is merged, leaving
+    /// a stale k1 row and two live k2 rows (5 rows). Keyed by position each base
+    /// row is merged on its own (3 rows).
+    /// Two golds, both Hudi's own output: `gold_data` is the default read,
+    /// `gold_positions` the same read with
+    /// `hoodie.merge.use.record.positions=true`.
+    #[strum(serialize = "table_duplicate_keys")]
+    MorLayoutDuplicateKeys,
 
     // -------------------------------------------------------------------------
     // Delete-block orderingVal wrapper-type fixtures (Task 7).
@@ -429,6 +451,18 @@ impl QuickstartTripsTable {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    /// Where this fixture's Spark snapshot taken with
+    /// `hoodie.merge.use.record.positions=true` lives, if it ships one.
+    ///
+    /// Only a fixture whose file group holds duplicate record keys needs a
+    /// second snapshot: everywhere else the two merge strategies agree and
+    /// [`Self::gold_dir`] is the answer for both.
+    pub fn gold_positions_dir(&self, format: TableFormat) -> Option<String> {
+        let zip_path = self.zip_path_for(format);
+        let dir = extract_test_table(zip_path.as_ref()).join("gold_positions");
+        dir.is_dir().then(|| dir.to_str().unwrap().to_string())
     }
 
     pub fn path_to_cow(&self) -> String {

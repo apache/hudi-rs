@@ -50,6 +50,19 @@ pub struct BaseFileReadOptions {
     /// against the file's own schema, which the caller does not have until the
     /// footer is open.
     pub row_filter: Option<RowFilterBuilder>,
+    /// Name for a synthetic `Int64` column carrying each row's physical position
+    /// in the file, appended after the file's own columns.
+    ///
+    /// The position is the row's index in the file as written, not its index in
+    /// what the read returns — a [`row_filter`](Self::row_filter) that skips rows
+    /// leaves gaps rather than renumbering. That is what makes it usable as the
+    /// merge key for position-based merge, where a log block's positions were
+    /// recorded against the unfiltered base file.
+    ///
+    /// Only the Parquet reader honors this; other formats ignore it. The name is
+    /// excluded from [`projection`](Self::projection) matching, since the column
+    /// is not one of the file's own.
+    pub row_index_column: Option<String>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -61,6 +74,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
             .field("projection", &self.projection)
             .field("known_file_size", &self.known_file_size)
             .field("row_filter", &self.row_filter.is_some())
+            .field("row_index_column", &self.row_index_column)
             .finish()
     }
 }
@@ -73,6 +87,13 @@ impl BaseFileReadOptions {
     /// Sets a predicate to push into the read. See [`Self::row_filter`].
     pub fn with_row_filter(mut self, row_filter: RowFilterBuilder) -> Self {
         self.row_filter = Some(row_filter);
+        self
+    }
+
+    /// Asks for a synthetic row-position column under `name`. See
+    /// [`Self::row_index_column`].
+    pub fn with_row_index_column(mut self, name: impl Into<String>) -> Self {
+        self.row_index_column = Some(name.into());
         self
     }
 

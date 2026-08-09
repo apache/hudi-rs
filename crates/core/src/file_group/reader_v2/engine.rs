@@ -136,16 +136,48 @@ pub struct HoodieFileGroupReader {
     // `make_base_file_source` below.
 }
 
-/// Base-file read options carrying an optional pushdown predicate.
+/// Base-file read options carrying an optional pushdown predicate, and the
+/// row-position column when the merge is by position.
 ///
-/// The three base reads below differ only in projection, so the filter is
-/// attached in one place — a read that silently lost it would return extra rows
-/// rather than fail, which is the hard kind of bug to notice.
-fn base_read_options(row_filter: Option<RowFilterBuilder>) -> BaseFileReadOptions {
-    match row_filter {
-        Some(f) => BaseFileReadOptions::new().with_row_filter(f),
-        None => BaseFileReadOptions::new(),
+/// The three base reads below differ only in projection, so both are attached in
+/// one place — a read that silently lost the filter would return extra rows
+/// rather than fail, which is the hard kind of bug to notice, and one that lost
+/// the row-position column would fail in the buffer with the column named but
+/// not the read that dropped it.
+fn base_read_options(
+    row_filter: Option<RowFilterBuilder>,
+    use_record_position: bool,
+) -> BaseFileReadOptions {
+    let mut options = BaseFileReadOptions::new();
+    if let Some(row_filter) = row_filter {
+        options = options.with_row_filter(row_filter);
     }
+    if use_record_position {
+        options = options.with_row_index_column(ROW_INDEX_TEMPORARY_COLUMN_NAME);
+    }
+    options
+}
+
+/// `schema` without the internal row-position column.
+///
+/// The column belongs to the base read and the position buffer; it is not the
+/// table's, so it must not reach a caller. Every schema derived from a base
+/// source's own schema goes through here.
+fn without_row_index(schema: SchemaRef) -> SchemaRef {
+    if schema
+        .column_with_name(ROW_INDEX_TEMPORARY_COLUMN_NAME)
+        .is_none()
+    {
+        return schema;
+    }
+    Arc::new(arrow_schema::Schema::new(
+        schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != ROW_INDEX_TEMPORARY_COLUMN_NAME)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ))
 }
 
 impl HoodieFileGroupReader {
@@ -417,6 +449,7 @@ impl HoodieFileGroupReader {
         crate::file_group::reader_v2::gaps::report_for_read(
             &self.reader_context,
             &self.reader_parameters,
+            self.use_record_position(),
         );
         // A3 (ENG-42992): eager mode — the base parquet stream is drained
         // async during `init_record_iterators` (streaming=false), so the
@@ -582,8 +615,10 @@ impl HoodieFileGroupReader {
         let merge_schema: SchemaRef = if let Some(rs) = &self.schema_handler.required_schema {
             rs.clone()
         } else if self.input_split.base_file_path.is_some() {
-            // The base source's schema is the parquet schema after projection.
-            base_source_schema.clone()
+            // The base source's schema is the parquet schema after projection,
+            // plus the row-position column when merging by position — which is
+            // the reader's own and never an output column.
+            without_row_index(base_source_schema.clone())
         } else {
             // Log-only file group: peek at any non-delete log record's batch
             // (HashMap order is non-deterministic, so we must search all
@@ -763,6 +798,16 @@ impl HoodieFileGroupReader {
             None
         };
 
+        // Position-based merge: ask the base read for a synthetic row-index
+        // column carrying each row's TRUE physical base-file position (a parquet
+        // virtual RowNumber column — correct even under RowFilter pushdown). It
+        // is kept on the base source so the position buffer can match base rows
+        // to log records, then dropped by the buffer when it reconciles each
+        // batch to the merge schema. The column is NOT added to
+        // `required_schema`/`merge_schema` — only to the base source's physical
+        // schema (`base_read_schema` = required + row-index).
+        let use_position = self.use_record_position();
+
         // No projection schema → fall back to the unprojected eager helper
         // (rare; FFI always supplies a required_schema). Streaming variant
         // of the unprojected helper is not exposed yet — eager Vec here.
@@ -773,7 +818,7 @@ impl HoodieFileGroupReader {
         let Some(required_schema) = self.schema_handler.required_schema.clone() else {
             let batch = self
                 .base_file_reader()?
-                .read_data(&path, base_read_options(row_filter.clone()))
+                .read_data(&path, base_read_options(row_filter.clone(), use_position))
                 .await
                 .map_err(|e| {
                     CoreError::ReadFileSliceError(format!(
@@ -838,16 +883,6 @@ impl HoodieFileGroupReader {
             present_len
         );
 
-        // Position-based merge: append a synthetic row-index column carrying
-        // each row's TRUE physical base-file position (via a parquet virtual
-        // RowNumber column — correct even under RowFilter pushdown). It is kept
-        // on the base source so the position buffer can match base rows to log
-        // records, then stripped by the buffer before output. The column is NOT
-        // added to `required_schema`/`merge_schema` — only to the base source's
-        // physical schema (`base_read_schema` = required + row-index).
-        let use_position = self.use_record_position();
-        // Unused: position-based merging is not wired up here.
-        let _row_number_col = use_position.then(|| ROW_INDEX_TEMPORARY_COLUMN_NAME.to_string());
         let base_read_schema: SchemaRef = if use_position {
             let mut fields: Vec<arrow_schema::FieldRef> =
                 required_schema.fields().iter().cloned().collect();
@@ -880,14 +915,11 @@ impl HoodieFileGroupReader {
             // row groups can be pruned via column-index stats (the builder
             // resolves predicate columns by name and returns None when any
             // referenced column is absent — safe even for evolved/added cols).
-            // Upstream also threads a row-number column through this read, for
-            // position-based merging. That is not wired up here, so it is
-            // dropped rather than faked.
             let raw = self
                 .base_file_reader()?
                 .read_data(
                     &path,
-                    base_read_options(row_filter.clone())
+                    base_read_options(row_filter.clone(), use_position)
                         .with_projection(intersection.fields().iter().map(|f| f.name())),
                 )
                 .await
@@ -918,7 +950,7 @@ impl HoodieFileGroupReader {
                 .base_file_reader()?
                 .read_stream(
                     &path,
-                    base_read_options(row_filter.clone())
+                    base_read_options(row_filter.clone(), use_position)
                         .with_projection(intersection.fields().iter().map(|f| f.name())),
                 )
                 .await
@@ -1560,6 +1592,91 @@ mod tests {
         assert_eq!(
             eager_out, stream_out,
             "streaming base source must produce byte-identical output to the eager path"
+        );
+    }
+
+    /// A base source feeding a position-based merge carries the row-position
+    /// column, and one feeding a key-based merge does not.
+    ///
+    /// This is the join between the base read and the position buffer: the
+    /// buffer looks the column up by name and errors when it is absent, so a
+    /// read whose base source omits it cannot merge by position at all. Asserted
+    /// on both the eager and streaming sources, which open the parquet file
+    /// through different calls and could disagree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_make_base_file_source_carries_row_positions_for_position_merge() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            file_schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["k1", "k2", "k3"])),
+                Arc::new(Int32Array::from(vec![7, 8, 9])),
+            ],
+        )
+        .unwrap();
+        let base_name = "f1-0_0-1-1_20240101120000000.parquet";
+        write_parquet_file(tmp.path(), base_name, &batch);
+
+        let required = file_schema.clone();
+        let dir = tmp.path().to_path_buf();
+
+        let build = |use_record_position: bool| {
+            let dir = dir.clone();
+            let required = required.clone();
+            async move {
+                let mut reader =
+                    test_file_group_reader_for_base_file(&dir, base_name, required).await;
+                // Position merge only applies to a slice that has log records to
+                // merge, and only when the base file's instant is known.
+                reader.input_split = InputSplit::new(
+                    Some(base_name.to_string()),
+                    Some("20240101120000000".to_string()),
+                    vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+                    String::new(),
+                );
+                reader.reader_parameters = ReaderParameters {
+                    use_record_position,
+                    ..Default::default()
+                };
+                reader
+            }
+        };
+
+        let mut positional = build(true).await;
+        let eager = drain_base_source(positional.make_base_file_source(false).await.unwrap());
+        let positions = eager
+            .column_by_name(ROW_INDEX_TEMPORARY_COLUMN_NAME)
+            .expect("position merge needs the row-position column on the base source")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("row positions are Int64");
+        assert_eq!(positions.values(), &[0, 1, 2]);
+
+        let mut positional_streaming = build(true).await;
+        let streaming_source = positional_streaming
+            .make_base_file_source(true)
+            .await
+            .unwrap();
+        let streamed = tokio::task::spawn_blocking(move || drain_base_source(streaming_source))
+            .await
+            .unwrap();
+        assert_eq!(
+            streamed, eager,
+            "the streaming base source must carry the same positions as the eager one"
+        );
+
+        let mut keyed = build(false).await;
+        let without = drain_base_source(keyed.make_base_file_source(false).await.unwrap());
+        assert_eq!(
+            without.schema(),
+            required,
+            "a key-based merge must not pay for the row-position column"
         );
     }
 
