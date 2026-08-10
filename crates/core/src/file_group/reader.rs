@@ -18,7 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::read::HudiReadConfig;
+use crate::config::read::{FileGroupReaderVersion, HudiReadConfig};
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
@@ -49,6 +49,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// The reader that handles all read operations against a file group.
@@ -221,6 +222,88 @@ impl FileGroupReader {
             .await
     }
 
+    /// Which merge implementation serves this read.
+    ///
+    /// A metadata table is always served by the legacy reader whatever the
+    /// setting says: its base files and log blocks are HFile, which the
+    /// merge-on-read engine has no support for. That is permanent, not
+    /// transitional.
+    ///
+    /// The value is read raw rather than through `get_or_default`, which falls
+    /// back to the default when a value fails to parse. A typo in the engine
+    /// name would then silently read with the other engine, leaving a caller
+    /// convinced they had exercised it — the one outcome this switch must not
+    /// produce.
+    fn file_group_reader_version(&self) -> Result<FileGroupReaderVersion> {
+        if self.is_metadata_table() {
+            return Ok(FileGroupReaderVersion::One);
+        }
+        match self
+            .hudi_configs
+            .as_options()
+            .get(HudiReadConfig::FileGroupReaderVersion.as_ref())
+        {
+            Some(raw) => FileGroupReaderVersion::from_str(raw).map_err(CoreError::Config),
+            None => Ok(FileGroupReaderVersion::default()),
+        }
+    }
+
+    /// Why the merge-on-read engine cannot serve this read, if it cannot.
+    ///
+    /// This is a capability check, decided from config before any I/O — never a
+    /// catch-all on error. A read that fails *inside* the engine propagates:
+    /// retrying it on the legacy reader would make a bug look like a success,
+    /// make results depend on which engine happened to win, and leave the
+    /// differential tests unable to see anything.
+    ///
+    /// Every reason here means the legacy reader serves the read instead, so
+    /// selecting the engine cannot turn a working read into a failing one. Each
+    /// reason is logged, because a fallback nobody can observe is
+    /// indistinguishable from an engine that is never used.
+    fn version_two_unsupported_reason(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<Option<&'static str>> {
+        // Deliberately an error rather than a fallback: falling back would use
+        // the legacy reader's own merge derivation, which drops deletes on a
+        // commit-time-ordered table. Wrong rows are worse than a refusal.
+        if let Some(mode) = self
+            .hudi_configs
+            .as_options()
+            // Read by raw key: this crate has no typed config for it yet, and
+            // adding one belongs with the reader that acts on it.
+            .get("hoodie.record.merge.mode")
+            && mode.eq_ignore_ascii_case("CUSTOM")
+        {
+            return Err(CoreError::Unsupported(
+                "A table with a CUSTOM record merge mode needs its own merger, \
+                 which no reader here implements"
+                    .to_string(),
+            ));
+        }
+
+        // Unreachable while `file_group_reader_version` routes a metadata table
+        // to version 1 above; kept so a future change to that routing fails
+        // loudly here rather than reaching a reader that cannot read HFile.
+        if self.is_metadata_table() {
+            return Err(CoreError::Unsupported(
+                "The merge-on-read engine cannot read a metadata table's HFile \
+                 base files and log blocks"
+                    .to_string(),
+            ));
+        }
+
+        if options.is_read_optimized()? {
+            return Ok(Some("read-optimized reads are not served yet"));
+        }
+        // The fallthrough reports *unsupported*, deliberately: capability is
+        // enumerated, not assumed, so a situation nobody considered falls back
+        // rather than being served by an engine that has never seen it.
+        // Inverting this is a one-line change with no visible symptom, which is
+        // why it is called out here.
+        Ok(Some("the merge-on-read engine is not wired up yet"))
+    }
+
     /// Reads a file slice from a base file and a list of log files.
     ///
     /// `options.filters` are applied as a row-level mask after reading;
@@ -243,6 +326,29 @@ impl FileGroupReader {
             .map(|s| s.as_ref().to_string())
             .collect();
         let base_file_only = log_file_paths.is_empty() || options.is_read_optimized()?;
+
+        if self.file_group_reader_version()? == FileGroupReaderVersion::Two {
+            match self.version_two_unsupported_reason(&options)? {
+                None => {
+                    // Claiming a capability is claiming the rows are right, and
+                    // nothing in this crate can check that at runtime: a reader
+                    // that knew its answer was wrong would not be wrong. Only a
+                    // differential comparison against Hudi's own reader can, and
+                    // that is a test harness. So a capability may only be added
+                    // together with fixture coverage proving it.
+                    return Err(CoreError::Unsupported(
+                        "The merge-on-read engine reports itself able to serve this read, \
+                         but no engine is wired up behind the switch yet. A capability must \
+                         not be claimed here before there is fixture coverage comparing its \
+                         output against Hudi's reader"
+                            .to_string(),
+                    ));
+                }
+                Some(reason) => {
+                    log::debug!("reading '{base_file_path}' with the legacy engine: {reason}")
+                }
+            }
+        }
 
         let merged = if base_file_only {
             self.read_base_file_eager(base_file_path).await?
@@ -1288,7 +1394,7 @@ mod tests {
     // Metadata Table File Slice Reading Tests
     // =========================================================================
 
-    fn get_metadata_table_base_uri() -> String {
+    pub(super) fn get_metadata_table_base_uri() -> String {
         use hudi_test::QuickstartTripsTable;
         let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
         let metadata_table_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
@@ -1565,6 +1671,166 @@ mod tests {
         assert!(!filtered_records.contains_key("city=san_francisco"));
         assert!(!filtered_records.contains_key("city=sao_paulo"));
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reader_version_seam_tests {
+    use super::*;
+    use crate::config::util::empty_options;
+    use hudi_test::SampleTable;
+
+    async fn reader_with(
+        options: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> Result<FileGroupReader> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        FileGroupReader::new_with_options(base_url.as_ref(), options).await
+    }
+
+    /// The merge-on-read engine is the default, and nothing changes for a caller
+    /// who sets nothing — because every capability falls back today. Making it
+    /// the default only once it were capable would put the whole behaviour change
+    /// in one commit; this way each capability carries its own.
+    #[tokio::test]
+    async fn the_default_version_is_two_and_still_falls_back() -> Result<()> {
+        let reader = reader_with(Vec::<(&'static str, String)>::new()).await?;
+        assert_eq!(
+            reader.file_group_reader_version()?,
+            FileGroupReaderVersion::Two
+        );
+        assert!(
+            reader
+                .version_two_unsupported_reason(&ReadOptions::new())?
+                .is_some(),
+            "the default must still be served by the existing reader"
+        );
+        Ok(())
+    }
+
+    /// `legacy` remains reachable, so a caller can opt out of the engine
+    /// entirely rather than relying on it to keep falling back.
+    #[tokio::test]
+    async fn version_one_stays_selectable_as_an_escape_hatch() -> Result<()> {
+        let reader = reader_with([(
+            HudiReadConfig::FileGroupReaderVersion.as_ref(),
+            "1".to_string(),
+        )])
+        .await?;
+        assert_eq!(
+            reader.file_group_reader_version()?,
+            FileGroupReaderVersion::One
+        );
+        Ok(())
+    }
+
+    /// A typo must not read with the other engine. `get_or_default` would have
+    /// swallowed this and left the caller believing they had exercised `v2`.
+    #[tokio::test]
+    async fn an_unrecognised_version_is_an_error() -> Result<()> {
+        let reader = reader_with([(
+            HudiReadConfig::FileGroupReaderVersion.as_ref(),
+            "9".to_string(),
+        )])
+        .await?;
+        let err = reader.file_group_reader_version().unwrap_err();
+        assert!(
+            matches!(err, CoreError::Config(_)),
+            "expected a config error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("9"),
+            "the error must name the value"
+        );
+        Ok(())
+    }
+
+    /// Asking for the engine is a request, not a guarantee: every capability is
+    /// unimplemented so far, so the legacy reader serves the read and says why.
+    #[tokio::test]
+    async fn asking_for_version_two_falls_back_with_a_reason() -> Result<()> {
+        let reader = reader_with([(
+            HudiReadConfig::FileGroupReaderVersion.as_ref(),
+            "2".to_string(),
+        )])
+        .await?;
+        assert_eq!(
+            reader.file_group_reader_version()?,
+            FileGroupReaderVersion::Two
+        );
+
+        let reason = reader.version_two_unsupported_reason(&ReadOptions::new())?;
+        assert!(
+            reason.is_some(),
+            "with no engine wired up, every read must fall back"
+        );
+        Ok(())
+    }
+
+    /// The fall back is what makes the default safe: a read works exactly as it
+    /// did, because the existing reader served it either way.
+    #[tokio::test]
+    async fn selecting_version_two_does_not_change_what_a_read_returns() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let table = crate::table::Table::new(base_url.path()).await?;
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(!slices.is_empty(), "fixture must have a file slice to read");
+
+        let read_with = async |engine: Option<&str>| -> Result<usize> {
+            let options: Vec<(&str, String)> = match engine {
+                Some(e) => vec![(
+                    HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                    e.to_string(),
+                )],
+                None => Vec::new(),
+            };
+            let reader = FileGroupReader::new_with_options(base_url.as_ref(), options).await?;
+            let mut rows = 0;
+            for slice in &slices {
+                rows += reader
+                    .read_file_slice(slice, &ReadOptions::new())
+                    .await?
+                    .num_rows();
+            }
+            Ok(rows)
+        };
+
+        assert_eq!(
+            read_with(None).await?,
+            read_with(Some("1")).await?,
+            "the default must return what an explicit version 1 read returns"
+        );
+        Ok(())
+    }
+
+    /// A metadata table is served by the legacy reader whatever the setting
+    /// says, so setting the engine globally cannot make one unreadable — table
+    /// listing itself reads one.
+    #[tokio::test]
+    async fn a_metadata_table_ignores_the_setting() -> Result<()> {
+        use crate::config::HudiConfigs;
+        use crate::config::table::HudiTableConfig;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Built from configs rather than resolved from storage: a metadata table
+        // has no `hoodie.properties` of its own to load.
+        let configs = Arc::new(HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref(),
+                super::tests::get_metadata_table_base_uri(),
+            ),
+            (
+                HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                "2".to_string(),
+            ),
+        ]));
+        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        assert!(reader.is_metadata_table());
+        assert_eq!(
+            reader.file_group_reader_version()?,
+            FileGroupReaderVersion::One
+        );
         Ok(())
     }
 }
