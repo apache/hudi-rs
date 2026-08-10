@@ -188,7 +188,13 @@ impl Storage {
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let obj_meta = obj_store.head(&obj_path).await?;
-        Ok(StorageReader::new_streaming(obj_store, obj_meta))
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        Ok(StorageReader::new_streaming(
+            obj_store,
+            obj_meta,
+            window_size,
+        ))
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {

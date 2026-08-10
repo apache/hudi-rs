@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::config::HudiConfigs;
 use crate::storage::OBJECT_STORE_RUNTIME;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
@@ -23,13 +24,54 @@ use object_store::{ObjectMeta, ObjectStore};
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::sync::Arc;
 
-/// How much of a file a streaming reader keeps resident at once.
+/// How much of a file a streaming reader keeps resident at once, when the table
+/// does not say.
 ///
 /// Sweeping a log file's block headers touches small reads scattered across the
 /// file and seeks forward past block content, so a window this size is read
 /// once and reused for many headers. Peak buffering is one window regardless of
 /// how large the file is.
-const STREAM_WINDOW_SIZE: u64 = 16 * 1024 * 1024;
+///
+/// 16 MiB is what Hudi defaults [`CONFIG_DFS_BUFFER_MAX_SIZE`] to, so a table
+/// that sets nothing reads the same amount here as it would there.
+pub const DEFAULT_STREAM_WINDOW_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Hudi's buffer size for reading a log file.
+///
+/// Java hands this to the filesystem client when it opens a log file
+/// (`HoodieLogFileReader` → `HoodieStorage.openSeekable` → `FileSystem.open`),
+/// so it bounds how much of the file one reader holds. This crate buffers a
+/// window itself rather than delegating to a filesystem client, but the knob
+/// means the same thing to whoever sets it: the memory one log-file read may
+/// occupy. Matching Hudi's spelling means a table tuned for one reader is tuned
+/// for the other.
+///
+/// It exists because the cost scales with concurrency, not with one read — Java
+/// drops it to 1 MiB under MapReduce for exactly that reason, and this crate
+/// reads file slices concurrently (`hoodie.read.file.slice.read.concurrency`).
+pub const CONFIG_DFS_BUFFER_MAX_SIZE: &str = "hoodie.memory.dfs.buffer.max.size";
+
+/// The streaming window size a set of configs asks for.
+///
+/// Absent means [`DEFAULT_STREAM_WINDOW_SIZE`]. A value that is not a positive
+/// byte count is an error rather than a silent fallback: someone setting this is
+/// tuning memory, and quietly giving them 16 MiB when they asked for 1 MiB is
+/// the failure this config exists to prevent.
+pub fn stream_window_size(hudi_configs: &HudiConfigs) -> Result<u64> {
+    let Some(raw) = hudi_configs
+        .as_options()
+        .get(CONFIG_DFS_BUFFER_MAX_SIZE)
+        .cloned()
+    else {
+        return Ok(DEFAULT_STREAM_WINDOW_SIZE);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) | Err(_) => Err(Error::other(format!(
+            "{CONFIG_DFS_BUFFER_MAX_SIZE} must be a positive integer byte count, got '{raw}'"
+        ))),
+        Ok(size) => Ok(size),
+    }
+}
 
 /// Fetch a byte range synchronously, from any context.
 ///
@@ -105,6 +147,8 @@ pub struct StorageReader {
     /// until the first read forces a fetch.
     window: Bytes,
     window_start: u64,
+    /// How much to fetch per window refill. See [`stream_window_size`].
+    window_size: u64,
 }
 
 impl StorageReader {
@@ -127,13 +171,21 @@ impl StorageReader {
             whole: Some(bytes),
             window: Bytes::new(),
             window_start: 0,
+            window_size: DEFAULT_STREAM_WINDOW_SIZE,
         })
     }
 
     /// Open a reader that fetches bounded windows on demand.
     ///
+    /// `window_size` is how much is fetched per refill and therefore the peak
+    /// this reader buffers; see [`stream_window_size`] for where it comes from.
+    ///
     /// Nothing is read until the first [`Read::read`].
-    pub fn new_streaming(object_store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Self {
+    pub fn new_streaming(
+        object_store: Arc<dyn ObjectStore>,
+        object_meta: ObjectMeta,
+        window_size: u64,
+    ) -> Self {
         Self {
             object_store,
             location: object_meta.location,
@@ -142,6 +194,7 @@ impl StorageReader {
             whole: None,
             window: Bytes::new(),
             window_start: 0,
+            window_size,
         }
     }
 
@@ -162,7 +215,7 @@ impl StorageReader {
             return Ok(());
         }
         let start = self.pos;
-        let end = (start + STREAM_WINDOW_SIZE).min(self.file_len);
+        let end = (start + self.window_size).min(self.file_len);
         self.window = get_range_blocking(&self.object_store, &self.location, start, end - start)?;
         self.window_start = start;
         Ok(())
@@ -254,7 +307,7 @@ mod tests {
     #[test]
     fn test_streaming_read_matches_eager_across_window_refills() {
         // Larger than one window, so the read spans several refills.
-        let len = (STREAM_WINDOW_SIZE as usize) * 2 + 4096;
+        let len = (DEFAULT_STREAM_WINDOW_SIZE as usize) * 2 + 4096;
         let (store, meta, expected, _dir) = make_store(len);
 
         let mut eager = OBJECT_STORE_RUNTIME
@@ -262,7 +315,7 @@ mod tests {
             .unwrap();
         assert_eq!(read_all(&mut eager, 64 * 1024), expected);
 
-        let mut streaming = StorageReader::new_streaming(store, meta);
+        let mut streaming = StorageReader::new_streaming(store, meta, DEFAULT_STREAM_WINDOW_SIZE);
         assert_eq!(read_all(&mut streaming, 64 * 1024), expected);
     }
 
@@ -271,9 +324,9 @@ mod tests {
     /// back to a header or jumps past a block it is skipping.
     #[test]
     fn test_streaming_seek_backwards_and_past_end() {
-        let len = (STREAM_WINDOW_SIZE as usize) + 1024;
+        let len = (DEFAULT_STREAM_WINDOW_SIZE as usize) + 1024;
         let (store, meta, expected, _dir) = make_store(len);
-        let mut reader = StorageReader::new_streaming(store, meta);
+        let mut reader = StorageReader::new_streaming(store, meta, DEFAULT_STREAM_WINDOW_SIZE);
 
         // Force a window near the end, then walk back to the start.
         reader.seek(SeekFrom::Start(len as u64 - 512)).unwrap();
@@ -292,13 +345,64 @@ mod tests {
         assert!(reader.seek(SeekFrom::Current(-(len as i64) - 10)).is_err());
     }
 
+    /// Absent config reads the same amount Hudi would: 16 MiB.
+    #[test]
+    fn test_stream_window_size_defaults_to_hudis_own_default() {
+        let empty: Vec<(&str, &str)> = vec![];
+        assert_eq!(
+            stream_window_size(&HudiConfigs::new(empty)).unwrap(),
+            DEFAULT_STREAM_WINDOW_SIZE
+        );
+        assert_eq!(DEFAULT_STREAM_WINDOW_SIZE, 16 * 1024 * 1024);
+    }
+
+    /// The whole point of the knob: a caller tuning memory down must actually
+    /// get less, not the default. Reading a file larger than the window they
+    /// asked for proves the window, not just the field.
+    #[test]
+    fn test_configured_window_is_used_for_refills() {
+        let window = 4096u64;
+        let configs = HudiConfigs::new([(CONFIG_DFS_BUFFER_MAX_SIZE, window.to_string())]);
+        assert_eq!(stream_window_size(&configs).unwrap(), window);
+
+        let len = (window as usize) * 3 + 17;
+        let (store, meta, expected, _dir) = make_store(len);
+        let mut reader = StorageReader::new_streaming(store, meta, window);
+
+        // Same bytes as an eager read, across several refills of the smaller
+        // window.
+        assert_eq!(read_all(&mut reader, 512), expected);
+        assert!(
+            reader.window.len() as u64 <= window,
+            "a refill fetched {} bytes for a {window}-byte window",
+            reader.window.len()
+        );
+    }
+
+    /// A value that is not a positive byte count is rejected rather than
+    /// silently replaced by the default — someone setting this is bounding
+    /// memory, and handing them 16 MiB when they asked for less is the failure
+    /// the config exists to prevent.
+    #[test]
+    fn test_unusable_window_size_is_rejected() {
+        for bad in ["0", "-1", "16MB", ""] {
+            let configs = HudiConfigs::new([(CONFIG_DFS_BUFFER_MAX_SIZE, bad)]);
+            let err = stream_window_size(&configs)
+                .expect_err("'{bad}' is not a positive byte count and must not be accepted");
+            assert!(
+                format!("{err}").contains(CONFIG_DFS_BUFFER_MAX_SIZE),
+                "the error must name the config, got: {err}"
+            );
+        }
+    }
+
     /// A block fetcher reads only its own range, and does so without the file
     /// ever being resident.
     #[test]
     fn test_block_fetcher_reads_only_its_range() {
         let len = 8192;
         let (store, meta, expected, _dir) = make_store(len);
-        let reader = StorageReader::new_streaming(store, meta);
+        let reader = StorageReader::new_streaming(store, meta, DEFAULT_STREAM_WINDOW_SIZE);
 
         let content = reader.block_fetcher().read_content(1000, 256).unwrap();
         assert_eq!(&content[..], &expected[1000..1256]);
