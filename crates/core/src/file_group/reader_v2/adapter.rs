@@ -57,6 +57,53 @@ pub(crate) async fn read_file_slice(
     partition_path: String,
     data_schema: Option<SchemaRef>,
 ) -> Result<RecordBatch> {
+    let mut reader = build_reader(
+        hudi_configs,
+        storage,
+        base_file_path,
+        log_file_paths,
+        partition_path,
+        data_schema,
+    )?;
+
+    reader.read().await
+}
+
+/// Read one file slice through the merge-on-read reader, a batch at a time.
+///
+/// Same merge as [`read_file_slice`], but the base file is decoded one row group
+/// at a time instead of whole, so peak memory tracks a row group rather than the
+/// file. Arguments carry the same meaning.
+pub(crate) async fn read_file_slice_stream(
+    hudi_configs: Arc<HudiConfigs>,
+    storage: Arc<Storage>,
+    base_file_path: &str,
+    log_file_paths: Vec<String>,
+    partition_path: String,
+    data_schema: Option<SchemaRef>,
+) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+    let mut reader = build_reader(
+        hudi_configs,
+        storage,
+        base_file_path,
+        log_file_paths,
+        partition_path,
+        data_schema,
+    )?;
+
+    reader.open_blocking_stream().await
+}
+
+/// Assemble the reader both entry points use, so the eager and streaming reads
+/// cannot resolve their context, split or parameters differently.
+fn build_reader(
+    hudi_configs: Arc<HudiConfigs>,
+    storage: Arc<Storage>,
+    base_file_path: &str,
+    log_file_paths: Vec<String>,
+    partition_path: String,
+    data_schema: Option<SchemaRef>,
+) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
     let hudi_configs = with_unbounded_end_timestamp(hudi_configs);
     let mut context = resolve_reader_context(&hudi_configs, has_log_files)?;
@@ -83,16 +130,14 @@ pub(crate) async fn read_file_slice(
         ..ReaderParameters::default()
     };
 
-    let mut reader = HoodieFileGroupReader::new(
+    HoodieFileGroupReader::new(
         Arc::new(context),
         storage,
         input_split,
         reader_parameters,
         data_schema,
         None,
-    )?;
-
-    reader.read().await
+    )
 }
 
 /// The instant a base file was written at, taken from its name

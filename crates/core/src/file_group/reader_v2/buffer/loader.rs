@@ -159,7 +159,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         // Mirrors Java's DefaultFileGroupRecordBufferLoader.getRecordBuffer() lines 67-80.
         let is_skip_merge = reader_context
             .hoodie_reader_config
-            .get("hoodie.datasource.merge.type")
+            .get(crate::file_group::reader_v2::reader_context::CONFIG_MERGE_TYPE)
             .map(|v| v.eq_ignore_ascii_case("skip_merge"))
             .unwrap_or(false);
 

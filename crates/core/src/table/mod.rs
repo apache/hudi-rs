@@ -383,7 +383,7 @@ impl Table {
     /// Meta fields are only in the data when the table populates them; handing
     /// a reader a schema that names columns the files do not have fails the
     /// evolution step rather than helping it.
-    async fn data_schema_for_read(&self) -> Result<Schema> {
+    pub(crate) async fn data_schema_for_read(&self) -> Result<Schema> {
         let populates_meta_fields: bool = self
             .hudi_configs
             .get_or_default(HudiTableConfig::PopulatesMetaFields)
@@ -605,7 +605,15 @@ impl Table {
     /// `StartTimestamp` / `EndTimestamp` that [`FileGroupReader`] needs for
     /// log-scan bounds and commit-time filtering — the same normalization
     /// that [`Table::read`] performs internally.
-    pub fn create_file_group_reader_with_options<S, K, V>(
+    ///
+    /// The returned reader also carries the table's current data schema, which is
+    /// why this is async: resolving it reads the timeline. Without it a reader
+    /// falls back to whatever schema the base file happens to carry, and a base
+    /// file written before a column was widened or added would force newer
+    /// records back into that older shape — wrong values, with no error. Only a
+    /// caller with no timeline at all (the cxx bridge, which is handed paths) is
+    /// left with that fallback.
+    pub async fn create_file_group_reader_with_options<S, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
         extra_storage_overrides: S,
@@ -619,7 +627,24 @@ impl Table {
             Some(opts) => self.prepare_reader_options(opts)?.hudi_options,
             None => HashMap::new(),
         };
-        self.build_file_group_reader(hudi_opts, extra_storage_overrides)
+        let mut reader = self.build_file_group_reader(hudi_opts, extra_storage_overrides)?;
+        reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        Ok(reader)
+    }
+
+    /// Build a reader for one of this table's own read paths, carrying the
+    /// table's current data schema.
+    ///
+    /// The three read paths all need the same two steps, and a path that
+    /// performed only the first would read an evolved table with a stale schema —
+    /// so they share this rather than repeating it.
+    async fn reader_for_read_path(&self, prepared: &ReadOptions) -> Result<FileGroupReader> {
+        let mut reader = self.build_file_group_reader(
+            prepared.hudi_options.clone(),
+            std::iter::empty::<(&str, &str)>(),
+        )?;
+        reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        Ok(reader)
     }
 
     /// Convert caller-facing [`ReadOptions`] into the form that
@@ -671,6 +696,77 @@ impl Table {
         FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
     }
 
+    /// How many file slices to read at once.
+    ///
+    /// `try_join_all` over every slice was unbounded, so a table with a thousand
+    /// file groups issued a thousand concurrent reads and held a thousand merged
+    /// batches at the same time — and under the `v2` merge engine each of those
+    /// also carries its own merge map and, on spill, its own RocksDB instance.
+    /// `hoodie.read.file.slice.read.concurrency` already bounds the DataFusion
+    /// scan; honoring it here puts the direct and Python read paths on the same
+    /// knob instead of leaving them unbounded.
+    fn file_slice_read_concurrency(&self) -> usize {
+        let configured: usize = self
+            .hudi_configs
+            .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
+            .into();
+        configured.max(1)
+    }
+
+    /// Read `file_slices` with at most [`Self::file_slice_read_concurrency`] in
+    /// flight, in slice order.
+    ///
+    /// Order is preserved (`buffered`, not `buffer_unordered`) because a caller
+    /// that concatenates these batches should not see its row order shift with
+    /// scheduling. Any single failure aborts the whole read, as `try_join_all`
+    /// did — a partially-read table is not a useful answer.
+    async fn read_file_slices_bounded(
+        &self,
+        fg_reader: &FileGroupReader,
+        file_slices: &[FileSlice],
+        fg_options: &ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let concurrency = self.file_slice_read_concurrency();
+        let mut batches = Vec::with_capacity(file_slices.len());
+        // One `try_join_all` per chunk rather than a sliding window. A chunk waits
+        // for its slowest member, so this is slightly less busy than a true
+        // window — but the goal here is the ceiling, not maximal overlap, and the
+        // sliding-window form (`buffered` over these futures) cannot be proven
+        // `Send`: the futures borrow `&FileSlice`/`&ReadOptions`, and the
+        // higher-ranked lifetimes inside `FuturesOrdered` then defeat the
+        // auto-trait inference for any caller that spawns the read.
+        for chunk in file_slices.chunks(concurrency) {
+            let reads = chunk
+                .iter()
+                .map(|file_slice| fg_reader.read_file_slice(file_slice, fg_options));
+            batches.extend(futures::future::try_join_all(reads).await?);
+        }
+        Ok(batches)
+    }
+
+    /// Warn when an incremental window reaches below the active timeline.
+    ///
+    /// Archived instants are not read (see
+    /// [`TimelineLoader::load_archived_instants`](crate::timeline::loader::TimelineLoader::load_archived_instants)),
+    /// so a window whose start predates the archival boundary can only ever
+    /// report the commits still in the active timeline. Java's
+    /// `IncrementalQueryAnalyzer` falls back to the archived timeline for exactly
+    /// this case. Until that is implemented, say so — a range query silently
+    /// returning fewer commits than the range contains is the failure mode a
+    /// downstream consumer cannot detect for itself.
+    fn warn_if_window_predates_active_timeline(&self, start: &str) {
+        let Some(boundary) = self.timeline.earliest_active_instant.as_deref() else {
+            return;
+        };
+        if start < boundary {
+            log::warn!(
+                "incremental read starts at '{start}', before the active timeline begins at \
+                 '{boundary}'; commits archived below that point are not read, so this window \
+                 reports fewer changes than it covers"
+            );
+        }
+    }
+
     /// Read records, dispatching on `options.query_type`.
     ///
     /// - [`QueryType::Snapshot`] reads at `options.as_of_timestamp` or the latest commit.
@@ -697,22 +793,13 @@ impl Table {
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
-        let mut fg_reader = self.build_file_group_reader(
-            prepared.hudi_options.clone(),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
         // The table's current schema, not the base file's: a base file written
         // before a column was widened or added would otherwise force the newer
         // records back into its own narrower shape.
-        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        let fg_reader = self.reader_for_read_path(prepared).await?;
         let fg_options = self.options_for_file_group(prepared);
-        let batches = futures::future::try_join_all(
-            file_slices
-                .iter()
-                .map(|f| fg_reader.read_file_slice(f, &fg_options)),
-        )
-        .await?;
-        Ok(batches)
+        self.read_file_slices_bounded(&fg_reader, &file_slices, &fg_options)
+            .await
     }
 
     async fn read_incremental_inner(&self, prepared: &ReadOptions) -> Result<Vec<RecordBatch>> {
@@ -720,27 +807,20 @@ impl Table {
         else {
             return Ok(Vec::new());
         };
+        self.warn_if_window_predates_active_timeline(start);
         let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
             .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
-        let mut fg_reader = self.build_file_group_reader(
-            prepared.hudi_options.clone(),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
+
         // The table's current schema, not the base file's: a base file written
         // before a column was widened or added would otherwise force the newer
         // records back into its own narrower shape.
-        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        let fg_reader = self.reader_for_read_path(prepared).await?;
         let fg_options = self.options_for_file_group(prepared);
 
-        let batches = futures::future::try_join_all(
-            file_slices
-                .iter()
-                .map(|f| fg_reader.read_file_slice(f, &fg_options)),
-        )
-        .await?;
-        Ok(batches)
+        self.read_file_slices_bounded(&fg_reader, &file_slices, &fg_options)
+            .await
     }
 
     /// Build the [`ReadOptions`] passed to `FileGroupReader` for a per-slice read,
@@ -816,8 +896,8 @@ impl Table {
     /// Snapshot streams batches as they are read from each file slice. Incremental
     /// streaming is not yet supported and returns an `Unsupported` error.
     ///
-    /// For MOR file slices with log files, streaming falls back to a collect-and-merge
-    /// that yields that file slice's merged result as a single batch.
+    /// For MOR file slices with log files, the `v2` merge engine streams the merge;
+    /// the legacy engine collects it and yields the slice as a single batch.
     ///
     /// # Example
     /// ```ignore
@@ -864,14 +944,10 @@ impl Table {
             return Ok(Box::pin(stream::empty()));
         }
 
-        let mut fg_reader = self.build_file_group_reader(
-            prepared.hudi_options.clone(),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
         // The table's current schema, not the base file's: a base file written
         // before a column was widened or added would otherwise force the newer
         // records back into its own narrower shape.
-        fg_reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        let fg_reader = self.reader_for_read_path(prepared).await?;
 
         // Extract per-batch options. Keep `filters` so they apply at row-level too —
         // the upstream pruning already used them at file/partition level; applying at
@@ -1432,6 +1508,7 @@ mod tests {
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let batches = hudi_table
             .create_file_group_reader_with_options(None, empty_options())
+            .await
             .unwrap()
             .read_file_slice_from_paths(
                 "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
@@ -1442,6 +1519,59 @@ mod tests {
             .unwrap();
         assert_eq!(batches.num_rows(), 4);
         assert_eq!(batches.num_columns(), 21);
+    }
+
+    /// REGRESSION: the reader handed out by the public constructor must read an
+    /// evolved table with the TABLE's schema, not the base file's.
+    ///
+    /// This constructor is what DataFusion and the Python bindings use. It never
+    /// set the data schema, so a v2 read fell back to the base file's — and a
+    /// base file written before `num` was promoted from int to long forced the
+    /// log's 5000000000 back into i32, returning 705032704 with no error. The
+    /// exact value is asserted because that is the whole failure: not a crash,
+    /// a wrong number.
+    #[tokio::test]
+    async fn test_public_file_group_reader_reads_with_the_table_schema() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::MorEvoPromotion.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let options =
+            ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), "v2");
+
+        let reader = table
+            .create_file_group_reader_with_options(Some(&options), empty_options())
+            .await
+            .unwrap();
+        let slices = table.get_file_slices(&options).await.unwrap();
+        assert_eq!(slices.len(), 1, "fixture is a single non-partitioned slice");
+
+        let batch = reader.read_file_slice(&slices[0], &options).await.unwrap();
+
+        assert_eq!(
+            batch.schema().field_with_name("num").unwrap().data_type(),
+            &arrow_schema::DataType::Int64,
+            "the promoted column must come back at the table's width"
+        );
+        let num = batch
+            .column_by_name("num")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("num is i64");
+        let mut values: Vec<i64> = num.values().to_vec();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            vec![3, 4, 11, 5_000_000_000],
+            "5000000000 must survive; reading it as i32 yielded 705032704"
+        );
+        assert_eq!(
+            batch.schema().field_with_name("fnum").unwrap().data_type(),
+            &arrow_schema::DataType::Float64,
+            "the promoted float must not be narrowed back to f32 either"
+        );
     }
 
     #[tokio::test]
@@ -1963,6 +2093,311 @@ mod tests {
         let initialized = table.get_or_init_estimator(&latest_ts).await.unwrap();
         let cached = table.get_or_init_estimator(early_ts).await.unwrap();
         assert!(std::ptr::eq(initialized, cached));
+    }
+
+    /// REGRESSION: the slice fan-out honours
+    /// `hoodie.read.file.slice.read.concurrency`.
+    ///
+    /// Both read paths used a bare `try_join_all` over every file slice, so the
+    /// knob that already bounds the DataFusion scan was ignored here — the direct
+    /// and Python paths issued one concurrent read per slice with no ceiling. The
+    /// bogus-value half is what keeps this honest: it fails if the config stops
+    /// being consulted, even when the fixture is too small to show a difference
+    /// in row counts.
+    #[tokio::test]
+    async fn test_read_honours_the_file_slice_concurrency_bound() {
+        use crate::config::read::HudiReadConfig;
+
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+
+        let unbounded = Table::new(base_url.path()).await.unwrap();
+        let expected = unbounded
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        assert!(expected > 0, "fixture must return rows");
+
+        // A ceiling of one serialises the reads and must not change the answer.
+        let serial = Table::new_with_options(
+            base_url.path(),
+            [(HudiReadConfig::FileSliceReadConcurrency.as_ref(), "1")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(serial.file_slice_read_concurrency(), 1);
+        let serial_rows = serial
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        assert_eq!(
+            serial_rows, expected,
+            "bounding concurrency must not change what is read"
+        );
+
+        // A ceiling of zero would stall the fan-out forever. It never reaches it:
+        // the value is rejected when the read resolves its options.
+        let zero = Table::new_with_options(
+            base_url.path(),
+            [(HudiReadConfig::FileSliceReadConcurrency.as_ref(), "0")],
+        )
+        .await
+        .unwrap();
+        let err = zero
+            .read(&ReadOptions::new())
+            .await
+            .expect_err("a concurrency ceiling of zero must be rejected, not used");
+        assert!(
+            err.to_string()
+                .contains(HudiReadConfig::FileSliceReadConcurrency.as_ref()),
+            "the error must name the offending key, got: {err}"
+        );
+        // And the ceiling the fan-out would have used is never zero regardless.
+        assert!(zero.file_slice_read_concurrency() >= 1);
+    }
+
+    /// REGRESSION: the merge engine set at TABLE level must actually select the
+    /// engine, and a typo in it must fail the read.
+    ///
+    /// `Table::build` used to drop every `hoodie.read.*` key, so both halves of
+    /// this were broken in the same way and were indistinguishable: a table-level
+    /// `v2` read with legacy, and a table-level `not-an-engine` also read with
+    /// legacy instead of reporting the bad value. The bogus half is what makes
+    /// this test non-vacuous — it fails if the key stops reaching the reader,
+    /// even if v2 and legacy happen to agree on the fixture.
+    #[tokio::test]
+    async fn test_table_level_merge_engine_reaches_the_reader() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::QuickstartTripsTable;
+        let table_path = QuickstartTripsTable::MorEvoPromotion.path_to_mor_avro();
+
+        // A promoted column reads as i64 only when v2 actually ran; legacy
+        // cannot widen it (see the gold-parity known list).
+        let table =
+            Table::new_with_options(&table_path, [(HudiReadConfig::MergeEngine.as_ref(), "v2")])
+                .await
+                .unwrap();
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(
+            batches[0]
+                .schema()
+                .field_with_name("num")
+                .unwrap()
+                .data_type(),
+            &arrow_schema::DataType::Int64,
+            "a table-level merge engine of v2 must select v2"
+        );
+
+        // And a value that is not an engine must be reported, not ignored.
+        let table = Table::new_with_options(
+            &table_path,
+            [(HudiReadConfig::MergeEngine.as_ref(), "not-an-engine")],
+        )
+        .await
+        .unwrap();
+        let err = table
+            .read(&ReadOptions::new())
+            .await
+            .expect_err("a bogus table-level engine name must fail the read");
+        assert!(
+            err.to_string().contains("not-an-engine"),
+            "the error must name the offending value, got: {err}"
+        );
+    }
+
+    /// REGRESSION: `read` and `read_stream` must agree on the schema of an
+    /// evolved table.
+    ///
+    /// `read_stream` resolved the table's schema and then handed it to a base-file
+    /// path that ignored it, so read-optimized streaming returned the base file's
+    /// narrow types — i32/f32 where the eager read gave i64/f64. A caller that
+    /// declared the table's schema up front (the DataFusion scan does) then got
+    /// batches that did not match its own plan.
+    #[tokio::test]
+    async fn test_stream_and_eager_agree_on_an_evolved_schema() {
+        use crate::config::read::HudiReadConfig;
+        use futures::StreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::MorEvoPromotion.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let table_schema = table.get_schema().await.unwrap();
+
+        // Read-optimized is the case that diverged: it returns before the merge
+        // engine is consulted, so it took the base-file-only streaming path.
+        for read_optimized in [true, false] {
+            let mut options =
+                ReadOptions::new().with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), "v2");
+            if read_optimized {
+                options =
+                    options.with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+            }
+
+            let eager = table.read(&options).await.unwrap();
+            let mut stream = table.read_stream(&options).await.unwrap();
+            let mut streamed = Vec::new();
+            while let Some(batch) = stream.next().await {
+                streamed.push(batch.unwrap());
+            }
+
+            for column in ["num", "fnum"] {
+                let want = table_schema.field_with_name(column).unwrap().data_type();
+                assert_eq!(
+                    eager[0]
+                        .schema()
+                        .field_with_name(column)
+                        .unwrap()
+                        .data_type(),
+                    want,
+                    "eager read of '{column}' (read_optimized={read_optimized})"
+                );
+                assert_eq!(
+                    streamed[0]
+                        .schema()
+                        .field_with_name(column)
+                        .unwrap()
+                        .data_type(),
+                    want,
+                    "streamed read of '{column}' (read_optimized={read_optimized}) must match \
+                     the eager read and the table's declared schema"
+                );
+            }
+
+            let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
+            let streamed_rows: usize = streamed.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                eager_rows, streamed_rows,
+                "row counts must agree (read_optimized={read_optimized})"
+            );
+        }
+    }
+
+    /// A column a later writer added must appear in a streamed read too, and a
+    /// projection naming it must not fail just because the base file predates it.
+    #[tokio::test]
+    async fn test_stream_null_fills_a_column_added_after_the_base_file() {
+        use crate::config::read::HudiReadConfig;
+        use futures::StreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::MorEvoAddCol.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), "v2")
+            .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")
+            .with_projection(["key", "extra"]);
+
+        let mut stream = table.read_stream(&options).await.unwrap();
+        let mut streamed = Vec::new();
+        while let Some(batch) = stream.next().await {
+            streamed.push(batch.unwrap());
+        }
+
+        let schema = streamed[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["key", "extra"],
+            "the projection must be honored even though the base file has no 'extra'"
+        );
+        // The base file predates the column, so every value is null.
+        let extra = streamed[0].column_by_name("extra").unwrap();
+        assert_eq!(
+            extra.null_count(),
+            extra.len(),
+            "a column added after this base file must read as null, not error"
+        );
+    }
+
+    /// The merge-on-read engine streams a merged slice instead of materializing
+    /// it, and must return exactly what the eager read returns.
+    ///
+    /// The streaming path used to collect-and-merge for any slice with log files
+    /// and wrap the result in a one-item stream — `batch_size` was ignored and
+    /// output memory was the whole merged slice, even though the engine already
+    /// had a bounded row-group-at-a-time form with no caller. Asserting more than
+    /// one batch is what keeps this honest: with the old fallback it was always
+    /// exactly one.
+    #[tokio::test]
+    async fn test_stream_merges_a_slice_incrementally_and_matches_the_eager_read() {
+        use crate::config::read::HudiReadConfig;
+        use futures::StreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), "v2")
+            .with_hudi_option(HudiReadConfig::StreamBatchSize.as_ref(), "2");
+
+        let eager = table.read(&options).await.unwrap();
+        let eager_rows: usize = eager.iter().map(|b| b.num_rows()).sum();
+        assert!(eager_rows > 2, "fixture must exceed one batch to be a test");
+
+        let mut stream = table.read_stream(&options).await.unwrap();
+        let mut streamed = Vec::new();
+        while let Some(batch) = stream.next().await {
+            streamed.push(batch.unwrap());
+        }
+        let streamed_rows: usize = streamed.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(
+            streamed_rows, eager_rows,
+            "the streamed merge must produce the same rows as the eager one"
+        );
+        assert!(
+            streamed.len() > 1,
+            "a batch size of 2 over {eager_rows} rows must yield more than one batch; got {} \
+             (one batch means the merge was materialized whole)",
+            streamed.len()
+        );
+        assert_eq!(
+            streamed[0].schema(),
+            eager[0].schema(),
+            "both paths must return the same schema"
+        );
+
+        // Same rows, not merely the same count.
+        let key_of = |batches: &[RecordBatch]| {
+            let mut keys: Vec<String> = Vec::new();
+            for batch in batches {
+                let column = batch.column_by_name("uuid").unwrap();
+                let strings = column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                keys.extend((0..batch.num_rows()).map(|i| strings.value(i).to_string()));
+            }
+            keys.sort();
+            keys
+        };
+        assert_eq!(key_of(&streamed), key_of(&eager));
+    }
+
+    /// A read config that selects WHICH read to perform is dropped at table
+    /// level, so it cannot silently redirect every later read.
+    #[tokio::test]
+    async fn test_table_level_query_shape_config_is_not_baked_in() {
+        use crate::config::read::HudiReadConfig;
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new_with_options(
+            base_url.path(),
+            [(HudiReadConfig::AsOfTimestamp.as_ref(), "20240101000000000")],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !table.hudi_configs.contains(HudiReadConfig::AsOfTimestamp),
+            "a table-level as-of timestamp would pin every read to that instant"
+        );
+        // The read still resolves against the latest commit, not the dropped one.
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert!(batches.iter().map(|b| b.num_rows()).sum::<usize>() > 0);
     }
 
     #[tokio::test]

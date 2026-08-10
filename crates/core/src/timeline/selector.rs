@@ -170,7 +170,6 @@ pub struct TimelineSelector {
     end_datetime: Option<DateTime<Utc>>,
     states: Vec<State>,
     actions: Vec<Action>,
-    include_archived: bool,
     /// Timeline layout version determines instant format validation:
     /// - Layout 1 (pre-v8): expects `{timestamp}.{action}` for completed instants
     /// - Layout 2 (v8+): expects `{requestedTimestamp}_{completedTimestamp}.{action}` for completed instants
@@ -211,6 +210,25 @@ impl TimelineSelector {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<Self> {
+        Self::actions_in_range(actions, &[State::Completed], hudi_configs, start, end)
+    }
+
+    /// Select `actions` in any of `states`.
+    ///
+    /// The all-states form exists so one listing of the timeline directory can
+    /// answer two questions: which commits completed, and where the active
+    /// timeline *starts*. The second needs pending instants too — archival never
+    /// moves past the oldest pending instant, so the earliest instant of any
+    /// state is the archival boundary, and taking it over completed instants
+    /// alone would place the boundary above a pending instant and let that
+    /// instant's files read as archived (i.e. as committed).
+    pub fn actions_in_range(
+        actions: &[Action],
+        states: &[State],
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
         let timezone = Self::get_timezone_from_configs(&hudi_configs);
         let timeline_layout_version =
             Self::get_timeline_layout_version_from_configs(&hudi_configs)?;
@@ -220,9 +238,8 @@ impl TimelineSelector {
             timezone,
             start_datetime,
             end_datetime,
-            states: vec![State::Completed],
+            states: states.to_vec(),
             actions: actions.to_vec(),
-            include_archived: false,
             timeline_layout_version,
         })
     }
@@ -562,7 +579,6 @@ mod tests {
             end_datetime,
             states: states.to_vec(),
             actions: actions.to_vec(),
-            include_archived: false,
             timeline_layout_version: 1, // Default to layout v1 for tests
         }
     }
@@ -657,7 +673,6 @@ mod tests {
             start_datetime: None,
             end_datetime: None,
             timezone: "UTC".to_string(),
-            include_archived: false,
             timeline_layout_version: 1,
         };
         assert!(selector.select(&timeline).unwrap().is_empty());
@@ -673,7 +688,6 @@ mod tests {
             start_datetime: start.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             end_datetime: end.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             timezone: "UTC".to_string(),
-            include_archived: false,
             timeline_layout_version: 1,
         }
     }
@@ -687,7 +701,6 @@ mod tests {
             end_datetime: None,
             states: vec![State::Completed],
             actions: vec![Action::DeltaCommit],
-            include_archived: false,
             timeline_layout_version: 1,
         };
 
@@ -715,7 +728,6 @@ mod tests {
             end_datetime: None,
             states: vec![State::Completed],
             actions: vec![Action::DeltaCommit],
-            include_archived: false,
             timeline_layout_version: 2,
         };
 
@@ -743,7 +755,6 @@ mod tests {
             end_datetime: None,
             states: vec![State::Inflight],
             actions: vec![Action::DeltaCommit],
-            include_archived: false,
             timeline_layout_version: 2,
         };
 

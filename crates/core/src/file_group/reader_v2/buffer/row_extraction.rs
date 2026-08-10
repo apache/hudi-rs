@@ -206,9 +206,7 @@ pub(crate) fn reconcile_batch_to_schema(
 /// own metadata-laden type, so validation rejects it. Descending into
 /// `child_data` and rewriting each level's `DataType` resolves this.
 ///
-/// Union/Dictionary types are not expected here; they take the no-children path
-/// (empty target child types) and would fail loudly in `build()` on any layout
-/// mismatch — which is the desired behavior.
+/// A leaf's type is never rewritten — see the refusal below.
 fn rebuild_array_data_to_type(
     data: arrow::array::ArrayData,
     target_type: &DataType,
@@ -224,8 +222,25 @@ fn rebuild_array_data_to_type(
     };
 
     if target_child_types.is_empty() {
-        // Leaf (or Union/Dictionary): just rewrite this level's type tag.
-        return data.into_builder().data_type(target_type.clone()).build();
+        // A leaf carries no field name and no metadata — both live on the
+        // parent's `Field`s, which the parent level rewrites. So a leaf whose
+        // type differs from the target differs in the values themselves, and
+        // must be cast, not re-tagged.
+        //
+        // Re-tagging it cannot be left to `build()` to reject: `ArrayData`
+        // validation only rejects a buffer that is too SMALL for its type, so
+        // widening fails loudly but NARROWING passes and silently reinterprets.
+        // An i64 buffer tagged i32 reads the low word of each value —
+        // 5000000000 comes back as 705032704. Refuse instead, and let
+        // `reconcile_batch_to_schema`'s promotion arm do the conversion.
+        if data.data_type() != target_type {
+            return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
+                "reconcile: leaf type {} cannot be re-tagged as {target_type}; a leaf \
+                 difference is a value conversion, not a name reconciliation",
+                data.data_type(),
+            )));
+        }
+        return Ok(data);
     }
 
     // Snapshot children BEFORE consuming `data` into the builder (the builder
@@ -649,5 +664,64 @@ mod tests {
         let out = records_to_batch(records, schema.clone()).unwrap();
         assert_eq!(out.num_rows(), 0);
         assert_eq!(out.schema(), schema);
+    }
+
+    /// REGRESSION: reconciling a wide column down to a narrow target must fail,
+    /// not truncate.
+    ///
+    /// The leaf arm of `rebuild_array_data_to_type` used to re-tag any leaf's
+    /// `DataType`, and `ArrayData` validation only rejects a buffer too SMALL
+    /// for its type — so an i64 buffer tagged i32 passed and each value came
+    /// back as its low word. A caller that resolved a stale target schema (a
+    /// base file written before the column was widened) therefore read
+    /// 5000000000 as 705032704 with no error at all.
+    ///
+    /// Narrowing is not a promotion and never should have reached this path;
+    /// the point of the test is that when it does, it is loud.
+    #[test]
+    fn test_reconcile_refuses_to_narrow_a_leaf_instead_of_truncating() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        let wide = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![5_000_000_000i64]))],
+        )
+        .unwrap();
+        let narrow_target: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+
+        let err = reconcile_batch_to_schema(&wide, &narrow_target)
+            .expect_err("narrowing a leaf must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Int64") && msg.contains("Int32"),
+            "the error must name both types, got: {msg}"
+        );
+        // The truncated value must appear nowhere: this is what silently came
+        // back before the refusal.
+        assert!(
+            !msg.contains("705032704"),
+            "the low word must not be produced at all, got: {msg}"
+        );
+
+        // The opposite direction IS a promotion, and must still convert
+        // exactly rather than being caught by the new refusal.
+        let narrow = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![7i32]))],
+        )
+        .unwrap();
+        let wide_target: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let widened = reconcile_batch_to_schema(&narrow, &wide_target).unwrap();
+        assert_eq!(
+            widened
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("promoted to i64")
+                .values(),
+            &[7i64]
+        );
     }
 }

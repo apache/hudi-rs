@@ -96,12 +96,10 @@ impl FileLister {
                 // we expect a file that has the base file extension to be a valid base file.
                 let mut base_file = BaseFile::try_from(file_metadata)?;
 
-                // Look up completion timestamp and filter uncommitted files if applicable
+                // Look up completion timestamp, and skip the file outright if the
+                // commit that wrote it never completed.
                 base_file.set_completion_time(completion_time_view);
-                if completion_time_view.should_filter_uncommitted()
-                    && base_file.completion_timestamp.is_none()
-                {
-                    // file belongs to an uncommitted commit, skip it
+                if !completion_time_view.is_committed(&base_file.commit_timestamp) {
                     continue;
                 }
                 if let Some(metadata) = base_file.file_metadata.as_mut() {
@@ -124,12 +122,10 @@ impl FileLister {
             } else {
                 match LogFile::try_from(file_metadata) {
                     Ok(mut log_file) => {
-                        // Look up completion timestamp and filter uncommitted files if applicable
+                        // Look up completion timestamp, and skip the file outright
+                        // if the commit that wrote it never completed.
                         log_file.set_completion_time(completion_time_view);
-                        if completion_time_view.should_filter_uncommitted()
-                            && log_file.completion_timestamp.is_none()
-                        {
-                            // file belongs to an uncommitted commit, skip it
+                        if !completion_time_view.is_committed(&log_file.timestamp) {
                             continue;
                         }
 
@@ -262,13 +258,18 @@ mod test {
     use tempfile::tempdir;
     use url::Url;
 
+    /// A view that admits every file, so these tests stay about extension
+    /// handling rather than commit visibility: the far-future archival boundary
+    /// puts every instant below it, i.e. archived and therefore committed.
+    /// Commit visibility is covered in `timeline::view`.
     fn layout_v1_view() -> TimelineView {
-        TimelineView::new(
+        TimelineView::new_with_archival_boundary(
             "99999999999999999".to_string(),
             None,
             &[],
             HashSet::new(),
             &Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")])),
+            Some("99999999999999999".to_string()),
         )
     }
 

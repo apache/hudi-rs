@@ -25,7 +25,8 @@ use crate::config::error::ConfigError;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
-use crate::file_group::reader_v2::reader_context::{MergeMode, ReaderContext};
+use crate::file_group::reader_v2::buffer::spillable_map;
+use crate::file_group::reader_v2::reader_context::{CONFIG_MERGE_TYPE, MergeMode, ReaderContext};
 use crate::file_group::reader_v2::record_context::RecordContext;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
 use crate::timeline::selector::InstantRange;
@@ -99,6 +100,26 @@ const READ_CONFIG_PREFIX: &str = "hoodie.read.";
 #[allow(dead_code)]
 const CRATE_CONFIG_PREFIXES: [&str; 2] = ["hoodie.internal.", "hoodie.plan."];
 
+/// Per-read configs Hudi does *not* spell `hoodie.read.*`.
+///
+/// The reader looks these up on `ReaderContext::hoodie_reader_config`, so the
+/// prefix rule alone would route them to the table properties instead and every
+/// one of them would read as unset — the merge budget silently back at its 1 GiB
+/// default, the spill directory back at `/tmp`, the hard memory cap off, and
+/// `skip_merge` undetected (so a read asking for unmerged output would quietly
+/// get merged output rather than the unsupported-mode error).
+///
+/// Listed by reference to the constants that consume them so a rename cannot
+/// leave this behind.
+#[allow(dead_code)]
+const READER_CONFIG_KEYS: [&str; 5] = [
+    spillable_map::CONFIG_MERGE_MAX_SIZE,
+    spillable_map::CONFIG_MAX_PEAK_MEMORY,
+    spillable_map::CONFIG_SPILLABLE_MAP_PATH,
+    spillable_map::CONFIG_DISKMAP_TYPE,
+    CONFIG_MERGE_TYPE,
+];
+
 /// Split the merged config bag into the table's own properties and the
 /// per-read overrides, so the merge code can tell one from the other.
 ///
@@ -113,7 +134,7 @@ fn partition_configs(
     let mut reader_config = HashMap::new();
 
     for (key, value) in hudi_configs.as_options() {
-        if key.starts_with(READ_CONFIG_PREFIX) {
+        if key.starts_with(READ_CONFIG_PREFIX) || READER_CONFIG_KEYS.contains(&key.as_str()) {
             reader_config.insert(key, value);
         } else if !CRATE_CONFIG_PREFIXES
             .iter()
@@ -502,6 +523,59 @@ mod tests {
             rendered.contains("end_inclusive: true"),
             "the pinned commit is included, got: {rendered}"
         );
+    }
+
+    /// REGRESSION: every per-read key Hudi spells without the `hoodie.read.`
+    /// prefix must still reach the reader config.
+    ///
+    /// The split used to key on that prefix alone, so the merge budget, the
+    /// spill directory, the hard memory cap and the merge type all landed in the
+    /// table properties and read as unset — the memory limits were unreachable
+    /// from configuration, and `skip_merge` was undetected so an unmerged read
+    /// silently returned merged output instead of the unsupported-mode error.
+    ///
+    /// This asserts through `resolve_reader_context` on purpose: the buffer tests
+    /// insert straight into `hoodie_reader_config`, which proves the map honors
+    /// the key but not that the key ever arrives.
+    #[test]
+    fn routes_the_non_read_prefixed_per_read_keys_to_the_reader_config() {
+        let mut options = minimal_configs();
+        let expected = [
+            (spillable_map::CONFIG_MERGE_MAX_SIZE, "104857600"),
+            (spillable_map::CONFIG_MAX_PEAK_MEMORY, "209715200"),
+            (spillable_map::CONFIG_SPILLABLE_MAP_PATH, "/scratch/spill"),
+            (spillable_map::CONFIG_DISKMAP_TYPE, "ROCKS_DB"),
+            (CONFIG_MERGE_TYPE, "skip_merge"),
+        ];
+        for (key, value) in expected {
+            options.push((key.to_string(), value.to_string()));
+        }
+        let configs = HudiConfigs::new(options);
+
+        let ctx = resolve_reader_context(&configs, true).unwrap();
+
+        for (key, value) in expected {
+            assert_eq!(
+                ctx.hoodie_reader_config.get(key),
+                Some(&value.to_string()),
+                "{key} is a per-read override and must reach the reader config"
+            );
+            assert!(
+                !ctx.table_config.contains_key(key),
+                "{key} is not something the table declares about itself"
+            );
+        }
+
+        // And the spill config the buffer builds from that map must carry the
+        // configured values, not its defaults — this is what was broken.
+        let spill = spillable_map::SpillConfig::from_config(&ctx.hoodie_reader_config).unwrap();
+        assert_eq!(
+            spill.max_in_memory_size,
+            (104857600.0 * spillable_map::SPILL_TRIGGER_FRACTION) as u64,
+            "the configured merge budget must be honored"
+        );
+        assert_eq!(spill.spill_path, std::path::PathBuf::from("/scratch/spill"));
+        assert_eq!(spill.max_peak_in_memory_size, Some(209715200));
     }
 
     /// The reader is handed the table's own configs and the per-read overrides

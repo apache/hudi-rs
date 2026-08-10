@@ -61,6 +61,13 @@ pub struct CompletionGateInputs {
     /// archived fallback (every candidate must then be in `completed_instants`).
     pub archived_boundary: Option<String>,
 }
+
+/// Config key selecting how a slice's base and log records are combined.
+/// `skip_merge` asks for them unmerged, which this reader does not implement and
+/// refuses in the buffer loader. Hudi's own spelling, so it is looked up by name
+/// rather than modelled as a [`HudiReadConfig`](crate::config::read::HudiReadConfig).
+pub const CONFIG_MERGE_TYPE: &str = "hoodie.datasource.merge.type";
+
 /// Reader context that flows through the file group reader call stack.
 ///
 /// Mirrors Java's `HoodieReaderContext<T>`, carrying structured reader
@@ -110,6 +117,11 @@ pub struct ReaderContext {
     /// (`FileGroupReaderSchemaHandler<T>`).
     pub schema_handler: FileGroupReaderSchemaHandler,
     pub table_config: HashMap<String, String>,
+    /// Per-read overrides. Populated by
+    /// [`resolve_reader_context`](crate::file_group::reader_v2::resolver::resolve_reader_context)
+    /// from the `hoodie.read.*` keys plus the individually-named ones its
+    /// `READER_CONFIG_KEYS` lists — anything a consumer looks up here must
+    /// appear in one of those two, or it reads as unset.
     pub hoodie_reader_config: HashMap<String, String>,
     /// Optional parquet `RowFilter` builder for predicate pushdown into base
     /// parquet files and parquet-format log blocks. Set by the FFI bridge from
@@ -118,6 +130,14 @@ pub struct ReaderContext {
     /// Whether it actually gets installed is gated by [`Self::mor_pk_safe`] +
     /// table type (see callers in `file_group::reader::HoodieFileGroupReader`
     /// and `file_group::log_file::content::Decoder`).
+    ///
+    /// **Not active for reads through this crate.**
+    /// [`resolve_reader_context`](crate::file_group::reader_v2::resolver::resolve_reader_context)
+    /// leaves it `None`, so a `Table` or DataFusion read pushes no predicate into
+    /// either the base file or a log block, and the primary-key-safety gate never
+    /// runs outside the test harness. Filters are applied after the merge instead.
+    /// Groundwork for a caller that supplies one; no performance claim about this
+    /// crate's reads rests on it.
     pub row_filter_builder: Option<RowFilterBuilder>,
     /// True when [`Self::row_filter_builder`] references only primary-key
     /// columns and is therefore safe to push into MERGE_ON_READ base + log

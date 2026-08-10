@@ -106,15 +106,20 @@ fn i33_merge_budget_honored_when_forwarded() {
         DEFAULT_MERGE_MAX_SIZE_BYTES / MIB
     );
 
-    // The forwarded 64 MiB budget is honored: 0.8*64 MiB - 40 MiB RocksDB reserve.
+    // The forwarded 64 MiB budget is honored: 0.8 x 64 MiB. RocksDB's reserve is
+    // charged at run time, and only once the disk tier exists, so it is not
+    // deducted here — deducting it up front made every budget at or below 50 MiB
+    // resolve to zero.
     assert_eq!(
-        honored, 11_744_051,
-        "SpillConfig must honor the forwarded 64 MiB budget (0.8x64MiB - RocksDB reserve)"
+        honored,
+        (64 * MIB) * 8 / 10,
+        "SpillConfig must honor the forwarded 64 MiB budget (0.8 x 64 MiB)"
     );
-    // ...and it is NOT the unset 1 GiB default (0.8*1GiB - 40 MiB = 779 MiB).
+    // ...and it is NOT the unset 1 GiB default.
     assert_eq!(
-        default_path, 817_050_419,
-        "an absent budget key must fall back to the 0.8x1GiB - reserve default"
+        default_path,
+        DEFAULT_MERGE_MAX_SIZE_BYTES * 8 / 10,
+        "an absent budget key must fall back to 0.8 x 1 GiB"
     );
     assert!(
         honored < default_path,

@@ -146,12 +146,20 @@ async fn read_fixture(table_path: &str) -> crate::Result<RecordBatch> {
 
     let input_split = InputSplit::new(slice.base, None, slice.logs, slice.partition);
 
+    // The table's own schema, the way a real read resolves it. Passing `None`
+    // here — as this harness used to — makes the reader fall back to the base
+    // file's schema, which is stale on any table whose columns were widened
+    // after that file was written. The fixtures are then read into the older
+    // shape and the comparison below, which only counts rows, cannot see it.
+    let table = crate::table::Table::new(table_path).await?;
+    let data_schema = Arc::new(table.data_schema_for_read().await?);
+
     let mut reader = HoodieFileGroupReader::new(
         Arc::new(context),
         storage,
         input_split,
         ReaderParameters::default(),
-        None,
+        Some(data_schema),
         None,
     )?;
     reader.read().await

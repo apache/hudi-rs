@@ -3914,6 +3914,8 @@ mod tests {
     /// AND the spill actually fires. This is the unit-level equivalent of the
     /// fg-bench churn-under-low-budget e2e (the buffer is the spill chokepoint;
     /// the surrounding reader plumbing is unchanged by A1).
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn test_churn_spill_output_matches_no_spill_baseline_and_spill_fires() {
         // Baseline: default 1 GiB budget → never spills for this small workload.
@@ -3949,6 +3951,8 @@ mod tests {
     /// A delete in a churn workload still tombstones correctly through the spill
     /// tier (the deleted key is absent from the output), matching the no-spill
     /// path.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn test_churn_spill_preserves_deletes() {
         // Build two buffers (spill + no-spill) with one log delete among updates.

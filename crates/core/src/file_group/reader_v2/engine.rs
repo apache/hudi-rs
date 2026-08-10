@@ -29,6 +29,7 @@ use crate::error::CoreError;
 use crate::file_group::base_file::reader::{
     BaseFileReadOptions, BaseFileReader, create_base_file_reader,
 };
+use crate::file_group::reader_v2::buffer::BufferType;
 use crate::file_group::reader_v2::buffer::loader::{
     DefaultFileGroupRecordBufferLoader, FileGroupRecordBufferLoader,
 };
@@ -444,13 +445,6 @@ impl HoodieFileGroupReader {
     /// New consumers that can use a sync iterator should prefer
     /// [`Self::open`] for true streaming.
     pub async fn read(&mut self) -> Result<RecordBatch> {
-        // Anything this read expects that is quietly not done, said once, before
-        // the rows come back looking unremarkable.
-        crate::file_group::reader_v2::gaps::report_for_read(
-            &self.reader_context,
-            &self.reader_parameters,
-            self.use_record_position(),
-        );
         // A3 (ENG-42992): eager mode — the base parquet stream is drained
         // async during `init_record_iterators` (streaming=false), so the
         // returned iterator's `next()` is pure in-memory work and can be driven
@@ -598,6 +592,20 @@ impl HoodieFileGroupReader {
         let mut record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
 
+        // Anything this read expects that is quietly not done, said once, before
+        // the rows come back looking unremarkable. Reported here rather than on
+        // entry for two reasons: the scan has finished, so a position merge that
+        // gave up partway through is visible (the buffer flips its own type when
+        // it falls back, and nothing else records it); and every entry point goes
+        // through here, so the streaming read is covered too — reporting from
+        // `read()` alone left `open_blocking_stream` silent.
+        crate::file_group::reader_v2::gaps::report_for_read(
+            &self.reader_context,
+            &self.reader_parameters,
+            self.use_record_position(),
+            record_buffer.get_buffer_type() == BufferType::PositionBasedMerge,
+        );
+
         log::debug!(
             "[HoodieFileGroupReader] log scan complete: buffer_size={} valid_instants={:?} \
              stats: log_blocks={} log_records={} corrupt={} rollbacks={}",
@@ -734,7 +742,7 @@ impl HoodieFileGroupReader {
         let is_skip_merge = self
             .reader_context
             .hoodie_reader_config
-            .get("hoodie.datasource.merge.type")
+            .get(crate::file_group::reader_v2::reader_context::CONFIG_MERGE_TYPE)
             .map(|v| v.eq_ignore_ascii_case("skip_merge"))
             .unwrap_or(false);
         if is_skip_merge {

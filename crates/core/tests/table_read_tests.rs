@@ -768,7 +768,8 @@ mod v8_tables {
                 .expect("V8Trips8I3U1D MOR fixture should have at least one slice with log files");
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             // Sanity: read the merged slice unfiltered so we can pick a rider
             // present in this slice and assert the filter actually narrows it.
             let unfiltered = fg_reader
@@ -923,7 +924,8 @@ mod v8_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let expected = fg_reader.read_file_slice(file_slice, &options).await?;
@@ -955,7 +957,8 @@ mod v8_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             // Test with small batch size
             let options = ReadOptions::new().with_batch_size(1)?;
             let mut stream = fg_reader
@@ -1557,7 +1560,8 @@ mod v9_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let expected = fg_reader.read_file_slice(file_slice, &options).await?;
@@ -1583,7 +1587,8 @@ mod v9_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             let expected = fg_reader
                 .read_file_slice(file_slice, &ReadOptions::new())
                 .await?;
@@ -1749,7 +1754,8 @@ mod streaming_queries {
         );
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+            .await?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
         let expected = fg_reader.read_file_slice(file_slice, &options).await?;
@@ -1776,7 +1782,8 @@ mod streaming_queries {
         let file_slice = &file_slices[0];
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+            .await?;
         let options = ReadOptions::new().with_batch_size(1)?;
         let stream = fg_reader
             .read_file_slice_stream(file_slice, &options)
@@ -2201,10 +2208,12 @@ mod manual_reader_matches_table_read {
         options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = table.get_file_slices(options).await?;
-        let fg_reader = table.create_file_group_reader_with_options(
-            Some(options),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
+        let fg_reader = table
+            .create_file_group_reader_with_options(
+                Some(options),
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .await?;
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()

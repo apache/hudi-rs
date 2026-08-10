@@ -218,6 +218,19 @@ impl TimelineLoader {
     /// Note: This method assumes the archived loader was created only when
     /// `TimelineArchivedReadEnabled` is true. The config check is done in the builder.
     ///
+    /// # Not yet implemented
+    ///
+    /// Neither layout reads archived instants today. V2 returns empty outright.
+    /// V1 lists the archive folder and parses file *names* as instants, but Hudi
+    /// stores archived instants as records inside Avro archive logs
+    /// (`.commits_.archive.*`) rather than as one file per instant, so that
+    /// listing yields nothing either.
+    ///
+    /// Callers must therefore not treat an empty result as "no archived instants
+    /// in range" — see `Table::warn_if_window_predates_active_timeline`, which
+    /// reports the shortfall rather than letting a range query return quietly
+    /// short.
+    ///
     /// # Arguments
     ///
     /// * `selector` - The criteria for selecting instants (actions, states, time range)

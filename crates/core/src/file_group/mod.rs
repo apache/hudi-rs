@@ -68,12 +68,10 @@ impl Hash for FileGroup {
 
 impl fmt::Display for FileGroup {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            format!(
-                "File Group: partition={}, id={}",
-                &self.partition_path, &self.file_id
-            )
-            .as_str(),
+        write!(
+            f,
+            "File Group: partition={}, id={}",
+            self.partition_path, self.file_id
         )
     }
 }

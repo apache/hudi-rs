@@ -52,6 +52,20 @@ pub trait CompletionTimeView {
     /// completion time is not tracked.
     fn get_completion_time(&self, request_timestamp: &str) -> Option<&str>;
 
-    /// Returns true if uncommitted files should be filtered out.
-    fn should_filter_uncommitted(&self) -> bool;
+    /// Whether the commit that wrote `request_timestamp` has committed, and so
+    /// whether the files it wrote may be read.
+    ///
+    /// Mirrors Java's `containsInstant(ts) || isBeforeTimelineStarts(ts)`
+    /// (`BaseHoodieTimeline.java:494`) — a commit counts as committed if it is a
+    /// completed instant in the active timeline, **or** if it sorts before the
+    /// active timeline starts, which means it was archived and archived instants
+    /// are completed by definition.
+    ///
+    /// This deliberately does not key off whether a completion timestamp is
+    /// available. Timeline layout v1 records none at all, so a
+    /// completion-timestamp test can only ever be applied to layout v2 — which
+    /// left v1 tables reading files from commits that never completed. And on
+    /// layout v2 the completion map is built from the *active* timeline, so the
+    /// same test discarded files from commits that had merely been archived.
+    fn is_committed(&self, request_timestamp: &str) -> bool;
 }

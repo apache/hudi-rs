@@ -725,6 +725,7 @@ impl HudiDataSource {
         let file_group_reader = Arc::new(
             self.table
                 .create_file_group_reader_with_options(Some(&read_options), empty_options())
+                .await
                 .map_err(|e| external_error("Failed to create FileGroupReader", e))?,
         );
 

@@ -203,10 +203,10 @@ impl PositionBasedFileGroupRecordBuffer {
                 let keys = self.inner.record_context.get_record_keys(&row)?;
                 let key = keys[0].clone();
                 record.record_key = key.clone();
-                self.inner.base.records.insert(key, record)?;
+                self.reinsert_rekeyed(key, record)?;
             } else if !record.record_key.is_empty() {
                 let key = record.record_key.clone();
-                self.inner.base.records.insert(key, record)?;
+                self.reinsert_rekeyed(key, record)?;
             } else if record.is_delete() {
                 return Err(CoreError::Unsupported(
                     "position-based merge fallback encountered a delete record without a record \
@@ -224,6 +224,30 @@ impl PositionBasedFileGroupRecordBuffer {
             self.inner.base.records.len(),
         );
         Ok(())
+    }
+
+    /// Re-insert a record under its record key during a fallback, refusing to
+    /// drop one on the floor.
+    ///
+    /// Two position-keyed entries can only carry the same record key when the
+    /// base file holds that key at more than one position. A plain insert then
+    /// overwrites, and since the map's iteration order decides which one survives,
+    /// a committed update disappears from the read — nondeterministically, and
+    /// with no error. Java's `fallbackToKeyBasedBuffer` overwrites here; refusing
+    /// is a deliberate difference, because the operator can act on an error
+    /// (compact the file group, or turn position merge off) and cannot act on rows
+    /// that are quietly missing.
+    fn reinsert_rekeyed(&mut self, key: String, record: BufferedRecord) -> Result<()> {
+        if self.inner.base.records.contains_key(&key)? {
+            return Err(CoreError::ReadFileSliceError(format!(
+                "position-based merge fell back to key-based, but record key '{key}' occupies \
+                 more than one position in the base file, so re-keying would discard one of the \
+                 log records buffered for it. Merging by key cannot say which base row each \
+                 belongs to. Compact this file group, or read it with \
+                 hoodie.merge.use.record.positions=false to merge by key from the start."
+            )));
+        }
+        self.inner.base.records.insert(key, record)
     }
 
     /// Which matching mode the base scan should use right now.
@@ -1133,6 +1157,8 @@ mod tests {
     /// The key-based fallback must re-key EVERY buffered entry — including ones
     /// that spilled to the on-disk tier under a tiny merge budget. The merged
     /// output must be identical to the same scenario without spill.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn test_position_fallback_with_spilled_map_rekeys_all() {
         const N: usize = 200;
@@ -1224,6 +1250,8 @@ mod tests {
     /// from `record_from_entry`. This asserts the deleted row stays deleted in
     /// BOTH the spill and no-spill runs (Java parity); the no-spill control also
     /// guards against a change that would mask the spill-specific path.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn test_spilled_position_delete_survives_fallback_repro() {
         /// Run the scenario: a position-keyed delete for base position 3
@@ -1283,10 +1311,15 @@ mod tests {
         // Spill-engaged: a 1 KiB budget routes the tombstone straight to the
         // RocksDB tier before the fallback. EXPECTED TO FAIL against current
         // code: the tombstone comes back keyed "3" and "k00003" is resurrected.
-        let (spilled_out, did_spill) = run(&[("hoodie.memory.merge.max.size", "1024")]);
+        // A budget of 1 byte leaves a zero in-memory allowance, so even a lone
+        // tombstone spills. Stated as the smallest possible budget rather than a
+        // plausible-looking one: what this test needs is that the entry lands on
+        // the disk tier, and a "1 KiB" budget only happened to do that while the
+        // RocksDB reserve was being deducted up front.
+        let (spilled_out, did_spill) = run(&[("hoodie.memory.merge.max.size", "1")]);
         assert!(
             did_spill,
-            "a 1 KiB merge budget must spill the position-keyed delete tombstone"
+            "a zero in-memory allowance must spill the position-keyed delete tombstone"
         );
         assert_eq!(
             spilled_out, expected,
@@ -1294,6 +1327,107 @@ mod tests {
              key-based fallback (Java parity) — if this row is present, the tombstone was \
              re-keyed by its position string (spillable_map::record_from_entry) and silently \
              failed to delete"
+        );
+    }
+
+    /// REGRESSION: a fallback that would collapse two positions of the same
+    /// record key must refuse, not silently drop one of the updates.
+    ///
+    /// With `dup` at base positions 1 and 2 and a log block updating both by
+    /// position, the position merge lands both. A later block whose positions
+    /// were computed against a different base file forces a fallback; re-keying
+    /// then maps both entries onto "dup" and a plain insert kept whichever the
+    /// map happened to yield last. Observed before the fix:
+    ///
+    /// ```text
+    /// position merge:      [a=10/1, dup=100/7, dup=200/8]
+    /// after the fallback:  [a=11/9, dup=100/7, dup=30/3]   <- (200,8) gone
+    /// ```
+    ///
+    /// (30,3) is the untouched base row, so a committed update simply vanished —
+    /// and which of the two vanished depended on `HashMap` iteration order.
+    #[test]
+    fn test_fallback_refuses_to_collapse_duplicate_keys() {
+        let base = &[("a", 10, 1), ("dup", 20, 2), ("dup", 30, 3)];
+
+        // Control: no fallback, so both positions are merged independently and
+        // both updates survive. This is the answer the read is supposed to give.
+        let mut buffer = build_buffer();
+        let mut block =
+            data_block_with_positions(&[("dup", 100, 7), ("dup", 200, 8)], &[1, 2], BASE_INSTANT);
+        buffer.process_data_block(&mut block).unwrap();
+        buffer.set_base_file_iterator(vec![base_batch(base)]);
+        let (out, _) = Box::new(buffer).merge_and_collect_with_stats().unwrap();
+        assert_eq!(
+            extract(&out),
+            vec![
+                ("a".into(), 10, 1),
+                ("dup".into(), 100, 7),
+                ("dup".into(), 200, 8)
+            ],
+            "merging by position reaches both duplicate rows"
+        );
+
+        // Same buffered updates, then a block that forces the fallback.
+        let mut buffer = build_buffer();
+        let mut block = data_block_with_positions_at_instant(
+            &[("dup", 100, 7), ("dup", 200, 8)],
+            &[1, 2],
+            BASE_INSTANT,
+            "20240101000001000",
+        );
+        buffer.process_data_block(&mut block).unwrap();
+        let mut mismatched = data_block_with_positions_at_instant(
+            &[("a", 11, 9)],
+            &[0],
+            "19990101000000000",
+            "20240101000002000",
+        );
+        let err = buffer
+            .process_data_block(&mut mismatched)
+            .expect_err("collapsing two positions of one key must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dup"),
+            "the error must name the offending record key, got: {msg}"
+        );
+        assert!(
+            msg.contains("hoodie.merge.use.record.positions"),
+            "the error must say how to get a correct read instead, got: {msg}"
+        );
+    }
+
+    /// The same fallback over UNIQUE keys must still succeed — the refusal above
+    /// must not turn every fallback into an error.
+    #[test]
+    fn test_fallback_over_unique_keys_still_succeeds() {
+        let mut buffer = build_buffer();
+        let mut block = data_block_with_positions_at_instant(
+            &[("a", 100, 7), ("b", 200, 8)],
+            &[0, 1],
+            BASE_INSTANT,
+            "20240101000001000",
+        );
+        buffer.process_data_block(&mut block).unwrap();
+        let mut mismatched = data_block_with_positions_at_instant(
+            &[("c", 300, 9)],
+            &[2],
+            "19990101000000000",
+            "20240101000002000",
+        );
+        buffer.process_data_block(&mut mismatched).unwrap();
+        assert_eq!(buffer.get_buffer_type(), BufferType::KeyBasedMerge);
+
+        buffer.set_base_file_iterator(vec![base_batch(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)])]);
+        let (out, _) = Box::new(buffer).merge_and_collect_with_stats().unwrap();
+        assert_eq!(
+            extract(&out),
+            vec![
+                ("a".into(), 100, 7),
+                ("b".into(), 200, 8),
+                ("c".into(), 300, 9)
+            ],
+            "every re-keyed update must land when the keys are unique"
         );
     }
 }

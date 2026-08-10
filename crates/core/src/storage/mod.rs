@@ -75,12 +75,22 @@ pub type RowFilterBuilder = Arc<
 /// alive.
 pub static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
+        .worker_threads(OBJECT_STORE_RUNTIME_WORKERS)
         .enable_all()
-        .thread_name("hudi-rs-objstore")
+        .thread_name(OBJECT_STORE_RUNTIME_THREAD_NAME)
         .build()
         .expect("the object-store runtime must build")
 });
+
+/// Worker threads on [`OBJECT_STORE_RUNTIME`].
+pub(crate) const OBJECT_STORE_RUNTIME_WORKERS: usize = 8;
+
+/// Thread-name prefix for [`OBJECT_STORE_RUNTIME`]'s workers.
+///
+/// Load-bearing, not cosmetic: it is how a blocking bridge recognises that it is
+/// about to block one of its own workers — see
+/// [`in_object_store_runtime`](crate::storage::reader::in_object_store_runtime).
+pub(crate) const OBJECT_STORE_RUNTIME_THREAD_NAME: &str = "hudi-rs-objstore";
 
 #[derive(Clone, Debug)]
 pub struct Storage {

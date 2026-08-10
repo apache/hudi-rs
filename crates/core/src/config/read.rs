@@ -155,7 +155,57 @@ pub enum HudiReadConfig {
     MergeUseRecordPositions,
 }
 
+/// Where a [`HudiReadConfig`] may legitimately be set.
+///
+/// [`Table`](crate::table::Table) holds configuration for its whole lifetime,
+/// while a read is a single call, so the two kinds cannot be treated alike: a
+/// key that selects *which* read to perform would, baked at table level,
+/// silently redirect every subsequent read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadConfigScope {
+    /// Describes *how* to read. Stable for a deployment, so it may be set on the
+    /// table (including in `hoodie.properties` or `hudi-defaults.conf`) and
+    /// overridden per read.
+    TableOrRead,
+    /// Selects *which* read to perform. Meaningful only per call — see
+    /// [`ReadOptions`](crate::table::ReadOptions).
+    ReadOnly,
+}
+
 impl HudiReadConfig {
+    /// Where this config may be set. See [`ReadConfigScope`].
+    ///
+    /// Exhaustive on purpose: a new variant has to choose, rather than inheriting
+    /// whatever a prefix rule happens to do with its key.
+    pub const fn scope(&self) -> ReadConfigScope {
+        match self {
+            // These name a point or a window in the timeline, or the query shape
+            // itself. A table pinned to one of them would answer every later
+            // read as at that point, which no caller asked for.
+            Self::QueryType | Self::AsOfTimestamp | Self::StartTimestamp | Self::EndTimestamp => {
+                ReadConfigScope::ReadOnly
+            }
+            // These are deployment choices: which merge implementation runs, how
+            // much parallelism to use, how big a streamed batch is. Setting them
+            // once for a table is the natural way to use them.
+            Self::InputPartitions
+            | Self::UseReadOptimizedMode
+            | Self::StreamBatchSize
+            | Self::FileSliceReadConcurrency
+            | Self::MergeEngine
+            | Self::MergeUseRecordPositions => ReadConfigScope::TableOrRead,
+        }
+    }
+
+    /// The scope of the read config named by `key`, or `None` when `key` is not
+    /// a read config at all.
+    pub fn scope_of_key(key: &str) -> Option<ReadConfigScope> {
+        use strum::IntoEnumIterator;
+        Self::iter()
+            .find(|config| config.as_ref() == key)
+            .map(|config| config.scope())
+    }
+
     /// `&'static str` form of the config key. `const fn` so callers can use it in
     /// `const` contexts (e.g. building static lookup tables of `hoodie.*` keys
     /// without duplicating the literal strings).

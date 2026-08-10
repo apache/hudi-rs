@@ -60,10 +60,9 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 roaring = { workspace = true }
-rocksdb = { workspace = true }
 foldhash = { workspace = true }
-uuid = { workspace = true }
-tempfile = { workspace = true }
+rocksdb = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 lazy_static = { workspace = true }
@@ -108,12 +107,32 @@ percent-encoding = { workspace = true }
 [dev-dependencies]
 hudi-test = { path = "../test" }
 serial_test = { workspace = true }
+# Also a regular dependency, but only an optional one behind `spill-rocksdb`.
+# Repeated here because tests outside the spill tier use it too, and must keep
+# building in the `--no-default-features` configuration.
 tempfile = { workspace = true }
 
 [lints.clippy]
 result_large_err = "allow"
 
 [features]
+default = ["spill-rocksdb"]
+
+# The merge-on-read merge map's on-disk tier, which it spills to when a file
+# group's log records exceed `hoodie.memory.merge.max.size`.
+#
+# On by default because a read that needs to spill and cannot is a read that
+# fails. Off, `rocksdb` is not built at all — it bundles RocksDB and generates
+# its bindings with bindgen, so it needs libclang and a C++ toolchain in front of
+# every consumer of this crate, the Python wheel and the cxx bridge included.
+# Java's own default disk map is BitCask, not RocksDB, so paying for it
+# unconditionally is not parity either.
+#
+# With the feature off, a merge that stays inside its budget is unaffected; one
+# that would spill fails with a message naming this feature rather than growing
+# unbounded.
+spill-rocksdb = ["dep:rocksdb", "dep:tempfile"]
+
 datafusion = [
     "dep:datafusion",
     "datafusion-expr",

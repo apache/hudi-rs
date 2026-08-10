@@ -242,16 +242,19 @@ impl FileGroupReader {
         self.data_schema_override = Some(schema);
     }
 
-    /// The schema the merge-on-read reader needs up front, taken from the base
-    /// file itself.
+    /// The schema the merge-on-read reader needs up front.
     ///
-    /// This is what the existing path effectively reads with, so the two engines
-    /// start from the same types. It is also what the data actually has: under
-    /// schema evolution `hoodie.table.create.schema` records the table as it was
-    /// created, and the engine evolves each batch to the required schema anyway.
+    /// The table's own, whenever the caller could supply one — which is every
+    /// caller that holds a timeline, including [`Table`](crate::table::Table),
+    /// the DataFusion scan and the Python bindings. A base file's own schema is
+    /// stale the moment a later writer widens a column or adds one, and reading
+    /// with it forces the newer records back into the older shape: an i64 read as
+    /// i32, an f64 as f32, an added column dropped. Wrong values, not an error.
     ///
-    /// Reading the footer costs one request. The engine reads it again when it
-    /// opens the file; collapsing the two is worth doing but is not this change.
+    /// Only a caller reading from paths with no timeline at all — the cxx bridge —
+    /// falls back to the base file. Reading its footer costs one request; the
+    /// engine reads it again when it opens the file, and collapsing the two is
+    /// worth doing but is not this change.
     async fn resolved_data_schema(
         &self,
         base_file_path: &str,
@@ -269,6 +272,64 @@ impl FileGroupReader {
                 ))
             })?;
         Ok(Some(stream.schema().clone()))
+    }
+
+    /// The schema a streamed base-file batch must be reconciled to, or `None`
+    /// when there is nothing to reconcile.
+    ///
+    /// `None` for a caller that supplied no table schema (the cxx bridge), and
+    /// for a base file whose columns already match it — the overwhelmingly common
+    /// case, where reconciliation would be a per-batch no-op.
+    ///
+    /// With a projection the result keeps the projection's columns in the
+    /// projection's order, so a column the base file lacks is null-filled rather
+    /// than dropped. Without one it is the table's schema entire.
+    fn stream_target_schema(
+        &self,
+        base_file_schema: Option<&arrow_schema::SchemaRef>,
+        read_projection: &Option<Vec<String>>,
+    ) -> Option<arrow_schema::Schema> {
+        let table_schema = self.data_schema_override.as_ref()?;
+        let base_file_schema = base_file_schema?;
+
+        let target = match read_projection {
+            None => arrow_schema::Schema::new(table_schema.fields().clone()),
+            Some(cols) => {
+                let fields: Vec<arrow_schema::FieldRef> = cols
+                    .iter()
+                    .filter_map(|name| {
+                        table_schema
+                            .field_with_name(name)
+                            .ok()
+                            .or_else(|| base_file_schema.field_with_name(name).ok())
+                            .map(|field| Arc::new(field.clone()))
+                    })
+                    .collect();
+                arrow_schema::Schema::new(fields)
+            }
+        };
+
+        // Nothing to do when the base file already presents these columns
+        // exactly as the table declares them — skip the per-batch pass entirely.
+        //
+        // Nullability counts, not just the type: Hudi's meta fields are
+        // non-nullable in the table schema and nullable in the file, and the
+        // eager path returns the table's view of them. Comparing types alone left
+        // the streamed batches labelled the file's way, so the two paths still
+        // disagreed — on a field a `RecordBatchReader` consumer is entitled to
+        // trust, since it is what the scan declared up front. Metadata is
+        // deliberately not compared: parquet files routinely carry writer
+        // metadata the table schema does not, and reconciling over that would
+        // cost a pass on every read while changing no value.
+        let unchanged = target.fields().iter().all(|field| {
+            base_file_schema
+                .field_with_name(field.name())
+                .is_ok_and(|base| {
+                    base.data_type() == field.data_type()
+                        && base.is_nullable() == field.is_nullable()
+                })
+        });
+        if unchanged { None } else { Some(target) }
     }
 
     /// Read one slice through the merge-on-read reader.
@@ -428,9 +489,10 @@ impl FileGroupReader {
     /// streaming iterator from the underlying base file (Parquet or Lance), yielding
     /// batches as they are read without loading all data into memory.
     ///
-    /// For MOR tables with log files, this falls back to the collect-and-merge approach
-    /// and yields the merged result as a single batch. Streaming merge of base files
-    /// with log files is not yet implemented.
+    /// For MOR tables with log files, the `v2` merge engine streams the merge too:
+    /// the base file is decoded one row group at a time. The legacy engine sorts and
+    /// dedups whole batches at once and has no incremental form, so it still
+    /// collects the merge and yields it as a single batch.
     ///
     /// # Arguments
     /// * `file_slice` - The file slice to read.
@@ -530,15 +592,73 @@ impl FileGroupReader {
             .collect();
 
         if log_file_paths.is_empty() {
-            self.read_base_file_stream(base_file_path, &options, known_base_file_size)
-                .await
-        } else {
-            // Fallback: collect + merge, then yield as single-item stream
-            let batch = self
-                .read_file_slice_from_paths(base_file_path, log_file_paths, &options)
-                .await?;
-            Ok(Box::pin(futures::stream::once(async { Ok(batch) })))
+            return self
+                .read_base_file_stream(base_file_path, &options, known_base_file_size)
+                .await;
         }
+
+        if self.merge_engine()? == MergeEngineValue::V2 {
+            return self
+                .stream_via_v2(base_file_path, log_file_paths, &options)
+                .await;
+        }
+
+        // The existing merge sorts and dedups whole batches at once, so it has
+        // no incremental form to stream: collect it and yield the one batch.
+        let batch = self
+            .read_file_slice_from_paths(base_file_path, log_file_paths, &options)
+            .await?;
+        Ok(Box::pin(futures::stream::once(async { Ok(batch) })))
+    }
+
+    /// Stream one merged slice through the merge-on-read reader.
+    ///
+    /// The eager sibling of this — [`Self::read_via_v2`] — holds the whole merged
+    /// slice in memory, so `batch_size` means nothing to it and a `LIMIT` still
+    /// pays for the entire merge. This decodes the base file one row group at a
+    /// time and applies the same post-merge steps per batch, so the two agree row
+    /// for row while peak memory tracks a row group.
+    async fn stream_via_v2(
+        &self,
+        base_file_path: &str,
+        log_file_paths: Vec<String>,
+        options: &ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let data_schema = self.resolved_data_schema(base_file_path).await?;
+        if let Some(reason) = crate::file_group::reader_v2::adapter::refuse_reason(
+            self.is_metadata_table(),
+            data_schema.as_ref(),
+        ) {
+            return Err(reason);
+        }
+
+        let partition_path = std::path::Path::new(base_file_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        log::info!("streaming '{base_file_path}' with the merge-on-read engine");
+        let merged = crate::file_group::reader_v2::adapter::read_file_slice_stream(
+            self.hudi_configs.clone(),
+            self.storage.clone(),
+            base_file_path,
+            log_file_paths,
+            partition_path,
+            data_schema,
+        )
+        .await?;
+
+        // Per batch, in the same order the eager path applies them to the whole
+        // slice: narrow an incremental read back to its window, then the caller's
+        // filters and projection. Splitting the merge into batches must not
+        // change what any of the three mean.
+        let hudi_configs = self.hudi_configs.clone();
+        let options = options.clone();
+        let stream = merged.map(move |batch| {
+            let batch = apply_commit_time_filter(&hudi_configs, batch?)?;
+            apply_eager_options(&options, batch)
+        });
+        Ok(Box::pin(stream))
     }
 
     /// Reads a base file as a stream of record batches.
@@ -619,14 +739,57 @@ impl FileGroupReader {
             }
             combined
         });
+        // The base file's own columns, needed only when this read has to be
+        // reconciled to the table's schema — see `stream_target_schema`. Reading
+        // the footer costs one request; the eager merge-on-read path already pays
+        // the same one for the same reason.
+        let base_file_schema = match (&self.data_schema_override, relative_path.is_empty()) {
+            (Some(_), false) => Some(
+                self.reader_for_path(relative_path)?
+                    .read_stream(relative_path, BaseFileReadOptions::default())
+                    .await
+                    .map_err(|e| {
+                        ReadFileSliceError(format!(
+                            "Failed to read base file schema '{relative_path}': {e:?}"
+                        ))
+                    })?
+                    .schema()
+                    .clone(),
+            ),
+            _ => None,
+        };
+
         if let Some(ref cols) = read_projection {
-            read_options = read_options.with_projection(cols.clone());
+            // A column the table has but this base file does not cannot be
+            // selected from it — the parquet reader rejects an unknown column
+            // outright. It is null-filled by the reconciliation below instead.
+            let selectable: Vec<String> = match &base_file_schema {
+                Some(schema) => cols
+                    .iter()
+                    .filter(|name| schema.index_of(name).is_ok())
+                    .cloned()
+                    .collect(),
+                None => cols.clone(),
+            };
+            read_options = read_options.with_projection(selectable);
         }
+
+        // What each batch must look like once read: the table's types for the
+        // columns this read selected. Without this the streaming path returns the
+        // base file's own schema while the eager path returns the table's, so the
+        // two disagree on an evolved table — `Table::read` gives i64 where
+        // `Table::read_stream` gives i32, and a caller that declared the table's
+        // schema up front (the DataFusion scan does) is handed batches that do
+        // not match it.
+        let target_schema = self
+            .stream_target_schema(base_file_schema.as_ref(), &read_projection)
+            .map(Arc::new);
 
         let hudi_configs = self.hudi_configs.clone();
         let path = relative_path.to_string();
         let filters = Arc::new(options.filters.clone());
         let final_projection = Arc::new(final_projection);
+        let target_schema = Arc::new(target_schema);
         // Validate once on first batch so typoed filter columns surface as errors
         // rather than silent no-ops in `filters_to_row_mask`.
         let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -637,18 +800,33 @@ impl FileGroupReader {
             .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
             .await?;
 
-        // Apply filtering: commit time → structured filters → final projection.
+        // Apply: reconcile to the table's schema → commit time → structured
+        // filters → final projection. Reconciliation comes first so a filter and
+        // the commit-time mask compare against the same types the eager path
+        // gives them.
         let stream = base_stream.into_stream().filter_map(move |result| {
             let hudi_configs = hudi_configs.clone();
             let filters = filters.clone();
             let final_projection = final_projection.clone();
             let validated = validated.clone();
+            let target_schema = target_schema.clone();
             async move {
                 match result {
                     Err(e) => Some(Err(ReadFileSliceError(format!(
                         "Failed to read batch: {e:?}"
                     )))),
                     Ok(batch) => {
+                        let batch = match target_schema.as_ref() {
+                            Some(target) => {
+                                match crate::schema::batch_evolution::project_batch_to_schema(
+                                    &batch, target,
+                                ) {
+                                    Err(e) => return Some(Err(e)),
+                                    Ok(b) => b,
+                                }
+                            }
+                            None => batch,
+                        };
                         if !validated.load(std::sync::atomic::Ordering::Relaxed) {
                             if let Err(e) =
                                 validate_fields_against_schemas(&filters, [batch.schema().as_ref()])

@@ -268,10 +268,8 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 })?;
 
                 log_file.set_completion_time(completion_time_view);
-                // Filter uncommitted files for timeline layout v2
-                if completion_time_view.should_filter_uncommitted()
-                    && log_file.completion_timestamp.is_none()
-                {
+                // Skip the file if the commit that wrote it never completed.
+                if !completion_time_view.is_committed(&log_file.timestamp) {
                     continue;
                 }
                 if file_size > 0 {
@@ -295,10 +293,8 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 })?;
 
                 base_file.set_completion_time(completion_time_view);
-                // Filter uncommitted files for timeline layout v2
-                if completion_time_view.should_filter_uncommitted()
-                    && base_file.completion_timestamp.is_none()
-                {
+                // Skip the file if the commit that wrote it never completed.
+                if !completion_time_view.is_committed(&base_file.commit_timestamp) {
                     continue;
                 }
                 // Populate file metadata with on-disk size from MDT,
@@ -402,25 +398,34 @@ mod tests {
             .map(|contribution| contribution.file_groups)
         }
 
+        /// A view that admits every file, so these tests exercise file-name
+        /// parsing and grouping rather than commit visibility. The archival
+        /// boundary is the far-future sentinel: every instant sorts below it, so
+        /// every instant reads as archived and therefore as committed. Commit
+        /// visibility itself is covered in `timeline::view`.
         fn create_layout_v1_view() -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")]));
-            TimelineView::new(
+            TimelineView::new_with_archival_boundary(
                 "99999999999999999".to_string(),
                 None,
                 &[] as &[Instant],
                 HashSet::new(),
                 &configs,
+                Some("99999999999999999".to_string()),
             )
         }
 
+        /// As [`create_layout_v1_view`]: admits every file so the assertions stay
+        /// about parsing and grouping.
         fn create_layout_v2_view(instants: &[Instant]) -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
-            TimelineView::new(
+            TimelineView::new_with_archival_boundary(
                 "99999999999999999".to_string(),
                 None,
                 instants,
                 HashSet::new(),
                 &configs,
+                Some("99999999999999999".to_string()),
             )
         }
 
@@ -859,18 +864,41 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
 
+        /// A view that admits every file, so these tests exercise file-name
+        /// parsing and grouping rather than commit visibility. The archival
+        /// boundary is the far-future sentinel: every instant sorts below it, so
+        /// every instant reads as archived and therefore as committed. Commit
+        /// visibility itself is covered in `timeline::view`.
         fn create_layout_v1_view() -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")]));
-            TimelineView::new(
+            TimelineView::new_with_archival_boundary(
                 "99999999999999999".to_string(),
                 None,
                 &[] as &[Instant],
                 HashSet::new(),
                 &configs,
+                Some("99999999999999999".to_string()),
             )
         }
 
+        /// As [`create_layout_v1_view`]: admits every file so the assertions stay
+        /// about parsing and grouping.
         fn create_layout_v2_view(instants: &[Instant]) -> TimelineView {
+            let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
+            TimelineView::new_with_archival_boundary(
+                "99999999999999999".to_string(),
+                None,
+                instants,
+                HashSet::new(),
+                &configs,
+                Some("99999999999999999".to_string()),
+            )
+        }
+
+        /// A view with NO archival boundary, so nothing outside the completed set
+        /// is readable — the strict counterpart used by the tests whose subject
+        /// IS commit visibility.
+        fn create_strict_view(instants: &[Instant]) -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
             TimelineView::new(
                 "99999999999999999".to_string(),
@@ -1178,7 +1206,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = create_layout_v2_view(&instants);
+            let view = create_strict_view(&instants);
 
             let result = file_groups_from_files_partition_records(
                 &records,
@@ -1206,7 +1234,7 @@ mod tests {
             );
             records.insert(key, record);
 
-            let view = create_layout_v2_view(&[]);
+            let view = create_strict_view(&[]);
 
             let result = file_groups_from_files_partition_records(
                 &records,
@@ -1286,7 +1314,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = create_layout_v2_view(&instants);
+            let view = create_strict_view(&instants);
 
             let result = file_groups_from_files_partition_records(
                 &records,

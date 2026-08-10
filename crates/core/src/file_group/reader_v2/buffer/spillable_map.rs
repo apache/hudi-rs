@@ -62,9 +62,11 @@
 //!   `current_owned_and_overhead_bytes`.
 //! - **`true_retained_bytes` = `current_pinned_bytes` + `current_owned_and_overhead_bytes`**,
 //!   and [`over_budget`](SpillableRecordMap::over_budget) compares THAT against
-//!   the budget. The RocksDB engine's own memory ([`ROCKSDB_RESERVED_BYTES`]) is
-//!   subtracted from the budget up front so the disk tier's footprint is counted
-//!   inside `hoodie.memory.merge.max.size`.
+//!   the allowance. The RocksDB engine's own memory ([`ROCKSDB_RESERVED_BYTES`])
+//!   is subtracted from `hoodie.memory.merge.max.size` only while the disk tier
+//!   is live, so the disk tier's footprint is counted inside the budget without
+//!   charging reads that never spill — see
+//!   [`in_memory_allowance`](SpillableRecordMap::in_memory_allowance).
 //!
 //! ## Eviction by source batch (A6e)
 //!
@@ -92,7 +94,6 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use rocksdb::{BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBatch, WriteOptions};
 
 use crate::Result;
 use crate::error::CoreError;
@@ -264,8 +265,12 @@ impl DiskMapType {
 /// (05-a2a1-design.md Part 3 config table).
 #[derive(Debug, Clone)]
 pub struct SpillConfig {
-    /// `0.8 × hoodie.memory.merge.max.size − `[`ROCKSDB_RESERVED_BYTES`], the
-    /// in-memory byte budget before NEW entries spill to disk.
+    /// `0.8 × hoodie.memory.merge.max.size`, the in-memory byte budget before
+    /// NEW entries spill to disk.
+    ///
+    /// [`ROCKSDB_RESERVED_BYTES`] is *not* deducted here — it is charged only
+    /// while the disk tier is live, by
+    /// `SpillableRecordMap::in_memory_allowance`, which explains why.
     pub max_in_memory_size: u64,
     /// Parent directory for spill files (`hoodie.memory.spillable.map.path`).
     /// A per-read uuid subdirectory is created under it on the first spill.
@@ -323,16 +328,32 @@ impl SpillConfig {
 
     /// Build a [`SpillConfig`] from explicit parts (used by tests and by
     /// [`from_config`](Self::from_config)). Computes `max_in_memory_size` as
-    /// `0.8 × merge_max_size − `[`ROCKSDB_RESERVED_BYTES`], saturating at 0.
-    /// Leaves `max_peak_in_memory_size` unset (no hard cap); `from_config`
-    /// populates it from [`CONFIG_MAX_PEAK_MEMORY`] when present.
+    /// `0.8 × merge_max_size`; RocksDB's reserve is charged later, and only
+    /// while the disk tier is live — see
+    /// `SpillableRecordMap::in_memory_allowance`. Leaves
+    /// `max_peak_in_memory_size` unset (no hard cap); `from_config` populates it
+    /// from [`CONFIG_MAX_PEAK_MEMORY`] when present.
     pub fn from_parts(
         merge_max_size: u64,
         spill_path: PathBuf,
         diskmap_type: DiskMapType,
     ) -> Result<Self> {
-        let budget = (merge_max_size as f64 * SPILL_TRIGGER_FRACTION) as u64;
-        let max_in_memory_size = budget.saturating_sub(ROCKSDB_RESERVED_BYTES);
+        let max_in_memory_size = (merge_max_size as f64 * SPILL_TRIGGER_FRACTION) as u64;
+        // A budget this small cannot hold the RocksDB engine at all, so once the
+        // disk tier opens the in-memory allowance drops to zero and every entry
+        // spills — into a tier that then uses more memory than the whole budget.
+        // The read still works, but the operator asked for something impossible;
+        // say so rather than degrading quietly.
+        if max_in_memory_size <= ROCKSDB_RESERVED_BYTES {
+            log::warn!(
+                "[SpillConfig] {CONFIG_MERGE_MAX_SIZE}={merge_max_size} leaves a spill budget of \
+                 {max_in_memory_size} bytes, at or below the {ROCKSDB_RESERVED_BYTES} bytes the \
+                 RocksDB spill tier itself needs; if this read spills, its in-memory allowance \
+                 becomes zero and total memory will exceed the configured budget. Set it above \
+                 {} bytes.",
+                (ROCKSDB_RESERVED_BYTES as f64 / SPILL_TRIGGER_FRACTION) as u64,
+            );
+        }
         Ok(Self {
             max_in_memory_size,
             spill_path,
@@ -567,11 +588,35 @@ impl SpillableRecordMap {
         self.true_retained_bytes()
     }
 
+    /// The in-memory allowance right now: the configured soft budget, less
+    /// RocksDB's engine memory once — and only once — the disk tier exists.
+    ///
+    /// The reserve used to be subtracted at config time, which charged every
+    /// read for a tier most reads never open. Worse, it made the allowance
+    /// *zero* for any `hoodie.memory.merge.max.size` at or below 50 MiB
+    /// (0.8 × 50 MiB == [`ROCKSDB_RESERVED_BYTES`] exactly), so
+    /// [`over_budget`](Self::over_budget) was unconditionally true and every
+    /// entry spilled from the first insert — while RocksDB then consumed the
+    /// reserve anyway, putting the read *over* the budget it was given.
+    ///
+    /// Charging it lazily keeps the accounting honest in both states: before any
+    /// spill the whole budget is available to the map (matching Java, which
+    /// reserves nothing), and once the engine is live its footprint is counted
+    /// inside the same budget.
+    fn in_memory_allowance(&self) -> u64 {
+        if self.disk.is_some() {
+            self.max_in_memory_size
+                .saturating_sub(ROCKSDB_RESERVED_BYTES)
+        } else {
+            self.max_in_memory_size
+        }
+    }
+
     /// True once the in-memory budget is exhausted, measured on the TRUE retained
     /// heap (A6e). New entries that push over this must evict whole source
     /// batches (compact/spill) to get back under, or spill themselves.
     fn over_budget(&self) -> bool {
-        self.true_retained_bytes() >= self.max_in_memory_size
+        self.true_retained_bytes() >= self.in_memory_allowance()
     }
 
     /// Account a newly-added in-memory entry into the size trackers (pinned-batch
@@ -808,6 +853,24 @@ impl SpillableRecordMap {
 
     /// Lazily create the disk tier (and its per-read spill directory) on first
     /// spill, then return it. Sets the spill-fired flag.
+    ///
+    /// The only place a disk tier comes into existence. Without the
+    /// `spill-rocksdb` feature there is no backend to create one with, so this
+    /// fails here — the alternative would be to keep growing the in-memory tier
+    /// past the budget the caller set, which is the OOM this map exists to
+    /// prevent.
+    #[cfg(not(feature = "spill-rocksdb"))]
+    fn ensure_disk(&mut self) -> Result<&mut RocksDbDiskMap> {
+        Err(CoreError::Unsupported(format!(
+            "this merge needs to spill — its in-memory tier reached the {} byte budget from \
+             {CONFIG_MERGE_MAX_SIZE} — but hudi-core was built without the `spill-rocksdb` \
+             feature, so there is no on-disk tier to spill to. Rebuild with the feature, or raise \
+             {CONFIG_MERGE_MAX_SIZE} so the merge fits in memory.",
+            self.max_in_memory_size,
+        )))
+    }
+
+    #[cfg(feature = "spill-rocksdb")]
     fn ensure_disk(&mut self) -> Result<&mut RocksDbDiskMap> {
         if self.disk.is_none() {
             debug_assert_eq!(self.diskmap_type, DiskMapType::RocksDb);
@@ -857,7 +920,8 @@ impl SpillableRecordMap {
     /// pre-existing spill-only behavior exactly.
     fn enforce_memory_limits(&mut self) -> Result<()> {
         if self.over_budget() {
-            let low_water = (self.max_in_memory_size as f64 * EVICTION_LOW_WATER_FRACTION) as u64;
+            let low_water =
+                (self.in_memory_allowance() as f64 * EVICTION_LOW_WATER_FRACTION) as u64;
             self.evict_source_batches_until(low_water)?;
         }
         self.enforce_peak_cap()
@@ -1191,394 +1255,469 @@ struct DiskEntry {
     loc: DiskLoc,
 }
 
-/// Disk tier of the spillable merge map, with B5 multi-row batching.
-///
-/// Records accumulate in `staging` (in RAM, ≤ `SPILL_BATCH_ROWS`); on flush they
-/// are packed into ONE Arrow batch written under a synthetic `batch_id` key, and
-/// `index` records `key → (ordering, batch_id, row_idx)`. Reads resolve via the
-/// index + a small decoded-batch LRU. Overwrites just repoint the index (the stale
-/// row becomes dead — never referenced). Deletes live in the index (no batch row).
-pub struct RocksDbDiskMap {
-    db: DB,
-    /// Owns the on-disk directory; removed on drop (RAII).
-    dir: tempfile::TempDir,
-    /// Live (distinct-key) entry count across staging + index.
-    len: usize,
-    /// Interned schemas seen across spilled batches, addressed by id (= index).
-    /// Each body-only batch blob records its schema id, so a flush can pack a
-    /// MIX of schemas (e.g. narrow partial-update records alongside full ones)
-    /// into separate per-schema batches and decode each against the right schema
-    /// — without the per-record framing self-describing IPC would cost. Mirrors
-    /// Java's `BufferedRecord.schemaId` + `AvroSchemaCache`. Almost always holds
-    /// one entry (the reader schema); partial-update tables add a few narrow ones.
-    schemas: Vec<SchemaRef>,
-    /// Data records not yet flushed to a batch (≤ `SPILL_BATCH_ROWS`). Kept as full
-    /// records so `get`/`contains_key` see them without forcing a flush.
-    staging: MergeMap,
-    /// Flushed records: `key → (ordering, location)`.
-    index: HashMap<String, DiskEntry>,
-    /// Monotonic id for the next flushed batch (the RocksDB key).
-    next_batch_id: u64,
-    /// Decoded-batch LRU (interior-mutable so `get` stays `&self`).
-    cache: RefCell<VecDeque<(u64, Arc<RecordBatch>)>>,
-}
+#[cfg(feature = "spill-rocksdb")]
+mod rocksdb_disk_tier {
+    use super::*;
+    use rocksdb::{
+        BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBatch, WriteOptions,
+    };
 
-impl RocksDbDiskMap {
-    /// Create a fresh RocksDB under a uuid subdirectory of `parent`.
+    /// Disk tier of the spillable merge map, with B5 multi-row batching.
     ///
-    /// The parent directory is created if missing. The DB directory is owned by
-    /// a [`tempfile::TempDir`] so it is removed on drop even on panic.
-    pub fn create(parent: &Path) -> Result<Self> {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CoreError::ReadFileSliceError(format!(
-                "spill: failed to create spill parent dir {parent:?}: {e}"
-            ))
-        })?;
-        let dir = tempfile::Builder::new()
-            .prefix("hudi-spill-")
-            .tempdir_in(parent)
-            .map_err(|e| {
+    /// Records accumulate in `staging` (in RAM, ≤ `SPILL_BATCH_ROWS`); on flush they
+    /// are packed into ONE Arrow batch written under a synthetic `batch_id` key, and
+    /// `index` records `key → (ordering, batch_id, row_idx)`. Reads resolve via the
+    /// index + a small decoded-batch LRU. Overwrites just repoint the index (the stale
+    /// row becomes dead — never referenced). Deletes live in the index (no batch row).
+    pub struct RocksDbDiskMap {
+        db: DB,
+        /// Owns the on-disk directory; removed on drop (RAII).
+        dir: tempfile::TempDir,
+        /// Live (distinct-key) entry count across staging + index.
+        len: usize,
+        /// Interned schemas seen across spilled batches, addressed by id (= index).
+        /// Each body-only batch blob records its schema id, so a flush can pack a
+        /// MIX of schemas (e.g. narrow partial-update records alongside full ones)
+        /// into separate per-schema batches and decode each against the right schema
+        /// — without the per-record framing self-describing IPC would cost. Mirrors
+        /// Java's `BufferedRecord.schemaId` + `AvroSchemaCache`. Almost always holds
+        /// one entry (the reader schema); partial-update tables add a few narrow ones.
+        schemas: Vec<SchemaRef>,
+        /// Data records not yet flushed to a batch (≤ `SPILL_BATCH_ROWS`). Kept as full
+        /// records so `get`/`contains_key` see them without forcing a flush.
+        staging: MergeMap,
+        /// Flushed records: `key → (ordering, location)`.
+        index: HashMap<String, DiskEntry>,
+        /// Monotonic id for the next flushed batch (the RocksDB key).
+        next_batch_id: u64,
+        /// Decoded-batch LRU (interior-mutable so `get` stays `&self`).
+        cache: RefCell<VecDeque<(u64, Arc<RecordBatch>)>>,
+    }
+
+    impl RocksDbDiskMap {
+        /// Create a fresh RocksDB under a uuid subdirectory of `parent`.
+        ///
+        /// The parent directory is created if missing. The DB directory is owned by
+        /// a [`tempfile::TempDir`] so it is removed on drop even on panic.
+        pub fn create(parent: &Path) -> Result<Self> {
+            std::fs::create_dir_all(parent).map_err(|e| {
                 CoreError::ReadFileSliceError(format!(
-                    "spill: failed to create spill temp dir under {parent:?}: {e}"
+                    "spill: failed to create spill parent dir {parent:?}: {e}"
                 ))
             })?;
-        let db = DB::open(&Self::options(), dir.path()).map_err(|e| {
-            CoreError::ReadFileSliceError(format!(
-                "spill: failed to open RocksDB at {:?}: {e}",
-                dir.path()
-            ))
-        })?;
-        Ok(Self {
-            db,
-            dir,
-            len: 0,
-            schemas: Vec::new(),
-            staging: HashMap::default(),
-            index: HashMap::new(),
-            next_batch_id: 0,
-            cache: RefCell::new(VecDeque::new()),
-        })
-    }
-
-    /// Build the bounded-memory RocksDB options (see module docs / constants).
-    fn options() -> Options {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_write_buffer_size(ROCKSDB_WRITE_BUFFER_SIZE);
-        opts.set_max_write_buffer_number(ROCKSDB_MAX_WRITE_BUFFERS);
-        // Spill values are already compact single-row IPC blobs; no compression
-        // (trade revisited in B5 for the large-scale disk footprint).
-        opts.set_compression_type(DBCompressionType::None);
-
-        let cache = Cache::new_lru_cache(ROCKSDB_BLOCK_CACHE_BYTES);
-        let mut bbt = BlockBasedOptions::default();
-        bbt.set_block_cache(&cache);
-        // Count index/filter blocks against the (tiny) cache so engine memory
-        // stays bounded.
-        bbt.set_cache_index_and_filter_blocks(true);
-        opts.set_block_based_table_factory(&bbt);
-        opts
-    }
-
-    /// `WriteOptions` with WAL disabled (the spill map is rebuildable).
-    fn write_options() -> WriteOptions {
-        let mut wo = WriteOptions::default();
-        wo.disable_wal(true);
-        wo
-    }
-
-    /// Spill (or overwrite) a record at `key`. Data records accumulate in
-    /// `staging` and are flushed in `SPILL_BATCH_ROWS`-row batches (B5); deletes go
-    /// straight to the index. Overwrites repoint the index (stale rows go dead).
-    pub fn put(&mut self, key: &str, value: &BufferedRecord) -> Result<()> {
-        let was_present = self.staging.contains_key(key) || self.index.contains_key(key);
-        if value.is_delete() {
-            // Delete tombstone: no batch row. Drop any staged data for the key so
-            // `get` sees the delete (the index Delete also shadows a flushed row).
-            self.staging.remove(key);
-            self.index.insert(
-                key.to_string(),
-                DiskEntry {
-                    ordering_value: value.ordering_value.clone(),
-                    loc: DiskLoc::Delete {
-                        record_key: value.record_key.clone(),
-                    },
-                },
-            );
-        } else {
-            // Data: stage it. `get` prefers staging, and the eventual flush repoints
-            // the index (overwriting any prior Data/Delete entry for this key).
-            self.staging.insert(key.to_string(), value.clone());
-        }
-        if !was_present {
-            self.len += 1;
-        }
-        if self.staging.len() >= SPILL_BATCH_ROWS {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Intern a schema, returning its stable id (= index in `self.schemas`).
-    /// Linear scan: the cache holds one entry for a normal table and only a few
-    /// for partial-update tables, so this is cheaper than hashing a schema.
-    fn intern_schema(&mut self, schema: &SchemaRef) -> u32 {
-        if let Some(i) = self.schemas.iter().position(|s| s == schema) {
-            return i as u32;
-        }
-        self.schemas.push(schema.clone());
-        (self.schemas.len() - 1) as u32
-    }
-
-    /// Pack staged data records into Arrow batches — ONE per distinct schema —
-    /// write each under a fresh `batch_id`, and repoint the index
-    /// `key → (batch_id, row_idx)`. Records may carry DIFFERENT schemas (a narrow
-    /// partial-update record alongside full ones), so they are grouped by interned
-    /// schema id; each batch's blob records that id so it decodes against the right
-    /// schema. The common case (all reader-schema) yields exactly one group/batch.
-    fn flush(&mut self) -> Result<()> {
-        if self.staging.is_empty() {
-            return Ok(());
-        }
-        let staged: Vec<(String, BufferedRecord)> = self.staging.drain().collect();
-        // Group by interned schema id, preserving first-seen order.
-        #[allow(clippy::type_complexity)]
-        let mut groups: Vec<(u32, Vec<RecordBatch>, Vec<(String, Option<OrderingValue>)>)> =
-            Vec::new();
-        for (k, rec) in staged {
-            // Staging holds data only (deletes go to the index in `put`).
-            let batch = rec.get_record().ok_or_else(|| {
-                CoreError::ReadFileSliceError("spill flush: staged record had no data".to_string())
-            })?;
-            let sid = self.intern_schema(&batch.schema());
-            match groups.iter_mut().find(|(g, _, _)| *g == sid) {
-                Some((_, rows, keys)) => {
-                    rows.push(batch);
-                    keys.push((k, rec.ordering_value.clone()));
-                }
-                None => groups.push((sid, vec![batch], vec![(k, rec.ordering_value.clone())])),
-            }
-        }
-        for (sid, rows, keys) in groups {
-            let schema = rows[0].schema();
-            let batch =
-                arrow_select::concat::concat_batches(&schema, rows.iter()).map_err(|e| {
+            let dir = tempfile::Builder::new()
+                .prefix("hudi-spill-")
+                .tempdir_in(parent)
+                .map_err(|e| {
                     CoreError::ReadFileSliceError(format!(
-                        "spill flush: concat_batches failed: {e}"
+                        "spill: failed to create spill temp dir under {parent:?}: {e}"
                     ))
                 })?;
-            // Body-only (decode against schema `sid`); else self-describing fallback
-            // (e.g. dictionary columns), which carries its own schema so needs no id.
-            let blob = match row_serde::to_binary_row_body(&batch) {
-                Some(body) => {
-                    let mut v = Vec::with_capacity(1 + 4 + body.len());
-                    v.push(SPILL_BATCH_TAG_BODY);
-                    v.extend_from_slice(&sid.to_le_bytes());
-                    v.extend_from_slice(&body);
-                    v
-                }
-                None => {
-                    let full = row_serde::to_binary_row(&batch.schema(), &batch);
-                    let mut v = Vec::with_capacity(1 + full.len());
-                    v.push(SPILL_BATCH_TAG_FULL);
-                    v.extend_from_slice(&full);
-                    v
-                }
-            };
-            let batch_id = self.next_batch_id;
-            self.next_batch_id += 1;
-            let mut wb = WriteBatch::default();
-            wb.put(batch_id.to_le_bytes(), blob);
-            self.db.write_opt(wb, &Self::write_options()).map_err(|e| {
-                CoreError::ReadFileSliceError(format!("spill: RocksDB batch write failed: {e}"))
+            let db = DB::open(&Self::options(), dir.path()).map_err(|e| {
+                CoreError::ReadFileSliceError(format!(
+                    "spill: failed to open RocksDB at {:?}: {e}",
+                    dir.path()
+                ))
             })?;
-            for (row_idx, (k, ov)) in keys.into_iter().enumerate() {
+            Ok(Self {
+                db,
+                dir,
+                len: 0,
+                schemas: Vec::new(),
+                staging: HashMap::default(),
+                index: HashMap::new(),
+                next_batch_id: 0,
+                cache: RefCell::new(VecDeque::new()),
+            })
+        }
+
+        /// Build the bounded-memory RocksDB options (see module docs / constants).
+        fn options() -> Options {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.set_write_buffer_size(ROCKSDB_WRITE_BUFFER_SIZE);
+            opts.set_max_write_buffer_number(ROCKSDB_MAX_WRITE_BUFFERS);
+            // Spill values are already compact single-row IPC blobs; no compression
+            // (trade revisited in B5 for the large-scale disk footprint).
+            opts.set_compression_type(DBCompressionType::None);
+
+            let cache = Cache::new_lru_cache(ROCKSDB_BLOCK_CACHE_BYTES);
+            let mut bbt = BlockBasedOptions::default();
+            bbt.set_block_cache(&cache);
+            // Count index/filter blocks against the (tiny) cache so engine memory
+            // stays bounded.
+            bbt.set_cache_index_and_filter_blocks(true);
+            opts.set_block_based_table_factory(&bbt);
+            opts
+        }
+
+        /// `WriteOptions` with WAL disabled (the spill map is rebuildable).
+        fn write_options() -> WriteOptions {
+            let mut wo = WriteOptions::default();
+            wo.disable_wal(true);
+            wo
+        }
+
+        /// Spill (or overwrite) a record at `key`. Data records accumulate in
+        /// `staging` and are flushed in `SPILL_BATCH_ROWS`-row batches (B5); deletes go
+        /// straight to the index. Overwrites repoint the index (stale rows go dead).
+        pub fn put(&mut self, key: &str, value: &BufferedRecord) -> Result<()> {
+            let was_present = self.staging.contains_key(key) || self.index.contains_key(key);
+            if value.is_delete() {
+                // Delete tombstone: no batch row. Drop any staged data for the key so
+                // `get` sees the delete (the index Delete also shadows a flushed row).
+                self.staging.remove(key);
                 self.index.insert(
-                    k,
+                    key.to_string(),
                     DiskEntry {
-                        ordering_value: ov,
-                        loc: DiskLoc::Data {
-                            batch_id,
-                            row_idx: row_idx as u32,
+                        ordering_value: value.ordering_value.clone(),
+                        loc: DiskLoc::Delete {
+                            record_key: value.record_key.clone(),
                         },
                     },
                 );
+            } else {
+                // Data: stage it. `get` prefers staging, and the eventual flush repoints
+                // the index (overwriting any prior Data/Delete entry for this key).
+                self.staging.insert(key.to_string(), value.clone());
             }
+            if !was_present {
+                self.len += 1;
+            }
+            if self.staging.len() >= SPILL_BATCH_ROWS {
+                self.flush()?;
+            }
+            Ok(())
         }
-        Ok(())
-    }
 
-    /// Decode a spilled batch blob (tag-dispatched: body-only vs self-describing).
-    fn decode_batch(&self, raw: &[u8]) -> Result<RecordBatch> {
-        let (tag, body) = raw
-            .split_first()
-            .ok_or_else(|| CoreError::ReadFileSliceError("spill: empty batch blob".to_string()))?;
-        match *tag {
-            SPILL_BATCH_TAG_BODY => {
-                // [schema_id: u32 LE][ipc body]
-                let id_bytes = body.get(0..4).ok_or_else(|| {
+        /// Intern a schema, returning its stable id (= index in `self.schemas`).
+        /// Linear scan: the cache holds one entry for a normal table and only a few
+        /// for partial-update tables, so this is cheaper than hashing a schema.
+        fn intern_schema(&mut self, schema: &SchemaRef) -> u32 {
+            if let Some(i) = self.schemas.iter().position(|s| s == schema) {
+                return i as u32;
+            }
+            self.schemas.push(schema.clone());
+            (self.schemas.len() - 1) as u32
+        }
+
+        /// Pack staged data records into Arrow batches — ONE per distinct schema —
+        /// write each under a fresh `batch_id`, and repoint the index
+        /// `key → (batch_id, row_idx)`. Records may carry DIFFERENT schemas (a narrow
+        /// partial-update record alongside full ones), so they are grouped by interned
+        /// schema id; each batch's blob records that id so it decodes against the right
+        /// schema. The common case (all reader-schema) yields exactly one group/batch.
+        pub fn flush(&mut self) -> Result<()> {
+            if self.staging.is_empty() {
+                return Ok(());
+            }
+            let staged: Vec<(String, BufferedRecord)> = self.staging.drain().collect();
+            // Group by interned schema id, preserving first-seen order.
+            #[allow(clippy::type_complexity)]
+            let mut groups: Vec<(
+                u32,
+                Vec<RecordBatch>,
+                Vec<(String, Option<OrderingValue>)>,
+            )> = Vec::new();
+            for (k, rec) in staged {
+                // Staging holds data only (deletes go to the index in `put`).
+                let batch = rec.get_record().ok_or_else(|| {
                     CoreError::ReadFileSliceError(
-                        "spill: body-only batch blob too short for schema id".to_string(),
+                        "spill flush: staged record had no data".to_string(),
                     )
                 })?;
-                let sid = u32::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
-                let schema = self.schemas.get(sid).cloned().ok_or_else(|| {
-                    CoreError::ReadFileSliceError(format!(
-                        "spill: body-only batch references unknown schema id {sid}"
-                    ))
+                let sid = self.intern_schema(&batch.schema());
+                match groups.iter_mut().find(|(g, _, _)| *g == sid) {
+                    Some((_, rows, keys)) => {
+                        rows.push(batch);
+                        keys.push((k, rec.ordering_value.clone()));
+                    }
+                    None => groups.push((sid, vec![batch], vec![(k, rec.ordering_value.clone())])),
+                }
+            }
+            for (sid, rows, keys) in groups {
+                let schema = rows[0].schema();
+                let batch =
+                    arrow_select::concat::concat_batches(&schema, rows.iter()).map_err(|e| {
+                        CoreError::ReadFileSliceError(format!(
+                            "spill flush: concat_batches failed: {e}"
+                        ))
+                    })?;
+                // Body-only (decode against schema `sid`); else self-describing fallback
+                // (e.g. dictionary columns), which carries its own schema so needs no id.
+                let blob = match row_serde::to_binary_row_body(&batch) {
+                    Some(body) => {
+                        let mut v = Vec::with_capacity(1 + 4 + body.len());
+                        v.push(SPILL_BATCH_TAG_BODY);
+                        v.extend_from_slice(&sid.to_le_bytes());
+                        v.extend_from_slice(&body);
+                        v
+                    }
+                    None => {
+                        let full = row_serde::to_binary_row(&batch.schema(), &batch);
+                        let mut v = Vec::with_capacity(1 + full.len());
+                        v.push(SPILL_BATCH_TAG_FULL);
+                        v.extend_from_slice(&full);
+                        v
+                    }
+                };
+                let batch_id = self.next_batch_id;
+                self.next_batch_id += 1;
+                let mut wb = WriteBatch::default();
+                wb.put(batch_id.to_le_bytes(), blob);
+                self.db.write_opt(wb, &Self::write_options()).map_err(|e| {
+                    CoreError::ReadFileSliceError(format!("spill: RocksDB batch write failed: {e}"))
                 })?;
-                row_serde::from_binary_body(&body[4..], schema)
+                for (row_idx, (k, ov)) in keys.into_iter().enumerate() {
+                    self.index.insert(
+                        k,
+                        DiskEntry {
+                            ordering_value: ov,
+                            loc: DiskLoc::Data {
+                                batch_id,
+                                row_idx: row_idx as u32,
+                            },
+                        },
+                    );
+                }
             }
-            SPILL_BATCH_TAG_FULL => row_serde::from_binary(body),
-            other => Err(CoreError::ReadFileSliceError(format!(
-                "spill: unknown batch tag {other:#04x}"
-            ))),
+            Ok(())
         }
-    }
 
-    /// Load a spilled batch by id, via the decoded-batch LRU (one RocksDB get +
-    /// one decode per batch, shared across its rows).
-    fn load_batch(&self, batch_id: u64) -> Result<Arc<RecordBatch>> {
-        if let Some((_, b)) = self.cache.borrow().iter().find(|(id, _)| *id == batch_id) {
-            return Ok(b.clone());
-        }
-        let raw = self
-            .db
-            .get(batch_id.to_le_bytes())
-            .map_err(|e| CoreError::ReadFileSliceError(format!("spill: batch get failed: {e}")))?
-            .ok_or_else(|| {
-                CoreError::ReadFileSliceError(format!("spill: batch {batch_id} missing"))
+        /// Decode a spilled batch blob (tag-dispatched: body-only vs self-describing).
+        fn decode_batch(&self, raw: &[u8]) -> Result<RecordBatch> {
+            let (tag, body) = raw.split_first().ok_or_else(|| {
+                CoreError::ReadFileSliceError("spill: empty batch blob".to_string())
             })?;
-        let batch = Arc::new(self.decode_batch(&raw)?);
-        let mut cache = self.cache.borrow_mut();
-        cache.push_back((batch_id, batch.clone()));
-        if cache.len() > SPILL_BATCH_CACHE {
-            cache.pop_front();
+            match *tag {
+                SPILL_BATCH_TAG_BODY => {
+                    // [schema_id: u32 LE][ipc body]
+                    let id_bytes = body.get(0..4).ok_or_else(|| {
+                        CoreError::ReadFileSliceError(
+                            "spill: body-only batch blob too short for schema id".to_string(),
+                        )
+                    })?;
+                    let sid = u32::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
+                    let schema = self.schemas.get(sid).cloned().ok_or_else(|| {
+                        CoreError::ReadFileSliceError(format!(
+                            "spill: body-only batch references unknown schema id {sid}"
+                        ))
+                    })?;
+                    row_serde::from_binary_body(&body[4..], schema)
+                }
+                SPILL_BATCH_TAG_FULL => row_serde::from_binary(body),
+                other => Err(CoreError::ReadFileSliceError(format!(
+                    "spill: unknown batch tag {other:#04x}"
+                ))),
+            }
         }
-        Ok(batch)
-    }
 
-    /// Reconstruct the record for a flushed index entry.
-    fn record_from_entry(&self, key: &str, entry: &DiskEntry) -> Result<BufferedRecord> {
-        match &entry.loc {
-            // Use the PERSISTED record key, not the map key: this map may be keyed
-            // by base-file position (position-based merge), so reconstructing a
-            // delete's key from the map key would silently drop the delete after
-            // key-based fallback (PR #95 review).
-            DiskLoc::Delete { record_key } => Ok(BufferedRecord::new_delete(
-                record_key.clone(),
-                entry.ordering_value.clone(),
-            )),
-            DiskLoc::Data { batch_id, row_idx } => {
-                let batch = self.load_batch(*batch_id)?;
-                let row = batch.slice(*row_idx as usize, 1);
-                Ok(BufferedRecord::new_data(
-                    key.to_string(),
-                    row,
+        /// Load a spilled batch by id, via the decoded-batch LRU (one RocksDB get +
+        /// one decode per batch, shared across its rows).
+        fn load_batch(&self, batch_id: u64) -> Result<Arc<RecordBatch>> {
+            if let Some((_, b)) = self.cache.borrow().iter().find(|(id, _)| *id == batch_id) {
+                return Ok(b.clone());
+            }
+            let raw = self
+                .db
+                .get(batch_id.to_le_bytes())
+                .map_err(|e| {
+                    CoreError::ReadFileSliceError(format!("spill: batch get failed: {e}"))
+                })?
+                .ok_or_else(|| {
+                    CoreError::ReadFileSliceError(format!("spill: batch {batch_id} missing"))
+                })?;
+            let batch = Arc::new(self.decode_batch(&raw)?);
+            let mut cache = self.cache.borrow_mut();
+            cache.push_back((batch_id, batch.clone()));
+            if cache.len() > SPILL_BATCH_CACHE {
+                cache.pop_front();
+            }
+            Ok(batch)
+        }
+
+        /// Reconstruct the record for a flushed index entry.
+        fn record_from_entry(&self, key: &str, entry: &DiskEntry) -> Result<BufferedRecord> {
+            match &entry.loc {
+                // Use the PERSISTED record key, not the map key: this map may be keyed
+                // by base-file position (position-based merge), so reconstructing a
+                // delete's key from the map key would silently drop the delete after
+                // key-based fallback (PR #95 review).
+                DiskLoc::Delete { record_key } => Ok(BufferedRecord::new_delete(
+                    record_key.clone(),
                     entry.ordering_value.clone(),
-                ))
+                )),
+                DiskLoc::Data { batch_id, row_idx } => {
+                    let batch = self.load_batch(*batch_id)?;
+                    let row = batch.slice(*row_idx as usize, 1);
+                    Ok(BufferedRecord::new_data(
+                        key.to_string(),
+                        row,
+                        entry.ordering_value.clone(),
+                    ))
+                }
+            }
+        }
+
+        /// Read back the record at `key`, if present (staging tier preferred — newest).
+        pub fn get(&self, key: &str) -> Result<Option<BufferedRecord>> {
+            if let Some(r) = self.staging.get(key) {
+                return Ok(Some(r.clone()));
+            }
+            match self.index.get(key) {
+                Some(entry) => Ok(Some(self.record_from_entry(key, entry)?)),
+                None => Ok(None),
+            }
+        }
+
+        /// Remove and return the record at `key`, if present. The on-disk batch row (if
+        /// any) is left as a dead row — never referenced once the index entry is gone.
+        pub fn remove(&mut self, key: &str) -> Result<Option<BufferedRecord>> {
+            let existing = self.get(key)?;
+            if existing.is_some() {
+                self.staging.remove(key);
+                self.index.remove(key);
+                self.len -= 1;
+            }
+            Ok(existing)
+        }
+
+        /// The on-disk directory this tier owns. Exposed so a test can assert
+        /// the RAII cleanup actually removes it.
+        pub fn dir_path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// True if `key` is present in either tier.
+        pub fn contains_key(&self, key: &str) -> Result<bool> {
+            Ok(self.staging.contains_key(key) || self.index.contains_key(key))
+        }
+
+        /// Live entry count.
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        /// True if there are no spilled entries.
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        /// Consume the disk map into a drain iterator. Staged records are flushed first,
+        /// then entries are yielded in `(batch_id, row_idx)` order so each batch is
+        /// read and decoded ONCE (deletes last). NOTE: this changes the drain's output
+        /// order from the old key-sorted order to batch/insertion order — fine for the
+        /// MOR snapshot read (records are a set; the merge already resolved versions).
+        pub fn into_drain_iter(mut self) -> RocksDbDrainIter {
+            let flush_err = self.flush().err();
+            let mut entries: Vec<(String, DiskEntry)> = self.index.drain().collect();
+            entries.sort_by_key(|(_, e)| match e.loc {
+                DiskLoc::Data { batch_id, row_idx } => (batch_id, row_idx),
+                DiskLoc::Delete { .. } => (u64::MAX, 0),
+            });
+            RocksDbDrainIter {
+                order: entries.into_iter(),
+                flush_err,
+                // Hold the disk map (DB handle + temp dir + batch cache) alive for the
+                // lifetime of the iterator.
+                disk: self,
             }
         }
     }
 
-    /// Read back the record at `key`, if present (staging tier preferred — newest).
-    pub fn get(&self, key: &str) -> Result<Option<BufferedRecord>> {
-        if let Some(r) = self.staging.get(key) {
-            return Ok(Some(r.clone()));
+    impl Drop for RocksDbDiskMap {
+        fn drop(&mut self) {
+            // RAII: `tempfile::TempDir` removes the directory on its own drop, and
+            // the `DB` handle closes on drop. Double-drop safe (each field drops
+            // exactly once). We log for operability.
+            log::debug!(
+                "[RocksDbDiskMap] dropping spill DB at {:?} ({} entries)",
+                self.dir.path(),
+                self.len
+            );
         }
-        match self.index.get(key) {
-            Some(entry) => Ok(Some(self.record_from_entry(key, entry)?)),
-            None => Ok(None),
-        }
     }
 
-    /// Remove and return the record at `key`, if present. The on-disk batch row (if
-    /// any) is left as a dead row — never referenced once the index entry is gone.
-    pub fn remove(&mut self, key: &str) -> Result<Option<BufferedRecord>> {
-        let existing = self.get(key)?;
-        if existing.is_some() {
-            self.staging.remove(key);
-            self.index.remove(key);
-            self.len -= 1;
-        }
-        Ok(existing)
+    /// Forward drain iterator over the RocksDB disk tier. Yields reconstructed
+    /// [`BufferedRecord`]s in `(batch_id, row_idx)` order (deletes last) so each
+    /// spilled batch is read + decoded once (via the disk map's batch LRU). Holds the
+    /// disk map alive until dropped.
+    pub struct RocksDbDrainIter {
+        /// Flushed index entries, pre-sorted by batch location.
+        order: std::vec::IntoIter<(String, DiskEntry)>,
+        /// A deferred error from the final `flush()` in `into_drain_iter`, surfaced
+        /// on the first `next()`.
+        flush_err: Option<CoreError>,
+        /// Keeps the DB handle + temp dir + batch cache alive until the drain completes.
+        disk: RocksDbDiskMap,
     }
 
-    /// True if `key` is present in either tier.
-    pub fn contains_key(&self, key: &str) -> Result<bool> {
-        Ok(self.staging.contains_key(key) || self.index.contains_key(key))
-    }
+    impl Iterator for RocksDbDrainIter {
+        type Item = Result<BufferedRecord>;
 
-    /// Live entry count.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// True if there are no spilled entries.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Consume the disk map into a drain iterator. Staged records are flushed first,
-    /// then entries are yielded in `(batch_id, row_idx)` order so each batch is
-    /// read and decoded ONCE (deletes last). NOTE: this changes the drain's output
-    /// order from the old key-sorted order to batch/insertion order — fine for the
-    /// MOR snapshot read (records are a set; the merge already resolved versions).
-    fn into_drain_iter(mut self) -> RocksDbDrainIter {
-        let flush_err = self.flush().err();
-        let mut entries: Vec<(String, DiskEntry)> = self.index.drain().collect();
-        entries.sort_by_key(|(_, e)| match e.loc {
-            DiskLoc::Data { batch_id, row_idx } => (batch_id, row_idx),
-            DiskLoc::Delete { .. } => (u64::MAX, 0),
-        });
-        RocksDbDrainIter {
-            order: entries.into_iter(),
-            flush_err,
-            // Hold the disk map (DB handle + temp dir + batch cache) alive for the
-            // lifetime of the iterator.
-            disk: self,
+        fn next(&mut self) -> Option<Self::Item> {
+            if let Some(e) = self.flush_err.take() {
+                return Some(Err(e));
+            }
+            let (key, entry) = self.order.next()?;
+            Some(self.disk.record_from_entry(&key, &entry))
         }
     }
 }
 
-impl Drop for RocksDbDiskMap {
-    fn drop(&mut self) {
-        // RAII: `tempfile::TempDir` removes the directory on its own drop, and
-        // the `DB` handle closes on drop. Double-drop safe (each field drops
-        // exactly once). We log for operability.
-        log::debug!(
-            "[RocksDbDiskMap] dropping spill DB at {:?} ({} entries)",
-            self.dir.path(),
-            self.len
-        );
-    }
-}
+#[cfg(feature = "spill-rocksdb")]
+use rocksdb_disk_tier::{RocksDbDiskMap, RocksDbDrainIter};
 
-/// Forward drain iterator over the RocksDB disk tier. Yields reconstructed
-/// [`BufferedRecord`]s in `(batch_id, row_idx)` order (deletes last) so each
-/// spilled batch is read + decoded once (via the disk map's batch LRU). Holds the
-/// disk map alive until dropped.
-pub struct RocksDbDrainIter {
-    /// Flushed index entries, pre-sorted by batch location.
-    order: std::vec::IntoIter<(String, DiskEntry)>,
-    /// A deferred error from the final `flush()` in `into_drain_iter`, surfaced
-    /// on the first `next()`.
-    flush_err: Option<CoreError>,
-    /// Keeps the DB handle + temp dir + batch cache alive until the drain completes.
-    disk: RocksDbDiskMap,
-}
+/// Stand-ins for the disk tier when the `spill-rocksdb` feature is off.
+///
+/// Both are **uninhabited**, which is the precise statement of what the feature
+/// flag means: [`SpillableRecordMap::ensure_disk`] is the only thing that
+/// constructs a disk tier, and without the feature it returns an error instead —
+/// so `Option<DiskTier>` can only ever be `None`, and the compiler enforces that
+/// rather than the reader having to trust it. Every method below is therefore
+/// unreachable, and says so by matching on a value that cannot exist.
+#[cfg(not(feature = "spill-rocksdb"))]
+mod no_disk_tier {
+    use super::*;
 
-impl Iterator for RocksDbDrainIter {
-    type Item = Result<BufferedRecord>;
+    pub enum RocksDbDiskMap {}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(e) = self.flush_err.take() {
-            return Some(Err(e));
+    impl RocksDbDiskMap {
+        pub fn put(&mut self, _key: &str, _value: &BufferedRecord) -> Result<()> {
+            match *self {}
         }
-        let (key, entry) = self.order.next()?;
-        Some(self.disk.record_from_entry(&key, &entry))
+        pub fn get(&self, _key: &str) -> Result<Option<BufferedRecord>> {
+            match *self {}
+        }
+        pub fn remove(&mut self, _key: &str) -> Result<Option<BufferedRecord>> {
+            match *self {}
+        }
+        pub fn contains_key(&self, _key: &str) -> Result<bool> {
+            match *self {}
+        }
+        pub fn len(&self) -> usize {
+            match *self {}
+        }
+        pub fn flush(&mut self) -> Result<()> {
+            match *self {}
+        }
+        pub fn into_drain_iter(self) -> RocksDbDrainIter {
+            match self {}
+        }
+    }
+
+    pub enum RocksDbDrainIter {}
+
+    impl Iterator for RocksDbDrainIter {
+        type Item = Result<BufferedRecord>;
+        fn next(&mut self) -> Option<Self::Item> {
+            match *self {}
+        }
     }
 }
+
+#[cfg(not(feature = "spill-rocksdb"))]
+use no_disk_tier::{RocksDbDiskMap, RocksDbDrainIter};
 
 #[cfg(test)]
 mod tests {
@@ -1649,6 +1788,8 @@ mod tests {
     /// schema-id cache — not a single shared schema (which would make the flush
     /// `concat_batches` fail on the schema mismatch). Drains both back and checks
     /// each kept its own column count.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spill_mixed_schemas_round_trip_via_schema_id_cache() {
         let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
@@ -1720,9 +1861,9 @@ mod tests {
     #[test]
     fn spill_config_defaults_and_budget_math() {
         let cfg = SpillConfig::from_config(&HashMap::new()).unwrap();
-        // default 1 GiB → 0.8 GiB − reserved.
-        let expected = (DEFAULT_MERGE_MAX_SIZE_BYTES as f64 * SPILL_TRIGGER_FRACTION) as u64
-            - ROCKSDB_RESERVED_BYTES;
+        // default 1 GiB → 0.8 GiB. The RocksDB reserve is charged at run time,
+        // only while the disk tier is live, so it is NOT deducted here.
+        let expected = (DEFAULT_MERGE_MAX_SIZE_BYTES as f64 * SPILL_TRIGGER_FRACTION) as u64;
         assert_eq!(cfg.max_in_memory_size, expected);
         assert_eq!(cfg.spill_path, PathBuf::from(DEFAULT_SPILL_PATH));
         assert_eq!(cfg.diskmap_type, DiskMapType::RocksDb);
@@ -1741,12 +1882,66 @@ mod tests {
         ));
     }
 
+    /// REGRESSION: a modest merge budget must still leave usable in-memory
+    /// space before the first spill.
+    ///
+    /// The reserve used to be deducted at config time, so `0.8 × size − 40 MiB`
+    /// saturated to 0 for every `hoodie.memory.merge.max.size` at or below
+    /// 50 MiB — `over_budget()` was then `bytes >= 0`, always true, and every
+    /// entry spilled from the first insert while RocksDB consumed the reserve
+    /// anyway. Charging it lazily gives the map the whole budget until the disk
+    /// tier actually opens.
     #[test]
-    fn spill_config_tiny_budget_saturates_at_zero() {
-        // merge_max_size so small that 0.8× < reserved → budget saturates to 0.
-        let cfg =
-            SpillConfig::from_parts(1024, PathBuf::from("/tmp"), DiskMapType::RocksDb).unwrap();
-        assert_eq!(cfg.max_in_memory_size, 0);
+    fn spill_config_small_budget_still_has_in_memory_room_before_spilling() {
+        const SIXTEEN_MIB: u64 = 16 * 1024 * 1024;
+        let cfg = SpillConfig::from_parts(SIXTEEN_MIB, PathBuf::from("/tmp"), DiskMapType::RocksDb)
+            .unwrap();
+        // 0.8 × 16 MiB, with nothing deducted.
+        assert_eq!(
+            cfg.max_in_memory_size,
+            (SIXTEEN_MIB as f64 * SPILL_TRIGGER_FRACTION) as u64
+        );
+        assert!(
+            cfg.max_in_memory_size < ROCKSDB_RESERVED_BYTES,
+            "this budget is below the reserve — the point of the test"
+        );
+
+        // A fresh map (no disk tier) may use all of it, and is not already over
+        // budget with nothing inserted.
+        let mut map = SpillableRecordMap::with_config(cfg.clone());
+        assert_eq!(map.in_memory_allowance(), cfg.max_in_memory_size);
+        assert!(
+            !map.over_budget(),
+            "an empty map must not report itself over budget"
+        );
+        map.insert("k0".to_string(), record("k0", 0)).unwrap();
+        assert!(
+            !map.spill_fired(),
+            "a single small entry must not force a spill under a 12.8 MiB allowance"
+        );
+
+        // The default budget comfortably covers the reserve in both states.
+        let big = SpillConfig::from_config(&HashMap::new()).unwrap();
+        let big_map = SpillableRecordMap::with_config(big.clone());
+        assert_eq!(big_map.in_memory_allowance(), big.max_in_memory_size);
+    }
+
+    /// Once the disk tier is live, RocksDB's own memory comes out of the same
+    /// budget — that accounting is the reason the reserve exists.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
+    #[test]
+    fn in_memory_allowance_charges_the_rocksdb_reserve_only_once_spilled() {
+        let cfg = SpillConfig::from_config(&HashMap::new()).unwrap();
+        let mut map = SpillableRecordMap::with_config(cfg.clone());
+        assert_eq!(map.in_memory_allowance(), cfg.max_in_memory_size);
+
+        map.ensure_disk().unwrap();
+        assert_eq!(
+            map.in_memory_allowance(),
+            cfg.max_in_memory_size - ROCKSDB_RESERVED_BYTES,
+            "a live disk tier must be charged against the merge budget"
+        );
     }
 
     // ── Spill trigger + size accounting ───────────────────────────────────
@@ -1771,6 +1966,8 @@ mod tests {
         assert_eq!(map.true_retained_bytes(), expected);
     }
 
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spills_at_budget_boundary() {
         // Budget = exactly 2 entries' worth. After two inserts the running size
@@ -1795,6 +1992,8 @@ mod tests {
     /// with budget 0 every entry spills to disk staging, and once more than 1024
     /// are staged they are flushed into multi-row batches. Every record must
     /// still read back with its exact data across that boundary.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spill_flush_batches_round_trip_across_boundary() {
         let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
@@ -1825,6 +2024,8 @@ mod tests {
     /// `concat_batches` would error — so the mismatch only arises across flushes;
     /// the first 1024 records fill batch-1 and cache its schema, then the
     /// differently-shaped record flushes as batch-2.)
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spill_mismatched_schema_batch_round_trips_via_full_tag() {
         use arrow_array::Int64Array;
@@ -1912,6 +2113,8 @@ mod tests {
 
     // ── Exact-data round-trip across tiers ────────────────────────────────
 
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn get_returns_exact_data_from_both_tiers() {
         let one = entry_bytes("k0", &record("k0", 0));
@@ -1936,6 +2139,8 @@ mod tests {
         assert!(map.get("absent").unwrap().is_none());
     }
 
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spilled_delete_tombstone_round_trips() {
         let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
@@ -1953,6 +2158,8 @@ mod tests {
 
     // ── Iteration order: memory first, then disk ──────────────────────────
 
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn drain_iter_yields_memory_then_disk_with_all_data() {
         let one = entry_bytes("k0", &record("k0", 0));
@@ -2000,6 +2207,8 @@ mod tests {
 
     // ── Remove across both tiers ──────────────────────────────────────────
 
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn remove_across_tiers_decrements_and_absents() {
         let one = entry_bytes("k0", &record("k0", 0));
@@ -2037,6 +2246,8 @@ mod tests {
         assert_eq!(tuple(&map.get("k").unwrap().unwrap()), ("k".to_string(), 2));
     }
 
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn overwriting_spilled_key_updates_on_disk() {
         let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
@@ -2049,13 +2260,41 @@ mod tests {
 
     // ── Lifecycle: temp dir removed on drop ───────────────────────────────
 
+    /// Without a spill backend, a merge that needs to spill must fail with a
+    /// message that names the feature — not grow past its budget in silence.
+    ///
+    /// Runs only in the `--no-default-features` build, which is the whole point:
+    /// it is the configuration this error exists for.
+    #[cfg(not(feature = "spill-rocksdb"))]
+    #[test]
+    fn spilling_without_a_backend_fails_loudly() {
+        // A zero budget puts the very first insert over the line.
+        let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
+        let err = map
+            .insert("k".to_string(), record("k", 1))
+            .expect_err("a spill with no backend must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("spill-rocksdb"),
+            "the error must name the feature to rebuild with, got: {msg}"
+        );
+        assert!(
+            msg.contains(CONFIG_MERGE_MAX_SIZE),
+            "the error must name the budget the operator can raise instead, got: {msg}"
+        );
+        assert!(!map.spill_fired(), "no spill can have happened");
+    }
+
+    /// The spill directory only exists when there is a spill backend to create
+    /// it, so this is about the RocksDB tier specifically.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn spill_dir_is_removed_on_drop() {
         let dir_path;
         {
             let mut map = SpillableRecordMap::with_config(tiny_budget_config(0));
             map.insert("k".to_string(), record("k", 1)).unwrap();
-            dir_path = map.disk.as_ref().unwrap().dir.path().to_path_buf();
+            dir_path = map.disk.as_ref().unwrap().dir_path().to_path_buf();
             assert!(dir_path.exists(), "spill dir exists while map is alive");
         }
         assert!(
@@ -2221,6 +2460,8 @@ mod tests {
 
     /// Over a tight budget, a DENSE pinned batch is SPILLED (frees the whole Arc):
     /// spill fires, the tracked heap is bounded, and the data round-trips exactly.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn evict_spills_dense_pinned_batch_and_bounds_memory() {
         let src = wide_batch(256);
@@ -2289,6 +2530,8 @@ mod tests {
     /// get back under (NOT an error), and every row still round-trips. This is the
     /// positive branch complementing the loud-error case (which fires only when
     /// spilling cannot help — see the repro integration test).
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn peak_cap_spills_to_stay_under_cap_without_error() {
         let src = wide_batch(256);
@@ -2344,6 +2587,8 @@ mod tests {
     /// Output is identical across budget settings (unbounded / mid / tiny) for the
     /// same spread-key input — eviction order must not change the resolved data
     /// (the §4 correctness flag: a full-data equivalence across budgets).
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
     #[test]
     fn output_is_budget_invariant_across_unbounded_mid_tiny() {
         fn build(budget: u64) -> Vec<(String, i32)> {

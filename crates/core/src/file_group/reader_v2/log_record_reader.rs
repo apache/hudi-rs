@@ -252,16 +252,14 @@ pub fn forward_scan_pass1(
                 }
                 blocks_list.push(block);
             }
-            BlockType::Command => {
-                if block.is_rollback_block() {
-                    total_rollbacks += 1;
-                    if let Ok(target) = block.target_instant_time() {
-                        let target = target.to_string();
-                        log::debug!("[Pass1] ROLLBACK: removing instant={target}");
-                        target_rollback_instants.insert(target.clone());
-                        ordered_instants_list.retain(|t| t != &target);
-                        instant_to_blocks_map.remove(&target);
-                    }
+            BlockType::Command if block.is_rollback_block() => {
+                total_rollbacks += 1;
+                if let Ok(target) = block.target_instant_time() {
+                    let target = target.to_string();
+                    log::debug!("[Pass1] ROLLBACK: removing instant={target}");
+                    target_rollback_instants.insert(target.clone());
+                    ordered_instants_list.retain(|t| t != &target);
+                    instant_to_blocks_map.remove(&target);
                 }
             }
             _ => {}

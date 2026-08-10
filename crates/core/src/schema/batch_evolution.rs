@@ -111,22 +111,42 @@ fn is_container(dt: &DataType) -> bool {
     )
 }
 
-/// Whether `from` -> `to` is a promotion [`evolve_array`] performs, rather than
-/// a difference in how a nested type is named.
+/// Whether `from` -> `to` is a type change Hudi permits as schema evolution, and
+/// so one [`evolve_array`] should convert.
 ///
-/// A base file written before its column was widened still holds the narrow
-/// type; rebuilding its buffer under the wider one reads past the end.
+/// This is an allowlist, and deliberately so. It is the gate
+/// [`reconcile_batch_to_schema`](crate::file_group::reader_v2::buffer::row_extraction::reconcile_batch_to_schema)
+/// consults before converting; anything not listed here is refused rather than
+/// reinterpreted or cast. A *narrowing* must never appear on this list: the
+/// safe `arrow_cast` would turn an out-of-range value into NULL, which is data
+/// loss with no error, and narrowing is not legal Hudi evolution in the first
+/// place — it can only mean the caller resolved a stale target schema.
+///
+/// The set mirrors Avro's resolution rules as Hudi applies them
+/// (`HoodieAvroUtils::rewritePrimaryType`): widen within the numeric tower,
+/// convert between string and bytes, render any primitive as a string, and
+/// widen a decimal's precision.
 pub(crate) fn is_promotion(from: &DataType, to: &DataType) -> bool {
-    matches!(
-        (from, to),
-        (DataType::Int32, DataType::Int64)
-            | (DataType::Float32, DataType::Float64)
-            | (
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-                DataType::Utf8
-            )
-            | (DataType::Float32 | DataType::Float64, DataType::Utf8)
-    )
+    use DataType::*;
+    match (from, to) {
+        // Numeric tower: int -> long -> float -> double. Avro permits every
+        // forward step, not just int->long, and a table may have been evolved
+        // more than one step at a time.
+        (Int32, Int64 | Float32 | Float64) => true,
+        (Int64, Float32 | Float64) => true,
+        (Float32, Float64) => true,
+        // Any primitive rendered as a string. Hudi formats these with Java's
+        // `String.valueOf`, which `evolve_array` reproduces for floats.
+        (Int8 | Int16 | Int32 | Int64, Utf8) => true,
+        (Float32 | Float64, Utf8) => true,
+        // Avro treats string and bytes as mutually promotable (UTF-8 either way).
+        (Utf8, Binary) | (Binary, Utf8) => true,
+        // Decimal precision widening at a fixed scale. Scale changes rescale
+        // values and are not an Avro promotion, so they are excluded.
+        (Decimal128(pf, sf), Decimal128(pt, st)) => sf == st && pt >= pf,
+        (Decimal128(_, sf), Decimal256(_, st)) => sf == st,
+        _ => false,
+    }
 }
 
 pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<ArrayRef> {
@@ -158,7 +178,13 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
             let sa = src
                 .as_any()
                 .downcast_ref::<arrow_array::StructArray>()
-                .expect("struct array");
+                .ok_or_else(|| {
+                    CoreError::Schema(format!(
+                        "evolution: field '{}' is typed Struct but its array is not a \
+                         StructArray",
+                        target_field.name()
+                    ))
+                })?;
             let mut children: Vec<ArrayRef> = Vec::with_capacity(tfields.len());
             for tf in tfields {
                 match sa.column_by_name(tf.name()) {
@@ -189,7 +215,12 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
             let la = src
                 .as_any()
                 .downcast_ref::<arrow_array::ListArray>()
-                .expect("list array");
+                .ok_or_else(|| {
+                    CoreError::Schema(format!(
+                        "evolution: field '{}' is typed List but its array is not a ListArray",
+                        target_field.name()
+                    ))
+                })?;
             let new_values = evolve_array(la.values(), telem)?;
             Ok(Arc::new(
                 arrow_array::ListArray::try_new(
@@ -211,13 +242,23 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
             let ma = src
                 .as_any()
                 .downcast_ref::<arrow_array::MapArray>()
-                .expect("map array");
+                .ok_or_else(|| {
+                    CoreError::Schema(format!(
+                        "evolution: field '{}' is typed Map but its array is not a MapArray",
+                        target_field.name()
+                    ))
+                })?;
             let entries: ArrayRef = Arc::new(ma.entries().clone());
             let new_entries = evolve_array(&entries, tentries)?;
             let sa = new_entries
                 .as_any()
                 .downcast_ref::<arrow_array::StructArray>()
-                .expect("map entries struct")
+                .ok_or_else(|| {
+                    CoreError::Schema(format!(
+                        "evolution: rebuilt map entries for field '{}' are not a StructArray",
+                        target_field.name()
+                    ))
+                })?
                 .clone();
             Ok(Arc::new(
                 arrow_array::MapArray::try_new(
@@ -364,7 +405,10 @@ fn java_repr_finite(parts: FiniteFloatParts) -> String {
             format!("{shortest}.0")
         }
     } else {
-        let (m, e) = scientific.split_once('e').expect("exp format");
+        // `{:e}` always emits an `e`; there is no input for which it does not.
+        let Some((m, e)) = scientific.split_once('e') else {
+            return scientific;
+        };
         let m = if m.contains('.') {
             m.to_string()
         } else {
@@ -1117,5 +1161,101 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(s.value(0), "world");
+    }
+
+    /// Every pair `is_promotion` admits must actually convert, and the ones it
+    /// rejects must be the ones that would lose data.
+    ///
+    /// The rejected half is the point: `is_promotion` is the gate that decides
+    /// whether a type difference is converted or refused, so a pair wrongly
+    /// admitted here reaches `arrow_cast`, which nulls an out-of-range value
+    /// instead of erroring. A narrowing must never be admitted.
+    #[test]
+    fn test_is_promotion_admits_avro_widenings_and_rejects_narrowings() {
+        use super::is_promotion;
+        let dec = |p, s| DataType::Decimal128(p, s);
+
+        for (from, to) in [
+            // numeric tower, including multi-step
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int32, DataType::Float32),
+            (DataType::Int32, DataType::Float64),
+            (DataType::Int64, DataType::Float64),
+            (DataType::Float32, DataType::Float64),
+            // primitive -> string
+            (DataType::Int64, DataType::Utf8),
+            (DataType::Float64, DataType::Utf8),
+            // string <-> bytes
+            (DataType::Utf8, DataType::Binary),
+            (DataType::Binary, DataType::Utf8),
+            // decimal precision widening at a fixed scale
+            (dec(10, 2), dec(20, 2)),
+        ] {
+            assert!(
+                is_promotion(&from, &to),
+                "{from} -> {to} is legal Hudi evolution and must be converted"
+            );
+        }
+
+        for (from, to) in [
+            // narrowings — data loss, and not legal evolution
+            (DataType::Int64, DataType::Int32),
+            (DataType::Float64, DataType::Float32),
+            (DataType::Float64, DataType::Int64),
+            (dec(20, 2), dec(10, 2)),
+            // a decimal rescale moves the value, so it is not a promotion
+            (dec(10, 2), dec(20, 4)),
+            // string -> number is not an Avro promotion (only the reverse is)
+            (DataType::Utf8, DataType::Int64),
+        ] {
+            assert!(
+                !is_promotion(&from, &to),
+                "{from} -> {to} must be refused, not silently converted"
+            );
+        }
+    }
+
+    /// The widenings `is_promotion` admits must round-trip exact values, not
+    /// merely be accepted by the gate.
+    #[test]
+    fn test_evolve_array_converts_the_wider_numeric_promotions_exactly() {
+        use arrow_array::{Float64Array, Int64Array};
+
+        // int -> double, a two-step Avro promotion the gate used to reject.
+        let out = project_batch_to_schema(
+            &batch(
+                vec![Field::new("n", DataType::Int32, false)],
+                vec![Arc::new(Int32Array::from(vec![7i32, -3]))],
+            ),
+            &(Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, false)])) as SchemaRef),
+        )
+        .unwrap();
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .values(),
+            &[7.0f64, -3.0]
+        );
+
+        // long -> double at a magnitude that would have been truncated by a
+        // buffer reinterpretation.
+        let out = project_batch_to_schema(
+            &batch(
+                vec![Field::new("n", DataType::Int64, false)],
+                vec![Arc::new(Int64Array::from(vec![5_000_000_000i64]))],
+            ),
+            &(Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, false)])) as SchemaRef),
+        )
+        .unwrap();
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .values(),
+            &[5_000_000_000.0f64]
+        );
     }
 }

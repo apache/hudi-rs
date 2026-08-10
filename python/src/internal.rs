@@ -795,15 +795,18 @@ impl HudiTable {
         &self,
         read_options: Option<HudiReadOptions>,
         extra_storage_overrides: Option<HashMap<String, String>>,
+        py: Python,
     ) -> PyResult<HudiFileGroupReader> {
         let read_options = read_options.map(|o| o.to_inner());
-        let fg_reader = self
-            .inner
-            .create_file_group_reader_with_options(
+        // Resolving the table's data schema reads the timeline, so this blocks;
+        // release the GIL for it like the other I/O-bound methods here.
+        let fg_reader = py.detach(|| {
+            rt().block_on(self.inner.create_file_group_reader_with_options(
                 read_options.as_ref(),
                 extra_storage_overrides.unwrap_or_default(),
-            )
-            .map_err(PythonError::from)?;
+            ))
+            .map_err(PythonError::from)
+        })?;
         Ok(HudiFileGroupReader { inner: fg_reader })
     }
 

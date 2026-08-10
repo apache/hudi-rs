@@ -17,7 +17,7 @@
  * under the License.
  */
 use crate::config::HudiConfigs;
-use crate::storage::OBJECT_STORE_RUNTIME;
+use crate::storage::{OBJECT_STORE_RUNTIME, OBJECT_STORE_RUNTIME_THREAD_NAME};
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore};
@@ -73,16 +73,52 @@ pub fn stream_window_size(hudi_configs: &HudiConfigs) -> Result<u64> {
     }
 }
 
+/// Whether the calling thread is one of [`OBJECT_STORE_RUNTIME`]'s workers.
+///
+/// Recognised by thread name, which is the only handle available: a worker has no
+/// marker a caller can query, and `Handle::try_current()` cannot be compared to a
+/// `Runtime`'s own handle.
+pub(crate) fn in_object_store_runtime() -> bool {
+    std::thread::current()
+        .name()
+        .is_some_and(|name| name.starts_with(OBJECT_STORE_RUNTIME_THREAD_NAME))
+}
+
 /// Fetch a byte range synchronously, from any context.
 ///
 /// See [`OBJECT_STORE_RUNTIME`] for why the work is spawned onto a shared
 /// runtime and waited on over a channel rather than driven with `block_on`.
+///
+/// # Where this may be called from
+///
+/// A blocking-pool thread (`spawn_blocking`) or an ordinary sync thread. Both are
+/// fine: the fetch runs on [`OBJECT_STORE_RUNTIME`], so the wait always ends.
+///
+/// **Not** from an async task on a worker thread — that blocks the worker for a
+/// whole round trip, starving every other task on that runtime, which is the
+/// "no blocking I/O in async" rule. Nothing here can detect that in general, so
+/// it remains the caller's obligation.
+///
+/// **Never** from an [`OBJECT_STORE_RUNTIME`] worker: the wait would depend on a
+/// task that can only be scheduled on the workers, and with enough concurrent
+/// callers every worker blocks and none of their tasks can ever run — a genuine
+/// deadlock rather than mere starvation. That case *is* detectable, and is
+/// refused below with a message rather than left to hang. It is unreachable
+/// today; the guard is here so wiring a new caller cannot make it reachable
+/// silently.
 fn get_range_blocking(
     object_store: &Arc<dyn ObjectStore>,
     location: &ObjPath,
     offset: u64,
     length: u64,
 ) -> Result<Bytes> {
+    if in_object_store_runtime() {
+        return Err(Error::other(format!(
+            "a blocking ranged read was issued from an object-store runtime worker, which would \
+             deadlock: the wait can only be satisfied by a task on that same runtime. Drive this \
+             read from a blocking-pool thread instead (path '{location}')"
+        )));
+    }
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::other(format!(
             "ranged read offset {offset} + length {length} overflows u64"
@@ -299,6 +335,48 @@ mod tests {
             out.extend_from_slice(&buf[..n]);
         }
         out
+    }
+
+    /// A blocking ranged read issued from an object-store runtime worker must be
+    /// refused, because it would deadlock rather than merely block: the wait can
+    /// only be satisfied by a task on the very runtime whose worker is waiting.
+    ///
+    /// Asserted from inside the runtime, since the guard keys off the calling
+    /// thread. The negative control matters as much as the positive: an ordinary
+    /// thread must still be allowed through, or the guard would break every real
+    /// caller.
+    #[test]
+    fn test_blocking_read_from_the_object_store_runtime_is_refused() {
+        let len = 4096;
+        let (store, meta, expected, _dir) = make_store(len);
+
+        // Positive: on a worker of that runtime, refused with a message naming
+        // the hazard.
+        let err = OBJECT_STORE_RUNTIME
+            .block_on(async {
+                let store = store.clone();
+                let location = meta.location.clone();
+                tokio::task::spawn(async move {
+                    assert!(
+                        in_object_store_runtime(),
+                        "a spawned task must run on an object-store worker"
+                    );
+                    get_range_blocking(&store, &location, 0, 16).err()
+                })
+                .await
+                .unwrap()
+            })
+            .expect("must be refused, not attempted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deadlock"),
+            "the error must say why it refused, got: {msg}"
+        );
+
+        // Negative control: an ordinary thread reads normally.
+        assert!(!in_object_store_runtime());
+        let bytes = get_range_blocking(&store, &meta.location, 0, 16).unwrap();
+        assert_eq!(bytes.as_ref(), &expected[..16]);
     }
 
     /// The two modes have to be indistinguishable to a caller. A streaming read
