@@ -824,16 +824,27 @@ impl Table {
     /// returning fewer commits than the range contains is the failure mode a
     /// downstream consumer cannot detect for itself.
     fn warn_if_window_predates_active_timeline(&self, start: &str) {
-        let Some(boundary) = self.timeline.earliest_active_instant.as_deref() else {
-            return;
-        };
-        if start < boundary {
-            log::warn!(
+        if let Some(message) = self.window_predates_active_timeline(start) {
+            log::warn!("{message}");
+        }
+    }
+
+    /// The warning [`Self::warn_if_window_predates_active_timeline`] emits, or
+    /// `None` when the window is wholly inside the active timeline.
+    ///
+    /// Split out from the logging so the condition can be asserted: a warning
+    /// that stops firing is indistinguishable from one that never did, and this
+    /// is the only thing telling a caller their range came back short.
+    fn window_predates_active_timeline(&self, start: &str) -> Option<String> {
+        let boundary = self.timeline.earliest_active_instant.as_deref()?;
+        // Instant times are compared as strings, the way Hudi compares them.
+        (start < boundary).then(|| {
+            format!(
                 "incremental read starts at '{start}', before the active timeline begins at \
                  '{boundary}'; commits archived below that point are not read, so this window \
                  reports fewer changes than it covers"
-            );
-        }
+            )
+        })
     }
 
     /// Read records, dispatching on `options.query_type`.
@@ -1129,6 +1140,53 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The only thing telling a caller their incremental range came back short.
+    ///
+    /// Archived commits are not enumerated unless
+    /// `hoodie.internal.timeline.archived.enabled` is set, so a window reaching
+    /// below the active timeline reports fewer changes than it covers. That is
+    /// silent except for this warning — and a warning nothing asserts is one
+    /// that can stop firing without anyone noticing.
+    ///
+    /// Both directions are asserted: a window inside the active timeline must
+    /// stay quiet, or the warning would be noise a caller learns to ignore.
+    #[tokio::test]
+    async fn test_window_predating_the_active_timeline_is_reported() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let boundary = hudi_table
+            .timeline
+            .earliest_active_instant
+            .clone()
+            .expect("fixture has an active timeline");
+
+        // A start below the boundary: the window covers commits that are no
+        // longer enumerable.
+        let message = hudi_table
+            .window_predates_active_timeline("00000000000000")
+            .expect("a start below the active timeline must be reported");
+        assert!(
+            message.contains("00000000000000") && message.contains(&boundary),
+            "the warning must name both the requested start and the boundary, got: {message}"
+        );
+
+        // The boundary itself, and anything after it, is wholly inside the
+        // active timeline.
+        assert!(
+            hudi_table
+                .window_predates_active_timeline(&boundary)
+                .is_none(),
+            "a window starting exactly at the boundary covers no archived commit"
+        );
+        let after = format!("{boundary}9");
+        assert!(
+            hudi_table.window_predates_active_timeline(&after).is_none(),
+            "a window inside the active timeline must not warn"
+        );
+        Ok(())
+    }
     use crate::config::HUDI_CONF_DIR;
     use crate::config::internal::HudiInternalConfig;
     use crate::config::table::BaseFileFormatValue;
