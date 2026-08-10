@@ -18,9 +18,16 @@
  */
 //! Reader-vs-writer concurrency repros.
 //!
-//! Both are `#[ignore]`d: they document divergences from Hudi's Java reader that
-//! are not fixed yet, so they would fail the suite. Run them with
-//! `cargo test -p hudi-core --test zz_concurrency_probe -- --ignored --nocapture`.
+//! Most of these are `#[ignore]`d, for one of two reasons: they document a
+//! divergence from Hudi's Java reader that is not fixed yet, or they are probes
+//! that print what the reader does without asserting anything. Neither belongs
+//! in the suite — the first would fail it, and the second would pass whatever
+//! happened. Run them with
+//! `cargo test -p hudi-core --test reader_concurrency_tests -- --ignored --nocapture`.
+//!
+//! A divergence that gets fixed should leave this file, or become an ordinary
+//! test that pins the fixed behavior. An `#[ignore]` reason describing something
+//! that no longer happens is worse than no note at all.
 
 use hudi_core::table::{ReadOptions, Table};
 use std::path::{Path, PathBuf};
@@ -132,16 +139,26 @@ const V9_INSTANTS: &[(&str, &str)] = &[
     ("20260307162620509", "20260307162621330"),
 ];
 
-/// Does an incremental read range on requested time or completion time?
+/// An incremental read admits a commit by its COMPLETION time, as Hudi does.
 ///
 /// Java's `CompletionTimeQueryViewV2.getInstantTimes` filters
 /// `instantTime -> completionTime` by the window, and deliberately loads
 /// instants from a day BEFORE the window start so a long transaction requested
-/// earlier is still found. If hudi-rs ranges on requested time instead, a window
-/// that straddles one commit's requested/completion pair diverges.
-#[ignore = "documents ENG-46645: incremental ranges on requested time, Hudi 1.x uses completion time"]
+/// earlier is still found. Ranging on requested time instead diverged whenever a
+/// window straddled one commit's requested/completion pair — the divergence this
+/// used to document, before it was fixed.
+///
+/// The window below is chosen to tell the two apart: it contains instant #2's
+/// completion time and no instant's requested time. Both halves are asserted, so
+/// the test cannot pass by ranging on neither: the discriminating window must
+/// return the commit, and a window around the same commit's *requested* time
+/// must return nothing.
+///
+/// The window's discriminating power is asserted too. If a regenerated fixture
+/// ever made the two measures agree here, this would go back to proving nothing,
+/// and it says so instead.
 #[tokio::test]
-async fn probe_incremental_ranges_on_which_time() {
+async fn incremental_admits_a_commit_by_completion_time_not_requested_time() {
     use hudi_core::config::read::HudiReadConfig;
     use hudi_core::table::QueryType;
 
@@ -175,6 +192,19 @@ async fn probe_incremental_ranges_on_which_time() {
     println!("  instants by REQUESTED time  : {by_requested:?}");
     println!("  instants by COMPLETION time : {by_completion:?}  <- what Hudi 1.x returns");
 
+    // The window only distinguishes the two measures if exactly one instant
+    // falls in it by completion time and none by requested time.
+    assert!(
+        by_requested.is_empty(),
+        "the window must contain no instant's REQUESTED time, or it cannot tell \
+         the two measures apart; got {by_requested:?}"
+    );
+    assert_eq!(
+        by_completion.len(),
+        1,
+        "the window must contain exactly one instant's COMPLETION time; got {by_completion:?}"
+    );
+
     for engine in ["legacy", "v2"] {
         let options = ReadOptions::new()
             .with_query_type(QueryType::Incremental)
@@ -193,6 +223,17 @@ async fn probe_incremental_ranges_on_which_time() {
         println!(
             "  engine={engine:6} completion-time window -> {got} row(s); \
              requested-time control window -> {control} row(s)"
+        );
+
+        assert_eq!(
+            got, 1,
+            "engine '{engine}': the commit whose COMPLETION time is in the window \
+             must be returned, as Hudi returns it"
+        );
+        assert_eq!(
+            control, 0,
+            "engine '{engine}': a window holding only the commit's REQUESTED time \
+             must return nothing — returning rows there is ranging on requested time"
         );
     }
 }
