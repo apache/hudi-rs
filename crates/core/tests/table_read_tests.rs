@@ -2205,6 +2205,74 @@ mod streaming_queries {
         );
         Ok(())
     }
+
+    /// The two engines return the same rows when streamed, and differ in shape.
+    ///
+    /// The merge-on-read engine emits one chunk per base-source batch plus a tail
+    /// chunk for log-only inserts, so peak memory tracks a row group rather than
+    /// the file. The existing reader sorts and de-duplicates whole batches at
+    /// once, has no incremental form, and yields the slice as a single batch.
+    ///
+    /// Deliberately does NOT assert a chunk count for the merge-on-read engine.
+    /// Its cadence follows the base file's row groups, not `batch_size` — which
+    /// `FileGroupMergeIterator::new_buffered` accepts and discards (see its
+    /// `_batch_size` parameter). These fixtures are a single row group, so one
+    /// chunk is the correct answer for them, and asserting more would pin the
+    /// fixture's size rather than the engine's behavior.
+    ///
+    /// What is worth pinning here is that splitting the read into batches does
+    /// not change what comes back: nothing else at table level compares the
+    /// streaming output against the eager output row for row.
+    #[tokio::test]
+    async fn test_streaming_agrees_with_eager_on_both_engines() -> Result<()> {
+        let base_url = QuickstartTripsTable::MorLayoutCorruptTailBlock.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // One file slice, so batch counts describe one merged slice and not a
+        // chain of several.
+        let slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert_eq!(slices.len(), 1, "expected a single-slice fixture");
+
+        for engine in ["v2", "legacy"] {
+            let options = ReadOptions::new()
+                .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), engine)
+                .with_batch_size(2)?;
+
+            let eager = hudi_table.read(&options).await?;
+            let eager_schema = eager[0].schema();
+            let eager = concat_batches(&eager_schema, &eager)?;
+
+            let streamed = collect_stream_batches(hudi_table.read_stream(&options).await?).await?;
+            assert!(
+                !streamed.is_empty(),
+                "engine '{engine}': streaming a non-empty slice must yield batches"
+            );
+            let streamed = concat_batches(&streamed[0].schema(), &streamed)?;
+
+            assert_eq!(
+                streamed.num_rows(),
+                eager.num_rows(),
+                "engine '{engine}': streaming and eager row counts must agree"
+            );
+            assert_eq!(
+                format!("{:?}", streamed.columns()),
+                format!("{:?}", eager.columns()),
+                "engine '{engine}': streaming must return the same values as the eager read"
+            );
+
+            if engine == "legacy" {
+                let n = collect_stream_batches(hudi_table.read_stream(&options).await?)
+                    .await?
+                    .len();
+                assert_eq!(
+                    n, 1,
+                    "the existing reader has no incremental merge, so it yields the \
+                     slice as one batch; got {n}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Regression tests: manual `get_file_slices` + `create_file_group_reader_with_options`
