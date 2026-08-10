@@ -18,6 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::internal::HudiInternalConfig;
 use crate::config::read::{HudiReadConfig, MergeEngineValue};
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
@@ -470,7 +471,17 @@ impl FileGroupReader {
             all_batches.extend(log_batches);
 
             let merger = RecordMerger::new(schema.clone(), self.hudi_configs.clone());
-            merger.merge_record_batches(all_batches)?
+            let merged = merger.merge_record_batches(all_batches)?;
+
+            // Narrow to the read's window again, now that the merge has decided
+            // which record won each key. `read_base_file_eager` above applied it
+            // to the base file only, so a log record outside the window survived
+            // into the result — the log batches are admitted by instant range at
+            // scan time, which is a per-block decision, not a per-row one.
+            //
+            // Idempotent for the base rows, which already passed it, and it is
+            // where the merge-on-read engine applies the same filter.
+            apply_commit_time_filter(&self.hudi_configs, merged)?
         };
 
         apply_eager_options(&options, merged)
@@ -885,6 +896,33 @@ impl FileGroupReader {
 /// Creates a commit time filtering mask based on the provided configs.
 ///
 /// Returns `None` if no filtering is needed (meta fields disabled or no start timestamp).
+/// A mask keeping rows whose `_hoodie_commit_time` is one of `instant_times`
+/// (comma-separated).
+///
+/// An empty list admits nothing, which is correct: it means the window resolved
+/// to no commits, so the read has no changes to report.
+fn commit_time_membership_mask(instant_times: &str, batch: &RecordBatch) -> Result<BooleanArray> {
+    let admitted: std::collections::HashSet<&str> = instant_times
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let col_name = MetaField::CommitTime.as_ref();
+    let column = batch
+        .column_by_name(col_name)
+        .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} not found")))?;
+    let commit_times = column
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .ok_or_else(|| ReadFileSliceError(format!("Column {col_name} is not a string column")))?;
+
+    use arrow_array::Array;
+    Ok((0..batch.num_rows())
+        .map(|i| !commit_times.is_null(i) && admitted.contains(commit_times.value(i)))
+        .collect::<BooleanArray>())
+}
+
 fn create_commit_time_filter_mask(
     hudi_configs: &HudiConfigs,
     batch: &RecordBatch,
@@ -894,6 +932,17 @@ fn create_commit_time_filter_mask(
         .into();
     if !populates_meta_fields {
         return Ok(None);
+    }
+
+    // An incremental read that resolved its window against completion times hands
+    // the admitted instant times down explicitly, because `_hoodie_commit_time`
+    // holds the REQUESTED time and comparing that against completion-time bounds
+    // asks a different question. Match by membership instead.
+    if let Some(instant_times) =
+        hudi_configs.try_get(HudiInternalConfig::IncrementalInstantTimes)?
+    {
+        let instant_times: String = instant_times.into();
+        return commit_time_membership_mask(&instant_times, batch).map(Some);
     }
 
     let start_ts: Option<String> = hudi_configs

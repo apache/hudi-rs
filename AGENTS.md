@@ -101,6 +101,17 @@ instants. Testing for a completion timestamp instead is wrong twice over — lay
 v1 records none, and the completion map is built from the active timeline, so it
 also discards files from archived commits.
 
+### Incremental windows bound completion time
+
+On timeline layout v2, `hoodie.read.start/end.timestamp` bound a commit's
+**completion** time (Hudi 1.x parity). Layout v1 has no completion times and bounds
+requested times. The translation happens in exactly one place,
+`Table::resolve_incremental_window`, which resolves the window to the instant times
+it admits and re-expresses the bounds over those commits' *requested* times —
+because everything below the row mask (which base file, which log blocks) is a
+requested-time decision. Translating twice selects nothing; that is the bug the
+single translation point exists to prevent.
+
 ## Cloud storage & config
 
 Storage backends route by URI scheme (`file://`, `s3://`, `az://`, `gs://`) through

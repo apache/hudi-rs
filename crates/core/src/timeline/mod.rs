@@ -278,6 +278,21 @@ impl Timeline {
             .map(|instant| instant.timestamp.as_str())
     }
 
+    /// The greatest completion timestamp across completed commits — "everything
+    /// committed so far", expressed the way an incremental window is bounded.
+    ///
+    /// Not the completion time of the latest-*requested* commit: completion order
+    /// need not follow requested order, so the maximum has to be taken over the
+    /// completion timestamps themselves. Falls back to the latest requested time
+    /// on timeline layout v1, which records no completion times.
+    pub(crate) fn get_latest_completion_timestamp_as_option(&self) -> Option<&str> {
+        self.completed_commits
+            .iter()
+            .filter_map(|instant| instant.completion_timestamp.as_deref())
+            .max()
+            .or_else(|| self.get_latest_commit_timestamp_as_option())
+    }
+
     /// Get the latest commit timestamp from the [Timeline].
     ///
     /// Only completed commits are considered.
@@ -365,6 +380,25 @@ impl Timeline {
     ///
     /// # Returns
     /// File groups that were modified in the time range, excluding replaced file groups.
+    /// The completed commits an incremental window `(start, end]` admits, in
+    /// requested-time order.
+    ///
+    /// Which timestamp the window bounds depends on the timeline layout — see
+    /// [`TimelineSelector::select`].
+    pub(crate) fn get_completed_commits_in_range(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::completed_actions_in_completion_time_range(
+            DEFAULT_LOADING_ACTIONS,
+            self.hudi_configs.clone(),
+            start_timestamp,
+            end_timestamp,
+        )?;
+        selector.select(self)
+    }
+
     pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
@@ -376,7 +410,12 @@ impl Timeline {
             replaced_file_groups_from_replace_commit,
         };
 
-        // Get commits in the time range (start, end]
+        // Requested-time bounds by this point: an incremental window is
+        // translated once, in `Table::resolve_incremental_window`, which resolves
+        // the user's (possibly completion-time) window into the instant times it
+        // admits and re-expresses the bounds over those commits' requested times.
+        // Interpreting them as completion times again here would translate twice
+        // and select nothing.
         let selector = TimelineSelector::completed_actions_in_range(
             DEFAULT_LOADING_ACTIONS,
             self.hudi_configs.clone(),

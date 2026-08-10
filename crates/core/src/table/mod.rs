@@ -99,6 +99,7 @@ pub use crate::config::read_options::{QueryType, ReadOptions};
 
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
@@ -154,6 +155,19 @@ impl Clone for Table {
             cached_metadata_table: self.cached_metadata_table.clone(),
             cached_estimator: self.cached_estimator.clone(),
         }
+    }
+}
+
+/// One tick below `instant_time`, as a same-width instant string.
+///
+/// Used to turn an exclusive start bound into an inclusive one. Instant times are
+/// fixed-width numeric strings, so this is a plain decrement; a value that does
+/// not parse (the bootstrap sentinels, for instance) is returned unchanged, which
+/// keeps the bound no narrower than it was.
+fn instant_time_minus_one(instant_time: &str) -> String {
+    match instant_time.parse::<u64>() {
+        Ok(0) | Err(_) => instant_time.to_string(),
+        Ok(n) => format!("{:0width$}", n - 1, width = instant_time.len()),
     }
 }
 
@@ -662,16 +676,71 @@ impl Table {
                 }
             }
             QueryType::Incremental => {
-                if let Some((start, end)) = self.resolve_incremental_range(&options)? {
-                    Ok(options
-                        .clone()
-                        .with_start_timestamp(&start)
-                        .with_end_timestamp(&end))
-                } else {
-                    Ok(options)
-                }
+                let Some((start, end)) = self.resolve_incremental_range(&options)? else {
+                    return Ok(options);
+                };
+                self.resolve_incremental_window(options, &start, &end)
             }
         }
+    }
+
+    /// Turn an incremental window into the form the readers below need.
+    ///
+    /// Resolving this here rather than inside one read path is what keeps the
+    /// direct read, `create_file_group_reader_with_options`, and the DataFusion
+    /// scan on the same semantics — a caller assembling slices by hand used to get
+    /// a different answer from `Table::read` for the same window.
+    ///
+    /// Two things come out of it:
+    ///
+    /// 1. The instant times the window admits, for the row-level mask. The window
+    ///    may bound *completion* times while `_hoodie_commit_time` holds
+    ///    *requested* times, so rows are matched by membership rather than by
+    ///    comparing one against the other. See
+    ///    [`HudiInternalConfig::IncrementalInstantTimes`].
+    /// 2. Start/end bounds re-expressed over those commits' *requested* times.
+    ///    Everything below the mask — which base file to open, which log blocks to
+    ///    admit — is a requested-time decision, because that is what a file name
+    ///    and a block header carry. Left as completion-time bounds they discard the
+    ///    very files the window admits. So the range becomes pruning only and the
+    ///    mask stays the exact filter, which is how Hudi 1.x divides the same work.
+    fn resolve_incremental_window(
+        &self,
+        options: ReadOptions,
+        start: &str,
+        end: &str,
+    ) -> Result<ReadOptions> {
+        let admitted = self
+            .timeline
+            .get_completed_commits_in_range(Some(start), Some(end))?;
+
+        let mut prepared = options
+            .clone()
+            .with_start_timestamp(start)
+            .with_end_timestamp(end);
+        prepared.hudi_options.insert(
+            HudiInternalConfig::IncrementalInstantTimes
+                .as_ref()
+                .to_string(),
+            admitted
+                .iter()
+                .map(|instant| instant.timestamp.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        if let (Some(first), Some(last)) = (admitted.first(), admitted.last()) {
+            // The start bound is exclusive, so step below the earliest admitted
+            // instant to keep it in range.
+            prepared.hudi_options.insert(
+                HudiReadConfig::StartTimestamp.as_ref().to_string(),
+                instant_time_minus_one(&first.timestamp),
+            );
+            prepared.hudi_options.insert(
+                HudiReadConfig::EndTimestamp.as_ref().to_string(),
+                last.timestamp.clone(),
+            );
+        }
+        Ok(prepared)
     }
 
     /// Build a [`FileGroupReader`] from already-resolved hudi options.
@@ -873,9 +942,13 @@ impl Table {
     /// no commits. Invalid timestamp strings propagate as `Err`.
     fn resolve_incremental_range(&self, options: &ReadOptions) -> Result<Option<(String, String)>> {
         let timezone = self.timezone();
+        // The default end is the latest COMPLETION time, because that is what an
+        // incremental window bounds. Defaulting to the latest requested time
+        // instead excluded the newest commit from "everything up to now": it
+        // completed strictly after the instant it was requested at.
         let Some(end) = options
             .end_timestamp()
-            .or_else(|| self.timeline.get_latest_commit_timestamp_as_option())
+            .or_else(|| self.timeline.get_latest_completion_timestamp_as_option())
         else {
             return Ok(None);
         };

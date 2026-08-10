@@ -1291,11 +1291,19 @@ mod v9_tables {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
             let hudi_table = open_table(base_url.path()).await?;
 
+            // An incremental window bounds COMPLETION times, so the bounds come
+            // from the completion half of each instant rather than its requested
+            // half — a requested time as a bound excludes its own commit,
+            // because the commit completed strictly after it.
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
                 .iter()
-                .map(|i| i.timestamp.as_str())
+                .map(|i| {
+                    i.completion_timestamp
+                        .as_deref()
+                        .unwrap_or(i.timestamp.as_str())
+                })
                 .collect::<Vec<_>>();
             assert_eq!(commit_timestamps.len(), 3);
             let first_commit = commit_timestamps[0];
@@ -1404,8 +1412,16 @@ mod v9_tables {
                 .get_completed_deltacommits(false)
                 .await?;
             assert_eq!(deltacommits.len(), 2);
-            let first_commit = &deltacommits[0].timestamp;
-            let second_commit = &deltacommits[1].timestamp;
+            // Completion times: an incremental window bounds those, not the
+            // requested times a bound would otherwise be read from.
+            let first_commit = deltacommits[0]
+                .completion_timestamp
+                .as_deref()
+                .unwrap_or(deltacommits[0].timestamp.as_str());
+            let second_commit = deltacommits[1]
+                .completion_timestamp
+                .as_deref()
+                .unwrap_or(deltacommits[1].timestamp.as_str());
 
             let records = hudi_table
                 .read(
@@ -2823,18 +2839,22 @@ mod mdt_enabled_tables {
 /// records outside its window.
 ///
 /// The fixture's compacted base file holds `a@…526409`, `b@…528666` and
-/// `c`/`d@…522627`. Reading `(…522627, …530452]` admits that file, but `d` has
-/// never been touched inside the window and must not come back. A reader that
-/// decides per file rather than per row returns it, which is the regression
-/// this pins.
+/// `c`/`d@…522627`. The window admits that file, but `d` has never been touched
+/// inside the window and must not come back. A reader that decides per file
+/// rather than per row returns it, which is the regression this pins.
+///
+/// Bounds are completion times, so the window opens at `c1`'s completion rather
+/// than at its requested time — see [`C1_INSERT_ALL_COMPLETED`].
 mod incremental_over_a_compacted_base_file {
     use super::*;
 
-    const C1_INSERT_ALL: &str = "20260807223522627";
-    /// Between `c`'s update completing (…530767) and `d`'s starting (…531562).
-    /// Slice selection compares completion times while the row mask compares
-    /// requested times, so a boundary landing between the two would make the
-    /// test about that difference rather than about the compacted base file.
+    /// `c1` inserted a, b, c and d; it completed at …524868. An incremental
+    /// window bounds completion times, so starting here excludes c1 — which is
+    /// what leaves `d` untouched inside the window.
+    const C1_INSERT_ALL_COMPLETED: &str = "20260807223524868";
+    /// Between `c`'s update completing (…530767) and `d`'s completing (…531886),
+    /// so the window admits the former and not the latter without landing on
+    /// either boundary.
     const AFTER_C_BEFORE_D: &str = "20260807223531000";
 
     async fn read_window(merge_engine: &str) -> Result<Vec<(String, String, f64)>> {
@@ -2847,7 +2867,7 @@ mod incremental_over_a_compacted_base_file {
             .read(
                 &ReadOptions::new()
                     .with_query_type(QueryType::Incremental)
-                    .with_start_timestamp(C1_INSERT_ALL)
+                    .with_start_timestamp(C1_INSERT_ALL_COMPLETED)
                     .with_end_timestamp(AFTER_C_BEFORE_D)
                     .with_hudi_option(HudiReadConfig::MergeEngine.as_ref(), merge_engine),
             )
@@ -3001,26 +3021,18 @@ mod incremental_windows_match_hudi {
         .await
     }
 
-    /// A window whose bounds fall between one commit's requested and completion
-    /// times, where this crate and Hudi disagree.
+    /// REGRESSION: a window whose bounds fall between one commit's requested and
+    /// completion times must return that commit.
     ///
-    /// Both readers range `(start, end]`; they differ in *which* timestamp they
-    /// compare. Hudi uses the commit's **completion** time (…529143, inside the
-    /// window, so `b` is returned); this crate uses its **requested** time
-    /// (…528666, which is the window's own exclusive start, so nothing is).
-    /// See `v8_mor_boundary_windows` for the four boundary positions that pin
-    /// this down.
+    /// Both readers range `(start, end]`; what they compare used to differ. Hudi
+    /// compares the commit's **completion** time (…529143, inside the window, so
+    /// `b` is returned); this crate compared its **requested** time (…528666,
+    /// which is the window's own exclusive start, so nothing was). A commit that
+    /// completes inside a window but was requested before it is the normal shape
+    /// of a slow or contended write, and skipping it lost the change silently.
     #[tokio::test]
-    async fn a_window_between_requested_and_completion_time_disagrees() -> Result<()> {
-        for engine in ENGINES {
-            let actual = read_window(engine, "20260807223528666", "20260807223529143").await?;
-            assert_eq!(
-                actual.num_rows(),
-                0,
-                "engine '{engine}': this crate returns nothing here; when it starts \
-                 returning Hudi's one row, fold the window into the gold set"
-            );
-        }
+    async fn a_window_between_requested_and_completion_time_matches_hudi() -> Result<()> {
+        assert_matches_gold("only_b", "20260807223528666", "20260807223529143").await?;
         let gold = gold_for("only_b")?;
         assert_eq!(gold.num_rows(), 1, "Hudi returns b for this window");
         Ok(())
@@ -3033,19 +3045,15 @@ mod incremental_windows_match_hudi {
 /// Requires a table version 8 or later: only timeline layout v2 names completed
 /// instants `{requested}_{completion}`, so only there can the two disagree.
 ///
-/// Measured against Hudi 1.2.0-SNAPSHOT, the two readers follow the same shape
-/// and differ in one input:
+/// Measured against Hudi 1.2.0-SNAPSHOT, both readers now range `(start, end]`
+/// over the commit's **completion** time, so all four boundary positions agree.
 ///
-/// | | range | timestamp compared |
-/// |---|---|---|
-/// | Hudi | `(start, end]` | **completion** |
-/// | this crate | `(start, end]` | **requested** |
-///
-/// So they agree whenever a window's bounds fall in the gaps between commits,
-/// and disagree exactly when a bound lands between one commit's requested and
-/// completion times. Hudi's config docs describe the start as inclusive
-/// (`completion_time >= START_COMMIT`); the observed behaviour is exclusive,
-/// which `starting_on_a_completion_time` pins.
+/// They used to differ in that one input — this crate compared the *requested*
+/// time — which meant they agreed only when a window's bounds fell in the gaps
+/// between commits, and disagreed exactly when a bound landed between one
+/// commit's requested and completion times. Hudi's config docs describe the start
+/// as inclusive (`completion_time >= START_COMMIT`); the observed behaviour is
+/// exclusive, which `starting_on_a_completion_time` pins.
 mod incremental_window_boundaries {
     use super::*;
 
@@ -3125,37 +3133,40 @@ mod incremental_window_boundaries {
         Ok(())
     }
 
-    /// Starting on c3's *requested* time: Hudi keeps c3, since it completed
-    /// after the window opened. This crate drops it, since the window's start is
-    /// exclusive and c3's requested time is exactly that start.
+    /// REGRESSION: starting on c3's *requested* time keeps c3, because it
+    /// completed after the window opened.
+    ///
+    /// The window's start is exclusive on completion time, and c3's completion is
+    /// strictly after its requested time — so bounding on the requested time
+    /// dropped a commit Hudi returns.
     #[tokio::test]
-    async fn starting_on_a_requested_time_differs_from_hudi() -> Result<()> {
-        assert_eq!(hudi_uuids("start_on_requested")?, vec!["b".to_string()]);
+    async fn starting_on_a_requested_time_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("start_on_requested")?;
+        assert_eq!(hudi, vec!["b".to_string()]);
         for engine in ENGINES {
             assert_eq!(
                 uuids_in_window(engine, C3_REQUESTED, "20260808010724000").await?,
-                Vec::<String>::new(),
-                "engine '{engine}': when this returns b, fold the window into \
-                 the agreeing set above"
+                hudi,
+                "engine '{engine}'"
             );
         }
         Ok(())
     }
 
-    /// A window that opens at c3's requested time and closes at its completion
-    /// time contains exactly that one commit for Hudi, and nothing here.
+    /// REGRESSION: a window from c3's requested time to its completion time
+    /// contains exactly that one commit.
+    ///
+    /// The narrowest case of the same thing: the window brackets one commit's
+    /// requested→completion span, and only completion-time bounds see it.
     #[tokio::test]
-    async fn a_window_spanning_one_commit_differs_from_hudi() -> Result<()> {
-        assert_eq!(
-            hudi_uuids("requested_to_completion")?,
-            vec!["b".to_string()]
-        );
+    async fn a_window_spanning_one_commit_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("requested_to_completion")?;
+        assert_eq!(hudi, vec!["b".to_string()]);
         for engine in ENGINES {
             assert_eq!(
                 uuids_in_window(engine, C3_REQUESTED, C3_COMPLETED).await?,
-                Vec::<String>::new(),
-                "engine '{engine}': when this returns b, fold the window into \
-                 the agreeing set above"
+                hudi,
+                "engine '{engine}'"
             );
         }
         Ok(())

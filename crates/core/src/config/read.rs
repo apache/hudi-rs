@@ -114,10 +114,32 @@ pub enum HudiReadConfig {
     /// Snapshot/time-travel timestamp. Reads return the table state at this commit.
     AsOfTimestamp,
 
-    /// Start timestamp (exclusive) used by file-group readers to filter records.
+    /// Start of an incremental window, exclusive.
+    ///
+    /// # Which timestamp this is
+    ///
+    /// On timeline layout v2 (table version 8+) this bounds a commit's
+    /// **completion** time, matching Hudi 1.x — whose
+    /// `IncrementalQueryAnalyzer` names the same bound `startCompletionTime`. A
+    /// commit becomes visible when it completes, so that is what a window has to
+    /// bound: one requested before the window but completing inside it *is* a
+    /// change in that window, and bounding requested times skipped it silently.
+    ///
+    /// Layout v1 records no completion times, so there it bounds the requested
+    /// time, as it always did.
+    ///
+    /// **Breaking change.** This used to bound requested times on every layout.
+    /// Code that passes instant times read off the timeline — `Instant::timestamp`,
+    /// or a `{requested}_{completion}` file name's first half — now excludes the
+    /// commit it names, because that commit completed strictly later. Pass the
+    /// completion half instead (`Instant::completion_timestamp`).
     StartTimestamp,
 
-    /// End timestamp (inclusive) used by file-group readers to filter records.
+    /// End of an incremental window, inclusive. Bounds the same timestamp as
+    /// [`Self::StartTimestamp`] — see there, including the breaking change.
+    ///
+    /// Defaults to the greatest completion time among completed commits, i.e.
+    /// everything committed so far.
     EndTimestamp,
 
     /// Number of input partitions to read the data in parallel.
