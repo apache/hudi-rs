@@ -17,35 +17,128 @@
  * under the License.
  */
 use crate::Result;
-use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::log_file::avro::AvroDataBlockContentReader;
+use crate::file_group::log_file::avro::AvroBlockDecoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
 };
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
-use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
-use apache_avro::{Schema as AvroSchema, from_avro_datum};
+use crate::schema::delete::delete_record_list_schema_json;
+use crate::schema::extended_promotion::record_needs_rewrite_for_extended_promotion;
+use crate::schema::parquet_list_norm::normalize_parquet_metadata;
+use crate::schema::resolver::avro_json_to_arrow_schema;
+use crate::storage::RowFilterBuilder;
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
+use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use parquet::file::metadata::ParquetMetaDataReader;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
+
+/// Turn the wrapped ordering values into a plain column.
+///
+/// Hudi writes `orderingVal` as a union of per-type wrapper records, so a decode
+/// against that schema yields a union of one-field structs. The merge wants the
+/// value itself.
+///
+/// A block writes one ordering type, so exactly one branch is populated; that
+/// branch's `value` child is the column. A block mixing branches is rejected
+/// rather than silently reduced to one of them.
+fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
+    let union = ordering
+        .as_any()
+        .downcast_ref::<UnionArray>()
+        .ok_or_else(|| {
+            CoreError::LogBlockError(format!(
+                "Expected orderingVal to be a union, got {}",
+                ordering.data_type()
+            ))
+        })?;
+
+    let mut active: Option<i8> = None;
+    for i in 0..union.len() {
+        let type_id = union.type_id(i);
+        match active {
+            None => active = Some(type_id),
+            Some(seen) if seen == type_id => {}
+            Some(seen) => {
+                return Err(CoreError::LogBlockError(format!(
+                    "Delete block mixes ordering types (union branches {seen} and {type_id})"
+                )));
+            }
+        }
+    }
+    let Some(active) = active else {
+        return Ok(ordering.clone());
+    };
+
+    let child = union.child(active);
+    // Null is a branch like any other; there is nothing to unwrap out of it.
+    let Some(wrapper) = child.as_any().downcast_ref::<StructArray>() else {
+        return Ok(child.clone());
+    };
+    if wrapper.num_columns() != 1 {
+        return Err(CoreError::LogBlockError(format!(
+            "Expected an ordering wrapper with one field, got {}",
+            wrapper.num_columns()
+        )));
+    }
+    Ok(wrapper.column(0).clone())
+}
 
 #[allow(dead_code)]
 pub struct Decoder {
     batch_size: usize,
     hudi_configs: Arc<HudiConfigs>,
+    /// Predicate to push into a parquet log block, when the caller has decided
+    /// it is safe to evaluate before the merge. See
+    /// [`Decoder::with_row_filter`].
+    row_filter: Option<RowFilterBuilder>,
+    /// Schema an Avro block is resolved up to, as Avro JSON. See
+    /// [`Decoder::with_reader_schema`].
+    reader_schema_json: Option<String>,
 }
 
 impl Decoder {
+    /// Push a predicate into parquet log blocks.
+    ///
+    /// The caller decides whether this is sound: a log record can update a row,
+    /// so filtering before the merge is only safe when the merge cannot change
+    /// the predicate's outcome. Log blocks exist only on merge-on-read, so in
+    /// practice that means a predicate over primary keys, which are immutable
+    /// across upserts.
+    pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
+        self.row_filter = row_filter;
+        self
+    }
+
+    /// Resolve Avro blocks up to this schema as they are read.
+    ///
+    /// A block records the schema it was written with, which may predate a
+    /// change to the table. Supplying the current schema lets the decoder fill
+    /// added columns from their defaults and deliver promoted columns in the
+    /// promoted type, rather than leaving both to be reconciled after the fact.
+    ///
+    /// Blocks carrying `IsPartial` are excluded — see
+    /// [`Self::decode_avro_record_content`].
+    pub fn with_reader_schema(mut self, reader_schema_json: Option<String>) -> Self {
+        self.reader_schema_json = reader_schema_json;
+        self
+    }
+
     pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             batch_size: 1024,
             hudi_configs,
+            row_filter: None,
+            reader_schema_json: None,
         }
     }
     pub fn decode_content(
@@ -110,23 +203,88 @@ impl Decoder {
     ) -> Result<RecordBatches> {
         Decoder::validate_log_block_version(&mut reader)?;
 
-        let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+        let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
             CoreError::LogBlockError("Schema not found in block header".to_string())
         })?;
-        let writer_schema = Arc::new(AvroSchema::parse_str(writer_schema)?);
 
         let mut record_count_buf = [0u8; 4];
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let record_content_reader =
-            AvroDataBlockContentReader::new(reader, writer_schema.as_ref(), record_count);
-        let mut avro_arrow_array_reader =
-            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref())?;
+        // A partial-update block carries only the columns that were written, and
+        // the merge needs to know which those are. Resolving it up to the table
+        // schema would fabricate the rest, so it decodes against its own schema.
+        // The header's *value*, not its presence: Java reads this as
+        // `Boolean.parseBoolean(getOrDefault(IS_PARTIAL, "false"))`, so a writer
+        // that emits `IS_PARTIAL=false` on a full block would otherwise have it
+        // decoded writer-only — skipping the reader-schema resolution and
+        // reintroducing the int→long mismatch at merge time on an evolved table.
+        let is_partial = header
+            .get(&BlockMetadataKey::IsPartial)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if is_partial {
+            log::debug!("partial-update block: decoding at its own schema, not the table's");
+        }
+        let reader_schema_json = if is_partial {
+            None
+        } else {
+            self.reader_schema_json.as_deref()
+        };
+        // Avro resolves what it defines as a promotion; Hudi permits more than
+        // that — a number, or anything with a logical type, to string — and Avro
+        // refuses to build a reader for those at all. Such a block is decoded at
+        // the schema it was written with and converted afterwards, which is what
+        // the Java reader does when `recordNeedsRewriteForExtendedAvroTypePromotion`
+        // says so.
+        let (reader_schema_json, rewrite_to) = match reader_schema_json {
+            Some(required_json) => {
+                let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
+                let required = apache_avro::Schema::parse_str(required_json)?;
+                if record_needs_rewrite_for_extended_promotion(&writer, &required)? {
+                    // Worth saying out loud: the table evolved in a way Avro
+                    // cannot express, so the block is read at its own schema and
+                    // converted, rather than resolved as it is read.
+                    log::warn!(
+                        "log block rewritten rather than resolved: its schema differs from the \
+                         table's in a way Avro does not define a promotion for"
+                    );
+                    let target = avro_json_to_arrow_schema(required_json)?;
+                    (None, Some(Arc::new(target)))
+                } else {
+                    (Some(required_json), None)
+                }
+            }
+            None => (None, None),
+        };
+
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(
+            writer_schema_json,
+            reader_schema_json,
+            self.batch_size,
+        )?;
+        if let Some(rewrite_to) = rewrite_to {
+            decoder = decoder.with_rewrite_to(rewrite_to);
+        }
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
-        while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
-            let batch = batch.map_err(CoreError::ArrowError)?;
+
+        // Each datum is framed by Hudi with a four-byte length, so the bodies
+        // are read here and handed over one at a time.
+        let mut body = Vec::new();
+        for _ in 0..record_count {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf)?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            body.clear();
+            body.resize(len, 0);
+            reader.read_exact(&mut body)?;
+            if let Some(batch) = decoder.decode(&body)? {
+                batches.push_data_batch(batch);
+            }
+        }
+        if let Some(batch) = decoder.flush()?
+            && batch.num_rows() > 0
+        {
             batches.push_data_batch(batch);
         }
         Ok(batches)
@@ -136,7 +294,29 @@ impl Decoder {
         let mut content_bytes = Vec::new();
         reader.read_to_end(&mut content_bytes)?;
         let content_bytes = Bytes::from(content_bytes);
-        let parquet_reader = ParquetRecordBatchReader::try_new(content_bytes, self.batch_size)?;
+
+        // Same legacy `array<map>` encoding the base file path has to handle:
+        // parse the footer, rewrite the 2-level list, then build the reader from
+        // that metadata. The Arrow build is what rejects the original, so the
+        // rewrite has to land between the two.
+        let raw = Arc::new(ParquetMetaDataReader::new().parse_and_finish(&content_bytes)?);
+        let normalized = normalize_parquet_metadata(raw);
+        let arrow_metadata = ArrowReaderMetadata::try_new(normalized, ArrowReaderOptions::new())?;
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(content_bytes, arrow_metadata)
+                .with_batch_size(self.batch_size);
+
+        // Resolved here rather than by the caller because the predicate has to
+        // be matched against this block's own schema, which does not exist until
+        // its footer is read. A builder that declines reads every row.
+        let row_filter = self
+            .row_filter
+            .as_ref()
+            .and_then(|build| build(builder.parquet_schema(), builder.schema().as_ref()));
+        if let Some(row_filter) = row_filter {
+            builder = builder.with_row_filter(row_filter);
+        }
+        let parquet_reader = builder.build()?;
         let mut batches = RecordBatches::new();
         for item in parquet_reader {
             let batch = item.map_err(CoreError::ArrowError)?;
@@ -152,89 +332,76 @@ impl Decoder {
     ) -> Result<RecordBatches> {
         Decoder::validate_log_block_version(&mut reader)?;
 
-        // Read delete keys byte length
-        let mut delete_records_num_bytes = [0u8; 4];
-        reader.read_exact(&mut delete_records_num_bytes)?;
-        let delete_records_num_bytes = u32::from_be_bytes(delete_records_num_bytes);
+        let mut datum_len = [0u8; 4];
+        reader.read_exact(&mut datum_len)?;
+        let datum_len = u32::from_be_bytes(datum_len) as usize;
+        let mut datum = vec![0u8; datum_len];
+        reader.read_exact(&mut datum)?;
 
-        // Read and parse delete keys as Avro
-        let mut delete_records_reader = reader.take(delete_records_num_bytes as u64);
-        let del_list_schema = avro_schema_for_delete_record_list()?;
-        let delete_record_list =
-            from_avro_datum(del_list_schema, delete_records_reader.by_ref(), None)
-                .map_err(CoreError::AvroError)?;
-
-        // Extract delete records from the parsed Avro value
-        let delete_records = {
-            let fields = match delete_record_list {
-                apache_avro::types::Value::Record(fields) => fields,
-                _ => {
-                    return Err(CoreError::LogBlockError(
-                        "Expected record type for delete record list".to_string(),
-                    ));
-                }
-            };
-
-            if fields.len() != 1 {
-                return Err(CoreError::LogBlockError(format!(
-                    "Expected one field in delete record list, got {}",
-                    fields.len()
-                )));
-            }
-
-            let (field_name, field_value) = &fields[0];
-            if field_name != "deleteRecordList" {
-                return Err(CoreError::LogBlockError(format!(
-                    "Expected field name 'deleteRecordList', got '{field_name}'"
-                )));
-            }
-
-            match field_value {
-                // TODO make a specialized AvroArrowArrayReader for delete block to take &[Value] so we don't need to clone here
-                apache_avro::types::Value::Array(arr) => arr.clone(),
-                _ => {
-                    return Err(CoreError::LogBlockError(
-                        "Expected 'deleteRecordList' to be an array type".to_string(),
-                    ));
-                }
-            }
+        // The whole list is a single Avro datum, so one record decodes the lot:
+        // a one-row batch whose only column holds the delete records.
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(delete_record_list_schema_json(), None, 1)?;
+        let Some(batch) = decoder.decode(&datum)?.or(decoder.flush()?) else {
+            return Ok(RecordBatches::new());
         };
 
-        if delete_records.is_empty() {
+        let records = batch
+            .column_by_name("deleteRecordList")
+            .ok_or_else(|| {
+                CoreError::LogBlockError("Delete block has no deleteRecordList".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| CoreError::LogBlockError("deleteRecordList is not a list".to_string()))?
+            .value(0);
+        let records = records
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                CoreError::LogBlockError("Delete records are not structs".to_string())
+            })?;
+        if records.len() == 0 {
             return Ok(RecordBatches::new());
         }
 
-        // Generate schema based on the first delete record
-        let first_record = &delete_records[0];
-        let delete_record_schema = avro_schema_for_delete_record(first_record)?;
+        let ordering =
+            unwrap_ordering_values(records.column_by_name("orderingVal").ok_or_else(|| {
+                CoreError::LogBlockError("Delete record has no orderingVal".to_string())
+            })?)?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("recordKey", DataType::Utf8, true),
+            Field::new("partitionPath", DataType::Utf8, true),
+            Field::new("orderingVal", ordering.data_type().clone(), true),
+        ]));
+        let columns = vec![
+            records
+                .column_by_name("recordKey")
+                .ok_or_else(|| {
+                    CoreError::LogBlockError("Delete record has no recordKey".to_string())
+                })?
+                .clone(),
+            records
+                .column_by_name("partitionPath")
+                .ok_or_else(|| {
+                    CoreError::LogBlockError("Delete record has no partitionPath".to_string())
+                })?
+                .clone(),
+            ordering,
+        ];
 
-        let num_delete_batches = delete_records.len() / self.batch_size + 1;
-        let mut batches = RecordBatches::new_with_capacity(0, num_delete_batches);
-        let mut reader = AvroArrowArrayReader::try_new(
-            delete_records.into_iter().map(Ok),
-            &delete_record_schema,
-        )?;
-
-        let instant_time = header.get(&BlockMetadataKey::InstantTime).ok_or_else(|| {
-            CoreError::LogBlockError("Instant time not found in block header".to_string())
-        })?;
-        while let Some(batch_result) = reader.next_batch(self.batch_size) {
-            let batch = batch_result.map_err(CoreError::ArrowError)?;
-            batches.push_delete_batch(batch, instant_time.clone());
-        }
-
+        let mut batches = RecordBatches::new_with_capacity(0, 1);
+        let instant_time = header
+            .get(&BlockMetadataKey::InstantTime)
+            .cloned()
+            .unwrap_or_default();
+        batches.push_delete_batch(
+            RecordBatch::try_new(schema, columns).map_err(CoreError::ArrowError)?,
+            instant_time,
+        );
         Ok(batches)
     }
 
-    /// Decode HFile data block content into HFile records.
-    ///
-    /// HFile blocks are used in metadata table log files. Unlike Avro/Parquet blocks,
-    /// the content is NOT converted to Arrow RecordBatch because:
-    /// - Metadata table operations need key-based lookup/merge
-    /// - Values are Avro-serialized payloads decoded on demand
-    ///
-    /// The HFile content structure:
-    /// - Raw HFile data (no version prefix, unlike Avro blocks)
     fn decode_hfile_record_content(&self, mut reader: impl Read) -> Result<Vec<HFileRecord>> {
         // Note: HFile blocks do NOT have the 4-byte log block version prefix
         // that Avro blocks have. The content is raw HFile data.
@@ -287,7 +454,7 @@ mod tests {
                 {"name": "name", "type": ["null", "string"]}
             ]
         }"#;
-        let writer_schema = AvroSchema::parse_str(schema_str)?;
+        let writer_schema = apache_avro::Schema::parse_str(schema_str)?;
 
         // Create in-memory buffer and write the data
         let mut buf = Vec::new();
@@ -357,6 +524,385 @@ mod tests {
         assert_eq!(name_array.value(0), "Alice");
         assert!(name_array.is_null(1), "Second name value should be null");
 
+        Ok(())
+    }
+
+    /// A partial-update block carries only the columns that were written, and
+    /// must stay that way.
+    ///
+    /// The merge distinguishes "this column was not in the update" from "this
+    /// column was set to null", and the block's own schema is the only place
+    /// that signal exists. Decoding is against that schema and never against a
+    /// wider table schema, so the narrowness survives.
+    ///
+    /// If a reader schema is ever supplied here — for Avro resolution or
+    /// extended promotion — a block carrying `IsPartial` has to keep decoding
+    /// against its own schema, or the absent columns get fabricated and the
+    /// signal is gone.
+    /// A block written before a column was promoted to string still reads.
+    ///
+    /// Avro refuses to build a reader for `int -> string`, so this is the case
+    /// that used to fail outright with "Illegal promotion Int to String". The
+    /// block decodes at its own schema and is converted afterwards.
+    #[test]
+    fn test_extended_promotion_int_to_string_rewrites() -> Result<()> {
+        let writer_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"num","type":"int"}]}"#;
+        let required_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"num","type":"string"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("num", 42i32);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let batch = &batches.data_batches[0];
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("promoted to string");
+        assert_eq!(col.value(0), "42");
+        Ok(())
+    }
+
+    /// A float promoted to string has to read the way Java renders it. A plain
+    /// cast of `1.1f32` gives `1.100000023841858`, which is not what the table
+    /// says.
+    #[test]
+    fn test_extended_promotion_float_to_string_matches_java() -> Result<()> {
+        let writer_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"f","type":"float"}]}"#;
+        let required_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"f","type":"string"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("f", 1.1f32);
+        let body = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&body);
+
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.to_string()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let col = batches.data_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("promoted to string");
+        assert_eq!(
+            col.value(0),
+            "1.1",
+            "a plain f32 cast would give 1.100000023841858"
+        );
+        Ok(())
+    }
+
+    /// The ordering value arrives wrapped in a union of per-type records; the
+    /// merge wants the value. One populated branch, unwrapped to its `value`.
+    #[test]
+    fn test_unwrap_ordering_values_takes_the_populated_branch() {
+        use arrow_array::{Int64Array, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Fields, UnionFields};
+
+        let wrapped = StructArray::new(
+            Fields::from(vec![Field::new("value", DataType::Int64, false)]),
+            vec![Arc::new(Int64Array::from(vec![4000, 3000])) as ArrayRef],
+            None,
+        );
+        let union_fields = UnionFields::try_new(
+            vec![3],
+            vec![Field::new(
+                "LongWrapper",
+                wrapped.data_type().clone(),
+                false,
+            )],
+        )
+        .unwrap();
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(vec![3i8, 3i8]),
+            Some(ScalarBuffer::from(vec![0i32, 1i32])),
+            vec![Arc::new(wrapped) as ArrayRef],
+        )
+        .unwrap();
+
+        let out = unwrap_ordering_values(&(Arc::new(union) as ArrayRef)).unwrap();
+        let out = out.as_any().downcast_ref::<Int64Array>().expect("i64");
+        assert_eq!(out.value(0), 4000);
+        assert_eq!(out.value(1), 3000);
+    }
+
+    /// A block writes one ordering type. Two in the same block cannot both
+    /// become one column, so it is rejected rather than silently reduced to
+    /// whichever branch came first.
+    #[test]
+    fn test_unwrap_ordering_values_rejects_mixed_branches() {
+        use arrow_array::{Int32Array, Int64Array, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Fields, UnionFields};
+
+        let ints = StructArray::new(
+            Fields::from(vec![Field::new("value", DataType::Int32, false)]),
+            vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+            None,
+        );
+        let longs = StructArray::new(
+            Fields::from(vec![Field::new("value", DataType::Int64, false)]),
+            vec![Arc::new(Int64Array::from(vec![4000])) as ArrayRef],
+            None,
+        );
+        let union_fields = UnionFields::try_new(
+            vec![2, 3],
+            vec![
+                Field::new("IntWrapper", ints.data_type().clone(), false),
+                Field::new("LongWrapper", longs.data_type().clone(), false),
+            ],
+        )
+        .unwrap();
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(vec![2i8, 3i8]),
+            Some(ScalarBuffer::from(vec![0i32, 0i32])),
+            vec![Arc::new(ints) as ArrayRef, Arc::new(longs) as ArrayRef],
+        )
+        .unwrap();
+
+        let err = unwrap_ordering_values(&(Arc::new(union) as ArrayRef)).unwrap_err();
+        assert!(
+            err.to_string().contains("mixes ordering types"),
+            "got: {err}"
+        );
+    }
+
+    /// The block version is the first four bytes of a block's content, and only
+    /// V3 is understood. A block at another version is refused rather than
+    /// decoded as if it were V3, which would misread every byte after it.
+    #[test]
+    fn test_decode_content_rejects_a_non_v3_block_version() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let header = HashMap::from([(BlockMetadataKey::Schema, "{}".to_string())]);
+        let err = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_avro_record_content(buf.as_slice(), &header)
+            .expect_err("a non-V3 block must be refused");
+        assert!(
+            err.to_string().contains("log block version"),
+            "the error must name the version, got: {err}"
+        );
+    }
+
+    /// An Avro block records the schema it was written with in its header. With
+    /// none there is nothing to decode against, so the read stops rather than
+    /// guessing at the table's current schema — which would misread a block
+    /// written before an evolution.
+    #[test]
+    fn test_decode_avro_content_without_a_schema_header_is_an_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let err = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_avro_record_content(buf.as_slice(), &HashMap::new())
+            .expect_err("a block with no schema header must be refused");
+        assert!(err.to_string().contains("Schema not found"), "got: {err}");
+    }
+
+    /// `orderingVal` is a union of per-type wrapper records, so a decode yields
+    /// a union of one-field structs and the merge wants the value. Anything else
+    /// is refused rather than reduced to something that looks like a value.
+    #[test]
+    fn test_unwrap_ordering_values_rejects_a_non_union() {
+        let plain: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
+        let err = unwrap_ordering_values(&plain).expect_err("a non-union must be refused");
+        assert!(
+            err.to_string().contains("union"),
+            "the error must say what it expected, got: {err}"
+        );
+    }
+
+    /// A union with no rows has no populated branch to unwrap, so it passes
+    /// through unchanged rather than erroring on the absence.
+    #[test]
+    fn test_unwrap_ordering_values_passes_an_empty_union_through() {
+        use arrow_array::{Int32Array, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Fields, UnionFields};
+        let ints = StructArray::new(
+            Fields::from(vec![Field::new("value", DataType::Int32, false)]),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef],
+            None,
+        );
+        let union_fields = UnionFields::try_new(
+            vec![2],
+            vec![Field::new("IntWrapper", ints.data_type().clone(), false)],
+        )
+        .unwrap();
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(Vec::<i8>::new()),
+            Some(ScalarBuffer::from(Vec::<i32>::new())),
+            vec![Arc::new(ints) as ArrayRef],
+        )
+        .unwrap();
+        let src: ArrayRef = Arc::new(union);
+        let out = unwrap_ordering_values(&src).expect("an empty union is not an error");
+        assert_eq!(out.len(), 0);
+    }
+
+    /// A wrapper is one field — the value. More than one means the block was not
+    /// written by the writer this decode assumes, and picking a field would be a
+    /// guess about which one carries the ordering value.
+    #[test]
+    fn test_unwrap_ordering_values_rejects_a_multi_field_wrapper() {
+        use arrow_array::{Int32Array, UnionArray};
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::{Fields, UnionFields};
+        let wrapper = StructArray::new(
+            Fields::from(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("extra", DataType::Int32, false),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![8])) as ArrayRef,
+            ],
+            None,
+        );
+        let union_fields = UnionFields::try_new(
+            vec![2],
+            vec![Field::new("IntWrapper", wrapper.data_type().clone(), false)],
+        )
+        .unwrap();
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(vec![2i8]),
+            Some(ScalarBuffer::from(vec![0i32])),
+            vec![Arc::new(wrapper) as ArrayRef],
+        )
+        .unwrap();
+        let src: ArrayRef = Arc::new(union);
+        let err = unwrap_ordering_values(&src).expect_err("a two-field wrapper must be refused");
+        assert!(err.to_string().contains("one field"), "got: {err}");
+    }
+
+    #[test]
+    fn test_decode_avro_partial_update_block_keeps_narrow_schema() -> Result<()> {
+        // The table has id + name; this block carries only id.
+        let partial_schema_str =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"long"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(partial_schema_str)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("id", 7i64);
+        let record_bytes = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(record_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&record_bytes);
+
+        let header = HashMap::from([
+            (BlockMetadataKey::Schema, partial_schema_str.to_string()),
+            (BlockMetadataKey::IsPartial, "true".to_string()),
+        ]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        assert_eq!(batches.num_data_rows(), 1);
+        let batch = &batches.data_batches[0];
+        assert_eq!(
+            batch.num_columns(),
+            1,
+            "a partial block must not be widened to the table schema"
+        );
+        assert_eq!(batch.schema().field(0).name(), "id");
+        Ok(())
+    }
+
+    /// REGRESSION: `IS_PARTIAL=false` marks a FULL block.
+    ///
+    /// The flag used to be read by its presence, so a writer that spells the
+    /// negative case out turned every full block partial — decoded at its own
+    /// schema, skipping the resolution up to the reader's, which is what
+    /// delivers a promoted column in the promoted type. Java reads the value
+    /// (`Boolean.parseBoolean(getOrDefault(IS_PARTIAL, "false"))`), so this does
+    /// too.
+    #[test]
+    fn test_decode_avro_is_partial_false_resolves_to_the_reader_schema() -> Result<()> {
+        // Written narrow; the reader schema promotes `id` to a wider type and
+        // adds `name`, which only the resolving path can deliver.
+        let writer_schema_str =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"int"}]}"#;
+        let reader_schema_str = r#"{"type":"record","name":"TestRecord","fields":[{"name":"id","type":"long"},{"name":"name","type":["null","string"],"default":null}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_schema_str)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let mut record = AvroRecord::new(&writer_schema).unwrap();
+        record.put("id", 7i32);
+        let record_bytes = to_avro_datum(&writer_schema, record)?;
+        buf.extend_from_slice(&(record_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&record_bytes);
+
+        let header = HashMap::from([
+            (BlockMetadataKey::Schema, writer_schema_str.to_string()),
+            (BlockMetadataKey::IsPartial, "false".to_string()),
+        ]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(reader_schema_str.to_string()));
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+
+        let batch = &batches.data_batches[0];
+        assert_eq!(
+            batch.num_columns(),
+            2,
+            "IS_PARTIAL=false is a full block, so it resolves up to the reader schema"
+        );
+        assert_eq!(
+            batch.schema().field_with_name("id")?.data_type(),
+            &DataType::Int64,
+            "the promoted column must arrive promoted"
+        );
+        Ok(())
+    }
+
+    /// A parquet log block written by the Hudi Avro write path carries its
+    /// `array<map>` column as a legacy 2-level list, which the parquet→arrow
+    /// builder rejects with "Map cannot be repeated" unless the schema is
+    /// normalized first. The block is unreadable without it, so returning rows
+    /// at all is the assertion.
+    #[test]
+    fn test_decode_parquet_content_accepts_a_legacy_two_level_list() -> Result<()> {
+        const LEGACY_2LEVEL: &[u8] =
+            include_bytes!("../../../tests/data/i3/legacy_2level_repeated_map.parquet");
+
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        let batches = decoder.decode_parquet_record_content(LEGACY_2LEVEL)?;
+
+        assert!(
+            batches.num_data_rows() > 0,
+            "a legacy 2-level list block must decode"
+        );
         Ok(())
     }
 

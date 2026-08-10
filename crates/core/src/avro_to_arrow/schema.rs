@@ -24,6 +24,9 @@ use arrow::datatypes::{Field, UnionFields};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Timezone an Avro `timestamp-*` logical type denotes, per the Avro spec.
+const UTC_TIMEZONE: &str = "UTC";
+
 /// Converts an avro schema to an arrow schema
 pub fn to_arrow_schema(avro_schema: &apache_avro::Schema) -> Result<Schema> {
     let mut schema_fields = vec![];
@@ -53,6 +56,10 @@ fn schema_to_field(
     schema_to_field_with_props(schema, name, nullable, Default::default())
 }
 
+/// Arrow's conventional name for a map's entry struct, and what the parquet
+/// reader produces — the two schemas have to agree by name to reconcile.
+pub(crate) const MAP_ENTRIES_FIELD: &str = "key_value";
+
 fn schema_to_field_with_props(
     schema: &AvroSchema,
     name: Option<&str>,
@@ -77,12 +84,20 @@ fn schema_to_field_with_props(
             None,
         )?)),
         AvroSchema::Map(value_schema) => {
+            // An Arrow dictionary key must be an integer, so the `Dictionary(Utf8, V)`
+            // this used to produce was not a valid type and could not reconcile
+            // against the `Map` a parquet base file carries. Avro map keys are
+            // always strings, and the entry struct is never null.
             let value_field =
-                schema_to_field_with_props(&value_schema.types, Some("value"), false, None)?;
-            DataType::Dictionary(
-                Box::new(DataType::Utf8),
-                Box::new(value_field.data_type().clone()),
-            )
+                schema_to_field_with_props(&value_schema.types, Some("value"), true, None)?;
+            let entries = Field::new(
+                MAP_ENTRIES_FIELD,
+                DataType::Struct(
+                    vec![Field::new("key", DataType::Utf8, false), value_field].into(),
+                ),
+                false,
+            );
+            DataType::Map(Arc::new(entries), false)
         }
         AvroSchema::Union(us) => {
             // If there are only two variants and one of them is null, set the other type as the field data type
@@ -140,9 +155,20 @@ fn schema_to_field_with_props(
         AvroSchema::Date => DataType::Date32,
         AvroSchema::TimeMillis => DataType::Time32(TimeUnit::Millisecond),
         AvroSchema::TimeMicros => DataType::Time64(TimeUnit::Microsecond),
-        AvroSchema::TimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
-        AvroSchema::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
-        AvroSchema::TimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        // Avro's `timestamp-*` logical types are instants in UTC; the
+        // timezone-naive variants are `local-timestamp-*` below. Carrying the
+        // zone matters beyond correctness: a parquet base file reads back as
+        // `Timestamp(_, "UTC")`, so dropping it here makes a log batch fail to
+        // concatenate with the base batch it is merged against.
+        AvroSchema::TimestampMillis => {
+            DataType::Timestamp(TimeUnit::Millisecond, Some(UTC_TIMEZONE.into()))
+        }
+        AvroSchema::TimestampMicros => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into()))
+        }
+        AvroSchema::TimestampNanos => {
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIMEZONE.into()))
+        }
         AvroSchema::LocalTimestampMillis => todo!(),
         AvroSchema::LocalTimestampMicros => todo!(),
         AvroSchema::LocalTimestampNanos => todo!(),
@@ -213,8 +239,8 @@ fn default_field_name(dt: &DataType) -> &str {
         DataType::LargeList(_) => "largelist",
         DataType::Struct(_) => "struct",
         DataType::Union(_, _) => "union",
-        DataType::Dictionary(_, _) => "map",
-        DataType::Map(_, _) => unimplemented!("Map support not implemented"),
+        DataType::Dictionary(_, _) => "dictionary",
+        DataType::Map(_, _) => "map",
         DataType::RunEndEncoded(_, _) => {
             unimplemented!("RunEndEncoded support not implemented")
         }
@@ -282,5 +308,70 @@ pub fn aliased(alias: &Alias, namespace: Option<&str>, default_namespace: Option
             Some(ref namespace) => format!("{}.{}", namespace, alias.name()),
             None => alias.fullname(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apache_avro::Schema as AvroSchema;
+
+    /// An Avro map becomes an Arrow `Map`, not a dictionary. A dictionary key
+    /// must be an integer, so the `Dictionary(Utf8, V)` this used to produce was
+    /// not a valid Arrow type and could not reconcile against the `Map` a
+    /// parquet base file carries.
+    #[test]
+    fn test_avro_map_converts_to_arrow_map() {
+        let avro = AvroSchema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                 {"name":"m","type":{"type":"map","values":"int"}}]}"#,
+        )
+        .unwrap();
+
+        let schema = to_arrow_schema(&avro).unwrap();
+        let DataType::Map(entries, sorted) = schema.field(0).data_type() else {
+            panic!("expected a Map, got {}", schema.field(0).data_type());
+        };
+        assert!(!sorted);
+        assert_eq!(entries.name(), MAP_ENTRIES_FIELD);
+        assert!(!entries.is_nullable(), "map entries are never null");
+
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("entries must be a struct");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "key");
+        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        assert!(!fields[0].is_nullable(), "an Avro map key is never null");
+        assert_eq!(fields[1].name(), "value");
+        assert_eq!(fields[1].data_type(), &DataType::Int32);
+    }
+
+    /// A map whose values are records nests as a struct inside the entry, rather
+    /// than collapsing to the value type alone.
+    #[test]
+    fn test_avro_map_of_records_nests_the_value_struct() {
+        let avro = AvroSchema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                 {"name":"m","type":{"type":"map","values":
+                   {"type":"record","name":"v","fields":[{"name":"a","type":"double"}]}}}]}"#,
+        )
+        .unwrap();
+
+        let schema = to_arrow_schema(&avro).unwrap();
+        let DataType::Map(entries, _) = schema.field(0).data_type() else {
+            panic!("expected a Map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("entries must be a struct");
+        };
+        let DataType::Struct(value_fields) = fields[1].data_type() else {
+            panic!(
+                "map value must stay a struct, got {}",
+                fields[1].data_type()
+            );
+        };
+        assert_eq!(value_fields[0].name(), "a");
+        assert_eq!(value_fields[0].data_type(), &DataType::Float64);
     }
 }

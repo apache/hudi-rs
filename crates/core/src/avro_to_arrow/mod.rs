@@ -21,7 +21,6 @@
 
 #![allow(warnings, clippy::all)]
 
-pub mod arrow_array_reader;
 mod schema;
 
 use crate::error::Result;

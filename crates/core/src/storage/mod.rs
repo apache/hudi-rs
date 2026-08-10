@@ -18,6 +18,7 @@
  */
 //! This module is responsible for interacting with the storage layer.
 
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,7 +43,60 @@ pub mod file_metadata;
 pub mod reader;
 pub mod util;
 
+/// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
+/// the Arrow schema it maps to. Returning `None` means no filter is pushed.
+///
+/// `Arc` rather than `Box` so options holding it stay `Clone`. The captured
+/// state must be `Send + Sync` because the parquet stream may evaluate the
+/// filter on any worker thread.
+pub type RowFilterBuilder = Arc<
+    dyn Fn(
+            &parquet::schema::types::SchemaDescriptor,
+            &arrow_schema::Schema,
+        ) -> Option<parquet::arrow::arrow_reader::RowFilter>
+        + Send
+        + Sync,
+>;
+
 #[allow(dead_code)]
+/// Runtime that owns every ranged object-store read issued from synchronous
+/// code.
+///
+/// A log file is read through `std::io::Read`, which is synchronous, while
+/// `object_store` is async. Bridging the two needs somewhere to drive the
+/// future, and the obvious choices do not work: the sync read can be reached
+/// from inside another runtime, where `block_on` panics with "Cannot start a
+/// runtime from within a runtime", and a runtime built per read would take
+/// hyper's connection dispatcher down with it when dropped, failing every
+/// subsequent request against the same cached store.
+///
+/// So reads are spawned here and the calling thread waits on a channel. The
+/// runtime outlives any individual caller, which is what keeps the dispatcher
+/// alive.
+pub static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(OBJECT_STORE_RUNTIME_WORKERS)
+        .enable_all()
+        .thread_name(OBJECT_STORE_RUNTIME_THREAD_NAME)
+        .build()
+        .expect("the object-store runtime must build")
+});
+
+/// Worker threads on [`OBJECT_STORE_RUNTIME`].
+///
+/// This runtime only drives object-store I/O, which is latency-bound rather
+/// than CPU-bound, so the count is a fixed small number rather than a function
+/// of the machine's cores: a host with 96 of them has no more requests in
+/// flight than one with 8, and sizing to cores would spend threads on nothing.
+pub(crate) const OBJECT_STORE_RUNTIME_WORKERS: usize = 8;
+
+/// Thread-name prefix for [`OBJECT_STORE_RUNTIME`]'s workers.
+///
+/// Load-bearing, not cosmetic: it is how a blocking bridge recognises that it is
+/// about to block one of its own workers — see
+/// [`in_object_store_runtime`](crate::storage::reader::in_object_store_runtime).
+pub(crate) const OBJECT_STORE_RUNTIME_THREAD_NAME: &str = "hudi-rs-objstore";
+
 #[derive(Clone, Debug)]
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
@@ -138,6 +192,24 @@ impl Storage {
         StorageReader::new(obj_store, obj_meta)
             .await
             .map_err(StorageError::ReaderError)
+    }
+
+    /// A reader that fetches bounded windows instead of the whole file.
+    ///
+    /// Only the object metadata is fetched here; no file bytes are read until
+    /// the caller reads.
+    pub async fn get_streaming_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        Ok(StorageReader::new_streaming(
+            obj_store,
+            obj_meta,
+            window_size,
+        ))
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {

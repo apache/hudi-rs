@@ -61,9 +61,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install system dependencies
+        # librocksdb-sys generates its bindings with bindgen at build time, which
+        # needs libclang. The hosted runners ship it; this container does not.
         run: |
           apt-get update
-          apt-get install -y protobuf-compiler
+          apt-get install -y protobuf-compiler clang libclang-dev
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -80,6 +82,29 @@ jobs:
           name: cov-report-rust-tests-${{ runner.os }}
           path: ./cov-reports
           if-no-files-found: 'error'
+
+  # hudi-core without `spill-rocksdb` must keep building and passing. That build
+  # is the reason the feature exists — it needs no libclang and no C++ toolchain,
+  # so a consumer that cannot take a native build (or does not want one in a
+  # Python wheel) has a configuration to use. Nothing else in CI compiles it, so
+  # without this job it would break silently.
+  rust-tests-no-spill-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependencies
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: no-spill-backend
+      # Deliberately no clang/libclang: if a change makes the default-off build
+      # pull rocksdb back in, this job fails to compile rather than quietly
+      # reintroducing the native dependency.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Clippy without the spill backend
+        run: cargo clippy -p hudi-core --lib --no-default-features -- -D warnings
+      - name: Unit tests without the spill backend
+        run: cargo test -p hudi-core --lib --no-default-features --no-fail-fast
 
   rust-tests-windows:
     runs-on: windows-2025

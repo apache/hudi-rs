@@ -176,7 +176,13 @@ impl FileSystemView {
         for mut fg in file_groups {
             if let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) {
                 let relative_path = match fsl.base_file_relative_path() {
-                    Ok(path) => path,
+                    // No base file means no parquet footer to prune on; the
+                    // slice's records are all in its log files.
+                    Ok(None) => {
+                        retained.push(fg);
+                        continue;
+                    }
+                    Ok(Some(path)) => path,
                     Err(e) => {
                         log::warn!(
                             "Cannot get base file path for pruning: {e}. Including file group."
@@ -206,7 +212,9 @@ impl FileSystemView {
                 };
 
                 if file_pruner.should_include(&col_stats) {
-                    fsl.base_file.file_metadata = Some(file_metadata);
+                    if let Some(base_file) = fsl.base_file.as_mut() {
+                        base_file.file_metadata = Some(file_metadata);
+                    }
                     fsl.base_file_column_stats = Some(col_stats);
                     retained.push(fg);
                 } else {
@@ -477,7 +485,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"]);
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
@@ -517,7 +531,13 @@ mod tests {
 
         assert!(!file_slices.is_empty());
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
             assert!(metadata.byte_size > 0);
             assert!(metadata.num_records > 0);
@@ -549,7 +569,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
@@ -775,7 +801,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
@@ -994,7 +1026,13 @@ mod tests {
 
         assert_eq!(retained.len(), 1);
         let fsl = retained[0].get_file_slice_as_of(&as_of).unwrap();
-        let file_metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+        let file_metadata = fsl
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert!(file_metadata.size > 0);
         assert!(file_metadata.num_records > 0);
         assert!(fsl.base_file_column_stats.is_some());

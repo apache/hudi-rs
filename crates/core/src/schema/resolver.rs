@@ -203,6 +203,22 @@ fn arrow_schema_from_avro_schema_str(avro_schema_str: &str) -> Result<Schema> {
     to_arrow_schema(&avro_schema)
 }
 
+/// Convert an Avro schema in JSON form to an Arrow schema.
+///
+/// # Known divergence
+/// [`to_arrow_schema`] gives a list's element field `nullable = false`
+/// unconditionally, even when the Avro items schema is a `["null", T]` union
+/// (see `avro_to_arrow::schema`). A merge-on-read slice whose arrays contain
+/// NULL elements therefore resolves to a schema that disagrees with its data.
+/// Fixing that changes a shared conversion the existing read path also uses, so
+/// it belongs in its own change with its own regression test rather than riding
+/// along with the reader port.
+pub fn avro_json_to_arrow_schema(avro_schema_str: &str) -> Result<Schema> {
+    let avro = AvroSchema::parse_str(avro_schema_str)
+        .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema: {e}")))?;
+    to_arrow_schema(&avro)
+}
+
 fn extract_avro_schema_from_commit_metadata(
     commit_metadata: &Map<String, Value>,
 ) -> Option<String> {

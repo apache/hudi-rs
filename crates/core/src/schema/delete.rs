@@ -37,9 +37,54 @@ static DELETE_RECORD_AVRO_SCHEMA_IN_JSON: Lazy<Result<JsonValue>> = Lazy::new(||
         .map_err(|e| CoreError::Schema(format!("Failed to parse schema to JSON: {e}")))
 });
 
+/// Union position of `ArrayWrapper`, which carries a list rather than a scalar.
+/// Nothing orders records by a list, so it is rejected rather than mapped.
+const ARRAY_WRAPPER_POSITION: u32 = 12;
+
+/// Replace a wrapped ordering value with the primitive inside it.
+///
+/// Hudi writes `orderingVal` as a union of per-type wrapper records — `LongWrapper`
+/// is a record whose single `value` field is a `long`. The Arrow side wants the
+/// primitive, and [`avro_schema_for_delete_record`] narrows the schema to match,
+/// so the value has to be unwrapped to agree with it.
+///
+/// The narrowed schema has two branches, `[null, <primitive>]`, so the surviving
+/// branch is position 1 regardless of where the wrapper sat in the full union.
+///
+/// Records that are already primitives pass through: this runs over decoded
+/// values, and only the wrapper shape is rewritten.
+pub fn unwrap_ordering_value(delete_record: AvroValue) -> Result<AvroValue> {
+    let AvroValue::Record(mut fields) = delete_record else {
+        return Err(CoreError::Schema(
+            "Expected a record for delete record".to_string(),
+        ));
+    };
+    let Some((_, ordering_val)) = fields.get_mut(2) else {
+        return Err(CoreError::Schema(
+            "Delete record has no orderingVal field".to_string(),
+        ));
+    };
+    if let AvroValue::Union(pos, inner) = ordering_val {
+        if *pos == ARRAY_WRAPPER_POSITION {
+            return Err(CoreError::Schema(
+                "Delete record orders by an array (ArrayWrapper), which has no ordering"
+                    .to_string(),
+            ));
+        }
+        if let AvroValue::Record(wrapper_fields) = inner.as_ref() {
+            let [(_, wrapped)] = wrapper_fields.as_slice() else {
+                return Err(CoreError::Schema(format!(
+                    "Expected a wrapper record with exactly one field, got {}",
+                    wrapper_fields.len()
+                )));
+            };
+            *ordering_val = AvroValue::Union(1, Box::new(wrapped.clone()));
+        }
+    }
+    Ok(AvroValue::Record(fields))
+}
+
 // TODO further improve perf by using once_cell for the whole function based on table config
-// OR
-// TODO better make avro-arrow conversion work for multiple union types
 pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<AvroSchema> {
     let fields = match delete_record_value {
         AvroValue::Record(fields) => fields,
@@ -86,6 +131,13 @@ pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<
                 CoreError::Schema("Could not access orderingVal type array in schema".to_string())
             })?;
 
+        if ordering_val_type_pos == ARRAY_WRAPPER_POSITION {
+            return Err(CoreError::Schema(
+                "Delete record orders by an array (ArrayWrapper), which has no ordering"
+                    .to_string(),
+            ));
+        }
+
         // Validate bounds
         if ordering_val_type_pos as usize >= type_array.len() {
             return Err(CoreError::Schema(format!(
@@ -114,6 +166,11 @@ static DELETE_RECORD_LIST_AVRO_SCHEMA: Lazy<Result<AvroSchema>> = Lazy::new(|| {
     AvroSchema::parse_str(DELETE_RECORD_LIST_AVRO_SCHEMA_STR).map_err(CoreError::AvroError)
 });
 
+/// The delete-record list schema as Avro JSON, for decoders that take one.
+pub fn delete_record_list_schema_json() -> &'static str {
+    DELETE_RECORD_LIST_AVRO_SCHEMA_STR
+}
+
 pub fn avro_schema_for_delete_record_list() -> Result<&'static AvroSchema> {
     DELETE_RECORD_LIST_AVRO_SCHEMA
         .as_ref()
@@ -125,6 +182,7 @@ pub fn transform_delete_record_batch(
     batch: &RecordBatch,
     commit_time: &str,
     ordering_field: &str,
+    target_ordering_type: Option<&DataType>,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
 
@@ -134,9 +192,17 @@ pub fn transform_delete_record_batch(
     // Get the original column data directly by position
     let record_key_array = batch.column(0).clone(); // recordKey at pos 0
     let partition_path_array = batch.column(1).clone(); // partitionPath at pos 1
-    let ordering_val_array = batch.column(2).clone(); // orderingVal at pos 2
+    // Hudi picks the ordering value's wrapper from the value, not from the
+    // column, so a long ordering column can carry an int for a small value.
+    let ordering_val_array = match target_ordering_type {
+        Some(target) if target != batch.schema().field(2).data_type() => {
+            arrow::compute::cast(batch.column(2), target).map_err(CoreError::ArrowError)?
+        }
+        _ => batch.column(2).clone(),
+    };
 
     // Create new columns vector with the new order
+    let ordering_val_type = ordering_val_array.data_type().clone();
     let new_columns = vec![
         commit_time_array,
         record_key_array,
@@ -162,7 +228,7 @@ pub fn transform_delete_record_batch(
         )),
         Arc::new(Field::new(
             ordering_field,
-            batch.schema().field(2).data_type().clone(),
+            ordering_val_type,
             batch.schema().field(2).is_nullable(),
         )),
     ];
@@ -173,7 +239,7 @@ pub fn transform_delete_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apache_avro::schema::{DecimalSchema, RecordField, RecordSchema};
+    use apache_avro::schema::{RecordField, RecordSchema};
     use arrow_array::{Array, Int64Array};
 
     fn validate_delete_fields(
@@ -213,27 +279,35 @@ mod tests {
                     assert_eq!(union.variants()[0], AvroSchema::Null);
                     assert_eq!(union.variants()[1], minimized_type);
                 } else {
-                    assert_eq!(union.variants().len(), 13);
+                    // The wire schema wraps each ordering type in a record, and the
+                    // position of each wrapper is what a delete block's union index
+                    // refers to. Asserting the order pins the index space: reading a
+                    // block written by Hudi depends on position 3 meaning a long.
+                    let expected = [
+                        "BooleanWrapper",
+                        "IntWrapper",
+                        "LongWrapper",
+                        "FloatWrapper",
+                        "DoubleWrapper",
+                        "BytesWrapper",
+                        "StringWrapper",
+                        "DateWrapper",
+                        "DecimalWrapper",
+                        "TimeMicrosWrapper",
+                        "TimestampMicrosWrapper",
+                        "ArrayWrapper",
+                    ];
+                    assert_eq!(union.variants().len(), expected.len() + 1);
                     assert_eq!(union.variants()[0], AvroSchema::Null);
-                    assert_eq!(union.variants()[1], AvroSchema::Int);
-                    assert_eq!(union.variants()[2], AvroSchema::Long);
-                    assert_eq!(union.variants()[3], AvroSchema::Float);
-                    assert_eq!(union.variants()[4], AvroSchema::Double);
-                    assert_eq!(union.variants()[5], AvroSchema::Bytes);
-                    assert_eq!(union.variants()[6], AvroSchema::String);
-                    assert_eq!(
-                        union.variants()[7],
-                        AvroSchema::Decimal(DecimalSchema {
-                            precision: 30,
-                            scale: 15,
-                            inner: Box::new(AvroSchema::Bytes)
-                        })
-                    );
-                    assert_eq!(union.variants()[8], AvroSchema::Date);
-                    assert_eq!(union.variants()[9], AvroSchema::TimeMillis);
-                    assert_eq!(union.variants()[10], AvroSchema::TimeMicros);
-                    assert_eq!(union.variants()[11], AvroSchema::TimestampMillis);
-                    assert_eq!(union.variants()[12], AvroSchema::TimestampMicros);
+                    for (pos, name) in expected.iter().enumerate() {
+                        let variant = &union.variants()[pos + 1];
+                        assert_eq!(
+                            &variant.name().expect("wrapper is a named record").name,
+                            name,
+                            "union position {}",
+                            pos + 1
+                        );
+                    }
                 }
             }
             _ => panic!("Expected a Union schema for orderingVal"),
@@ -253,7 +327,13 @@ mod tests {
             ),
             (
                 "orderingVal".to_string(),
-                AvroValue::Union(1, Box::new(AvroValue::Int(42))),
+                AvroValue::Union(
+                    3,
+                    Box::new(AvroValue::Record(vec![(
+                        "value".to_string(),
+                        AvroValue::Long(4000),
+                    )])),
+                ),
             ),
         ]);
 
@@ -264,10 +344,65 @@ mod tests {
 
         match schema {
             AvroSchema::Record(RecordSchema { fields, .. }) => {
-                validate_delete_fields(&fields, Some(AvroSchema::Int));
+                validate_delete_fields(&fields, Some(AvroSchema::Long));
             }
             _ => panic!("Expected a Record schema"),
         }
+    }
+
+    /// The wrapper is replaced by the primitive it carries, at the position the
+    /// narrowed schema uses. Without this the Arrow conversion sees a struct
+    /// where every reader expects a scalar.
+    #[test]
+    fn test_unwrap_ordering_value_yields_the_wrapped_primitive() {
+        let record = AvroValue::Record(vec![
+            ("recordKey".to_string(), AvroValue::String("k".to_string())),
+            (
+                "partitionPath".to_string(),
+                AvroValue::String("".to_string()),
+            ),
+            (
+                "orderingVal".to_string(),
+                AvroValue::Union(
+                    3,
+                    Box::new(AvroValue::Record(vec![(
+                        "value".to_string(),
+                        AvroValue::Long(4000),
+                    )])),
+                ),
+            ),
+        ]);
+
+        let AvroValue::Record(fields) = unwrap_ordering_value(record).unwrap() else {
+            panic!("expected a record");
+        };
+        assert_eq!(
+            fields[2].1,
+            AvroValue::Union(1, Box::new(AvroValue::Long(4000)))
+        );
+    }
+
+    /// `ArrayWrapper` carries a list, which cannot order anything. Rejected in
+    /// both places that read the union position, so neither can produce a column
+    /// whose type disagrees with the value in it.
+    #[test]
+    fn test_array_wrapper_ordering_is_rejected() {
+        let record = AvroValue::Record(vec![
+            ("recordKey".to_string(), AvroValue::String("k".to_string())),
+            (
+                "partitionPath".to_string(),
+                AvroValue::String("".to_string()),
+            ),
+            (
+                "orderingVal".to_string(),
+                AvroValue::Union(12, Box::new(AvroValue::Array(vec![]))),
+            ),
+        ]);
+
+        let err = unwrap_ordering_value(record.clone()).unwrap_err();
+        assert!(err.to_string().contains("ArrayWrapper"), "got: {err}");
+        let err = avro_schema_for_delete_record(&record).unwrap_err();
+        assert!(err.to_string().contains("ArrayWrapper"), "got: {err}");
     }
 
     #[test]
@@ -346,7 +481,8 @@ mod tests {
         let commit_time = "20240101000000";
         let ordering_field = "sequenceNumber";
 
-        let result = transform_delete_record_batch(&batch, commit_time, ordering_field).unwrap();
+        let result =
+            transform_delete_record_batch(&batch, commit_time, ordering_field, None).unwrap();
 
         // Check number of rows preserved
         assert_eq!(result.num_rows(), 3);
@@ -409,7 +545,8 @@ mod tests {
         let commit_time = "20240101000000";
         let ordering_field = "sequenceNumber";
 
-        let result = transform_delete_record_batch(&batch, commit_time, ordering_field).unwrap();
+        let result =
+            transform_delete_record_batch(&batch, commit_time, ordering_field, None).unwrap();
 
         // Check empty batch handling
         assert_eq!(result.num_rows(), 0);
@@ -434,7 +571,7 @@ mod tests {
         let commit_times = ["20240101000000", "20231225123045", "20240630235959"];
 
         for commit_time in commit_times {
-            let result = transform_delete_record_batch(&batch, commit_time, "seq").unwrap();
+            let result = transform_delete_record_batch(&batch, commit_time, "seq", None).unwrap();
 
             let commit_time_array = result
                 .column(0)

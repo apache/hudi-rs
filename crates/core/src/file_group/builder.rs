@@ -22,7 +22,7 @@ use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
-use crate::metadata::commit::HoodieCommitMetadata;
+use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::metadata::table_record::FilesPartitionRecord;
 use crate::statistics::estimator::FileStatsEstimator;
@@ -57,23 +57,6 @@ impl FileGroupMerger for HashSet<FileGroup> {
     }
 }
 
-/// Build file groups from commit metadata.
-///
-/// This function is used for **incremental queries** to get file groups between two timestamps.
-/// It parses file information from individual commit metadata files (e.g., `.commit`, `.deltacommit`)
-/// in the `.hoodie` timeline directory.
-///
-/// # Arguments
-///
-/// * `commit_metadata` - The commit metadata JSON map
-/// * `completion_time_view` - View to look up completion timestamps.
-pub fn file_groups_from_commit_metadata<V: CompletionTimeView>(
-    commit_metadata: &Map<String, Value>,
-    completion_time_view: &V,
-) -> Result<HashSet<FileGroup>> {
-    file_groups_from_commit_metadata_with_estimator(commit_metadata, completion_time_view, None)
-}
-
 /// # Arguments
 ///
 /// * `commit_metadata` - The commit metadata JSON map
@@ -86,10 +69,11 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
     commit_metadata: &Map<String, Value>,
     completion_time_view: &V,
     estimator: Option<&FileStatsEstimator>,
-) -> Result<HashSet<FileGroup>> {
+) -> Result<CommitFileGroups> {
     let metadata = HoodieCommitMetadata::from_json_map(commit_metadata)?;
 
     let mut file_groups = HashSet::new();
+    let mut unattached_log_files = Vec::new();
 
     for (partition, write_stat) in metadata.iter_write_stats() {
         let file_id = write_stat
@@ -102,18 +86,40 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
         // Resolve the base file name: MOR write stats record `baseFile`; COW write
         // stats record `path` (`<partition>/<file>`). Either way, derive the file
         // name string used to construct the BaseFile.
-        let base_file_name: String = if let Some(name) = &write_stat.base_file {
-            name.clone()
-        } else {
-            let path = write_stat
-                .path
-                .as_ref()
-                .ok_or_else(|| CoreError::CommitMetadata("Missing path in write stats".into()))?;
-            Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?
-                .to_string()
+        let base_file_name: Option<String> = match write_stat.base_file.as_deref() {
+            // A delta commit that only appends to a file group leaves `baseFile`
+            // empty and points `path` at the log file it wrote. That is not a
+            // name to parse — the slice it belongs to was written by an earlier
+            // commit, so the log file waits until every base file is known.
+            Some("") | None => {
+                let path = write_stat.path.as_deref().ok_or_else(|| {
+                    CoreError::CommitMetadata("Missing path in write stats".into())
+                })?;
+                let name = Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| CoreError::CommitMetadata("Invalid file name in path".into()))?;
+                if LogFile::is_log_file_name(name) {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            }
+            Some(name) => Some(name.to_string()),
+        };
+
+        let Some(base_file_name) = base_file_name else {
+            for log_file_name in log_file_names_in(write_stat) {
+                // Parsed to reject a malformed name here rather than later; the
+                // file group's identity is all the incremental path needs, since
+                // it reads the slice live at the range's end.
+                LogFile::from_str(&log_file_name)?;
+                unattached_log_files.push(UnattachedLogFile {
+                    partition: partition.clone(),
+                    file_id: file_id.clone(),
+                });
+            }
+            continue;
         };
 
         let mut base_file = BaseFile::from_str(&base_file_name)?;
@@ -146,9 +152,7 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
         file_group.add_base_file(base_file)?;
 
         // Log files are only present in MOR write stats (the `baseFile` branch).
-        if write_stat.base_file.is_some()
-            && let Some(log_file_names) = &write_stat.log_files
-        {
+        if let Some(log_file_names) = &write_stat.log_files {
             for log_file_name in log_file_names {
                 let mut log_file = LogFile::from_str(log_file_name)?;
                 log_file.set_completion_time(completion_time_view);
@@ -159,7 +163,45 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
         file_groups.insert(file_group);
     }
 
-    Ok(file_groups)
+    Ok(CommitFileGroups {
+        file_groups,
+        unattached_log_files,
+    })
+}
+
+/// A log file whose file slice was not written by the same commit.
+///
+/// Its slice is keyed by a base instant an earlier commit produced, so it can
+/// only be placed once every commit in the range has contributed its base files.
+pub(crate) struct UnattachedLogFile {
+    pub partition: String,
+    pub file_id: String,
+}
+
+/// What one commit's metadata contributes to an incremental read.
+pub(crate) struct CommitFileGroups {
+    pub file_groups: HashSet<FileGroup>,
+    pub unattached_log_files: Vec<UnattachedLogFile>,
+}
+
+/// The log files a write stat says it wrote.
+///
+/// `log_files` carries them when the stat also names a base file; a log-only
+/// stat names its single log file in `path`.
+fn log_file_names_in(write_stat: &HoodieWriteStat) -> Vec<String> {
+    if let Some(names) = &write_stat.log_files
+        && !names.is_empty()
+    {
+        return names.clone();
+    }
+    write_stat
+        .path
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| LogFile::is_log_file_name(name))
+        .map(|name| vec![name.to_string()])
+        .unwrap_or_default()
 }
 
 pub fn replaced_file_groups_from_replace_commit(
@@ -226,10 +268,8 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 })?;
 
                 log_file.set_completion_time(completion_time_view);
-                // Filter uncommitted files for timeline layout v2
-                if completion_time_view.should_filter_uncommitted()
-                    && log_file.completion_timestamp.is_none()
-                {
+                // Skip the file if the commit that wrote it never completed.
+                if !completion_time_view.is_committed(&log_file.timestamp) {
                     continue;
                 }
                 if file_size > 0 {
@@ -253,10 +293,8 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 })?;
 
                 base_file.set_completion_time(completion_time_view);
-                // Filter uncommitted files for timeline layout v2
-                if completion_time_view.should_filter_uncommitted()
-                    && base_file.completion_timestamp.is_none()
-                {
+                // Skip the file if the commit that wrote it never completed.
+                if !completion_time_view.is_committed(&base_file.commit_timestamp) {
                     continue;
                 }
                 // Populate file metadata with on-disk size from MDT,
@@ -305,7 +343,6 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
 
 #[cfg(test)]
 mod tests {
-
     mod test_file_group_merger {
         use super::super::*;
         use crate::file_group::FileGroup;
@@ -346,25 +383,49 @@ mod tests {
         use std::collections::HashSet;
         use std::sync::Arc;
 
+        /// The file groups one commit contributes, without the log files whose
+        /// slice another commit owns. These tests predate log-only slices and
+        /// assert on the groups alone.
+        fn file_groups_from_commit_metadata<V: CompletionTimeView>(
+            commit_metadata: &Map<String, Value>,
+            completion_time_view: &V,
+        ) -> Result<HashSet<FileGroup>> {
+            file_groups_from_commit_metadata_with_estimator(
+                commit_metadata,
+                completion_time_view,
+                None,
+            )
+            .map(|contribution| contribution.file_groups)
+        }
+
+        /// A view that admits every file, so these tests exercise file-name
+        /// parsing and grouping rather than commit visibility. The archival
+        /// boundary is the far-future sentinel: every instant sorts below it, so
+        /// every instant reads as archived and therefore as committed. Commit
+        /// visibility itself is covered in `timeline::view`.
         fn create_layout_v1_view() -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")]));
-            TimelineView::new(
+            TimelineView::new_with_archival_boundary(
                 "99999999999999999".to_string(),
                 None,
                 &[] as &[Instant],
                 HashSet::new(),
                 &configs,
+                Some("99999999999999999".to_string()),
             )
         }
 
+        /// As [`create_layout_v1_view`]: admits every file so the assertions stay
+        /// about parsing and grouping.
         fn create_layout_v2_view(instants: &[Instant]) -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
-            TimelineView::new(
+            TimelineView::new_with_archival_boundary(
                 "99999999999999999".to_string(),
                 None,
                 instants,
                 HashSet::new(),
                 &configs,
+                Some("99999999999999999".to_string()),
             )
         }
 
@@ -557,7 +618,7 @@ mod tests {
             assert_eq!(file_group.file_slices.len(), 1);
             let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
             assert_eq!(
-                file_slice.base_file.file_name(),
+                file_slice.base_file.as_ref().unwrap().file_name(),
                 "file-id-0_0-7-24_20240418173200000.parquet"
             );
             assert_eq!(file_slice.log_files.len(), 2);
@@ -635,7 +696,7 @@ mod tests {
             let file_group = file_groups.iter().next().unwrap();
             let file_slice = file_group.file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -664,7 +725,13 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(file_slice.log_files.is_empty());
-            let m = file_slice.base_file.file_metadata.as_ref().unwrap();
+            let m = file_slice
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert_eq!(m.name, "fid-0_0-7-24_20240418173200000.parquet");
             assert_eq!(m.size, 4096);
             assert_eq!(m.byte_size, 0);
@@ -694,7 +761,8 @@ mod tests {
                 &create_layout_v1_view(),
                 Some(&estimator),
             )
-            .unwrap();
+            .unwrap()
+            .file_groups;
             let m = groups
                 .iter()
                 .next()
@@ -704,6 +772,8 @@ mod tests {
                 .next()
                 .unwrap()
                 .base_file
+                .as_ref()
+                .unwrap()
                 .file_metadata
                 .as_ref()
                 .unwrap();
@@ -735,7 +805,8 @@ mod tests {
                 &create_layout_v1_view(),
                 Some(&estimator),
             )
-            .unwrap();
+            .unwrap()
+            .file_groups;
             let file_slice = groups
                 .iter()
                 .next()
@@ -746,7 +817,14 @@ mod tests {
                 .unwrap();
 
             assert_eq!(file_slice.log_files.len(), 1);
-            assert!(file_slice.base_file.file_metadata.is_none());
+            assert!(
+                file_slice
+                    .base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .is_none()
+            );
         }
 
         #[test]
@@ -770,7 +848,7 @@ mod tests {
                 .values()
                 .next()
                 .unwrap();
-            assert!(fs.base_file.file_metadata.is_none());
+            assert!(fs.base_file.as_ref().unwrap().file_metadata.is_none());
         }
     }
 
@@ -786,18 +864,41 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
 
+        /// A view that admits every file, so these tests exercise file-name
+        /// parsing and grouping rather than commit visibility. The archival
+        /// boundary is the far-future sentinel: every instant sorts below it, so
+        /// every instant reads as archived and therefore as committed. Commit
+        /// visibility itself is covered in `timeline::view`.
         fn create_layout_v1_view() -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")]));
-            TimelineView::new(
+            TimelineView::new_with_archival_boundary(
                 "99999999999999999".to_string(),
                 None,
                 &[] as &[Instant],
                 HashSet::new(),
                 &configs,
+                Some("99999999999999999".to_string()),
             )
         }
 
+        /// As [`create_layout_v1_view`]: admits every file so the assertions stay
+        /// about parsing and grouping.
         fn create_layout_v2_view(instants: &[Instant]) -> TimelineView {
+            let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
+            TimelineView::new_with_archival_boundary(
+                "99999999999999999".to_string(),
+                None,
+                instants,
+                HashSet::new(),
+                &configs,
+                Some("99999999999999999".to_string()),
+            )
+        }
+
+        /// A view with NO archival boundary, so nothing outside the completed set
+        /// is readable — the strict counterpart used by the tests whose subject
+        /// IS commit visibility.
+        fn create_strict_view(instants: &[Instant]) -> TimelineView {
             let configs = Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "2")]));
             TimelineView::new(
                 "99999999999999999".to_string(),
@@ -1105,7 +1206,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = create_layout_v2_view(&instants);
+            let view = create_strict_view(&instants);
 
             let result = file_groups_from_files_partition_records(
                 &records,
@@ -1133,7 +1234,7 @@ mod tests {
             );
             records.insert(key, record);
 
-            let view = create_layout_v2_view(&[]);
+            let view = create_strict_view(&[]);
 
             let result = file_groups_from_files_partition_records(
                 &records,
@@ -1183,7 +1284,7 @@ mod tests {
             // Verify completion timestamp was set
             let file_slice = file_groups[0].file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -1213,7 +1314,7 @@ mod tests {
                 state: State::Completed,
                 epoch_millis: 0,
             }];
-            let view = create_layout_v2_view(&instants);
+            let view = create_strict_view(&instants);
 
             let result = file_groups_from_files_partition_records(
                 &records,
@@ -1405,7 +1506,7 @@ mod tests {
             let extensions: HashSet<_> = file_groups
                 .iter()
                 .flat_map(|fg| fg.file_slices.values())
-                .map(|slice| slice.base_file.extension.as_str())
+                .map(|slice| slice.base_file.as_ref().unwrap().extension.as_str())
                 .collect();
 
             assert_eq!(extensions, HashSet::from(["lance", "parquet"]));
@@ -1437,7 +1538,13 @@ mod tests {
             let file_groups = file_groups_map.get("partition1").unwrap();
             let fg = &file_groups[0];
             let (_, file_slice) = fg.file_slices.iter().next().unwrap();
-            let metadata = file_slice.base_file.file_metadata.as_ref().unwrap();
+            let metadata = file_slice
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert_eq!(metadata.size, 5000); // on-disk size
             assert_eq!(metadata.byte_size, 10000); // 5000 * 2.0
             assert_eq!(metadata.num_records, 20); // 5000 / 250

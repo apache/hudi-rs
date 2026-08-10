@@ -83,10 +83,32 @@ pub enum HudiReadConfig {
     /// Snapshot/time-travel timestamp. Reads return the table state at this commit.
     AsOfTimestamp,
 
-    /// Start timestamp (exclusive) used by file-group readers to filter records.
+    /// Start of an incremental window, exclusive.
+    ///
+    /// # Which timestamp this is
+    ///
+    /// On timeline layout v2 (table version 8+) this bounds a commit's
+    /// **completion** time, matching Hudi 1.x — whose
+    /// `IncrementalQueryAnalyzer` names the same bound `startCompletionTime`. A
+    /// commit becomes visible when it completes, so that is what a window has to
+    /// bound: one requested before the window but completing inside it *is* a
+    /// change in that window, and bounding requested times skipped it silently.
+    ///
+    /// Layout v1 records no completion times, so there it bounds the requested
+    /// time, as it always did.
+    ///
+    /// **Breaking change.** This used to bound requested times on every layout.
+    /// Code that passes instant times read off the timeline — `Instant::timestamp`,
+    /// or a `{requested}_{completion}` file name's first half — now excludes the
+    /// commit it names, because that commit completed strictly later. Pass the
+    /// completion half instead (`Instant::completion_timestamp`).
     StartTimestamp,
 
-    /// End timestamp (inclusive) used by file-group readers to filter records.
+    /// End of an incremental window, inclusive. Bounds the same timestamp as
+    /// [`Self::StartTimestamp`] — see there, including the breaking change.
+    ///
+    /// Defaults to the greatest completion time among completed commits, i.e.
+    /// everything committed so far.
     EndTimestamp,
 
     /// Number of input partitions to read the data in parallel.
@@ -115,9 +137,71 @@ pub enum HudiReadConfig {
 
     /// Maximum number of file-slice streams to poll concurrently within one scan partition.
     FileSliceReadConcurrency,
+
+    /// Match a log record to the base row it updates by that row's position in
+    /// the base file rather than by record key. Defaults to `false`.
+    ///
+    /// Only the writer knows whether it recorded positions; a log block that did
+    /// not is merged by key regardless of this setting. The two agree except in a
+    /// file group holding duplicate record keys, where merging by key cannot say
+    /// which of them a log record updates.
+    ///
+    /// Honored only by file group reader version 2 — see
+    /// [`Self::FileGroupReaderVersion`].
+    MergeUseRecordPositions,
+}
+
+/// Where a [`HudiReadConfig`] may legitimately be set.
+///
+/// [`Table`](crate::table::Table) holds configuration for its whole lifetime,
+/// while a read is a single call, so the two kinds cannot be treated alike: a
+/// key that selects *which* read to perform would, baked at table level,
+/// silently redirect every subsequent read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadConfigScope {
+    /// Describes *how* to read. Stable for a deployment, so it may be set on the
+    /// table (including in `hoodie.properties` or `hudi-defaults.conf`) and
+    /// overridden per read.
+    TableOrRead,
+    /// Selects *which* read to perform. Meaningful only per call — see
+    /// [`ReadOptions`](crate::table::ReadOptions).
+    ReadOnly,
 }
 
 impl HudiReadConfig {
+    /// Where this config may be set. See [`ReadConfigScope`].
+    ///
+    /// Exhaustive on purpose: a new variant has to choose, rather than inheriting
+    /// whatever a prefix rule happens to do with its key.
+    pub const fn scope(&self) -> ReadConfigScope {
+        match self {
+            // These name a point or a window in the timeline, or the query shape
+            // itself. A table pinned to one of them would answer every later
+            // read as at that point, which no caller asked for.
+            Self::QueryType | Self::AsOfTimestamp | Self::StartTimestamp | Self::EndTimestamp => {
+                ReadConfigScope::ReadOnly
+            }
+            // These are deployment choices: which file group reader runs, how
+            // much parallelism to use, how big a streamed batch is. Setting them
+            // once for a table is the natural way to use them.
+            Self::InputPartitions
+            | Self::UseReadOptimizedMode
+            | Self::StreamBatchSize
+            | Self::FileSliceReadConcurrency
+            | Self::FileGroupReaderVersion
+            | Self::MergeUseRecordPositions => ReadConfigScope::TableOrRead,
+        }
+    }
+
+    /// The scope of the read config named by `key`, or `None` when `key` is not
+    /// a read config at all.
+    pub fn scope_of_key(key: &str) -> Option<ReadConfigScope> {
+        use strum::IntoEnumIterator;
+        Self::iter()
+            .find(|config| config.as_ref() == key)
+            .map(|config| config.scope())
+    }
+
     /// `&'static str` form of the config key. `const fn` so callers can use it in
     /// `const` contexts (e.g. building static lookup tables of `hoodie.*` keys
     /// without duplicating the literal strings).
@@ -132,6 +216,10 @@ impl HudiReadConfig {
             Self::FileGroupReaderVersion => "hoodie.read.file.group.reader.version",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
+            // Hudi's own key, not a `hoodie.read.*` one: a table written with
+            // record positions is read with this set, and a reader that invented
+            // its own spelling would ignore what the writer was told.
+            Self::MergeUseRecordPositions => "hoodie.merge.use.record.positions",
         }
     }
 }
@@ -217,6 +305,7 @@ impl ConfigParser for HudiReadConfig {
             HudiReadConfig::FileGroupReaderVersion => Some(HudiConfigValue::UInteger(
                 FileGroupReaderVersion::default().as_usize(),
             )),
+            HudiReadConfig::MergeUseRecordPositions => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
             _ => None,
@@ -244,7 +333,7 @@ impl ConfigParser for HudiReadConfig {
             Self::FileGroupReaderVersion => get_result
                 .and_then(FileGroupReaderVersion::from_str)
                 .map(|v| HudiConfigValue::UInteger(v.as_usize())),
-            Self::UseReadOptimizedMode => get_result
+            Self::UseReadOptimizedMode | Self::MergeUseRecordPositions => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
