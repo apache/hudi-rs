@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordSchema};
 use apache_avro::types::Value;
 use arrow::datatypes::{DataType, IntervalUnit, Schema, TimeUnit, UnionMode};
 use arrow::datatypes::{Field, UnionFields};
+use parquet::variant::VariantType;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+const AVRO_LOGICAL_TYPE_KEY: &str = "logicalType";
+const HUDI_VARIANT_LOGICAL_TYPE: &str = "variant";
 
 /// Converts an avro schema to an arrow schema
 pub fn to_arrow_schema(avro_schema: &apache_avro::Schema) -> Result<Schema> {
@@ -125,7 +129,12 @@ fn schema_to_field_with_props(
                     /*if let Some(aliases) = fields.aliases {
                         props.insert("aliases", aliases);
                     }*/
-                    schema_to_field_with_props(&field.schema, Some(&field.name), false, Some(props))
+                    schema_to_field_with_props(
+                        &field.schema,
+                        Some(&field.name),
+                        field.is_nullable(),
+                        Some(props),
+                    )
                 })
                 .collect();
             DataType::Struct(fields?)
@@ -154,7 +163,89 @@ fn schema_to_field_with_props(
 
     let mut field = Field::new(name, field_type, nullable);
     field.set_metadata(props.unwrap_or_default());
+    if is_hudi_variant_schema(schema) {
+        validate_hudi_variant_field(&field)?;
+        field.try_with_extension_type(VariantType)?;
+    }
     Ok(field)
+}
+
+fn is_hudi_variant_schema(schema: &AvroSchema) -> bool {
+    match schema {
+        AvroSchema::Record(record_schema) => is_hudi_variant_record(record_schema),
+        AvroSchema::Union(union_schema) => {
+            let variants = union_schema.variants();
+            variants.len() == 2
+                && variants
+                    .iter()
+                    .any(|schema| matches!(schema, AvroSchema::Null))
+                && variants.iter().any(is_hudi_variant_schema)
+        }
+        _ => false,
+    }
+}
+
+fn is_hudi_variant_record(record_schema: &RecordSchema) -> bool {
+    matches!(
+        record_schema.attributes.get(AVRO_LOGICAL_TYPE_KEY),
+        Some(serde_json::Value::String(logical_type)) if logical_type == HUDI_VARIANT_LOGICAL_TYPE
+    )
+}
+
+fn validate_hudi_variant_field(field: &Field) -> Result<()> {
+    let DataType::Struct(fields) = field.data_type() else {
+        return Err(CoreError::Schema(format!(
+            "Hudi variant field '{}' must be an Avro record",
+            field.name()
+        )));
+    };
+
+    let metadata = fields.iter().find(|child| child.name() == "metadata");
+    match metadata {
+        Some(child) if is_variant_binary_field(child) => {}
+        Some(child) => {
+            return Err(CoreError::Schema(format!(
+                "Hudi variant field '{}' must have binary 'metadata', got {}",
+                field.name(),
+                child.data_type()
+            )));
+        }
+        None => {
+            return Err(CoreError::Schema(format!(
+                "Hudi variant field '{}' must contain a 'metadata' field",
+                field.name()
+            )));
+        }
+    }
+
+    if let Some(value) = fields.iter().find(|child| child.name() == "value")
+        && !is_variant_binary_field(value)
+    {
+        return Err(CoreError::Schema(format!(
+            "Hudi variant field '{}' must have binary 'value', got {}",
+            field.name(),
+            value.data_type()
+        )));
+    }
+
+    if !fields
+        .iter()
+        .any(|child| matches!(child.name().as_str(), "value" | "typed_value"))
+    {
+        return Err(CoreError::Schema(format!(
+            "Hudi variant field '{}' must contain 'value' or 'typed_value'",
+            field.name()
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_variant_binary_field(field: &Field) -> bool {
+    matches!(
+        field.data_type(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    )
 }
 
 fn default_field_name(dt: &DataType) -> &str {
@@ -282,5 +373,102 @@ pub fn aliased(alias: &Alias, namespace: Option<&str>, default_namespace: Option
             Some(ref namespace) => format!("{}.{}", namespace, alias.name()),
             None => alias.fullname(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::variant::VariantType;
+
+    fn root_schema(field_type: &str) -> AvroSchema {
+        AvroSchema::parse_str(&format!(
+            r#"{{
+                "type": "record",
+                "name": "root",
+                "fields": [
+                    {{
+                        "name": "var",
+                        "type": {field_type}
+                    }}
+                ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    fn variant_record(fields: &str) -> String {
+        format!(
+            r#"{{
+                "type": "record",
+                "name": "variant_record",
+                "logicalType": "variant",
+                "fields": [{fields}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn maps_hudi_variant_record_to_arrow_variant_extension() {
+        let schema = root_schema(&variant_record(
+            r#"
+                {"name": "metadata", "type": "bytes"},
+                {"name": "value", "type": "bytes"}
+            "#,
+        ));
+
+        let arrow_schema = to_arrow_schema(&schema).unwrap();
+        let field = arrow_schema.field_with_name("var").unwrap();
+
+        field.try_extension_type::<VariantType>().unwrap();
+        let DataType::Struct(fields) = field.data_type() else {
+            panic!("variant should be represented as an Arrow struct");
+        };
+        assert_eq!(fields[0].name(), "metadata");
+        assert_eq!(fields[1].name(), "value");
+    }
+
+    #[test]
+    fn maps_nullable_hudi_variant_record_to_nullable_arrow_variant_extension() {
+        let schema = root_schema(&format!(
+            r#"[ "null", {} ]"#,
+            variant_record(
+                r#"
+                    {"name": "metadata", "type": "bytes"},
+                    {"name": "value", "type": "bytes"}
+                "#,
+            )
+        ));
+
+        let arrow_schema = to_arrow_schema(&schema).unwrap();
+        let field = arrow_schema.field_with_name("var").unwrap();
+
+        assert!(field.is_nullable());
+        field.try_extension_type::<VariantType>().unwrap();
+    }
+
+    #[test]
+    fn rejects_hudi_variant_record_without_metadata() {
+        let schema = root_schema(&variant_record(
+            r#"
+                {"name": "value", "type": "bytes"}
+            "#,
+        ));
+
+        let err = to_arrow_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("must contain a 'metadata' field"));
+    }
+
+    #[test]
+    fn rejects_hudi_variant_record_with_non_binary_value() {
+        let schema = root_schema(&variant_record(
+            r#"
+                {"name": "metadata", "type": "bytes"},
+                {"name": "value", "type": "string"}
+            "#,
+        ));
+
+        let err = to_arrow_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("must have binary 'value'"));
     }
 }

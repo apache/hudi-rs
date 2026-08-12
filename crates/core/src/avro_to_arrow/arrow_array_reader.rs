@@ -930,3 +930,102 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StructArray;
+    use parquet::variant::{Variant, VariantArray, VariantArrayBuilder, VariantBuilderExt};
+
+    fn variant_bytes() -> (Vec<u8>, Vec<u8>) {
+        let mut builder = VariantArrayBuilder::new(1);
+        builder.append_value("iceberg");
+        let array = builder.build();
+        let metadata = array.metadata_field().value(0).to_vec();
+        let value = array.value_field().unwrap().value(0).to_vec();
+        (metadata, value)
+    }
+
+    fn variant_schema(child_fields: &str) -> AvroSchema {
+        AvroSchema::parse_str(&format!(
+            r#"{{
+                "type": "record",
+                "name": "root",
+                "fields": [
+                    {{
+                        "name": "var",
+                        "type": {{
+                            "type": "record",
+                            "name": "variant_record",
+                            "logicalType": "variant",
+                            "fields": [{child_fields}]
+                        }}
+                    }}
+                ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    fn variant_value(fields: Vec<(String, Value)>) -> Value {
+        Value::Record(vec![("var".to_string(), Value::Record(fields))])
+    }
+
+    #[test]
+    fn reads_hudi_variant_avro_record_as_variant_array() {
+        let schema = variant_schema(
+            r#"
+                {"name": "metadata", "type": "bytes"},
+                {"name": "value", "type": "bytes"}
+            "#,
+        );
+        let (metadata, value) = variant_bytes();
+        let value = variant_value(vec![
+            ("metadata".to_string(), Value::Bytes(metadata)),
+            ("value".to_string(), Value::Bytes(value)),
+        ]);
+
+        let mut reader = AvroArrowArrayReader::try_new([Ok(value)].into_iter(), &schema).unwrap();
+        let batch = reader.next_batch(10).unwrap().unwrap();
+        let schema = batch.schema();
+        let field = schema.field_with_name("var").unwrap();
+
+        field
+            .try_extension_type::<parquet::variant::VariantType>()
+            .unwrap();
+        let variant_array = VariantArray::try_new(batch.column_by_name("var").unwrap()).unwrap();
+        assert_eq!(variant_array.value(0), Variant::from("iceberg"));
+    }
+
+    #[test]
+    fn reads_hudi_variant_avro_record_by_child_name_not_position() {
+        let schema = variant_schema(
+            r#"
+                {"name": "value", "type": "bytes"},
+                {"name": "metadata", "type": "bytes"}
+            "#,
+        );
+        let (metadata, value) = variant_bytes();
+        let value = variant_value(vec![
+            ("value".to_string(), Value::Bytes(value)),
+            ("metadata".to_string(), Value::Bytes(metadata)),
+        ]);
+
+        let mut reader = AvroArrowArrayReader::try_new([Ok(value)].into_iter(), &schema).unwrap();
+        let batch = reader.next_batch(10).unwrap().unwrap();
+        let variant_column = batch
+            .column_by_name("var")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        assert!(variant_column.column_by_name("metadata").is_some());
+        assert_eq!(
+            VariantArray::try_new(batch.column_by_name("var").unwrap())
+                .unwrap()
+                .value(0),
+            Variant::from("iceberg")
+        );
+    }
+}

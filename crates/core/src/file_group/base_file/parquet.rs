@@ -189,14 +189,39 @@ impl BaseFileReader for ParquetBaseFileReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{ArrayRef, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+    use parquet::variant::{
+        Variant, VariantArray, VariantArrayBuilder, VariantBuilderExt, VariantType,
+    };
+    use std::fs::File;
     use std::fs::canonicalize;
     use std::path::Path;
+    use tempfile::TempDir;
     use url::Url;
 
     fn test_storage() -> Arc<Storage> {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         Storage::new_with_base_url(base_url).unwrap()
+    }
+
+    fn temp_storage(temp_dir: &TempDir) -> Arc<Storage> {
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        Storage::new_with_base_url(base_url).unwrap()
+    }
+
+    fn write_variant_parquet(path: &Path) {
+        let mut builder = VariantArrayBuilder::new(2);
+        builder.append_value("iceberg");
+        builder.append_value("hudi");
+        let array = builder.build();
+        let schema = arrow_schema::Schema::new(vec![array.field("var")]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![ArrayRef::from(array)]).unwrap();
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
     }
 
     #[tokio::test]
@@ -279,5 +304,43 @@ mod tests {
         let meta = reader.get_parquet_metadata("a.parquet").await.unwrap();
         assert_eq!(meta.file_metadata().num_rows(), 5);
         assert!(!meta.row_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_variant_parquet_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_variant_parquet(&temp_dir.path().join("variant.parquet"));
+        let reader = ParquetBaseFileReader::new(temp_storage(&temp_dir));
+
+        let batch = reader
+            .read_data("variant.parquet", BaseFileReadOptions::default())
+            .await
+            .unwrap();
+        let schema = batch.schema();
+        let field = schema.field_with_name("var").unwrap();
+        field.try_extension_type::<VariantType>().unwrap();
+
+        let variant_array = VariantArray::try_new(batch.column_by_name("var").unwrap()).unwrap();
+        assert_eq!(variant_array.value(0), Variant::from("iceberg"));
+        assert_eq!(variant_array.value(1), Variant::from("hudi"));
+    }
+
+    #[tokio::test]
+    async fn test_project_variant_parquet_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_variant_parquet(&temp_dir.path().join("variant.parquet"));
+        let reader = ParquetBaseFileReader::new(temp_storage(&temp_dir));
+
+        let opts = BaseFileReadOptions::default().with_projection(["var"]);
+        let batch = reader.read_data("variant.parquet", opts).await.unwrap();
+
+        assert_eq!(batch.num_columns(), 1);
+        batch
+            .schema()
+            .field_with_name("var")
+            .unwrap()
+            .try_extension_type::<VariantType>()
+            .unwrap();
+        assert!(VariantArray::try_new(batch.column_by_name("var").unwrap()).is_ok());
     }
 }
