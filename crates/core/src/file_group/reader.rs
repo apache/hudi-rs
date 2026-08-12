@@ -263,16 +263,23 @@ impl FileGroupReader {
     fn version_two_unsupported_reason(
         &self,
         options: &ReadOptions,
+        base_file_only: bool,
     ) -> Result<Option<&'static str>> {
         // Deliberately an error rather than a fallback: falling back would use
         // version 1's own merge derivation, which drops deletes on a
         // commit-time-ordered table. Wrong rows are worse than a refusal.
-        if let Some(mode) = self
-            .hudi_configs
-            .as_options()
-            // Read by raw key: this crate has no typed config for it yet, and
-            // adding one belongs with the reader that acts on it.
-            .get("hoodie.record.merge.mode")
+        //
+        // Only when a merge actually happens, though. A slice with nothing to
+        // merge — copy-on-write, or read-optimized — returns base rows without
+        // consulting a merger at all, so refusing it would break reads that work
+        // today over a mode they never reach.
+        if !base_file_only
+            && let Some(mode) = self
+                .hudi_configs
+                .as_options()
+                // Read by raw key: this crate has no typed config for it yet, and
+                // adding one belongs with the reader that acts on it.
+                .get("hoodie.record.merge.mode")
             && mode.eq_ignore_ascii_case("CUSTOM")
         {
             return Err(CoreError::Unsupported(
@@ -328,7 +335,7 @@ impl FileGroupReader {
         let base_file_only = log_file_paths.is_empty() || options.is_read_optimized()?;
 
         if self.file_group_reader_version()? == FileGroupReaderVersion::Two {
-            match self.version_two_unsupported_reason(&options)? {
+            match self.version_two_unsupported_reason(&options, base_file_only)? {
                 None => {
                     // Claiming a capability is claiming the rows are right, and
                     // nothing in this crate can check that at runtime: a reader
@@ -1759,7 +1766,7 @@ mod file_group_reader_version_tests {
             FileGroupReaderVersion::Two
         );
 
-        let reason = reader.version_two_unsupported_reason(&ReadOptions::new())?;
+        let reason = reader.version_two_unsupported_reason(&ReadOptions::new(), false)?;
         assert!(
             reason.is_some(),
             "with no engine wired up, every read must fall back"
@@ -1776,7 +1783,7 @@ mod file_group_reader_version_tests {
         let slices = table.get_file_slices(&ReadOptions::new()).await?;
         assert!(!slices.is_empty(), "fixture must have a file slice to read");
 
-        let read_with = async |engine: Option<&str>| -> Result<usize> {
+        let read_with = async |engine: Option<&str>| -> Result<Vec<String>> {
             let options: Vec<(&str, String)> = match engine {
                 Some(e) => vec![(
                     HudiReadConfig::FileGroupReaderVersion.as_ref(),
@@ -1785,20 +1792,90 @@ mod file_group_reader_version_tests {
                 None => Vec::new(),
             };
             let reader = FileGroupReader::new_with_options(base_url.as_ref(), options).await?;
-            let mut rows = 0;
+            // Rendered cell by cell rather than counted: a row count would
+            // match even if the columns or the values differed.
+            let mut rendered: Vec<String> = Vec::new();
             for slice in &slices {
-                rows += reader
-                    .read_file_slice(slice, &ReadOptions::new())
-                    .await?
-                    .num_rows();
+                let batch = reader.read_file_slice(slice, &ReadOptions::new()).await?;
+                let names: Vec<String> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                rendered.push(names.join(","));
+                for row in 0..batch.num_rows() {
+                    let cells: Vec<String> = batch
+                        .columns()
+                        .iter()
+                        .map(|col| {
+                            arrow_cast::display::array_value_to_string(col.as_ref(), row)
+                                .unwrap_or_else(|_| "<unrenderable>".to_string())
+                        })
+                        .collect();
+                    rendered.push(cells.join(" | "));
+                }
             }
-            Ok(rows)
+            rendered.sort();
+            Ok(rendered)
         };
 
         assert_eq!(
             read_with(None).await?,
             read_with(Some("1")).await?,
             "the default must return what an explicit version 1 read returns"
+        );
+        Ok(())
+    }
+
+    /// A table declaring a CUSTOM record merge mode still reads when there is
+    /// nothing to merge.
+    ///
+    /// The refusal exists because falling back would merge with version 1's own
+    /// derivation, which drops deletes. But a copy-on-write slice and a
+    /// read-optimized read never consult a merger, so refusing them would break
+    /// reads that work today over a mode they never reach — and version 2 being
+    /// the default means nobody opted in to that.
+    #[tokio::test]
+    async fn test_version_two_unsupported_reason_custom_merge_mode_without_merge_returns_reason()
+    -> Result<()> {
+        let reader = reader_with([("hoodie.record.merge.mode", "CUSTOM".to_string())]).await?;
+
+        // Nothing to merge: falls back like any other unimplemented capability.
+        assert!(
+            reader
+                .version_two_unsupported_reason(&ReadOptions::new(), true)?
+                .is_some(),
+            "a read with nothing to merge must not be refused for a merge mode"
+        );
+
+        // A read-optimized read reaches the same conclusion through `options`.
+        let read_optimized = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+        assert!(
+            reader
+                .version_two_unsupported_reason(&read_optimized, true)?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// The same table is refused once a merge is actually involved.
+    #[tokio::test]
+    async fn test_version_two_unsupported_reason_custom_merge_mode_with_merge_returns_error()
+    -> Result<()> {
+        let reader = reader_with([("hoodie.record.merge.mode", "CUSTOM".to_string())]).await?;
+
+        let err = reader
+            .version_two_unsupported_reason(&ReadOptions::new(), false)
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Unsupported(_)),
+            "expected a refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("CUSTOM"),
+            "the error must name why"
         );
         Ok(())
     }
