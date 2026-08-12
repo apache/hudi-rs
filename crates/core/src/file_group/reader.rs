@@ -224,7 +224,7 @@ impl FileGroupReader {
 
     /// Which merge implementation serves this read.
     ///
-    /// A metadata table is always served by the legacy reader whatever the
+    /// A metadata table is always served by version 1 whatever the
     /// setting says: its base files and log blocks are HFile, which the
     /// merge-on-read engine has no support for. That is permanent, not
     /// transitional.
@@ -252,11 +252,11 @@ impl FileGroupReader {
     ///
     /// This is a capability check, decided from config before any I/O — never a
     /// catch-all on error. A read that fails *inside* the engine propagates:
-    /// retrying it on the legacy reader would make a bug look like a success,
+    /// retrying it on version 1 would make a bug look like a success,
     /// make results depend on which engine happened to win, and leave the
     /// differential tests unable to see anything.
     ///
-    /// Every reason here means the legacy reader serves the read instead, so
+    /// Every reason here means version 1 serves the read instead, so
     /// selecting the engine cannot turn a working read into a failing one. Each
     /// reason is logged, because a fallback nobody can observe is
     /// indistinguishable from an engine that is never used.
@@ -265,7 +265,7 @@ impl FileGroupReader {
         options: &ReadOptions,
     ) -> Result<Option<&'static str>> {
         // Deliberately an error rather than a fallback: falling back would use
-        // the legacy reader's own merge derivation, which drops deletes on a
+        // version 1's own merge derivation, which drops deletes on a
         // commit-time-ordered table. Wrong rows are worse than a refusal.
         if let Some(mode) = self
             .hudi_configs
@@ -345,12 +345,17 @@ impl FileGroupReader {
                     ));
                 }
                 Some(reason) => {
-                    log::debug!("reading '{base_file_path}' with the legacy engine: {reason}")
+                    log::debug!(
+                        "reading '{base_file_path}' with file group reader version 1: {reason}"
+                    )
                 }
             }
         }
 
         let merged = if base_file_only {
+            // Nothing to merge — a copy-on-write slice, or a read-optimized read
+            // that ignores the log files. Served by the base file reader, not by
+            // either file group reader, so the version above does not reach it.
             self.read_base_file_eager(base_file_path).await?
         } else {
             let instant_range = self.create_instant_range_for_log_file_scan()?;
@@ -1676,7 +1681,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod reader_version_seam_tests {
+mod file_group_reader_version_tests {
     use super::*;
     use crate::config::util::empty_options;
     use hudi_test::SampleTable;
@@ -1693,25 +1698,19 @@ mod reader_version_seam_tests {
     /// the default only once it were capable would put the whole behaviour change
     /// in one commit; this way each capability carries its own.
     #[tokio::test]
-    async fn the_default_version_is_two_and_still_falls_back() -> Result<()> {
+    async fn test_file_group_reader_version_unset_returns_two() -> Result<()> {
         let reader = reader_with(Vec::<(&'static str, String)>::new()).await?;
         assert_eq!(
             reader.file_group_reader_version()?,
             FileGroupReaderVersion::Two
         );
-        assert!(
-            reader
-                .version_two_unsupported_reason(&ReadOptions::new())?
-                .is_some(),
-            "the default must still be served by the existing reader"
-        );
         Ok(())
     }
 
-    /// `legacy` remains reachable, so a caller can opt out of the engine
+    /// Version 1 remains reachable, so a caller can opt out of version 2
     /// entirely rather than relying on it to keep falling back.
     #[tokio::test]
-    async fn version_one_stays_selectable_as_an_escape_hatch() -> Result<()> {
+    async fn test_file_group_reader_version_one_returns_one() -> Result<()> {
         let reader = reader_with([(
             HudiReadConfig::FileGroupReaderVersion.as_ref(),
             "1".to_string(),
@@ -1727,7 +1726,7 @@ mod reader_version_seam_tests {
     /// A typo must not read with the other engine. `get_or_default` would have
     /// swallowed this and left the caller believing they had exercised `v2`.
     #[tokio::test]
-    async fn an_unrecognised_version_is_an_error() -> Result<()> {
+    async fn test_file_group_reader_version_unrecognised_returns_config_error() -> Result<()> {
         let reader = reader_with([(
             HudiReadConfig::FileGroupReaderVersion.as_ref(),
             "9".to_string(),
@@ -1746,9 +1745,10 @@ mod reader_version_seam_tests {
     }
 
     /// Asking for the engine is a request, not a guarantee: every capability is
-    /// unimplemented so far, so the legacy reader serves the read and says why.
+    /// unimplemented so far, so version 1 serves the read and says why.
     #[tokio::test]
-    async fn asking_for_version_two_falls_back_with_a_reason() -> Result<()> {
+    async fn test_version_two_unsupported_reason_nothing_implemented_returns_reason() -> Result<()>
+    {
         let reader = reader_with([(
             HudiReadConfig::FileGroupReaderVersion.as_ref(),
             "2".to_string(),
@@ -1770,7 +1770,7 @@ mod reader_version_seam_tests {
     /// The fall back is what makes the default safe: a read works exactly as it
     /// did, because the existing reader served it either way.
     #[tokio::test]
-    async fn selecting_version_two_does_not_change_what_a_read_returns() -> Result<()> {
+    async fn test_read_file_slice_from_paths_default_version_matches_version_one() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
         let table = crate::table::Table::new(base_url.path()).await?;
         let slices = table.get_file_slices(&ReadOptions::new()).await?;
@@ -1803,11 +1803,11 @@ mod reader_version_seam_tests {
         Ok(())
     }
 
-    /// A metadata table is served by the legacy reader whatever the setting
+    /// A metadata table is served by version 1 whatever the setting
     /// says, so setting the engine globally cannot make one unreadable — table
     /// listing itself reads one.
     #[tokio::test]
-    async fn a_metadata_table_ignores_the_setting() -> Result<()> {
+    async fn test_file_group_reader_version_metadata_table_returns_one() -> Result<()> {
         use crate::config::HudiConfigs;
         use crate::config::table::HudiTableConfig;
         use std::collections::HashMap;
