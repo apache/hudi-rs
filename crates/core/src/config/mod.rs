@@ -250,6 +250,15 @@ impl HudiConfigs {
         self.raw_options.contains_key(key.as_ref())
     }
 
+    /// Look up a raw value without copying the option map.
+    ///
+    /// For a key this crate has no typed config for. Prefer [`Self::try_get`]
+    /// where one exists — it parses, and errors rather than silently returning
+    /// the default when a value is malformed.
+    pub fn get_raw(&self, key: impl AsRef<str>) -> Option<&str> {
+        self.raw_options.get(key.as_ref()).map(String::as_str)
+    }
+
     /// Get value for the given config. Return [Result] with the value.
     /// If the config is not found or value was not parsed properly, return [Err].
     pub fn get(

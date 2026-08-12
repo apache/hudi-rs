@@ -180,6 +180,18 @@ impl FileGroupReaderVersion {
     }
 }
 
+impl TryFrom<usize> for FileGroupReaderVersion {
+    type Error = ConfigError;
+
+    fn try_from(value: usize) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::One),
+            2 => Ok(Self::Two),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
 impl Display for FileGroupReaderVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_usize())

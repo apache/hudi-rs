@@ -49,7 +49,6 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryFutureExt};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::str::FromStr;
 use std::sync::Arc;
 
 /// The reader that handles all read operations against a file group.
@@ -238,12 +237,17 @@ impl FileGroupReader {
         if self.is_metadata_table() {
             return Ok(FileGroupReaderVersion::One);
         }
+        // `try_get` rather than `get_or_default`: the latter returns the default
+        // when a value fails to parse, so a typo would silently read with the
+        // other version and leave a caller convinced they had exercised the one
+        // they asked for. Borrowing, so no copy of the config map per read.
         match self
             .hudi_configs
-            .as_options()
-            .get(HudiReadConfig::FileGroupReaderVersion.as_ref())
+            .try_get(HudiReadConfig::FileGroupReaderVersion)?
         {
-            Some(raw) => FileGroupReaderVersion::from_str(raw).map_err(CoreError::Config),
+            Some(value) => {
+                FileGroupReaderVersion::try_from(usize::from(value)).map_err(CoreError::Config)
+            }
             None => Ok(FileGroupReaderVersion::default()),
         }
     }
@@ -274,12 +278,10 @@ impl FileGroupReader {
         // consulting a merger at all, so refusing it would break reads that work
         // today over a mode they never reach.
         if !base_file_only
-            && let Some(mode) = self
-                .hudi_configs
-                .as_options()
-                // Read by raw key: this crate has no typed config for it yet, and
-                // adding one belongs with the reader that acts on it.
-                .get("hoodie.record.merge.mode")
+            // Read by raw key: this crate has no typed config for it yet, and
+            // adding one belongs with the reader that acts on it. Borrowed, so
+            // no copy of the option map per read.
+            && let Some(mode) = self.hudi_configs.get_raw("hoodie.record.merge.mode")
             && mode.eq_ignore_ascii_case("CUSTOM")
         {
             return Err(CoreError::Unsupported(
@@ -1690,7 +1692,6 @@ mod tests {
 #[cfg(test)]
 mod file_group_reader_version_tests {
     use super::*;
-    use crate::config::util::empty_options;
     use hudi_test::SampleTable;
 
     async fn reader_with(
