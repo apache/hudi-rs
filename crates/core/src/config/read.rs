@@ -192,12 +192,6 @@ impl TryFrom<usize> for FileGroupReaderVersion {
     }
 }
 
-impl Display for FileGroupReaderVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_usize())
-    }
-}
-
 impl FromStr for FileGroupReaderVersion {
     type Err = ConfigError;
 
@@ -388,6 +382,19 @@ mod tests {
         assert!(AsOfTimestamp.default_value().is_none());
         assert!(StartTimestamp.default_value().is_none());
         assert!(EndTimestamp.default_value().is_none());
+    }
+
+    #[test]
+    fn file_group_reader_version_try_from_usize_accepts_1_and_2_and_rejects_others() {
+        assert_eq!(
+            FileGroupReaderVersion::try_from(1).unwrap(),
+            FileGroupReaderVersion::One
+        );
+        assert_eq!(
+            FileGroupReaderVersion::try_from(2).unwrap(),
+            FileGroupReaderVersion::Two
+        );
+        assert!(FileGroupReaderVersion::try_from(3).is_err());
     }
 
     #[test]

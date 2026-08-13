@@ -225,12 +225,12 @@ impl FileGroupReader {
     ///
     /// A metadata table is always served by version 1 whatever the
     /// setting says: its base files and log blocks are HFile, which the
-    /// merge-on-read engine has no support for. That is permanent, not
+    /// file group reader version 2 has no support for. That is permanent, not
     /// transitional.
     ///
     /// The value is read raw rather than through `get_or_default`, which falls
-    /// back to the default when a value fails to parse. A typo in the engine
-    /// name would then silently read with the other engine, leaving a caller
+    /// back to the default when a value fails to parse. A typo in the version
+    /// would then silently read with the other version, leaving a caller
     /// convinced they had exercised it — the one outcome this switch must not
     /// produce.
     fn file_group_reader_version(&self) -> Result<FileGroupReaderVersion> {
@@ -252,18 +252,18 @@ impl FileGroupReader {
         }
     }
 
-    /// Why the merge-on-read engine cannot serve this read, if it cannot.
+    /// Why file group reader version 2 cannot serve this read, if it cannot.
     ///
     /// This is a capability check, decided from config before any I/O — never a
-    /// catch-all on error. A read that fails *inside* the engine propagates:
+    /// catch-all on error. A read that fails *inside* version 2 propagates:
     /// retrying it on version 1 would make a bug look like a success,
-    /// make results depend on which engine happened to win, and leave the
+    /// make results depend on which reader happened to win, and leave the
     /// differential tests unable to see anything.
     ///
     /// Every reason here means version 1 serves the read instead, so
-    /// selecting the engine cannot turn a working read into a failing one. Each
+    /// selecting a version cannot turn a working read into a failing one. Each
     /// reason is logged, because a fallback nobody can observe is
-    /// indistinguishable from an engine that is never used.
+    /// indistinguishable from a reader that is never used.
     fn version_two_unsupported_reason(
         &self,
         options: &ReadOptions,
@@ -296,7 +296,7 @@ impl FileGroupReader {
         // loudly here rather than reaching a reader that cannot read HFile.
         if self.is_metadata_table() {
             return Err(CoreError::Unsupported(
-                "The merge-on-read engine cannot read a metadata table's HFile \
+                "File group reader version 2 cannot read a metadata table's HFile \
                  base files and log blocks"
                     .to_string(),
             ));
@@ -307,10 +307,10 @@ impl FileGroupReader {
         }
         // The fallthrough reports *unsupported*, deliberately: capability is
         // enumerated, not assumed, so a situation nobody considered falls back
-        // rather than being served by an engine that has never seen it.
+        // rather than being served by a reader that has never seen it.
         // Inverting this is a one-line change with no visible symptom, which is
         // why it is called out here.
-        Ok(Some("the merge-on-read engine is not wired up yet"))
+        Ok(Some("file group reader version 2 is not wired up yet"))
     }
 
     /// Reads a file slice from a base file and a list of log files.
@@ -346,8 +346,8 @@ impl FileGroupReader {
                     // that is a test harness. So a capability may only be added
                     // together with fixture coverage proving it.
                     return Err(CoreError::Unsupported(
-                        "The merge-on-read engine reports itself able to serve this read, \
-                         but no engine is wired up behind the switch yet. A capability must \
+                        "File group reader version 2 reports itself able to serve this read, \
+                         but nothing is wired up behind the switch yet. A capability must \
                          not be claimed here before there is fixture coverage comparing its \
                          output against Hudi's reader"
                             .to_string(),
@@ -1701,7 +1701,7 @@ mod file_group_reader_version_tests {
         FileGroupReader::new_with_options(base_url.as_ref(), options).await
     }
 
-    /// The merge-on-read engine is the default, and nothing changes for a caller
+    /// File group reader version 2 is the default, and nothing changes for a caller
     /// who sets nothing — because every capability falls back today. Making it
     /// the default only once it were capable would put the whole behaviour change
     /// in one commit; this way each capability carries its own.
@@ -1731,7 +1731,34 @@ mod file_group_reader_version_tests {
         Ok(())
     }
 
-    /// A typo must not read with the other engine. `get_or_default` would have
+    /// The guard inside the check, reached only if the dispatch's metadata
+    /// routing were ever removed. Asserted directly because the dispatch answers
+    /// metadata tables before the check runs, so no read can reach it today —
+    /// which is exactly why it must keep erroring rather than fall through to a
+    /// reader that cannot read HFile.
+    #[tokio::test]
+    async fn test_version_two_unsupported_reason_metadata_table_returns_error() -> Result<()> {
+        use crate::config::HudiConfigs;
+        use crate::config::table::HudiTableConfig;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref(),
+            super::tests::get_metadata_table_base_uri(),
+        )]));
+        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let err = reader
+            .version_two_unsupported_reason(&ReadOptions::new(), false)
+            .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Unsupported(ref m) if m.contains("metadata table")),
+            "expected an unsupported error naming the metadata table, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A typo must not read with the other version. `get_or_default` would have
     /// swallowed this and left the caller believing they had exercised `v2`.
     #[tokio::test]
     async fn test_file_group_reader_version_unrecognised_returns_config_error() -> Result<()> {
@@ -1752,7 +1779,7 @@ mod file_group_reader_version_tests {
         Ok(())
     }
 
-    /// Asking for the engine is a request, not a guarantee: every capability is
+    /// Asking for a version is a request, not a guarantee: every capability is
     /// unimplemented so far, so version 1 serves the read and says why.
     #[tokio::test]
     async fn test_version_two_unsupported_reason_nothing_implemented_returns_reason() -> Result<()>
@@ -1770,7 +1797,7 @@ mod file_group_reader_version_tests {
         let reason = reader.version_two_unsupported_reason(&ReadOptions::new(), false)?;
         assert!(
             reason.is_some(),
-            "with no engine wired up, every read must fall back"
+            "with nothing wired up, every read must fall back"
         );
         Ok(())
     }
@@ -1784,8 +1811,8 @@ mod file_group_reader_version_tests {
         let slices = table.get_file_slices(&ReadOptions::new()).await?;
         assert!(!slices.is_empty(), "fixture must have a file slice to read");
 
-        let read_with = async |engine: Option<&str>| -> Result<Vec<String>> {
-            let options: Vec<(&str, String)> = match engine {
+        let read_with = async |version: Option<&str>| -> Result<Vec<String>> {
+            let options: Vec<(&str, String)> = match version {
                 Some(e) => vec![(
                     HudiReadConfig::FileGroupReaderVersion.as_ref(),
                     e.to_string(),
@@ -1882,7 +1909,7 @@ mod file_group_reader_version_tests {
     }
 
     /// A metadata table is served by version 1 whatever the setting
-    /// says, so setting the engine globally cannot make one unreadable — table
+    /// says, so setting the version globally cannot make one unreadable — table
     /// listing itself reads one.
     #[tokio::test]
     async fn test_file_group_reader_version_metadata_table_returns_one() -> Result<()> {
