@@ -97,6 +97,17 @@ pub enum HudiReadConfig {
     /// When set to true, only base files will be read for optimized reads.
     /// This is only applicable to Merge-On-Read (MOR) tables.
     UseReadOptimizedMode,
+    /// Which implementation of the file group reader serves a read: `2`
+    /// (default) or `1`.
+    ///
+    /// A read version 2 cannot serve is served by version 1 instead, so neither
+    /// value can make a working read fail. Set `1` explicitly to opt out of the
+    /// newer reader entirely.
+    ///
+    /// An unrecognised value is an error rather than a fall back to the default
+    /// — silently reading with the other implementation would leave a caller
+    /// convinced they had exercised the one they asked for.
+    FileGroupReaderVersion,
 
     /// Target number of rows per batch for streaming reads.
     /// This controls the batch size when using streaming APIs.
@@ -118,6 +129,7 @@ impl HudiReadConfig {
             Self::EndTimestamp => "hoodie.read.end.timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
+            Self::FileGroupReaderVersion => "hoodie.read.file.group.reader.version",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
         }
@@ -136,6 +148,62 @@ impl Display for HudiReadConfig {
     }
 }
 
+/// Which implementation of the file group reader serves a read.
+///
+/// Numbered rather than named after a strategy, because the older one is being
+/// retired rather than kept as an alternative: a version says newer supersedes
+/// older, where a name like `batch_merge` would imply a permanent choice.
+/// Matches how Hudi already versions `hoodie.table.version` and
+/// `hoodie.timeline.layout.version`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileGroupReaderVersion {
+    /// The reader that has always served reads: whole-batch sort and dedup.
+    /// Reachable explicitly, as an escape hatch, and reached by fall back
+    /// whenever [`Self::Two`] cannot serve a read.
+    One,
+    /// The merge-on-read reader being ported in, and the default.
+    ///
+    /// It does not serve every read yet. Anything it cannot serve is served by
+    /// [`Self::One`] instead, which is why it can be the default this early:
+    /// what changes a read is the reader gaining a capability, not this setting.
+    #[default]
+    Two,
+}
+
+impl FileGroupReaderVersion {
+    /// The integer a caller writes in config.
+    pub fn as_usize(&self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+}
+
+impl TryFrom<usize> for FileGroupReaderVersion {
+    type Error = ConfigError;
+
+    fn try_from(value: usize) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::One),
+            2 => Ok(Self::Two),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
+impl FromStr for FileGroupReaderVersion {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim() {
+            "1" => Ok(Self::One),
+            "2" => Ok(Self::Two),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
 impl ConfigParser for HudiReadConfig {
     type Output = HudiConfigValue;
 
@@ -146,6 +214,9 @@ impl ConfigParser for HudiReadConfig {
             )),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
+            HudiReadConfig::FileGroupReaderVersion => Some(HudiConfigValue::UInteger(
+                FileGroupReaderVersion::default().as_usize(),
+            )),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
             _ => None,
@@ -170,6 +241,9 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
+            Self::FileGroupReaderVersion => get_result
+                .and_then(FileGroupReaderVersion::from_str)
+                .map(|v| HudiConfigValue::UInteger(v.as_usize())),
             Self::UseReadOptimizedMode => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
@@ -308,6 +382,19 @@ mod tests {
         assert!(AsOfTimestamp.default_value().is_none());
         assert!(StartTimestamp.default_value().is_none());
         assert!(EndTimestamp.default_value().is_none());
+    }
+
+    #[test]
+    fn file_group_reader_version_try_from_usize_accepts_1_and_2_and_rejects_others() {
+        assert_eq!(
+            FileGroupReaderVersion::try_from(1).unwrap(),
+            FileGroupReaderVersion::One
+        );
+        assert_eq!(
+            FileGroupReaderVersion::try_from(2).unwrap(),
+            FileGroupReaderVersion::Two
+        );
+        assert!(FileGroupReaderVersion::try_from(3).is_err());
     }
 
     #[test]
