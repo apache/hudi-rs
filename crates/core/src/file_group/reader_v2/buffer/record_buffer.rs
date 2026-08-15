@@ -47,13 +47,13 @@ use std::vec::IntoIter;
 /// - `buffered_record_merger` — for delta merge (log-vs-log) and final merge (base-vs-log)
 /// - `update_processor` — strategy for processing updates during merge iteration
 /// - `base_file_source` / `current_base_batch` / `base_row_idx` — lazy
-///   counterpart of Java's `baseFileIterator`: a `RecordBatchReader` from
-///   which the merge loop pulls one parquet row-group at a time. For tests
-///   and the `read()` back-compat path, the source is just a
-///   `RecordBatchIterator` wrapping a pre-built Vec; for the streaming
-///   `open()` path, it is a `ParquetSyncReader`. The current batch is
-///   interned into an `Arc` so base records become zero-copy `BatchRef`s
-///   into the streamed batch.
+///   counterpart of Java's `baseFileIterator`. The lazy source replaced the
+///   eagerly-loaded `Vec<RecordBatch>` with a `RecordBatchReader` so the
+///   merge loop pulls one parquet row-group at a time. For tests and the
+///   `read()` back-compat path, the source is just a `RecordBatchIterator`
+///   wrapping a pre-built Vec; for the FFI streaming path, it is a
+///   `ParquetSyncReader`. The current batch is interned into an `Arc` so
+///   base records become zero-copy `BatchRef`s into the streamed batch.
 /// - `next_record` — Java's `nextRecord` (the lookahead for has_next/next pattern)
 pub struct FileGroupRecordBuffer {
     /// The per-key records map. Mirrors Java's `ExternalSpillableMap`: keeps
@@ -79,11 +79,11 @@ pub struct FileGroupRecordBuffer {
     /// Lazy base file source set by [`HoodieFileGroupRecordBuffer::set_base_file_source`].
     /// `None` until log scan + base open has run, or for log-only file groups.
     ///
-    /// The base file is pulled one parquet row-group at a time from this
-    /// `RecordBatchReader` rather than eagerly collected and concatenated
-    /// into a `Vec<RecordBatch>`. For tests and the `read()` back-compat
-    /// path the source is a `RecordBatchIterator` over a pre-built vec; for
-    /// the streaming `open()` path it is a `ParquetSyncReader`.
+    /// A3 — the base file is pulled one parquet row-group at a
+    /// time from this `RecordBatchReader` instead of being eagerly collected
+    /// and concatenated into a `Vec<RecordBatch>`. For tests and the `read()`
+    /// back-compat path the source is a `RecordBatchIterator` over a pre-built
+    /// vec; for the FFI streaming path (`open()`) it is a `ParquetSyncReader`.
     pub base_file_source: Option<Box<dyn RecordBatchReader + Send>>,
 
     /// The current base file batch being iterated, interned into a single

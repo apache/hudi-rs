@@ -120,8 +120,8 @@ pub struct ReaderContext {
     /// appear in one of those two, or it reads as unset.
     pub hoodie_reader_config: HashMap<String, String>,
     /// Optional parquet `RowFilter` builder for predicate pushdown into base
-    /// parquet files and parquet-format log blocks. Set by a caller that
-    /// pushes a predicate down; `None` when no predicate was pushed.
+    /// parquet files and parquet-format log blocks. Set by the FFI bridge from
+    /// the decoded substrait predicate; `None` when no predicate was pushed.
     ///
     /// Whether it actually gets installed is gated by [`Self::mor_pk_safe`] +
     /// table type (see callers in `file_group::reader::HoodieFileGroupReader`
@@ -145,14 +145,14 @@ pub struct ReaderContext {
     /// On COPY_ON_WRITE tables this flag is irrelevant — all filters push
     /// because no merge happens. On MERGE_ON_READ, only filters with this
     /// flag true are pushed; filters touching non-PK columns wait for
-    /// post-merge evaluation (handled by the query engine above the FG
-    /// reader).
+    /// post-merge evaluation (handled by the caller — Velox/Spark — above
+    /// the FG reader).
     pub mor_pk_safe: bool,
     /// Gate-3 completed/inflight inputs (completed/inflight/archived sets).
     /// Carried here mirroring [`Self::instant_range`]; `Some` only for table
-    /// version < 8 snapshot reads whose caller enables the gate, `None`
-    /// otherwise (v8+/incremental/no-timeline) which
-    /// leaves Gate 3 a no-op. Consumed by the log
+    /// version < 8 snapshot reads (set by the FFI bridge when the planner
+    /// enabled the gate), `None` otherwise (v8+/incremental/no-timeline) which
+    /// leaves Gate 3 a no-op, preserving prior behavior. Consumed by the log
     /// scan builder in `buffer::loader::scan_log_files`.
     pub completion_gate_inputs: Option<CompletionGateInputs>,
 }
@@ -233,8 +233,9 @@ impl ReaderContext {
         Self::record_key_fields_from(&self.table_config)
     }
 
-    /// Static version of [`Self::record_key_fields`], for callers that need
-    /// the PK fields to decide `mor_pk_safe` before a `ReaderContext` exists.
+    /// Static version of [`Self::record_key_fields`]. Used at FFI entry when
+    /// a `ReaderContext` doesn't yet exist (we need PK fields to decide
+    /// `mor_pk_safe` before constructing the context).
     pub fn record_key_fields_from(table_config: &HashMap<String, String>) -> Vec<String> {
         // Delegate to the canonical parse on RecordContext so the two types can never
         // disagree on the key-field list.

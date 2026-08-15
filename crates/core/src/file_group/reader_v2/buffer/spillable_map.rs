@@ -184,9 +184,9 @@ pub const CONFIG_MERGE_MAX_SIZE: &str = "hoodie.memory.merge.max.size";
 /// eviction cannot bring it back down (e.g. a single oversized record or pinned
 /// source batch), the insert fails loudly with
 /// [`CoreError::MemoryLimitExceeded`] instead of continuing to allocate and
-/// risking a silent executor OOM. Unset (the default) → no cap, giving the
-/// spill-only behavior. An embedding engine that reserves memory against the
-/// reader can set this to enforce its reservation.
+/// risking a silent executor OOM. Unset (the default) → no cap, preserving the
+/// pre-existing spill-only behavior. This is the hudi-rs foundation the velox
+/// memory-reservation work builds on.
 ///
 /// OPERATIONAL NOTE: because the cap is opt-in, the loud-OOM protection is
 /// inert unless the embedding engine sets this key — deployments relying on it
@@ -562,8 +562,8 @@ impl SpillableRecordMap {
     /// (an alias of [`true_retained_bytes`](Self::true_retained_bytes), named for
     /// external callers): the distinct pinned source batches plus owned-payload,
     /// key, and per-entry-overhead bytes. It is the quantity a host memory
-    /// manager (e.g. an embedding engine's memory pool) needs in order to
-    /// RESERVE against the reader's footprint, and the value the hard peak cap
+    /// manager (e.g. velox's `MemoryPool`) needs in order to RESERVE against the
+    /// hudi-rs reader's footprint, and the value the hard peak cap
     /// ([`CONFIG_MAX_PEAK_MEMORY`]) is enforced against.
     ///
     /// # What is and isn't included

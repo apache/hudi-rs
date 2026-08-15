@@ -161,8 +161,8 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
 
     /// The merge map's CURRENT tracked in-memory footprint (bytes) — the live
     /// resident heap right now, not the peak. This is the value a host memory
-    /// manager (e.g. an embedding engine's memory pool) can reserve against
-    /// the hudi-rs reader. Default 0 for
+    /// manager (e.g. velox's `MemoryPool`) reserves against the hudi-rs reader;
+    /// the FFI reader-memory accessor forwards it. Default 0 for
     /// buffers without a spillable map. See
     /// [`SpillableRecordMap::current_in_memory_bytes`](super::spillable_map::SpillableRecordMap::current_in_memory_bytes)
     /// for exactly what is and isn't included.

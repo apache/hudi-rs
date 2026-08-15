@@ -53,7 +53,7 @@ pub trait OutputConverter: Send + Sync + std::fmt::Debug {
 /// struct has fewer (or reordered) subfields than the source's.
 ///
 /// Without nested narrowing, downstream consumers that expect a pruned struct
-/// (a strict engine-side type check on the arrow batch) reject
+/// (e.g. Velox's `RowVector` ctor type check at `ComplexVector.h:62`) reject
 /// the record because the child's type doesn't match the declared parent
 /// schema.
 ///

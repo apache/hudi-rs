@@ -146,7 +146,7 @@ fg_case_test!(
 // =============================================================================
 
 /// Config key for the hard peak-memory cap (`SpillableRecordMap`'s
-/// `CONFIG_MAX_PEAK_MEMORY`). Spelled here as the literal an operator
+/// `CONFIG_MAX_PEAK_MEMORY`). Spelled here as the literal an operator/gluten
 /// forwards, so the case exercises the string→config parse just like production.
 const MERGE_MAX_PEAK_SIZE_KEY: &str = "hoodie.memory.merge.max.peak.size";
 
@@ -397,7 +397,7 @@ fg_case_test!(
     }
 );
 
-// Projection through the builder path: schemas live on
+// Projection through the FFI/builder path: schemas live on
 // `ReaderContext.schema_handler`, reader built via `.builder()` with NO
 // explicit schemas. Guards the regression where a builder-constructed reader
 // with an empty schema handler left required_schema = None (base read
@@ -476,7 +476,7 @@ fg_case_test!(
 
 /// Component: Verify `required_schema` includes only the expected columns.
 ///
-/// Constructs a `FileGroupReaderSchemaHandler` mimicking an external caller, calls
+/// Constructs a `FileGroupReaderSchemaHandler` mimicking the FFI flow, calls
 /// `prepare_required_schema`, and verifies the computed `required_schema`
 /// contains the requested columns PLUS mandatory merge fields, but NOT the
 /// full parquet schema.
@@ -707,11 +707,10 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
 // =============================================================================
 // NULL elements inside containers (table_null_containers fixture)
 //
-// Mirrors the external read path of TestMORFileSliceLayoutsExtendedTypes
+// Mirrors the Gluten/FFI read path of TestMORFileSliceLayoutsExtendedTypes
 // "2. NULL elements in containers and empty containers": the data/requested
-// schemas are derived from the table's Avro schema JSON (as an external
-// caller passes them), the base parquet holds arrays without NULL elements,
-// and the log file holds
+// schemas are derived from the table's Avro schema JSON (as passed over FFI),
+// the base parquet holds arrays without NULL elements, and the log file holds
 // an UPDATE whose array carries a NULL element ([1, NULL, 3]).
 //
 // The Avro schema declares array items as the nullable union ["null","int"],
@@ -719,8 +718,8 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
 // =============================================================================
 
 /// Table Avro schema of the `table_null_containers` fixture (verbatim from the
-/// base parquet footer's `parquet.avro.schema`, which is what an external
-/// caller passes as `data_schema_json` / `requested_schema_json`).
+/// base parquet footer's `parquet.avro.schema`, which is what the Gluten side
+/// passes over FFI as `data_schema_json` / `requested_schema_json`).
 const NULL_CONTAINERS_AVRO_JSON: &str = r#"{"type":"record","name":"h2_record","namespace":"hoodie.h2","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_commit_seqno","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_record_key","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_partition_path","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_file_name","type":["null","string"],"doc":"","default":null},{"name":"id","type":["null","int"],"default":null},{"name":"arr_null_elem","type":["null",{"type":"array","items":["null","int"]}],"default":null},{"name":"map_null_val","type":["null",{"type":"map","values":["null","int"]}],"default":null},{"name":"st_null_field","type":["null",{"type":"record","name":"st_null_field","namespace":"hoodie.h2.h2_record","fields":[{"name":"a","type":["null","int"],"default":null},{"name":"b","type":["null","string"],"default":null}]}],"default":null},{"name":"arr_empty","type":["null",{"type":"array","items":["null","string"]}],"default":null},{"name":"map_empty","type":["null",{"type":"map","values":["null","int"]}],"default":null},{"name":"emptyinit_arr","type":["null",{"type":"array","items":["null","int"]}],"default":null},{"name":"ts","type":["null","long"],"default":null}]}"#;
 
 /// Extract (id -> Vec<Option<i32>>) for an INT-array column, sorted by id.
@@ -961,9 +960,9 @@ fn validate_null_containers(batch: &arrow_array::RecordBatch) -> std::result::Re
     Ok(())
 }
 
-// NULL elements inside containers, read through the explicit-schema
+// NULL elements inside containers, read through the FFI-style explicit-schema
 // path: data/requested schemas derived from the table's Avro schema JSON
-// (as an external caller supplies them). Base has arrays without NULLs; the log
+// (what Gluten passes over FFI). Base has arrays without NULLs; the log
 // UPDATE carries [1, NULL, 3] — the NULL element must survive the merge.
 fn case_null_containers() -> FgReaderCase {
     let avro_derived: SchemaRef = Arc::new(
@@ -1309,8 +1308,8 @@ fg_case_test!(
 //   - PK-safe filters (record-key columns) may be pushed under MOR merge.
 //   - Data-column filters may be pushed only on the CoW path (no log files).
 //   - The gate `can_push_row_filter() = is_cow() || mor_pk_safe` blocks unsafe
-//     pushes; when blocked, ALL rows return and the post-merge filter (the
-//     query engine above the FG reader) evaluates the predicate.
+//     pushes; when blocked, ALL rows return and the post-merge filter (above
+//     the FG reader, e.g. Velox/Spark) evaluates the predicate.
 //
 // Record-key format for V9Mor8I4UCommitTime: plain id value ("1", "2", ...)
 // (verified by reading the sf base parquet's _hoodie_record_key column).
@@ -1960,8 +1959,8 @@ const LOG_ONLY_LOG_FILES: &[&str] = &[
     ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030528554.log.1_0-130-231",
 ];
 
-/// Full table arrow schema of MorLayoutLogOnly, hand-built exactly as an
-/// external caller supplies it (there is no base parquet footer to derive it from).
+/// Full table arrow schema of MorLayoutLogOnly, hand-built exactly as the FFI
+/// path receives it (there is no base parquet footer to derive it from).
 fn log_only_table_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("_hoodie_commit_time", DataType::Utf8, true),
@@ -1979,7 +1978,7 @@ fn log_only_table_schema() -> SchemaRef {
 }
 
 // Projection on a log-only file group. No base footer exists, so the
-// data schema must come in explicitly; the requested schema
+// data schema must come in explicitly (FFI-style); the requested schema
 // prunes to [key, level] and merge-internal fields must be stripped from the
 // output. Validates the avro log decode honors the required schema without a
 // base file.
@@ -2067,15 +2066,15 @@ fg_case_test!(
 //
 // Fixtures from Hudi Spark's `TestMORFileSliceLayoutsSchemaEvo` (self-
 // validating generator): one file group whose two AVRO log blocks were written
-// under DIFFERENT writer schemas. Read through `SchemaSpec::ExplicitJson`
-// (the external-caller mirror) so `reader_schema_json` is populated and the
-// log-block decoder takes the avro RESOLUTION branch (older writer schema resolved
+// under DIFFERENT writer schemas. Read through `SchemaSpec::ExplicitJson` —
+// the full FFI mirror — so `reader_schema_json` is armed and the log-block
+// decoder takes the avro RESOLUTION branch (older writer schema resolved
 // against the required schema), and the base parquet goes through
 // intersection-read + projection (null-fill / promotion).
 // =============================================================================
 
-/// table_evo_add_col table avro schema (printed by the generator; what an
-/// external caller passes as data_schema_json after the ALTER).
+/// table_evo_add_col table avro schema (printed by the generator; what Gluten
+/// would pass over FFI as data_schema_json after the ALTER).
 const EVO_ADD_COL_AVRO_JSON: &str = r#"{"type":"record","name":"h1_record","namespace":"hoodie.h1","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_commit_seqno","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_record_key","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_partition_path","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_file_name","type":["null","string"],"doc":"","default":null},{"name":"key","type":["null","string"],"default":null},{"name":"ts","type":["null","long"],"default":null},{"name":"val","type":["null","string"],"default":null},{"name":"extra","type":["null","string"],"default":null}]}"#;
 
 /// Projected requested schema for the add-col fixture: key, val, extra only.

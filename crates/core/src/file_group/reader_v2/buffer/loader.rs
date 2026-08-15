@@ -186,7 +186,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
             // parquet base file. A mismatch would build a position buffer for a
             // base source that lacks the row-index column. The base file's
             // commit time (validated present by the gate) is used to check
-            // log-block position headers. When it is absent (e.g. the caller could
+            // log-block position headers. When it is absent (e.g. the FFI could
             // not parse it from the base file name), this arm is skipped and the
             // read falls through to key-based merge — which is always correct
             // and needs no commit time — rather than erroring. Position merge
@@ -312,9 +312,9 @@ async fn scan_log_files(
     } else {
         reader_context.latest_commit_time.clone()
     };
-    // Forward the Gate-3 completed/inflight inputs the caller stashed on the
-    // reader context (mirroring how instant_range rides on it). `None` for
-    // v8+/incremental/non-gated reads leaves Gate 3 a no-op.
+    // C-INFLIGHT-DELTA: forward the Gate-3 completed/inflight inputs the FFI
+    // bridge stashed on the reader context (mirroring how instant_range rides
+    // on it). `None` for v8+/incremental/non-gated reads leaves Gate 3 a no-op.
     let completion_gate_inputs = reader_context.completion_gate_inputs.clone();
     let reader = HoodieMergedLogRecordReader::new_builder()
         .with_reader_context(reader_context)

@@ -229,9 +229,9 @@ impl HoodieFileGroupReader {
         //     new FileGroupReaderSchemaHandler(readerContext, dataSchema, requestedSchema, ...));
         //
         // When schemas are explicitly provided (direct construction / tests), create
-        // a new handler. When they are not provided (builder path), use the
-        // handler already on reader_context, which the caller populated before
-        // construction.
+        // a new handler. When they are not provided (FFI path via builder), use the
+        // handler already on reader_context — which was populated by the FFI bridge
+        // from the Avro JSON schemas passed through the Substrait proto.
         let mut schema_handler = if data_schema.is_some() || requested_schema.is_some() {
             let mut handler = FileGroupReaderSchemaHandler::new();
             if let Some(ds) = data_schema {
@@ -377,8 +377,8 @@ impl HoodieFileGroupReader {
         // streaming mode — the base file is held as a lazy
         // `ParquetSyncReader` that does per-batch `block_on` against
         // OBJECT_STORE_RUNTIME. The caller MUST consume the returned
-        // iterator from a synchronous context (e.g. a blocking-pool
-        // thread), never from inside another tokio runtime.
+        // iterator from a synchronous context (e.g. the FFI driver),
+        // never from inside another tokio runtime.
         self.init_record_iterators(/* streaming */ true).await
     }
 
@@ -453,7 +453,7 @@ impl HoodieFileGroupReader {
         // returned iterator's `next()` is pure in-memory work and can be driven
         // from an async caller (no nested `block_on`). `open()` (streaming=true)
         // instead holds a lazy `ParquetSyncReader` for true streaming peak
-        // memory, but requires a synchronous consumer.
+        // memory, but requires a sync consumer (the FFI driver).
         let batch = self
             .init_record_iterators(/* streaming */ false)
             .await?
@@ -461,9 +461,10 @@ impl HoodieFileGroupReader {
         // The streaming iterator accumulated the merge-phase
         // timings + insert/update/delete counts into the shared `stream_stats`
         // while `collect_into_one_batch` drove it to exhaustion. Drain them back
-        // into `self.read_stats` so `read_stats()`-based callers (benchmarks,
-        // tests, the adapter path) observe the full stats. (The `open()` path
-        // does not read these back — its caller consumes the stream directly.)
+        // into `self.read_stats` so `read_stats()`-based callers (fg-bench,
+        // tests, reader_v1) observe the same stats the pre-streaming `read()`
+        // surfaced. (The FFI `open()` path does not read these back — Velox
+        // consumes the stream directly.)
         self.drain_stream_stats();
         Ok(batch)
     }
@@ -792,9 +793,8 @@ impl HoodieFileGroupReader {
         //        primary key (PKs are immutable across upserts, so the predicate
         //        outcome doesn't change post-merge — `reader_context.mor_pk_safe`,
         //        mirroring Java's `filterIsSafeForPrimaryKey`).
-        //   Otherwise: drop the filter; the post-merge filter (the query
-        //        engine above the FG reader) evaluates the predicate after
-        //        base+log merge.
+        //   Otherwise: drop the filter; the post-merge filter (Velox/Spark above
+        //        the FG reader) evaluates the predicate after base+log merge.
         let row_filter = if self.reader_context.can_push_row_filter() {
             self.reader_context.row_filter_builder.clone()
         } else {
@@ -819,8 +819,8 @@ impl HoodieFileGroupReader {
         let use_position = self.use_record_position();
 
         // No projection schema → fall back to the unprojected eager helper
-        // (rare; production callers always supply a required_schema). Streaming
-        // variant of the unprojected helper is not exposed yet — eager Vec here.
+        // (rare; FFI always supplies a required_schema). Streaming variant
+        // of the unprojected helper is not exposed yet — eager Vec here.
         // The instant-range filter (if active) must still be applied on this
         // path — it gates the base file by its commit instant regardless of
         // projection, so every branch of this method honors it.
@@ -1007,8 +1007,8 @@ impl HoodieFileGroupReader {
     /// `applyInstantRangeFilter` when `getInstantRange().isPresent()` (empty on a
     /// plain snapshot); inflight / rolled-back *base files* are otherwise excluded
     /// at the file-slice level by `HoodieTableFileSystemView`, never by a per-row
-    /// `_hoodie_commit_time` test. The range here (for a snapshot read: instants
-    /// <= latest completed) exists to exclude base
+    /// `_hoodie_commit_time` test. The range here (set by the gluten adapter for a
+    /// native snapshot read: instants <= latest completed) exists to exclude base
     /// files from inflight / rolled-back commits; log-block exclusion is handled
     /// separately in the log path via `valid_block_instants`, not here.
     ///
@@ -1028,7 +1028,7 @@ impl HoodieFileGroupReader {
             return Ok(batches);
         }
 
-        // Production callers set `base_file_commit_time`. Fall back to parsing it
+        // Production: the FFI sets `base_file_commit_time`. Fall back to parsing it
         // from the base file name when unset (robustness / tests) so the per-file
         // decision still works.
         let file_commit_time = self.input_split.base_file_commit_time.clone().or_else(|| {
@@ -1056,7 +1056,7 @@ impl HoodieFileGroupReader {
 
     /// Best-effort parse of a base file's commit instant from its path
     /// (`…/<fileId>_<writeToken>_<commit>.<ext>`). Fallback for when
-    /// [`InputSplit::base_file_commit_time`] is unset (callers normally set it).
+    /// [`InputSplit::base_file_commit_time`] is unset (the FFI normally sets it).
     fn base_commit_time_from_path(path: &str) -> Option<String> {
         let file_name = path.rsplit('/').next().unwrap_or(path);
         file_name
@@ -1107,7 +1107,7 @@ impl HoodieFileGroupReader {
 
     /// Set the output converter.
     /// Mirrors Java: `this.outputConverter = readerContext.getSchemaHandler().getOutputConverter()`.
-    /// Set by the harness-driven path before `open`; the adapter path installs neither.
+    /// Set by the FFI/harness path before `open`; the adapter path installs neither.
     #[allow(dead_code)]
     pub fn set_output_converter(&mut self, converter: Box<dyn OutputConverter>) {
         self.output_converter = Some(converter);
@@ -1115,7 +1115,7 @@ impl HoodieFileGroupReader {
 
     /// Set the buffered record converter.
     /// Mirrors Java: `this.bufferedRecordConverter = BufferedRecordConverter.createConverter(...)`.
-    /// Set by the harness-driven path — see `set_output_converter`.
+    /// Set by the FFI/harness path — see `set_output_converter`.
     #[allow(dead_code)]
     pub fn set_buffered_record_converter(&mut self, converter: Box<dyn BufferedRecordConverter>) {
         self.buffered_record_converter = Some(converter);
@@ -1149,8 +1149,8 @@ impl HoodieFileGroupReader {
 ///
 /// Reached only from the test harness today — `FileGroupReader` constructs the
 /// engine directly through [`adapter`](super::adapter). Kept because the
-/// harness is what drives the engine the way an external caller would, so it is
-/// the only exercise of this construction path.
+/// harness is what drives the engine the way an FFI caller would, so it is the
+/// only exercise of this construction path.
 #[allow(dead_code)]
 ///
 /// Mirrors Java's `HoodieFileGroupReader.Builder<T>`.
@@ -1227,8 +1227,8 @@ impl HoodieFileGroupReaderBuilder {
     /// pushes into both base parquet files and parquet log blocks on MOR
     /// tables. When false (default), the filter pushes only on CoW.
     ///
-    /// The caller computes PK-safety from the predicate it pushes (does it
-    /// reference only primary-key columns?) and passes the result here.
+    /// Compute via [`crate::file_group::predicate::PushedFilter::references_only_primary_keys`]
+    /// (lives in the cpp crate via FFI) and pass the result here.
     pub fn with_mor_pk_safe(mut self, mor_pk_safe: bool) -> Self {
         self.mor_pk_safe = Some(mor_pk_safe);
         self
@@ -1323,7 +1323,7 @@ mod tests {
     // so a virtual-key table (NULL commit-time column) is never wrongly dropped.
     #[test]
     fn base_file_in_instant_range_uses_file_commit_not_row_column() {
-        // Range = up_to(latest) = (-INF, latest]  (the snapshot-read cap).
+        // Range = up_to(latest) = (-INF, latest]  (the gluten snapshot cap).
         let latest = "20260710235017614";
         let range = InstantRange::up_to(latest, "UTC");
 
@@ -1474,9 +1474,11 @@ mod tests {
     /// prove the streaming path enforces the same schema evolution as the eager
     /// path. The two outputs must be byte-identical.
     ///
-    /// Multi-threaded tokio flavor on purpose: the streaming source blocks on
-    /// its base stream per row-group, so it is drained on a blocking-pool
-    /// thread, which needs worker threads left free to drive the stream.
+    /// This is a plain `#[test]` (NOT `#[tokio::test]`): the streaming source is
+    /// a `ParquetSyncReader` that does `block_on(stream.next())` per row-group,
+    /// which panics if driven from inside an async runtime. Async setup runs on
+    /// `OBJECT_STORE_RUNTIME` then we drain from this sync context — mirroring
+    /// the FFI driver's `open()` → sync `get_next` call shape.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_make_base_file_source_schema_on_write_evolution() {
         use arrow_array::{Float32Array, Int32Array};
@@ -1700,8 +1702,8 @@ mod tests {
     // see the same gating decision.
     //
     // Pure builder-state tests — they exercise the builder plumbing without
-    // actually executing a read. End-to-end coverage lives in the harness
-    // tests.
+    // actually executing a read. End-to-end integration is covered by the
+    // FFI-level tests + the lake-loader functional benchmark.
     // ════════════════════════════════════════════════════════════════════
 
     fn dummy_reader_context(table_type: &str) -> Arc<ReaderContext> {

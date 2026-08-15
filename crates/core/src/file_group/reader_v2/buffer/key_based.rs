@@ -318,8 +318,8 @@ impl KeyBasedFileGroupRecordBuffer {
         // / spillable.diskmap.type (BITCASK and ROCKS_DB both → RocksDB backend).
         let spill_config = SpillConfig::from_config(&reader_context.hoodie_reader_config)?;
         // Diagnostic: the resolved in-memory spill threshold and whether the
-        // merge-memory budget key reached this map. When the caller forwards
-        // `hoodie.memory.merge.max.size` in hoodie_reader_config, `budget_key_present=true`
+        // merge-memory budget key reached this map. gluten now forwards
+        // `hoodie.memory.merge.max.size` in hoodie_reader_config, so `budget_key_present=true`
         // and the threshold tracks the operator/computed budget; a `false` here means the budget
         // was dropped and the threshold fell back to the 0.8×1 GiB default (OOM risk).
         log::debug!(
@@ -2817,7 +2817,8 @@ mod tests {
     /// records must return every base row. Before the fix the base-merge kernel's
     /// `record_key_array` downcast the INT key column to `StringArray`, errored,
     /// and the error propagated out of `merge_one_base_batch_kernel` — dropping the
-    /// entire base batch, returning 0 rows for a virtual-key bulk-insert table.
+    /// entire base batch (0 rows: the gluten `TestInsertTable2` virtual-key
+    /// bulk-insert silent-wrong symptom).
     #[test]
     fn test_virtual_key_int_base_only_merge_returns_rows() {
         let merge_mode = "COMMIT_TIME_ORDERING";
@@ -3902,7 +3903,8 @@ mod tests {
     /// A churn workload under a `merge.max.size` low enough
     /// to force spilling produces output BYTE-IDENTICAL to the no-spill baseline,
     /// AND the spill actually fires. This is the unit-level equivalent of the
-    /// churn-under-low-budget benchmark (the buffer is the spill chokepoint).
+    /// fg-bench churn-under-low-budget e2e (the buffer is the spill chokepoint;
+    /// the surrounding reader plumbing is unchanged by A1).
     // Exercises the on-disk spill tier, which only exists with the backend.
     #[cfg(feature = "spill-rocksdb")]
     #[test]
@@ -4814,9 +4816,9 @@ mod tests {
 
     #[test]
     fn test_event_time_delete_block_vs_base_file_rejects_lower_ordering() {
-        // Records live in the BASE FILE and the delete sits in a log block, so
-        // the decisive comparison is base-vs-buffered-delete via
-        // has_next_base_record (final_merge), not delta_merge_delete.
+        // Mirrors the REAL gluten scenario: records live in the BASE FILE, the
+        // delete sits in a log block. The decisive comparison is base-vs-buffered
+        // -delete via has_next_base_record (final_merge), NOT delta_merge_delete.
         // delete id=2 @ ts=99 must lose to base id=2 @ ts=100.
         let mut buffer = build_key_based_buffer("EVENT_TIME_ORDERING");
 
@@ -6924,11 +6926,23 @@ mod tests {
     }
 
     // =========================================================================
-    // A base file larger than one chunk must be emitted as several chunks
-    // rather than truncated at the first: an iterator that stops after one
-    // chunk silently drops every row past DEFAULT_BATCH_SIZE. The base source
-    // below carries DEFAULT_BATCH_SIZE * 2 + 100 rows, so a correct drain
-    // yields 3 chunks.
+    // T10 — pin the production q99 symptom: does Buffered iterator emit more
+    // than one chunk when the base file has > DEFAULT_BATCH_SIZE rows?
+    //
+    // Production observation (lin-diag-mor-nowarmup-q99):
+    //   date_dim base file has 73,049 rows
+    //   FG-SUMMARY shows chunks_in=1 rows_in=4096
+    //
+    // i.e. PostMergePredicateFilter saw the iterator emit EXACTLY ONE chunk
+    // of 4096 rows then stop. We need to know:
+    //   (a) does FileGroupMergeIterator::Buffered correctly continue past
+    //       the first chunk when base_file_source has more rows?
+    //   (b) if YES — the production stop is downstream (Velox/FFI/Drop).
+    //   (c) if NO — the bug is here in the Buffered iterator.
+    //
+    // Strategy: empty log records map + base file source carrying
+    // DEFAULT_BATCH_SIZE * 2 + 100 = 8292 rows. Drive Buffered iterator,
+    // count chunks. Correct behavior = 3 chunks (4096 + 4096 + 100).
     // =========================================================================
     #[test]
     fn t10_buffered_emits_multiple_chunks_when_base_exceeds_batch_size() {
@@ -6975,10 +6989,16 @@ mod tests {
         assert_eq!(batches[0].num_rows(), n);
     }
 
-    /// A post-merge filter that passes no rows must still emit one (empty)
-    /// chunk per inner chunk and drive the iterator to completion. A wrapper
-    /// that stopped on the first empty batch would truncate the read, so the
-    /// chunk count is the assertion.
+    /// T11 — companion to T10. Wraps the same Buffered iterator in a
+    /// minimal "always-false filter" — Rust analogue of
+    /// `cpp/src/lib.rs::PostMergePredicateFilter` with a 0-rows-pass filter.
+    /// Verifies the wrapper STILL emits chunks corresponding to each inner
+    /// chunk (just empty), and the inner iterator is driven to completion.
+    ///
+    /// If T11 emits exactly 3 (empty) chunks → wrapper + iterator are fine,
+    /// so production bug is in the FFI consumer (Velox `HudiSplitReader::next`
+    /// caller stopping on empty arrow batch). If T11 emits only 1 → bug
+    /// reproduces locally and is in the wrapper or iterator interaction.
     #[test]
     fn t11_wrapper_with_always_false_filter_drives_iterator_to_completion() {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");

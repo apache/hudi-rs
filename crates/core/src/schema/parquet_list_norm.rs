@@ -251,7 +251,7 @@ mod tests {
     }
 
     /// Documents the bug: the raw (un-normalized) schema is rejected by the
-    /// parquet→arrow builder with the `Map cannot be repeated` error.
+    /// parquet→arrow builder with exactly the runtime error we see in gluten.
     #[test]
     fn legacy_schema_is_rejected_before_normalization() {
         let meta = raw_metadata(LEGACY_2LEVEL);

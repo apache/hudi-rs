@@ -78,18 +78,17 @@ pub struct FileGroupReaderSchemaHandler {
     /// Mirrors Java's `FileGroupReaderSchemaHandler.deleteContext`.
     delete_context: Option<DeleteContext>,
 
-    /// Avro JSON of the data/table schema, when the caller supplies one.
-    /// Enables Avro-land required-schema computation mirroring Java.
+    /// Avro JSON of the data/table schema (from FFI). Enables Avro-land
+    /// required-schema computation mirroring gold.
     pub data_schema_json: Option<String>,
-    /// Avro JSON of the requested schema (see `data_schema_json`).
+    /// Avro JSON of the requested schema (from FFI).
     pub requested_schema_json: Option<String>,
     /// Avro JSON of the required schema — computed by `prepare_required_schema`
     /// when the JSONs above are present. Used as the Avro reader schema for
     /// log-block decode (Java: GenericDatumReader's readerSchema). Named for
     /// Avro's own term, matching `Decoder`/`LogFileReader::with_reader_schema`.
     /// CONTRACT: consumers (log-block decode) MUST treat `None` as the
-    /// no-evolution decode path — `None` is normal for callers that supply
-    /// only Arrow schemas
+    /// no-evolution decode path — `None` is normal for non-FFI callers
     /// and for any failure in the avro-land computation (which falls back to
     /// the arrow-land required schema with a warning).
     pub reader_schema_json: Option<String>,
@@ -115,7 +114,7 @@ impl FileGroupReaderSchemaHandler {
         self
     }
 
-    /// Builder parity for callers that supply Avro JSON; this crate's
+    /// Builder parity for the FFI path, which supplies Avro JSON; this crate's
     /// callers supply Arrow schemas.
     #[allow(dead_code)]
     pub fn with_data_schema_json(mut self, json: String) -> Self {
@@ -123,7 +122,7 @@ impl FileGroupReaderSchemaHandler {
         self
     }
 
-    /// Builder parity — see `with_data_schema_json`.
+    /// Builder parity for the FFI path — see `with_data_schema_json`.
     #[allow(dead_code)]
     pub fn with_requested_schema_json(mut self, json: String) -> Self {
         self.requested_schema_json = Some(json);
@@ -141,7 +140,7 @@ impl FileGroupReaderSchemaHandler {
     /// Get the schema for updates (log record merging).
     ///
     /// Mirrors Java's `FileGroupReaderSchemaHandler.getSchemaForUpdates()`.
-    /// Partial-update parity surface; the merge resolves the update schema
+    /// Partial-update surface for the FFI path; the merge resolves the update schema
     /// per block instead.
     #[allow(dead_code)]
     pub fn schema_for_updates(&self) -> Option<&SchemaRef> {
@@ -339,8 +338,8 @@ impl FileGroupReaderSchemaHandler {
         // Initialize schema_for_updates = required_schema (Java line 106).
         self.schema_for_updates = self.required_schema.clone();
 
-        // Avro-land mirror (Java computes the required schema in Avro). When the
-        // Avro JSONs are available, compute reader_schema_json by
+        // Avro-land mirror (gold computes required schema in Avro). When the
+        // Avro JSONs are available (FFI path), compute reader_schema_json by
         // appending the SAME mandatory fields, and derive the Arrow required
         // schema FROM it so decode output and pivot schema agree by construction.
         self.reader_schema_json = None;
@@ -361,16 +360,16 @@ impl FileGroupReaderSchemaHandler {
                 .map(|f| f.name().as_str())
                 .filter(|n| !requested_names.contains(n))
                 .collect();
-            // Both JSONs were already parsed by the caller (which derived the
-            // Arrow schemas above from them), so a failure here is an internal
-            // inconsistency — NOT a
+            // On the FFI path both JSONs were already parsed (cpp converted them
+            // to the Arrow schemas above) and the same append+convert ran once at
+            // the boundary, so a failure here is an internal inconsistency — NOT a
             // recoverable condition. Falling back would leave reader_schema_json
-            // = None, which is the documented "no Avro JSON supplied" sentinel
+            // = None, which is the documented "non-FFI caller" sentinel
             // (see content.rs decode_avro_record_content): the log-block decoder
             // would then silently switch from required-schema resolution to
             // writer-only decode, producing wrong data on an evolved table. Fail
-            // loudly instead. (Callers without the JSONs never enter this block —
-            // the Some/Some/Some guard requires them.)
+            // loudly instead. (Non-FFI/test callers never enter this block — the
+            // Some/Some/Some guard requires the JSONs.)
             let required_json =
                 crate::schema::avro_schema_utils::append_mandatory_fields_avro_json(
                     &requested_json,

@@ -1438,8 +1438,8 @@ mod tests {
     }
 
     /// Virtual-key base batch: NO meta columns, real key column `id` (INT32) plus
-    /// a `longField` precombine (a typical virtual-key bulk-insert layout:
-    /// `primaryKey=id`, a precombine field, no meta fields).
+    /// a `longField` precombine (matching the gluten `TestInsertTable2` virtual-key
+    /// bulk-insert fixture — `primaryKey=id`, `preCombineField`, no meta fields).
     fn make_virtual_key_base_batch(ids: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),

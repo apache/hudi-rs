@@ -21,8 +21,8 @@
 //!
 //! The Java reader's `getClosableIterator()` returns a lazy iterator that
 //! emits merged rows in chunks. `FileGroupMergeIterator` does the same — it
-//! emits one merged chunk per `next()`, so the consumer can free each chunk
-//! before the next is built,
+//! emits one merged chunk per `next()`, so the consumer (Velox
+//! `HudiSplitReader::next()`) can free each chunk before the next is built,
 //! instead of holding the entire merged `RecordBatch` resident at once.
 //!
 //! [`FileGroupMergeIterator`] is the streaming bridge:
@@ -54,8 +54,10 @@
 //!
 //! ## Default batch size
 //!
-//! [`DEFAULT_BATCH_SIZE`] = 4096 rows, a typical query-engine operator batch
-//! size. Callers override it via `hoodie.read.stream.batch_size`.
+//! [`DEFAULT_BATCH_SIZE`] = 4096 rows, matching Velox's typical operator
+//! batch size. The Velox `HudiSplitReader::next(uint64_t size, ...)` API
+//! exposes a requested size parameter; a follow-up will plumb that through
+//! the FFI. For now the iterator uses its constructor-time `batch_size`.
 
 use crate::Result;
 use crate::error::CoreError;
@@ -68,7 +70,7 @@ use std::time::Instant;
 
 /// Default chunk size (rows) emitted by [`FileGroupMergeIterator`].
 ///
-/// Matches Spark Hudi's
+/// Matches Velox's typical operator batch size; matches Spark Hudi's
 /// `hoodie.parquet.batchsize.default`. Used as the fallback when
 /// `hoodie.read.stream.batch_size` is unset/unparseable.
 pub const DEFAULT_BATCH_SIZE: usize = 4096;
@@ -292,9 +294,9 @@ impl FileGroupMergeIterator {
     /// Delegates to the buffer's
     /// [`current_in_memory_bytes`](HoodieFileGroupRecordBuffer::current_in_memory_bytes)
     /// on the merge path; returns 0 for the Eager (no-merge) source, which holds
-    /// no merge map. Lets a host memory manager reserve against hudi-rs's live
-    /// native footprint.
-    /// Cheap (an `AtomicU64`/counter read on the buffer), safe to call
+    /// no merge map. Used by the FFI reader-memory accessor so a host memory
+    /// manager (velox's `MemoryPool`) can reserve against hudi-rs's live native
+    /// footprint. Cheap (an `AtomicU64`/counter read on the buffer), safe to call
     /// between chunk pulls.
     #[must_use]
     /// Reported by the memory harness; the merge path reads the map's own counter.
@@ -1060,9 +1062,10 @@ mod tests {
     // ---- OutputConverter (projection) path ----
 
     /// The `OutputConverter` path: `schema()` reports the converter's target
-    /// schema BEFORE any chunk is produced (consumers read the schema before
-    /// the first chunk), and the projection is applied per chunk across >1
-    /// chunk — the project-per-chunk contract.
+    /// schema BEFORE any chunk is produced (Velox calls `get_schema` before the
+    /// first `get_next`), and the projection is applied per chunk across >1
+    /// chunk — the project-per-chunk contract that replaced the old
+    /// project-once-over-the-whole-batch path.
     #[test]
     fn buffered_output_converter_projects_per_chunk() {
         let merge_schema = small_schema(); // (key: Utf8, v: Int32)

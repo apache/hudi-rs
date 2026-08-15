@@ -97,10 +97,10 @@ impl<'a> CompletionGate<'a> {
     /// committedness for any instant, so it admits everything (a no-op) rather
     /// than excluding all blocks. Java always builds the gate from a non-empty
     /// active timeline (`filterCompletedInstants()`), so an empty set here means
-    /// the inputs were not populated by the caller. Excluding on that basis would
-    /// silently drop EVERY log delta
-    /// — including committed ones — and return base-file-only data (silently
-    /// wrong: a committed later delta dropped). Deferring
+    /// the inputs were not populated by the caller (e.g. the FFI bridge forwarded
+    /// an empty list). Excluding on that basis would silently drop EVERY log delta
+    /// — including committed ones — and return base-file-only data (the
+    /// C-INFLIGHT silent-wrong: a committed later delta wrongly dropped). Deferring
     /// to the other gates preserves the pre-gate behavior for a mis-wired gate; a
     /// correctly-populated gate is unaffected because its completed set is non-empty.
     fn admits(&self, instant_time: &str) -> bool {
@@ -122,8 +122,8 @@ impl<'a> CompletionGate<'a> {
     /// version < 8 snapshot), being unpopulated is a mis-wire signal, not a genuine empty
     /// timeline: Java always builds the gate from a non-empty active timeline
     /// (`filterCompletedInstants()`), and a v1 snapshot always has >= 1 completed instant.
-    /// `forward_scan_pass1` warns once when this holds so a gate whose inputs the caller
-    /// dropped is diagnosable rather than a silent no-op.
+    /// `forward_scan_pass1` warns once when this holds so a gate whose inputs were dropped
+    /// across the FFI boundary is diagnosable rather than a silent no-op.
     fn is_unpopulated(&self) -> bool {
         self.completed_instants.is_empty() && self.archived_boundary.is_none()
     }
@@ -165,7 +165,7 @@ pub fn forward_scan_pass1(
     );
 
     // The completion gate was supplied (table version < 8 snapshot) but carries no positive
-    // completion info — its inputs were not populated by the caller. Rather than
+    // completion info — its inputs were not populated across the FFI boundary. Rather than
     // silently degrade to admit-all (Gate 3 becomes a no-op, so a straddling uncommitted delta
     // could be merged), warn once so the mis-wire is diagnosable. Behavior is unchanged (still
     // fail-open); this only makes the condition visible.
@@ -449,7 +449,7 @@ pub struct BaseHoodieLogRecordReader {
     pub allow_inflight_instants: bool,
     /// Inputs for the Gate-3 completed/inflight check. `Some` only for
     /// table version < 8 (v1 timeline layout); `None` for v8+ and when no timeline is available,
-    /// in which case Gate 3 is a no-op. Populated by the builder from the active
+    /// in which case Gate 3 is a no-op. Populated by the builder / FFI wiring from the active
     /// timeline (completed + inflight instant sets + the first active instant).
     pub completion_gate_inputs: Option<CompletionGateInputs>,
 
@@ -1715,8 +1715,11 @@ mod tests {
         assert_eq!(counters.value(0), 2);
     }
 
-    /// Value-level end-to-end: a COMMITTED straddling delta is NOT dropped once the reader
-    /// is fed the correct completed/inflight sets and the committed log block:
+    /// C-INFLIGHT-DELTA, value-level end-to-end: proves hudi-rs does NOT drop a COMMITTED
+    /// straddling delta once it is actually fed the correct completed/inflight sets and the
+    /// committed log block. This is the faithful standalone reproduction of the
+    /// `TestMORSnapshotExcludesUncommitted#snapshotExcludesStraddlingUncommittedDelta` scenario,
+    /// isolated to hudi-rs (no gluten, no sweep):
     ///
     ///   base file (t0, committed):        id=1, age=1000
     ///   log block t1 (INFLIGHT, straddling below the watermark): id=2, age=9999

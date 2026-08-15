@@ -38,7 +38,7 @@ pub struct HoodieReadStats {
     // ── Stage timings (perf harness) ───────────────────────
     // Cheap monotonic `Instant`-based accumulators wired at the matching
     // code sites. Always-on, accumulated per block/batch (never per row).
-    // Used by `benchmark/filegroup` to attribute wall time across
+    // Used by `benchmark/filegroup` (fg-bench) to attribute wall time across
     // the read pipeline. Zero behavioral effect — instrumentation only.
     //
     /// Wall ms spent reading + projecting the base parquet file
