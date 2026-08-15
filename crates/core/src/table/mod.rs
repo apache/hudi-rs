@@ -671,6 +671,10 @@ impl Table {
         };
         let mut reader = self.build_file_group_reader(hudi_opts, extra_storage_overrides)?;
         reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        // This table holds the timeline, so it can tell a committed instant from
+        // one still inflight — the log-block scan cannot work that out from the
+        // slice alone.
+        reader.set_completion_gate_inputs(self.timeline.completion_gate_inputs());
         Ok(reader)
     }
 
@@ -686,6 +690,10 @@ impl Table {
             std::iter::empty::<(&str, &str)>(),
         )?;
         reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        // This table holds the timeline, so it can tell a committed instant from
+        // one still inflight — the log-block scan cannot work that out from the
+        // slice alone.
+        reader.set_completion_gate_inputs(self.timeline.completion_gate_inputs());
         Ok(reader)
     }
 
@@ -2395,6 +2403,43 @@ mod tests {
     /// fixture rather than a reproduction of the one input that broke: the bound
     /// is an instant the timeline actually contains, so it parses by
     /// construction.
+    /// Regression test: a table-built reader carries the timeline's
+    /// committed/inflight sets, so the log-block scan can gate on them.
+    ///
+    /// The gate exists to skip blocks from an instant that never completed — the
+    /// straddling case where a writer is still inflight when a later one
+    /// commits, so its blocks sort below the latest instant and pass every other
+    /// gate. It was inert for every read through this crate because nothing
+    /// populated its inputs.
+    #[tokio::test]
+    async fn test_table_reader_carries_the_completion_gate_inputs() {
+        use hudi_test::SampleTable;
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let table = Table::new(base_url.path()).await.unwrap();
+
+        let inputs = table.timeline.completion_gate_inputs();
+        assert!(
+            !inputs.completed_instants.is_empty(),
+            "the fixture's completed commits must reach the gate"
+        );
+        assert!(
+            inputs.archived_boundary.is_some(),
+            "the archival boundary is the gate's second half — an archived \
+             instant is committed by definition"
+        );
+
+        // And the reader the read paths use actually receives them.
+        let reader = table
+            .create_file_group_reader_with_options(None, empty_options())
+            .await
+            .unwrap();
+        assert!(
+            reader.has_completion_gate_inputs(),
+            "a reader built from a table must be able to gate the log scan"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolve_incremental_window_start_bound_is_a_real_instant() {
         use crate::config::internal::HudiInternalConfig;

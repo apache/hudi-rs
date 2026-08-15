@@ -30,6 +30,7 @@ use crate::config::HudiConfigs;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::builder::replaced_file_groups_from_replace_commit;
+use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_data_schema_from_commit_metadata,
 };
@@ -69,6 +70,15 @@ pub struct Timeline {
     /// (`BaseHoodieTimeline.java:494`). `None` means the active timeline is
     /// empty, so nothing can be treated as archived.
     pub(crate) earliest_active_instant: Option<String>,
+    /// Request timestamps of the active instants that have NOT completed —
+    /// requested or inflight.
+    ///
+    /// Read from the same listing that yields [`Self::completed_commits`] and
+    /// the archival boundary, so retaining it costs nothing. The log-block scan
+    /// needs it: a log file admitted at listing time on its own committed
+    /// instant can still carry blocks appended by a later instant that never
+    /// completed, and only the instant's state can tell.
+    pub(crate) pending_instants: HashSet<String>,
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
@@ -89,6 +99,7 @@ impl Timeline {
             archived_loader,
             completed_commits: Vec::new(),
             earliest_active_instant: None,
+            pending_instants: HashSet::new(),
         }
     }
 
@@ -114,11 +125,45 @@ impl Timeline {
             .iter()
             .map(|instant| instant.timestamp.clone())
             .min();
-        timeline.completed_commits = all_active
+        let (completed, pending): (Vec<Instant>, Vec<Instant>) = all_active
             .into_iter()
-            .filter(|instant| instant.state == State::Completed)
+            .partition(|instant| instant.state == State::Completed);
+        // An instant is listed once per state file it has, so a completed one
+        // also appears as requested and inflight. Pending means it reached NO
+        // completed state — subtracting is what makes that true, and without the
+        // subtraction every committed instant reads as inflight and the gate
+        // rejects the whole timeline.
+        let completed_times: HashSet<String> = completed
+            .iter()
+            .map(|instant| instant.timestamp.clone())
             .collect();
+        timeline.pending_instants = pending
+            .into_iter()
+            .map(|instant| instant.timestamp)
+            .filter(|timestamp| !completed_times.contains(timestamp))
+            .collect();
+        timeline.completed_commits = completed;
         Ok(timeline)
+    }
+
+    /// The inputs the log-block scan needs to tell a committed instant from one
+    /// that never finished.
+    ///
+    /// A log file is admitted to a slice on its own instant, but blocks inside
+    /// it carry their own — including a writer that was still inflight when a
+    /// later writer committed. Without these sets that block merges as if it
+    /// were committed, because it sorts below the latest instant and so passes
+    /// every other gate.
+    pub(crate) fn completion_gate_inputs(&self) -> CompletionGateInputs {
+        CompletionGateInputs {
+            completed_instants: self
+                .completed_commits
+                .iter()
+                .map(|instant| instant.timestamp.clone())
+                .collect(),
+            inflight_instants: self.pending_instants.clone(),
+            archived_boundary: self.earliest_active_instant.clone(),
+        }
     }
 
     /// Load instants from the timeline based on the selector criteria.
@@ -897,5 +942,40 @@ mod tests {
         let timestamp = timeline.get_latest_commit_timestamp_as_option();
         assert!(timestamp.is_some());
         assert!(!timestamp.unwrap().is_empty());
+    }
+
+    /// Regression test: a completed instant is not also reported as pending.
+    ///
+    /// The active timeline lists an instant once per state file it has, so a
+    /// completed one appears as requested and inflight too. Reading pending
+    /// straight off the non-completed rows therefore marks every committed
+    /// instant inflight, and the log-scan gate — which admits only
+    /// `committed && !inflight` — then rejects the whole timeline and returns
+    /// base-file-only data. That is silent: no error, just missing log deltas.
+    #[tokio::test]
+    async fn test_completion_gate_inputs_do_not_report_completed_instants_as_pending() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath,
+            base_url.to_string(),
+        )]));
+        let timeline = Timeline::new_from_storage(hudi_configs, Arc::new(HashMap::new()))
+            .await
+            .unwrap();
+
+        let inputs = timeline.completion_gate_inputs();
+        assert!(
+            !inputs.completed_instants.is_empty(),
+            "the fixture has completed commits"
+        );
+        let both: Vec<&String> = inputs
+            .inflight_instants
+            .iter()
+            .filter(|t| inputs.completed_instants.contains(*t))
+            .collect();
+        assert!(
+            both.is_empty(),
+            "an instant cannot be both completed and pending, got {both:?}"
+        );
     }
 }

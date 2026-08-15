@@ -1789,4 +1789,46 @@ mod tests {
             "inflight straddling delta t1 (id=2) must be excluded"
         );
     }
+
+    /// REGRESSION: a block from an instant that never completed is admitted when
+    /// no completion gate is supplied, and skipped when one is.
+    ///
+    /// This is the "straddling" case: writer A opens an instant at T1 and is
+    /// still inflight when writer B commits T2 > T1. `latest_instant_time` is
+    /// T2, so A's blocks pass the future gate and the instant-range gate, and
+    /// nothing else looks at whether A ever committed. The log file itself was
+    /// admitted at listing time on its own (committed) instant, so the
+    /// file-level check does not see these blocks either.
+    ///
+    /// The pair is the point: same blocks, same bounds, gate absent vs present.
+    #[test]
+    fn test_pass1_admits_an_uncommitted_instant_without_the_completion_gate() {
+        let blocks = vec![make_data_block("T1_inflight"), make_data_block("T2_done")];
+
+        // No gate — what every production read did before the gate was wired.
+        let ungated = forward_scan_pass1(blocks.clone(), "T2_done", &None, "UTC", None).unwrap();
+        assert!(
+            ungated.instant_to_blocks_map.contains_key("T1_inflight"),
+            "without a gate an inflight instant's blocks are merged: {:?}",
+            ungated.ordered_instants_list
+        );
+
+        // With the timeline's own sets, the inflight instant is excluded.
+        let inputs = CompletionGateInputs {
+            completed_instants: HashSet::from(["T2_done".to_string()]),
+            inflight_instants: HashSet::from(["T1_inflight".to_string()]),
+            archived_boundary: Some("T0".to_string()),
+        };
+        let gate = CompletionGate::new(&inputs);
+        let gated = forward_scan_pass1(blocks, "T2_done", &None, "UTC", Some(&gate)).unwrap();
+
+        assert!(
+            !gated.instant_to_blocks_map.contains_key("T1_inflight"),
+            "the gate must skip an instant that never completed"
+        );
+        assert!(
+            gated.instant_to_blocks_map.contains_key("T2_done"),
+            "the committed instant must still be merged"
+        );
+    }
 }
