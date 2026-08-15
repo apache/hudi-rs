@@ -48,9 +48,13 @@ use std::sync::Arc;
 /// against that schema yields a union of one-field structs. The merge wants the
 /// value itself.
 ///
-/// A block writes one ordering type, so exactly one branch is populated; that
-/// branch's `value` child is the column. A block mixing branches is rejected
-/// rather than silently reduced to one of them.
+/// A row on the null branch carries no ordering value and decodes as a null
+/// cell, which the merge treats as a natural-order delete. A block with any
+/// `ArrayWrapper` row (multiple ordering fields, HUDI-9569) keeps the union
+/// column as is: only the per-row union decode in
+/// `delete_batch_to_keys_with_ordering` can represent a composite ordering
+/// value. At most one scalar wrapper branch may appear otherwise: two would
+/// collapse different value types into one column, so that mix is rejected.
 fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
     let union = ordering
         .as_any()
@@ -62,11 +66,28 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
             ))
         })?;
 
-    let mut active: Option<i8> = None;
+    // Only ArrayWrapper carries a list; anything else struct-shaped goes down
+    // the scalar path, where a malformed wrapper is still refused loudly.
+    let is_composite = |child: &ArrayRef| -> bool {
+        matches!(child.data_type(), DataType::Struct(fields)
+            if fields.len() == 1
+                && matches!(fields[0].data_type(), DataType::List(_) | DataType::LargeList(_)))
+    };
+
+    let mut scalar: Option<i8> = None;
+    let mut composite_rows = 0usize;
     for i in 0..union.len() {
         let type_id = union.type_id(i);
-        match active {
-            None => active = Some(type_id),
+        let child = union.child(type_id);
+        if child.data_type() == &DataType::Null {
+            continue;
+        }
+        if is_composite(child) {
+            composite_rows += 1;
+            continue;
+        }
+        match scalar {
+            None => scalar = Some(type_id),
             Some(seen) if seen == type_id => {}
             Some(seen) => {
                 return Err(CoreError::LogBlockError(format!(
@@ -75,22 +96,37 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
             }
         }
     }
-    let Some(active) = active else {
+    if composite_rows > 0 {
         return Ok(ordering.clone());
+    }
+
+    let Some(scalar) = scalar else {
+        // Every row is a natural-order delete; the column type only has to be
+        // one an ordering reader accepts, since every cell is null.
+        return Ok(arrow_array::new_null_array(&DataType::Int64, union.len()));
     };
 
-    let child = union.child(active);
-    // Null is a branch like any other; there is nothing to unwrap out of it.
-    let Some(wrapper) = child.as_any().downcast_ref::<StructArray>() else {
-        return Ok(child.clone());
+    let child = union.child(scalar);
+    let values = match child.as_any().downcast_ref::<StructArray>() {
+        Some(wrapper) => {
+            if wrapper.num_columns() != 1 {
+                return Err(CoreError::LogBlockError(format!(
+                    "Expected an ordering wrapper with one field, got {}",
+                    wrapper.num_columns()
+                )));
+            }
+            wrapper.column(0).clone()
+        }
+        None => child.clone(),
     };
-    if wrapper.num_columns() != 1 {
-        return Err(CoreError::LogBlockError(format!(
-            "Expected an ordering wrapper with one field, got {}",
-            wrapper.num_columns()
-        )));
-    }
-    Ok(wrapper.column(0).clone())
+
+    // Rows on other branches take a null index, which `take` renders as a
+    // null cell; scalar rows take the union's own offset, so this holds for
+    // dense offsets in any order (and for sparse unions, where offset == row).
+    let indices: arrow_array::Int32Array = (0..union.len())
+        .map(|i| (union.type_id(i) == scalar).then(|| union.value_offset(i) as i32))
+        .collect();
+    arrow::compute::take(values.as_ref(), &indices, None).map_err(CoreError::ArrowError)
 }
 
 #[allow(dead_code)]
@@ -435,8 +471,10 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_group::log_file::log_block::LogBlockVersion;
     use apache_avro::to_avro_datum;
     use apache_avro::types::Record as AvroRecord;
+    use apache_avro::types::Value as AvroValue;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
@@ -939,5 +977,163 @@ mod tests {
         assert_eq!(batches.num_data_rows(), 3);
 
         Ok(())
+    }
+
+    /// Union positions in `HoodieDeleteRecordList.avsc`: 0 = null,
+    /// 3 = `LongWrapper`, 12 = `ArrayWrapper`.
+    fn delete_record_with_ordering(key: &str, ordering: AvroValue) -> AvroValue {
+        AvroValue::Record(vec![
+            (
+                "recordKey".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::String(key.to_string()))),
+            ),
+            (
+                "partitionPath".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::String(String::new()))),
+            ),
+            ("orderingVal".to_string(), ordering),
+        ])
+    }
+
+    fn long_wrapper(value: i64) -> AvroValue {
+        AvroValue::Union(
+            3,
+            Box::new(AvroValue::Record(vec![(
+                "value".to_string(),
+                AvroValue::Long(value),
+            )])),
+        )
+    }
+
+    fn null_ordering() -> AvroValue {
+        AvroValue::Union(0, Box::new(AvroValue::Null))
+    }
+
+    fn array_wrapper() -> AvroValue {
+        AvroValue::Union(
+            12,
+            Box::new(AvroValue::Record(vec![(
+                "wrappedValues".to_string(),
+                AvroValue::Union(
+                    1,
+                    Box::new(AvroValue::Array(vec![long_wrapper(9), long_wrapper(1)])),
+                ),
+            )])),
+        )
+    }
+
+    /// Serialize delete records into the block-content byte layout
+    /// `decode_delete_record_content` reads: version, datum length, datum.
+    fn delete_block_bytes(records: Vec<AvroValue>) -> Result<Vec<u8>> {
+        let schema = crate::schema::delete::avro_schema_for_delete_record_list()?;
+        let value = AvroValue::Record(vec![(
+            "deleteRecordList".to_string(),
+            AvroValue::Array(records),
+        )]);
+        let datum = to_avro_datum(schema, value)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(LogBlockVersion::V3 as u32).to_be_bytes());
+        buf.extend_from_slice(&(datum.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&datum);
+        Ok(buf)
+    }
+
+    fn decode_delete_block(records: Vec<AvroValue>) -> Result<RecordBatches> {
+        let buf = delete_block_bytes(records)?;
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+        decoder.decode_delete_record_content(Cursor::new(buf), &HashMap::new())
+    }
+
+    fn ordering_column(batches: &RecordBatches) -> ArrayRef {
+        batches.delete_batches[0].0.column(2).clone()
+    }
+
+    /// REGRESSION: a delete written without an ordering value shares its block
+    /// with typed ones: null is a union branch, not a second ordering type.
+    /// The null slot decodes as a null cell, which the merge treats as a
+    /// natural-order delete, matching Hudi.
+    #[test]
+    fn test_delete_block_null_ordering_among_typed_decodes_as_null_slots() -> Result<()> {
+        let batches = decode_delete_block(vec![
+            delete_record_with_ordering("k0", null_ordering()),
+            delete_record_with_ordering("k1", long_wrapper(5)),
+            delete_record_with_ordering("k2", null_ordering()),
+        ])?;
+
+        let ordering = ordering_column(&batches);
+        let ordering = ordering.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(ordering.is_null(0));
+        assert_eq!(ordering.value(1), 5);
+        assert!(ordering.is_null(2));
+        Ok(())
+    }
+
+    /// REGRESSION: a block whose deletes all carry no ordering value must not
+    /// produce a `DataType::Null` column, which no ordering reader accepts.
+    #[test]
+    fn test_delete_block_all_null_ordering_decodes_readably() -> Result<()> {
+        let batches = decode_delete_block(vec![
+            delete_record_with_ordering("k0", null_ordering()),
+            delete_record_with_ordering("k1", null_ordering()),
+        ])?;
+
+        let ordering = ordering_column(&batches);
+        assert_ne!(ordering.data_type(), &DataType::Null);
+        assert_eq!(ordering.null_count(), 2);
+        Ok(())
+    }
+
+    /// REGRESSION: multiple ordering fields serialize to `ArrayWrapper`, whose
+    /// composite value only the per-row union decode can represent. The union
+    /// passes through whole and decodes to the composite the merge compares,
+    /// so a stale composite delete can lose to a newer row instead of the read
+    /// failing (or the delete winning unconditionally).
+    #[test]
+    fn test_delete_block_array_wrapper_ordering_decodes_as_composite() -> Result<()> {
+        use crate::file_group::reader_v2::buffered_record::OrderingValue;
+        use crate::file_group::reader_v2::record_context::RecordContext;
+
+        let batches = decode_delete_block(vec![
+            delete_record_with_ordering("k0", array_wrapper()),
+            delete_record_with_ordering("k1", long_wrapper(7)),
+        ])?;
+
+        let ordering = ordering_column(&batches);
+        assert!(matches!(ordering.data_type(), DataType::Union(_, _)));
+
+        let record_context = RecordContext::new(&HashMap::new(), String::new());
+        let entries =
+            record_context.delete_batch_to_keys_with_ordering(&batches.delete_batches[0].0)?;
+        assert_eq!(
+            entries[0],
+            (
+                "k0".to_string(),
+                Some(OrderingValue::Composite(vec![
+                    OrderingValue::Long(9),
+                    OrderingValue::Long(1),
+                ]))
+            )
+        );
+        assert_eq!(entries[1], ("k1".to_string(), Some(OrderingValue::Long(7))));
+        Ok(())
+    }
+
+    /// Two scalar ordering types in one block remain rejected: collapsing them
+    /// to either type would compare across types the merge keeps apart.
+    #[test]
+    fn test_delete_block_mixing_scalar_ordering_types_errors() {
+        let int_wrapper = AvroValue::Union(
+            2,
+            Box::new(AvroValue::Record(vec![(
+                "value".to_string(),
+                AvroValue::Int(1),
+            )])),
+        );
+        let err = decode_delete_block(vec![
+            delete_record_with_ordering("k0", int_wrapper),
+            delete_record_with_ordering("k1", long_wrapper(2)),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("mixes"), "got: {err}");
     }
 }

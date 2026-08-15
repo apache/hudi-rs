@@ -298,6 +298,45 @@ mod tests {
         }
     }
 
+    fn composite(parts: &[i64]) -> OrderingValue {
+        OrderingValue::Composite(parts.iter().copied().map(OrderingValue::Long).collect())
+    }
+
+    /// REGRESSION: a composite (multi-field) delete ordering value follows the
+    /// scalar rule: a stale delete loses to a record whose composite ordering
+    /// is higher, and a newer one wins.
+    #[test]
+    fn test_event_time_delta_merge_delete_composite_ordering() {
+        let merger = EventTimeRecordMerger;
+
+        let mut existing = make_data_record("k1", Some(0));
+        existing.ordering_value = Some(composite(&[2, 1]));
+
+        let stale_delete = DeleteRecord {
+            record_key: "k1".to_string(),
+            ordering_value: Some(composite(&[1, 50])),
+        };
+        let result = merger
+            .delta_merge_delete(&stale_delete, Some(&existing))
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "delete((1,50)) should lose to data((2,1))"
+        );
+
+        let newer_delete = DeleteRecord {
+            record_key: "k1".to_string(),
+            ordering_value: Some(composite(&[2, 2])),
+        };
+        let result = merger
+            .delta_merge_delete(&newer_delete, Some(&existing))
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "delete((2,2)) should win over data((2,1))"
+        );
+    }
+
     // =========================================================================
     // CommitTimeRecordMerger tests
     // =========================================================================

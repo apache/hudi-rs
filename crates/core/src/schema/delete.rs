@@ -38,7 +38,9 @@ static DELETE_RECORD_AVRO_SCHEMA_IN_JSON: Lazy<Result<JsonValue>> = Lazy::new(||
 });
 
 /// Union position of `ArrayWrapper`, which carries a list rather than a scalar.
-/// Nothing orders records by a list, so it is rejected rather than mapped.
+/// This legacy helper rejects it; the live decode (`unwrap_ordering_values` in
+/// `log_file/content.rs`) keeps the union column whole so the per-row decode
+/// yields the composite ordering value the merge compares.
 const ARRAY_WRAPPER_POSITION: u32 = 12;
 
 /// Replace a wrapped ordering value with the primitive inside it.

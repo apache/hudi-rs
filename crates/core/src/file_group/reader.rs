@@ -2302,6 +2302,103 @@ mod file_group_reader_version_tests {
         Ok(())
     }
 
+    /// REGRESSION: the gate's promise held at the gate but not behind it: the
+    /// engine refused the merge mode it was never going to consult, so a
+    /// base-file-only read of a CUSTOM table failed end to end while the
+    /// streaming path served it. Read the whole table both ways to pin the
+    /// promise where it broke.
+    #[tokio::test]
+    async fn test_custom_merge_mode_reads_base_only_slices_end_to_end() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = crate::table::Table::new(base_url.path()).await?;
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(!slices.is_empty(), "fixture must have a file slice to read");
+
+        let read_all = async |options: Vec<(&str, String)>| -> Result<usize> {
+            let reader = FileGroupReader::new_with_options(base_url.as_ref(), options).await?;
+            let mut rows = 0;
+            for slice in &slices {
+                rows += reader
+                    .read_file_slice(slice, &ReadOptions::new())
+                    .await?
+                    .num_rows();
+            }
+            Ok(rows)
+        };
+
+        let custom = ("hoodie.record.merge.mode", "CUSTOM".to_string());
+        let default_rows = read_all(vec![custom.clone()]).await?;
+        let v1_rows = read_all(vec![
+            custom,
+            (
+                HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                "1".to_string(),
+            ),
+        ])
+        .await?;
+        assert!(default_rows > 0, "the fixture has rows");
+        assert_eq!(
+            default_rows, v1_rows,
+            "both versions must read the same rows"
+        );
+        Ok(())
+    }
+
+    /// A read-optimized read ignores the log files, so it follows the same
+    /// rule as a copy-on-write slice: served, whatever the merge mode says.
+    #[tokio::test]
+    async fn test_custom_merge_mode_reads_read_optimized_end_to_end() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let table = crate::table::Table::new(base_url.path()).await?;
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(!slices.is_empty(), "fixture must have a file slice to read");
+
+        let reader = FileGroupReader::new_with_options(
+            base_url.as_ref(),
+            [("hoodie.record.merge.mode", "CUSTOM".to_string())],
+        )
+        .await?;
+        let options = ReadOptions::new().with_hudi_option(
+            HudiReadConfig::UseReadOptimizedMode.as_ref(),
+            "true".to_string(),
+        );
+        let mut rows = 0;
+        for slice in &slices {
+            rows += reader.read_file_slice(slice, &options).await?.num_rows();
+        }
+        assert!(rows > 0, "a read-optimized read must be served");
+        Ok(())
+    }
+
+    /// The same table errors once a merge is real, and the error names the
+    /// version that reads it.
+    #[tokio::test]
+    async fn test_custom_merge_mode_merging_read_errors_end_to_end() -> Result<()> {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let table = crate::table::Table::new(base_url.path()).await?;
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        let slice = slices
+            .iter()
+            .find(|s| s.has_log_file())
+            .expect("fixture must have a slice with log files");
+
+        let reader = FileGroupReader::new_with_options(
+            base_url.as_ref(),
+            [("hoodie.record.merge.mode", "CUSTOM".to_string())],
+        )
+        .await?;
+        let err = reader
+            .read_file_slice(slice, &ReadOptions::new())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("hoodie.read.file.group.reader.version=1"),
+            "the error must name the way back, got: {err}"
+        );
+        Ok(())
+    }
+
     /// REGRESSION: a base file whose format is only knowable from its extension
     /// falls back to version 1 rather than being read as parquet.
     ///

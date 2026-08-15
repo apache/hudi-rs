@@ -49,7 +49,15 @@ pub(crate) fn resolve_reader_context(
         .ok_or_else(|| ConfigError::NotFound(HudiReadConfig::EndTimestamp.as_ref().to_string()))?
         .into();
 
-    let merge_mode = resolve_merge_mode(hudi_configs)?;
+    // A slice with no log files consults no merger, so an unsupported merge
+    // mode (CUSTOM, or one inferred from a custom payload class) must not
+    // refuse it: `version_two_unsupported_reason` deliberately serves such
+    // reads. Commit-time ordering stands in as the mode nothing reads.
+    let merge_mode = match resolve_merge_mode(hudi_configs) {
+        Ok(mode) => mode,
+        Err(CoreError::Unsupported(_)) if !has_log_files => MergeMode::CommitTimeOrdering,
+        Err(e) => return Err(e),
+    };
     let base_file_format = BaseFileFormatValue::resolve_from_configs(hudi_configs, None)?;
     let instant_range = resolve_instant_range(hudi_configs)?;
     let (table_config, hoodie_reader_config) = partition_configs(hudi_configs);
@@ -356,7 +364,9 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
             "COMMIT_TIME_ORDERING" => Ok(MergeMode::CommitTimeOrdering),
             "EVENT_TIME_ORDERING" => Ok(MergeMode::EventTimeOrdering),
             other => Err(CoreError::Unsupported(format!(
-                "Record merge mode '{other}' is not supported."
+                "Record merge mode '{other}' is not supported. Set \
+                 hoodie.read.file.group.reader.version=1 to read with the \
+                 reader that served this table before"
             ))),
         };
     }
@@ -372,7 +382,9 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         // a table without those configs and drop its deletes silently.
         InferredMode::Custom => Err(CoreError::Unsupported(
             "This table merges with a merger of its own, which the merge-on-read \
-             reader cannot reproduce."
+             reader cannot reproduce. Set hoodie.read.file.group.reader.version=1 \
+             to read with the reader that served it before, which merges without \
+             that merger"
                 .to_string(),
         )),
     }
@@ -459,6 +471,52 @@ mod tests {
         let ctx = resolve_reader_context(&configs, false).unwrap();
 
         assert_eq!(ctx.table_path, "file:///tmp/t");
+    }
+
+    /// REGRESSION: a slice with no log files consults no merger, so a merge
+    /// mode this reader cannot serve must not refuse it:
+    /// `version_two_unsupported_reason` deliberately serves such reads.
+    #[test]
+    fn resolves_a_base_only_slice_of_a_custom_merge_table() {
+        let mut options = minimal_configs();
+        options.push(("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()));
+        let ctx = resolve_reader_context(&HudiConfigs::new(options), false).unwrap();
+        assert_eq!(ctx.merge_mode, "COMMIT_TIME_ORDERING");
+    }
+
+    /// The same table is still refused once log files make a merge real, and
+    /// the error names the version that reads it.
+    #[test]
+    fn refuses_a_merging_slice_of_a_custom_merge_table_naming_the_way_back() {
+        let mut options = minimal_configs();
+        options.push(("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()));
+        let err = resolve_reader_context(&HudiConfigs::new(options), true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("hoodie.read.file.group.reader.version=1"),
+            "the error must name the way back, got: {err}"
+        );
+    }
+
+    /// A custom payload class infers a CUSTOM merge, which follows the same
+    /// rule: served with nothing to merge, refused with log files to merge.
+    #[test]
+    fn custom_payload_class_follows_the_same_no_merge_rule() {
+        let mut options = minimal_configs();
+        options.push((
+            "hoodie.compaction.payload.class".to_string(),
+            "com.example.MyPayload".to_string(),
+        ));
+        let configs = HudiConfigs::new(options);
+        let ctx = resolve_reader_context(&configs, false).unwrap();
+        assert_eq!(ctx.merge_mode, "COMMIT_TIME_ORDERING");
+
+        let err = resolve_reader_context(&configs, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("hoodie.read.file.group.reader.version=1"),
+            "the error must name the way back, got: {err}"
+        );
     }
 
     #[test]
