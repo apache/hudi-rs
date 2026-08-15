@@ -2013,7 +2013,7 @@ mod tests {
         Ok(())
     }
 
-    /// REGRESSION: no row an incremental read returns may sit outside its
+    /// Regression test: no row an incremental read returns may sit outside its
     /// window, including a compacted base row that no log record replaces.
     ///
     /// Compaction merges records from many commits into one base file while
@@ -2302,7 +2302,7 @@ mod file_group_reader_version_tests {
         Ok(())
     }
 
-    /// REGRESSION: the gate's promise held at the gate but not behind it: the
+    /// Regression test: the gate's promise held at the gate but not behind it: the
     /// engine refused the merge mode it was never going to consult, so a
     /// base-file-only read of a CUSTOM table failed end to end while the
     /// streaming path served it. Read the whole table both ways to pin the
@@ -2399,7 +2399,7 @@ mod file_group_reader_version_tests {
         Ok(())
     }
 
-    /// REGRESSION: a base file whose format is only knowable from its extension
+    /// Regression test: a base file whose format is only knowable from its extension
     /// falls back to version 1 rather than being read as parquet.
     ///
     /// Version 2 resolves the format from `hoodie.table.base.file.format`
@@ -2425,7 +2425,7 @@ mod file_group_reader_version_tests {
         Ok(())
     }
 
-    /// REGRESSION: a table that drops its partition columns from the data files
+    /// Regression test: a table that drops its partition columns from the data files
     /// falls back to version 1 rather than null-filling them.
     ///
     /// Neither reader reconstructs a dropped partition column from the

@@ -1883,7 +1883,7 @@ mod tests {
         ));
     }
 
-    /// REGRESSION: a modest merge budget must still leave usable in-memory
+    /// Regression test: a modest merge budget must still leave usable in-memory
     /// space before the first spill.
     ///
     /// The reserve used to be deducted at config time, so `0.8 × size − 40 MiB`

@@ -302,7 +302,7 @@ mod tests {
         OrderingValue::Composite(parts.iter().copied().map(OrderingValue::Long).collect())
     }
 
-    /// REGRESSION: a composite (multi-field) delete ordering value follows the
+    /// Regression test: a composite (multi-field) delete ordering value follows the
     /// scalar rule: a stale delete loses to a record whose composite ordering
     /// is higher, and a newer one wins.
     #[test]

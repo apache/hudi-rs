@@ -102,7 +102,7 @@ async fn probe_with_reader_version(zip: &str, label: &str, reader_version: &str)
     );
 }
 
-/// REGRESSION: a base file whose commit never completed is not readable, on
+/// Regression test: a base file whose commit never completed is not readable, on
 /// either timeline layout and under either reader version.
 ///
 /// This began as an `#[ignore]`d probe recording a divergence: readability was

@@ -1685,7 +1685,7 @@ mod tests {
         assert_eq!(batches.num_columns(), 21);
     }
 
-    /// REGRESSION: the reader handed out by the public constructor must read an
+    /// Regression test: the reader handed out by the public constructor must read an
     /// evolved table with the TABLE's schema, not the base file's.
     ///
     /// This constructor is what DataFusion and the Python bindings use. It never
@@ -2259,7 +2259,7 @@ mod tests {
         assert!(std::ptr::eq(initialized, cached));
     }
 
-    /// REGRESSION: the slice fan-out honours
+    /// Regression test: the slice fan-out honours
     /// `hoodie.read.file.slice.read.concurrency`.
     ///
     /// Both read paths used a bare `try_join_all` over every file slice, so the
@@ -2325,7 +2325,7 @@ mod tests {
         assert!(zero.file_slice_read_concurrency() >= 1);
     }
 
-    /// REGRESSION: the file group reader version set at TABLE level must
+    /// Regression test: the file group reader version set at TABLE level must
     /// actually select the reader, and a typo in it must fail the read.
     ///
     /// `Table::build` used to drop every `hoodie.read.*` key, so both halves of
@@ -2379,7 +2379,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION: the start bound handed to the log scan is a real instant, not
+    /// Regression test: the start bound handed to the log scan is a real instant, not
     /// a synthesized "one tick below" string.
     ///
     /// It used to be the earliest admitted instant decremented as an integer, to
@@ -2477,7 +2477,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION: `read` and `read_stream` must agree on the schema of an
+    /// Regression test: `read` and `read_stream` must agree on the schema of an
     /// evolved table.
     ///
     /// `read_stream` resolved the table's schema and then handed it to a base-file

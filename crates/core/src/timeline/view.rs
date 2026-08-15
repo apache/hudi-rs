@@ -288,7 +288,7 @@ mod tests {
         assert!(view.get_completion_time("unknown").is_none());
     }
 
-    /// REGRESSION: uncommitted files must be filtered on BOTH timeline layouts.
+    /// Regression test: uncommitted files must be filtered on BOTH timeline layouts.
     ///
     /// The predicate used to be `should_filter_uncommitted() && completion_time
     /// .is_none()`, gated on layout v2 — so on a v1 table nothing was filtered
@@ -325,7 +325,7 @@ mod tests {
         }
     }
 
-    /// REGRESSION: a file whose commit was ARCHIVED is still committed.
+    /// Regression test: a file whose commit was ARCHIVED is still committed.
     ///
     /// The completion map is built from the ACTIVE timeline, so testing for a
     /// completion timestamp discarded files from commits that had merely been

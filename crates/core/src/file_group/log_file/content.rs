@@ -876,7 +876,7 @@ mod tests {
         Ok(())
     }
 
-    /// REGRESSION: `IS_PARTIAL=false` marks a FULL block.
+    /// Regression test: `IS_PARTIAL=false` marks a FULL block.
     ///
     /// The flag used to be read by its presence, so a writer that spells the
     /// negative case out turned every full block partial — decoded at its own
@@ -1048,7 +1048,7 @@ mod tests {
         batches.delete_batches[0].0.column(2).clone()
     }
 
-    /// REGRESSION: a delete written without an ordering value shares its block
+    /// Regression test: a delete written without an ordering value shares its block
     /// with typed ones: null is a union branch, not a second ordering type.
     /// The null slot decodes as a null cell, which the merge treats as a
     /// natural-order delete, matching Hudi.
@@ -1068,7 +1068,7 @@ mod tests {
         Ok(())
     }
 
-    /// REGRESSION: a block whose deletes all carry no ordering value must not
+    /// Regression test: a block whose deletes all carry no ordering value must not
     /// produce a `DataType::Null` column, which no ordering reader accepts.
     #[test]
     fn test_delete_block_all_null_ordering_decodes_readably() -> Result<()> {
@@ -1083,7 +1083,7 @@ mod tests {
         Ok(())
     }
 
-    /// REGRESSION: multiple ordering fields serialize to `ArrayWrapper`, whose
+    /// Regression test: multiple ordering fields serialize to `ArrayWrapper`, whose
     /// composite value only the per-row union decode can represent. The union
     /// passes through whole and decodes to the composite the merge compares,
     /// so a stale composite delete can lose to a newer row instead of the read

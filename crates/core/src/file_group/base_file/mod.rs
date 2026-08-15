@@ -205,7 +205,7 @@ mod tests {
         assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
     }
 
-    /// REGRESSION: `BaseFile`'s `Display` stays exercised.
+    /// Regression test: `BaseFile`'s `Display` stays exercised.
     ///
     /// It renders the file name a reader would see in a log line or an error,
     /// so it is the string a person debugging a slice reads first. Nothing else

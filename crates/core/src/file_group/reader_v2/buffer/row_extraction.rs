@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(out.schema(), schema);
     }
 
-    /// REGRESSION: reconciling a wide column down to a narrow target must fail,
+    /// Regression test: reconciling a wide column down to a narrow target must fail,
     /// not truncate.
     ///
     /// The leaf arm of `rebuild_array_data_to_type` used to re-tag any leaf's

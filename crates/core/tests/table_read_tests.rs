@@ -3115,7 +3115,7 @@ mod incremental_windows_match_hudi {
         .await
     }
 
-    /// REGRESSION: a window whose bounds fall between one commit's requested and
+    /// Regression test: a window whose bounds fall between one commit's requested and
     /// completion times must return that commit.
     ///
     /// Both readers range `(start, end]`; what they compare used to differ. Hudi
@@ -3230,7 +3230,7 @@ mod incremental_window_boundaries {
         Ok(())
     }
 
-    /// REGRESSION: starting on c3's *requested* time keeps c3, because it
+    /// Regression test: starting on c3's *requested* time keeps c3, because it
     /// completed after the window opened.
     ///
     /// The window's start is exclusive on completion time, and c3's completion is
@@ -3250,7 +3250,7 @@ mod incremental_window_boundaries {
         Ok(())
     }
 
-    /// REGRESSION: a window from c3's requested time to its completion time
+    /// Regression test: a window from c3's requested time to its completion time
     /// contains exactly that one commit.
     ///
     /// The narrowest case of the same thing: the window brackets one commit's

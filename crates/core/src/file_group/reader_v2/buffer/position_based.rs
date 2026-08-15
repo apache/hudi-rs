@@ -1236,7 +1236,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION (PR #95 review major, fixed): a position-keyed DELETE tombstone
+    /// Regression test: a position-keyed DELETE tombstone
     /// that spills to the RocksDB tier must still suppress its target row after
     /// key-based fallback. A delete's disk entry stores no payload, so before the
     /// fix `spillable_map::record_from_entry` reconstructed `record_key` from the
@@ -1328,7 +1328,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION: a fallback that would collapse two positions of the same
+    /// Regression test: a fallback that would collapse two positions of the same
     /// record key must refuse, not silently drop one of the updates.
     ///
     /// With `dup` at base positions 1 and 2 and a log block updating both by

@@ -494,7 +494,7 @@ mod tests {
         }
     }
 
-    /// REGRESSION: a read config describing HOW to read must survive onto the
+    /// Regression test: a read config describing HOW to read must survive onto the
     /// table's own configs; only one selecting WHICH read is dropped.
     ///
     /// Everything under `hoodie.read.` used to be filtered out, so

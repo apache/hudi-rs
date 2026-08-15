@@ -764,7 +764,7 @@ mod tests {
         timeline
     }
 
-    /// REGRESSION: a layout-v2 incremental window bounds COMPLETION times.
+    /// Regression test: a layout-v2 incremental window bounds COMPLETION times.
     ///
     /// It used to bound requested times, which silently skipped any commit
     /// requested before the window that completed inside it — the normal shape of

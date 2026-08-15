@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(ctx.table_path, "file:///tmp/t");
     }
 
-    /// REGRESSION: a slice with no log files consults no merger, so a merge
+    /// Regression test: a slice with no log files consults no merger, so a merge
     /// mode this reader cannot serve must not refuse it:
     /// `version_two_unsupported_reason` deliberately serves such reads.
     #[test]
@@ -594,7 +594,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION: every per-read key Hudi spells without the `hoodie.read.`
+    /// Regression test: every per-read key Hudi spells without the `hoodie.read.`
     /// prefix must still reach the reader config.
     ///
     /// The split used to key on that prefix alone, so the merge budget, the
