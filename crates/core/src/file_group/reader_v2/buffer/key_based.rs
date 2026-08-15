@@ -4115,6 +4115,175 @@ mod tests {
         assert_eq!(records[2], ("3".to_string(), 1, 2)); // update with ts=2 wins over "delete"
     }
 
+    /// Buffer whose table and data schema are the given schema, for delete-flag
+    /// scenarios that need columns beyond the default test schema.
+    fn build_key_based_buffer_with_schema(
+        merge_mode: &str,
+        schema: Arc<Schema>,
+    ) -> KeyBasedFileGroupRecordBuffer {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::OrderingFields.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(schema.clone())
+            .with_data_schema(schema);
+        let key_field = ctx.record_key_field().to_string();
+        let ordering = ctx.record_context.ordering_field_names.clone();
+        handler
+            .prepare_required_schema(
+                true,
+                &[key_field],
+                &ordering,
+                &ctx.table_config,
+                false,
+                merge_mode,
+            )
+            .unwrap();
+        ctx.schema_handler = handler;
+        KeyBasedFileGroupRecordBuffer::new(Arc::new(ctx), merge_mode.to_string(), false).unwrap()
+    }
+
+    /// Keys surviving a merge, for the delete-flag scenarios below.
+    fn surviving_keys(batch: &RecordBatch) -> Vec<String> {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut out: Vec<String> = (0..batch.num_rows())
+            .map(|i| keys.value(i).to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `(key, ts, _hoodie_is_deleted)` batch for the flag-delete scenarios.
+    fn flag_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("_hoodie_is_deleted", DataType::Boolean, true),
+        ]))
+    }
+
+    fn flag_batch(rows: &[(&str, i64, Option<bool>)]) -> RecordBatch {
+        use arrow_array::BooleanArray;
+        RecordBatch::try_new(
+            flag_schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, t, _)| *t).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(BooleanArray::from(
+                    rows.iter().map(|(_, _, d)| *d).collect::<Vec<_>>(),
+                )) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A data-block record carrying `_hoodie_is_deleted=true` deletes its base
+    /// row through the merge, and one carrying `false` updates it. The flag is
+    /// the writer's soft-delete spelling, so it must act as a delete in the
+    /// merge itself, not only in the predicate that detects it.
+    #[test]
+    fn test_data_block_hoodie_is_deleted_flag_drives_the_merge() {
+        let mut buffer = build_key_based_buffer_with_schema("COMMIT_TIME_ORDERING", flag_schema());
+        let log = flag_batch(&[
+            ("k1", 5, Some(true)),  // flag delete of a base row
+            ("k2", 5, Some(false)), // ordinary update
+            ("k4", 5, Some(true)),  // flag delete of an absent key: no output row
+        ]);
+        buffer
+            .process_data_block(&mut make_data_block(log, "instant1"))
+            .unwrap();
+        buffer.set_base_file_iterator(vec![flag_batch(&[
+            ("k1", 1, None),
+            ("k2", 1, None),
+            ("k3", 1, None),
+        ])]);
+
+        let result = Box::new(buffer).merge_and_collect().unwrap();
+        assert_eq!(surviving_keys(&result), ["k2", "k3"]);
+    }
+
+    /// Under event-time ordering a stale `_hoodie_is_deleted` record loses the
+    /// ordering comparison like any other delete: the base row survives.
+    #[test]
+    fn test_data_block_hoodie_is_deleted_stale_flag_loses_under_event_time() {
+        let mut buffer = build_key_based_buffer_with_schema("EVENT_TIME_ORDERING", flag_schema());
+        let log = flag_batch(&[
+            ("k1", 1, Some(true)),  // stale flag delete: base ts=10 wins
+            ("k2", 20, Some(true)), // newer flag delete: applies
+        ]);
+        buffer
+            .process_data_block(&mut make_data_block(log, "instant1"))
+            .unwrap();
+        buffer.set_base_file_iterator(vec![flag_batch(&[("k1", 10, None), ("k2", 10, None)])]);
+
+        let result = Box::new(buffer).merge_and_collect().unwrap();
+        assert_eq!(surviving_keys(&result), ["k1"]);
+    }
+
+    /// A data-block record whose `_hoodie_operation` is the persisted delete
+    /// name ("D") or update-before name ("-U") deletes its base row through the
+    /// merge; any other operation value updates it. Mirrors Java's
+    /// `HoodieOperation`-based delete detection on tables written with
+    /// operation metadata.
+    #[test]
+    fn test_data_block_hoodie_operation_delete_drives_the_merge() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("_hoodie_operation", DataType::Utf8, true),
+        ]));
+        let op_batch = |rows: &[(&str, i64, Option<&str>)]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
+                    )) as _,
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(_, t, _)| *t).collect::<Vec<_>>(),
+                    )) as _,
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(_, _, o)| *o).collect::<Vec<_>>(),
+                    )) as _,
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut buffer = build_key_based_buffer_with_schema("COMMIT_TIME_ORDERING", schema.clone());
+        // Phase 2 of DeleteContext needs the reader schema to locate
+        // `_hoodie_operation`, as the loader provides in production.
+        buffer.set_reader_schema(schema.clone());
+        let log = op_batch(&[
+            ("k1", 5, Some("D")),  // delete
+            ("k2", 5, Some("-U")), // update-before: also a delete
+            ("k3", 5, Some("U")),  // ordinary update
+        ]);
+        buffer
+            .process_data_block(&mut make_data_block(log, "instant1"))
+            .unwrap();
+        buffer.set_base_file_iterator(vec![op_batch(&[
+            ("k1", 1, None),
+            ("k2", 1, None),
+            ("k3", 1, None),
+            ("k4", 1, None),
+        ])]);
+
+        let result = Box::new(buffer).merge_and_collect().unwrap();
+        assert_eq!(surviving_keys(&result), ["k3", "k4"]);
+    }
+
     // =========================================================================
     // Part E: Phase A/B/C tests from FS_logBlockConsumption.md
     // =========================================================================
