@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.read.HoodieReadStats`.
 //!
 //! Mutable accumulator for read statistics, written during log scanning
@@ -41,7 +38,7 @@ pub struct HoodieReadStats {
     // ── Stage timings (perf harness) ───────────────────────
     // Cheap monotonic `Instant`-based accumulators wired at the matching
     // code sites. Always-on, accumulated per block/batch (never per row).
-    // Used by `benchmark/filegroup` (fg-bench) to attribute wall time across
+    // Used by `benchmark/filegroup` to attribute wall time across
     // the read pipeline. Zero behavioral effect — instrumentation only.
     //
     /// Wall ms spent reading + projecting the base parquet file
@@ -70,15 +67,16 @@ pub struct HoodieReadStats {
 
     // ── Spillable merge map ──────────────────────────────
     /// True if the size-tracked merge map spilled any entry to disk (RocksDB)
-    /// during the scan — i.e. the in-memory budget was exceeded. This is the M3
-    /// acceptance signal: a low `hoodie.memory.merge.max.size` should set it.
+    /// during the scan — i.e. the in-memory budget was exceeded. A low
+    /// `hoodie.memory.merge.max.size` should set it.
     pub merge_map_spilled: bool,
     /// Peak TRUE-retained in-memory bytes the merge map held during the scan:
     /// the sum of the distinct pinned source batches' `get_array_memory_size`
-    /// plus owned/key/overhead bytes — NOT the pre-A6 per-row share, which
-    /// under-counted dense spread-key `BatchRef` maps (M5: stat read ~budget while
-    /// RSS was 21.9 GB). Bounded by `0.8 × hoodie.memory.merge.max.size − rocksdb
-    /// reserved` once A6e eviction is active, so a benchmark can confirm the
-    /// in-memory footprint stayed within budget while the rest spilled.
+    /// plus owned/key/overhead bytes. Counting whole pinned batches rather than
+    /// a per-row share keeps the stat honest for dense spread-key `BatchRef`
+    /// maps, where a per-row share vastly under-counts the retained RSS.
+    /// Bounded by `0.8 × hoodie.memory.merge.max.size − rocksdb reserved` via
+    /// source-batch eviction, so a benchmark can confirm the in-memory
+    /// footprint stayed within budget while the rest spilled.
     pub merge_map_peak_in_memory_bytes: u64,
 }

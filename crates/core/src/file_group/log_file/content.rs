@@ -579,8 +579,9 @@ mod tests {
     /// signal is gone.
     /// A block written before a column was promoted to string still reads.
     ///
-    /// Avro refuses to build a reader for `int -> string`, so this is the case
-    /// that used to fail outright with "Illegal promotion Int to String". The
+    /// Avro refuses to build a reader for `int -> string`, so without the
+    /// extended-promotion path this read fails outright with "Illegal
+    /// promotion Int to String". The
     /// block decodes at its own schema and is converted afterwards.
     #[test]
     fn test_extended_promotion_int_to_string_rewrites() -> Result<()> {
@@ -878,12 +879,12 @@ mod tests {
 
     /// Regression test: `IS_PARTIAL=false` marks a FULL block.
     ///
-    /// The flag used to be read by its presence, so a writer that spells the
-    /// negative case out turned every full block partial — decoded at its own
-    /// schema, skipping the resolution up to the reader's, which is what
-    /// delivers a promoted column in the promoted type. Java reads the value
-    /// (`Boolean.parseBoolean(getOrDefault(IS_PARTIAL, "false"))`), so this does
-    /// too.
+    /// Reading the flag by its mere presence would turn every full block from a
+    /// writer that spells the negative case out into a partial one — decoded at
+    /// its own schema, skipping the resolution up to the reader's, which is
+    /// what delivers a promoted column in the promoted type. Java reads the
+    /// value (`Boolean.parseBoolean(getOrDefault(IS_PARTIAL, "false"))`), so
+    /// this does too.
     #[test]
     fn test_decode_avro_is_partial_false_resolves_to_the_reader_schema() -> Result<()> {
         // Written narrow; the reader schema promotes `id` to a wider type and
@@ -1118,7 +1119,7 @@ mod tests {
         Ok(())
     }
 
-    /// Two scalar ordering types in one block remain rejected: collapsing them
+    /// Two scalar ordering types in one block are rejected: collapsing them
     /// to either type would compare across types the merge keeps apart.
     #[test]
     fn test_delete_block_mixing_scalar_ordering_types_errors() {

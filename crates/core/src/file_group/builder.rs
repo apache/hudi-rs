@@ -850,6 +850,56 @@ mod tests {
                 .unwrap();
             assert!(fs.base_file.as_ref().unwrap().file_metadata.is_none());
         }
+
+        /// A log-only delta commit names its log file in `path` with no base
+        /// file; it contributes an unattached log file, not a file group.
+        #[test]
+        fn test_log_only_delta_commit_contributes_unattached_log_files() {
+            let json = r#"{
+                "partitionToWriteStats": {
+                    "p1": [{
+                        "fileId": "fid-0",
+                        "path": "p1/.fid-0_20240418173200000.log.1_0-8-25"
+                    }]
+                }
+            }"#;
+            let metadata: Map<String, Value> = serde_json::from_str(json).unwrap();
+
+            let contribution = file_groups_from_commit_metadata_with_estimator(
+                &metadata,
+                &create_layout_v1_view(),
+                None,
+            )
+            .unwrap();
+
+            assert!(contribution.file_groups.is_empty());
+            assert_eq!(contribution.unattached_log_files.len(), 1);
+            assert_eq!(contribution.unattached_log_files[0].partition, "p1");
+            assert_eq!(contribution.unattached_log_files[0].file_id, "fid-0");
+        }
+
+        /// A malformed log-file name in a log-only write stat fails loudly
+        /// instead of contributing a slice that can never be located.
+        #[test]
+        fn test_log_only_delta_commit_with_invalid_log_name_errors() {
+            let json = r#"{
+                "partitionToWriteStats": {
+                    "p1": [{
+                        "fileId": "fid-0",
+                        "path": "p1/.not-a-log-name.log",
+                        "logFiles": [".not-a-log-name.log"]
+                    }]
+                }
+            }"#;
+            let metadata: Map<String, Value> = serde_json::from_str(json).unwrap();
+
+            let result = file_groups_from_commit_metadata_with_estimator(
+                &metadata,
+                &create_layout_v1_view(),
+                None,
+            );
+            assert!(result.is_err());
+        }
     }
 
     mod test_file_groups_from_files_partition_records {
@@ -958,6 +1008,48 @@ mod tests {
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
             assert!(file_groups_map.is_empty());
+        }
+
+        /// Files whose commit never completed are skipped, base and log alike:
+        /// a crashed or in-flight writer's files must not read as committed.
+        #[test]
+        fn test_uncommitted_base_and_log_files_are_skipped() {
+            let committed = Instant {
+                timestamp: "20240418173200000".to_string(),
+                completion_timestamp: Some("20240418173210000".to_string()),
+                action: Action::Commit,
+                state: State::Completed,
+                epoch_millis: 0,
+            };
+            let view = create_strict_view(&[committed]);
+
+            let records: HashMap<String, FilesPartitionRecord> = [create_files_record(
+                "p1",
+                vec![
+                    ("fid-0_0-7-24_20240418173200000.parquet", 1024, false),
+                    (".fid-0_20240418173200000.log.1_0-8-25", 512, false),
+                    // Same file group, written by an instant the timeline never
+                    // completed: both must be dropped from the view.
+                    ("fid-1_0-7-24_20240418999999999.parquet", 1024, false),
+                    (".fid-0_20240418999999999.log.2_0-9-26", 512, false),
+                ],
+            )]
+            .into();
+
+            let file_groups_map = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &view,
+                None,
+            )
+            .unwrap();
+
+            let file_groups = file_groups_map.get("p1").unwrap();
+            assert_eq!(file_groups.len(), 1, "the uncommitted base file is out");
+            let fg = &file_groups[0];
+            assert_eq!(fg.file_id, "fid-0");
+            let slice = fg.file_slices.values().next().unwrap();
+            assert_eq!(slice.log_files.len(), 1, "the uncommitted log file is out");
         }
 
         #[test]

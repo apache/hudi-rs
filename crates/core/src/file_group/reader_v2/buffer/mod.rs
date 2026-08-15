@@ -17,12 +17,11 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-// Re-exports here serve buffer implementations that land in later changes.
+// Some items exist only for Java parity or for buffer variants that are not
+// implemented yet, and have no caller.
 #![allow(dead_code, unused_imports)]
 
-//! Record buffer hierarchy for the file group reader.
+//! Record buffer hierarchy for the merge-on-read file group reader.
 //!
 //! Mirrors the Java package `org.apache.hudi.common.table.read.buffer`.
 //!
@@ -36,9 +35,9 @@
 //!   FileGroupRecordBuffer  (common state struct)  (Java abstract class)
 //!       │
 //!       ├── KeyBasedFileGroupRecordBuffer          (KEY_BASED_MERGE, default)
-//!       ├── [PositionBasedFileGroupRecordBuffer]    (future)
-//!       ├── [SortedKeyBasedFileGroupRecordBuffer]   (future)
-//!       └── [UnmergedFileGroupRecordBuffer]          (future)
+//!       ├── PositionBasedFileGroupRecordBuffer      (position-based merge)
+//!       ├── [SortedKeyBasedFileGroupRecordBuffer]   (not yet implemented)
+//!       └── [UnmergedFileGroupRecordBuffer]          (not yet implemented)
 //! ```
 
 pub mod key_based;
@@ -66,7 +65,7 @@ use arrow_schema::SchemaRef;
 pub enum BufferType {
     /// Key-based merge: deduplicates by record key, keeps latest by ordering value.
     KeyBasedMerge,
-    /// Position-based merge (not yet implemented).
+    /// Position-based merge: matches base rows to log records by base-file row position.
     PositionBasedMerge,
     /// Unmerged: skips merge (not yet implemented).
     Unmerged,
@@ -82,16 +81,15 @@ pub enum BufferType {
 /// - `processDeleteBlock` → `process_delete_block`
 /// - `processNextDeletedRecord` → `process_next_deleted_record`
 /// - `containsLogRecord` → `contains_log_record`
-/// - `setBaseFileIterator` → `set_base_file_iterator` (legacy, default-impl)
+/// - `setBaseFileIterator` → `set_base_file_iterator` (back-compat default impl)
 ///   and `set_base_file_source` (the lazy entry point)
 /// - `hasNext` / `next` → `has_next` / `next`
 ///
-/// The trait used to require `Sync`. Dropped because the
-/// buffer now holds a lazy `Box<dyn RecordBatchReader + Send>` for the
-/// base file source, and arrow-rs's `RecordBatchReader` is `Send` but
-/// not `Sync`. Nothing in the codebase ever shared a buffer through
-/// `&buffer` across threads — every use is either owned (`Box<dyn ...>`)
-/// or accessed through `&mut self` — so removing `Sync` is benign.
+/// The trait requires `Send` but not `Sync`: the buffer holds a lazy
+/// `Box<dyn RecordBatchReader + Send>` for the base file source, and
+/// arrow-rs's `RecordBatchReader` is `Send` but not `Sync`. Nothing in
+/// the codebase shares a buffer through `&buffer` across threads — every
+/// use is either owned (`Box<dyn ...>`) or accessed through `&mut self`.
 pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Returns the buffer type.
     fn get_buffer_type(&self) -> BufferType;
@@ -136,7 +134,7 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
 
     /// Stage timing (perf harness): cumulative wall ms spent inflating /
     /// decoding log blocks inside `process_data_block` / `process_delete_block`.
-    /// This is a SUBSET of the Pass-3 merge-insert window. Default 0 for buffers
+    /// A subset of the merge-insert stat window. Default 0 for buffers
     /// that don't instrument decode.
     fn stage_decode_ms(&self) -> u64 {
         0
@@ -150,7 +148,7 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
 
     /// Spill stat: true if the size-tracked merge map spilled
     /// any entry to disk during the scan. Default false for buffers without a
-    /// spillable map. This is the M3 acceptance signal.
+    /// spillable map.
     fn merge_map_spilled(&self) -> bool {
         false
     }
@@ -163,8 +161,8 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
 
     /// The merge map's CURRENT tracked in-memory footprint (bytes) — the live
     /// resident heap right now, not the peak. This is the value a host memory
-    /// manager (e.g. velox's `MemoryPool`) reserves against the hudi-rs reader;
-    /// the FFI reader-memory accessor forwards it. Default 0 for
+    /// manager (e.g. an embedding engine's memory pool) can reserve against
+    /// the hudi-rs reader. Default 0 for
     /// buffers without a spillable map. See
     /// [`SpillableRecordMap::current_in_memory_bytes`](super::spillable_map::SpillableRecordMap::current_in_memory_bytes)
     /// for exactly what is and isn't included.
@@ -220,8 +218,8 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
         self.set_base_file_source(Box::new(iter));
     }
 
-    /// Compact sparsely-populated pinned source batches in the merge map (A2
-    /// safety valve).
+    /// Compact sparsely-populated pinned source batches in the merge map (the
+    /// batch-pinning safety valve).
     ///
     /// A `BatchRef` entry keeps its whole source `Arc<RecordBatch>` alive, so a
     /// source batch with few surviving keys pins memory for its dead rows. This
@@ -275,7 +273,7 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Vectorized: extracts all keys+ordering values from `base` in one pass,
     /// builds a `BooleanArray` keep-mask, then uses
     /// `arrow::compute::filter_record_batch` to apply the mask in a single
-    /// Arrow kernel call — vs. the legacy `next_base_row` path which does
+    /// Arrow kernel call — vs. the per-row `next_base_row` path, which does
     /// `batch.slice(idx, 1)` + per-row `BufferedRecord` allocation and a
     /// 4096-batch `concat_batches` per emitted chunk.
     ///

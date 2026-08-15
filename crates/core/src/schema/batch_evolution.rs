@@ -17,17 +17,15 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
 #![allow(dead_code)]
 
 //! Batch-level schema-evolution projector.
 //!
-//! Equivalent of gold's record rewrite (`HoodieAvroUtils.rewriteRecordWithNewSchema`,
+//! Equivalent of Java's record rewrite (`HoodieAvroUtils.rewriteRecordWithNewSchema`,
 //! avro log path) and cast projection (`HoodieParquetFileFormatHelper.generateUnsafeProjection`,
 //! parquet base path): reorder columns by name, null-fill added columns, cast
-//! promoted types. Gold-parity cast rules:
-//!   * Float32→Float64: STRING-MEDIATED (both gold paths do this; C6 value-exactness)
+//! promoted types. Java-parity cast rules:
+//!   * Float32→Float64: STRING-MEDIATED (both Java paths do this) so values stay exact
 //!   * numeric→Utf8: Java `String.valueOf` formatting
 //!   * struct/list/map: recursive
 //!   * everything else: `arrow_cast::cast`
@@ -71,7 +69,7 @@ pub fn project_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Resul
 }
 
 /// Locate a column by name, preferring an exact match and falling back to a
-/// case-insensitive match (gold/Spark resolve field names case-insensitively).
+/// case-insensitive match (Java/Spark resolve field names case-insensitively).
 ///
 /// Returns `Ok(None)` when no field matches (the caller null-fills) and an
 /// error when more than one field matches case-insensitively without an exact
@@ -156,7 +154,7 @@ pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<Ar
         return Ok(src.clone());
     }
     match (st, tt) {
-        // Gold C6: float→double via string round-trip (both gold paths).
+        // Matches Java: float→double via string round-trip (both Java paths).
         (DataType::Float32, DataType::Float64) => {
             let s = float_to_java_string_array(src)?;
             arrow_cast::cast(&s, &DataType::Float64)
@@ -573,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_project_timestamp_micros_to_millis_ntz_divides_like_java() {
-        // S4: the NTZ (local-timestamp) micros→millis pair is a GENUINE arithmetic
+        // The NTZ (local-timestamp) micros→millis pair is a GENUINE arithmetic
         // conversion, NOT the #18132 reinterpret. Java's AvroSchemaRepair does not
         // repair the NTZ classes (AvroSchemaRepair.java:133-134 matches only the
         // tz-aware TimestampMicros/TimestampMillis), so the value flows through
@@ -635,7 +633,7 @@ mod tests {
     fn test_project_timestamp_micros_to_millis_preserves_timezone_and_nulls() {
         // The target field's timezone is applied to the same epoch buffer, and
         // null entries are preserved through the reinterpret. tz-AWARE on both sides
-        // (Some) — the only pairing that reaches the #18132 reinterpret arm after S4.
+        // (Some) — the only pairing that reaches the #18132 reinterpret arm.
         let b = batch(
             vec![Field::new(
                 "ts",
@@ -839,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_project_float_to_double_is_value_exact() {
-        // Gold C6: 0.1f must become 0.1 (string-mediated), NOT 0.10000000149011612.
+        // Matches Java: 0.1f must become 0.1 (string-mediated), NOT 0.10000000149011612.
         let b = batch(
             vec![Field::new("v", DataType::Float32, true)],
             vec![Arc::new(Float32Array::from(vec![0.1f32]))],
@@ -985,7 +983,7 @@ mod tests {
         assert_eq!(ev.value(1), 2);
     }
 
-    // --- Added cases (prompt) ---
+    // --- Additional cases ---
 
     #[test]
     fn test_project_float32_to_string_shortest_f32_repr() {
@@ -1044,7 +1042,7 @@ mod tests {
     #[test]
     fn test_project_float_to_string_nan_and_infinities() {
         // Java Float/Double.toString: NaN → "NaN", +inf → "Infinity",
-        // -inf → "-Infinity". Pin exact tokens for both widths (review B1).
+        // -inf → "-Infinity". Pin exact tokens for both widths.
         let b = batch(
             vec![
                 Field::new("f_nan", DataType::Float32, true),
@@ -1221,7 +1219,7 @@ mod tests {
     fn test_evolve_array_converts_the_wider_numeric_promotions_exactly() {
         use arrow_array::{Float64Array, Int64Array};
 
-        // int -> double, a two-step Avro promotion the gate used to reject.
+        // int -> double, a two-step Avro promotion.
         let out = project_batch_to_schema(
             &batch(
                 vec![Field::new("n", DataType::Int32, false)],

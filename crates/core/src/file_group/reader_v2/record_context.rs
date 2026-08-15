@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.engine.RecordContext<T>`.
 //!
 //! In Java Hudi, `RecordContext<T>` is an abstract class with engine-specific
@@ -161,7 +158,7 @@ impl<'b> OrderingAccessor<'b> {
     /// Build the [`OrderingValue`] for row `idx`. A NULL cell in a supported
     /// ordering column yields [`OrderingValue::Default`] (the null-coerced default,
     /// Java `OrderingValues.getDefault()` == `Integer(0)`) — NOT `None` — so a
-    /// null-ordering record does not auto-win a merge (G-B). `None` is returned
+    /// null-ordering record does not auto-win a merge. `None` is returned
     /// only for [`OrderingAccessor::None`] (no ordering field configured, the field
     /// is absent from the batch, or the column is an unsupported ordering type),
     /// which the caller treats as "no ordering value". Downcast-free — the column
@@ -191,7 +188,7 @@ impl<'b> OrderingAccessor<'b> {
         }
         // An `int` (Arrow `Int32`) field's value of `0` is Java `Integer(0)`, which
         // IS the default ordering value (`OrderingValues.isDefault` ==
-        // `Integer(0).equals(x)`) — GAP-2. Every OTHER integer-domain type
+        // `Integer(0).equals(x)`). Every OTHER integer-domain type
         // (`Int64`/`Int16`/`Int8`/`Date`/`Timestamp`/`Boolean`) boxes to a class
         // that is NOT `Integer`, so its `0` is a GENUINE value (`Long(0)`), NOT the
         // default — a genuine `bigint 0` must be ordering-compared, not treated as
@@ -312,7 +309,7 @@ pub struct RecordContext {
     /// meta-field tables read the encoded key straight from `_hoodie_record_key`.
     /// When set, [`Self::record_key_array`] reconstructs the `field:value` key so it
     /// matches the writer's stored key (else a delete keyed `id:42` would not match a
-    /// base row keyed `42`, and the deleted row would resurface — G-C).
+    /// base row keyed `42`, and the deleted row would resurface).
     pub encode_single_key_field: bool,
 }
 
@@ -435,7 +432,7 @@ impl RecordContext {
         "hoodie.write.complex.keygen.new.encoding";
 
     /// Whether a single-field VIRTUAL key is stored as `<field>:<value>` by the
-    /// writer's key generator, so the reader must reconstruct the same shape (G-C).
+    /// writer's key generator, so the reader must reconstruct the same shape.
     ///
     /// Mirrors Java: a `ComplexKeyGenerator`/`ComplexAvroKeyGenerator` over a SINGLE
     /// record-key field prefixes the field name when
@@ -517,7 +514,7 @@ impl RecordContext {
         // construction.
         //
         // A SINGLE-field virtual key written by a ComplexKeyGenerator is encoded as
-        // `field:val` too (G-C — see [`Self::encode_single_key_field`]); it routes
+        // `field:val` too (see [`Self::encode_single_key_field`]); it routes
         // through the same builder, which for one field yields `field:val` (no
         // trailing separator) and errors on a null/empty key (matching Java's
         // single-field `HoodieKeyException`).
@@ -1060,7 +1057,7 @@ impl RecordContext {
             let record = if is_delete {
                 BufferedRecord::new_delete(key.clone(), ordering_value)
             } else {
-                // A2: zero-copy reference into the shared source batch; no slice
+                // Zero-copy reference into the shared source batch; no slice
                 // or copy until the drain interleaves survivors.
                 BufferedRecord::new_batch_ref(key.clone(), batch.clone(), row_idx, ordering_value)
             };
@@ -1072,14 +1069,12 @@ impl RecordContext {
 
     /// Extract the record keys from a delete RecordBatch.
     ///
-    /// Delete batches have schema: (recordKey, partitionPath, orderingVal). The
-    /// only field the key-based buffer's `process_delete_block` consumes is the
-    /// record key — it constructs its own `DeleteRecord` per key. We therefore
-    /// extract keys only and skip building a `BufferedRecord` per row (review A3:
-    /// the per-row `new_delete` allocations were wasted — the caller discarded
-    /// them). Ordering/partition are unreachable-post-gate (D-P3-1): EVENT_TIME
-    /// delete ordering is rejected at buffer/loader.rs before any merge runs.
-    /// Java-parity helper; the decoder turns delete blocks into records.
+    /// Delete batches have schema: (recordKey, partitionPath, orderingVal).
+    /// This key-only variant extracts just the record keys and is a Java-parity
+    /// leftover: production code uses
+    /// [`Self::delete_batch_to_keys_with_ordering`], which also decodes each
+    /// delete's ordering value so an EVENT_TIME delete carrying a lower
+    /// ordering value does not remove the row.
     #[allow(dead_code)]
     pub fn delete_batch_to_keys(&self, batch: &RecordBatch) -> Result<Vec<String>> {
         if batch.num_rows() == 0 {
@@ -1151,8 +1146,7 @@ impl RecordContext {
                 }
                 // Fallback: a bare primitive orderingVal column (older format /
                 // tests). An UNSUPPORTED bare primitive type must reject loudly
-                // (restores fix 34cc3f4, reverted during the vectorized-merge
-                // work) — never silently degrade to all-`None`, which would make
+                // — never silently degrade to all-`None`, which would make
                 // a delete unconditionally win under EVENT_TIME (silent-wrong).
                 // Matches the union path and the loud-rejection contract.
                 _ => match Self::column_to_ordering_values(col.as_ref()) {
@@ -1444,8 +1438,8 @@ mod tests {
     }
 
     /// Virtual-key base batch: NO meta columns, real key column `id` (INT32) plus
-    /// a `longField` precombine (matching the gluten `TestInsertTable2` virtual-key
-    /// bulk-insert fixture — `primaryKey=id`, `preCombineField`, no meta fields).
+    /// a `longField` precombine (a typical virtual-key bulk-insert layout:
+    /// `primaryKey=id`, a precombine field, no meta fields).
     fn make_virtual_key_base_batch(ids: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1483,11 +1477,11 @@ mod tests {
         RecordContext::new(&table_config, String::new())
     }
 
-    /// Regression (lin/virtual-key-base-read): a virtual-key table whose record
+    /// Regression: a virtual-key table whose record
     /// key is a non-string data column (`id INT`) must extract string keys, NOT
-    /// error with "is not a StringArray". Before the fix, `get_record_keys` /
-    /// `record_key_array` downcast the key column to `StringArray` unconditionally,
-    /// erroring on the INT column; in the buffer base-merge that error dropped
+    /// error with "is not a StringArray". An unconditional
+    /// `StringArray` downcast errors on the INT column, and
+    /// in the buffer base-merge that error drops
     /// every base row (silent-wrong: 0 rows instead of the actual data).
     #[test]
     fn test_get_record_keys_virtual_key_int_column() {
@@ -1513,7 +1507,7 @@ mod tests {
         assert_eq!(key_array.value(1), "42");
     }
 
-    /// G-C: a SINGLE-field VIRTUAL key written by a `ComplexKeyGenerator` is stored
+    /// A SINGLE-field VIRTUAL key written by a `ComplexKeyGenerator` is stored
     /// as `field:value` (Java `KeyGenUtils.encodeSingleKeyFieldNameForComplexKeyGen`,
     /// default `true`). The reader must reconstruct the SAME shape so a delete keyed
     /// `id:42` matches its base row (else the deleted row resurfaces).
@@ -1724,10 +1718,10 @@ mod tests {
         assert_eq!(ctx.record_key_field, "id");
     }
 
-    /// a composite virtual key (>1 record-key field) with meta fields off
+    /// A composite virtual key (>1 record-key field) with meta fields off
     /// must reconstruct the full `field:val,field:val` merge key per row — mirroring
     /// Java `KeyGenerator.constructRecordKey` (ComplexKeyGenerator) — so records that
-    /// share the first field but differ on a later one get distinct keys and no longer
+    /// share the first field but differ on a later one get distinct keys and do not
     /// collide. A non-string key column (`id INT`) is stringified, same as the
     /// single-field path.
     #[test]
@@ -1831,7 +1825,7 @@ mod tests {
         assert_eq!(
             values[2],
             Some(OrderingValue::Default),
-            "null weight → null-coerced Default ordering value (G-B)"
+            "null weight → null-coerced Default ordering value"
         );
         // The higher weight must compare greater (drives EVENT_TIME winner pick).
         assert!(values[0] > values[1]);
@@ -1892,7 +1886,7 @@ mod tests {
         assert_eq!(
             d[1],
             Some(OrderingValue::Default),
-            "null date → null-coerced Default ordering value (G-B)"
+            "null date → null-coerced Default ordering value"
         );
 
         // Int16 (short) → Long.
@@ -1993,11 +1987,11 @@ mod tests {
     /// [`RecordContext::get_ordering_values`] (log records) — must extract the
     /// SAME, CORRECT `OrderingValue` for every supported scalar type. Asserted
     /// against independent expected constants (NOT lazy-vs-eager parity, which is
-    /// tautological now that both resolve the column through
-    /// [`OrderingAccessor::from_column`]). Widening beyond Int64/Utf8 is the fix: a
-    /// `Double`/`Timestamp`/... precombine field previously extracted a value on
-    /// the log side but `None` on the base side, silently degrading EVENT_TIME MOR
-    /// merges to commit-time (log-always-wins).
+    /// tautological since both resolve the column through
+    /// [`OrderingAccessor::from_column`]). Widening beyond Int64/Utf8 matters: a
+    /// `Double`/`Timestamp`/... precombine field that extracted a value on
+    /// the log side but `None` on the base side would silently degrade EVENT_TIME
+    /// MOR merges to commit-time (log-always-wins).
     #[test]
     fn test_ordering_value_extraction_lazy_and_eager() {
         // Assert BOTH entry points yield `expected` for a single-ordering-column
@@ -2049,8 +2043,8 @@ mod tests {
 
         // Scalar types — absolute expected values (a wrong mapping cannot hide
         // behind lazy==eager, since both entry points call `from_column`).
-        // A NULL cell coerces to `Default` (G-B); an `Int32` value of `0` also
-        // coerces to `Default` (Java `Integer(0)` is the default; GAP-2).
+        // A NULL cell coerces to `Default`; an `Int32` value of `0` also
+        // coerces to `Default` (Java `Integer(0)` is the default).
         assert_extracts(
             "i64",
             Arc::new(Int64Array::from(vec![Some(5i64), None, Some(7i64)])),
@@ -2089,8 +2083,8 @@ mod tests {
             ])),
             &[Some(Long(100)), Some(Long(50))],
         );
-        // Float64/Float32 → Double: the regression case (previously `None` on the
-        // base-record path, so a lower-ordering log update wrongly won the merge).
+        // Float64/Float32 → Double: the regression case (`None` on the
+        // base-record path would let a lower-ordering log update wrongly win).
         assert_extracts(
             "f64",
             Arc::new(arrow_array::Float64Array::from(vec![
@@ -2214,7 +2208,7 @@ mod tests {
         assert!(!records[0].1.is_delete());
         // Check ordering values were extracted
         assert_eq!(records[0].1.ordering_value, Some(OrderingValue::Long(0)));
-        // A2: payloads are zero-copy BatchRefs into the shared source batch, and
+        // Payloads are zero-copy BatchRefs into the shared source batch, and
         // each addresses its own row — full data must round-trip.
         let r0 = records[0].1.get_record().unwrap();
         let key0 = r0
@@ -2260,10 +2254,10 @@ mod tests {
     /// INSERT="I". A DELETE or UPDATE_BEFORE row is a delete; UPDATE_AFTER and
     /// INSERT are live rows.
     ///
-    /// Discriminating: before the fix hudi-rs compared against the long enum
-    /// identifiers ("DELETE"/"UPDATE_BEFORE"), which never match the persisted
-    /// short names, so operation-field deletes were silently ignored and the
-    /// deleted rows resurfaced (TestDataSourceReadWithDeletes: 4 rows, not 2).
+    /// Discriminating: comparing against the long enum
+    /// identifiers ("DELETE"/"UPDATE_BEFORE") never matches the persisted
+    /// short names, so operation-field deletes would be silently ignored and the
+    /// deleted rows resurface (TestDataSourceReadWithDeletes: 4 rows, not 2).
     #[test]
     fn test_is_delete_record_hoodie_operation() {
         let ctx = RecordContext::default();
@@ -2306,10 +2300,10 @@ mod tests {
     #[test]
     fn test_delete_batch_to_keys_with_ordering_extracts_ordering() {
         // Mirrors a HoodieDeleteBlock batch: recordKey (0), partitionPath (1),
-        // orderingVal (2). Regression guard for the ordering value
+        // orderingVal (2). Regression guard: the ordering value
         // MUST survive extraction so EVENT_TIME delete merge can reject a
         // lower-ordering delete. Row "9" has a null ordering → the null-coerced
-        // `Default` (G-B); `Default` and `None` are both the natural-order default.
+        // `Default`; `Default` and `None` are both the natural-order default.
         let ctx = RecordContext::default();
         let schema = Arc::new(Schema::new(vec![
             Field::new("recordKey", DataType::Utf8, false),
@@ -2339,15 +2333,11 @@ mod tests {
 
     #[test]
     fn test_delete_batch_to_keys_with_ordering_unsupported_bare_primitive_is_loud() {
-        // Restores fix 34cc3f4 (reverted during the vectorized-merge work): a
-        // bare-primitive orderingVal column of an unsupported type must reject
+        // A bare-primitive orderingVal column of an unsupported type must reject
         // LOUDLY, not silently degrade to all-`None` — which would make the
         // delete win unconditionally under EVENT_TIME (silent-wrong). `Binary`
-        // is used (not the original's Float64) so the test stays valid as the
-        // supported scalar set widens upstack (#61 adds Float, #66 Decimal):
-        // Binary is not a comparable ordering scalar in ANY version of
-        // `column_to_ordering_values`, so the reject-loudly contract holds after
-        // the fix is rebased up the stack.
+        // is used because it is not a comparable ordering scalar, so the
+        // reject-loudly contract holds even as the supported scalar set widens.
         use arrow_array::BinaryArray;
         let ctx = RecordContext::default();
         let schema = Arc::new(Schema::new(vec![
@@ -2476,7 +2466,8 @@ mod tests {
     #[test]
     fn test_scalar_ordering_value_unsupported_type_is_loud() {
         // A genuinely unrepresentable ordering type must be a LOUD error — silently
-        // dropping it would make an EVENT_TIME delete win unconditionally (// regression guard). Binary is not a valid Comparable ordering field, so it
+        // dropping it would make an EVENT_TIME delete win unconditionally.
+        // Binary is not a valid Comparable ordering field, so it
         // stands in for the "no representation" case. NB: integral, temporal,
         // boolean, float, decimal, and string types are all SUPPORTED — see
         // test_scalar_ordering_value_supported_types.
@@ -2492,9 +2483,10 @@ mod tests {
     fn test_decode_delete_wrapper_ordering_union() {
         // Pins the REAL production path: a Hudi delete-block `orderingVal` is an
         // Arrow DenseUnion of avro wrapper structs. Build one with a scalar
-        // `LongWrapper{value:i64}` and a composite `ArrayWrapper{wrappedValues}`
-        // (multi-field ordering, no `value` field) and assert the scalar decodes
-        // while the composite is a LOUD error (not a silent drop → delete-wins).
+        // `LongWrapper{value:i64}` and a malformed `ArrayWrapper{wrappedValues}`
+        // (whose `wrappedValues` is not a list) and assert the scalar decodes
+        // while the malformed composite is a LOUD error (not a silent drop →
+        // delete-wins).
         use arrow_array::{ArrayRef, Int64Array, StructArray, UnionArray};
         use arrow_buffer::ScalarBuffer;
         use arrow_schema::{Field, UnionFields};

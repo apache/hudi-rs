@@ -77,7 +77,7 @@ impl InputSplit {
     ///
     /// Mirrors Java's `InputSplit` constructor filter
     /// (`InputSplit.java:57`): `!logFile.getFileName().endsWith(CDC_LOGFILE_SUFFIX)`.
-    /// The match is on the file-name portion (after the last `/`), matching gold's
+    /// The match is on the file-name portion (after the last `/`), matching Java's
     /// `getFileName()` semantics.
     fn filter_cdc_log_files(paths: Vec<String>) -> Vec<String> {
         paths
@@ -187,7 +187,7 @@ mod tests {
     }
 
     /// CDC log files (`.cdc` suffix) must be dropped from the scan list, mirroring
-    /// gold's `InputSplit` constructor filter (`InputSplit.java:57`,
+    /// Java's `InputSplit` constructor filter (`InputSplit.java:57`,
     /// `HoodieCDCUtils.CDC_LOGFILE_SUFFIX`). A normal snapshot read must not pull
     /// in change-data-capture blocks.
     #[test]

@@ -17,17 +17,13 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Size-tracked, RocksDB-spillable merge map.
 //!
 //! Mirrors `org.apache.hudi.common.util.collection.ExternalSpillableMap`: an
 //! unbounded merge map that keeps entries in memory until a byte budget is hit,
-//! then spills NEW entries to disk (RocksDB). This replaces the previously
-//! unbounded in-memory `HashMap<String, BufferedRecord>` in
-//! [`FileGroupRecordBuffer`](super::record_buffer::FileGroupRecordBuffer) and is
-//! the OOM-prevention fix that aligns hudi-rs with the Java reader (GAP-10).
+//! then spills NEW entries to disk (RocksDB). Backs the merge map in
+//! [`FileGroupRecordBuffer`](super::record_buffer::FileGroupRecordBuffer),
+//! bounding the reader's merge memory the way the Java reader does.
 //!
 //! ## Tiers and iteration order
 //!
@@ -40,14 +36,14 @@
 //! Iteration ([`SpillableRecordMap::drain_iter`]) yields all in-memory entries
 //! first, then disk entries — matching Java's `ExternalSpillableMap` iterator.
 //!
-//! ## Size accounting (A6e — true retained bytes)
+//! ## Size accounting (true retained bytes)
 //!
 //! The budget trigger uses the **true retained heap** of the in-memory tier, not
 //! a per-row share. A `BatchRef` entry pins its WHOLE source `Arc<RecordBatch>`
 //! alive until its LAST live ref is dropped, so charging it only
-//! `array_bytes / num_rows` (the pre-A6 estimate) drastically under-counted dense
-//! spread-key workloads (M5: 21.9 GB resident while the per-row estimate read
-//! under budget). A6e fixes this:
+//! `array_bytes / num_rows` would drastically under-count dense spread-key
+//! workloads (a measured 21.9 GB resident while the per-row estimate read
+//! under budget). Instead:
 //!
 //! - **Pinned source batches** are tracked in [`PinnedBatches`]: a map keyed by
 //!   `Arc::as_ptr` (one `Arc` per decoded source batch — invariant established in
@@ -115,7 +111,7 @@ pub type MergeMap = std::collections::HashMap<String, BufferedRecord, MergeHashe
 // ── Budget / accounting constants ──────────────────────────────────────────
 
 /// Fraction of `hoodie.memory.merge.max.size` retained in memory before NEW
-/// entries spill to disk. Matches Java `ExternalSpillableMap`'s gold 0.8 factor
+/// entries spill to disk. Matches Java `ExternalSpillableMap`'s 0.8 factor
 /// (it keeps a 20% headroom for the merge work that runs alongside the map).
 pub const SPILL_TRIGGER_FRACTION: f64 = 0.8;
 
@@ -132,8 +128,7 @@ pub const ENTRY_OVERHEAD_BYTES: u64 = 64;
 /// RocksDB engine memory reserved out of the merge budget up front: the live
 /// memtables ([`ROCKSDB_WRITE_BUFFER_SIZE`] × [`ROCKSDB_MAX_WRITE_BUFFERS`] =
 /// 32 MiB) plus the block cache ([`ROCKSDB_BLOCK_CACHE_BYTES`] = 8 MiB), so the
-/// disk tier's own memory is counted inside `hoodie.memory.merge.max.size`. The
-/// the port's memory spike measured RSS staying within this budget.
+/// disk tier's own memory is counted inside `hoodie.memory.merge.max.size`.
 pub const ROCKSDB_RESERVED_BYTES: u64 = ROCKSDB_WRITE_BUFFER_SIZE as u64
     * ROCKSDB_MAX_WRITE_BUFFERS as u64
     + ROCKSDB_BLOCK_CACHE_BYTES as u64;
@@ -148,10 +143,9 @@ pub const ROCKSDB_RESERVED_BYTES: u64 = ROCKSDB_WRITE_BUFFER_SIZE as u64
 /// little, so we spill its live entries to RocksDB instead (frees the whole
 /// batch, costs IO).
 ///
-/// Set to 0.5 from the port's memory spike: in realistic churn most
-/// batches stay > 50% live, so the dense (spill) branch is taken there; the
-/// pathological sparse-survivor case (191 MiB held for 1.5% live data) takes the
-/// cheap compaction branch.
+/// Set to 0.5: in realistic churn most batches stay > 50% live, so the dense
+/// (spill) branch is taken there; the pathological sparse-survivor case (e.g.
+/// 191 MiB held for 1.5% live data) takes the cheap compaction branch.
 pub const COMPACTION_LIVE_RATIO: f64 = 0.5;
 
 /// When the budget is exceeded, evict-by-source-batch frees down to this fraction
@@ -190,15 +184,14 @@ pub const CONFIG_MERGE_MAX_SIZE: &str = "hoodie.memory.merge.max.size";
 /// eviction cannot bring it back down (e.g. a single oversized record or pinned
 /// source batch), the insert fails loudly with
 /// [`CoreError::MemoryLimitExceeded`] instead of continuing to allocate and
-/// risking a silent executor OOM. Unset (the default) → no cap, preserving the
-/// pre-existing spill-only behavior. This is the hudi-rs foundation the velox
-/// memory-reservation work builds on.
+/// risking a silent executor OOM. Unset (the default) → no cap, giving the
+/// spill-only behavior. An embedding engine that reserves memory against the
+/// reader can set this to enforce its reservation.
 ///
 /// OPERATIONAL NOTE: because the cap is opt-in, the loud-OOM protection is
 /// inert unless the embedding engine sets this key — deployments relying on it
-/// (e.g. the Quanton MOR rollout) must set it explicitly alongside
-/// `hoodie.memory.merge.max.size`; the soft budget alone only controls
-/// spilling, not the hard in-memory ceiling.
+/// must set it explicitly alongside `hoodie.memory.merge.max.size`; the soft
+/// budget alone only controls spilling, not the hard in-memory ceiling.
 pub const CONFIG_MAX_PEAK_MEMORY: &str = "hoodie.memory.merge.max.peak.size";
 /// Config key: parent directory for spill files. Default [`DEFAULT_SPILL_PATH`].
 pub const CONFIG_SPILLABLE_MAP_PATH: &str = "hoodie.memory.spillable.map.path";
@@ -484,12 +477,12 @@ pub struct SpillableRecordMap {
     spill_path: PathBuf,
     /// Spill backend (always RocksDB once constructed).
     diskmap_type: DiskMapType,
-    /// True once any entry has spilled to disk (M3 acceptance signal). Surfaced
+    /// True once any entry has spilled to disk. Surfaced
     /// to `HoodieReadStats.merge_map_spilled`.
     spill_fired: bool,
     /// Peak TRUE-retained in-memory bytes observed (diagnostic / stats). Surfaced
     /// to `HoodieReadStats.merge_map_peak_in_memory_bytes` so the stat reflects
-    /// the real resident set, not the pre-A6 per-row under-count.
+    /// the real resident set, not a per-row share.
     peak_in_memory_size: u64,
 }
 
@@ -569,8 +562,8 @@ impl SpillableRecordMap {
     /// (an alias of [`true_retained_bytes`](Self::true_retained_bytes), named for
     /// external callers): the distinct pinned source batches plus owned-payload,
     /// key, and per-entry-overhead bytes. It is the quantity a host memory
-    /// manager (e.g. velox's `MemoryPool`) needs in order to RESERVE against the
-    /// hudi-rs reader's footprint, and the value the hard peak cap
+    /// manager (e.g. an embedding engine's memory pool) needs in order to
+    /// RESERVE against the reader's footprint, and the value the hard peak cap
     /// ([`CONFIG_MAX_PEAK_MEMORY`]) is enforced against.
     ///
     /// # What is and isn't included
@@ -592,12 +585,12 @@ impl SpillableRecordMap {
     /// The in-memory allowance right now: the configured soft budget, less
     /// RocksDB's engine memory once — and only once — the disk tier exists.
     ///
-    /// The reserve used to be subtracted at config time, which charged every
-    /// read for a tier most reads never open. Worse, it made the allowance
+    /// Subtracting the reserve at config time would charge every
+    /// read for a tier most reads never open. Worse, it would make the allowance
     /// *zero* for any `hoodie.memory.merge.max.size` at or below 50 MiB
     /// (0.8 × 50 MiB == [`ROCKSDB_RESERVED_BYTES`] exactly), so
-    /// [`over_budget`](Self::over_budget) was unconditionally true and every
-    /// entry spilled from the first insert — while RocksDB then consumed the
+    /// [`over_budget`](Self::over_budget) would be unconditionally true and every
+    /// entry would spill from the first insert — while RocksDB then consumed the
     /// reserve anyway, putting the read *over* the budget it was given.
     ///
     /// Charging it lazily keeps the accounting honest in both states: before any
@@ -651,13 +644,13 @@ impl SpillableRecordMap {
     /// (in-memory updates re-account the size delta; disk updates overwrite).
     ///
     /// For a NEW key the routing depends on what is over budget:
-    /// - **`BatchRef` payload** (the A2 hot path): add it to the in-memory tier
-    ///   and account it, then evict whole source batches (compact sparse / spill
-    ///   dense — A6e) until back under budget. The incoming entry's own batch is a
+    /// - **`BatchRef` payload** (the zero-copy hot path): add it to the in-memory
+    ///   tier and account it, then evict whole source batches (compact sparse /
+    ///   spill dense) until back under budget. The incoming entry's own batch is a
     ///   valid eviction victim, so this terminates even if it is the sole offender.
-    /// - **`Owned` / `Delete` payload** (no shared source batch to evict): preserve
-    ///   the A1 semantics — while over budget the NEW entry goes straight to the
-    ///   disk tier (existing in-memory entries stay), since there is no batch to
+    /// - **`Owned` / `Delete` payload** (no shared source batch to evict): while
+    ///   over budget the NEW entry goes straight to the disk tier (existing
+    ///   in-memory entries stay, Java parity), since there is no batch to
     ///   free by eviction.
     ///
     /// Updates the size trackers and the spill-fired flag.
@@ -681,7 +674,7 @@ impl SpillableRecordMap {
 
         // New key. A `BatchRef` participates in evict-by-source-batch; an
         // `Owned`/`Delete` entry has no shared batch to free, so when over budget
-        // it spills directly (A1 parity: existing entries stay, new puts go to
+        // it spills directly (Java parity: existing entries stay, new puts go to
         // disk).
         let is_batch_ref = matches!(value.payload, RecordPayload::BatchRef { .. });
         if !is_batch_ref && self.over_budget() {
@@ -803,8 +796,8 @@ impl SpillableRecordMap {
         &self.in_memory
     }
 
-    /// Mutable view of the in-memory tier, for the A2 compaction safety valve
-    /// (`compact_pinned_batches`), which re-batches sparsely-pinned source
+    /// Mutable view of the in-memory tier, for the end-of-scan compaction safety
+    /// valve (`compact_pinned_batches`), which re-batches sparsely-pinned source
     /// batches in place. Spilled (disk-tier) entries are already `Owned` and pin
     /// nothing shared, so compaction only ever touches the in-memory tier.
     ///
@@ -815,15 +808,14 @@ impl SpillableRecordMap {
         &mut self.in_memory
     }
 
-    /// True once any entry has been spilled to disk during this read (the M3
-    /// acceptance signal).
+    /// True once any entry has been spilled to disk during this read.
     pub fn spill_fired(&self) -> bool {
         self.spill_fired
     }
 
     /// Peak TRUE-retained in-memory bytes observed during the read. The
-    /// stat that `merge_map_peak_in_memory_bytes` surfaces — it now reflects the
-    /// real resident set, not the pre-A6 per-row under-count.
+    /// stat that `merge_map_peak_in_memory_bytes` surfaces — it reflects the
+    /// real resident set, not a per-row share.
     pub fn peak_in_memory_size(&self) -> u64 {
         self.peak_in_memory_size
     }
@@ -930,7 +922,7 @@ impl SpillableRecordMap {
 
     /// Evict whole pinned source batches, largest bytes first, until the TRUE
     /// retained heap drops to `target` bytes or no pinned source batch remains to
-    /// evict (A6e — the core of the memory-bound fix). A single O(in-memory)
+    /// evict — the core of the memory bound. A single O(in-memory)
     /// grouping scan.
     ///
     /// Spilling individual entries does NOT free a pinned source batch unless ALL
@@ -1055,7 +1047,8 @@ impl SpillableRecordMap {
 
     /// COMPACT one over-budget source batch: interleave its live rows into one
     /// small owned batch and repoint the entries to it, dropping the original
-    /// `Arc`. No IO. (A6e sparse branch — mirrors the A2 compaction primitive.)
+    /// `Arc`. No IO. (The sparse eviction branch — same primitive as the
+    /// end-of-scan compaction valve.)
     fn compact_victim_batch(
         &mut self,
         victim_batch: &Arc<RecordBatch>,
@@ -1099,7 +1092,7 @@ impl SpillableRecordMap {
 
     /// SPILL one over-budget source batch: serialize each of its live entries to
     /// the RocksDB tier and remove them from memory so the last ref drops and the
-    /// whole batch is freed (A6e dense branch — uses the A1 IPC spill path).
+    /// whole batch is freed (the dense eviction branch — uses the IPC spill path).
     fn spill_victim_batch(&mut self, keys: &[String]) -> Result<()> {
         // Remove the entries from memory first (un-accounting their pins) so the
         // Arc's last ref is gone before we hold any borrow on `self.disk`.
@@ -1121,7 +1114,7 @@ impl SpillableRecordMap {
         // immediate flush, a dense victim with fewer than `SPILL_BATCH_ROWS` live
         // rows would keep its parent batch resident until an unrelated flush
         // trips — so a wide-row table under a tight budget could hold pinned
-        // batches well past the budget (A6e/GAP-10). Flushing materializes the
+        // batches well past the budget. Flushing materializes the
         // staged rows into one compact on-disk batch and drops the slices,
         // releasing the parent. (Eviction is the cold/over-budget path, so the
         // extra small on-disk batch is an acceptable trade for the bound.)
@@ -1130,11 +1123,10 @@ impl SpillableRecordMap {
     }
 
     /// Compact every in-memory source batch whose live-row ratio is below
-    /// `live_ratio_threshold` (the A2 end-of-scan safety valve), keeping the
+    /// `live_ratio_threshold` (the end-of-scan safety valve), keeping the
     /// pinned-bytes accounting in sync.
     ///
-    /// This is the accounting-aware replacement for the old free-function
-    /// `compact_pinned_batches`: it groups in-memory `BatchRef` entries by source
+    /// Groups in-memory `BatchRef` entries by source
     /// batch, and for any batch below the threshold re-batches its survivors into
     /// one compact owned batch and repoints the entries (releasing the original).
     /// Runs once after log scanning, before the drain — by then the size trackers
@@ -1212,7 +1204,7 @@ impl Iterator for SpillDrainIter {
 /// logs), no compression, bounded memtable + block-cache memory. The temp dir
 /// is removed on drop (RAII via [`tempfile::TempDir`]); the `DB` handle is
 /// closed when this struct drops. See module docs for the option rationale.
-/// Rows packed into one spilled Arrow batch (B5 multi-row batching). Amortizes the
+/// Rows packed into one spilled Arrow batch (multi-row batching). Amortizes the
 /// per-record RocksDB op + IPC framing/decode over many rows — turning the spill
 /// from N single-row blobs into N/`SPILL_BATCH_ROWS` multi-row blobs.
 const SPILL_BATCH_ROWS: usize = 1024;
@@ -1223,8 +1215,7 @@ const SPILL_BATCH_ROWS: usize = 1024;
 /// (= 8 × 1024 = 8,192) fully-decoded rows, i.e. `8,192 × row_width` bytes. This
 /// is a fixed overhead *on top of* `hoodie.memory.merge.max.size` and is not
 /// counted against that budget, so for very wide schemas it is a bounded but
-/// non-trivial RAM spike during drain (tracked follow-up: size by row width or
-/// count against the budget).
+/// non-trivial RAM spike during drain.
 const SPILL_BATCH_CACHE: usize = 8;
 /// Batch blob tag: body-only (decode against the cached schema).
 const SPILL_BATCH_TAG_BODY: u8 = 0x01;
@@ -1242,8 +1233,8 @@ enum DiskLoc {
     /// so a spilled delete round-trips it faithfully: this map may be keyed by
     /// base-file POSITION (position-based merge), not by record key, so
     /// `record_from_entry` must NOT reconstruct a delete's key from the map key —
-    /// doing so lands the tombstone under a position string and it silently fails
-    /// to suppress its target row after key-based fallback (PR #95 review).
+    /// doing so would land the tombstone under a position string and silently fail
+    /// to suppress its target row after key-based fallback.
     Delete {
         record_key: String,
     },
@@ -1263,7 +1254,7 @@ mod rocksdb_disk_tier {
         BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBatch, WriteOptions,
     };
 
-    /// Disk tier of the spillable merge map, with B5 multi-row batching.
+    /// Disk tier of the spillable merge map, with multi-row batching.
     ///
     /// Records accumulate in `staging` (in RAM, ≤ `SPILL_BATCH_ROWS`); on flush they
     /// are packed into ONE Arrow batch written under a synthetic `batch_id` key, and
@@ -1338,8 +1329,8 @@ mod rocksdb_disk_tier {
             opts.create_if_missing(true);
             opts.set_write_buffer_size(ROCKSDB_WRITE_BUFFER_SIZE);
             opts.set_max_write_buffer_number(ROCKSDB_MAX_WRITE_BUFFERS);
-            // Spill values are already compact single-row IPC blobs; no compression
-            // (trade revisited in B5 for the large-scale disk footprint).
+            // Spill blobs are already compact Arrow IPC batches; skip compression
+            // to keep spill/reload cheap on the short-lived scratch data.
             opts.set_compression_type(DBCompressionType::None);
 
             let cache = Cache::new_lru_cache(ROCKSDB_BLOCK_CACHE_BYTES);
@@ -1543,7 +1534,7 @@ mod rocksdb_disk_tier {
                 // Use the PERSISTED record key, not the map key: this map may be keyed
                 // by base-file position (position-based merge), so reconstructing a
                 // delete's key from the map key would silently drop the delete after
-                // key-based fallback (PR #95 review).
+                // key-based fallback.
                 DiskLoc::Delete { record_key } => Ok(BufferedRecord::new_delete(
                     record_key.clone(),
                     entry.ordering_value.clone(),
@@ -1606,8 +1597,8 @@ mod rocksdb_disk_tier {
 
         /// Consume the disk map into a drain iterator. Staged records are flushed first,
         /// then entries are yielded in `(batch_id, row_idx)` order so each batch is
-        /// read and decoded ONCE (deletes last). NOTE: this changes the drain's output
-        /// order from the old key-sorted order to batch/insertion order — fine for the
+        /// read and decoded ONCE (deletes last). The drain's output order is thus
+        /// batch/insertion order, not key order — fine for the
         /// MOR snapshot read (records are a set; the merge already resolved versions).
         pub fn into_drain_iter(mut self) -> RocksDbDrainIter {
             let flush_err = self.flush().err();
@@ -1886,10 +1877,10 @@ mod tests {
     /// Regression test: a modest merge budget must still leave usable in-memory
     /// space before the first spill.
     ///
-    /// The reserve used to be deducted at config time, so `0.8 × size − 40 MiB`
-    /// saturated to 0 for every `hoodie.memory.merge.max.size` at or below
-    /// 50 MiB — `over_budget()` was then `bytes >= 0`, always true, and every
-    /// entry spilled from the first insert while RocksDB consumed the reserve
+    /// Deducting the reserve at config time would saturate `0.8 × size − 40 MiB`
+    /// to 0 for every `hoodie.memory.merge.max.size` at or below
+    /// 50 MiB — `over_budget()` would then be `bytes >= 0`, always true, and every
+    /// entry would spill from the first insert while RocksDB consumed the reserve
     /// anyway. Charging it lazily gives the map the whole budget until the disk
     /// tier actually opens.
     #[test]
@@ -1989,7 +1980,7 @@ mod tests {
         assert!(map.contains_key("k2").unwrap());
     }
 
-    /// B5 batched spill must cross the `SPILL_BATCH_ROWS` (1024) flush boundary:
+    /// Batched spill must cross the `SPILL_BATCH_ROWS` (1024) flush boundary:
     /// with budget 0 every entry spills to disk staging, and once more than 1024
     /// are staged they are flushed into multi-row batches. Every record must
     /// still read back with its exact data across that boundary.
@@ -2305,7 +2296,7 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // A6e — pinned-bytes accounting + evict-by-source-batch + detector #1
+    // Pinned-bytes accounting + evict-by-source-batch + detector #1
     // ══════════════════════════════════════════════════════════════════════
 
     /// A wide multi-row source batch of `(k{base+i}, v=base+i)` rows, interned
@@ -2363,8 +2354,8 @@ mod tests {
     /// M source batches with SPREAD keys, drop the source Vec so only the map pins
     /// the batches, and assert the map's tracked retained bytes equals the TRUE
     /// retained bytes (independently summed `get_array_memory_size` over distinct
-    /// live Arcs). The PRE-A6 per-row accounting (`array_bytes / num_rows`) would
-    /// fail this by a large factor; A6e is exact.
+    /// live Arcs). A per-row accounting (`array_bytes / num_rows`) would
+    /// fail this by a large factor; the pinned-batch accounting is exact.
     #[test]
     fn detector_1_tracked_retained_bytes_matches_truth_for_shared_batches() {
         // Budget high enough that nothing spills/compacts — we are testing the
@@ -2400,12 +2391,12 @@ mod tests {
         let truth = true_retained_from_scratch(&map);
         assert_eq!(
             tracked, truth,
-            "A6e accounting must equal the true retained heap (distinct pinned \
+            "accounting must equal the true retained heap (distinct pinned \
              Arcs + owned/overhead). tracked={tracked} truth={truth}"
         );
 
-        // And it must reflect WHOLE batches, not a per-row share. The pre-A6 bug
-        // would have charged only LIVE_PER_BATCH/ROWS of each batch.
+        // And it must reflect WHOLE batches, not a per-row share. A per-row
+        // accounting would have charged only LIVE_PER_BATCH/ROWS of each batch.
         let per_row_undercount: u64 = (LIVE_PER_BATCH as u64) * M as u64; // ~rows charged
         assert!(
             map.true_retained_bytes() > per_row_undercount * 100,
@@ -2526,7 +2517,7 @@ mod tests {
         }
     }
 
-    /// the hard peak cap is satisfied by SPILLING when it can be: a
+    /// The hard peak cap is satisfied by SPILLING when it can be: a
     /// dense BatchRef that pushes the footprint over the cap is spilled to disk to
     /// get back under (NOT an error), and every row still round-trips. This is the
     /// positive branch complementing the loud-error case (which fires only when
@@ -2587,7 +2578,7 @@ mod tests {
 
     /// Output is identical across budget settings (unbounded / mid / tiny) for the
     /// same spread-key input — eviction order must not change the resolved data
-    /// (the §4 correctness flag: a full-data equivalence across budgets).
+    /// (full-data equivalence across budgets).
     // Exercises the on-disk spill tier, which only exists with the backend.
     #[cfg(feature = "spill-rocksdb")]
     #[test]

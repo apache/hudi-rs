@@ -263,7 +263,7 @@ impl OrderingValue {
     /// Note: an *absent* ordering (`None`) is ALSO the default — the caller
     /// (`is_default_ordering` in `record_merger.rs`, and `pick_winner`'s delete
     /// arm) treats `None` and `Some(Default)` identically. A GENUINE `Long(0)`
-    /// is NOT the default (ENG: GAP-2 — mirrors Java `OrderingValues.isDefault`,
+    /// is NOT the default (mirrors Java `OrderingValues.isDefault`,
     /// `Integer(0).equals(Long(0))` == `false`).
     pub fn is_default(&self) -> bool {
         matches!(self, OrderingValue::Default)
@@ -538,7 +538,7 @@ mod tests {
     }
 
     /// `is_default` recognizes ONLY the null-coerced `Default` sentinel — a
-    /// GENUINE `Long(0)` is NOT the default (GAP-2; mirrors Java
+    /// GENUINE `Long(0)` is NOT the default (mirrors Java
     /// `OrderingValues.isDefault` == `Integer(0).equals(x)`, `false` for `Long(0)`).
     /// `is_same_class` is true when the variants match, PLUS the `Default`↔`Long`
     /// (integer-domain) pairing, and it drives the cross-class rejection the delete

@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.read.buffer.KeyBasedFileGroupRecordBuffer`.
 //!
 //! The default record buffer. Deduplicates by record key using a HashMap,
@@ -55,7 +52,7 @@ use crate::file_group::reader_v2::buffered_record::{
 };
 use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 // `CoreError` / `RecordPayload` are used only by the test-only compaction
-// primitive and the unit tests (A6e moved production compaction onto the map).
+// primitive and the unit tests (production compaction lives on the spillable map).
 #[cfg(test)]
 use crate::error::CoreError;
 #[cfg(test)]
@@ -77,13 +74,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // The compaction live-row threshold is a single source of truth in
-// `spillable_map` (A6e shares it between over-budget eviction and the
+// `spillable_map` (shared between over-budget eviction and the
 // end-of-scan safety valve). Re-imported here for the free-function compaction
 // primitive's tests and the trait delegate.
 use crate::file_group::reader_v2::buffer::spillable_map::COMPACTION_LIVE_RATIO;
 
 #[cfg(test)]
 use crate::config::table::HudiTableConfig;
+
+/// How a base-file row is matched to a buffered log record during the merge.
+///
+/// The merge kernels are identical except for the per-row lookup key: key-based
+/// merge looks up the row's record key; position-based merge looks up the row's
+/// physical base-file position (read from the synthetic row-index column). This
+/// enum lets [`KeyBasedFileGroupRecordBuffer`]'s kernels serve both, so the
+/// position buffer reuses them rather than duplicating the vectorized/scalar
+/// merge logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BaseMatch {
+    /// Match by record key (key-based merge).
+    RecordKey,
+    /// Match by base-file row position, read from the row-index column
+    /// ([`ROW_INDEX_TEMPORARY_COLUMN_NAME`](super::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME)).
+    Position,
+}
 
 /// Key-based file group record buffer.
 ///
@@ -112,23 +126,6 @@ use crate::config::table::HudiTableConfig;
 ///   logRecord = records.remove(key)
 ///   return super.hasNextBaseRecord(base, logRecord)
 /// ```
-/// How a base-file row is matched to a buffered log record during the merge.
-///
-/// The merge kernels are identical except for the per-row lookup key: key-based
-/// merge looks up the row's record key; position-based merge looks up the row's
-/// physical base-file position (read from the synthetic row-index column). This
-/// enum lets [`KeyBasedFileGroupRecordBuffer`]'s kernels serve both, so the
-/// position buffer reuses them rather than duplicating the vectorized/scalar
-/// merge logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BaseMatch {
-    /// Match by record key (key-based merge).
-    RecordKey,
-    /// Match by base-file row position, read from the row-index column
-    /// ([`ROW_INDEX_TEMPORARY_COLUMN_NAME`](super::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME)).
-    Position,
-}
-
 #[derive(Debug)]
 pub struct KeyBasedFileGroupRecordBuffer {
     /// Common buffer state.
@@ -321,8 +318,8 @@ impl KeyBasedFileGroupRecordBuffer {
         // / spillable.diskmap.type (BITCASK and ROCKS_DB both → RocksDB backend).
         let spill_config = SpillConfig::from_config(&reader_context.hoodie_reader_config)?;
         // Diagnostic: the resolved in-memory spill threshold and whether the
-        // merge-memory budget key reached this map. gluten now forwards
-        // `hoodie.memory.merge.max.size` in hoodie_reader_config, so `budget_key_present=true`
+        // merge-memory budget key reached this map. When the caller forwards
+        // `hoodie.memory.merge.max.size` in hoodie_reader_config, `budget_key_present=true`
         // and the threshold tracks the operator/computed budget; a `false` here means the budget
         // was dropped and the threshold fell back to the 0.8×1 GiB default (OOM risk).
         log::debug!(
@@ -433,8 +430,8 @@ impl KeyBasedFileGroupRecordBuffer {
             .get_ordering_values(&row)?
             .and_then(|mut v| v.drain(..).next().flatten());
 
-        // A2: base record is a zero-copy BatchRef into the shared base batch,
-        // removing the per-row `base_row.clone()` allocation.
+        // The base record is a zero-copy BatchRef into the shared base batch
+        // (no per-row `base_row.clone()` allocation).
         let base_record =
             BufferedRecord::new_batch_ref(record_key, base_batch.clone(), row_idx, base_ordering);
 
@@ -506,11 +503,11 @@ impl KeyBasedFileGroupRecordBuffer {
     ///
     /// Per-row allocation is paid only on the rows that actually have a log
     /// entry — the no-conflict path is one bit and no allocation. This is
-    /// the hot path that replaces the legacy
-    /// `next_base_row` + per-row `has_next_base_record` + 4096-batch
-    /// `concat_batches` chain in `next_get_next_us`.
+    /// the hot path, vs. the per-row
+    /// `next_base_row` + `has_next_base_record` + 4096-batch
+    /// `concat_batches` chain.
     ///
-    /// Duplicate-key semantics match the legacy path: `HashMap::remove`
+    /// Duplicate-key semantics match the per-row path: `HashMap::remove`
     /// consumes the log entry on the first base row whose key matches;
     /// subsequent duplicates within the same base batch find `None` and
     /// pass through. (Duplicate base keys within a single file group are
@@ -577,11 +574,11 @@ impl KeyBasedFileGroupRecordBuffer {
                     // Build the base ordering value only now — on a conflict row.
                     let base_ordering = orderings.value_at(idx);
                     let winner = pick_winner(merge_mode, &log_rec, &base_ordering);
-                    // Mirror the per-record counting the legacy row path performs
-                    // in `RecordBuffer::has_next_base_record`: a key present in
-                    // both base and log is an update unless the merged result is a
-                    // delete (`Winner::LogDelete`). Base-only rows (the `None`
-                    // arm) are intentionally not counted, matching gold.
+                    // Mirror the per-record counting the per-row path performs in
+                    // `FileGroupRecordBuffer::has_next_base_record`: a key present
+                    // in both base and log is an update unless the merged result is
+                    // a delete (`Winner::LogDelete`). Base-only rows (the `None`
+                    // arm) are intentionally not counted, matching Java.
                     self.base.update_processor.process_update(
                         key,
                         Some(&log_rec),
@@ -758,8 +755,8 @@ impl KeyBasedFileGroupRecordBuffer {
             return Ok(Some(kept));
         }
 
-        // ONE concat of two batches — vs the legacy path's concat of 4096
-        // single-row batches per chunk.
+        // ONE concat of two batches (kept + replacements) — vs the per-row
+        // path's concat of 4096 single-row batches per chunk.
         let refs: Vec<&RecordBatch> = vec![&kept, &repl_batch];
         arrow::compute::concat_batches(target_schema, refs)
             .map(Some)
@@ -1423,7 +1420,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 total_rows,
             );
             for batch in record_batches.data_batches {
-                // A2: intern the decoded block batch into a single `Arc` here
+                // Intern the decoded block batch into a single `Arc` here
                 // (the one mint point per block batch). Every BufferedRecord
                 // produced from it shares this `Arc`, so the map pins one source
                 // batch per block — and `Arc::as_ptr` is a valid compaction
@@ -1439,9 +1436,8 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             }
         }
         // No explicit deflate: the `std::mem::take(&mut block.content)` above
-        // already replaced the content with `LogBlockContent::Empty` (its
-        // Default), which is exactly what `deflate()` does — a trailing
-        // `block.deflate()` here was a dead no-op (review C8).
+        // already left the content `LogBlockContent::Empty`, which is what
+        // `deflate()` would do.
         Ok(())
     }
 
@@ -1503,11 +1499,11 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             // Rationale: when ≥2 log updates to a key never touch the base, a
             // default (IGNORE_DEFAULTS) / sentinel (FILL_UNAVAILABLE) column must be
             // filled from the OTHER record, or it silently overwrites/retains the
-            // wrong value (Class-C silent-wrong). Filling only new-from-prior (the
+            // wrong value. Filling only new-from-prior (the
             // previous behavior) missed the case where the HIGHER-ordering record
             // arrives FIRST and wins: a later lower-ordering update carrying the real
             // value was discarded, leaving the winner's default/sentinel column
-            // un-backfilled (P3/P4).
+            // un-backfilled.
             //
             // The fill only rewrites default/sentinel columns and never touches
             // `ordering_value`, so it cannot change the winner; a same-ordering tie
@@ -1546,7 +1542,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 .merge_in_place(key, |existing| merger.delta_merge(&record, existing))?;
         }
 
-        // Stage stat (02/D3): track peak merge-map size.
+        // Track peak merge-map size.
         let len = self.base.records.len() as u64;
         if len > self.base.merge_map_peak_entries {
             self.base.merge_map_peak_entries = len;
@@ -1597,8 +1593,8 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 }
             }
         }
-        // No explicit deflate — see process_data_block (review C8): the
-        // `std::mem::take` above already left the content `Empty`.
+        // No explicit deflate, as in process_data_block: the `std::mem::take`
+        // above already left the content `Empty`.
         Ok(())
     }
 
@@ -1692,7 +1688,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     }
 
     fn set_base_file_source(&mut self, source: Box<dyn arrow_array::RecordBatchReader + Send>) {
-        // A3: the lazy streaming source replaces the eager
+        // The lazy streaming source replaces the eager
         // `Vec<RecordBatch>`. `next_base_row` pulls one row-group at a time and
         // interns it into an `Arc` so base records remain zero-copy
         // `BatchRef`s — one `Arc` per streamed batch keeps `Arc::as_ptr`
@@ -1715,10 +1711,10 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// source batch). `Owned` and `Delete` payloads are left untouched (they pin
     /// nothing shared).
     fn compact_pinned_batches(&mut self) -> Result<()> {
-        // A6e: delegate to the spillable map's accounting-aware compaction so the
+        // Delegate to the spillable map's accounting-aware compaction so the
         // pinned-bytes trackers (and the peak stat) stay in sync. Compaction only
         // ever touches the in-memory tier (spilled entries are `Owned` and pin
-        // nothing shared). Under A6e the over-budget eviction already compacts /
+        // nothing shared). The over-budget eviction already compacts /
         // spills sparse / dense batches DURING the scan; this end-of-scan pass is
         // the residual safety valve for sparse batches that never tripped the
         // budget.
@@ -1747,7 +1743,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// Drives the `has_next()`/`next()` iterator to completion and
     /// collects all records into a single batch.
     fn merge_and_collect_with_stats(mut self: Box<Self>) -> Result<(RecordBatch, UpdateStats)> {
-        // A3: base_rows is no longer summed up front — the base
+        // base_rows is not summed up front: the base
         // file is a lazy stream now, so counting it would force a full decode.
         let log_records = self.base.records.len();
         log::debug!(
@@ -1890,7 +1886,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                     // A drain error is terminal. Release the iterator so the buffer is
                     // left in a clean state — a retry would otherwise resume a
                     // partially-consumed iterator (skipping the errored record) rather
-                    // than surfacing a stable failure (#76 review).
+                    // than surfacing a stable failure.
                     self.base.log_drain_iter = None;
                     return Err(e);
                 }
@@ -1898,7 +1894,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                     // Drain exhausted — release the drain iterator NOW so the
                     // RocksDB handle + spill temp dir are freed immediately
                     // (RAII drop), instead of staying pinned as an exhausted
-                    // `Some(..)` until the whole buffer is dropped (#76 review).
+                    // `Some(..)` until the whole buffer is dropped.
                     // A subsequent call re-enters with `records` already empty
                     // and returns `Ok(None)` via the guard above.
                     self.base.log_drain_iter = None;
@@ -1911,7 +1907,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             return Ok(None);
         }
         let batch = records_to_batch(records, target_schema.clone())?;
-        // Harm-H7 guard: a FILL_UNAVAILABLE sentinel must never survive into a
+        // A FILL_UNAVAILABLE sentinel must never survive into a
         // log-only insert (a record with no base row and no prior to fill from).
         // Debezium-only — gated on a configured sentinel, so non-Debezium tables
         // pay nothing; one scan of this (log-only) batch when it is set.
@@ -2157,7 +2153,7 @@ mod tests {
     /// `payload` (sentinel). The merged output must carry the prior log record's
     /// payload, not the sentinel — the log-vs-log analog of the base-vs-log
     /// toasted blend. Before the fix the blend ran only against the base file, so
-    /// this purely-in-log case leaked the sentinel (Class-C silent-wrong).
+    /// this purely-in-log case leaked the sentinel.
     #[test]
     fn test_log_vs_log_toasted_value_filled_from_prior_buffered_record() {
         let mut buffer = build_toasted_buffer();
@@ -2430,14 +2426,14 @@ mod tests {
     /// the winner from the loser in BOTH directions — when the older/base record
     /// wins it runs `partialMerge(base, log)`.
     ///
-    /// This is the sweep P3/P4 base-vs-log repro
+    /// This is the base-vs-log repro
     /// (`testPartialUpdateBackfillsWinnerFromLoser`): the ts=2 upsert lands in a
     /// new base file (null `name`) and out-ranks a later ts=1 log update carrying
     /// the real value.
     ///
     /// Discriminating: before the fix the `Winner::Base` branch emitted the base
     /// row unchanged, so the winner's null column was never back-filled and the
-    /// merged value stayed null (Class-C silent-wrong). The base's higher ordering
+    /// merged value stayed null. The base's higher ordering
     /// is preserved; only its default column takes the loser's real value. A
     /// control key whose winning base value is non-null is emitted untouched.
     #[test]
@@ -2510,7 +2506,7 @@ mod tests {
             got,
             vec![
                 // Base wins on ordering but its null (default) val is back-filled
-                // from the losing log record (P3/P4 both-direction fill).
+                // from the losing log record (both-direction fill).
                 ("k1".to_string(), Some("real_from_log".to_string())),
                 // Base wins and already holds a real value → losing log ignored.
                 ("k2".to_string(), Some("orig_k2".to_string())),
@@ -2720,7 +2716,7 @@ mod tests {
     /// Log-vs-log IGNORE_DEFAULTS: two updates to one key, NO base file. The second
     /// update leaves `payload` null (default); the merged output must carry the
     /// prior log record's `payload`, not null — the purely-in-log analog (≥2 log
-    /// updates never touch the base), which would otherwise be Class-C silent-wrong.
+    /// updates never touch the base), which would otherwise be silently wrong.
     #[test]
     fn test_log_vs_log_ignore_defaults_null_filled_from_prior_buffered_record() {
         let mut buffer = build_ignore_defaults_buffer();
@@ -2748,7 +2744,7 @@ mod tests {
         assert_eq!(tss.value(0), 2, "the newer ordering (ts=2) record wins");
     }
 
-    /// P3/P4: Log-vs-log IGNORE_DEFAULTS where the HIGHER-ordering record (carrying a
+    /// Log-vs-log IGNORE_DEFAULTS where the HIGHER-ordering record (carrying a
     /// DEFAULT/null column) arrives FIRST and WINS, and a later LOWER-ordering record
     /// carries the REAL value. The winner (existing) must be BACK-FILLED from the
     /// incoming loser — mirroring Java `EventTimePartialRecordMerger.deltaMerge`,
@@ -2756,7 +2752,7 @@ mod tests {
     ///
     /// Discriminating: before the fix, hudi-rs filled only new-from-prior and
     /// returned the winning existing record UNMODIFIED, so the winner's null
-    /// `payload` was never back-filled and the merged output was `null` (Class-C
+    /// `payload` was never back-filled and the merged output was `null` (silently
     /// silent-wrong). The winner's ordering (ts=2) is preserved; its default column
     /// takes the loser's real value.
     #[test]
@@ -2783,7 +2779,7 @@ mod tests {
         assert_eq!(
             payloads.value(0),
             "real-value",
-            "P3/P4: the winning (ts=2) record's default payload is back-filled from \
+            "the winning (ts=2) record's default payload is back-filled from \
              the lower-ordering (ts=1) incoming record's real value"
         );
         assert_eq!(
@@ -2821,8 +2817,7 @@ mod tests {
     /// records must return every base row. Before the fix the base-merge kernel's
     /// `record_key_array` downcast the INT key column to `StringArray`, errored,
     /// and the error propagated out of `merge_one_base_batch_kernel` — dropping the
-    /// entire base batch (0 rows: the gluten `TestInsertTable2` virtual-key
-    /// bulk-insert silent-wrong symptom).
+    /// entire base batch, returning 0 rows for a virtual-key bulk-insert table.
     #[test]
     fn test_virtual_key_int_base_only_merge_returns_rows() {
         let merge_mode = "COMMIT_TIME_ORDERING";
@@ -3415,7 +3410,7 @@ mod tests {
     /// `IntWrapper`) — e.g. a global-index relocate DELETE. An `Int32` value of `0`
     /// decodes to [`OrderingValue::Default`] (the natural-order default), whereas the
     /// `Int64` (`bigint`) column in [`make_delete_block`] decodes a genuine `0` to
-    /// `Long(0)` (GAP-2 — a real ordering value, ordering-compared, not default).
+    /// `Long(0)` (a real ordering value, ordering-compared, not default).
     fn make_delete_block_i32(entries: &[(&str, Option<i32>)], instant: &str) -> LogBlock {
         let schema = Arc::new(Schema::new(vec![
             Field::new("recordKey", DataType::Utf8, false),
@@ -3904,11 +3899,10 @@ mod tests {
         (recs, spilled)
     }
 
-    /// M3 acceptance signal: a churn workload under a `merge.max.size` low enough
+    /// A churn workload under a `merge.max.size` low enough
     /// to force spilling produces output BYTE-IDENTICAL to the no-spill baseline,
     /// AND the spill actually fires. This is the unit-level equivalent of the
-    /// fg-bench churn-under-low-budget e2e (the buffer is the spill chokepoint;
-    /// the surrounding reader plumbing is unchanged by A1).
+    /// churn-under-low-budget benchmark (the buffer is the spill chokepoint).
     // Exercises the on-disk spill tier, which only exists with the backend.
     #[cfg(feature = "spill-rocksdb")]
     #[test]
@@ -4243,7 +4237,7 @@ mod tests {
         assert_eq!(records[0], ("k4".to_string(), 1, 1)); // insert from log
     }
 
-    /// #76 review — the log-only drain releases its `log_drain_iter` (and thus the
+    /// The log-only drain releases its `log_drain_iter` (and thus the
     /// RocksDB handle + spill temp dir) as soon as the drain is exhausted, rather
     /// than pinning an exhausted iterator until the whole buffer is dropped.
     #[test]
@@ -4651,9 +4645,9 @@ mod tests {
 
     #[test]
     fn test_event_time_delete_block_vs_base_file_rejects_lower_ordering() {
-        // Mirrors the REAL gluten scenario: records live in the BASE FILE, the
-        // delete sits in a log block. The decisive comparison is base-vs-buffered
-        // -delete via has_next_base_record (final_merge), NOT delta_merge_delete.
+        // Records live in the BASE FILE and the delete sits in a log block, so
+        // the decisive comparison is base-vs-buffered-delete via
+        // has_next_base_record (final_merge), not delta_merge_delete.
         // delete id=2 @ ts=99 must lose to base id=2 @ ts=100.
         let mut buffer = build_key_based_buffer("EVENT_TIME_ORDERING");
 
@@ -4688,7 +4682,7 @@ mod tests {
         // order"). Such a delete must ALWAYS apply even though the base row carries a
         // higher ordering value — mirrors Java
         // `BufferedRecordMergerFactory.deltaMergeDeleteRecord` (the `!isDefault`
-        // short-circuit). An `Int32` `0` decodes to `OrderingValue::Default` (GAP-2:
+        // short-circuit). An `Int32` `0` decodes to `OrderingValue::Default` (
         // only the `Integer(0)` default, not a genuine `bigint 0`, is natural-order).
         let mut buffer = build_key_based_buffer("EVENT_TIME_ORDERING");
 
@@ -4711,7 +4705,7 @@ mod tests {
         assert_eq!(records[0], ("2".to_string(), 22, 1000));
     }
 
-    /// GAP-2: EVENT_TIME, a delete carrying a GENUINE `bigint` ordering value of `0`
+    /// EVENT_TIME, a delete carrying a GENUINE `bigint` ordering value of `0`
     /// (`Int64` → `Long(0)`, NOT the natural-order default) against a base row with a
     /// higher ordering value → the delete is STALE and the row is KEPT. Mirrors Java
     /// `OrderingValues.isDefault` == `Integer(0).equals(Long(0))` == `false`.
@@ -4736,7 +4730,7 @@ mod tests {
         assert_eq!(
             result.num_rows(),
             2,
-            "GAP-2: a genuine bigint-0 delete (< base ts=100) is stale; the row is kept"
+            "a genuine bigint-0 delete (< base ts=100) is stale; the row is kept"
         );
         assert_eq!(records[0], ("1".to_string(), 11, 100));
         assert_eq!(records[1], ("2".to_string(), 22, 100));
@@ -6761,23 +6755,11 @@ mod tests {
     }
 
     // =========================================================================
-    // T10 — pin the production q99 symptom: does Buffered iterator emit more
-    // than one chunk when the base file has > DEFAULT_BATCH_SIZE rows?
-    //
-    // Production observation (lin-diag-mor-nowarmup-q99):
-    //   date_dim base file has 73,049 rows
-    //   FG-SUMMARY shows chunks_in=1 rows_in=4096
-    //
-    // i.e. PostMergePredicateFilter saw the iterator emit EXACTLY ONE chunk
-    // of 4096 rows then stop. We need to know:
-    //   (a) does FileGroupMergeIterator::Buffered correctly continue past
-    //       the first chunk when base_file_source has more rows?
-    //   (b) if YES — the production stop is downstream (Velox/FFI/Drop).
-    //   (c) if NO — the bug is here in the Buffered iterator.
-    //
-    // Strategy: empty log records map + base file source carrying
-    // DEFAULT_BATCH_SIZE * 2 + 100 = 8292 rows. Drive Buffered iterator,
-    // count chunks. Correct behavior = 3 chunks (4096 + 4096 + 100).
+    // A base file larger than one chunk must be emitted as several chunks
+    // rather than truncated at the first: an iterator that stops after one
+    // chunk silently drops every row past DEFAULT_BATCH_SIZE. The base source
+    // below carries DEFAULT_BATCH_SIZE * 2 + 100 rows, so a correct drain
+    // yields 3 chunks.
     // =========================================================================
     #[test]
     fn t10_buffered_emits_multiple_chunks_when_base_exceeds_batch_size() {
@@ -6824,16 +6806,10 @@ mod tests {
         assert_eq!(batches[0].num_rows(), n);
     }
 
-    /// T11 — companion to T10. Wraps the same Buffered iterator in a
-    /// minimal "always-false filter" — Rust analogue of
-    /// `cpp/src/lib.rs::PostMergePredicateFilter` with a 0-rows-pass filter.
-    /// Verifies the wrapper STILL emits chunks corresponding to each inner
-    /// chunk (just empty), and the inner iterator is driven to completion.
-    ///
-    /// If T11 emits exactly 3 (empty) chunks → wrapper + iterator are fine,
-    /// so production bug is in the FFI consumer (Velox `HudiSplitReader::next`
-    /// caller stopping on empty arrow batch). If T11 emits only 1 → bug
-    /// reproduces locally and is in the wrapper or iterator interaction.
+    /// A post-merge filter that passes no rows must still emit one (empty)
+    /// chunk per inner chunk and drive the iterator to completion. A wrapper
+    /// that stopped on the first empty batch would truncate the read, so the
+    /// chunk count is the assertion.
     #[test]
     fn t11_wrapper_with_always_false_filter_drives_iterator_to_completion() {
         let mut buffer = build_key_based_buffer("COMMIT_TIME_ORDERING");
@@ -7074,9 +7050,8 @@ mod tests {
     // Rule 3 is implemented via `fill_unavailable_from_base` (gated on the
     // `hoodie.record.merge.property.partial.update.unavailable.value` config):
     // when a winning log column equals the sentinel, the prior base value is
-    // kept. This test asserts that Postgres semantics. (Before the rule, the log
-    // won wholesale and the sentinel string leaked into the output — Class-C
-    // silent-wrong.) See the postgres-payload-v6 gap writeup.
+    // kept. This test asserts that Postgres semantics: without the rule the log
+    // wins wholesale and the sentinel string leaks into the output.
     // =========================================================================
 
     /// EVENT_TIME (LSN-ordered) buffer over a minimal Debezium-shaped table:

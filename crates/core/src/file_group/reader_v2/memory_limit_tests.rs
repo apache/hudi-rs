@@ -17,32 +17,21 @@
  * under the License.
  */
 
-//! Spill-budget config propagation.
+//! Spill-budget config propagation and the peak-memory cap.
 //!
 //! `SpillConfig::from_config` derives the in-memory spill threshold from the
-//! reader config map only (`reader_context.hoodie_reader_config`, read at
-//! `crates/core/src/file_group/reader/buffer/key_based.rs`). The gluten adapter
-//! forwards `hoodie.memory.merge.max.size` (the computed `maxMemoryPerCompaction`)
-//! into that map, so the operator/computed budget reaches spill sizing.
+//! reader config map alone (`ReaderContext::hoodie_reader_config`). An engine
+//! that means to bound merge memory has to forward
+//! `hoodie.memory.merge.max.size` into that map: a budget passed anywhere else
+//! never reaches spill sizing, and the threshold silently stays at the 1 GiB
+//! default. The first group of tests pins that contract in both directions,
+//! honored when forwarded and defaulted only when genuinely absent.
 //!
-//! Regression guard for I-33: gluten previously put the budget only in the props
-//! map, which hudi-rs never sees, so `SpillConfig` fell back to the 1 GiB default
-//! on every read (in-memory threshold pinned at ~779 MiB regardless of the
-//! operator's setting -> OOM risk). This asserts `from_config` honors the budget
-//! when it is present (as gluten now forwards it) and only defaults when it is
-//! genuinely absent.
-//!
-//! ## Peak-memory hard cap (/ 44437)
-//!
-//! The second group of tests here covers the hudi-rs-side foundation for the
-//! velox memory-reservation work: a queryable current-footprint getter
-//! ([`SpillableRecordMap::current_in_memory_bytes`]) and a configurable HARD
-//! peak cap ([`CONFIG_MAX_PEAK_MEMORY`]) that fails loudly with
-//! [`CoreError::MemoryLimitExceeded`] instead of letting the executor OOM. These
-//! are cargo-only (no gluten/velox bundle); the FFI + velox reservation wiring
-//! is a later increment.
-//!
-//! Run: `cargo test -p hudi-core --test nonfunctional_gaps_repro -- --nocapture`
+//! The second group covers the current-footprint getter
+//! ([`SpillableRecordMap::current_in_memory_bytes`]) and the hard peak cap
+//! ([`CONFIG_MAX_PEAK_MEMORY`]), which fails with
+//! [`CoreError::MemoryLimitExceeded`] rather than letting the process run out
+//! of memory.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,10 +45,10 @@ use crate::file_group::reader_v2::buffered_record::{BufferedRecord, OrderingValu
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
-/// The merge-type key gluten forwards in `hoodieReaderConfig`
+/// The merge-type key an engine forwards in its reader config
 /// (`HoodieReaderConfig.MERGE_TYPE.key()`).
 const MERGE_TYPE_KEY: &str = "hoodie.datasource.merge.type";
-/// Default merge type gluten resolves when unset (`REALTIME_PAYLOAD_COMBINE`).
+/// Default merge type when unset (`REALTIME_PAYLOAD_COMBINE`).
 const MERGE_TYPE_PAYLOAD_COMBINE: &str = "payload_combine";
 
 const MIB: u64 = 1024 * 1024;
@@ -71,36 +60,34 @@ fn threshold_bytes(config: &HashMap<String, String>) -> u64 {
         .max_in_memory_size
 }
 
-/// I-33 / G-16 — with the gluten fix, `hoodie.memory.merge.max.size` is forwarded
-/// in `hoodie_reader_config`, so `SpillConfig` honors the operator/computed budget
-/// instead of collapsing to the 1 GiB default.
+/// A `hoodie.memory.merge.max.size` forwarded in `hoodie_reader_config` is
+/// honored by `SpillConfig` rather than collapsing to the 1 GiB default.
 #[test]
-fn test_i33_merge_budget_honored_when_forwarded() {
-    // The gluten-realistic reader config POST-FIX: MERGE_TYPE plus the forwarded
-    // budget (operator lowers merge memory to 64 MiB to bound executor RSS).
-    let gluten_reader_config: HashMap<String, String> = HashMap::from([
+fn test_merge_budget_honored_when_forwarded() {
+    // A realistic reader config: MERGE_TYPE plus a forwarded budget (the
+    // engine lowers merge memory to 64 MiB to bound its own footprint).
+    let reader_config: HashMap<String, String> = HashMap::from([
         (
             MERGE_TYPE_KEY.to_string(),
             MERGE_TYPE_PAYLOAD_COMBINE.to_string(),
         ),
         (CONFIG_MERGE_MAX_SIZE.to_string(), (64 * MIB).to_string()),
     ]);
-    let honored = threshold_bytes(&gluten_reader_config);
+    let honored = threshold_bytes(&reader_config);
     println!(
-        "[I-33] gluten hoodie_reader_config (budget forwarded, 64 MiB) -> \
+        "hoodie_reader_config (budget forwarded, 64 MiB) -> \
          max_in_memory_size = {honored} bytes ({} MiB)",
         honored / MIB
     );
 
-    // A map WITHOUT the budget key (pre-fix gluten map / genuinely unset) still
-    // falls back to the 1 GiB default — this is what the fix avoids.
+    // A map without the budget key falls back to the 1 GiB default.
     let no_budget: HashMap<String, String> = HashMap::from([(
         MERGE_TYPE_KEY.to_string(),
         MERGE_TYPE_PAYLOAD_COMBINE.to_string(),
     )]);
     let default_path = threshold_bytes(&no_budget);
     println!(
-        "[I-33] no budget key -> max_in_memory_size = {default_path} bytes ({} MiB); \
+        "no budget key -> max_in_memory_size = {default_path} bytes ({} MiB); \
          DEFAULT_MERGE_MAX_SIZE_BYTES = {} MiB",
         default_path / MIB,
         DEFAULT_MERGE_MAX_SIZE_BYTES / MIB
@@ -124,11 +111,11 @@ fn test_i33_merge_budget_honored_when_forwarded() {
     assert!(
         honored < default_path,
         "the forwarded budget must lower the threshold below the default; \
-         if these were equal the budget would be silently ignored (the I-33 gap)"
+         if these were equal the budget would be silently ignored"
     );
     println!(
-        "[I-33] FIX OK: forwarded budget honored ({} MiB) != unset default ({} MiB); \
-         the operator's merge-memory budget reaches SpillConfig.",
+        "forwarded budget honored ({} MiB) != unset default ({} MiB); \
+         the engine's merge-memory budget reaches SpillConfig.",
         honored / MIB,
         default_path / MIB
     );

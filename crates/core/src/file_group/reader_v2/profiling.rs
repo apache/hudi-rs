@@ -17,8 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
 #![allow(dead_code, unused_macros, unused_imports)]
 
 //! Stage-timing profiling primitives for the file-group reader (perf harness).

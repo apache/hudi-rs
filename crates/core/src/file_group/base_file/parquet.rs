@@ -533,6 +533,44 @@ mod tests {
         assert!(!schema.fields().is_empty());
     }
 
+    /// The row-position column is re-added to a projected stream's schema from
+    /// the builder's full schema; a full schema that lacks it is a loud error,
+    /// not a schema that silently disagrees with the batches.
+    #[test]
+    fn test_schema_with_row_index_requires_the_column_in_the_full_schema() {
+        use arrow_schema::{DataType, Field, Schema};
+        let stream_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let full_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("_row_pos", DataType::Int64, false),
+        ]));
+
+        // No column requested: the stream schema passes through.
+        let out = ParquetBaseFileReader::schema_with_row_index(&stream_schema, &full_schema, None)
+            .unwrap();
+        assert_eq!(out, stream_schema);
+
+        // Requested and present in the full schema: appended after the
+        // stream's own columns.
+        let out = ParquetBaseFileReader::schema_with_row_index(
+            &stream_schema,
+            &full_schema,
+            Some("_row_pos"),
+        )
+        .unwrap();
+        assert_eq!(out.fields().len(), 2);
+        assert_eq!(out.field(1).name(), "_row_pos");
+
+        // Requested but absent from the full schema: an error naming the column.
+        let err = ParquetBaseFileReader::schema_with_row_index(
+            &stream_schema,
+            &stream_schema,
+            Some("_row_pos"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("_row_pos"), "got: {err}");
+    }
+
     #[tokio::test]
     async fn test_get_parquet_metadata() {
         let reader = ParquetBaseFileReader::new(test_storage());

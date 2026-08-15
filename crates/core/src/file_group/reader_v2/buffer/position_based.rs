@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Some items exist only for parity
-//! with the Java reader and have no caller here.
-
 //! Position-based file-group record buffer.
 //!
 //! Mirrors Java `org.apache.hudi.common.table.read.buffer.PositionBasedFileGroupRecordBuffer`,
@@ -176,22 +173,20 @@ impl PositionBasedFileGroupRecordBuffer {
         // Rebuild the (possibly-spilled) position-keyed map as a record-key-keyed
         // map. `drain_iter` yields values; the position keys are dropped.
         //
-        // A record's `record_key` field is NOT trustworthy here: the spill tier
-        // reconstructs a drained record's `record_key` from its MAP key (see
-        // `RocksDbDiskMap::record_from_entry`), which in this buffer is the
-        // POSITION string, not the record key. So for data records the true key
-        // is re-extracted from the payload row itself. A delete tombstone has no
-        // payload to re-extract from — its `record_key` is only correct if the
-        // tombstone never spilled (hudi-rs delete blocks always carry record
-        // keys, and `process_next_deleted_record` preserves them in the
-        // in-memory tier). A delete without a usable record key cannot be
-        // re-keyed — Java keeps it position-keyed under the hybrid strategy, but
-        // that requires the position, which `drain_iter` does not surface; fail
-        // loudly rather than silently drop a delete (which would resurrect a
-        // deleted row). A SPILLED position-keyed delete comes back with its
-        // position string as `record_key` and is indistinguishable from a real
-        // numeric key — persisting the record key through the spill tier is the
-        // real fix (tracked as a follow-up outside this buffer).
+        // A DATA record's `record_key` field is NOT trustworthy here: the spill
+        // tier reconstructs a drained data record's `record_key` from its MAP
+        // key (see `RocksDbDiskMap::record_from_entry`), which in this buffer is
+        // the POSITION string, not the record key. So for data records the true
+        // key is re-extracted from the payload row itself. A DELETE tombstone
+        // has no payload to re-extract from, but its `record_key` IS
+        // trustworthy: hudi-rs delete blocks always carry record keys,
+        // `process_next_deleted_record` preserves them in the in-memory tier,
+        // and the spill tier persists a delete's real key
+        // (`DiskLoc::Delete { record_key }`) and restores it on drain. A delete
+        // that still lacks a record key cannot be re-keyed — Java keeps it
+        // position-keyed under the hybrid strategy, but that requires the
+        // position, which `drain_iter` does not surface — so fail loudly rather
+        // than silently drop a delete (which would resurrect a deleted row).
         let fresh = SpillableRecordMap::with_config(SpillConfig::from_config(
             &self.inner.reader_context.hoodie_reader_config,
         )?);
@@ -1238,16 +1233,17 @@ mod tests {
 
     /// Regression test: a position-keyed DELETE tombstone
     /// that spills to the RocksDB tier must still suppress its target row after
-    /// key-based fallback. A delete's disk entry stores no payload, so before the
-    /// fix `spillable_map::record_from_entry` reconstructed `record_key` from the
+    /// key-based fallback. A delete's disk entry stores no payload, so if
+    /// `spillable_map::record_from_entry` reconstructed `record_key` from the
     /// MAP key — which in this buffer is the POSITION string (e.g. "3"), not the
-    /// record key ("k00003"). `fallback_to_key_based` then re-inserted the
-    /// tombstone under "3"; it never matched its target base row, so the deleted
-    /// row silently reappeared. Fixed by persisting the true `record_key` in the
-    /// delete's spill entry (`DiskLoc::Delete { record_key }`) and returning it
-    /// from `record_from_entry`. This asserts the deleted row stays deleted in
-    /// BOTH the spill and no-spill runs (Java parity); the no-spill control also
-    /// guards against a change that would mask the spill-specific path.
+    /// record key ("k00003") — `fallback_to_key_based` would re-insert the
+    /// tombstone under "3"; it would never match its target base row, and the
+    /// deleted row would silently reappear. Guarded by persisting the true
+    /// `record_key` in the delete's spill entry (`DiskLoc::Delete { record_key }`)
+    /// and returning it from `record_from_entry`. This asserts the deleted row
+    /// stays deleted in BOTH the spill and no-spill runs (Java parity); the
+    /// no-spill control also guards against a change that would mask the
+    /// spill-specific path.
     // Exercises the on-disk spill tier, which only exists with the backend.
     #[cfg(feature = "spill-rocksdb")]
     #[test]
@@ -1306,14 +1302,12 @@ mod tests {
             "no-spill control: the position-keyed delete must suppress \"k00003\" after fallback"
         );
 
-        // Spill-engaged: a 1 KiB budget routes the tombstone straight to the
-        // RocksDB tier before the fallback. EXPECTED TO FAIL against current
-        // code: the tombstone comes back keyed "3" and "k00003" is resurrected.
-        // A budget of 1 byte leaves a zero in-memory allowance, so even a lone
-        // tombstone spills. Stated as the smallest possible budget rather than a
-        // plausible-looking one: what this test needs is that the entry lands on
-        // the disk tier, and a "1 KiB" budget only happened to do that while the
-        // RocksDB reserve was being deducted up front.
+        // Spill-engaged: a 1-byte budget leaves a zero in-memory allowance, so
+        // even the lone tombstone spills to the RocksDB tier before the
+        // fallback. The smallest possible budget is used deliberately: what
+        // this test needs is that the entry lands on the disk tier, and a
+        // larger "plausible" budget could keep it in memory since the RocksDB
+        // reserve is charged only once the disk tier opens.
         let (spilled_out, did_spill) = run(&[("hoodie.memory.merge.max.size", "1")]);
         assert!(
             did_spill,
@@ -1328,22 +1322,6 @@ mod tests {
         );
     }
 
-    /// Regression test: a fallback that would collapse two positions of the same
-    /// record key must refuse, not silently drop one of the updates.
-    ///
-    /// With `dup` at base positions 1 and 2 and a log block updating both by
-    /// position, the position merge lands both. A later block whose positions
-    /// were computed against a different base file forces a fallback; re-keying
-    /// then maps both entries onto "dup" and a plain insert kept whichever the
-    /// map happened to yield last. Observed before the fix:
-    ///
-    /// ```text
-    /// position merge:      [a=10/1, dup=100/7, dup=200/8]
-    /// after the fallback:  [a=11/9, dup=100/7, dup=30/3]   <- (200,8) gone
-    /// ```
-    ///
-    /// (30,3) is the untouched base row, so a committed update simply vanished —
-    /// and which of the two vanished depended on `HashMap` iteration order.
     /// A delete block carrying more records than positions is refused.
     ///
     /// The block's records and its position bitmap are zipped index by index —
@@ -1404,6 +1382,23 @@ mod tests {
         );
     }
 
+    /// Regression test: a fallback that would collapse two positions of the same
+    /// record key must refuse, not silently drop one of the updates.
+    ///
+    /// With `dup` at base positions 1 and 2 and a log block updating both by
+    /// position, the position merge lands both. A later block whose positions
+    /// were computed against a different base file forces a fallback; re-keying
+    /// then maps both entries onto "dup", and a plain insert would keep whichever
+    /// the map happened to yield last:
+    ///
+    /// ```text
+    /// position merge:      [a=10/1, dup=100/7, dup=200/8]
+    /// after the fallback:  [a=11/9, dup=100/7, dup=30/3]   <- (200,8) gone
+    /// ```
+    ///
+    /// (30,3) is the untouched base row, so a committed update would simply
+    /// vanish — and which of the two vanished would depend on `HashMap`
+    /// iteration order.
     #[test]
     fn test_fallback_refuses_to_collapse_duplicate_keys() {
         let base = &[("a", 10, 1), ("dup", 20, 2), ("dup", 30, 3)];

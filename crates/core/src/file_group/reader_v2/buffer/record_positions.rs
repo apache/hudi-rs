@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Some items exist only for parity
-//! with the Java reader and have no caller here.
-
 //! Decoding of the `RECORD_POSITIONS` log-block header for position-based merge.
 //!
 //! A log block that was written with record positions carries two headers:

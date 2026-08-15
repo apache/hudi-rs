@@ -17,18 +17,18 @@
  * under the License.
  */
 
-//! Context types for the merge-on-read file group reader.
+//! The merge-on-read file group reader engine, mirroring Java's
+//! `org.apache.hudi.common.table.read` package.
 //!
-//! This module holds the inputs the MOR reader needs and the resolver that
-//! derives them from a table's configs. Nothing consumes it yet — the reader
-//! itself lands in later changes, and the existing read path is untouched
-//! until it does.
+//! `engine` orchestrates a read: the `resolver` derives the reader context
+//! from a table's configs, the log scanner and record buffer merge log records
+//! over the base file, and `merge_iterator` streams the merged output.
+//! `file_group::reader::FileGroupReader` reaches all of this through
+//! `adapter` (see its `read_via_v2` / `stream_via_v2`).
 //!
-//! Everything here is therefore unreachable from the crate's call graph, which
-//! the `allow(dead_code)` on each file silences. Hand-written items carry the
-//! allow per item so a mistakenly-dead one still warns; files ported wholesale
-//! carry it at file scope, since every item in them is live upstream. Drop the
-//! allows as the reader wires in.
+//! Some surface exists only for Java parity or is reached only by the test
+//! harness; it carries targeted `#[allow(dead_code)]` allows rather than a
+//! module-wide blanket, so an item that is mistakenly dead still warns.
 
 /// Far-future instant standing in for "no upper bound on the timeline": every
 /// real instant sorts before it, so a read watermarked here sees the whole

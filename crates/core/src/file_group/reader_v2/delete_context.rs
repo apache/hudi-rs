@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.read.DeleteContext`.
 //!
 //! Knows how to detect delete operations from schema metadata and

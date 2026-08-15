@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.read.BufferedRecordMerger` and
 //! `org.apache.hudi.common.table.read.BufferedRecordMergerFactory`.
 //!
@@ -532,7 +529,7 @@ mod tests {
             "delete(ordering=Default) wins unconditionally over data(ts=2)"
         );
 
-        // GAP-2: a delete with a GENUINE ordering value of 0 (a real bigint field
+        // A delete with a GENUINE ordering value of 0 (a real bigint field
         // value, `Long(0)`) is NOT the default — it is ordering-compared, and so
         // LOSES to a higher existing ts (row kept). Java: `Integer(0).equals(Long(0))`
         // is `false`, so `OrderingValues.isDefault(Long(0))` is `false`.
@@ -542,7 +539,7 @@ mod tests {
             .unwrap();
         assert!(
             result.is_none(),
-            "GAP-2: delete(genuine ts=0) loses to data(ts=2); the row is kept"
+            "delete(genuine ts=0) loses to data(ts=2); the row is kept"
         );
     }
 
@@ -562,7 +559,7 @@ mod tests {
             "default-ordering delete wins over higher-ts base"
         );
 
-        // GAP-2: a delete carrying a GENUINE ordering value of 0 (`Long(0)`) is
+        // A delete carrying a GENUINE ordering value of 0 (`Long(0)`) is
         // NOT the default — it is ordering-compared and LOSES to the higher-ts
         // base, so the base survives (row kept).
         let genuine_zero_delete =
@@ -570,7 +567,7 @@ mod tests {
         let merged = merger.final_merge(&base, &genuine_zero_delete).unwrap();
         assert!(
             !merged.is_delete(),
-            "GAP-2: delete(genuine ts=0) loses to higher-ts base; base survives"
+            "delete(genuine ts=0) loses to higher-ts base; base survives"
         );
 
         // A non-default delete with a LOWER ordering value loses; the base survives.
@@ -654,7 +651,7 @@ mod tests {
         );
     }
 
-    /// G-B: a null ordering value coerces to `OrderingValue::Default` (Java
+    /// A null ordering value coerces to `OrderingValue::Default` (Java
     /// `OrderingValues.getDefault()` == `Integer(0)`) and is COMPARED, not
     /// auto-winning. Mirrors Java `BufferedRecordMergerFactory.shouldKeepNewerRecord`
     /// (`newer.compareTo(older) >= 0`) with the null field coerced to the default.
@@ -732,7 +729,7 @@ mod tests {
         assert!(result.is_some());
     }
 
-    /// A3c: EVENT_TIME ordering by a `double` field (e.g. `weight`).
+    /// EVENT_TIME ordering by a `double` field (e.g. `weight`).
     /// The higher-weight record must win base-vs-log and log-vs-log; equal weights
     /// go to the newer record (`>=`), matching Java `EventTimeRecordMerger`. Before
     /// the fix, a `Float64` ordering column resolved to `None`, so every log record

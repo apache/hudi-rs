@@ -50,26 +50,25 @@ use hudi_test::QuickstartTripsTable;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
 
-/// How the reader is constructed — mirrors the four call paths used today.
+/// How the reader is constructed — mirrors the reader's real call paths.
 pub enum SchemaSpec {
     /// `new(.., None, None)` — no projection.
     None,
     /// `new(.., data_from_base_footer, Some(requested))`.
     Projection(SchemaRef),
-    /// `new(.., Some(data), Some(requested))` — the FFI explicit-schema path.
+    /// `new(.., Some(data), Some(requested))` — both schemas supplied
+    /// explicitly, as an external caller does.
     Explicit {
         data: SchemaRef,
         requested: SchemaRef,
     },
-    /// Builder path: schemas live on `ReaderContext.schema_handler`
-    /// (mimics `new_file_group_reader_with_context`).
+    /// Builder path: schemas live on `ReaderContext.schema_handler`.
     BuilderProjection(SchemaRef),
-    /// Full FFI mirror: data/requested schemas given as Avro JSON, set on the
-    /// schema handler as BOTH arrow and JSON — exactly what
-    /// `new_file_group_reader_with_context` does. This is the only arm that
-    /// arms `reader_schema_json`, i.e. the avro resolution / extended-
-    /// promotion branches of the log-block decoder. Use it for
-    /// schema-evolution cases.
+    /// Mirror of an external caller: data/requested schemas given as Avro
+    /// JSON, set on the schema handler as BOTH arrow and JSON. This is the
+    /// only arm that populates `reader_schema_json`, i.e. exercises the avro
+    /// resolution / extended-promotion branches of the log-block decoder. Use
+    /// it for schema-evolution cases.
     ExplicitJson {
         data_json: &'static str,
         requested_json: &'static str,
@@ -124,15 +123,15 @@ pub enum FilterPredicate {
 /// Closures can't live in a `const` case table, so a case declares its filter
 /// declaratively and [`build_row_filter_builder`] compiles it. The compiled
 /// builder is installed via the `with_row_filter_builder` /
-/// `with_mor_pk_safe` builder methods, exercising the same Rust-reachable
-/// channel Gluten/FFI uses (D-P2-1).
+/// `with_mor_pk_safe` builder methods, the same channel an external caller
+/// uses to push predicates.
 pub struct RowFilterSpec {
     /// Column the predicate references, by name. Located in the parquet
     /// `SchemaDescriptor` the reader hands the builder.
     pub column: &'static str,
     pub predicate: FilterPredicate,
-    /// Marks the filter PK-safe. Gold contract
-    /// (`SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`):
+    /// Marks the filter PK-safe. Mirrors Java's
+    /// `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`:
     /// only record-key filters are safe to push under merge, because PKs are
     /// immutable across upserts. Sets `builder.with_mor_pk_safe`; the
     /// `can_push_row_filter` gate (`is_cow() || mor_pk_safe`) decides whether
@@ -162,18 +161,18 @@ pub struct FgReaderCase {
     /// Override the merge mode (default "COMMIT_TIME_ORDERING").
     pub merge_mode: Option<&'static str>,
     /// Override the latest-commit-time watermark (default far-future sentinel
-    /// [`MAX_INSTANT_TIME`]). Gold gate 2: log blocks whose INSTANT_TIME header
-    /// is `> latest_commit_time` are FUTURE blocks and excluded.
+    /// [`MAX_INSTANT_TIME`]). Matches Java: log blocks whose INSTANT_TIME
+    /// header is `> latest_commit_time` are future blocks and excluded.
     pub latest_commit_time: Option<&'static str>,
     /// Instant range applied to the read; the harness invokes the fn and sets
     /// `reader_context.instant_range`. Stored as `fn()` so the case table stays
-    /// `'static`-friendly. Gold: blocks whose INSTANT_TIME is outside the range
-    /// are skipped, and base rows are filtered by `_hoodie_commit_time`.
+    /// `'static`-friendly. Matches Java: blocks whose INSTANT_TIME is outside
+    /// the range are skipped, and base rows are filtered by `_hoodie_commit_time`.
     pub instant_range: Option<fn() -> InstantRange>,
     /// Reader parameters override (default `ReaderParameters::default()`).
     pub reader_parameters: Option<ReaderParameters>,
     /// Extra `hoodie_reader_config` entries merged onto the reader context
-    /// before the read. This is the SAME map the FFI/gluten adapter populates
+    /// before the read. This is the SAME map an external caller populates
     /// and that `SpillConfig::from_config` reads, so a case can drive real
     /// config-string behavior end-to-end (e.g. the merge spill budget
     /// `hoodie.memory.merge.max.size` or the hard peak cap
@@ -247,14 +246,14 @@ fn join_partition(partition: &str, file: &str) -> String {
 
 /// Compile a [`RowFilterSpec`] into a [`RowFilterBuilder`] closure.
 ///
-/// The closure mirrors what the FFI layer (`cpp/src/predicate.rs`) does, but
-/// without the substrait wire format: it locates the predicate column in the
-/// parquet `SchemaDescriptor` the reader passes in, builds a single-root
-/// `ProjectionMask` for it, and installs one `ArrowPredicateFn` that compares
-/// the column against the literal (parsed per the arrow column type) using
-/// arrow-ord-style element-wise comparison. Returns `None` if the column is
-/// absent from the parquet schema (gold-parity: drop the pushdown, never fail
-/// the read), which keeps the builder honest for evolved/added columns.
+/// The closure mirrors what an external predicate-pushing caller does: it
+/// locates the predicate column in the parquet `SchemaDescriptor` the reader
+/// passes in, builds a single-root `ProjectionMask` for it, and installs one
+/// `ArrowPredicateFn` that compares the column against the literal (parsed per
+/// the arrow column type) using arrow-ord-style element-wise comparison.
+/// Returns `None` if the column is absent from the parquet schema (matching
+/// Java: drop the pushdown, never fail the read), which keeps the builder
+/// honest for evolved/added columns.
 ///
 /// Supported column types: Utf8/LargeUtf8, Int32, Int64, Float32, Float64,
 /// Boolean, Date32, Timestamp, Decimal128. Literal formats are documented on
@@ -546,8 +545,7 @@ fn reader_parameters(case: &FgReaderCase) -> ReaderParameters {
 /// snapshot of the reader's [`HoodieReadStats`] (cloned after `read()`, so the
 /// reader can be dropped while the caller still inspects stats).
 ///
-/// Matches on [`SchemaSpec`] to replicate the four construction paths that
-/// the standalone helpers in `file_group_reader_tests.rs` use today.
+/// Matches on [`SchemaSpec`] to replicate the reader's construction paths.
 async fn read_case(
     case: &FgReaderCase,
     table_path: &str,
@@ -565,8 +563,8 @@ async fn read_case(
         .map(|lf| join_partition(case.partition, lf))
         .collect();
 
-    // Derive the base file's instant from its name, as the adapter and the FFI
-    // (cpp/src/lib.rs) both do. Position-based merge needs it to check that a log
+    // Derive the base file's instant from its name, as the adapter does.
+    // Position-based merge needs it to check that a log
     // block's positions were recorded against this base file; leaving it unset
     // would make every harness case decline that path regardless of what it asked
     // for, and a case written to exercise position merge would pass while
@@ -589,7 +587,7 @@ async fn read_case(
     // Filtered cases route through the builder path: it is the only
     // construction that threads a `row_filter_builder` onto the base parquet
     // read (`HoodieFileGroupReader::new` has no filter param, and the
-    // unprojected base read explicitly skips pushdown — reader/mod.rs:562).
+    // unprojected base read explicitly skips pushdown).
     // The requested schema (driving the projected base read that engages the
     // filter) is derived from `expect_output_columns`.
     if let Some(spec) = &case.row_filter {
@@ -648,7 +646,7 @@ async fn read_case(
             Ok((batch, reader.read_stats().clone()))
         }
         SchemaSpec::BuilderProjection(requested) => {
-            // Mimic the FFI bridge: schemas live on ReaderContext.schema_handler,
+            // Mimic an external caller: schemas live on ReaderContext.schema_handler,
             // and the reader is built WITHOUT explicit data/requested schemas.
             let table_schema: Option<SchemaRef> = if let Some(ref bp) = base_path {
                 crate::file_group::base_file::parquet::ParquetBaseFileReader::new(storage.clone())
@@ -682,7 +680,7 @@ async fn read_case(
             data_json,
             requested_json,
         } => {
-            // Full FFI mirror (new_file_group_reader_with_context): both the
+            // Mirror an external caller in full: both the
             // arrow schemas AND the avro JSONs land on the schema handler, so
             // prepare_required_schema computes `reader_schema_json` and the
             // log-block decoder takes the avro resolution / extended-promotion
@@ -714,10 +712,10 @@ async fn read_case(
 }
 
 /// Construct + read a filtered case via the builder, installing the compiled
-/// `RowFilterBuilder` and `mor_pk_safe` flag through the Rust-reachable channel
-/// (`with_row_filter_builder` / `with_mor_pk_safe`). Schemas live on the
-/// `ReaderContext.schema_handler` (FFI-style), with the requested schema
-/// derived from the case's `expect_output_columns`.
+/// `RowFilterBuilder` and `mor_pk_safe` flag through `with_row_filter_builder`
+/// / `with_mor_pk_safe`. Schemas live on the `ReaderContext.schema_handler`
+/// (as an external caller sets them), with the requested schema derived from
+/// the case's `expect_output_columns`.
 async fn read_case_with_filter(
     case: &FgReaderCase,
     storage: Arc<Storage>,
@@ -769,9 +767,9 @@ async fn read_case_with_filter(
     reader_context.schema_handler = schema_handler;
 
     // The `can_push_row_filter` gate is `is_cow() || mor_pk_safe`, and
-    // `is_cow()` reads `hoodie.table.type` from the table_config. The FFI/Spark
-    // path populates this from `hoodie.properties`; the harness's
-    // `ReaderContext::empty()` does not, so set it here to match gold's
+    // `is_cow()` reads `hoodie.table.type` from the table_config. Real callers
+    // populate this from `hoodie.properties`; the harness's
+    // `ReaderContext::empty()` does not, so set it here to match Java's
     // pushdown gate. A base-only slice (no log files) is read as COPY_ON_WRITE
     // (no merge can flip the predicate outcome — the CoW gate branch); a slice
     // with log files is MERGE_ON_READ (only PK-safe filters may push).
@@ -1009,8 +1007,8 @@ macro_rules! fg_case_test {
             $crate::file_group::reader_v2::harness::run_case($case).await;
         }
     };
-    // Variant for cases pinned to a tracked gap: the case body stays intact
-    // (never weakened) but the test is `#[ignore]`d with the finding as its
+    // Variant for cases documenting a known gap: the case body stays intact
+    // (never weakened) but the test is `#[ignore]`d with the gap as its
     // reason, so `cargo test -- --ignored` still exercises it on demand.
     ($name:ident, $case:expr, ignore = $reason:literal) => {
         #[tokio::test]

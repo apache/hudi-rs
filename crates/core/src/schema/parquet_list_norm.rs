@@ -17,11 +17,9 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
 #![allow(dead_code)]
 
-//! normalize legacy 2-level `array<map>` parquet encodings so
+//! Normalize legacy 2-level `array<map>` parquet encodings so
 //! parquet-rs's parquet→arrow schema builder accepts them.
 //!
 //! # The problem
@@ -238,8 +236,7 @@ mod tests {
 
     // A real parquet log block written by the Hudi AVRO write path with the
     // default `write-old-list-structure=true`, carrying an `array<map<string,
-    // string>>` column (`obj_ids`) in the rejected 2-level encoding. Captured
-    // as I-3 evidence (evidence/i3-avro-block.parquet).
+    // string>>` column (`obj_ids`) in the rejected 2-level encoding.
     const LEGACY_2LEVEL: &[u8] =
         include_bytes!("../../tests/data/i3/legacy_2level_repeated_map.parquet");
 
@@ -254,7 +251,7 @@ mod tests {
     }
 
     /// Documents the bug: the raw (un-normalized) schema is rejected by the
-    /// parquet→arrow builder with exactly the runtime error we see in gluten.
+    /// parquet→arrow builder with the `Map cannot be repeated` error.
     #[test]
     fn legacy_schema_is_rejected_before_normalization() {
         let meta = raw_metadata(LEGACY_2LEVEL);

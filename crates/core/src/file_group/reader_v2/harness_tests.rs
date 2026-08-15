@@ -18,7 +18,7 @@
  */
 
 //! E2E tests for `HoodieFileGroupReader`, driven by the declarative harness
-//! in `fg_harness` (see `fg_harness/mod.rs`).
+//! in `harness.rs` (imported as `fg_harness`).
 //!
 //! Supported read matrix under test: table v9, MOR snapshot,
 //! COMMIT_TIME_ORDERING, schema-on-write backward-compatible evolution,
@@ -44,7 +44,8 @@ use fg_harness::{Expected, FgReaderCase, FilterPredicate, RowFilterSpec, SchemaS
 use hudi_test::QuickstartTripsTable;
 use std::sync::Arc;
 
-/// city=sf merge case as a harness case — the migration template.
+/// city=sf merge case — the template other cases follow; also reused by the
+/// harness self-test below.
 fn case_sf_merge() -> FgReaderCase {
     FgReaderCase {
         name: "v9_mor_commit_time_sf_merge",
@@ -141,11 +142,11 @@ fg_case_test!(
 // `ReaderContext.hoodie_reader_config` → `SpillConfig::from_config` →
 // `HoodieFileGroupRecordBuffer`'s `SpillableRecordMap` → `enforce_peak_cap` —
 // NOT by constructing a `SpillConfig`/calling `enforce_peak_cap` directly
-// (the unit-level path is covered in `nonfunctional_gaps_repro.rs`).
+// (the unit-level path is covered in `memory_limit_tests.rs`).
 // =============================================================================
 
 /// Config key for the hard peak-memory cap (`SpillableRecordMap`'s
-/// `CONFIG_MAX_PEAK_MEMORY`). Spelled here as the literal an operator/gluten
+/// `CONFIG_MAX_PEAK_MEMORY`). Spelled here as the literal an operator
 /// forwards, so the case exercises the string→config parse just like production.
 const MERGE_MAX_PEAK_SIZE_KEY: &str = "hoodie.memory.merge.max.peak.size";
 
@@ -254,7 +255,7 @@ fg_case_test!(
                 &["6", "F2", "65.0"],
             ],
         },
-        // Stats derived from the fixture semantics (B2 wiring, mirrors gold
+        // Stats derived from the fixture semantics (mirrors Java's
         // StandardUpdateProcessor): log 1 deletes ids 0-2 (3 deletes), log 2
         // updates ids 4-6 via base+log merge (3 updates), id=3 is an untouched
         // base record (emitted directly, NOT counted). No log-only new key, so
@@ -396,11 +397,11 @@ fg_case_test!(
     }
 );
 
-// Projection through the FFI/builder path: schemas live on
+// Projection through the builder path: schemas live on
 // `ReaderContext.schema_handler`, reader built via `.builder()` with NO
-// explicit schemas. This is the case that would have caught the original
-// bug where the builder created an empty schema handler (required_schema =
-// None → base read unpruned, no output projection).
+// explicit schemas. Guards the regression where a builder-constructed reader
+// with an empty schema handler left required_schema = None (base read
+// unpruned, no output projection).
 fg_case_test!(
     harness_projection_via_builder,
     FgReaderCase {
@@ -475,7 +476,7 @@ fg_case_test!(
 
 /// Component: Verify `required_schema` includes only the expected columns.
 ///
-/// Constructs a `FileGroupReaderSchemaHandler` mimicking the FFI flow, calls
+/// Constructs a `FileGroupReaderSchemaHandler` mimicking an external caller, calls
 /// `prepare_required_schema`, and verifies the computed `required_schema`
 /// contains the requested columns PLUS mandatory merge fields, but NOT the
 /// full parquet schema.
@@ -706,10 +707,11 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
 // =============================================================================
 // NULL elements inside containers (table_null_containers fixture)
 //
-// Mirrors the Gluten/FFI read path of TestMORFileSliceLayoutsExtendedTypes
+// Mirrors the external read path of TestMORFileSliceLayoutsExtendedTypes
 // "2. NULL elements in containers and empty containers": the data/requested
-// schemas are derived from the table's Avro schema JSON (as passed over FFI),
-// the base parquet holds arrays without NULL elements, and the log file holds
+// schemas are derived from the table's Avro schema JSON (as an external
+// caller passes them), the base parquet holds arrays without NULL elements,
+// and the log file holds
 // an UPDATE whose array carries a NULL element ([1, NULL, 3]).
 //
 // The Avro schema declares array items as the nullable union ["null","int"],
@@ -717,8 +719,8 @@ async fn test_component_builder_uses_reader_context_schema_handler() -> Result<(
 // =============================================================================
 
 /// Table Avro schema of the `table_null_containers` fixture (verbatim from the
-/// base parquet footer's `parquet.avro.schema`, which is what the Gluten side
-/// passes over FFI as `data_schema_json` / `requested_schema_json`).
+/// base parquet footer's `parquet.avro.schema`, which is what an external
+/// caller passes as `data_schema_json` / `requested_schema_json`).
 const NULL_CONTAINERS_AVRO_JSON: &str = r#"{"type":"record","name":"h2_record","namespace":"hoodie.h2","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_commit_seqno","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_record_key","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_partition_path","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_file_name","type":["null","string"],"doc":"","default":null},{"name":"id","type":["null","int"],"default":null},{"name":"arr_null_elem","type":["null",{"type":"array","items":["null","int"]}],"default":null},{"name":"map_null_val","type":["null",{"type":"map","values":["null","int"]}],"default":null},{"name":"st_null_field","type":["null",{"type":"record","name":"st_null_field","namespace":"hoodie.h2.h2_record","fields":[{"name":"a","type":["null","int"],"default":null},{"name":"b","type":["null","string"],"default":null}]}],"default":null},{"name":"arr_empty","type":["null",{"type":"array","items":["null","string"]}],"default":null},{"name":"map_empty","type":["null",{"type":"map","values":["null","int"]}],"default":null},{"name":"emptyinit_arr","type":["null",{"type":"array","items":["null","int"]}],"default":null},{"name":"ts","type":["null","long"],"default":null}]}"#;
 
 /// Extract (id -> Vec<Option<i32>>) for an INT-array column, sorted by id.
@@ -959,9 +961,9 @@ fn validate_null_containers(batch: &arrow_array::RecordBatch) -> std::result::Re
     Ok(())
 }
 
-// NULL elements inside containers, read through the FFI-style explicit-schema
+// NULL elements inside containers, read through the explicit-schema
 // path: data/requested schemas derived from the table's Avro schema JSON
-// (what Gluten passes over FFI). Base has arrays without NULLs; the log
+// (as an external caller supplies them). Base has arrays without NULLs; the log
 // UPDATE carries [1, NULL, 3] — the NULL element must survive the merge.
 fn case_null_containers() -> FgReaderCase {
     let avro_derived: SchemaRef = Arc::new(
@@ -989,8 +991,7 @@ fn case_null_containers() -> FgReaderCase {
 fg_case_test!(harness_null_container_elements, case_null_containers());
 
 // Unhappy path: a log file that does not exist must surface a loud read
-// error (storage-level), never an empty/partial result. P3 adds the
-// unsupported-feature cases (IsPartial, event-time ordering, ...) here.
+// error (storage-level), never an empty/partial result.
 fg_case_test!(
     harness_missing_log_file_errors,
     FgReaderCase {
@@ -1005,10 +1006,10 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Instant-range + latest-commit-time watermark coverage (gold block-filter
-// gates). Read configs are set on the case via the harness extension; expected
-// values follow GOLD semantics (D-P2-5). Any hudi-rs divergence is captured as
-// an #[ignore] + reviewNotes/p2-findings.md entry — never an expectation weaken.
+// Instant-range + latest-commit-time watermark coverage (the block-filter
+// gates, matching Java). Read configs are set on the case; expected values
+// follow Java semantics. Any hudi-rs divergence is captured as an
+// #[ignore]d case — never a weakened expectation.
 //
 // -- V9MorNonpart3Commits timeline & data (verified from the extracted zip) ---
 // c1 = 20260409002001492  base (insert), 7 rows ids 0-6
@@ -1049,7 +1050,7 @@ const I8I4U_SF_LOG: &str =
     ".fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73";
 
 // (a) Watermark = c2: the c3 UPDATE block (INSTANT_TIME=c3 > c2) is a FUTURE
-// block (gold gate 2) and is excluded. The c2 DELETE block still applies.
+// block (Gate 2) and is excluded. The c2 DELETE block still applies.
 // => ids 0,1,2 deleted; ids 4,5,6 keep ORIGINAL values; id=3 untouched.
 fg_case_test!(
     harness_watermark_excludes_future_blocks,
@@ -1103,7 +1104,7 @@ fg_case_test!(
 );
 
 // (c) instant_range up_to(c2) (inclusive end): the c3 UPDATE block's
-// INSTANT_TIME=c3 is outside the range and gold gate 3 skips it; the c2 DELETE
+// INSTANT_TIME=c3 is outside the range and is skipped; the c2 DELETE
 // block (INSTANT_TIME=c2, in range) applies. Watermark left at default.
 // => same expectation as case (a).
 fn instant_range_up_to_c2() -> InstantRange {
@@ -1136,7 +1137,7 @@ fg_case_test!(
 // (d) instant_range within_open_closed(base, log] on V9Mor8I4UCommitTime sf:
 // the base commit (INSTANT_TIME=base) is EXCLUDED (open start) so base rows are
 // filtered out by _hoodie_commit_time; the log commit (INSTANT_TIME=log) is in
-// range. GOLD: log records in range are emitted standalone. The log carries
+// range. Matching Java, log records in range are emitted standalone. The log carries
 // only the id=1 UPDATE (Alice-V2/31); id=2 has no log record, so with its base
 // row filtered out it disappears. => only id=1 Alice-V2.
 fn instant_range_excludes_base() -> InstantRange {
@@ -1187,7 +1188,7 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Supported-matrix boundary: unsupported-config loud-error cases (design.md §1)
+// Supported-matrix boundary: unsupported-config loud-error cases.
 //
 // The normative supported matrix: table v9, MOR snapshot,
 // COMMIT_TIME_ORDERING ONLY, schema-on-write only.
@@ -1196,9 +1197,9 @@ fg_case_test!(
 // Fixture: V9Mor8I4UCommitTime, partition city=sf (base + log; MOR merge path).
 // =============================================================================
 
-// EVENT_TIME_ORDERING on a MOR fixture (now SUPPORTED).
+// EVENT_TIME_ORDERING on a MOR fixture.
 // buffer/loader.rs accepts EVENT_TIME_ORDERING and KeyBasedFileGroupRecordBuffer
-// merges base-vs-log by ordering value (the base record now carries its ordering
+// merges base-vs-log by ordering value (the base record carries its ordering
 // value — has_next_base_record_keyed). For this 8I4U fixture the updates carry the
 // latest ordering, so EVENT_TIME picks the same winners as COMMIT_TIME — expected
 // rows match case_sf_merge().
@@ -1221,7 +1222,7 @@ fg_case_test!(
 );
 
 // CUSTOM merge mode on a MOR fixture.
-// Per design.md §1, only COMMIT_TIME_ORDERING is supported; CUSTOM (partial-update
+// Only COMMIT_TIME_ORDERING is supported; CUSTOM (partial-update
 // / custom merger) is not implemented. The loader.rs guard rejects it with:
 // "Unsupported merge mode: 'CUSTOM'. Only COMMIT_TIME_ORDERING is supported
 // (table v9 MOR scan path)." — stable substring: "Unsupported merge mode".
@@ -1271,9 +1272,9 @@ fg_case_test!(
     }
 );
 
-// emit_delete=true on a MOR fixture (GAP-06).
-// Per design.md §1, the supported read path drops deletes from the merged output;
-// emitting delete records (gold's emitDeletes / RecordContext.getDeleteRow) is not
+// emit_delete=true on a MOR fixture.
+// The supported read path drops deletes from the merged output;
+// emitting delete records (Java's emitDeletes / RecordContext.getDeleteRow) is not
 // implemented. The loader.rs guard rejects it with:
 // "emit_delete=true (emitting delete records into the output) is not yet
 // implemented; ..." — stable substring: "emit_delete".
@@ -1295,7 +1296,7 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Filter-pushdown e2e coverage via the Rust-reachable channel (D-P2-1):
+// Filter-pushdown e2e coverage via
 //   HoodieFileGroupReaderBuilder::with_row_filter_builder + with_mor_pk_safe.
 //
 // Declarative `RowFilterSpec` on the case is compiled by the harness into a
@@ -1304,12 +1305,12 @@ fg_case_test!(
 // base parquet read). Poison principle: if the filter is NOT applied, extra
 // rows survive and the exact-rows assert fails.
 //
-// Gold contract (SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey):
+// Java contract (SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey):
 //   - PK-safe filters (record-key columns) may be pushed under MOR merge.
 //   - Data-column filters may be pushed only on the CoW path (no log files).
 //   - The gate `can_push_row_filter() = is_cow() || mor_pk_safe` blocks unsafe
-//     pushes; when blocked, ALL rows return and the post-merge filter (above
-//     the FG reader, e.g. Velox/Spark) evaluates the predicate.
+//     pushes; when blocked, ALL rows return and the post-merge filter (the
+//     query engine above the FG reader) evaluates the predicate.
 //
 // Record-key format for V9Mor8I4UCommitTime: plain id value ("1", "2", ...)
 // (verified by reading the sf base parquet's _hoodie_record_key column).
@@ -1350,13 +1351,12 @@ fg_case_test!(
 // exact-row assert poisons if the base pushdown did not engage.
 //
 // NB: a PK *Gt* "1" filter is NOT discriminating on this fixture. Its log is
-// an AVRO data block, and the gold contract pushes the filter only to base
+// an AVRO data block, and the Java contract pushes the filter only to base
 // parquet + PARQUET log blocks (never avro blocks). Gt "1" prunes id=1 from the
 // base, but the unfiltered avro log re-introduces id=1's UPDATE during merge,
-// so the result is {Alice-V2, Bob} — identical to unfiltered. That is
-// gold-correct (the merge must not lose a log-sourced record), just not a
+// so the result is {Alice-V2, Bob} — identical to unfiltered. That matches
+// Java (the merge must not lose a log-sourced record), just not a
 // poison test; Lt "2" is used here because base+log agree on id=1.
-// See reviewNotes/p2-findings.md (T3 note) for the avro-log pushdown scope.
 fg_case_test!(
     harness_filter_pk_lt_mor_merge,
     FgReaderCase {
@@ -1470,21 +1470,20 @@ fg_case_test!(
 );
 
 // ---------------------------------------------------------------------------
-// Tier-2 fixtures (P2 Task 5): corrupt-tail / parquet-log / partial / hfile.
-// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2` (commit
-// 309a0b287e), self-validating layout generator. All v9 MOR,
+// Tier-2 fixtures: corrupt-tail / parquet-log / partial / hfile.
+// Provenance: Hudi Spark `TestMORFileSliceLayoutsFixturesV2`,
+// a self-validating layout generator. All v9 MOR,
 // COMMIT_TIME_ORDERING, non-partitioned; schema key STRING / ts LONG /
 // value STRING / num INT. See the `QuickstartTripsTable` doc comments.
 // ---------------------------------------------------------------------------
 
 // (a) Corrupt tail block: base + 2 AVRO logs, the second followed by appended
 // garbage forming a CORRUPT tail block. Gold (4 rows) reflects the data with
-// the corrupt tail ignored; the corrupt block should surface LOUDLY in
-// read_stats (total_corrupt_log_blocks >= 1) rather than aborting the read —
-// matching gold/Java HoodieLogFileReader semantics (Gate 1: corrupt → skip).
+// the corrupt tail ignored; the corrupt block must surface LOUDLY in
+// read_stats (total_corrupt_log_blocks >= 1) rather than aborting the read,
+// matching Java's HoodieLogFileReader semantics (Gate 1: corrupt → skip).
 //
-// RESOLVED (T5-1, P3 Task 4): hudi-rs now recovers from a corrupt tail block,
-// matching gold/Java HoodieLogFileReader. The reader validates each block via a
+// The reader validates each block via a
 // footer reverse-pointer probe (`LogFileReader::is_block_corrupted`) before
 // parsing its body; on an anomaly (oversized/truncated block length, footer
 // mismatch, or missing next MAGIC) it synthesizes a `BlockType::Corrupted`
@@ -1527,8 +1526,7 @@ fg_case_test!(
 /// The fixture holds three keys; filtering to one has to return exactly that
 /// row. This is the whole chain — the merge-on-read reader decides the predicate
 /// is safe, hands it to the log file reader, which hands it to the block decoder
-/// — so it fails if any link drops it, which is how the base-file pushdown was
-/// lost before.
+/// — so it fails if any link drops it.
 fn case_parquet_log_block_pk_filter() -> FgReaderCase {
     let mut case = FgReaderCase {
         name: "parquet_log_block_pk_filter",
@@ -1590,10 +1588,8 @@ fg_case_test!(
 );
 
 // (c) Partial-update block: base + 1 AVRO log carrying an IS_PARTIAL=true data
-// block. Originally this was a gap (D-P2-2) and hudi-rs refused such blocks
-// loudly to avoid silently null-filling absent columns. That gap is now closed:
-// hudi-rs applies IS_PARTIAL / KEEP_VALUES blocks by overlaying the updated
-// column subset onto the prior record. So the case now asserts the read
+// block. hudi-rs applies IS_PARTIAL / KEEP_VALUES blocks by overlaying the
+// updated column subset onto the prior record. The case asserts the read
 // SUCCEEDS and matches the gold Spark `SELECT *` snapshot (the merge-correct
 // truth, 4 rows) — any divergence from gold surfaces an incorrect partial merge.
 fg_case_test!(
@@ -1609,16 +1605,14 @@ fg_case_test!(
     }
 );
 
-// (d) HFile log block: base + 1 HFILE_DATA_BLOCK log. The HFile log reader was
-// removed from hudi-rs, so the read fails loudly while parsing the log block
-// header: the HFILE_DATA_BLOCK type ordinal (4) is no longer a recognized block
-// type, so block-header parsing rejects it with
-// `LogFormatError("Invalid block type: 4")` — a loud, unambiguous refusal (the
-// data is never silently dropped). The assertion matches that stable text.
-// NOTE: the matched string "Invalid block type: 4" comes from
-// `BlockType::TryFrom` (log_block.rs) formatting the raw ordinal.
-// If HFILE_DATA_BLOCK is ever added back as ordinal 4, this case will
-// flip to an unexpected-success failure — that's the intended signal.
+// (d) HFile log block: base + 1 HFILE_DATA_BLOCK log. The case asserts a loud
+// refusal while parsing the log block header: a build without HFile support
+// does not recognize the HFILE_DATA_BLOCK type ordinal (4) and rejects it with
+// `LogFormatError("Invalid block type: 4")` (the stable text matched here,
+// formatted by `BlockType::TryFrom` in log_block.rs), so the data is never
+// silently dropped. This crate does recognize HFile blocks, so the read
+// completes; the case stays #[ignore]d until the expectation is re-derived
+// (see the ignore reason) rather than being silently inverted.
 fg_case_test!(
     harness_hfile_log_block_rejected,
     FgReaderCase {
@@ -1634,9 +1628,9 @@ fg_case_test!(
 );
 
 // =============================================================================
-// DELETE-block orderingVal wrapper-type e2e fixtures (Task 7)
+// DELETE-block orderingVal wrapper-type e2e fixtures
 //
-// Six real MOR v9 COMMIT_TIME_ORDERING tables generated by gold Hudi Spark.
+// Six real MOR v9 COMMIT_TIME_ORDERING tables generated by Hudi Spark.
 // Each table: 4 rows inserted (ids 1-4), ids 3 and 4 deleted via upsert with
 // `_hoodie_is_deleted=true`. After applying the DELETE log block: ids 1 and 2
 // remain. The DELETE block's orderingVal is wrapped in the Avro type named by
@@ -1646,8 +1640,7 @@ fg_case_test!(
 // Schema: id INT32, val STRING, ts <type> (non-partitioned).
 // Precombine field: ts (set via table_config, matching hoodie.properties).
 //
-// Provenance: /home/ubuntu/ws2/hudi-rs-delete-fixtures/{ord_int,...}
-// Generated: 2026-06-08, gold Hudi Spark, `hoodie.table.format=native`.
+// Generated by Hudi Spark with `hoodie.table.format=native`.
 // =============================================================================
 
 // DELETE block orderingVal: IntWrapper (Avro int, Java Integer).
@@ -1758,9 +1751,9 @@ fg_case_test!(
 );
 
 // DELETE block orderingVal: TimestampMicrosWrapper (Avro long / epoch micros).
-// ts is TIMESTAMP[us, UTC]; delete block carries Long (epoch micros) values —
-// adjacent: unwrapAvroValueWrapper returns Long, not Instant, but the
-// block IS written and the decoder must handle TimestampMicrosWrapper.value as a
+// ts is TIMESTAMP[us, UTC]; delete block carries Long (epoch micros) values.
+// Java's unwrapAvroValueWrapper returns Long, not Instant, and the
+// decoder must handle TimestampMicrosWrapper.value as a
 // plain long. After merge: ids 1 and 2 survive.
 fg_case_test!(
     harness_delete_ord_timestamp,
@@ -1780,9 +1773,9 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Filter-pushdown extensions (0610 review): IN predicates and logical/typed
-// columns (GAP-HARNESS-T3B closed). Scope note: the supported matrix is
-// parquet BASE + avro LOG only, and gold never pushes filters into avro log
+// Filter-pushdown extensions: IN predicates and logical/typed
+// columns. Scope note: the supported matrix is
+// parquet BASE + avro LOG only, and Java never pushes filters into avro log
 // blocks, so pushdown coverage targets the base parquet read (CoW path and
 // the PK-safe MOR cases above).
 //
@@ -1949,7 +1942,7 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Log-only file-group read-config coverage (0610 review): projection,
+// Log-only file-group read-config coverage: projection,
 // instant-range, and watermark on a file group with NO base file.
 //
 // MorLayoutLogOnly ground truth (decoded from the log blocks):
@@ -1967,8 +1960,8 @@ const LOG_ONLY_LOG_FILES: &[&str] = &[
     ".7787bafe-f674-4382-85f7-a94177194136-0_20260409030528554.log.1_0-130-231",
 ];
 
-/// Full table arrow schema of MorLayoutLogOnly, hand-built exactly as the FFI
-/// path receives it (there is no base parquet footer to derive it from).
+/// Full table arrow schema of MorLayoutLogOnly, hand-built exactly as an
+/// external caller supplies it (there is no base parquet footer to derive it from).
 fn log_only_table_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("_hoodie_commit_time", DataType::Utf8, true),
@@ -1986,7 +1979,7 @@ fn log_only_table_schema() -> SchemaRef {
 }
 
 // Projection on a log-only file group. No base footer exists, so the
-// data schema must come in explicitly (FFI-style); the requested schema
+// data schema must come in explicitly; the requested schema
 // prunes to [key, level] and merge-internal fields must be stripped from the
 // output. Validates the avro log decode honors the required schema without a
 // base file.
@@ -2070,19 +2063,19 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Schema-on-write evolution e2e (0610 review).
+// Schema-on-write evolution e2e.
 //
-// Fixtures from hudi-internal `TestMORFileSliceLayoutsSchemaEvo` (self-
+// Fixtures from Hudi Spark's `TestMORFileSliceLayoutsSchemaEvo` (self-
 // validating generator): one file group whose two AVRO log blocks were written
-// under DIFFERENT writer schemas. Read through `SchemaSpec::ExplicitJson` —
-// the full FFI mirror — so `reader_schema_json` is armed and the log-block
-// decoder takes the avro RESOLUTION branch (older writer schema resolved
+// under DIFFERENT writer schemas. Read through `SchemaSpec::ExplicitJson`
+// (the external-caller mirror) so `reader_schema_json` is populated and the
+// log-block decoder takes the avro RESOLUTION branch (older writer schema resolved
 // against the required schema), and the base parquet goes through
 // intersection-read + projection (null-fill / promotion).
 // =============================================================================
 
-/// table_evo_add_col table avro schema (printed by the generator; what Gluten
-/// would pass over FFI as data_schema_json after the ALTER).
+/// table_evo_add_col table avro schema (printed by the generator; what an
+/// external caller passes as data_schema_json after the ALTER).
 const EVO_ADD_COL_AVRO_JSON: &str = r#"{"type":"record","name":"h1_record","namespace":"hoodie.h1","fields":[{"name":"_hoodie_commit_time","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_commit_seqno","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_record_key","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_partition_path","type":["null","string"],"doc":"","default":null},{"name":"_hoodie_file_name","type":["null","string"],"doc":"","default":null},{"name":"key","type":["null","string"],"default":null},{"name":"ts","type":["null","long"],"default":null},{"name":"val","type":["null","string"],"default":null},{"name":"extra","type":["null","string"],"default":null}]}"#;
 
 /// Projected requested schema for the add-col fixture: key, val, extra only.
@@ -2217,12 +2210,12 @@ fg_case_test!(
 );
 
 // =============================================================================
-// Read-boundary hardening regression cases (0610 review).
+// Read-boundary hardening regression cases.
 // =============================================================================
 
 // Empty latest_commit_time must read the FULL snapshot, not base-file-only.
-// Poison: before the loader's empty-watermark guard, "" flowed into Gate 2 as
-// the lexicographic upper bound, making `instant > ""` true for every log
+// Poison: without the loader's empty-watermark guard, "" would flow into Gate 2
+// as the lexicographic upper bound, making `instant > ""` true for every log
 // block — all log records silently dropped → the 7 original base rows (ids
 // 0-6) with no error. With the guard, empty defaults to the far-future
 // sentinel and the full 3-commit merge applies (ids 0-2 deleted, 4-6 updated).
@@ -2249,11 +2242,11 @@ fg_case_test!(
     }
 );
 
-// A lowercase merge mode must be accepted (gold's getMergeMode is
-// case-insensitive). Poison: before the loader upper-cased merge_mode, the
-// schema handler accepted "commit_time_ordering" (eq_ignore_ascii_case) but the
-// loader gate's exact match rejected it with "Unsupported merge mode", so a
-// semantically-supported read failed. With normalization the full merge runs.
+// A lowercase merge mode must be accepted (Java's getMergeMode is
+// case-insensitive). Poison: without the loader upper-casing merge_mode, the
+// schema handler would accept "commit_time_ordering" (eq_ignore_ascii_case) but
+// the loader gate's exact match would reject it with "Unsupported merge mode",
+// failing a semantically-supported read. With normalization the full merge runs.
 fg_case_test!(
     harness_merge_mode_lowercase_accepted,
     FgReaderCase {

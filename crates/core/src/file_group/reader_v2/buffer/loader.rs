@@ -17,9 +17,9 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
+//! Record buffer loading: selects a buffer strategy, then populates the buffer
+//! by scanning the file slice's log files.
+//!
 //! Mirrors:
 //! - `FileGroupRecordBufferLoader` (Java interface)
 //! - `LogScanningRecordBufferLoader` (Java abstract class)
@@ -119,7 +119,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         // readerContext.getMergeMode()). Normalize to upper-case so the gate
         // below, the record-merger factory (reached via the buffer), and the
         // schema handler (which already compares case-insensitively) agree on
-        // one spelling — gold's `getMergeMode` is likewise case-insensitive.
+        // one spelling — Java's `getMergeMode` is likewise case-insensitive.
         let merge_mode = if reader_context.merge_mode.is_empty() {
             "COMMIT_TIME_ORDERING".to_string()
         } else {
@@ -131,8 +131,8 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         // mode flows into record-buffer construction, so the gate lives here.
         // EVENT_TIME_ORDERING: the KeyBasedFileGroupRecordBuffer builds
         // the EventTimeRecordMerger via BufferedRecordMergerFactory and merges
-        // base-vs-log by ordering value (the base record now carries its ordering
-        // value — see KeyBasedFileGroupRecordBuffer::has_next_base_record_keyed).
+        // base-vs-log by ordering value (the base record carries its ordering
+        // value — see KeyBasedFileGroupRecordBuffer::has_next_base_record_at).
         // CUSTOM still requires a partial-update / custom merger that is not implemented.
         match merge_mode.as_str() {
             "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING" => {}
@@ -186,7 +186,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
             // parquet base file. A mismatch would build a position buffer for a
             // base source that lacks the row-index column. The base file's
             // commit time (validated present by the gate) is used to check
-            // log-block position headers. When it is absent (e.g. the FFI could
+            // log-block position headers. When it is absent (e.g. the caller could
             // not parse it from the base file name), this arm is skipped and the
             // read falls through to key-based merge — which is always correct
             // and needs no commit time — rather than erroring. Position merge
@@ -208,7 +208,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
                 base_file_instant_time,
             )?)
         } else if reader_parameters.emit_delete {
-            // Gold's emitDeletes path synthesizes a delete row
+            // Java's emitDeletes path synthesizes a delete row
             // (RecordContext.getDeleteRow) and tags HoodieOperation.DELETE so
             // deletes flow into the output (UpdateProcessor.java:91-101). That
             // delete-row synthesis + operation tagging is not implemented; gate
@@ -237,18 +237,13 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         )
         .await?;
 
-        // STEP: compact sparsely-pinned source batches before the drain (A2
-        // safety valve). After log scanning the merge map holds zero-copy
-        // BatchRefs that each pin their whole source batch; this releases the
-        // dead-row memory of any source batch whose survivors fell below the
-        // compaction threshold. A no-op for buffers that don't hold batch refs,
-        // and for the common case where survivors keep most batches well-populated.
-        //
-        // Absolute-pinned-bytes cap hook: a future budget-driven pass will additionally
-        // trigger this — or a budget-driven variant — when distinct-pinned Arrow
-        // bytes exceed a fraction of the merge budget, so the per-row size
-        // estimate and the real pinned cost converge. Wired here as the
-        // unconditional end-of-scan pass for now.
+        // STEP: compact sparsely-pinned source batches before the drain (the
+        // batch-pinning safety valve). After log scanning the merge map holds
+        // zero-copy BatchRefs that each pin their whole source batch; this
+        // releases the dead-row memory of any source batch whose survivors fell
+        // below the compaction threshold. A no-op for buffers that don't hold
+        // batch refs, and for the common case where survivors keep most batches
+        // well-populated.
         populated_buffer.compact_pinned_batches()?;
 
         // Populate read stats from scan stats
@@ -310,16 +305,16 @@ async fn scan_log_files(
     // lexicographic `instant_time > latest_instant_time`; passing "" through
     // makes that true for EVERY block, silently dropping ALL log records and
     // returning base-file-only data with no error. Default empty to the
-    // far-future sentinel so a missing watermark reads everything (gold's
+    // far-future sentinel so a missing watermark reads everything (Java's
     // behavior), matching the no-watermark default downstream.
     let latest_instant_time = if reader_context.latest_commit_time.is_empty() {
         crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string()
     } else {
         reader_context.latest_commit_time.clone()
     };
-    // C-INFLIGHT-DELTA: forward the Gate-3 completed/inflight inputs the FFI
-    // bridge stashed on the reader context (mirroring how instant_range rides
-    // on it). `None` for v8+/incremental/non-gated reads leaves Gate 3 a no-op.
+    // Forward the Gate-3 completed/inflight inputs the caller stashed on the
+    // reader context (mirroring how instant_range rides on it). `None` for
+    // v8+/incremental/non-gated reads leaves Gate 3 a no-op.
     let completion_gate_inputs = reader_context.completion_gate_inputs.clone();
     let reader = HoodieMergedLogRecordReader::new_builder()
         .with_reader_context(reader_context)

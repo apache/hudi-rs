@@ -17,15 +17,12 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Streaming output for the file-group reader.
 //!
 //! The Java reader's `getClosableIterator()` returns a lazy iterator that
 //! emits merged rows in chunks. `FileGroupMergeIterator` does the same — it
-//! emits one merged chunk per `next()`, so the consumer (Velox
-//! `HudiSplitReader::next()`) can free each chunk before the next is built,
+//! emits one merged chunk per `next()`, so the consumer can free each chunk
+//! before the next is built,
 //! instead of holding the entire merged `RecordBatch` resident at once.
 //!
 //! [`FileGroupMergeIterator`] is the streaming bridge:
@@ -53,15 +50,12 @@
 //! an [`OutputConverter`] is present, that comes from
 //! `OutputConverter::target_schema()`. Otherwise it equals the merge schema
 //! (= base file schema, or required_schema if set), determined in
-//! `HoodieFileGroupReader::open()` using the same logic
-//! `merge_and_collect` used to use.
+//! `HoodieFileGroupReader::open()`.
 //!
 //! ## Default batch size
 //!
-//! [`DEFAULT_BATCH_SIZE`] = 4096 rows, matching Velox's typical operator
-//! batch size. The Velox `HudiSplitReader::next(uint64_t size, ...)` API
-//! exposes a requested size parameter; a follow-up will plumb that through
-//! the FFI. For now the iterator uses its constructor-time `batch_size`.
+//! [`DEFAULT_BATCH_SIZE`] = 4096 rows, a typical query-engine operator batch
+//! size. Callers override it via `hoodie.read.stream.batch_size`.
 
 use crate::Result;
 use crate::error::CoreError;
@@ -74,7 +68,7 @@ use std::time::Instant;
 
 /// Default chunk size (rows) emitted by [`FileGroupMergeIterator`].
 ///
-/// Matches Velox's typical operator batch size; matches Spark Hudi's
+/// Matches Spark Hudi's
 /// `hoodie.parquet.batchsize.default`. Used as the fallback when
 /// `hoodie.read.stream.batch_size` is unset/unparseable.
 pub const DEFAULT_BATCH_SIZE: usize = 4096;
@@ -141,7 +135,7 @@ enum MergeSource {
     ///
     /// `batch_size` is retained but unused on the merge path — it is kept
     /// in the public `new_buffered` signature for API compatibility with
-    /// callers that still pass `DEFAULT_BATCH_SIZE`. Chunk size is now
+    /// callers that pass `DEFAULT_BATCH_SIZE`. Chunk size is
     /// determined by the base source's own row-group cadence.
     Buffered {
         buffer: Box<dyn HoodieFileGroupRecordBuffer>,
@@ -298,9 +292,9 @@ impl FileGroupMergeIterator {
     /// Delegates to the buffer's
     /// [`current_in_memory_bytes`](HoodieFileGroupRecordBuffer::current_in_memory_bytes)
     /// on the merge path; returns 0 for the Eager (no-merge) source, which holds
-    /// no merge map. Used by the FFI reader-memory accessor so a host memory
-    /// manager (velox's `MemoryPool`) can reserve against hudi-rs's live native
-    /// footprint. Cheap (an `AtomicU64`/counter read on the buffer), safe to call
+    /// no merge map. Lets a host memory manager reserve against hudi-rs's live
+    /// native footprint.
+    /// Cheap (an `AtomicU64`/counter read on the buffer), safe to call
     /// between chunk pulls.
     #[must_use]
     /// Reported by the memory harness; the merge path reads the map's own counter.
@@ -326,10 +320,10 @@ impl FileGroupMergeIterator {
         }
     }
 
-    /// Convenience for callers that want the legacy "one batch" behaviour
+    /// Convenience for callers that want "one batch" behaviour
     /// (drives the iterator to completion and concatenates).
     ///
-    /// Mirrors the historical `HoodieFileGroupReader::read()` return type.
+    /// Backs `HoodieFileGroupReader::read()`'s single-batch return type.
     pub fn collect_into_one_batch(mut self) -> Result<RecordBatch> {
         let output_schema = self.output_schema.clone();
         let mut chunks: Vec<RecordBatch> = Vec::new();
@@ -382,7 +376,7 @@ impl Iterator for FileGroupMergeIterator {
         type Chunk = (RecordBatch, u64, u64);
         let produced: Result<Option<Chunk>, (CoreError, u64, u64)> = match &mut self.source {
             MergeSource::Eager { source } => {
-                // A3: one source batch = one emitted chunk. The
+                // One source batch = one emitted chunk. The
                 // source is a `RecordBatchReader` — lazy (`ParquetSyncReader`
                 // doing block_on per row-group) or eager (`RecordBatchIterator`
                 // over a Vec for tests / instant-range-filter fallback). The
@@ -403,8 +397,8 @@ impl Iterator for FileGroupMergeIterator {
             } => {
                 // Vectorized merge path: pull the next merged base
                 // batch, or drain log-only inserts, then hand it to the shared
-                // timing / projection / exhaustion tail below (Step 2) so
-                // HEAD's stream-stats timing is preserved. Loop to skip base
+                // timing / projection / exhaustion tail below (Step 2) so the
+                // stream-stats timing is preserved. Loop to skip base
                 // chunks fully eliminated by log deletes.
                 let merge_start = Instant::now();
                 let mut chunk_err: Option<CoreError> = None;
@@ -528,7 +522,7 @@ mod tests {
 
     /// A single-row `(key, v)` `BufferedRecord` whose payload is a zero-copy
     /// `BatchRef` into a shared source batch — exactly how
-    /// `KeyBasedFileGroupRecordBuffer` stores records post-A2
+    /// `KeyBasedFileGroupRecordBuffer` stores records
     /// (`process_next_data_record` keeps the `BatchRef`, no IPC serialization).
     /// Exercising the in-memory representation here guards the streaming
     /// iterator's drain against the real payload shape.
@@ -702,7 +696,7 @@ mod tests {
     }
 
     /// Extract `(key, v)` rows from a batch (small_schema layout) for full-data
-    /// assertions per codeQuality/guide.md §5.
+    /// assertions.
     fn rows(b: &RecordBatch) -> Vec<(String, i32)> {
         let keys = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let vs = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
@@ -711,8 +705,7 @@ mod tests {
             .collect()
     }
 
-    /// Eager mode yields each input batch unchanged when no converter is set;
-    /// assert the full row contents, not just counts.    /// The trait's default stat accessors are the contract a buffer that does
+    /// The trait's default stat accessors are the contract a buffer that does
     /// not instrument itself falls back to. `MockBuffer` is exactly such a
     /// buffer, and the loader calls every one of these when it copies scan stats
     /// into `HoodieReadStats`. Both production buffers override them, so this is
@@ -729,6 +722,8 @@ mod tests {
         assert_eq!(buffer.update_stats_snapshot(), UpdateStats::default());
     }
 
+    /// Eager mode yields each input batch unchanged when no converter is set;
+    /// assert the full row contents, not just counts.
     #[test]
     fn eager_yields_each_batch() {
         let schema = small_schema();
@@ -795,7 +790,7 @@ mod tests {
     }
 
     /// 10 records → all rows preserved in order. (vectorized: chunk
-    /// cadence now follows the base source's batches, not `batch_size`, so we
+    /// cadence follows the base source's batches, not `batch_size`, so we
     /// assert total-row + ordered-content parity rather than a per-chunk shape.)
     #[test]
     fn stream_buffered_chunking_row_counts_and_partial_tail() {
@@ -819,7 +814,7 @@ mod tests {
     }
 
     /// Small `batch_size` hint → full data preserved (vectorized: the
-    /// hint no longer forces singleton chunks; chunking follows the base source).
+    /// hint does not force singleton chunks; chunking follows the base source).
     #[test]
     fn stream_buffered_batch_size_one_yields_singleton_chunks() {
         let schema = small_schema();
@@ -911,9 +906,9 @@ mod tests {
     }
 
     /// On exhaustion the iterator snapshots the buffer's update-processor
-    /// insert/update/delete counts into the shared stats sink (stats
-    /// lifecycle — the streaming path can no longer drain them via
-    /// `merge_and_collect_with_stats`).
+    /// insert/update/delete counts into the shared stats sink (the streaming
+    /// path never calls `merge_and_collect_with_stats`, so this snapshot is
+    /// the only stats hand-off).
     #[test]
     fn stream_buffered_snapshots_update_stats_on_exhaustion() {
         let schema = small_schema();
@@ -931,8 +926,8 @@ mod tests {
 
     /// Full-data equivalence across chunk sizes: the iterator-collected output
     /// is identical (ordered, row-for-row) regardless of `batch_size`, matching
-    /// the legacy single-batch semantics. This is the streaming-vs-collect
-    /// equivalence guarantee (codeQuality/guide.md §5: assert the full dataset).
+    /// the single-batch semantics. This is the streaming-vs-collect
+    /// equivalence guarantee, asserted over the full dataset.
     #[test]
     fn stream_buffered_full_data_equivalent_across_chunk_sizes() {
         let schema = small_schema();
@@ -1015,9 +1010,9 @@ mod tests {
             &mut self,
             _target_schema: &SchemaRef,
         ) -> Result<Option<RecordBatch>> {
-            // merge-perf's state-machine iterator drives the buffer via this
+            // The state-machine iterator drives the buffer via this
             // method first (BaseScanning); error here to exercise the
-            // surface-once-then-fuse contract on the current API.
+            // surface-once-then-fuse contract.
             Err(crate::error::CoreError::ReadFileSliceError("boom".into()))
         }
         fn drain_log_only_inserts(
@@ -1032,7 +1027,7 @@ mod tests {
     }
 
     /// A `has_next` error surfaces exactly once as `Some(Err(_))`, then the
-    /// iterator fuses (sticky `done`) — the contract every A1–A6 PR leans on.
+    /// iterator fuses (sticky `done`) — the contract every consumer leans on.
     #[test]
     fn buffered_surfaces_error_then_fuses() {
         let schema = small_schema();
@@ -1065,10 +1060,9 @@ mod tests {
     // ---- OutputConverter (projection) path ----
 
     /// The `OutputConverter` path: `schema()` reports the converter's target
-    /// schema BEFORE any chunk is produced (Velox calls `get_schema` before the
-    /// first `get_next`), and the projection is applied per chunk across >1
-    /// chunk — the project-per-chunk contract that replaced the old
-    /// project-once-over-the-whole-batch path.
+    /// schema BEFORE any chunk is produced (consumers read the schema before
+    /// the first chunk), and the projection is applied per chunk across >1
+    /// chunk — the project-per-chunk contract.
     #[test]
     fn buffered_output_converter_projects_per_chunk() {
         let merge_schema = small_schema(); // (key: Utf8, v: Int32)
@@ -1078,7 +1072,7 @@ mod tests {
         let converter = crate::file_group::reader_v2::output_converter::ProjectionConverter::new(
             &target_schema,
         );
-        // 5 records, batch_size 2 → 3 chunks, so per-chunk projection is exercised.
+        // 5 records with a converter installed, so per-chunk projection is exercised.
         let it = FileGroupMergeIterator::new_buffered(
             MockBuffer::boxed(batch_ref_seq(&merge_schema, 5), UpdateStats::default()),
             merge_schema,
@@ -1095,7 +1089,7 @@ mod tests {
         );
 
         let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
-        // merge-perf's MockBuffer drains its log-only inserts in one batch, so
+        // The MockBuffer drains its log-only inserts in one batch, so
         // the projection may land in a single chunk here; assert projection is
         // applied (schema + values below) rather than a specific chunk count.
         assert!(!chunks.is_empty(), "projection yields at least one chunk");
@@ -1118,7 +1112,7 @@ mod tests {
         assert_eq!(got, want, "per-chunk projection preserves values in order");
     }
 
-    /// A3 — the Eager (no-merge) source works with an arbitrary
+    /// The Eager (no-merge) source works with an arbitrary
     /// `RecordBatchReader`, not just a Vec. Models the lazy base-file path
     /// where the FG reader hands a `ParquetSyncReader` (or similar) to
     /// `new_eager` directly, pulling one row-group per chunk.

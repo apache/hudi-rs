@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.log.HoodieMergedLogRecordReader`.
 //!
 //! Thin wrapper around [`BaseHoodieLogRecordReader`] that adds:
@@ -275,7 +272,7 @@ pub struct Builder {
     /// By default true, matching Java: `private boolean forceFullScan = true;`
     force_full_scan: bool,
     allow_inflight_instants: bool,
-    /// Inputs for the Gate-3 completed/inflight check (C-INFLIGHT-DELTA); `Some` only for
+    /// Inputs for the Gate-3 completed/inflight check; `Some` only for
     /// table version < 8. `None` (default) leaves Gate 3 a no-op.
     completion_gate_inputs: Option<CompletionGateInputs>,
 }
@@ -348,7 +345,7 @@ impl Builder {
         self
     }
 
-    /// Supply the Gate-3 completed/inflight sets (C-INFLIGHT-DELTA). Callers pass `Some` only for
+    /// Supply the Gate-3 completed/inflight sets. Callers pass `Some` only for
     /// table version < 8; `None` (the default) leaves Gate 3 disabled.
     pub fn with_completion_gate_inputs(mut self, inputs: Option<CompletionGateInputs>) -> Self {
         self.completion_gate_inputs = inputs;

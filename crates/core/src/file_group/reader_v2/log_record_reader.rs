@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.log.BaseHoodieLogRecordReader`.
 //!
 //! The 2-pass log scanning engine that reads log blocks, filters them through
@@ -100,10 +97,10 @@ impl<'a> CompletionGate<'a> {
     /// committedness for any instant, so it admits everything (a no-op) rather
     /// than excluding all blocks. Java always builds the gate from a non-empty
     /// active timeline (`filterCompletedInstants()`), so an empty set here means
-    /// the inputs were not populated by the caller (e.g. the FFI bridge forwarded
-    /// an empty list). Excluding on that basis would silently drop EVERY log delta
-    /// — including committed ones — and return base-file-only data (the
-    /// C-INFLIGHT silent-wrong: a committed later delta wrongly dropped). Deferring
+    /// the inputs were not populated by the caller. Excluding on that basis would
+    /// silently drop EVERY log delta
+    /// — including committed ones — and return base-file-only data (silently
+    /// wrong: a committed later delta dropped). Deferring
     /// to the other gates preserves the pre-gate behavior for a mis-wired gate; a
     /// correctly-populated gate is unaffected because its completed set is non-empty.
     fn admits(&self, instant_time: &str) -> bool {
@@ -125,8 +122,8 @@ impl<'a> CompletionGate<'a> {
     /// version < 8 snapshot), being unpopulated is a mis-wire signal, not a genuine empty
     /// timeline: Java always builds the gate from a non-empty active timeline
     /// (`filterCompletedInstants()`), and a v1 snapshot always has >= 1 completed instant.
-    /// `forward_scan_pass1` warns once when this holds so a gate whose inputs were dropped
-    /// across the FFI boundary is diagnosable rather than a silent no-op.
+    /// `forward_scan_pass1` warns once when this holds so a gate whose inputs the caller
+    /// dropped is diagnosable rather than a silent no-op.
     fn is_unpopulated(&self) -> bool {
         self.completed_instants.is_empty() && self.archived_boundary.is_none()
     }
@@ -140,8 +137,8 @@ impl<'a> CompletionGate<'a> {
 /// ## 5 Gates (per-block):
 /// 1. Corrupt → skip
 /// 2. Future (instant > latest_instant_time) → skip
-/// 3. Completed/inflight → skip data/delete blocks whose instant is uncommitted or inflight
-///    (C-INFLIGHT-DELTA). Applied only when `completion_gate` is `Some` — callers pass it for
+/// 3. Completed/inflight → skip data/delete blocks whose instant is uncommitted or inflight.
+///    Applied only when `completion_gate` is `Some` — callers pass it for
 ///    table version < 8 and leave it `None` for v8+ (and when no timeline is available), which
 ///    preserves the prior behavior of admitting such blocks.
 /// 4. Instant range → skip if not in range
@@ -168,7 +165,7 @@ pub fn forward_scan_pass1(
     );
 
     // The completion gate was supplied (table version < 8 snapshot) but carries no positive
-    // completion info — its inputs were not populated across the FFI boundary. Rather than
+    // completion info — its inputs were not populated by the caller. Rather than
     // silently degrade to admit-all (Gate 3 becomes a no-op, so a straddling uncommitted delta
     // could be merged), warn once so the mis-wire is diagnosable. Behavior is unchanged (still
     // fail-open); this only makes the condition visible.
@@ -212,7 +209,7 @@ pub fn forward_scan_pass1(
         // when no timeline is available). A data/delete block whose instant is not
         // committed, or is inflight, is skipped -- without this an uncommitted
         // "straddling" instant (time < latest completed, no in-log rollback block)
-        // is wrongly merged (C-INFLIGHT-DELTA). Command (rollback) blocks are never
+        // is wrongly merged. Command (rollback) blocks are never
         // gated here so they can still remove their target instant below.
         if block.block_type != BlockType::Command
             && let Some(gate) = completion_gate
@@ -316,7 +313,7 @@ pub struct Pass2Result {
 /// - Compaction: if block has `COMPACTED_BLOCK_TIMES` header, register mapping
 /// - Deduplication: `instant_times_included` prevents double-enqueue
 ///
-/// ## Invariants (from FS_logFileReadInputs_fileOrderRequestTime.md):
+/// ## Invariants:
 ///
 /// **Invariant 1**: `instant_times_included` and `valid_block_instants` contain
 /// exactly the same instant strings (Set vs List).
@@ -450,9 +447,9 @@ pub struct BaseHoodieLogRecordReader {
     /// and `ReaderParameters` never sets this true.
     #[allow(dead_code)]
     pub allow_inflight_instants: bool,
-    /// Inputs for the Gate-3 completed/inflight check (C-INFLIGHT-DELTA). `Some` only for
+    /// Inputs for the Gate-3 completed/inflight check. `Some` only for
     /// table version < 8 (v1 timeline layout); `None` for v8+ and when no timeline is available,
-    /// in which case Gate 3 is a no-op. Populated by the builder / FFI wiring from the active
+    /// in which case Gate 3 is a no-op. Populated by the builder from the active
     /// timeline (completed + inflight instant sets + the first active instant).
     pub completion_gate_inputs: Option<CompletionGateInputs>,
 
@@ -492,9 +489,7 @@ impl BaseHoodieLogRecordReader {
 
         let timezone = self.reader_context.timezone();
 
-        // Read all blocks as metadata-only (no content decoding).
-        // Mirrors Java's Pass 1 where content bytes are skipped via seek().
-        // Content is loaded lazily via inflate() during Pass 3.
+        // Collect every block from every log file for the Pass-1 gate sweep.
         let mut all_blocks: Vec<LogBlock> = Vec::new();
         let hudi_configs = Arc::new(crate::config::HudiConfigs::new(
             self.reader_context.table_config.clone(),
@@ -503,14 +498,14 @@ impl BaseHoodieLogRecordReader {
             InstantRange::new(self.reader_context.timezone(), None, None, false, true);
         profile_once!(self.log_block_read_ms, {
             for path in &self.log_file_paths.clone() {
-                // A5 / R5: stream the log file in bounded windows for the Pass-1
-                // header sweep instead of buffering the whole file. Each block
-                // gets a ranged fetcher so Pass-3 inflate reads only its content.
-                // Upstream sweeps block headers in bounded windows and inflates
-                // each block's content later. This crate's log file reader is
-                // whole-file, so the blocks come back with their content already
-                // read — same block set, more memory, and no more than the
-                // existing read path already uses. The range is left unbounded so
+                // The sweep reads each log file whole, so blocks arrive with
+                // their content already read — same block set as a bounded
+                // sweep, more memory, but no more than the existing read path
+                // already uses. The bounded-window streaming tier
+                // (`LogFileReader::new_streaming` +
+                // `read_all_blocks_metadata_only`) walks headers only and lets
+                // each admitted block fetch its content in Pass 3; it is not
+                // wired here yet. The range is left unbounded so
                 // the gates below decide what is admitted, rather than filtering
                 // twice with different rules.
                 // A log record can update a row, so a predicate may only be
@@ -860,7 +855,7 @@ mod tests {
         assert_eq!(result.ordered_instants_list, vec!["20250101000000000"]);
     }
 
-    /// C-INFLIGHT-DELTA fix (table version < 8): an UNCOMMITTED "straddling" instant -- one whose
+    /// Table version < 8: an UNCOMMITTED "straddling" instant -- one whose
     /// time is BELOW the latest completed instant (the high-watermark) and which has NO in-log
     /// rollback command block (a pending/failed write, or a concurrent writer's inflight commit) --
     /// must be EXCLUDED (not merged) once the completed/inflight sets are supplied.
@@ -955,7 +950,7 @@ mod tests {
         );
     }
 
-    /// Focused `admits()` audit (defect-3 requirement (a)): given a
+    /// Focused `admits()` audit: given a
     /// correctly-populated completed set, a committed instant below the
     /// high-watermark is admitted while a separate uncommitted straddling instant
     /// is excluded. This is the unit-level counterpart of the Pass-1 integration
@@ -989,10 +984,10 @@ mod tests {
         );
     }
 
-    /// Defect-3 requirement (b): an empty completed set with no archived boundary
+    /// An empty completed set with no archived boundary
     /// carries no positive completion information, so the gate is a no-op and
     /// admits every instant — it must NOT exclude everything (which would drop all
-    /// committed deltas and return base-only data, the C-INFLIGHT silent-wrong).
+    /// committed deltas and silently return base-only data).
     #[test]
     fn test_completion_gate_empty_completed_set_admits_all() {
         let gate_inputs = CompletionGateInputs::default();
@@ -1295,7 +1290,7 @@ mod tests {
         assert_eq!(b3.block_type, BlockType::Delete); // C was second
     }
 
-    /// Concrete trace from howLogBlocksAreFiletered.md:
+    /// Concrete rollback + multi-block trace:
     ///
     /// Given: log files with B1(i=20250101), B2(i=20250102), B3(i=20250102),
     ///        B4(i=20250103), R1(rollback target=20250102)
@@ -1329,7 +1324,7 @@ mod tests {
         assert!(pass2.current_instant_log_blocks.is_empty());
     }
 
-    /// From FS_logFileReadInputs_fileOrderRequestTime.md: 5-block example.
+    /// 5-block example across three instants.
     ///
     /// Given: t1→[A,B], t2→[C], t3→[D,E]
     /// When:  Pass 2 reverse + pop_back drain
@@ -1380,11 +1375,10 @@ mod tests {
     // Commit-Time Ordering: Full chain from log file order → deque →
     // processNextDataRecord → running map → correct final state
     //
-    // From FS_logFileReadInputs_fileOrderRequestTime.md:
-    //   "The double-reversal (reverse iteration of instants + addLast
-    //    in the deque + pollLast to consume) produces oldest-first
-    //    processing. The last writer to records.put(key, ...) is
-    //    always the newest deltaCommitTime."
+    // The double-reversal (reverse iteration of instants + addLast
+    // in the deque + pollLast to consume) produces oldest-first
+    // processing. The last writer to records.put(key, ...) is
+    // always the newest deltaCommitTime.
     // =====================================================================
 
     use crate::config::table::HudiTableConfig;
@@ -1475,7 +1469,7 @@ mod tests {
     /// Then:  pop_back order: t1 → t2 → t3 (oldest first)
     ///        After processing: records["K"] = (counter=3, ts=30) (newest wins)
     ///
-    /// This validates the full chain from FS_logFileReadInputs_fileOrderRequestTime.md:
+    /// This validates the full chain:
     ///   deltaMerge(t1_record, null)        → records["K"] = t1_record
     ///   deltaMerge(t2_record, t1_record)   → records["K"] = t2_record
     ///   deltaMerge(t3_record, t2_record)   → records["K"] = t3_record (newest wins)
@@ -1543,9 +1537,9 @@ mod tests {
     ///        Then t2: blockC processed last
     ///        Final: records["K"] = v3 (t2, newest instant)
     ///
-    /// From the reference: "Collections.reverse + addLast + pollLast pattern is
+    /// The Collections.reverse + addLast + pollLast pattern is
     /// effectively a double-reversal that restores original file-read order within
-    /// each instant."
+    /// each instant.
     #[test]
     fn test_commit_time_within_instant_file_read_order() {
         let blocks = vec![
@@ -1721,11 +1715,8 @@ mod tests {
         assert_eq!(counters.value(0), 2);
     }
 
-    /// C-INFLIGHT-DELTA, value-level end-to-end: proves hudi-rs does NOT drop a COMMITTED
-    /// straddling delta once it is actually fed the correct completed/inflight sets and the
-    /// committed log block. This is the faithful standalone reproduction of the
-    /// `TestMORSnapshotExcludesUncommitted#snapshotExcludesStraddlingUncommittedDelta` scenario,
-    /// isolated to hudi-rs (no gluten, no sweep):
+    /// Value-level end-to-end: a COMMITTED straddling delta is NOT dropped once the reader
+    /// is fed the correct completed/inflight sets and the committed log block:
     ///
     ///   base file (t0, committed):        id=1, age=1000
     ///   log block t1 (INFLIGHT, straddling below the watermark): id=2, age=9999
@@ -1733,15 +1724,8 @@ mod tests {
     ///   gate: completed={t0, t2}, inflight={t1}
     ///
     /// Correct snapshot semantics: {(1, 1500)} -- t2's committed delta overrides the base for
-    /// id=1, and id=2 (from the inflight t1 delta) is excluded.
-    ///
-    /// This test PASSES on current hudi-rs code, which localizes the sweep failure: given correct
-    /// inputs (the committed t2 log block actually reaching the reader), hudi-rs is correct, so the
-    /// committed delta being dropped in the sweep is an INPUT problem -- the base-only file slice
-    /// that reaches the reader -- NOT a Gate-3 over-exclusion. (For the specific v6 base-merge
-    /// layout in that test, the hudi-internal FileSystemView assigns t2's committed log to the
-    /// uncommitted t1 base-instant slice and drops the whole slice, so the log never arrives; both
-    /// the JVM reader and hudi-rs then read base-only.)
+    /// id=1, and id=2 (from the inflight t1 delta) is excluded. This pins Gate 3 to excluding
+    /// only the inflight delta, never the committed one straddling it.
     #[test]
     fn test_c_inflight_committed_straddling_delta_applied_value_level() {
         // File-read order: t1 (older) then t2 (newer).

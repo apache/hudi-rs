@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors Java's `Option<UnaryOperator<T>> outputConverter` field
 //! on `HoodieFileGroupReader`.
 //!
@@ -56,7 +53,7 @@ pub trait OutputConverter: Send + Sync + std::fmt::Debug {
 /// struct has fewer (or reordered) subfields than the source's.
 ///
 /// Without nested narrowing, downstream consumers that expect a pruned struct
-/// (e.g. Velox's `RowVector` ctor type check at `ComplexVector.h:62`) reject
+/// (a strict engine-side type check on the arrow batch) reject
 /// the record because the child's type doesn't match the declared parent
 /// schema.
 ///

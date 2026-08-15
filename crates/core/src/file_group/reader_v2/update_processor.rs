@@ -22,18 +22,15 @@
 //! Strategy interface for processing record updates during the
 //! base-file-vs-log merge phase. The default implementation passes through the
 //! merged record and increments the read-stats counters (inserts / updates /
-//! deletes), mirroring gold's `StandardUpdateProcessor`.
+//! deletes), mirroring Java's `StandardUpdateProcessor`.
 //!
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its items
-//! are unreachable from the crate's call graph until the reader wires in.
-
 use super::buffered_record::BufferedRecord;
 use crate::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-merge counts of insert / update / delete operations.
 ///
-/// Mirrors the `numInserts` / `numUpdates` / `numDeletes` that gold's
+/// Mirrors the `numInserts` / `numUpdates` / `numDeletes` that Java's
 /// `StandardUpdateProcessor` increments on `HoodieReadStats`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UpdateStats {
@@ -53,7 +50,7 @@ pub trait UpdateProcessor: Send + Sync + std::fmt::Debug {
     ///
     /// `previous_record` is the pre-merge base record when this record came
     /// from a base+log merge (the update path), and `None` when it came from a
-    /// log-only record (the insert path) — matching gold's
+    /// log-only record (the insert path) — matching Java's
     /// `processUpdate(recordKey, previousRecord, mergedRecord, isDelete)`.
     ///
     /// Returns the record to emit, or `None` to skip.
@@ -67,7 +64,7 @@ pub trait UpdateProcessor: Send + Sync + std::fmt::Debug {
 
     /// Snapshot the accumulated insert / update / delete counts.
     ///
-    /// Mirrors the counters gold's `StandardUpdateProcessor` writes onto
+    /// Mirrors the counters Java's `StandardUpdateProcessor` writes onto
     /// `HoodieReadStats` (`incrementNumInserts/Updates/Deletes`). The reader
     /// drains these into its `HoodieReadStats` after the merge completes.
     fn read_stats_counts(&self) -> UpdateStats {
@@ -139,7 +136,7 @@ impl UpdateProcessor for StandardUpdateProcessor {
 ///
 /// `emit_deletes` is always false in current execution — `emit_delete=true` is
 /// rejected at buffer/loader.rs before this is reached; the parameter exists for
-/// gold signature parity. The standard processor always drops deletes from the
+/// Java signature parity. The standard processor always drops deletes from the
 /// output, so the `true` branch is not yet implemented and asserted against
 /// rather than silently ignored: a caller that reached here asking for deletes
 /// would otherwise get them dropped and no indication why.

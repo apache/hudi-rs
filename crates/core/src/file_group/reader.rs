@@ -230,8 +230,8 @@ impl FileGroupReader {
     ///
     /// Only a caller reading from paths with no timeline at all — the cxx bridge —
     /// falls back to the base file. Reading its footer costs one request; the
-    /// engine reads it again when it opens the file, and collapsing the two is
-    /// worth doing but is not this change.
+    /// engine reads it again when it opens the file, and collapsing the two
+    /// into one request is not yet done.
     async fn resolved_data_schema(&self, base_file_path: &str) -> Result<arrow_schema::SchemaRef> {
         if let Some(schema) = &self.data_schema_override {
             return Ok(schema.clone());
@@ -288,10 +288,10 @@ impl FileGroupReader {
         //
         // Nullability counts, not just the type: Hudi's meta fields are
         // non-nullable in the table schema and nullable in the file, and the
-        // eager path returns the table's view of them. Comparing types alone left
-        // the streamed batches labelled the file's way, so the two paths still
-        // disagreed — on a field a `RecordBatchReader` consumer is entitled to
-        // trust, since it is what the scan declared up front. Metadata is
+        // eager path returns the table's view of them. Comparing types alone
+        // would leave the streamed batches labelled the file's way, so the two
+        // paths would disagree — on a field a `RecordBatchReader` consumer is
+        // entitled to trust, since it is what the scan declared up front. Metadata is
         // deliberately not compared: parquet files routinely carry writer
         // metadata the table schema does not, and reconciling over that would
         // cost a pass on every read while changing no value.
@@ -432,11 +432,11 @@ impl FileGroupReader {
     /// indistinguishable from a reader that is never used.
     ///
     /// The exception is a `CUSTOM` record merge mode with a merge to perform,
-    /// which errors. That one *does* turn a working read into a failing one:
+    /// which errors. That one *does* refuse a read version 1 would serve:
     /// version 2 is the default, so a merge-on-read table declaring `CUSTOM`
-    /// that reads today stops reading. It is deliberate — falling back would
+    /// errors instead of reading. It is deliberate — falling back would
     /// merge with version 1's own derivation, which drops deletes, and wrong
-    /// rows are worse than a refusal — but it is a behaviour change, and the
+    /// rows are worse than a refusal — and the
     /// error names the way back.
     ///
     /// Refusals are the exception, not the fallthrough: version 2 is the reader
@@ -2024,9 +2024,8 @@ mod tests {
     /// The fixture is chosen so removing that filter is visible: the compacted
     /// base holds `c` and `d` at the same pre-window commit, and only `c` is
     /// updated by an in-window log record. `d` therefore survives the merge
-    /// unmatched, carrying its out-of-window time — an earlier version of this
-    /// test used a slice whose every stale row was replaced by the merge
-    /// anyway, so it passed with the filter deleted.
+    /// unmatched, carrying its out-of-window time — a slice whose every stale
+    /// row is replaced by the merge would pass even with the filter deleted.
     #[tokio::test]
     async fn test_read_file_slice_from_paths_incremental_excludes_out_of_window_rows() -> Result<()>
     {
@@ -2207,8 +2206,7 @@ mod file_group_reader_version_tests {
     /// The default returns what version 1 returns, cell for cell.
     ///
     /// Version 2 serves this read, so the two are different code paths and the
-    /// comparison is a real differential one — not the tautology it was while
-    /// every capability fell back to version 1.
+    /// comparison is a real differential one.
     #[tokio::test]
     async fn test_read_file_slice_from_paths_default_version_matches_version_one() -> Result<()> {
         let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();

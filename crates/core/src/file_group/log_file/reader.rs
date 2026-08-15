@@ -897,8 +897,7 @@ mod tests {
     ///
     /// The fixture is a valid multi-block file, so the scan lands on the *next*
     /// block's magic rather than EOF; what is pinned is that either answer
-    /// stays inside the file. An earlier name claimed EOF specifically, which
-    /// this fixture cannot produce.
+    /// stays inside the file.
     #[tokio::test]
     async fn test_scan_for_next_block_offset_stays_within_file_bounds() -> Result<()> {
         let (dir, file_name) = get_valid_log_avro_data();

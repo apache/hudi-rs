@@ -375,9 +375,9 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         InferredMode::CommitTime => Ok(MergeMode::CommitTimeOrdering),
         InferredMode::EventTime => Ok(MergeMode::EventTimeOrdering),
         // A table with its own merger cannot be reproduced by merging on key and
-        // ordering value alone. Engines that know better — gluten remaps a
+        // ordering value alone. An engine that knows better (one that remaps a
         // Debezium payload to event-time ordering, having injected the delete
-        // marker its merge needs — say so by setting the merge mode outright,
+        // marker its merge needs) says so by setting the merge mode outright,
         // which is handled above. Inferring the same thing here would read such
         // a table without those configs and drop its deletes silently.
         InferredMode::Custom => Err(CoreError::Unsupported(

@@ -17,15 +17,12 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Utility functions to bridge Arrow columnar data with per-record operations.
 //!
 //! Record-level operations (key extraction, ordering value extraction, batch-to-record
-//! conversion) have moved to [`RecordContext`](crate::file_group::reader_v2::record_context::RecordContext).
+//! conversion) live in [`RecordContext`](crate::file_group::reader_v2::record_context::RecordContext).
 //!
-//! This module retains Arrow batch-level utilities that don't need RecordContext:
+//! This module holds Arrow batch-level utilities that don't need RecordContext:
 //! - `slice_row` — zero-copy single-row extraction
 //! - `records_to_batch` — reassemble BufferedRecords into a RecordBatch
 //! - `reconcile_batch_to_schema` — handle Avro/Parquet schema differences
@@ -46,12 +43,12 @@ pub fn slice_row(batch: &RecordBatch, row_index: usize) -> RecordBatch {
 }
 
 /// Reassemble a collection of BufferedRecords back into a single RecordBatch
-/// via the Arrow `interleave` kernel (A2 drain path).
+/// via the Arrow `interleave` kernel (the drain path).
 ///
 /// Each surviving (non-delete) record addresses one row of a source batch
 /// (`BatchRef`) or holds its own single-row batch (`Owned`). Rather than
-/// slicing every row to a 1-row batch and concatenating (the old per-row path,
-/// which for binary payloads paid an IPC decode per row), this groups the
+/// slicing every row to a 1-row batch and concatenating (which for binary
+/// payloads would pay an IPC decode per row), this groups the
 /// records by distinct source batch, reconciles each distinct batch to the
 /// target `schema` ONCE, and emits the output with a single
 /// [`arrow::compute::interleave_record_batch`] call over `(slot, row)` indices.
@@ -122,9 +119,9 @@ fn reconcile_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<Record
 
 /// Reconcile a RecordBatch to a target schema (name-metadata only).
 ///
-/// After the schema-on-write evolution work (design D5), every batch reaching the
+/// Schema evolution runs upstream, so every batch reaching the
 /// merge is already REQUIRED-SHAPED: it has exactly the target's columns with the
-/// target's types. The only remaining legitimate job of this function is field-NAME
+/// target's types. The only remaining job of this function is field-NAME
 /// metadata reconciliation between Avro-derived schemas (from log files) and
 /// Parquet-derived schemas (from base files). For example:
 /// - List child field: arrow-avro uses "item", Parquet uses "element"
@@ -242,8 +239,8 @@ fn rebuild_array_data_to_type(
         return Ok(data);
     }
 
-    // Snapshot children BEFORE consuming `data` into the builder (the builder
-    // does not expose a mutable child accessor on this arrow fork).
+    // Snapshot children BEFORE consuming `data` into the builder (the
+    // `ArrayData` builder does not expose a mutable child accessor).
     let children = data.child_data().to_vec();
 
     // Reconcile, not evolution: child counts must match exactly. A mismatch
@@ -281,11 +278,11 @@ mod tests {
     /// (TestMORFileSliceLayoutsExtendedTypes "2. NULL elements in containers"):
     ///
     /// The merge target schema is derived from the table's Avro schema, where
-    /// array items are the nullable union `["null","int"]`. The former vendored
-    /// Avro→Arrow converter used to force list elements non-nullable
-    /// (`List(non-null Int32, field: 'array')`), so a log record holding
-    /// `[1, NULL, 3]` could not be reconciled to the target and
-    /// `concat_batches` failed with "It is not possible to concatenate arrays
+    /// array items are the nullable union `["null","int"]`. An Avro→Arrow
+    /// converter that forces list elements non-nullable
+    /// (`List(non-null Int32, field: 'array')`) would leave a log record holding
+    /// `[1, NULL, 3]` unable to reconcile to the target, and
+    /// `concat_batches` would fail with "It is not possible to concatenate arrays
     /// of different data types (List(Int32), List(non-null Int32, field:
     /// 'array'))". The arrow-avro-based derivation keeps elements nullable,
     /// and the merge must preserve the NULL element.
@@ -301,8 +298,8 @@ mod tests {
                 {"name": "arr", "type": ["null", {"type": "array", "items": ["null", "int"]}], "default": null}
             ]
         }"#;
-        // Upstream routes this through arrow-avro; here it goes through the
-        // crate's own Avro-to-Arrow conversion, which is the same shape.
+        // Production routes this through arrow-avro; the test goes through the
+        // crate's own Avro-to-Arrow conversion, which yields the same shape.
         let avro = apache_avro::Schema::parse_str(avro_json).unwrap();
         let target: SchemaRef = Arc::new(crate::avro_to_arrow::to_arrow_schema(&avro).unwrap());
 
@@ -379,9 +376,8 @@ mod tests {
         assert_eq!(row1.value(1), 20);
     }
 
-    /// After the evolution work, every batch reaching records_to_batch is
-    /// required-shaped. A genuinely missing column is an upstream bug → loud error,
-    /// not panic (was: .expect panic).
+    /// Every batch reaching records_to_batch is required-shaped, so a genuinely
+    /// missing column is an upstream bug → loud error, not a panic.
     #[test]
     fn test_records_to_batch_missing_column_errors_loudly() {
         let log_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
@@ -402,12 +398,12 @@ mod tests {
         );
     }
 
-    /// Repro for the reconcile regression (commit 45bdceb): a Map column decoded
+    /// Repro for the nested-map reconcile regression: a Map column decoded
     /// by arrow-avro carries (a) the entries field named "entries" and (b)
     /// avro.name/avro.namespace metadata on the entries struct field, while the
     /// parquet-derived target uses "key_value" and no metadata. Both are genuine
-    /// name-metadata differences, but they live in CHILD field definitions, so the
-    /// single-level `ArrayData::into_builder().data_type(..).build()` rejected them
+    /// name-metadata differences, but they live in CHILD field definitions, so a
+    /// single-level `ArrayData::into_builder().data_type(..).build()` rejects them
     /// with "Child type mismatch ... Expected Struct(..) but child data had
     /// Struct(.., metadata: {..})". The recursive rebuild must reconcile them and
     /// the data must round-trip.
@@ -556,7 +552,7 @@ mod tests {
     }
 
     /// Extract `(key, value)` tuples from a make_test_batch-shaped batch, in row
-    /// order, for full-data assertions (guide §5).
+    /// order, for full-data assertions.
     fn extract_kv(batch: &RecordBatch) -> Vec<(String, i64)> {
         let keys = batch
             .column(0)
@@ -601,7 +597,7 @@ mod tests {
         assert_eq!(result.num_rows(), 0);
     }
 
-    /// A2 drain: interleave over BatchRefs that point at NON-contiguous rows of a
+    /// Drain: interleave over BatchRefs that point at NON-contiguous rows of a
     /// shared source batch produces exactly those rows in the order given (not
     /// the source order) — proving the (slot,row) index path, not a naive slice.
     #[test]
@@ -626,7 +622,7 @@ mod tests {
         );
     }
 
-    /// A2 drain: mixed BatchRef + Owned + Delete payloads — deletes drop out, the
+    /// Drain: mixed BatchRef + Owned + Delete payloads — deletes drop out, the
     /// rest interleave in order with exact data, across two distinct source Arcs.
     #[test]
     fn test_records_to_batch_mixed_payloads_and_deletes() {
@@ -651,7 +647,7 @@ mod tests {
         );
     }
 
-    /// A2 drain: an all-deletes record set produces an empty batch with the
+    /// Drain: an all-deletes record set produces an empty batch with the
     /// target schema (no interleave call, no panic).
     #[test]
     fn test_records_to_batch_all_deletes_is_empty() {
@@ -668,12 +664,12 @@ mod tests {
     /// Regression test: reconciling a wide column down to a narrow target must fail,
     /// not truncate.
     ///
-    /// The leaf arm of `rebuild_array_data_to_type` used to re-tag any leaf's
-    /// `DataType`, and `ArrayData` validation only rejects a buffer too SMALL
-    /// for its type — so an i64 buffer tagged i32 passed and each value came
-    /// back as its low word. A caller that resolved a stale target schema (a
-    /// base file written before the column was widened) therefore read
-    /// 5000000000 as 705032704 with no error at all.
+    /// If the leaf arm of `rebuild_array_data_to_type` re-tagged any leaf's
+    /// `DataType`, `ArrayData` validation would not object — it only rejects a
+    /// buffer too SMALL for its type — so an i64 buffer tagged i32 would pass
+    /// and each value would come back as its low word. A caller that resolved a
+    /// stale target schema (a base file written before the column was widened)
+    /// would then read 5000000000 as 705032704 with no error at all.
     ///
     /// Narrowing is not a promotion and never should have reached this path;
     /// the point of the test is that when it does, it is loud.

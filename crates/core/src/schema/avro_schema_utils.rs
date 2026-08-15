@@ -17,8 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
 #![allow(dead_code)]
 
 //! Mirrors Java's `org.apache.hudi.avro.AvroSchemaUtils`.
@@ -83,7 +81,7 @@ fn types_equivalent(a: &DataType, b: &DataType) -> bool {
 /// Append top-level field definitions (copied verbatim from `source_json`) to
 /// `base_json` for every name in `field_names` not already present in base.
 ///
-/// Mirrors gold `AvroSchemaUtils.appendFieldsToSchemaDedupNested` for the
+/// Mirrors Java's `AvroSchemaUtils.appendFieldsToSchemaDedupNested` for the
 /// top-level mandatory-merge-field case used by `generateRequiredSchema`.
 pub fn append_mandatory_fields_avro_json(
     base_json: &str,
@@ -109,7 +107,7 @@ pub fn append_mandatory_fields_avro_json(
         if let Some(def) = source_fields.iter().find(|f| f["name"] == *name) {
             base_fields.push(def.clone());
         }
-        // Absent from source: skip — gold throws only for fields it already
+        // Absent from source: skip — Java throws only for fields it already
         // resolved from tableSchema; our callers pass table-derived names.
     }
     serde_json::to_string(&base)

@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Mirrors `org.apache.hudi.common.table.read.buffer.FileGroupRecordBuffer`.
 //!
 //! Common state for all record buffer variants. In Java this is an abstract class
@@ -46,22 +43,21 @@ use std::vec::IntoIter;
 ///
 /// ## Key fields (matching Java):
 /// - `records` — Java's `ExternalSpillableMap<Serializable, BufferedRecord<T>>`
-///   (in Rust: [`SpillableRecordMap`] — size-tracked, RocksDB-spillable, A1)
+///   (in Rust: [`SpillableRecordMap`] — size-tracked, RocksDB-spillable)
 /// - `buffered_record_merger` — for delta merge (log-vs-log) and final merge (base-vs-log)
 /// - `update_processor` — strategy for processing updates during merge iteration
 /// - `base_file_source` / `current_base_batch` / `base_row_idx` — lazy
-///   counterpart of Java's `baseFileIterator`. The lazy source replaced the
-///   eagerly-loaded `Vec<RecordBatch>` with a `RecordBatchReader` so the
-///   merge loop pulls one parquet row-group at a time. For tests and the
-///   `read()` back-compat path, the source is just a `RecordBatchIterator`
-///   wrapping a pre-built Vec; for the FFI streaming path, it is a
-///   `ParquetSyncReader`. The current batch is interned into an `Arc` so
-///   base records become zero-copy `BatchRef`s into the streamed batch.
+///   counterpart of Java's `baseFileIterator`: a `RecordBatchReader` from
+///   which the merge loop pulls one parquet row-group at a time. For tests
+///   and the `read()` back-compat path, the source is just a
+///   `RecordBatchIterator` wrapping a pre-built Vec; for the streaming
+///   `open()` path, it is a `ParquetSyncReader`. The current batch is
+///   interned into an `Arc` so base records become zero-copy `BatchRef`s
+///   into the streamed batch.
 /// - `next_record` — Java's `nextRecord` (the lookahead for has_next/next pattern)
 pub struct FileGroupRecordBuffer {
     /// The per-key records map. Mirrors Java's `ExternalSpillableMap`: keeps
     /// entries in memory until the merge budget is hit, then spills to RocksDB.
-    /// Replaces the previously unbounded in-memory `HashMap`.
     pub records: SpillableRecordMap,
 
     /// The reader schema.
@@ -79,15 +75,15 @@ pub struct FileGroupRecordBuffer {
     /// Processor for update records during merge iteration.
     pub update_processor: Box<dyn UpdateProcessor>,
 
-    // ── Base file iteration state (lazy source + A2 batch-ref) ──
+    // ── Base file iteration state (lazy source + batch-ref) ──
     /// Lazy base file source set by [`HoodieFileGroupRecordBuffer::set_base_file_source`].
     /// `None` until log scan + base open has run, or for log-only file groups.
     ///
-    /// A3 — the base file is pulled one parquet row-group at a
-    /// time from this `RecordBatchReader` instead of being eagerly collected
-    /// and concatenated into a `Vec<RecordBatch>`. For tests and the `read()`
-    /// back-compat path the source is a `RecordBatchIterator` over a pre-built
-    /// vec; for the FFI streaming path (`open()`) it is a `ParquetSyncReader`.
+    /// The base file is pulled one parquet row-group at a time from this
+    /// `RecordBatchReader` rather than eagerly collected and concatenated
+    /// into a `Vec<RecordBatch>`. For tests and the `read()` back-compat
+    /// path the source is a `RecordBatchIterator` over a pre-built vec; for
+    /// the streaming `open()` path it is a `ParquetSyncReader`.
     pub base_file_source: Option<Box<dyn RecordBatchReader + Send>>,
 
     /// The current base file batch being iterated, interned into a single
@@ -95,7 +91,7 @@ pub struct FileGroupRecordBuffer {
     /// so base records can become zero-copy
     /// [`RecordPayload::BatchRef`](crate::file_group::reader_v2::buffered_record::RecordPayload::BatchRef)
     /// views into the *streamed* batch rather than per-row clones during
-    /// the base-vs-log merge. The A2 pinning valve still applies: a streamed
+    /// the base-vs-log merge. The batch-pinning valve still applies: a streamed
     /// batch stays alive only while a surviving `BatchRef` points into it.
     pub current_base_batch: Option<Arc<RecordBatch>>,
 
@@ -217,8 +213,8 @@ impl FileGroupRecordBuffer {
     /// Iterate remaining log records not consumed by base file iteration.
     ///
     /// Mirrors Java's `hasNextLogRecord()`. A `process_update` failure is
-    /// propagated as `Err` (review A1): swallowing it into `Ok(false)` would
-    /// silently truncate the merged output, mirroring gold's checked-exception
+    /// propagated as `Err`: swallowing it into `Ok(false)` would
+    /// silently truncate the merged output, mirroring Java's checked-exception
     /// behavior on the `doHasNext` → `hasNext` chain.
     pub fn has_next_log_record(&mut self) -> Result<bool> {
         if self.log_record_iter.is_none() {
@@ -250,9 +246,9 @@ impl FileGroupRecordBuffer {
     /// advance the position. Pulls a fresh row-group from `base_file_source`
     /// whenever `current_base_batch` is exhausted (or absent on first call).
     ///
-    /// A3 — was previously an indexed walk over an eager
-    /// `Vec<RecordBatch>`; now lazy, pulling one parquet row-group at a time
-    /// from the streaming source. Each pulled batch is interned into a single
+    /// Lazy: pulls one parquet row-group at a time from the streaming source
+    /// rather than walking an eagerly collected `Vec<RecordBatch>`. Each
+    /// pulled batch is interned into a single
     /// `Arc` so the returned `(Arc<RecordBatch>, row_idx)` lets the caller
     /// build a zero-copy
     /// [`RecordPayload::BatchRef`](crate::file_group::reader_v2::buffered_record::RecordPayload::BatchRef)
@@ -289,10 +285,10 @@ impl FileGroupRecordBuffer {
                     return Ok(None);
                 }
                 Some(Ok(batch)) => {
-                    // A2: intern the streamed row-group into one `Arc` (the
+                    // Intern the streamed row-group into one `Arc` (the
                     // single mint point per base batch). BatchRefs built from
                     // it share this `Arc`; it stays alive only while a
-                    // surviving ref pins it — the A2 compaction valve applies.
+                    // surviving ref pins it — the compaction valve applies.
                     self.current_base_batch = Some(Arc::new(batch));
                     self.base_row_idx = 0;
                     // Loop again to slice the first row of the new batch.
@@ -303,8 +299,8 @@ impl FileGroupRecordBuffer {
                     // the remaining base rows and truncate the read (silent data
                     // loss). Release the source and propagate the error loudly so
                     // the caller (`do_has_next`, `Result`-returning) surfaces it.
-                    // This brings the eager per-row path to parity with the
-                    // vectorized `next_merged_base_batch`, which already errors.
+                    // Matches the vectorized `next_merged_base_batch`, which
+                    // errors the same way.
                     self.current_base_batch = None;
                     self.base_file_source = None;
                     return Err(crate::error::CoreError::ReadFileSliceError(format!(
@@ -327,7 +323,7 @@ mod tests {
     use std::sync::Arc;
 
     /// An UpdateProcessor that always errors. Used to prove `has_next_log_record`
-    /// propagates `process_update` failures instead of swallowing them (review A1).
+    /// propagates `process_update` failures instead of swallowing them.
     #[derive(Debug, Default)]
     struct ErroringUpdateProcessor;
 
@@ -367,7 +363,7 @@ mod tests {
         )
     }
 
-    /// A1: `has_next_log_record` must surface `process_update` errors rather than
+    /// `has_next_log_record` must surface `process_update` errors rather than
     /// returning `Ok(false)` (which silently truncates the output).
     #[test]
     fn test_has_next_log_record_propagates_update_processor_error() {
@@ -384,7 +380,7 @@ mod tests {
         );
     }
 
-    /// A1: with no erroring processor and an empty map, `has_next_log_record`
+    /// With no erroring processor and an empty map, `has_next_log_record`
     /// returns `Ok(false)` cleanly (no false-positive error path).
     #[test]
     fn test_has_next_log_record_empty_map_is_ok_false() {
@@ -399,7 +395,7 @@ mod tests {
         assert!(matches!(buffer.has_next_log_record(), Ok(false)));
     }
 
-    // ── A3: streamed base source + A2 batch-ref interaction ──────
+    // ── Streamed base source + batch-ref interaction ──────
 
     fn id_batch(vals: &[i64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
@@ -419,9 +415,9 @@ mod tests {
         buffer
     }
 
-    /// A3: `next_base_row` lazily pulls a multi-row-group base source one
+    /// `next_base_row` lazily pulls a multi-row-group base source one
     /// row-group at a time, returning a `(Arc<RecordBatch>, row_idx)` into the
-    /// *streamed* batch (A2 zero-copy). Every row of a given row-group shares
+    /// *streamed* batch (zero-copy). Every row of a given row-group shares
     /// ONE `Arc` (the per-batch intern point → stable `Arc::as_ptr` for
     /// compaction grouping), and rows from a DIFFERENT row-group carry a
     /// DIFFERENT `Arc` — proving the source is decoded incrementally, not
@@ -491,7 +487,7 @@ mod tests {
         );
     }
 
-    /// A3: a source error mid-stream is PROPAGATED, not swallowed. The rows
+    /// A source error mid-stream is PROPAGATED, not swallowed. The rows
     /// pulled before the error are yielded, then the call that hits the error
     /// returns `Err` (rather than `Ok(None)`, which would silently truncate the
     /// base file and drop rows — data loss). The source is released so a later

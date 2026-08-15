@@ -17,9 +17,6 @@
  * under the License.
  */
 
-//! Ported from the merge-on-read reader. Nothing consumes it yet, so its
-//! items are unreachable from the crate's call graph until the reader wires in.
-
 //! Arrow IPC serialization for spilled records.
 //!
 //! These are the primitives the spill path uses to move a `RecordBatch` to disk
