@@ -149,11 +149,15 @@ pub struct ReaderContext {
     /// the FG reader).
     pub mor_pk_safe: bool,
     /// Gate-3 completed/inflight inputs (completed/inflight/archived sets).
-    /// Carried here mirroring [`Self::instant_range`]; `Some` only for table
-    /// version < 8 snapshot reads (set by the FFI bridge when the planner
-    /// enabled the gate), `None` otherwise (v8+/incremental/no-timeline) which
-    /// leaves Gate 3 a no-op, preserving prior behavior. Consumed by the log
-    /// scan builder in `buffer::loader::scan_log_files`.
+    /// Carried here mirroring [`Self::instant_range`]. `Some` for every read
+    /// built from a [`crate::table::Table`], which holds the timeline these
+    /// sets are derived from; `None` only for a caller handed bare paths with
+    /// no timeline (the cxx bridge), where Gate 3 stays a no-op. Consumed by
+    /// the log scan builder in `buffer::loader::scan_log_files`.
+    ///
+    /// Deliberately not scoped to a table version or to snapshot reads: the
+    /// gate only ever EXCLUDES blocks whose instant is pending, which holds for
+    /// incremental reads too, and it cannot admit a block another gate rejected.
     pub completion_gate_inputs: Option<CompletionGateInputs>,
 }
 

@@ -97,8 +97,8 @@ impl<'a> CompletionGate<'a> {
     /// committedness for any instant, so it admits everything (a no-op) rather
     /// than excluding all blocks. Java always builds the gate from a non-empty
     /// active timeline (`filterCompletedInstants()`), so an empty set here means
-    /// the inputs were not populated by the caller (e.g. the FFI bridge forwarded
-    /// an empty list). Excluding on that basis would silently drop EVERY log delta
+    /// the inputs were not populated by the caller — a caller that supplied the
+    /// struct but left the sets empty. Excluding on that basis would silently drop EVERY log delta
     /// — including committed ones — and return base-file-only data (the
     /// C-INFLIGHT silent-wrong: a committed later delta wrongly dropped). Deferring
     /// to the other gates preserves the pre-gate behavior for a mis-wired gate; a
@@ -118,12 +118,12 @@ impl<'a> CompletionGate<'a> {
     /// `completed_instants` set AND no `archived_boundary`. Such a gate cannot establish
     /// committedness for any instant, so [`admits`](Self::admits) degrades to admit-all.
     ///
-    /// When the gate was supplied deliberately (the caller passes `Some` only for a table
-    /// version < 8 snapshot), being unpopulated is a mis-wire signal, not a genuine empty
+    /// When the gate was supplied deliberately (the caller passes `Some` whenever it has a
+    /// timeline to build it from), being unpopulated is a mis-wire signal, not a genuine empty
     /// timeline: Java always builds the gate from a non-empty active timeline
-    /// (`filterCompletedInstants()`), and a v1 snapshot always has >= 1 completed instant.
+    /// (`filterCompletedInstants()`), and a readable table always has >= 1 completed instant.
     /// `forward_scan_pass1` warns once when this holds so a gate whose inputs were dropped
-    /// across the FFI boundary is diagnosable rather than a silent no-op.
+    /// before reaching the scan is diagnosable rather than a silent no-op.
     fn is_unpopulated(&self) -> bool {
         self.completed_instants.is_empty() && self.archived_boundary.is_none()
     }
@@ -536,7 +536,8 @@ impl BaseHoodieLogRecordReader {
         });
 
         // Pass 1: Forward scan with 5 gates. The completed/inflight gate (Gate 3)
-        // is applied only when the timeline sets were supplied (table version < 8).
+        // is applied whenever the caller supplied the timeline sets — every read
+        // built from a `Table`; a caller with no timeline leaves it a no-op.
         let completion_gate = self
             .completion_gate_inputs
             .as_ref()
@@ -855,7 +856,7 @@ mod tests {
         assert_eq!(result.ordered_instants_list, vec!["20250101000000000"]);
     }
 
-    /// Table version < 8: an UNCOMMITTED "straddling" instant -- one whose
+    /// An UNCOMMITTED "straddling" instant -- one whose
     /// time is BELOW the latest completed instant (the high-watermark) and which has NO in-log
     /// rollback command block (a pending/failed write, or a concurrent writer's inflight commit) --
     /// must be EXCLUDED (not merged) once the completed/inflight sets are supplied.
@@ -901,11 +902,11 @@ mod tests {
         );
     }
 
-    /// Without the completion gate (v8+ tables, or no timeline available) Gate 3 is a no-op, so the
-    /// straddling instant is still admitted -- proving the fix is scoped to table version < 8 and is
-    /// purely additive (prior callers pass `None` and see unchanged behavior). v8+ safety is
-    /// enforced elsewhere: per-delta-commit log files are excluded at the completion-time file-slice
-    /// level, so the same block never reaches Pass 1.
+    /// Without the completion gate (a caller with no timeline, i.e. the cxx bridge) Gate 3 is a
+    /// no-op, so the straddling instant is still admitted -- proving the gate is purely additive
+    /// and that such a caller sees unchanged behavior. On v8+ the same block is also excluded
+    /// earlier and independently: per-delta-commit log files are dropped at the completion-time
+    /// file-slice level, so it never reaches Pass 1.
     #[test]
     fn test_pass1_gate3_absent_gate_admits_straddling_instant() {
         let blocks = vec![
@@ -920,6 +921,44 @@ mod tests {
         assert_eq!(
             result.ordered_instants_list,
             vec!["20250101", "20250102", "20250103"]
+        );
+    }
+
+    /// The gate is supplied for every read built from a `Table`, incremental ones included, so it
+    /// has to COMPOSE with Gate 4's window rather than widen it. Two claims are pinned here: a
+    /// pending instant inside the incremental window is still excluded (Gate 3 applies even though
+    /// a range is set), and a committed instant outside the window stays excluded (Gate 3 admitting
+    /// it cannot override Gate 4). Together they show the gate only ever subtracts, which is what
+    /// makes applying it on every read -- not just table version < 8 snapshots -- safe.
+    #[test]
+    fn test_pass1_gate3_and_the_incremental_window_only_ever_subtract() {
+        let blocks = vec![
+            make_data_block("20250101000000000"), // committed, inside the window
+            make_data_block("20250102000000000"), // PENDING, inside the window
+            make_data_block("20250104000000000"), // committed, outside the window
+        ];
+        let range = Some(InstantRange::up_to("20250103000000000", "utc"));
+
+        let gate_inputs = CompletionGateInputs {
+            completed_instants: [
+                "20250101000000000".to_string(),
+                "20250104000000000".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            inflight_instants: ["20250102000000000".to_string()].into_iter().collect(),
+            archived_boundary: None,
+        };
+        let gate = CompletionGate::new(&gate_inputs);
+
+        let result =
+            forward_scan_pass1(blocks, MAX_INSTANT_TIME, &range, "utc", Some(&gate)).unwrap();
+
+        assert_eq!(
+            result.ordered_instants_list,
+            vec!["20250101000000000"],
+            "pending 20250102 excluded by Gate 3 despite being in range; \
+             committed 20250104 excluded by Gate 4 despite Gate 3 admitting it"
         );
     }
 
