@@ -45,13 +45,23 @@ cargo test -p hudi-core --lib --no-default-features
 
 ### Features
 
-`hudi-core` has one default-on feature, `spill-rocksdb`, carrying the merge-on-read merge map's
-on-disk tier. It is separable because `rocksdb` bundles RocksDB and runs `bindgen`, so leaving it
-unconditional puts libclang and a C++ toolchain in front of every consumer — the Python wheel and
-the cxx bridge included — for a tier that only engages when a merge exceeds
-`hoodie.memory.merge.max.size`. A test that needs the disk tier must be
-`#[cfg(feature = "spill-rocksdb")]`; the `--no-default-features` CI leg installs no libclang, so a
-change that reintroduces the native dependency fails to compile there rather than passing quietly.
+`spill-rocksdb` carries the merge-on-read merge map's on-disk tier. It is separable because
+`rocksdb` bundles RocksDB and runs `bindgen`, so leaving it unconditional puts libclang and a C++
+toolchain in front of every consumer, for a tier that only engages when a merge exceeds
+`hoodie.memory.merge.max.size`.
+
+It is **default-on in `hudi-core`, `hudi-datafusion` and `hudi`**, and the latter two forward it
+rather than taking `hudi-core` with its defaults: a consumer can only opt out of a feature its
+direct dependency exposes, and unification through `hudi-datafusion` would otherwise hand the tier
+back. The opt-out is therefore `default-features = false` on `hudi`, and it holds with the
+`datafusion` feature on. **The Python wheel and the cxx bridge do not opt out** — both take `hudi`
+with defaults and build RocksDB. Dropping the feature removes the tier, and a merge past the budget
+then fails with a `CoreError::Unsupported` naming the config rather than spilling, which is why the
+published artifacts keep it.
+
+A test that needs the disk tier must be `#[cfg(feature = "spill-rocksdb")]`; the
+`--no-default-features` CI leg installs no libclang, so a change that reintroduces the native
+dependency fails to compile there rather than passing quietly.
 
 ### Dependencies
 
