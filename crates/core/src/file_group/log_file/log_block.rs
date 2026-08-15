@@ -19,9 +19,11 @@
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
+use crate::storage::reader::LogBlockFetcher;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -275,6 +277,18 @@ impl LogBlockContent {
     }
 }
 
+/// Where a block's content sits, for reading it later.
+///
+/// A scan that only needs headers records this instead of decoding, so a block
+/// the gates then discard costs nothing beyond its header.
+#[derive(Debug, Clone)]
+pub struct LogBlockContentLocation {
+    /// Byte offset where the content starts.
+    pub content_position: u64,
+    /// Length of the content in bytes.
+    pub content_length: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogBlock {
     pub format_version: LogFormatVersion,
@@ -282,10 +296,54 @@ pub struct LogBlock {
     pub header: HashMap<BlockMetadataKey, String>,
     pub content: LogBlockContent,
     pub footer: HashMap<BlockMetadataKey, String>,
+    /// Set when the block was read headers-only; `content` is then `Empty`
+    /// until [`LogBlock::load_content`] runs.
+    ///
+    /// One field rather than two so the pairing is structural: the location and
+    /// the fetcher are only ever meaningful together, and a caller that set one
+    /// without the other used to compile and fail at read time.
+    pub deferred_content: Option<DeferredContent>,
     pub skipped: bool,
 }
 
+/// Where a headers-only block's content sits, and how to read it.
+#[derive(Debug, Clone)]
+pub struct DeferredContent {
+    pub location: LogBlockContentLocation,
+    /// Reads this block's own content range, holding no file bytes.
+    pub fetcher: LogBlockFetcher,
+}
+
 impl LogBlock {
+    /// Fetch and decode the content a headers-only scan skipped past.
+    ///
+    /// Reads only this block's own range, so a scan can walk a file without
+    /// holding it and each admitted block costs its own content and no more.
+    /// A block that already has content is left alone.
+    pub fn load_content(&mut self, decoder: &Decoder) -> Result<()> {
+        if !self.content.is_empty() {
+            return Ok(());
+        }
+        let Some(DeferredContent { location, fetcher }) = self.deferred_content.as_ref() else {
+            return Err(CoreError::LogBlockError(
+                "Cannot load the content of a block that was not read headers-only".to_string(),
+            ));
+        };
+
+        let bytes = fetcher
+            .read_content(location.content_position, location.content_length)
+            .map_err(CoreError::ReadLogFileError)?;
+        let mut reader = std::io::Cursor::new(bytes);
+        self.content = decoder.decode_content(
+            &mut reader,
+            &self.format_version,
+            location.content_length,
+            &self.block_type,
+            &self.header,
+        )?;
+        Ok(())
+    }
+
     /// Create a new log block with the given content.
     pub fn new(
         format_version: LogFormatVersion,
@@ -300,6 +358,7 @@ impl LogBlock {
             header,
             content,
             footer,
+            deferred_content: None,
             skipped: false,
         }
     }
@@ -318,6 +377,7 @@ impl LogBlock {
             header,
             content: LogBlockContent::Empty,
             footer: HashMap::new(),
+            deferred_content: None,
             skipped: true,
         }
     }
@@ -379,6 +439,26 @@ impl LogBlock {
                 )
             })?;
         v.parse::<CommandBlock>()
+    }
+
+    /// The `RECORD_POSITIONS` header value: the positions this block's records
+    /// occupy in the base file, as a base64-encoded Roaring64 bitmap, if the
+    /// writer recorded them.
+    #[must_use]
+    pub fn record_positions_header(&self) -> Option<&str> {
+        self.header
+            .get(&BlockMetadataKey::RecordPositions)
+            .map(String::as_str)
+    }
+
+    /// The `BASE_FILE_INSTANT_TIME_OF_RECORD_POSITIONS` header value: the base
+    /// file instant time this block's record positions were computed against.
+    /// Positions are only usable when it matches the base file being merged.
+    #[must_use]
+    pub fn base_file_instant_time_of_positions(&self) -> Option<&str> {
+        self.header
+            .get(&BlockMetadataKey::BaseFileInstantTimeOfRecordPositions)
+            .map(String::as_str)
     }
 
     #[must_use]

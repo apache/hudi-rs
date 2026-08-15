@@ -29,7 +29,20 @@ use std::path::PathBuf;
 /// a [FileSlice] is a logical group of [BaseFile] and [LogFile]s.
 #[derive(Clone, Debug)]
 pub struct FileSlice {
-    pub base_file: BaseFile,
+    /// The base file, when the slice has one.
+    ///
+    /// A slice written by inserts that went straight to log files has none —
+    /// Flink ingestion, a bucket index's first write to a bucket, and any
+    /// merge-on-read file group before its first compaction all produce these.
+    pub base_file: Option<BaseFile>,
+    /// The enclosing file group's id.
+    ///
+    /// Held here rather than read out of the base file, which a log-only slice
+    /// does not have.
+    file_id: String,
+    /// The instant that created this slice: its base file's commit, or — with
+    /// no base file — the earliest log file's own instant.
+    creation_instant_time: String,
     pub log_files: BTreeSet<LogFile>,
     pub partition_path: String,
     /// Column statistics from the base file's Parquet footer.
@@ -43,7 +56,7 @@ impl Display for FileSlice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FileSlice {{ base_file: {}, log_files: {:?}, partition_path: {} }}",
+            "FileSlice {{ base_file: {:?}, log_files: {:?}, partition_path: {} }}",
             self.base_file, self.log_files, self.partition_path
         )
     }
@@ -51,7 +64,10 @@ impl Display for FileSlice {
 
 impl PartialEq for FileSlice {
     fn eq(&self, other: &Self) -> bool {
-        self.base_file == other.base_file && self.partition_path == other.partition_path
+        self.base_file == other.base_file
+            && self.partition_path == other.partition_path
+            && self.file_id == other.file_id
+            && self.creation_instant_time == other.creation_instant_time
     }
 }
 
@@ -60,7 +76,25 @@ impl Eq for FileSlice {}
 impl FileSlice {
     pub fn new(base_file: BaseFile, partition_path: String) -> Self {
         Self {
-            base_file,
+            file_id: base_file.file_id.clone(),
+            creation_instant_time: base_file.commit_timestamp.clone(),
+            base_file: Some(base_file),
+            log_files: BTreeSet::new(),
+            partition_path,
+            base_file_column_stats: None,
+        }
+    }
+
+    /// A slice whose records live entirely in log files.
+    pub fn new_log_only(
+        file_id: String,
+        creation_instant_time: String,
+        partition_path: String,
+    ) -> Self {
+        Self {
+            base_file: None,
+            file_id,
+            creation_instant_time,
             log_files: BTreeSet::new(),
             partition_path,
             base_file_column_stats: None,
@@ -91,9 +125,12 @@ impl FileSlice {
     }
 
     /// Returns the relative path of the [BaseFile] in the [FileSlice].
-    pub fn base_file_relative_path(&self) -> Result<String> {
-        let file_name = &self.base_file.file_name();
-        self.relative_path_for_file(file_name)
+    pub fn base_file_relative_path(&self) -> Result<Option<String>> {
+        let Some(base_file) = &self.base_file else {
+            return Ok(None);
+        };
+        self.relative_path_for_file(&base_file.file_name())
+            .map(Some)
     }
 
     /// Returns the relative path of the given [LogFile] in the [FileSlice].
@@ -105,7 +142,7 @@ impl FileSlice {
     /// Returns the enclosing [FileGroup]'s id.
     #[inline]
     pub fn file_id(&self) -> &str {
-        &self.base_file.file_id
+        &self.file_id
     }
 
     /// Returns the instant time that marks the [FileSlice] creation.
@@ -113,7 +150,7 @@ impl FileSlice {
     /// This is also an instant time stored in the [Timeline].
     #[inline]
     pub fn creation_instant_time(&self) -> &str {
-        &self.base_file.commit_timestamp
+        &self.creation_instant_time
     }
 
     /// Total on-disk size of the file slice (base file + all log files), in bytes.
@@ -128,8 +165,8 @@ impl FileSlice {
     pub fn total_size_bytes(&self) -> u64 {
         let base = self
             .base_file
-            .file_metadata
             .as_ref()
+            .and_then(|f| f.file_metadata.as_ref())
             .map(|m| m.size)
             .unwrap_or(0);
         let logs: u64 = self
@@ -172,19 +209,11 @@ mod tests {
             ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.2_0-51-115",
         )?);
 
-        let mut slice1 = FileSlice {
-            base_file: base.clone(),
-            log_files: log_set1,
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice1 = FileSlice::new(base.clone(), EMPTY_PARTITION_PATH.to_string());
+        slice1.log_files = log_set1;
 
-        let slice2 = FileSlice {
-            base_file: base,
-            log_files: log_set2,
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice2 = FileSlice::new(base, EMPTY_PARTITION_PATH.to_string());
+        slice2.log_files = log_set2;
 
         slice1.merge(&slice2)?;
 
@@ -210,23 +239,19 @@ mod tests {
 
     #[test]
     fn test_merge_different_base_files() -> Result<()> {
-        let mut slice1 = FileSlice {
-            base_file: BaseFile::from_str(
+        let mut slice1 = FileSlice::new(
+            BaseFile::from_str(
                 "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
             )?,
-            log_files: BTreeSet::new(),
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+            EMPTY_PARTITION_PATH.to_string(),
+        );
 
-        let slice2 = FileSlice {
-            base_file: BaseFile::from_str(
+        let slice2 = FileSlice::new(
+            BaseFile::from_str(
                 "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
             )?,
-            log_files: BTreeSet::new(),
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+            EMPTY_PARTITION_PATH.to_string(),
+        );
 
         // Should return error for different base files
         assert!(slice1.merge(&slice2).is_err());
@@ -239,19 +264,11 @@ mod tests {
         let base = BaseFile::from_str(
             "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
         )?;
-        let mut slice1 = FileSlice {
-            base_file: base.clone(),
-            log_files: BTreeSet::new(),
-            partition_path: "path/to/partition1".to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice1 = FileSlice::new(base.clone(), "path/to/partition1".to_string());
+        slice1.log_files = BTreeSet::new();
 
-        let slice2 = FileSlice {
-            base_file: base,
-            log_files: BTreeSet::new(),
-            partition_path: "path/to/partition2".to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice2 = FileSlice::new(base, "path/to/partition2".to_string());
+        slice2.log_files = BTreeSet::new();
 
         // Should return error for different partition paths
         assert!(slice1.merge(&slice2).is_err());
@@ -279,12 +296,11 @@ mod tests {
 
     #[test]
     fn test_total_size_bytes_base_only() {
-        let slice = FileSlice {
-            base_file: make_base_file_with_metadata(1000),
-            log_files: BTreeSet::new(),
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice = FileSlice::new(
+            make_base_file_with_metadata(1000),
+            EMPTY_PARTITION_PATH.to_string(),
+        );
+        slice.log_files = BTreeSet::new();
         assert_eq!(slice.total_size_bytes(), 1000);
     }
 
@@ -293,12 +309,11 @@ mod tests {
         let mut logs = BTreeSet::new();
         logs.insert(make_log_file_with_metadata(1, Some(200)));
         logs.insert(make_log_file_with_metadata(2, Some(300)));
-        let slice = FileSlice {
-            base_file: make_base_file_with_metadata(1000),
-            log_files: logs,
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice = FileSlice::new(
+            make_base_file_with_metadata(1000),
+            EMPTY_PARTITION_PATH.to_string(),
+        );
+        slice.log_files = logs;
         assert_eq!(slice.total_size_bytes(), 1500);
     }
 
@@ -307,12 +322,11 @@ mod tests {
         let mut logs = BTreeSet::new();
         logs.insert(make_log_file_with_metadata(1, Some(200)));
         logs.insert(make_log_file_with_metadata(2, None));
-        let slice = FileSlice {
-            base_file: make_base_file_with_metadata(1000),
-            log_files: logs,
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice = FileSlice::new(
+            make_base_file_with_metadata(1000),
+            EMPTY_PARTITION_PATH.to_string(),
+        );
+        slice.log_files = logs;
         assert_eq!(slice.total_size_bytes(), 1200);
     }
 
@@ -325,12 +339,8 @@ mod tests {
         )
         .unwrap();
         bf.file_metadata = None;
-        let slice = FileSlice {
-            base_file: bf,
-            log_files: logs,
-            partition_path: EMPTY_PARTITION_PATH.to_string(),
-            base_file_column_stats: None,
-        };
+        let mut slice = FileSlice::new(bf, EMPTY_PARTITION_PATH.to_string());
+        slice.log_files = logs;
         assert_eq!(slice.total_size_bytes(), 0);
     }
 }

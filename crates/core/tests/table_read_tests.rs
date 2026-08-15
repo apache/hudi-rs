@@ -768,7 +768,8 @@ mod v8_tables {
                 .expect("V8Trips8I3U1D MOR fixture should have at least one slice with log files");
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             // Sanity: read the merged slice unfiltered so we can pick a rider
             // present in this slice and assert the filter actually narrows it.
             let unfiltered = fg_reader
@@ -923,7 +924,8 @@ mod v8_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let expected = fg_reader.read_file_slice(file_slice, &options).await?;
@@ -955,7 +957,8 @@ mod v8_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             // Test with small batch size
             let options = ReadOptions::new().with_batch_size(1)?;
             let mut stream = fg_reader
@@ -1288,11 +1291,19 @@ mod v9_tables {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
             let hudi_table = open_table(base_url.path()).await?;
 
+            // An incremental window bounds COMPLETION times, so the bounds come
+            // from the completion half of each instant rather than its requested
+            // half — a requested time as a bound excludes its own commit,
+            // because the commit completed strictly after it.
             let commit_timestamps = hudi_table
                 .timeline
                 .completed_commits
                 .iter()
-                .map(|i| i.timestamp.as_str())
+                .map(|i| {
+                    i.completion_timestamp
+                        .as_deref()
+                        .unwrap_or(i.timestamp.as_str())
+                })
                 .collect::<Vec<_>>();
             assert_eq!(commit_timestamps.len(), 3);
             let first_commit = commit_timestamps[0];
@@ -1401,8 +1412,16 @@ mod v9_tables {
                 .get_completed_deltacommits(false)
                 .await?;
             assert_eq!(deltacommits.len(), 2);
-            let first_commit = &deltacommits[0].timestamp;
-            let second_commit = &deltacommits[1].timestamp;
+            // Completion times: an incremental window bounds those, not the
+            // requested times a bound would otherwise be read from.
+            let first_commit = deltacommits[0]
+                .completion_timestamp
+                .as_deref()
+                .unwrap_or(deltacommits[0].timestamp.as_str());
+            let second_commit = deltacommits[1]
+                .completion_timestamp
+                .as_deref()
+                .unwrap_or(deltacommits[1].timestamp.as_str());
 
             let records = hudi_table
                 .read(
@@ -1557,7 +1576,8 @@ mod v9_tables {
             );
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             let options = ReadOptions::new();
             let file_slice = &file_slices[0];
             let expected = fg_reader.read_file_slice(file_slice, &options).await?;
@@ -1583,7 +1603,8 @@ mod v9_tables {
             let file_slice = &file_slices[0];
 
             let fg_reader = hudi_table
-                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+                .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+                .await?;
             let expected = fg_reader
                 .read_file_slice(file_slice, &ReadOptions::new())
                 .await?;
@@ -1617,17 +1638,16 @@ mod v9_tables {
                 "Expected at least one MOR file slice with log files"
             );
 
+            // This table's log records carry a decimal and a timestamp. Both used
+            // to stop the read — the decimal had no Avro-to-Arrow conversion, and
+            // the timestamp came back without the UTC zone its parquet base file
+            // has, so the two could not be concatenated. This asserted that
+            // failure; it now asserts the read.
             let options = ReadOptions::new();
             let stream = hudi_table.read_stream(&options).await?;
-            let err = match collect_stream_batches(stream).await {
-                Ok(_) => panic!("Expected MOR streaming read with decimal log records to fail"),
-                Err(err) => err,
-            };
-            let err_message = err.to_string();
-            assert!(
-                err_message.contains("Decimal128(15, 2) not supported"),
-                "Unexpected error for MOR log-file streaming path: {err_message}"
-            );
+            let batches = collect_stream_batches(stream).await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(rows > 0, "MOR log-file streaming read returned no rows");
             Ok(())
         }
 
@@ -1750,7 +1770,8 @@ mod streaming_queries {
         );
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+            .await?;
         let options = ReadOptions::new();
         let file_slice = &file_slices[0];
         let expected = fg_reader.read_file_slice(file_slice, &options).await?;
@@ -1777,7 +1798,8 @@ mod streaming_queries {
         let file_slice = &file_slices[0];
 
         let fg_reader = hudi_table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+            .await?;
         let options = ReadOptions::new().with_batch_size(1)?;
         let stream = fg_reader
             .read_file_slice_stream(file_slice, &options)
@@ -2183,6 +2205,92 @@ mod streaming_queries {
         );
         Ok(())
     }
+
+    /// Both reader versions return the same rows when streamed, and differ in
+    /// shape.
+    ///
+    /// Version 2 emits one chunk per base-source batch plus a tail chunk for
+    /// log-only inserts, so peak memory tracks a row group rather than the file.
+    /// Version 1 sorts and de-duplicates whole batches at once, has no
+    /// incremental form, and yields the slice as a single batch.
+    ///
+    /// Deliberately does NOT assert a chunk count for version 2. Its cadence
+    /// follows the base file's row groups, not `batch_size` — which
+    /// `FileGroupMergeIterator::new_buffered` accepts and discards (see its
+    /// `_batch_size` parameter). These fixtures are a single row group, so one
+    /// chunk is the correct answer for them, and asserting more would pin the
+    /// fixture's size rather than the reader's behavior.
+    ///
+    /// What is worth pinning here is that splitting the read into batches does
+    /// not change what comes back: nothing else at table level compares the
+    /// streaming output against the eager output row for row.
+    #[tokio::test]
+    async fn test_streaming_agrees_with_eager_on_both_reader_versions() -> Result<()> {
+        let base_url = QuickstartTripsTable::MorLayoutCorruptTailBlock.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        // One file slice, so batch counts describe one merged slice and not a
+        // chain of several.
+        let slices = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert_eq!(slices.len(), 1, "expected a single-slice fixture");
+
+        // Read-optimized is its own axis, not a variation on the same code: the
+        // eager path hands version 2 an empty log list and merges through its
+        // engine, while the streaming path returns before the version is
+        // consulted and reads the base file directly. Nothing else compares the
+        // *values* those two produce.
+        for (reader_version, read_optimized) in
+            [("2", false), ("1", false), ("2", true), ("1", true)]
+        {
+            let mut options = ReadOptions::new()
+                .with_hudi_option(
+                    HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                    reader_version,
+                )
+                .with_batch_size(2)?;
+            if read_optimized {
+                options =
+                    options.with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+            }
+
+            let eager = hudi_table.read(&options).await?;
+            let eager_schema = eager[0].schema();
+            let eager = concat_batches(&eager_schema, &eager)?;
+
+            let streamed = collect_stream_batches(hudi_table.read_stream(&options).await?).await?;
+            assert!(
+                !streamed.is_empty(),
+                "reader version '{reader_version}' (read-optimized {read_optimized}): \
+                 streaming a non-empty slice must yield batches"
+            );
+            let streamed = concat_batches(&streamed[0].schema(), &streamed)?;
+
+            assert_eq!(
+                streamed.num_rows(),
+                eager.num_rows(),
+                "reader version '{reader_version}' (read-optimized {read_optimized}): \
+                 streaming and eager row counts must agree"
+            );
+            assert_eq!(
+                format!("{:?}", streamed.columns()),
+                format!("{:?}", eager.columns()),
+                "reader version '{reader_version}' (read-optimized {read_optimized}): \
+                 streaming must return the same values as the eager read"
+            );
+
+            if reader_version == "1" && !read_optimized {
+                let n = collect_stream_batches(hudi_table.read_stream(&options).await?)
+                    .await?
+                    .len();
+                assert_eq!(
+                    n, 1,
+                    "version 1 has no incremental merge, so it yields the \
+                     slice as one batch; got {n}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Regression tests: manual `get_file_slices` + `create_file_group_reader_with_options`
@@ -2202,10 +2310,12 @@ mod manual_reader_matches_table_read {
         options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
         let file_slices = table.get_file_slices(options).await?;
-        let fg_reader = table.create_file_group_reader_with_options(
-            Some(options),
-            std::iter::empty::<(&str, &str)>(),
-        )?;
+        let fg_reader = table
+            .create_file_group_reader_with_options(
+                Some(options),
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .await?;
         let batches = futures::future::try_join_all(
             file_slices
                 .iter()
@@ -2679,7 +2789,7 @@ mod lance_tables {
         assert!(
             file_slices.iter().any(|slice| slice
                 .base_file_relative_path()
-                .is_ok_and(|path| path.ends_with(".lance"))),
+                .is_ok_and(|path| path.is_some_and(|p| p.ends_with(".lance")))),
             "table listing should discover .lance base files without an explicit format config"
         );
 
@@ -2807,5 +2917,355 @@ mod mdt_enabled_tables {
 
             Ok(())
         }
+    }
+}
+
+/// A base file written by compaction carries records from every commit it
+/// merged, so an incremental read that admits the file must still drop the
+/// records outside its window.
+///
+/// The fixture's compacted base file holds `a@…526409`, `b@…528666` and
+/// `c`/`d@…522627`. The window admits that file, but `d` has never been touched
+/// inside the window and must not come back. A reader that decides per file
+/// rather than per row returns it, which is the regression this pins.
+///
+/// Bounds are completion times, so the window opens at `c1`'s completion rather
+/// than at its requested time — see [`C1_INSERT_ALL_COMPLETED`].
+mod incremental_over_a_compacted_base_file {
+    use super::*;
+
+    /// `c1` inserted a, b, c and d; it completed at …524868. An incremental
+    /// window bounds completion times, so starting here excludes c1 — which is
+    /// what leaves `d` untouched inside the window.
+    const C1_INSERT_ALL_COMPLETED: &str = "20260807223524868";
+    /// Between `c`'s update completing (…530767) and `d`'s completing (…531886),
+    /// so the window admits the former and not the latter without landing on
+    /// either boundary.
+    const AFTER_C_BEFORE_D: &str = "20260807223531000";
+
+    async fn read_window(reader_version: &str) -> Result<Vec<(String, String, f64)>> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+
+        // The reader version has to travel with the read: `Table::build` strips
+        // every `hoodie.read.*` key from the table's own configs.
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT_ALL_COMPLETED)
+                    .with_end_timestamp(AFTER_C_BEFORE_D)
+                    .with_hudi_option(
+                        HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                        reader_version,
+                    ),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = &records[0].schema();
+        let merged = concat_batches(schema, &records)?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|l, r| l.0.cmp(&r.0));
+        Ok(rows)
+    }
+
+    /// `d` sits in the compacted base file at a commit before the window opens.
+    #[tokio::test]
+    async fn version_two_drops_a_base_record_from_outside_the_window() -> Result<()> {
+        let rows = read_window("2").await?;
+
+        let ids: Vec<&str> = rows.iter().map(|(uuid, _, _)| uuid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b", "c"],
+            "the compacted base file is inside the window, but d's only commit is not"
+        );
+        Ok(())
+    }
+
+    /// Version 1 reaches the same answer, so the fixture pins behaviour rather
+    /// than one reader's interpretation of it.
+    #[tokio::test]
+    async fn both_reader_versions_agree_on_the_window() -> Result<()> {
+        assert_eq!(read_window("2").await?, read_window("1").await?);
+        Ok(())
+    }
+}
+
+/// Incremental reads over a merge-on-read table whose delta commits only append.
+///
+/// Every update to a merge-on-read table writes a log file and nothing else, and
+/// such a write stat records an empty `baseFile`. Reading one used to fail
+/// outright with `Failed to parse file name '' for base file.`, so no
+/// merge-on-read table could be read incrementally at all — unnoticed because
+/// every other incremental test here reads a copy-on-write table.
+mod incremental_over_append_only_delta_commits {
+    use super::*;
+
+    /// Commit 1 inserts ids 0-6, commit 2 deletes 0,1,2, commit 3 updates 4,5,6.
+    const C1_INSERT: &str = "20260409002001492";
+    const C3_UPDATE: &str = "20260409002003963";
+
+    #[tokio::test]
+    async fn a_log_only_delta_commit_no_longer_breaks_the_read() -> Result<()> {
+        let base_url = QuickstartTripsTable::V9MorNonpart3Commits.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT)
+                    .with_end_timestamp(C3_UPDATE),
+            )
+            .await?;
+
+        let rows: usize = records.iter().map(|batch| batch.num_rows()).sum();
+        assert!(
+            rows > 0,
+            "the window covers a delete and an update commit, so it cannot be empty"
+        );
+        Ok(())
+    }
+}
+
+/// Incremental windows checked against what Hudi's own reader returns.
+///
+/// The gold files under the fixture's `gold_incremental/<window>` were produced
+/// by Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT reading the same table with
+/// `hoodie.datasource.read.begin.instanttime` / `end.instanttime`. Comparing
+/// against them checks this crate against the reference implementation rather
+/// than against its own incumbent reader.
+mod incremental_windows_match_hudi {
+    use super::*;
+
+    /// Both reader versions, so the comparison covers the reader being shipped
+    /// as well as the one it replaces.
+    const READER_VERSIONS: [&str; 2] = ["1", "2"];
+
+    async fn read_window(reader_version: &str, start: &str, end: &str) -> Result<RecordBatch> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        // The reader version has to travel with the read: `Table::build` strips
+        // every `hoodie.read.*` key from the table's own configs.
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end)
+                    .with_hudi_option(
+                        HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                        reader_version,
+                    ),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(RecordBatch::new_empty(std::sync::Arc::new(
+                arrow_schema::Schema::empty(),
+            )));
+        }
+        let schema = records[0].schema();
+        Ok(concat_batches(&schema, &records)?)
+    }
+
+    fn gold_for(window: &str) -> Result<RecordBatch> {
+        let dir = format!(
+            "{}/gold_incremental/{window}",
+            QuickstartTripsTable::V9MorCompactedIncremental.path_to_mor_avro()
+        );
+        hudi_test::gold::read_gold_parquet(&dir)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("gold '{window}': {e}")))
+    }
+
+    async fn assert_matches_gold(window: &str, start: &str, end: &str) -> Result<()> {
+        let gold = gold_for(window)?;
+        for reader_version in READER_VERSIONS {
+            let actual = read_window(reader_version, start, end).await?;
+            hudi_test::gold::compare_against_gold_keyed(&actual, &gold, "uuid").map_err(|e| {
+                CoreError::ReadFileSliceError(format!(
+                    "window '{window}', reader version '{reader_version}': {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Opens after the insert, closes on `c`'s update: `a`, `b`, `c` changed.
+    #[tokio::test]
+    async fn a_window_spanning_the_compaction_and_a_later_update() -> Result<()> {
+        assert_matches_gold(
+            "after_insert_through_c",
+            "20260807223524868",
+            "20260807223530767",
+        )
+        .await
+    }
+
+    /// Closes on the compaction: only `a` and `b` had changed by then.
+    #[tokio::test]
+    async fn a_window_closing_on_the_compaction() -> Result<()> {
+        assert_matches_gold(
+            "through_compaction",
+            "20260807223524868",
+            "20260807223529586",
+        )
+        .await
+    }
+
+    /// Regression test: a window whose bounds fall between one commit's requested and
+    /// completion times must return that commit.
+    ///
+    /// Both readers range `(start, end]`; what they compare used to differ. Hudi
+    /// compares the commit's **completion** time (…529143, inside the window, so
+    /// `b` is returned); this crate compared its **requested** time (…528666,
+    /// which is the window's own exclusive start, so nothing was). A commit that
+    /// completes inside a window but was requested before it is the normal shape
+    /// of a slow or contended write, and skipping it lost the change silently.
+    #[tokio::test]
+    async fn a_window_between_requested_and_completion_time_matches_hudi() -> Result<()> {
+        assert_matches_gold("only_b", "20260807223528666", "20260807223529143").await?;
+        let gold = gold_for("only_b")?;
+        assert_eq!(gold.num_rows(), 1, "Hudi returns b for this window");
+        Ok(())
+    }
+}
+
+/// Incremental windows whose bounds land on a commit's requested or completion
+/// time, checked against what Hudi returns for the same window.
+///
+/// Requires a table version 8 or later: only timeline layout v2 names completed
+/// instants `{requested}_{completion}`, so only there can the two disagree.
+///
+/// Measured against Hudi 1.2.0-SNAPSHOT, both readers now range `(start, end]`
+/// over the commit's **completion** time, so all four boundary positions agree.
+///
+/// They used to differ in that one input — this crate compared the *requested*
+/// time — which meant they agreed only when a window's bounds fell in the gaps
+/// between commits, and disagreed exactly when a bound landed between one
+/// commit's requested and completion times. Hudi's config docs describe the start
+/// as inclusive (`completion_time >= START_COMMIT`); the observed behaviour is
+/// exclusive, which `starting_on_a_completion_time` pins.
+mod incremental_window_boundaries {
+    use super::*;
+
+    /// c3 (`UPDATE b`) is the pivot: requested …723246, completed …723734.
+    const C3_REQUESTED: &str = "20260808010723246";
+    const C3_COMPLETED: &str = "20260808010723734";
+
+    /// Both reader versions, so the comparison covers the reader being shipped
+    /// as well as the one it replaces.
+    const READER_VERSIONS: [&str; 2] = ["1", "2"];
+
+    async fn uuids_in_window(reader_version: &str, start: &str, end: &str) -> Result<Vec<String>> {
+        let base_url = QuickstartTripsTable::V8MorBoundaryWindows.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        // The reader version has to travel with the read: `Table::build` strips
+        // every `hoodie.read.*` key from the table's own configs.
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end)
+                    .with_hudi_option(
+                        HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                        reader_version,
+                    ),
+            )
+            .await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = records[0].schema();
+        let merged = concat_batches(&schema, &records)?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(uuid, _, _)| uuid).collect())
+    }
+
+    /// What Hudi returned for the same window, read from the fixture's gold.
+    fn hudi_uuids(window: &str) -> Result<Vec<String>> {
+        let dir = format!(
+            "{}/gold_incremental/{window}",
+            QuickstartTripsTable::V8MorBoundaryWindows.path_to_mor_avro()
+        );
+        let gold = hudi_test::gold::read_gold_parquet(&dir)
+            .map_err(|e| CoreError::ReadFileSliceError(format!("gold '{window}': {e}")))?;
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&gold);
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows.into_iter().map(|(uuid, _, _)| uuid).collect())
+    }
+
+    /// Neither bound touches a commit's timestamps, so requested and completion
+    /// time pick the same commits and the readers agree.
+    #[tokio::test]
+    async fn a_window_between_commits_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("between_commits")?;
+        for reader_version in READER_VERSIONS {
+            assert_eq!(
+                uuids_in_window(reader_version, "20260808010722500", "20260808010724000").await?,
+                hudi,
+                "reader version '{reader_version}'"
+            );
+        }
+        Ok(())
+    }
+
+    /// Starting on c3's *completion* time excludes c3 from both readers — Hudi
+    /// because its start is exclusive on completion time, this crate because
+    /// c3's requested time is earlier still. Agreement by different routes.
+    #[tokio::test]
+    async fn starting_on_a_completion_time_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("start_on_completion")?;
+        for reader_version in READER_VERSIONS {
+            assert_eq!(
+                uuids_in_window(reader_version, C3_COMPLETED, "20260808010725000").await?,
+                hudi,
+                "reader version '{reader_version}'"
+            );
+        }
+        Ok(())
+    }
+
+    /// Regression test: starting on c3's *requested* time keeps c3, because it
+    /// completed after the window opened.
+    ///
+    /// The window's start is exclusive on completion time, and c3's completion is
+    /// strictly after its requested time — so bounding on the requested time
+    /// dropped a commit Hudi returns.
+    #[tokio::test]
+    async fn starting_on_a_requested_time_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("start_on_requested")?;
+        assert_eq!(hudi, vec!["b".to_string()]);
+        for reader_version in READER_VERSIONS {
+            assert_eq!(
+                uuids_in_window(reader_version, C3_REQUESTED, "20260808010724000").await?,
+                hudi,
+                "reader version '{reader_version}'"
+            );
+        }
+        Ok(())
+    }
+
+    /// Regression test: a window from c3's requested time to its completion time
+    /// contains exactly that one commit.
+    ///
+    /// The narrowest case of the same thing: the window brackets one commit's
+    /// requested→completion span, and only completion-time bounds see it.
+    #[tokio::test]
+    async fn a_window_spanning_one_commit_agrees_with_hudi() -> Result<()> {
+        let hudi = hudi_uuids("requested_to_completion")?;
+        assert_eq!(hudi, vec!["b".to_string()]);
+        for reader_version in READER_VERSIONS {
+            assert_eq!(
+                uuids_in_window(reader_version, C3_REQUESTED, C3_COMPLETED).await?,
+                hudi,
+                "reader version '{reader_version}'"
+            );
+        }
+        Ok(())
     }
 }

@@ -218,6 +218,19 @@ impl TimelineLoader {
     /// Note: This method assumes the archived loader was created only when
     /// `TimelineArchivedReadEnabled` is true. The config check is done in the builder.
     ///
+    /// # Not yet implemented
+    ///
+    /// Neither layout reads archived instants today. V2 returns empty outright.
+    /// V1 lists the archive folder and parses file *names* as instants, but Hudi
+    /// stores archived instants as records inside Avro archive logs
+    /// (`.commits_.archive.*`) rather than as one file per instant, so that
+    /// listing yields nothing either.
+    ///
+    /// Callers must therefore not treat an empty result as "no archived instants
+    /// in range" — see `Table::warn_if_window_predates_active_timeline`, which
+    /// reports the shortfall rather than letting a range query return quietly
+    /// short.
+    ///
     /// # Arguments
     ///
     /// * `selector` - The criteria for selecting instants (actions, states, time range)
@@ -323,6 +336,73 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::config::table::HudiTableConfig;
     use std::collections::HashMap;
+
+    /// An archived instant is enumerated when the archived loader is used.
+    ///
+    /// Nothing covered this: the existing tests assert only that the loader is
+    /// *constructed* when `hoodie.internal.timeline.archived.enabled` is set,
+    /// never that it finds anything. Without this, the opt-in could resolve a
+    /// directory and return nothing and every test would still pass.
+    ///
+    /// Layout v1 keeps archived instants as ordinarily-named files under
+    /// `hoodie.archivelog.folder`, so the timeline can be laid out directly
+    /// rather than generated: what is under test is the enumeration, not the
+    /// file format.
+    #[tokio::test]
+    async fn test_archived_instants_are_enumerated_from_the_archive_folder() {
+        use crate::timeline::selector::TimelineSelector;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join(".hoodie/archived")).unwrap();
+        // One archived instant, and one active instant the archived loader must
+        // NOT pick up — it reads the archive folder, not the table's timeline.
+        std::fs::write(base.join(".hoodie/archived/20240101000000000.commit"), "{}").unwrap();
+        std::fs::write(base.join(".hoodie/20240301000000000.commit"), "{}").unwrap();
+
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            format!("file://{}", base.display()),
+        )]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+
+        // A window covering both instants, so exclusion cannot be an artifact of
+        // the range.
+        let selector = TimelineSelector::completed_commits_in_range(
+            configs.clone(),
+            Some("20240101000000000"),
+            Some("20240401000000000"),
+        )
+        .unwrap();
+        assert!(
+            selector.has_time_filter(),
+            "the archived timeline is only consulted for a time-filtered read"
+        );
+
+        let archived = TimelineLoader::new_layout_one_archived(configs.clone(), storage.clone());
+        let found = archived
+            .load_archived_instants(&selector, false)
+            .await
+            .unwrap();
+        let timestamps: Vec<&str> = found.iter().map(|i| i.timestamp.as_str()).collect();
+        assert_eq!(
+            timestamps,
+            vec!["20240101000000000"],
+            "the archived loader must return the archived instant and only that"
+        );
+
+        // An ACTIVE loader has no archived part and must return nothing, which is
+        // what makes the opt-in the thing that changes the answer.
+        let active = TimelineLoader::new_layout_one_active(configs, storage);
+        assert!(
+            active
+                .load_archived_instants(&selector, false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an active loader must not read the archive folder"
+        );
+    }
 
     fn create_test_configs() -> Arc<HudiConfigs> {
         let mut options = HashMap::new();

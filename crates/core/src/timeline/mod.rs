@@ -36,7 +36,7 @@ use crate::schema::resolver::{
 use crate::statistics::estimator::FileStatsEstimator;
 use crate::storage::Storage;
 use crate::timeline::builder::TimelineBuilder;
-use crate::timeline::instant::Action;
+use crate::timeline::instant::{Action, State};
 use crate::timeline::loader::TimelineLoader;
 use crate::timeline::selector::TimelineSelector;
 use crate::timeline::view::TimelineView;
@@ -57,6 +57,18 @@ pub struct Timeline {
     active_loader: TimelineLoader,
     archived_loader: Option<TimelineLoader>,
     pub completed_commits: Vec<Instant>,
+    /// Request timestamp of the earliest instant still in the active timeline,
+    /// in any state — the archival boundary.
+    ///
+    /// A data file whose instant sorts *below* this was written by a commit that
+    /// has since been archived, and archived instants are committed by
+    /// definition: archival only ever moves completed ones, and never moves past
+    /// the oldest pending instant. So it is the second half of
+    /// [`CompletionTimeView::is_committed`], mirroring Java's
+    /// `containsInstant(ts) || isBeforeTimelineStarts(ts)`
+    /// (`BaseHoodieTimeline.java:494`). `None` means the active timeline is
+    /// empty, so nothing can be treated as archived.
+    pub(crate) earliest_active_instant: Option<String>,
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
@@ -76,6 +88,7 @@ impl Timeline {
             active_loader,
             archived_loader,
             completed_commits: Vec::new(),
+            earliest_active_instant: None,
         }
     }
 
@@ -85,13 +98,26 @@ impl Timeline {
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         let mut timeline = TimelineBuilder::new(hudi_configs, storage).build().await?;
-        let selector = TimelineSelector::completed_actions_in_range(
+        // Every state, not just completed: one listing then yields both the
+        // completed commits and the archival boundary. See
+        // `Timeline::earliest_active_instant` for why the boundary needs the
+        // pending ones.
+        let selector = TimelineSelector::actions_in_range(
             DEFAULT_LOADING_ACTIONS,
+            &[State::Requested, State::Inflight, State::Completed],
             timeline.hudi_configs.clone(),
             None,
             None,
         )?;
-        timeline.completed_commits = timeline.load_instants(&selector, false).await?;
+        let all_active = timeline.load_instants(&selector, false).await?;
+        timeline.earliest_active_instant = all_active
+            .iter()
+            .map(|instant| instant.timestamp.clone())
+            .min();
+        timeline.completed_commits = all_active
+            .into_iter()
+            .filter(|instant| instant.state == State::Completed)
+            .collect();
         Ok(timeline)
     }
 
@@ -124,8 +150,16 @@ impl Timeline {
                     .load_archived_instants(selector, desc)
                     .await?;
                 if !archived.is_empty() {
-                    // Both sides already sorted by loaders; append is fine for now.
+                    // Each side is sorted, but archived instants are OLDER than
+                    // active ones, so appending leaves the whole vector unsorted.
+                    // `TimelineSelector::select` binary-searches this with
+                    // `partition_point`, which silently returns nonsense on
+                    // unsorted input — so re-sort rather than merely concatenate.
                     instants.append(&mut archived);
+                    instants.sort_unstable();
+                    if desc {
+                        instants.reverse();
+                    }
                 }
             }
             Ok(instants)
@@ -244,6 +278,21 @@ impl Timeline {
             .map(|instant| instant.timestamp.as_str())
     }
 
+    /// The greatest completion timestamp across completed commits — "everything
+    /// committed so far", expressed the way an incremental window is bounded.
+    ///
+    /// Not the completion time of the latest-*requested* commit: completion order
+    /// need not follow requested order, so the maximum has to be taken over the
+    /// completion timestamps themselves. Falls back to the latest requested time
+    /// on timeline layout v1, which records no completion times.
+    pub(crate) fn get_latest_completion_timestamp_as_option(&self) -> Option<&str> {
+        self.completed_commits
+            .iter()
+            .filter_map(|instant| instant.completion_timestamp.as_deref())
+            .max()
+            .or_else(|| self.get_latest_commit_timestamp_as_option())
+    }
+
     /// Get the latest commit timestamp from the [Timeline].
     ///
     /// Only completed commits are considered.
@@ -255,12 +304,13 @@ impl Timeline {
     /// Create a [TimelineView] as of the given timestamp.
     pub async fn create_view_as_of(&self, timestamp: &str) -> Result<TimelineView> {
         let excludes = self.get_replaced_file_groups_as_of(timestamp).await?;
-        Ok(TimelineView::new(
+        Ok(TimelineView::new_with_archival_boundary(
             timestamp.to_string(),
             None,
             &self.completed_commits,
             excludes,
             &self.hudi_configs,
+            self.earliest_active_instant.clone(),
         ))
     }
 
@@ -330,6 +380,25 @@ impl Timeline {
     ///
     /// # Returns
     /// File groups that were modified in the time range, excluding replaced file groups.
+    /// The completed commits an incremental window `(start, end]` admits, in
+    /// requested-time order.
+    ///
+    /// Which timestamp the window bounds depends on the timeline layout — see
+    /// [`TimelineSelector::select`].
+    pub(crate) fn get_completed_commits_in_range(
+        &self,
+        start_timestamp: Option<&str>,
+        end_timestamp: Option<&str>,
+    ) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::completed_actions_in_completion_time_range(
+            DEFAULT_LOADING_ACTIONS,
+            self.hudi_configs.clone(),
+            start_timestamp,
+            end_timestamp,
+        )?;
+        selector.select(self)
+    }
+
     pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
@@ -341,7 +410,12 @@ impl Timeline {
             replaced_file_groups_from_replace_commit,
         };
 
-        // Get commits in the time range (start, end]
+        // Requested-time bounds by this point: an incremental window is
+        // translated once, in `Table::resolve_incremental_window`, which resolves
+        // the user's (possibly completion-time) window into the instant times it
+        // admits and re-expresses the bounds over those commits' requested times.
+        // Interpreting them as completion times again here would translate twice
+        // and select nothing.
         let selector = TimelineSelector::completed_actions_in_range(
             DEFAULT_LOADING_ACTIONS,
             self.hudi_configs.clone(),
@@ -367,11 +441,23 @@ impl Timeline {
 
         for commit in commits {
             let commit_metadata = self.get_instant_metadata(&commit).await?;
-            file_groups.merge(file_groups_from_commit_metadata_with_estimator(
+            let contribution = file_groups_from_commit_metadata_with_estimator(
                 &commit_metadata,
                 &completion_time_view,
                 estimator,
-            )?)?;
+            )?;
+            file_groups.merge(contribution.file_groups)?;
+
+            // A delta commit that only appends names no base file, so it
+            // contributes no slice — but the file group it touched still
+            // changed in the range, and the caller reads it as of the range's
+            // end. Carry the identity alone.
+            for unattached in contribution.unattached_log_files {
+                let touched = FileGroup::new(unattached.file_id, unattached.partition);
+                if !file_groups.contains(&touched) {
+                    file_groups.insert(touched);
+                }
+            }
 
             if commit.is_replacecommit() {
                 replaced_file_groups

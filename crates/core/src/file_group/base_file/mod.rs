@@ -204,4 +204,18 @@ mod tests {
         let result = BaseFile::try_from(metadata);
         assert!(matches!(result.unwrap_err(), CoreError::FileGroup(_)));
     }
+
+    /// Regression test: `BaseFile`'s `Display` stays exercised.
+    ///
+    /// It renders the file name a reader would see in a log line or an error,
+    /// so it is the string a person debugging a slice reads first. Nothing else
+    /// in the crate formats a `BaseFile` today, which is how it quietly stopped
+    /// being covered.
+    #[test]
+    fn test_base_file_display_renders_the_file_name() {
+        let name = "5a226b7a-1a4d-4b4c-8b3e-3d2e1f0a9c8b-0_1-2-3_20240101120000000.parquet";
+        let base_file = BaseFile::from_str(name).unwrap();
+
+        assert_eq!(format!("{base_file}"), format!("BaseFile: {name}"));
+    }
 }

@@ -61,10 +61,14 @@ pub fn lexsort_to_indices(arrays: &[ArrayRef], desc: bool) -> UInt32Array {
     let converter = RowConverter::new(fields).unwrap();
     let rows = converter.convert_columns(arrays).unwrap();
     let mut sort: Vec<_> = rows.iter().enumerate().collect();
+    // Ties break on the original position, in both directions. The sort is
+    // unstable, so without that the permutation over equal rows is whatever the
+    // algorithm happened to do — and `desc` is not simply the reverse of `asc`,
+    // since reversing would also reverse tied rows among themselves.
     if desc {
-        sort.sort_unstable_by(|(_, a), (_, b)| b.cmp(a));
+        sort.sort_unstable_by(|(ia, a), (ib, b)| b.cmp(a).then(ia.cmp(ib)));
     } else {
-        sort.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
+        sort.sort_unstable_by(|(ia, a), (ib, b)| a.cmp(b).then(ia.cmp(ib)));
     }
     UInt32Array::from_iter_values(sort.iter().map(|(i, _)| *i as u32))
 }

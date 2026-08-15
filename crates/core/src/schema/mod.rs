@@ -22,7 +22,11 @@ use crate::schema::resolver::sanitize_avro_schema_str;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::Value;
 
+pub mod avro_schema_utils;
+pub mod batch_evolution;
 pub mod delete;
+pub mod extended_promotion;
+pub mod parquet_list_norm;
 pub mod resolver;
 
 pub fn prepend_meta_fields(schema: SchemaRef) -> Result<Schema> {

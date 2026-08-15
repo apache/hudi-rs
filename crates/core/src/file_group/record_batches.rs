@@ -111,9 +111,16 @@ impl RecordBatches {
         concat_batches(&schema, &self.data_batches).map_err(CoreError::ArrowError)
     }
 
+    /// `data_schema` supplies the type the ordering column must end up in.
+    ///
+    /// A delete record's ordering value is written with a wrapper chosen for the
+    /// value, so a table whose ordering column is a long can still carry an
+    /// `IntWrapper` for a small value. The merger builds its row converter from
+    /// the data batch, so the two have to agree before they meet.
     pub fn concat_delete_batches_transformed(
         &self,
         hudi_configs: Arc<HudiConfigs>,
+        data_schema: &Schema,
     ) -> Result<RecordBatch> {
         let ordering_fields: Vec<String> =
             hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
@@ -123,9 +130,19 @@ impl RecordBatches {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
         }
 
+        let target_ordering_type = data_schema
+            .field_with_name(ordering_field)
+            .ok()
+            .map(|f| f.data_type().clone());
+
         let mut delete_batches = Vec::with_capacity(self.delete_batches.len());
         for (batch, instant_time) in &self.delete_batches {
-            let batch = transform_delete_record_batch(batch, instant_time, ordering_field)?;
+            let batch = transform_delete_record_batch(
+                batch,
+                instant_time,
+                ordering_field,
+                target_ordering_type.as_ref(),
+            )?;
             delete_batches.push(batch);
         }
 
@@ -513,7 +530,7 @@ mod tests {
         )]));
 
         let result = record_batches
-            .concat_delete_batches_transformed(hudi_configs)
+            .concat_delete_batches_transformed(hudi_configs, &Schema::empty())
             .unwrap();
 
         assert_eq!(result.num_rows(), 0);
@@ -540,7 +557,7 @@ mod tests {
         )]));
 
         let result = record_batches
-            .concat_delete_batches_transformed(hudi_configs)
+            .concat_delete_batches_transformed(hudi_configs, &Schema::empty())
             .unwrap();
 
         assert_eq!(result.num_rows(), 3);
@@ -576,7 +593,7 @@ mod tests {
         )]));
 
         let result = record_batches
-            .concat_delete_batches_transformed(hudi_configs)
+            .concat_delete_batches_transformed(hudi_configs, &Schema::empty())
             .unwrap();
 
         assert_eq!(result.num_rows(), 6); // 2 + 3 + 1
@@ -620,7 +637,7 @@ mod tests {
         )]));
 
         let result = record_batches
-            .concat_delete_batches_transformed(hudi_configs)
+            .concat_delete_batches_transformed(hudi_configs, &Schema::empty())
             .unwrap();
 
         // Check schema field names
@@ -641,7 +658,8 @@ mod tests {
         let hudi_configs = Arc::new(HudiConfigs::empty());
 
         // This should return an error
-        let result = record_batches.concat_delete_batches_transformed(hudi_configs);
+        let result =
+            record_batches.concat_delete_batches_transformed(hudi_configs, &Schema::empty());
         match result {
             Err(CoreError::Config(ConfigError::NotFound(s))) => {
                 assert_eq!(s, HudiTableConfig::OrderingFields.as_ref());

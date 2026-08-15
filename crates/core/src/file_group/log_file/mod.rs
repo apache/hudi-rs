@@ -25,9 +25,9 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 mod avro;
-mod content;
-mod log_block;
-mod log_format;
+pub(crate) mod content;
+pub mod log_block;
+pub mod log_format;
 pub mod reader;
 pub mod scanner;
 
@@ -64,6 +64,17 @@ pub struct LogFile {
 }
 
 const LOG_FILE_PREFIX: char = '.';
+
+impl LogFile {
+    /// Whether a file name is a log file's rather than a base file's.
+    ///
+    /// A log-only write stat names its log file in `path`, where a base file
+    /// name would otherwise be expected, so the two have to be told apart
+    /// before either is parsed.
+    pub fn is_log_file_name(file_name: &str) -> bool {
+        file_name.starts_with(LOG_FILE_PREFIX)
+    }
+}
 
 impl LogFile {
     /// Parse a log file's name into parts.
@@ -477,3 +488,6 @@ mod tests {
         assert_eq!(logs, vec![log1, log2, log3]);
     }
 }
+
+#[cfg(test)]
+mod memory_bench;

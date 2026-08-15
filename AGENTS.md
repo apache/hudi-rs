@@ -34,14 +34,30 @@ cargo test -p hudi-core                                        # one crate
 cargo test -p hudi-core table::tests::hudi_table_get_schema    # one test
 pytest python/tests/test_table_read.py -s -k "<expr>"          # one Python test
 make coverage-rust                                             # tarpaulin HTML at cov-reports/
+
+# hudi-core without the spill backend — CI runs this leg, so check it before a PR
+# that touches the merge map or its dependencies.
+cargo clippy -p hudi-core --lib --no-default-features -- -D warnings
+cargo test -p hudi-core --lib --no-default-features
 ```
 
 ## Conventions
 
+### Features
+
+`hudi-core` has one default-on feature, `spill-rocksdb`, carrying the merge-on-read merge map's
+on-disk tier. It is separable because `rocksdb` bundles RocksDB and runs `bindgen`, so leaving it
+unconditional puts libclang and a C++ toolchain in front of every consumer — the Python wheel and
+the cxx bridge included — for a tier that only engages when a merge exceeds
+`hoodie.memory.merge.max.size`. A test that needs the disk tier must be
+`#[cfg(feature = "spill-rocksdb")]`; the `--no-default-features` CI leg installs no libclang, so a
+change that reintroduces the native dependency fails to compile there rather than passing quietly.
+
 ### Dependencies
 
 Prefer stdlib or existing workspace dependencies before adding new crates. Keep `Cargo.lock`
-changes intentional — don't `cargo add` without justification.
+changes intentional — don't `cargo add` without justification. A dependency needed by one module
+for an optional capability belongs behind a feature, not in the unconditional set.
 
 ### Language-specific
 
@@ -71,6 +87,30 @@ unique purpose.
    `python/`, and `cpp/`. Verify all bindings still build; document breaking changes.
 6. **No secrets**. Cloud credentials come from env vars (`AWS_*`, `AZURE_*`, `GOOGLE_*`) or table
    options. Don't bypass `make check` / pre-commit hooks (`--no-verify`) without justification.
+
+## Reader semantics
+
+### Commit visibility
+
+A data file is readable only when the commit that wrote it is committed —
+`CompletionTimeView::is_committed`, which mirrors Java's
+`containsInstant(ts) || isBeforeTimelineStarts(ts)`. Both halves are load-bearing:
+membership in the active completed set, **or** below the archival boundary
+(`Timeline::earliest_active_instant`), since archival only ever moves completed
+instants. Testing for a completion timestamp instead is wrong twice over — layout
+v1 records none, and the completion map is built from the active timeline, so it
+also discards files from archived commits.
+
+### Incremental windows bound completion time
+
+On timeline layout v2, `hoodie.read.start/end.timestamp` bound a commit's
+**completion** time (Hudi 1.x parity). Layout v1 has no completion times and bounds
+requested times. The translation happens in exactly one place,
+`Table::resolve_incremental_window`, which resolves the window to the instant times
+it admits and re-expresses the bounds over those commits' *requested* times —
+because everything below the row mask (which base file, which log blocks) is a
+requested-time decision. Translating twice selects nothing; that is the bug the
+single translation point exists to prevent.
 
 ## Cloud storage & config
 

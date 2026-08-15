@@ -121,8 +121,10 @@ impl RecordMerger {
                     if record_batches.num_delete_rows() == 0 {
                         HashMap::new()
                     } else {
-                        let delete_batch = record_batches
-                            .concat_delete_batches_transformed(self.hudi_configs.clone())?;
+                        let delete_batch = record_batches.concat_delete_batches_transformed(
+                            self.hudi_configs.clone(),
+                            &data_batch.schema(),
+                        )?;
                         let mut delete_orderings: HashMap<OwnedRow, MaxOrderingInfo> =
                             HashMap::with_capacity(delete_batch.num_rows());
                         process_batch_for_max_orderings(
@@ -457,6 +459,58 @@ mod tests {
                 ("c1".to_string(), "s1".to_string(), "k2".to_string(), 2, 20), // Original value since ts=1 < ts=2
                 ("c2".to_string(), "s2".to_string(), "k3".to_string(), 3, 60), // Latest value due to equal ts and seqno=s2
             ]
+        );
+    }
+
+    /// Records what the append-only strategy does with a delete block.
+    ///
+    /// It concatenates the data batches and returns, so the delete batches are
+    /// never consulted: a deleted record is still present in the output. This
+    /// test exists to pin that, because it is reachable — the table config
+    /// derives `append_only` whenever meta fields are disabled or no ordering
+    /// field is set, including on merge-on-read tables whose log files carry
+    /// delete blocks.
+    #[test]
+    fn test_append_only_does_not_apply_deletes() {
+        let schema = create_test_schema(false);
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c1", "c1"])),
+                Arc::new(StringArray::from(vec!["s1", "s1"])),
+                Arc::new(StringArray::from(vec!["k1", "k2"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        // A delete of k1 at a later ordering value than the row above.
+        let delete = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c2"])),
+                Arc::new(StringArray::from(vec!["s2"])),
+                Arc::new(StringArray::from(vec!["k1"])),
+                Arc::new(Int32Array::from(vec![9])),
+                Arc::new(Int32Array::from(vec![90])),
+            ],
+        )
+        .unwrap();
+
+        let mut batches = RecordBatches::new_with_data_batches([data]);
+        batches.push_delete_batch(delete, "20240101000000000".to_string());
+
+        let configs = create_configs("APPEND_ONLY", false, None);
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let merged = merger.merge_record_batches(batches).unwrap();
+
+        let keys: Vec<String> = get_sorted_rows(&merged).into_iter().map(|r| r.2).collect();
+        assert_eq!(
+            keys,
+            vec!["k1".to_string(), "k2".to_string()],
+            "k1 was deleted, yet it is still in the output"
         );
     }
 }

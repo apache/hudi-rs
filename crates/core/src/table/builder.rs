@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::config::read::{HudiReadConfig, ReadConfigScope};
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
 use crate::config::{HUDI_CONF_DIR, HudiConfigs};
@@ -105,11 +106,23 @@ impl TableBuilder {
 
         option_resolver.resolve_options().await?;
 
+        // A read config is dropped from the table's own configs only when it
+        // selects WHICH read to perform — those are meaningful per call, and one
+        // baked at table level would silently redirect every later read. The rest
+        // describe HOW to read (which file group reader version, read-optimized,
+        // batch size) and are exactly the kind of thing an operator sets once, in
+        // `hoodie.properties` or `hudi-defaults.conf`; keeping them makes a
+        // table-level setting the default that `ReadOptions` then overrides.
+        //
+        // Dropping them all — which a `hoodie.read.` prefix test did — meant
+        // `hoodie.read.file.group.reader.version` never reached the reader, so
+        // the strict version parse it exists to protect could not fire and a typo
+        // read with the other version after all.
         let hudi_configs = Arc::from(HudiConfigs::new(
             option_resolver
                 .hudi_options
                 .iter()
-                .filter(|(k, _)| !k.starts_with("hoodie.read.")),
+                .filter(|(key, _)| Self::keep_at_table_level(key)),
         ));
 
         let storage_options = Arc::from(self.option_resolver.storage_options.clone());
@@ -128,6 +141,31 @@ impl TableBuilder {
             cached_metadata_table: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             cached_estimator: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         })
+    }
+
+    /// Whether `key` may live on the table's own configs.
+    ///
+    /// Anything that is not a read config is kept. A read config is kept when its
+    /// [`ReadConfigScope`] says it describes how to read; a per-read-only one is
+    /// dropped with a warning, because it was almost certainly meant for
+    /// [`ReadOptions`](crate::table::ReadOptions) and would otherwise be ignored
+    /// in silence.
+    ///
+    /// Dropping rather than erroring: `hudi_options` is a merge of the user's
+    /// options, `hoodie.properties`, and `hudi-defaults.conf`, so an error here
+    /// would make a table unopenable because of a file the caller may not
+    /// control.
+    fn keep_at_table_level(key: &str) -> bool {
+        match HudiReadConfig::scope_of_key(key) {
+            None | Some(ReadConfigScope::TableOrRead) => true,
+            Some(ReadConfigScope::ReadOnly) => {
+                log::warn!(
+                    "ignoring '{key}' set at table level: it selects which read to perform, so \
+                     it is only meaningful per read — pass it through ReadOptions instead"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -453,6 +491,64 @@ mod tests {
         unsafe {
             std::env::remove_var("HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key");
             std::env::remove_var("AWS_ACCESS_KEY_ID");
+        }
+    }
+
+    /// Regression test: a read config describing HOW to read must survive onto the
+    /// table's own configs; only one selecting WHICH read is dropped.
+    ///
+    /// Everything under `hoodie.read.` used to be filtered out, so
+    /// `hoodie.read.file.group.reader.version` set on the table, in
+    /// `hoodie.properties`, or in `hudi-defaults.conf` never reached the file
+    /// group reader — and because it never reached the reader, the strict parse
+    /// guarding against a typoed version could not fire either.
+    #[test]
+    fn test_keep_at_table_level_keeps_how_to_read_and_drops_which_read() {
+        for config in [
+            HudiReadConfig::FileGroupReaderVersion,
+            HudiReadConfig::UseReadOptimizedMode,
+            HudiReadConfig::MergeUseRecordPositions,
+            HudiReadConfig::StreamBatchSize,
+            HudiReadConfig::InputPartitions,
+            HudiReadConfig::FileSliceReadConcurrency,
+        ] {
+            assert!(
+                TableBuilder::keep_at_table_level(config.as_ref()),
+                "{config} describes how to read and must reach the reader"
+            );
+        }
+
+        for config in [
+            HudiReadConfig::QueryType,
+            HudiReadConfig::AsOfTimestamp,
+            HudiReadConfig::StartTimestamp,
+            HudiReadConfig::EndTimestamp,
+        ] {
+            assert!(
+                !TableBuilder::keep_at_table_level(config.as_ref()),
+                "{config} selects which read to perform and must not be baked onto the table"
+            );
+        }
+
+        // Non-read configs are untouched.
+        assert!(TableBuilder::keep_at_table_level(
+            HudiTableConfig::TableType.as_ref()
+        ));
+        assert!(TableBuilder::keep_at_table_level(
+            "hoodie.memory.merge.max.size"
+        ));
+    }
+
+    /// Every read config must state a scope, so a new one cannot silently
+    /// inherit whatever a prefix rule would have done with its key.
+    #[test]
+    fn test_every_read_config_declares_a_scope() {
+        use strum::IntoEnumIterator;
+        for config in HudiReadConfig::iter() {
+            assert!(
+                HudiReadConfig::scope_of_key(config.as_ref()).is_some(),
+                "{config} must be reachable by key lookup for the table-level filter to see it"
+            );
         }
     }
 }
