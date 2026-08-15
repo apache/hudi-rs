@@ -1403,9 +1403,9 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         // Mirrors Java: getRecordsIterator → getEngineRecordIterator
         //   → readRecordsFromBlockPayload → inflate → deserializeRecords → deflate
         let decode_start = std::time::Instant::now();
-        // Upstream fetches a lazy block's content here. This crate's log file
-        // reader returns blocks with their content already read, so there is
-        // nothing to fetch and the take below finds it present.
+        // Upstream fetches a lazy block's content here. Pass 3 loads it for every
+        // admitted block before dispatch, so there is nothing left to fetch and
+        // the take below finds it present.
         self.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
@@ -1557,9 +1557,9 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// `process_next_deleted_record` for each.
     fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()> {
         let decode_start = std::time::Instant::now();
-        // Upstream fetches a lazy block's content here. This crate's log file
-        // reader returns blocks with their content already read, so there is
-        // nothing to fetch and the take below finds it present.
+        // Upstream fetches a lazy block's content here. Pass 3 loads it for every
+        // admitted block before dispatch, so there is nothing left to fetch and
+        // the take below finds it present.
         self.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {

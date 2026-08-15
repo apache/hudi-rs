@@ -493,42 +493,19 @@ impl BaseHoodieLogRecordReader {
         let hudi_configs = Arc::new(crate::config::HudiConfigs::new(
             self.reader_context.table_config.clone(),
         ));
-        let unbounded_range =
-            InstantRange::new(self.reader_context.timezone(), None, None, false, true);
         profile_once!(self.log_block_read_ms, {
             for path in &self.log_file_paths.clone() {
-                // The sweep reads each log file whole, so blocks arrive with
-                // their content already read — same block set as a bounded
-                // sweep, more memory, but no more than the existing read path
-                // already uses. The bounded-window streaming tier
-                // (`LogFileReader::new_streaming` +
-                // `read_all_blocks_metadata_only`) walks headers only and lets
-                // each admitted block fetch its content in Pass 3; it is not
-                // wired here yet. The range is left unbounded so
-                // the gates below decide what is admitted, rather than filtering
-                // twice with different rules.
-                // A log record can update a row, so a predicate may only be
-                // evaluated before the merge when the merge cannot change its
-                // answer. Log blocks exist only on merge-on-read, so the gate
-                // reduces to a predicate over primary keys, which are immutable
-                // across upserts. Anything else is left for the post-merge
-                // filter.
-                let row_filter = if self.reader_context.can_push_row_filter() {
-                    self.reader_context.row_filter_builder.clone()
-                } else {
-                    None
-                };
+                // Walk headers only, out of a bounded fetch window. Passes 1 and 2
+                // read nothing but a block's header, so the gates below decide what
+                // is admitted before any content is fetched or decoded, and Pass 3
+                // reads each admitted block's own content. A block the gates discard
+                // therefore costs no bytes and cannot fail the read by being
+                // undecodable. No instant range is applied here: the gates decide,
+                // rather than filtering twice with different rules.
                 let mut reader =
-                    LogFileReader::new(hudi_configs.clone(), self.storage.clone(), path)
-                        .await?
-                        .with_row_filter(row_filter)
-                        .with_reader_schema(
-                            self.reader_context
-                                .schema_handler
-                                .reader_schema_json
-                                .clone(),
-                        );
-                let blocks = reader.read_all_blocks(&unbounded_range)?;
+                    LogFileReader::new_streaming(hudi_configs.clone(), self.storage.clone(), path)
+                        .await?;
+                let blocks = reader.read_all_blocks_metadata_only()?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
             }
