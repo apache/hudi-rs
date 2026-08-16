@@ -670,12 +670,23 @@ impl Table {
             Some(opts) => self.prepare_reader_options(opts)?.hudi_options,
             None => HashMap::new(),
         };
-        let mut reader = self.build_file_group_reader(hudi_opts, extra_storage_overrides)?;
+        let reader = self.build_file_group_reader(hudi_opts, extra_storage_overrides)?;
+        self.finish_reader(reader).await
+    }
+
+    /// Carry this table's per-read state onto a freshly built reader.
+    ///
+    /// Every read path needs the same two steps, and a path performing only some
+    /// of them fails silently rather than loudly: without the data schema an
+    /// evolved table reads against the base file's, and without the gate inputs
+    /// the log scan admits uncommitted blocks. Both return plausible rows. So the
+    /// steps live here and each path calls this rather than repeating them.
+    async fn finish_reader(&self, mut reader: FileGroupReader) -> Result<FileGroupReader> {
         reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
         // This table holds the timeline, so it can tell a committed instant from
         // one still inflight — the log-block scan cannot work that out from the
         // slice alone.
-        if let Some(inputs) = self.completion_gate_inputs() {
+        if let Some(inputs) = self.completion_gate_inputs()? {
             reader.set_completion_gate_inputs(inputs);
         }
         Ok(reader)
@@ -691,15 +702,21 @@ impl Table {
     /// built, and asking again per block would be redundant. Below version 8
     /// there are no completion times to build a slice from, which leaves the
     /// block scan as the only place the question can be asked.
-    fn completion_gate_inputs(&self) -> Option<CompletionGateInputs> {
+    ///
+    /// So from version 8 the exclusion rests entirely on the log file's *name*
+    /// carrying the delta commit that wrote it (`file_group::builder`), which
+    /// holds for files a version-8 writer produced. A table upgraded from
+    /// version 6 keeps older log files named on the base instant instead; those
+    /// are attributed by name like any other, and this gate is no longer behind
+    /// them. Java has the same boundary, so this matches it rather than
+    /// improving on it — worth re-checking here if that assumption ever moves.
+    fn completion_gate_inputs(&self) -> Result<Option<CompletionGateInputs>> {
         let table_version: isize = self
             .hudi_configs
-            .try_get(HudiTableConfig::TableVersion)
-            .ok()
-            .flatten()
+            .try_get(HudiTableConfig::TableVersion)?
             .map(|v| v.into())
             .unwrap_or(6);
-        (table_version < 8).then(|| self.timeline.completion_gate_inputs())
+        Ok((table_version < 8).then(|| self.timeline.completion_gate_inputs()))
     }
 
     /// Build a reader for one of this table's own read paths, carrying the
@@ -709,18 +726,11 @@ impl Table {
     /// performed only the first would read an evolved table with a stale schema —
     /// so they share this rather than repeating it.
     async fn reader_for_read_path(&self, prepared: &ReadOptions) -> Result<FileGroupReader> {
-        let mut reader = self.build_file_group_reader(
+        let reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
-        reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
-        // This table holds the timeline, so it can tell a committed instant from
-        // one still inflight — the log-block scan cannot work that out from the
-        // slice alone.
-        if let Some(inputs) = self.completion_gate_inputs() {
-            reader.set_completion_gate_inputs(inputs);
-        }
-        Ok(reader)
+        self.finish_reader(reader).await
     }
 
     /// Convert caller-facing [`ReadOptions`] into the form that
@@ -2479,7 +2489,7 @@ mod tests {
         let table_path = QuickstartTripsTable::V9MorNonpart3Commits.path_to_mor_avro();
         let table = Table::new(&table_path).await.unwrap();
         assert!(
-            table.completion_gate_inputs().is_none(),
+            table.completion_gate_inputs().unwrap().is_none(),
             "a version 9 table must not arm the per-block gate"
         );
 

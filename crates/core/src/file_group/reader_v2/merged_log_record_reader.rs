@@ -274,7 +274,7 @@ pub struct Builder {
     allow_inflight_instants: bool,
     /// Inputs for the Gate-3 completed/inflight check; `Some` only for
     /// table version < 8. `None` (default) leaves Gate 3 a no-op.
-    completion_gate_inputs: Option<CompletionGateInputs>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 }
 
 impl Default for Builder {
@@ -347,7 +347,10 @@ impl Builder {
 
     /// Supply the Gate-3 completed/inflight sets. Callers pass `Some` only for
     /// table version < 8; `None` (the default) leaves Gate 3 disabled.
-    pub fn with_completion_gate_inputs(mut self, inputs: Option<CompletionGateInputs>) -> Self {
+    pub fn with_completion_gate_inputs(
+        mut self,
+        inputs: Option<Arc<CompletionGateInputs>>,
+    ) -> Self {
         self.completion_gate_inputs = inputs;
         self
     }

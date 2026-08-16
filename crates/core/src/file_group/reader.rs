@@ -73,7 +73,7 @@ pub struct FileGroupReader {
     /// below the latest instant and passes every other gate. Only a caller
     /// holding the timeline can supply them; one reading from paths alone (the
     /// cxx bridge) leaves the gate off, as it always was.
-    completion_gate_inputs: Option<CompletionGateInputs>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 }
 
 impl std::fmt::Debug for FileGroupReader {
@@ -234,7 +234,7 @@ impl FileGroupReader {
 
     /// Gate the log-block scan on these committed/inflight sets.
     pub(crate) fn set_completion_gate_inputs(&mut self, inputs: CompletionGateInputs) {
-        self.completion_gate_inputs = Some(inputs);
+        self.completion_gate_inputs = Some(Arc::new(inputs));
     }
 
     /// Read slices with `schema` rather than whatever the base file carries.

@@ -323,14 +323,29 @@ pub enum QuickstartTripsTable {
     // for only one version would leave the other route unexercised.
     //
     // Provenance: `table_uncommitted_log.sql` beside these zips (Spark 3.5.3 /
-    // Hudi 1.2.0-SNAPSHOT). Generated normally, then the last delta commit's
-    // completed timeline file was deleted, leaving its `.inflight` and
-    // `.requested` and its log file in place. gold_data is Spark reading the
-    // table in that state, so it is Hudi's own answer to the doctored layout.
+    // Hudi 1.2.0-SNAPSHOT). Generated normally — a base write then two updates —
+    // after which the *middle* delta commit's completed timeline file was
+    // deleted, leaving its `.inflight` and `.requested` and its log file behind.
+    // gold_data is Spark reading the table in that state, so it is Hudi's own
+    // answer to the doctored layout.
+    //
+    // The middle one, not the last: an orphan at the end sorts above the latest
+    // committed instant, so the future-block gate discards it and the
+    // completed/inflight gate is never reached. The first attempt at this
+    // fixture orphaned the last commit and passed with the gate disarmed —
+    // regenerate it that way and the sweep goes green proving nothing.
+    //
     // Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
-    // Layout: base .parquet (4 rows at ts 100) + log.1 (committed update of `a`
-    // at ts 200) + log.1 (orphaned update of `b` at ts 300).
+    // Layout: base .parquet, 4 rows at ts 100, then two log files — the orphaned
+    // update of `b` at ts 300, then the committed update of `a` at ts 200. The
+    // versions name those files differently, which is the whole point: on v6
+    // both are `.log.1`/`.log.2` carrying the *base* instant, so no file-level
+    // check can attribute either to a delta commit and only the per-block gate
+    // can exclude the orphan; on v9 each is a `.log.1` carrying its own delta
+    // commit, so the orphan's file is dropped when the slice is built.
     // Semantics: `a` takes its update, `b` keeps the base row. gold_data = 4 rows.
+    // The orphan's ts 300 outranks every other row, so an admitted orphan would
+    // win under `preCombineField = 'ts'` — the fixture fails loudly, not silently.
     // -------------------------------------------------------------------------
     /// Table version 6: the orphaned blocks are excluded by the log-block scan's
     /// completed/inflight gate.

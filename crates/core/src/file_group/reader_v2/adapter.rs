@@ -57,7 +57,7 @@ pub(crate) async fn read_file_slice(
     log_file_paths: Vec<String>,
     partition_path: String,
     data_schema: Option<SchemaRef>,
-    completion_gate_inputs: Option<CompletionGateInputs>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<RecordBatch> {
     let mut reader = build_reader(
         hudi_configs,
@@ -84,7 +84,7 @@ pub(crate) async fn read_file_slice_stream(
     log_file_paths: Vec<String>,
     partition_path: String,
     data_schema: Option<SchemaRef>,
-    completion_gate_inputs: Option<CompletionGateInputs>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
     let mut reader = build_reader(
         hudi_configs,
@@ -108,7 +108,7 @@ fn build_reader(
     log_file_paths: Vec<String>,
     partition_path: String,
     data_schema: Option<SchemaRef>,
-    completion_gate_inputs: Option<CompletionGateInputs>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
     let hudi_configs = with_unbounded_end_timestamp(hudi_configs);
