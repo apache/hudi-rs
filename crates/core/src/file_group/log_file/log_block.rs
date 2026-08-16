@@ -333,6 +333,21 @@ impl LogBlock {
         let bytes = fetcher
             .read_content(location.content_position, location.content_length)
             .map_err(CoreError::ReadLogFileError)?;
+        // A ranged read whose end runs past the file is CLAMPED rather than
+        // refused, so an overlong content length comes back as a short buffer.
+        // That length is read straight out of the file and nothing upstream
+        // validates it — `is_block_corrupted` checks the block's outer span, not
+        // this inner field — so decoding the short buffer would fail somewhere
+        // inside the block format rather than naming the real problem.
+        if bytes.len() as u64 != location.content_length {
+            return Err(CoreError::LogBlockError(format!(
+                "ranged read at offset {} returned {} bytes, expected {}: this block's content \
+                 runs past the end of the file (truncated or corrupt block)",
+                location.content_position,
+                bytes.len(),
+                location.content_length,
+            )));
+        }
         let mut reader = std::io::Cursor::new(bytes);
         self.content = decoder.decode_content(
             &mut reader,
@@ -341,6 +356,9 @@ impl LogBlock {
             &self.block_type,
             &self.header,
         )?;
+        // Content is decoded, so the means to fetch it again is dead weight.
+        // Mirrors Java's `deflate()` releasing the block's `byte[]`.
+        self.deferred_content = None;
         Ok(())
     }
 

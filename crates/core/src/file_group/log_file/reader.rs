@@ -788,6 +788,53 @@ mod tests {
         Ok(())
     }
 
+    /// A block whose content runs past the end of the file must say so. The
+    /// ranged read comes back CLAMPED rather than refused, so without a length
+    /// check the decoder is handed a short buffer and fails somewhere inside the
+    /// block format instead. Also pins that a loaded block releases what it
+    /// needed to fetch itself.
+    #[tokio::test]
+    async fn test_load_content_reports_a_block_running_past_the_file_end() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join(&file_name);
+        std::fs::copy(PathBuf::from(&dir).join(&file_name), &copied).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
+        let mut blocks = reader.read_all_blocks_metadata_only()?;
+
+        let block = blocks.last_mut().expect("the fixture has a block to walk");
+        let location = block
+            .deferred_content
+            .as_ref()
+            .expect("a metadata-only block records where its content is")
+            .location
+            .clone();
+
+        // Cut the file one byte short of this block's content so the ranged read
+        // returns less than it asked for.
+        let end = location.content_position + location.content_length;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&copied)
+            .unwrap()
+            .set_len(end - 1)
+            .unwrap();
+
+        let decoder = Decoder::new(hudi_configs);
+        let err = block
+            .load_content(&decoder)
+            .expect_err("content running past the file end must be an error");
+        assert!(
+            err.to_string().contains("truncated or corrupt block"),
+            "the error must name the truncation rather than fail inside the decoder, got: {err}"
+        );
+        Ok(())
+    }
+
     /// A block deferred by the metadata-only pass reads back the same records
     /// the eager path produces. Deferring must change when the bytes are read,
     /// not what they decode to.
@@ -844,6 +891,10 @@ mod tests {
 
         // Already decoded by the eager read: nothing to do.
         blocks[0].load_content(&decoder)?;
+        assert!(
+            blocks[0].deferred_content.is_none(),
+            "an eagerly read block has nothing deferred to release"
+        );
 
         // A block with content cleared and no deferred location cannot say where
         // to read from.
