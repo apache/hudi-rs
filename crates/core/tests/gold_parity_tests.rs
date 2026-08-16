@@ -508,6 +508,14 @@ const KNOWN: &[Known] = &[
     // version 1 does not, which is the divergence itself rather than a fixture
     // flaw. Only the version 6 fixture separates the two readers: on version 9
     // the log file is dropped when the slice is built, which both of them share.
+    //
+    // Unlike the other version 1 entries here, which record a narrower or
+    // differently-shaped answer, this one records a wrong one: rows that were
+    // never committed. It is accepted rather than fixed because version 2 is the
+    // default and version 1 is on its way out. Two things would reopen that: a
+    // version 1 read reachable without asking for it, or version 1 outliving the
+    // migration. Fixing it means giving `LogFileScanner` the instant state its
+    // `scan` has no notion of, which reaches the metadata table reader too.
     Known {
         fixture: "table_uncommitted_log_v6",
         scope: CaseScope::Any,
