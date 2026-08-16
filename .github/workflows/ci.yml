@@ -105,6 +105,15 @@ jobs:
         run: cargo clippy -p hudi-core --lib --no-default-features -- -D warnings
       - name: Unit tests without the spill backend
         run: cargo test -p hudi-core --lib --no-default-features --no-fail-fast
+      # The umbrella crate is where a consumer actually opts out, and it reaches
+      # hudi-core twice: directly, and through hudi-datafusion. Either edge taking
+      # default features hands the tier back without the steps above noticing,
+      # since they only build hudi-core. Both shapes are built here, where there
+      # is no libclang to build rocksdb with.
+      - name: Check the umbrella crate without the spill backend
+        run: cargo check -p hudi --no-default-features
+      - name: Check the umbrella crate without the spill backend, with datafusion
+        run: cargo check -p hudi --no-default-features --features datafusion
 
   rust-tests-windows:
     runs-on: windows-2025
