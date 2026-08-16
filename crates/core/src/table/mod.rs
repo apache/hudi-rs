@@ -107,6 +107,7 @@ use crate::error::CoreError;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
@@ -674,8 +675,31 @@ impl Table {
         // This table holds the timeline, so it can tell a committed instant from
         // one still inflight — the log-block scan cannot work that out from the
         // slice alone.
-        reader.set_completion_gate_inputs(self.timeline.completion_gate_inputs());
+        if let Some(inputs) = self.completion_gate_inputs() {
+            reader.set_completion_gate_inputs(inputs);
+        }
         Ok(reader)
+    }
+
+    /// Inputs for the log-block scan's completed/inflight gate, or `None` when
+    /// this table does not need one.
+    ///
+    /// Mirrors Java `BaseHoodieLogRecordReader`, which runs the check only below
+    /// table version 8 (`tableVersion.lesserThan(HoodieTableVersion.EIGHT)`).
+    /// From version 8 the timeline records completion times, so a log file whose
+    /// delta commit never completed is already dropped when the file slice is
+    /// built, and asking again per block would be redundant. Below version 8
+    /// there are no completion times to build a slice from, which leaves the
+    /// block scan as the only place the question can be asked.
+    fn completion_gate_inputs(&self) -> Option<CompletionGateInputs> {
+        let table_version: isize = self
+            .hudi_configs
+            .try_get(HudiTableConfig::TableVersion)
+            .ok()
+            .flatten()
+            .map(|v| v.into())
+            .unwrap_or(6);
+        (table_version < 8).then(|| self.timeline.completion_gate_inputs())
     }
 
     /// Build a reader for one of this table's own read paths, carrying the
@@ -693,7 +717,9 @@ impl Table {
         // This table holds the timeline, so it can tell a committed instant from
         // one still inflight — the log-block scan cannot work that out from the
         // slice alone.
-        reader.set_completion_gate_inputs(self.timeline.completion_gate_inputs());
+        if let Some(inputs) = self.completion_gate_inputs() {
+            reader.set_completion_gate_inputs(inputs);
+        }
         Ok(reader)
     }
 
@@ -2437,6 +2463,33 @@ mod tests {
         assert!(
             reader.has_completion_gate_inputs(),
             "a reader built from a table must be able to gate the log scan"
+        );
+    }
+
+    /// From table version 8 the timeline records completion times, so a log file
+    /// whose delta commit never completed is already dropped when the file slice
+    /// is built. Java stops applying the per-block gate there
+    /// (`BaseHoodieLogRecordReader`, `tableVersion.lesserThan(EIGHT)`), and so
+    /// does this. Paired with the version-6 test above, the two pin the
+    /// condition rather than only the armed case.
+    #[tokio::test]
+    async fn test_completion_gate_is_not_armed_from_table_version_eight() {
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::V9MorNonpart3Commits.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        assert!(
+            table.completion_gate_inputs().is_none(),
+            "a version 9 table must not arm the per-block gate"
+        );
+
+        let reader = table
+            .create_file_group_reader_with_options(None, empty_options())
+            .await
+            .unwrap();
+        assert!(
+            !reader.has_completion_gate_inputs(),
+            "the slice already excludes an uncommitted log file on this layout"
         );
     }
 
