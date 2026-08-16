@@ -357,8 +357,14 @@ impl LogBlock {
             &self.header,
         )?;
         // Content is decoded, so the means to fetch it again is dead weight.
-        // Mirrors Java's `deflate()` releasing the block's `byte[]`.
-        self.deferred_content = None;
+        // Mirrors Java's `deflate()` releasing the block's `byte[]`. A block that
+        // decodes to no content keeps its location: a command block decodes to
+        // `Empty`, which is indistinguishable here from never having been loaded,
+        // so releasing it there would turn a second call into an error rather
+        // than the no-op it is.
+        if !self.content.is_empty() {
+            self.deferred_content = None;
+        }
         Ok(())
     }
 
