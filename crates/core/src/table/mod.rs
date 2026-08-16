@@ -1848,6 +1848,57 @@ mod tests {
         Ok(())
     }
 
+    /// The streaming read carries the completion gate too.
+    ///
+    /// It reaches the gate through its own pass-through, separate from the eager read's, and
+    /// it is the path DataFusion and the Python binding use. The gold sweep only exercises
+    /// the eager one, so without this a regression that disarmed the gate for every streaming
+    /// read would leave the whole suite green — which is exactly what a mutation of the
+    /// streaming pass-through did before this test existed.
+    ///
+    /// The fixture's orphaned delta commit sets `rider = 'ORPHANED-B'` at `ts = 300`, above
+    /// every other row's ordering value, so an admitted orphan wins the row outright rather
+    /// than losing the merge for an unrelated reason.
+    #[tokio::test]
+    async fn hudi_table_read_stream_excludes_an_uncommitted_instants_blocks() -> Result<()> {
+        use arrow_array::Array;
+        use futures::TryStreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        let base_url = QuickstartTripsTable::MorUncommittedLogV6.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let stream = hudi_table.read_stream(&ReadOptions::new()).await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        let riders: Vec<String> = batches
+            .iter()
+            .filter_map(|b| b.column_by_name("rider").cloned())
+            .flat_map(|c| {
+                let arr = c
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .expect("rider is a string column")
+                    .clone();
+                (0..arr.len()).map(move |i| arr.value(i).to_string())
+            })
+            .collect();
+
+        assert!(
+            !riders.is_empty(),
+            "the streaming read returned no rows, so it cannot show the gate ran"
+        );
+        assert!(
+            !riders.iter().any(|r| r == "ORPHANED-B"),
+            "the streaming read merged a block from an instant that never completed: {riders:?}"
+        );
+        assert!(
+            riders.iter().any(|r| r == "rider-B"),
+            "the base row the orphan would have overwritten must survive: {riders:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn hudi_table_read_snapshot_stream_returns_empty_when_no_file_slices_match_filters()
     -> Result<()> {
