@@ -835,6 +835,32 @@ mod tests {
         Ok(())
     }
 
+    /// Loading is a no-op the second time. A block that decodes to no content —
+    /// a command block does — looks unloaded afterwards, so releasing its
+    /// location on the way out would make the second call fail instead.
+    #[tokio::test]
+    async fn test_load_content_is_idempotent_for_every_block_type() -> Result<()> {
+        let (dir, file_name) = get_valid_log_rollback();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(&dir)?)?;
+        let mut reader =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
+        let mut blocks = reader.read_all_blocks_metadata_only()?;
+        assert!(
+            blocks.iter().any(|b| b.block_type == BlockType::Command),
+            "this fixture is chosen for its command block, which decodes to no content"
+        );
+
+        let decoder = Decoder::new(hudi_configs);
+        for block in blocks.iter_mut() {
+            block.load_content(&decoder)?;
+            block
+                .load_content(&decoder)
+                .expect("loading an already-loaded block must be a no-op, whatever it decoded to");
+        }
+        Ok(())
+    }
+
     /// A block deferred by the metadata-only pass reads back the same records
     /// the eager path produces. Deferring must change when the bytes are read,
     /// not what they decode to.
