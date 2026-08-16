@@ -502,6 +502,18 @@ impl Known {
 /// disagreement fails the build, and one that starts passing has to be removed
 /// from here, so this list cannot quietly go stale.
 const KNOWN: &[Known] = &[
+    // Version 1 only: it applies no completed/inflight check to log blocks, so
+    // the blocks of a delta commit that never completed still reach the merge.
+    // The fixture exists to pin that version 2 does check; this records that
+    // version 1 does not, which is the divergence itself rather than a fixture
+    // flaw. Only the version 6 fixture separates the two readers: on version 9
+    // the log file is dropped when the slice is built, which both of them share.
+    Known {
+        fixture: "table_uncommitted_log_v6",
+        scope: CaseScope::Any,
+        reader_version: "1",
+        reason: "version 1 admits blocks from an instant that never completed",
+    },
     // Version 1 only: it now reads a log-only slice but returns it without the
     // base columns. Nothing it is asked to project changes that, so the
     // fixture is blanketed.
