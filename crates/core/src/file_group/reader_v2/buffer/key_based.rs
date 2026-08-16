@@ -6213,7 +6213,10 @@ mod tests {
     }
 
     fn build_pu_event_buffer() -> KeyBasedFileGroupRecordBuffer {
-        let merge_mode = "EVENT_TIME_ORDERING";
+        build_pu_buffer("EVENT_TIME_ORDERING")
+    }
+
+    fn build_pu_buffer(merge_mode: &str) -> KeyBasedFileGroupRecordBuffer {
         let mut ctx = ReaderContext::empty();
         ctx.table_config.insert(
             HudiTableConfig::OrderingFields.as_ref().to_string(),
@@ -6399,6 +6402,68 @@ mod tests {
             pu_event_drain(buffer),
             (9, 99, Some("late".to_string())),
             "ts=5 loses to the union's winner ordering of 9"
+        );
+    }
+
+    /// EVENT_TIME, incoming wins: on a column BOTH partials carry, the winner's
+    /// value survives. The mirror of the stale-loses tests above, which use
+    /// disjoint columns and so cannot see the overlay direction at all.
+    #[test]
+    fn test_partial_update_event_time_newer_wins_overlapping_column() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("keep".to_string())),
+            "both partials carry `a`; the ts=9 winner's value must survive, not the ts=2 loser's"
+        );
+    }
+
+    /// EVENT_TIME, incoming wins: the folded union carries the WINNER's ordering
+    /// value, so a later write between the two loses. Mirrors
+    /// `test_partial_update_event_time_fold_keeps_winner_ordering`, which pins
+    /// the same property on the other arm.
+    #[test]
+    fn test_partial_update_event_time_newer_wins_fold_keeps_winner_ordering() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 5, 55), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("keep".to_string())),
+            "ts=5 loses to a union whose winner sat at ts=9, not to the ts=2 loser it folded"
+        );
+    }
+
+    /// COMMIT_TIME_ORDERING is last-writer-wins, so a later partial update wins
+    /// even when its ordering value went DOWN. Without the short-circuit the
+    /// ordering comparison would hand it to the earlier record, which is
+    /// event-time behavior on a commit-time table.
+    #[test]
+    fn test_partial_update_commit_time_later_write_wins_a_lower_ordering_value() {
+        let mut buffer = build_pu_buffer("COMMIT_TIME_ORDERING");
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (2, 11, Some("keep".to_string())),
+            "last writer wins on a commit-time table, whichever way the ordering value moved"
         );
     }
 
