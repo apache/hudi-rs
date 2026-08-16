@@ -114,6 +114,8 @@ const EXPECTED_OPTION_FIXTURES: &[&str] = &[
     "table_null_containers [MorAvro]",
     "table_parquet_log_block [MorAvro]",
     "table_partial_update [MorAvro]",
+    "table_uncommitted_log_v6 [MorAvro]",
+    "table_uncommitted_log_v9 [MorAvro]",
     "v6_trips_8i1u [MorAvro]",
     "v6_trips_8i3d [MorAvro]",
     "v8_mor_boundary_windows [MorAvro]",

@@ -82,6 +82,16 @@ pub struct Timeline {
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
+
+/// The actions a read loads from the timeline.
+///
+/// Narrowing this is no longer only a listing decision: [`Timeline::completion_gate_inputs`]
+/// derives the log scan's committed set from these, so an action that completes outside this
+/// list and wrote data or delete log blocks would have its rows dropped from a merge-on-read
+/// read — silently, since the gate excludes rather than errors. The three here cover every
+/// action that writes such blocks (compaction completes as `commit`, clustering as
+/// `replacecommit`, log compaction as `deltacommit`), which is also the set Java's gate is
+/// built from via `getCommitsTimeline()`.
 pub const DEFAULT_LOADING_ACTIONS: &[Action] =
     &[Action::Commit, Action::DeltaCommit, Action::ReplaceCommit];
 

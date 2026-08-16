@@ -704,12 +704,15 @@ impl Table {
     /// block scan as the only place the question can be asked.
     ///
     /// So from version 8 the exclusion rests entirely on the log file's *name*
-    /// carrying the delta commit that wrote it (`file_group::builder`), which
-    /// holds for files a version-8 writer produced. A table upgraded from
-    /// version 6 keeps older log files named on the base instant instead; those
-    /// are attributed by name like any other, and this gate is no longer behind
-    /// them. Java has the same boundary, so this matches it rather than
-    /// improving on it — worth re-checking here if that assumption ever moves.
+    /// carrying the delta commit that wrote it (`file_group::builder`). A table
+    /// upgraded from version 6 would seem to break that, since a version-6
+    /// writer names log files on the base instant — but the writer's upgrade
+    /// closes it from the other side, two ways: it rolls back failed writes and
+    /// compacts every log file into a new base file before bumping the version,
+    /// and where the pending commit has completed commits after it, rollback is
+    /// refused and the upgrade aborts rather than proceeding. Either way no
+    /// version-6-named log file reaches a version-8 slice. Verified by running
+    /// both paths on Spark 3.5.3 with Hudi 1.2.0-SNAPSHOT.
     fn completion_gate_inputs(&self) -> Result<Option<CompletionGateInputs>> {
         let table_version: isize = self
             .hudi_configs
