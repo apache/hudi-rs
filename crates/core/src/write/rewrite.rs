@@ -1461,7 +1461,7 @@ async fn complete_deltacommit(
     } else {
         metadata.to_json_bytes()?
     };
-    storage.put_file(&path, bytes).await?;
+    storage.put_file_if_absent(&path, bytes).await?;
     Ok(())
 }
 
@@ -2263,7 +2263,7 @@ async fn rewrite(
     };
     let commit = Instant::new_completed(instant.to_string(), action, completed)?;
     let path = commit.relative_path_with_base(&timeline_dir(table))?;
-    if let Err(error) = storage.put_file(&path, bytes).await {
+    if let Err(error) = storage.put_file_if_absent(&path, bytes).await {
         for path in written_paths {
             let _ = storage.delete_file(&path).await;
         }

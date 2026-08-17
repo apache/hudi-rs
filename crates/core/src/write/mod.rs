@@ -131,14 +131,16 @@ pub(crate) async fn fence_timeline_instant(
     }
     .map_err(|e| CoreError::Write(format!("invalid fencing instant: {e}")))?;
 
+    // Create-if-absent: a second writer minting the same instant must surface
+    // as a conflict here, not silently share (and later clobber) the instant.
     storage
-        .put_file(
+        .put_file_if_absent(
             &requested.relative_path_with_base(timeline_dir)?,
             requested_bytes,
         )
         .await?;
     storage
-        .put_file(
+        .put_file_if_absent(
             &inflight.relative_path_with_base(timeline_dir)?,
             inflight_bytes,
         )
@@ -384,4 +386,44 @@ pub(crate) fn build_delete_log_block(
         ]),
         &content,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two writers fencing the same instant: the second must get a conflict,
+    /// not silently share the instant.
+    #[tokio::test]
+    async fn test_fence_timeline_instant_conflicts_on_same_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+
+        fence_timeline_instant(
+            &storage,
+            ".hoodie/timeline",
+            "20260101000000000",
+            Action::Commit,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let err = fence_timeline_instant(
+            &storage,
+            ".hoodie/timeline",
+            "20260101000000000",
+            Action::Commit,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected instant conflict, got: {err}"
+        );
+    }
 }

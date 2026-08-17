@@ -966,7 +966,7 @@ pub(crate) async fn write_metadata_commit(
     let completion = crate::write::append::generate_instant_time().await;
     let completed_path = format!("{timeline}/{instant}_{completion}.deltacommit");
     storage
-        .put_file(&completed_path, metadata.to_avro_bytes()?)
+        .put_file_if_absent(&completed_path, metadata.to_avro_bytes()?)
         .await?;
     Ok(())
 }

@@ -196,13 +196,13 @@ async fn rollback_instant(
         version: Some(1),
     };
     storage
-        .put_file(
+        .put_file_if_absent(
             &format!("{timeline_dir}/{rollback_ts}.rollback.requested"),
             plan.to_avro_bytes()?,
         )
         .await?;
     storage
-        .put_file(
+        .put_file_if_absent(
             &format!("{timeline_dir}/{rollback_ts}.rollback.inflight"),
             Vec::new(),
         )
@@ -234,7 +234,7 @@ async fn rollback_instant(
         rollback_ts.clone()
     };
     storage
-        .put_file(
+        .put_file_if_absent(
             &format!("{timeline_dir}/{rollback_ts}_{completion}.rollback"),
             metadata.to_avro_bytes()?,
         )

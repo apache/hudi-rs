@@ -426,7 +426,10 @@ async fn append_batches_inner(
     };
     let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
     let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
-    if let Err(error) = storage.put_file(&commit_relative_path, commit_bytes).await {
+    if let Err(error) = storage
+        .put_file_if_absent(&commit_relative_path, commit_bytes)
+        .await
+    {
         for path in &written_paths {
             let _ = storage.delete_file(path).await;
         }
