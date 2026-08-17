@@ -119,9 +119,36 @@ jobs:
       # so it keeps working if this job ever gains a C++ toolchain.
       - name: Assert the opt-out drops rocksdb from the dependency graph
         run: |
+          # A graph assertion has two ways to look like it passed: the tier
+          # really is gone, or cargo tree never ran. `-i` exits non-zero with an
+          # empty stdout in BOTH cases, so neither the output nor the status
+          # alone tells them apart, and discarding stderr makes a broken command
+          # indistinguishable from a working opt-out. Each check below therefore
+          # pins the specific reason rather than inferring from emptiness.
+
+          # Under defaults the tier must be reachable. If this ever stops
+          # holding, the absence checks below are asserting nothing.
+          for args in "" "--features datafusion"; do
+            if ! out=$(cargo tree -p hudi $args -i rocksdb 2>&1) \
+               || ! printf '%s\n' "$out" | grep -q '^rocksdb'; then
+              echo "cargo tree did not find rocksdb under default features: '$args'"
+              echo "so the absence checks below cannot tell an opt-out from a broken command"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+          done
+
+          # With the opt-out it must be gone — and gone because the package is
+          # absent from the graph, which cargo says in those words, not because
+          # the command failed for some other reason.
           for args in "--no-default-features" "--no-default-features --features datafusion"; do
-            if cargo tree -p hudi $args -i rocksdb 2>/dev/null | grep -q '^rocksdb'; then
+            if out=$(cargo tree -p hudi $args -i rocksdb 2>&1); then
               echo "rocksdb is still reachable from hudi with: $args"
+              printf '%s\n' "$out"
+              exit 1
+            elif ! printf '%s\n' "$out" | grep -q 'did not match any packages'; then
+              echo "cargo tree failed for a reason other than rocksdb being absent: '$args'"
+              printf '%s\n' "$out"
               exit 1
             fi
           done
