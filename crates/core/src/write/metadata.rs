@@ -673,11 +673,16 @@ async fn compute_partition_stats_records(
     // Files still live in the latest pre-commit file slices of touched partitions.
     let mut survivors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for slice in table.get_file_slices(&ReadOptions::new()).await? {
-        let (partition, base_name) = split_partition_and_name(&slice.base_file_relative_path()?);
+        let partition = slice.partition_path.clone();
         if !touched.contains(&partition) {
             continue;
         }
-        let mut names = vec![base_name];
+        // Log-only slices contribute no base file name.
+        let mut names = Vec::new();
+        if let Some(base_path) = slice.base_file_relative_path()? {
+            let (_, base_name) = split_partition_and_name(&base_path);
+            names.push(base_name);
+        }
         for log_file in &slice.log_files {
             let (_, log_name) = split_partition_and_name(&slice.log_file_relative_path(log_file)?);
             names.push(log_name);

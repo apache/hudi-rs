@@ -714,7 +714,9 @@ fn ensure_supported_merge_configs(table: &Table) -> Result<()> {
 struct MorFileLocation {
     file_id: String,
     partition_path: String,
-    base_file_path: String,
+    /// `None` for a log-only file group (e.g. a Spark delta commit that
+    /// appended logs before any base file existed).
+    base_file_path: Option<String>,
     base_instant: String,
 }
 
@@ -729,7 +731,7 @@ async fn mor_file_locations(
             (slice.partition_path.clone(), slice.file_id().to_string()),
             (
                 slice.base_file_relative_path()?,
-                slice.base_file.commit_timestamp.clone(),
+                slice.creation_instant_time().to_string(),
             ),
         );
     }
@@ -888,8 +890,14 @@ async fn mor_upsert_batches(
             base_by_group.insert(
                 (partition.clone(), slice.file_id().to_string()),
                 (
-                    slice.base_file.file_name(),
-                    slice.base_file.commit_timestamp.clone(),
+                    // Empty for log-only groups; the delta write stat's
+                    // `baseFile` is empty in that case, matching Java.
+                    slice
+                        .base_file
+                        .as_ref()
+                        .map(|base_file| base_file.file_name())
+                        .unwrap_or_default(),
+                    slice.creation_instant_time().to_string(),
                 ),
             );
         }
@@ -1297,11 +1305,20 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         written_paths.push(log_file.clone());
         deleted += keys.len();
         files_mdt.push((partition_path.clone(), log_name.clone(), size, false));
-        let base_basename = std::path::Path::new(&location.base_file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(location.base_file_path.as_str())
-            .to_string();
+        // Empty when the file group is log-only: Java's delta write stat leaves
+        // `baseFile` empty in that case and the file-group builder treats it as
+        // an unattached log file.
+        let base_basename = location
+            .base_file_path
+            .as_deref()
+            .map(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string()
+            })
+            .unwrap_or_default();
         stats.push(HoodieWriteStat {
             file_id: Some(file_id),
             path: Some(log_file.clone()),
@@ -1517,10 +1534,12 @@ async fn data_for_file_ids(
         return Ok((None, Vec::new(), Vec::new(), Vec::new()));
     }
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let reader = table.create_file_group_reader_with_options(
-        Some(&ReadOptions::new()),
-        std::iter::empty::<(&str, String)>(),
-    )?;
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
     let mut batches = Vec::new();
     let mut kept_ids = Vec::new();
     let mut kept_paths = Vec::new();
@@ -1530,7 +1549,12 @@ async fn data_for_file_ids(
             continue;
         }
         kept_ids.push(slice.file_id().to_string());
-        kept_paths.push(slice.base_file_relative_path()?);
+        kept_paths.push(slice.base_file_relative_path()?.ok_or_else(|| {
+            CoreError::Write(format!(
+                "copy-on-write file slice for file group '{}' has no base file",
+                slice.file_id()
+            ))
+        })?);
         let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
         row_file_ids.extend(std::iter::repeat_n(
             slice.file_id().to_string(),
@@ -1556,10 +1580,12 @@ async fn data_for_partitions(
         return Ok((None, Vec::new(), Vec::new()));
     }
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let reader = table.create_file_group_reader_with_options(
-        Some(&ReadOptions::new()),
-        std::iter::empty::<(&str, String)>(),
-    )?;
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
     let mut batches = Vec::new();
     let mut kept_ids = Vec::new();
     let mut kept_paths = Vec::new();
@@ -1568,7 +1594,12 @@ async fn data_for_partitions(
             continue;
         }
         kept_ids.push(slice.file_id().to_string());
-        kept_paths.push(slice.base_file_relative_path()?);
+        kept_paths.push(slice.base_file_relative_path()?.ok_or_else(|| {
+            CoreError::Write(format!(
+                "copy-on-write file slice for file group '{}' has no base file",
+                slice.file_id()
+            ))
+        })?);
         batches.push(reader.read_file_slice(&slice, &ReadOptions::new()).await?);
     }
     Ok((

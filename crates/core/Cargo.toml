@@ -75,7 +75,6 @@ strum = { workspace = true }
 strum_macros = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-base64 = { workspace = true }
 md-5 = { workspace = true }
 xxhash-rust = { workspace = true }
 

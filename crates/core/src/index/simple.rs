@@ -62,7 +62,8 @@ impl HoodieIndex for SimpleIndex {
         }
         let fallback_key = &record_key_fields[0];
         let reader = table
-            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())?;
+            .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+            .await?;
         let mut by_record_key: HashMap<String, RecordLocation> = HashMap::new();
         for slice in table.get_file_slices(&ReadOptions::new()).await? {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;

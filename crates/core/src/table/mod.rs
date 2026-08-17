@@ -1115,7 +1115,7 @@ impl Table {
         else {
             return Ok(None);
         };
-        let end = format_timestamp(&end, &timezone)?;
+        let end = format_timestamp(end, &timezone)?;
         let start = options
             .start_timestamp()
             .unwrap_or(EARLIEST_START_TIMESTAMP);

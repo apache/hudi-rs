@@ -1189,8 +1189,13 @@ async fn test_mor_delete_then_upsert_same_key_visible() {
         .await
         .unwrap();
     table.delete("id = 'a'").await.unwrap();
+    // The re-insert's ordering value must beat the deleted row's (20 > 10):
+    // under event-time ordering a late-arriving upsert loses to the base
+    // record even across a delete (the tombstone is consumed in the log
+    // buffer and the base wins the final merge — Java
+    // `BufferedRecordMergerFactory` semantics).
     table
-        .upsert([ordered_batch(vec![("a", 2, 5)])])
+        .upsert([ordered_batch(vec![("a", 2, 20)])])
         .await
         .unwrap();
     assert_eq!(

@@ -181,12 +181,6 @@ impl CompletionTimeView for TimelineView {
             None => false,
         }
     }
-
-    fn is_committed_by_archival(&self, request_timestamp: &str) -> bool {
-        self.archival_floor
-            .as_deref()
-            .is_some_and(|floor| request_timestamp < floor)
-    }
 }
 
 #[cfg(test)]

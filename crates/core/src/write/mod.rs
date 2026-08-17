@@ -335,7 +335,29 @@ pub(crate) fn build_delete_log_block(
                 ),
                 (
                     "orderingVal".to_string(),
-                    AvroValue::Union(2, Box::new(AvroValue::Long(ordering_val))),
+                    // Java wraps ordering primitives in wrapper records inside
+                    // the union. `HoodieRecord.DEFAULT_ORDERING_VALUE` (0,
+                    // commit-time fallback) is an Integer serialized via
+                    // IntWrapper (union position 2); readers only treat the
+                    // Int32 zero as the default. A real bigint ordering value
+                    // goes through LongWrapper (position 3).
+                    if ordering_val == 0 {
+                        AvroValue::Union(
+                            2,
+                            Box::new(AvroValue::Record(vec![(
+                                "value".to_string(),
+                                AvroValue::Int(0),
+                            )])),
+                        )
+                    } else {
+                        AvroValue::Union(
+                            3,
+                            Box::new(AvroValue::Record(vec![(
+                                "value".to_string(),
+                                AvroValue::Long(ordering_val),
+                            )])),
+                        )
+                    },
                 ),
             ])
         })

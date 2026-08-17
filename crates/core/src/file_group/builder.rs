@@ -84,8 +84,8 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
         let mut file_group = FileGroup::new(file_id.clone(), partition.clone());
 
         // Resolve the base file name: MOR write stats record `baseFile`; COW write
-        // stats record `path` (`<partition>/<file>`). Either way, derive the
-        // basename only — never keep a partition prefix in BaseFile.
+        // stats record `path` (`<partition>/<file>`). Either way, derive the file
+        // name string used to construct the BaseFile.
         let base_file_name: Option<String> = match write_stat.base_file.as_deref() {
             // A delta commit that only appends to a file group leaves `baseFile`
             // empty and points `path` at the log file it wrote. That is not a
@@ -105,13 +105,7 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
                     Some(name.to_string())
                 }
             }
-            Some(name) => Some(
-                Path::new(name)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(name)
-                    .to_string(),
-            ),
+            Some(name) => Some(name.to_string()),
         };
 
         let Some(base_file_name) = base_file_name else {
@@ -160,11 +154,7 @@ pub(crate) fn file_groups_from_commit_metadata_with_estimator<V: CompletionTimeV
         // Log files are only present in MOR write stats (the `baseFile` branch).
         if let Some(log_file_names) = &write_stat.log_files {
             for log_file_name in log_file_names {
-                let log_basename = Path::new(log_file_name)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(log_file_name.as_str());
-                let mut log_file = LogFile::from_str(log_basename)?;
+                let mut log_file = LogFile::from_str(log_file_name)?;
                 log_file.set_completion_time(completion_time_view);
                 file_group.add_log_file(log_file)?;
             }

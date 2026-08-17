@@ -176,8 +176,8 @@ pub(crate) fn small_file_groups(
     for slice in slices {
         let base_size = slice
             .base_file
-            .file_metadata
             .as_ref()
+            .and_then(|base_file| base_file.file_metadata.as_ref())
             .map(|m| m.size as i64)
             .unwrap_or(0);
         let size = if is_mor {
@@ -260,12 +260,10 @@ pub(crate) async fn latest_slices_by_partition(
         .await?;
     let mut by_partition: HashMap<String, Vec<FileSlice>> = HashMap::new();
     for slice in slices {
-        let partition = slice
-            .base_file_relative_path()?
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default();
-        by_partition.entry(partition).or_default().push(slice);
+        by_partition
+            .entry(slice.partition_path.clone())
+            .or_default()
+            .push(slice);
     }
     Ok(by_partition)
 }
