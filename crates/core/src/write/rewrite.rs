@@ -328,10 +328,9 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
 
     if table.is_mor() {
         ensure_mor_merge_supported(table)?;
-        let (Some(old), _, _, _) = current_data(table).await? else {
+        let Some((old, _, _, _)) = data_for_filter_matches(table, &filter).await? else {
             return Ok(WriteResult::default());
         };
-        validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
         let mask = filters_to_row_mask(&[filter], &old)?;
         let key_name = record_key_name(table, &old).map_err(|_| {
             CoreError::Unsupported(
@@ -356,12 +355,25 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
         return mor_delete_keys(table, &delete_key_list).await;
     }
 
-    // COW scan path — any column; no configured record key required.
+    // COW scan path — any column; no configured record key required. Only
+    // the file groups containing matching rows are loaded and rewritten.
     ensure_rewrite_supported(table)?;
-    let (Some(old), file_ids, old_paths, old_row_file_ids) = current_data(table).await? else {
+    let Some((old, file_ids, old_paths, old_row_file_ids)) =
+        data_for_filter_matches(table, &filter).await?
+    else {
         return Ok(WriteResult::default());
     };
-    validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
+    let old_paths = old_paths
+        .into_iter()
+        .zip(&file_ids)
+        .map(|(path, file_id)| {
+            path.ok_or_else(|| {
+                CoreError::Write(format!(
+                    "copy-on-write file slice for file group '{file_id}' has no base file"
+                ))
+            })
+        })
+        .collect::<Result<Vec<String>>>()?;
     let mask = filters_to_row_mask(&[filter], &old)?;
     let deleted_indices = mask
         .iter()
@@ -436,10 +448,22 @@ pub async fn update_filter(
         return mor_update_filter(table, filter, updates).await;
     }
     ensure_rewrite_supported(table)?;
-    let (Some(old), file_ids, old_paths, old_row_file_ids) = current_data(table).await? else {
+    let Some((old, file_ids, old_paths, old_row_file_ids)) =
+        data_for_filter_matches(table, &filter).await?
+    else {
         return Ok(WriteResult::default());
     };
-    validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
+    let old_paths = old_paths
+        .into_iter()
+        .zip(&file_ids)
+        .map(|(path, file_id)| {
+            path.ok_or_else(|| {
+                CoreError::Write(format!(
+                    "copy-on-write file slice for file group '{file_id}' has no base file"
+                ))
+            })
+        })
+        .collect::<Result<Vec<String>>>()?;
     let mask = filters_to_row_mask(&[filter], &old)?;
     let (merged, num_updates) = apply_set_updates(&old, &mask, &updates)?;
     if num_updates == 0 {
@@ -1215,10 +1239,9 @@ async fn mor_update_filter(
 ) -> Result<WriteResult> {
     ensure_mor_merge_supported(table)?;
     ensure_configured_record_key(table)?;
-    let (Some(old), _, _, _) = current_data(table).await? else {
+    let Some((old, _, _, _)) = data_for_filter_matches(table, &filter).await? else {
         return Ok(WriteResult::default());
     };
-    validate_fields_against_schemas(std::slice::from_ref(&filter), [old.schema().as_ref()])?;
     let mask = filters_to_row_mask(&[filter], &old)?;
     let (merged, num_updates) = apply_set_updates(&old, &mask, &updates)?;
     if num_updates == 0 {
@@ -1609,6 +1632,66 @@ async fn data_for_partitions(
         kept_ids,
         kept_paths,
     ))
+}
+
+/// Load only the file groups holding rows that match `filter`, with per-row
+/// origin file ids parallel to the concatenated batch (P1-2: expression
+/// update/delete must rewrite the affected groups, not the whole table).
+///
+/// Scans slice by slice, so peak memory holds the affected groups plus one
+/// transient slice. `filter` is validated against the first non-empty slice's
+/// schema. Base paths are `None` for log-only MOR groups; COW callers convert
+/// that to an error. Returns `Ok(None)` when no row matches (no commit).
+#[allow(clippy::type_complexity)]
+async fn data_for_filter_matches(
+    table: &Table,
+    filter: &Filter,
+) -> Result<Option<(RecordBatch, Vec<String>, Vec<Option<String>>, Vec<String>)>> {
+    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
+    let mut batches = Vec::new();
+    let mut kept_ids = Vec::new();
+    let mut kept_paths = Vec::new();
+    let mut row_file_ids = Vec::new();
+    let mut validated = false;
+    for slice in slices {
+        let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if !validated {
+            validate_fields_against_schemas(
+                std::slice::from_ref(filter),
+                [batch.schema().as_ref()],
+            )?;
+            validated = true;
+        }
+        let mask = filters_to_row_mask(std::slice::from_ref(filter), &batch)?;
+        if !mask.iter().any(|m| m.unwrap_or(false)) {
+            continue;
+        }
+        kept_ids.push(slice.file_id().to_string());
+        kept_paths.push(slice.base_file_relative_path()?);
+        row_file_ids.extend(std::iter::repeat_n(
+            slice.file_id().to_string(),
+            batch.num_rows(),
+        ));
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((
+        concat(&batches)?,
+        kept_ids,
+        kept_paths,
+        row_file_ids,
+    )))
 }
 
 fn concat(batches: &[RecordBatch]) -> Result<RecordBatch> {

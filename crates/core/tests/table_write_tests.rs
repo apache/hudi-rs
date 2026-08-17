@@ -1374,3 +1374,56 @@ async fn test_cow_delete_emptying_one_group_writes_empty_base() {
         "sf group should have the original base plus an empty rewrite, saw {sf_files:?}"
     );
 }
+
+/// P1-2: an expression delete must rewrite ONLY the file groups holding
+/// matching rows — file groups in other partitions keep their base files
+/// byte-identical (no whole-table rewrite).
+#[tokio::test]
+async fn test_expression_delete_rewrites_only_affected_file_groups() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([partitioned_batch(vec![("a", "sf", 1), ("b", "sf", 2)])])
+        .await
+        .unwrap();
+    table
+        .append([partitioned_batch(vec![("c", "nyc", 3), ("d", "nyc", 4)])])
+        .await
+        .unwrap();
+
+    let parquets = |part: &str| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join(format!("city={part}")))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".parquet"))
+            .collect();
+        names.sort();
+        names
+    };
+    let nyc_before = parquets("nyc");
+
+    // Non-key filter → scan path; matches only the sf partition's group.
+    let result = table.delete("value = 2").await.unwrap();
+    assert_eq!(result.num_deletes, 1);
+
+    assert_eq!(
+        parquets("nyc"),
+        nyc_before,
+        "file groups without matching rows must not be rewritten"
+    );
+    assert_eq!(
+        parquets("sf").len(),
+        2,
+        "the affected sf group gains one rewritten base file"
+    );
+    let rows = table.read(&ReadOptions::new()).await.unwrap();
+    let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+}
