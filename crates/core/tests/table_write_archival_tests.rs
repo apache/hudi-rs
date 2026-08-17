@@ -197,3 +197,57 @@ async fn test_archival_prunes_active_timeline_and_keeps_reads_working() {
     );
     assert_eq!(result.num_inserts, 0);
 }
+
+/// The SAME handle that ran the writes must keep seeing rows from archived
+/// commits.
+///
+/// Regression: `reload_completed_commits` (run before every write) refreshed
+/// the completed set but not the archival boundary upstream's `is_committed`
+/// keys on. Once archival (inside a write) raised the real boundary, the
+/// handle's stale boundary left newly-archived instants looking uncommitted:
+/// reads on the handle dropped their file groups, and later writes planned on
+/// the same view could silently miss the rows they were meant to rewrite.
+/// A reopened table was never affected, which is why the test above could not
+/// catch it.
+#[tokio::test]
+async fn test_stale_write_handle_sees_archived_commits() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_option("hoodie.keep.min.commits", "4")
+        .with_option("hoodie.keep.max.commits", "6")
+        .create()
+        .await
+        .unwrap();
+
+    // 8 appends on one handle: archival runs at the 7th commit (7 > max=6),
+    // pushing the first commits — and the rows only they wrote — into history.
+    for i in 0..8 {
+        let id = format!("k{i}");
+        table
+            .append([batch(vec![(id.as_str(), "sf", i)])])
+            .await
+            .unwrap();
+    }
+
+    // Read through the SAME handle, not a reopen.
+    let rows = table
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(
+        total, 8,
+        "rows written by archived commits must stay visible on the writing handle"
+    );
+
+    // A keyed mutation through the same handle must still find the row a
+    // now-archived commit wrote (the write plans against the same view).
+    let result = table.delete("id = 'k0'").await.unwrap();
+    assert_eq!(
+        result.num_deletes, 1,
+        "delete must locate a row written by an archived commit"
+    );
+}
