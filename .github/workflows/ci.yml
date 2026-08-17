@@ -114,6 +114,17 @@ jobs:
         run: cargo check -p hudi --no-default-features
       - name: Check the umbrella crate without the spill backend, with datafusion
         run: cargo check -p hudi --no-default-features --features datafusion
+      # The steps above prove the opt-out COMPILES. This proves it actually drops
+      # the dependency, and unlike them it does not rest on libclang being absent,
+      # so it keeps working if this job ever gains a C++ toolchain.
+      - name: Assert the opt-out drops rocksdb from the dependency graph
+        run: |
+          for args in "--no-default-features" "--no-default-features --features datafusion"; do
+            if cargo tree -p hudi $args -i rocksdb 2>/dev/null | grep -q '^rocksdb'; then
+              echo "rocksdb is still reachable from hudi with: $args"
+              exit 1
+            fi
+          done
 
   rust-tests-windows:
     runs-on: windows-2025
