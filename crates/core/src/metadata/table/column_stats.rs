@@ -411,6 +411,44 @@ fn merge_max(a: Option<ColumnStatValue>, b: Option<ColumnStatValue>) -> Option<C
     }
 }
 
+/// A decoded stat value as a single-element Arrow array of `target` type.
+///
+/// Builds the value in its natural Arrow type, then casts to the schema's
+/// column type; `None` when the cast is not possible (callers treat that as
+/// "no stats" and include the file — the conservative direction).
+pub(crate) fn stat_value_to_array(
+    value: &ColumnStatValue,
+    target: &arrow_schema::DataType,
+) -> Option<arrow_array::ArrayRef> {
+    use arrow_array::ArrayRef;
+    use std::sync::Arc;
+    let natural: ArrayRef = match value {
+        ColumnStatValue::Boolean(v) => Arc::new(arrow_array::BooleanArray::from(vec![*v])),
+        ColumnStatValue::Int(v) => Arc::new(arrow_array::Int32Array::from(vec![*v])),
+        ColumnStatValue::Long(v) => Arc::new(arrow_array::Int64Array::from(vec![*v])),
+        ColumnStatValue::Float(v) => Arc::new(arrow_array::Float32Array::from(vec![*v])),
+        ColumnStatValue::Double(v) => Arc::new(arrow_array::Float64Array::from(vec![*v])),
+        ColumnStatValue::Bytes(v) => {
+            Arc::new(arrow_array::BinaryArray::from(vec![v.as_slice()]))
+        }
+        ColumnStatValue::String(v) => Arc::new(arrow_array::StringArray::from(vec![v.as_str()])),
+        ColumnStatValue::Date(v) => Arc::new(arrow_array::Date32Array::from(vec![*v])),
+        ColumnStatValue::TimeMicros(v) => {
+            Arc::new(arrow_array::Time64MicrosecondArray::from(vec![*v]))
+        }
+        ColumnStatValue::TimestampMicros(v) => Arc::new(
+            arrow_array::TimestampMicrosecondArray::from(vec![*v]).with_timezone_utc(),
+        ),
+        ColumnStatValue::LocalTimestampMicros(v) => {
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![*v]))
+        }
+    };
+    if natural.data_type() == target {
+        return Some(natural);
+    }
+    arrow::compute::cast(&natural, target).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

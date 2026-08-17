@@ -1427,3 +1427,49 @@ async fn test_expression_delete_rewrites_only_affected_file_groups() {
     let total: usize = rows.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 3);
 }
+
+/// Data-column filters on an MDT-stats-enabled table go through MDT
+/// column_stats pruning (no parquet footer reads) and must return exactly the
+/// matching rows — including from files whose ranges straddle the predicate.
+#[tokio::test]
+async fn test_read_filter_prunes_via_mdt_column_stats() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    // Disjoint value ranges per file group: sf in [1,2], nyc in [100,200].
+    table
+        .append([partitioned_batch(vec![("a", "sf", 1), ("b", "sf", 2)])])
+        .await
+        .unwrap();
+    table
+        .append([partitioned_batch(vec![("c", "nyc", 100), ("d", "nyc", 200)])])
+        .await
+        .unwrap();
+    assert!(
+        table
+            .get_metadata_table_partitions()
+            .contains(&"column_stats".to_string()),
+        "column_stats must be enabled for this test to exercise MDT pruning"
+    );
+
+    // Filter matched only by the nyc group; the sf group prunes on its range.
+    let options = ReadOptions::new().with_filters([("value", ">", "50")]).unwrap();
+    let rows = rows_by_id(&table.read(&options).await.unwrap());
+    assert_eq!(
+        rows,
+        vec![("c".to_string(), 100), ("d".to_string(), 200)],
+        "filtered read must return exactly the matching rows"
+    );
+
+    // A filter matching nothing anywhere prunes every group.
+    let options = ReadOptions::new()
+        .with_filters([("value", ">", "1000")])
+        .unwrap();
+    let rows = rows_by_id(&table.read(&options).await.unwrap());
+    assert!(rows.is_empty());
+}

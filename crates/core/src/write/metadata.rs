@@ -706,7 +706,12 @@ async fn compute_partition_stats_records(
             }
         }
     }
-    let existing = load_column_stats_records(table, &wanted).await?;
+    let existing = load_column_stats_records(
+        table.file_system_view.storage.clone(),
+        table.hudi_configs.clone(),
+        &wanted,
+    )
+    .await?;
 
     // Ranges per (partition, file): this commit's in-memory ranges + survivors.
     let mut ranges: BTreeMap<String, BTreeMap<String, Vec<ColumnRangeStats>>> = BTreeMap::new();
@@ -757,14 +762,17 @@ async fn compute_partition_stats_records(
 
 /// Read `column_stats` records for the requested keys from the MDT partition
 /// (HFile bases + log blocks, later blocks win), mirroring the RLI loader.
-async fn load_column_stats_records(
-    table: &Table,
+///
+/// `storage` and `hudi_configs` must belong to the DATA table (paths are
+/// resolved under `.hoodie/metadata` and fencing lists the data timeline).
+pub(crate) async fn load_column_stats_records(
+    storage: std::sync::Arc<Storage>,
+    hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
     wanted: &HashMap<String, (String, String)>,
 ) -> Result<HashMap<String, ColumnStatsMetadata>> {
     if wanted.is_empty() {
         return Ok(HashMap::new());
     }
-    let storage = table.file_system_view.storage.clone();
     let partition = MetadataPartitionType::ColumnStats.partition_name();
     let dir = format!("{METADATA_BASE}/{partition}");
     let listed = match storage.list_files(Some(&dir)).await {
@@ -806,12 +814,10 @@ async fn load_column_stats_records(
     if !log_paths.is_empty() {
         // Only trust log blocks whose instant completed on the data timeline
         // (Java getValidInstantTimestamps) — orphan MDT commits are skipped.
-        let valid = crate::metadata::table::valid_metadata_instants(
-            &table.file_system_view.storage,
-            &table.hudi_configs,
-        )
-        .await?;
-        let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage);
+        let valid =
+            crate::metadata::table::valid_metadata_instants(storage.as_ref(), &hudi_configs)
+                .await?;
+        let scanner = LogFileScanner::new(hudi_configs, storage);
         let range = InstantRange::exact_match(valid, "UTC");
         match scanner.scan(log_paths, &range).await? {
             ScanResult::HFileRecords(records) => {
