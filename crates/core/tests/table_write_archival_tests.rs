@@ -251,3 +251,81 @@ async fn test_stale_write_handle_sees_archived_commits() {
         "delete must locate a row written by an archived commit"
     );
 }
+
+/// Repeated archival runs must roll the manifest version, keep every L0 file
+/// listed in the newest manifest, and prune manifests beyond the retention
+/// window (3 versions).
+#[tokio::test]
+async fn test_repeated_archival_rotates_manifests_and_retains_three() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_option("hoodie.keep.min.commits", "4")
+        .with_option("hoodie.keep.max.commits", "6")
+        .create()
+        .await
+        .unwrap();
+
+    for i in 0..16 {
+        let id = format!("k{i}");
+        table
+            .append([batch(vec![(id.as_str(), "sf", i)])])
+            .await
+            .unwrap();
+    }
+
+    let history = dir.path().join(".hoodie/timeline/history");
+    let names: Vec<String> = std::fs::read_dir(&history)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    let parquets: Vec<&String> = names.iter().filter(|n| n.ends_with(".parquet")).collect();
+    assert!(
+        parquets.len() >= 2,
+        "multiple archival runs must produce multiple L0 files: {names:?}"
+    );
+
+    let mut manifest_versions: Vec<u64> = names
+        .iter()
+        .filter_map(|n| n.strip_prefix("manifest_"))
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    manifest_versions.sort_unstable();
+    assert!(
+        manifest_versions.len() <= 3,
+        "manifest retention must keep at most 3 versions: {manifest_versions:?}"
+    );
+    assert!(
+        *manifest_versions.last().unwrap() >= 2,
+        "manifest version must advance across archival runs: {manifest_versions:?}"
+    );
+
+    // The newest manifest lists every L0 file (readers depend on it).
+    let latest = format!("manifest_{}", manifest_versions.last().unwrap());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(history.join(latest)).unwrap()).unwrap();
+    let listed: Vec<String> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["fileName"].as_str().unwrap().to_string())
+        .collect();
+    for parquet in &parquets {
+        assert!(
+            listed.contains(parquet),
+            "L0 file {parquet} missing from the latest manifest {listed:?}"
+        );
+    }
+
+    // All 16 rows remain readable through the archival boundary on the same handle.
+    let rows = table
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 16);
+}

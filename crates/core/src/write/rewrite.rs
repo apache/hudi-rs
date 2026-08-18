@@ -632,6 +632,17 @@ pub async fn dynamic_partition_overwrite_batches(
             "dynamic_partition_overwrite requires at least one RecordBatch".to_string(),
         ));
     }
+    // Validate before fencing so misuse leaves no pending instant behind.
+    let partition_fields: Vec<String> = table
+        .hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::PartitionFields)
+        .into();
+    if partition_fields.is_empty() {
+        return Err(CoreError::Unsupported(
+            "dynamic_partition_overwrite requires a partitioned table; use overwrite() for unpartitioned tables"
+                .to_string(),
+        ));
+    }
     let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
     let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let replacement = concat(&prepared)?;

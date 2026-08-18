@@ -867,3 +867,119 @@ pub(crate) fn prepare_batches_for_write_with_offset(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn test_arrow_schema_to_avro_json_type_matrix() {
+        let schema = Schema::new(vec![
+            Field::new("b", DataType::Boolean, false),
+            Field::new("i8", DataType::Int8, false),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i32", DataType::Int32, false),
+            Field::new("i64", DataType::Int64, false),
+            Field::new("f32", DataType::Float32, false),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("ls", DataType::LargeUtf8, false),
+            Field::new("bin", DataType::Binary, false),
+            Field::new("d", DataType::Date32, false),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("dec", DataType::Decimal128(10, 2), false),
+            Field::new(
+                "list",
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Int64,
+                    true,
+                ))),
+                false,
+            ),
+        ]);
+        let json = arrow_schema_to_avro_json(&schema).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let fields = value["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 15);
+        let type_of = |name: &str| -> serde_json::Value {
+            fields
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap_or_else(|| panic!("missing field {name}"))["type"]
+                .clone()
+        };
+        assert_eq!(type_of("b"), serde_json::json!("boolean"));
+        assert_eq!(type_of("i32"), serde_json::json!("int"));
+        // Nullable fields become ["null", T] unions.
+        assert_eq!(type_of("i16")[0], serde_json::json!("null"));
+        assert_eq!(type_of("i64"), serde_json::json!("long"));
+        assert_eq!(type_of("d")["logicalType"], "date");
+        assert_eq!(type_of("ts_ms")["logicalType"], "timestamp-millis");
+        assert_eq!(type_of("ts_us")["logicalType"], "timestamp-micros");
+        assert_eq!(type_of("dec")["logicalType"], "decimal");
+        assert_eq!(type_of("dec")["precision"], 10);
+        assert_eq!(type_of("list")["type"], "array");
+    }
+
+    #[test]
+    fn test_arrow_schema_to_avro_json_rejects_unsupported() {
+        // Nanosecond timestamps have no Avro logical type in commit metadata.
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
+        assert!(arrow_schema_to_avro_json(&schema).is_err());
+
+        let schema = Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(
+                std::sync::Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        )]);
+        // Either a mapped type or a hard error is acceptable long-term; today
+        // unmapped compound types must error rather than degrade to string.
+        assert!(arrow_schema_to_avro_json(&schema).is_err());
+    }
+
+    #[test]
+    fn test_strip_meta_fields_from_schema() {
+        let schema = Schema::new(vec![
+            Field::new("_hoodie_commit_time", DataType::Utf8, true),
+            Field::new("_hoodie_record_key", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, false),
+        ]);
+        let stripped = strip_meta_fields_from_schema(&schema);
+        assert_eq!(
+            stripped
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["id"]
+        );
+    }
+}

@@ -50,7 +50,9 @@ COV_THRESHOLD ?= 60
 COV_EXCLUDE := \
 	--exclude-files 'cpp/src/*' \
 	--exclude-files 'crates/core/src/avro_to_arrow/*' \
-	--exclude-files 'benchmark/*'
+	--exclude-files 'benchmark/*' \
+	--exclude-files 'crates/*/tests/*' \
+	--exclude-files 'crates/*/examples/*'
 TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
 	--all-features --workspace $(COV_EXCLUDE) --skip-clean
 

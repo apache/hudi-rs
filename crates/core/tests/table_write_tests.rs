@@ -1563,3 +1563,149 @@ async fn test_merge_stamps_file_name_and_only_matched_commit_times() {
         }
     }
 }
+
+/// Create-builder validation: every unsupported combination must fail up
+/// front with a clear error, before anything lands on storage.
+#[tokio::test]
+async fn test_create_builder_rejects_invalid_combinations() {
+    // Missing table name.
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .create()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Table name is required"));
+
+    // RLI without MDT.
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_metadata(false)
+        .with_record_index(true)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("record index requires"));
+
+    // column_stats without MDT.
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_metadata(false)
+        .with_record_index(false)
+        .with_column_stats(true)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("column_stats requires"));
+
+    // partition_stats without column_stats.
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_column_stats(false)
+        .with_partition_stats(true)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("partition_stats requires"));
+
+    // v9 with layout 1 / v6 with layout 2: both incoherent.
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_timeline_layout_version(1)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires timeline layout version 2")
+    );
+
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_metadata(false)
+        .with_record_index(false)
+        .with_column_stats(false)
+        .with_table_version(6)
+        .with_timeline_layout_version(2)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires timeline layout version 1")
+    );
+}
+
+/// MOR-unsupported combinations must return clear errors.
+#[tokio::test]
+async fn test_mor_unsupported_verbs_error_clearly() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_batch(vec![("a", 1, 1)])])
+        .await
+        .unwrap();
+
+    // Partial-column upsert is COW-only.
+    let err = table
+        .upsert_with(
+            [ordered_batch(vec![("a", 2, 2)])],
+            UpsertOptions {
+                update_columns: Some(vec!["value".to_string()]),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Unsupported(_)), "{err}");
+
+    // Full-table overwrite works on MOR (INSERT_OVERWRITE_TABLE semantics).
+    let result = table
+        .overwrite([ordered_batch(vec![("z", 9, 9)])])
+        .await
+        .unwrap();
+    assert_eq!(result.num_writes, 1);
+
+    // Zero-match expression delete: no commit, empty result.
+    let commits_before = std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+        .unwrap()
+        .count();
+    let result = table.delete("value = 12345").await.unwrap();
+    assert_eq!(result.num_deletes, 0);
+    assert_eq!(result.instant, "");
+    let commits_after = std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+        .unwrap()
+        .count();
+    assert_eq!(commits_before, commits_after, "zero-match must not commit");
+
+    // Dynamic partition overwrite requires a partitioned table — and the
+    // error must not leave a pending instant behind.
+    let err = table
+        .dynamic_partition_overwrite([ordered_batch(vec![("z2", 10, 10)])])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("partitioned"), "{err}");
+    let commits_final = std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        commits_after, commits_final,
+        "failed validation must not fence an instant"
+    );
+}

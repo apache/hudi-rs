@@ -316,4 +316,50 @@ mod tests {
         ]);
         assert!(MetadataPayloadMerger::from_properties(&props).is_ok());
     }
+
+    #[test]
+    fn test_from_properties_rejects_foreign_strategy_and_payload() {
+        use std::collections::HashMap;
+        let mut props: HashMap<&str, &str> = HashMap::new();
+        props.insert(
+            "hoodie.record.merge.strategy.id",
+            "deadbeef-0000-0000-0000-000000000000",
+        );
+        assert!(MetadataPayloadMerger::from_properties(&props).is_err());
+
+        let mut props: HashMap<&str, &str> = HashMap::new();
+        props.insert(
+            "hoodie.compaction.payload.class",
+            "com.example.OtherPayload",
+        );
+        assert!(MetadataPayloadMerger::from_properties(&props).is_err());
+
+        // Missing keys resolve to the default merger.
+        let props: HashMap<&str, &str> = HashMap::new();
+        assert!(MetadataPayloadMerger::from_properties(&props).is_ok());
+    }
+
+    #[test]
+    fn test_compare_stat_values_same_and_cross_variant() {
+        use crate::metadata::table::encode::ColumnStatValue as V;
+        use std::cmp::Ordering;
+        let cases = vec![
+            (V::Boolean(false), V::Boolean(true)),
+            (V::Int(1), V::Int(2)),
+            (V::Long(1), V::Long(2)),
+            (V::Float(1.0), V::Float(2.0)),
+            (V::Double(1.0), V::Double(2.0)),
+            (V::Bytes(vec![1]), V::Bytes(vec![2])),
+            (V::String("a".into()), V::String("b".into())),
+            (V::Date(1), V::Date(2)),
+            (V::TimeMicros(1), V::TimeMicros(2)),
+            (V::TimestampMicros(1), V::TimestampMicros(2)),
+            (V::LocalTimestampMicros(1), V::LocalTimestampMicros(2)),
+        ];
+        for (a, b) in &cases {
+            assert_eq!(compare_stat_values(a, b), Some(Ordering::Less));
+        }
+        // Cross-variant comparison is undefined -> None.
+        assert_eq!(compare_stat_values(&V::Int(1), &V::Long(1)), None);
+    }
 }

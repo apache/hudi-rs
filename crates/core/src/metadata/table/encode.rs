@@ -949,4 +949,85 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.file_id, file_id);
     }
+
+    /// V1 (tv8) and V2 (tv9) encodings must both decode back to the same
+    /// logical stat values for every wrapper variant.
+    #[test]
+    fn test_column_stats_encode_decode_roundtrip_all_variants() {
+        let variants = vec![
+            ColumnStatValue::Boolean(true),
+            ColumnStatValue::Int(7),
+            ColumnStatValue::Long(9),
+            ColumnStatValue::Float(1.5),
+            ColumnStatValue::Double(2.5),
+            ColumnStatValue::Bytes(vec![1, 2, 3]),
+            ColumnStatValue::String("s".to_string()),
+            ColumnStatValue::Date(19000),
+            ColumnStatValue::TimeMicros(11),
+            ColumnStatValue::TimestampMicros(22),
+            ColumnStatValue::LocalTimestampMicros(33),
+        ];
+        for version in [StatsIndexVersion::V1, StatsIndexVersion::V2] {
+            for value in &variants {
+                let meta = ColumnStatsMetadata {
+                    file_name: "f.parquet".to_string(),
+                    column_name: "c".to_string(),
+                    min_value: Some(value.clone()),
+                    max_value: Some(value.clone()),
+                    value_count: 3,
+                    null_count: 1,
+                    total_size: 100,
+                    total_uncompressed_size: 200,
+                    is_deleted: false,
+                    is_tight_bound: true,
+                    decoded_value_type_ordinal: None,
+                };
+                let bytes = encode_column_stats(&meta, version)
+                    .unwrap_or_else(|e| panic!("{version:?} encode {value:?}: {e}"));
+                let schema = metadata_schema().unwrap();
+                let decoded = decode_column_stats_entry(&bytes, Some(schema))
+                    .unwrap_or_else(|e| panic!("{version:?} decode {value:?}: {e}"))
+                    .unwrap_or_else(|| panic!("{version:?} decode {value:?}: tombstone"));
+                // V1 has no `valueType`, so a tz-less timestamp is
+                // indistinguishable from a UTC one after decode — the reason
+                // the V2 index exists.
+                let expected = match (version, value) {
+                    (StatsIndexVersion::V1, ColumnStatValue::LocalTimestampMicros(v)) => {
+                        ColumnStatValue::TimestampMicros(*v)
+                    }
+                    _ => value.clone(),
+                };
+                assert_eq!(decoded.min_value.as_ref(), Some(&expected), "{version:?}");
+                assert_eq!(decoded.max_value.as_ref(), Some(&expected), "{version:?}");
+                assert_eq!(decoded.value_count, 3);
+                assert_eq!(decoded.null_count, 1);
+            }
+        }
+    }
+
+    /// Tombstones round-trip as deletes for both index versions.
+    #[test]
+    fn test_column_stats_tombstone_roundtrip() {
+        for version in [StatsIndexVersion::V1, StatsIndexVersion::V2] {
+            let meta = ColumnStatsMetadata {
+                file_name: "f.parquet".to_string(),
+                column_name: "c".to_string(),
+                min_value: None,
+                max_value: None,
+                value_count: 0,
+                null_count: 0,
+                total_size: 0,
+                total_uncompressed_size: 0,
+                is_deleted: true,
+                is_tight_bound: false,
+                decoded_value_type_ordinal: None,
+            };
+            let bytes = encode_column_stats(&meta, version).unwrap();
+            let schema = metadata_schema().unwrap();
+            let decoded = decode_column_stats_entry(&bytes, Some(schema))
+                .unwrap()
+                .expect("tombstone still decodes to a record");
+            assert!(decoded.is_deleted, "{version:?}");
+        }
+    }
 }

@@ -182,3 +182,145 @@ pub fn relative_data_path(partition_path: &str, file_name: &str) -> String {
         format!("{partition_path}/{file_name}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn configs(pairs: &[(&str, &str)]) -> HudiConfigs {
+        HudiConfigs::new(pairs.iter().map(|(k, v)| (*k, v.to_string())))
+    }
+
+    fn batch(fields: Vec<Field>, columns: Vec<arrow::array::ArrayRef>) -> RecordBatch {
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    #[test]
+    fn test_missing_record_key_column_errors() {
+        let cfg = configs(&[("hoodie.table.recordkey.fields", "id")]);
+        let b = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        );
+        let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
+        assert!(err.to_string().contains("record key field 'id' is missing"));
+    }
+
+    #[test]
+    fn test_null_record_key_errors() {
+        let cfg = configs(&[("hoodie.table.recordkey.fields", "id")]);
+        let b = batch(
+            vec![Field::new("id", DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+        );
+        let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("null"), "{err}");
+    }
+
+    #[test]
+    fn test_non_string_record_key_errors() {
+        let cfg = configs(&[("hoodie.table.recordkey.fields", "id")]);
+        let b = batch(
+            vec![Field::new("id", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        );
+        assert!(hoodie_keys_for_batch(&cfg, &b, None).is_err());
+    }
+
+    #[test]
+    fn test_multi_field_record_key_unsupported() {
+        let cfg = configs(&[("hoodie.table.recordkey.fields", "a,b")]);
+        let b = batch(
+            vec![Field::new("a", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["x"]))],
+        );
+        let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
+        assert!(err.to_string().contains("exactly one record key field"));
+    }
+
+    #[test]
+    fn test_auto_keys_require_instant() {
+        let cfg = configs(&[]);
+        let b = batch(
+            vec![Field::new("v", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        );
+        let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
+        assert!(err.to_string().contains("commit instant timestamp"));
+    }
+
+    #[test]
+    fn test_partition_value_renderings_and_errors() {
+        let cfg = configs(&[
+            ("hoodie.table.recordkey.fields", "id"),
+            ("hoodie.table.partition.fields", "p"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+        // Int32 partition values render as plain decimal segments.
+        let b = batch(
+            vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("p", DataType::Int32, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["k"])),
+                Arc::new(Int32Array::from(vec![7])),
+            ],
+        );
+        let keys = hoodie_keys_for_batch(&cfg, &b, None).unwrap();
+        assert_eq!(keys[0].partition_path, "p=7");
+
+        // Int64 partition values.
+        let b = batch(
+            vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("p", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["k"])),
+                Arc::new(Int64Array::from(vec![9])),
+            ],
+        );
+        assert_eq!(
+            hoodie_keys_for_batch(&cfg, &b, None).unwrap()[0].partition_path,
+            "p=9"
+        );
+
+        // Null partition value: error.
+        let b = batch(
+            vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("p", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["k"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            ],
+        );
+        assert!(hoodie_keys_for_batch(&cfg, &b, None).is_err());
+
+        // Missing partition column: error.
+        let b = batch(
+            vec![Field::new("id", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["k"]))],
+        );
+        let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
+        assert!(err.to_string().contains("partition field 'p' is missing"));
+
+        // Unsupported partition value type: error.
+        let b = batch(
+            vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("p", DataType::Float64, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["k"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.5])),
+            ],
+        );
+        assert!(hoodie_keys_for_batch(&cfg, &b, None).is_err());
+    }
+}

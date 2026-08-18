@@ -500,4 +500,116 @@ mod tests {
         ]);
         assert_eq!(columns_to_index(&schema), vec!["s".to_string()]);
     }
+
+    #[test]
+    fn test_stat_value_to_array_matrix() {
+        use super::stat_value_to_array;
+        use crate::metadata::table::encode::ColumnStatValue as V;
+        use arrow_schema::{DataType, TimeUnit};
+
+        let cases: Vec<(V, DataType)> = vec![
+            (V::Boolean(true), DataType::Boolean),
+            (V::Int(7), DataType::Int32),
+            (V::Long(9), DataType::Int64),
+            (V::Float(1.5), DataType::Float32),
+            (V::Double(2.5), DataType::Float64),
+            (V::Bytes(vec![1, 2]), DataType::Binary),
+            (V::String("s".into()), DataType::Utf8),
+            (V::Date(19000), DataType::Date32),
+            (V::TimeMicros(1), DataType::Time64(TimeUnit::Microsecond)),
+            (
+                V::TimestampMicros(1),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            (
+                V::LocalTimestampMicros(1),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+        ];
+        for (value, target) in &cases {
+            let arr = stat_value_to_array(value, target)
+                .unwrap_or_else(|| panic!("natural conversion must succeed for {target:?}"));
+            assert_eq!(arr.data_type(), target);
+            assert_eq!(arr.len(), 1);
+        }
+
+        // Widening casts: Int stat onto an Int64 column, Long onto Float64.
+        let widened = stat_value_to_array(&V::Int(5), &DataType::Int64).unwrap();
+        assert_eq!(widened.data_type(), &DataType::Int64);
+        let widened = stat_value_to_array(&V::Long(5), &DataType::Float64).unwrap();
+        assert_eq!(widened.data_type(), &DataType::Float64);
+
+        // Impossible cast: bytes onto a boolean column -> None (conservative).
+        assert!(stat_value_to_array(&V::Bytes(vec![1]), &DataType::Boolean).is_none());
+    }
+
+    /// Footer range extraction across the type matrix: every supported type
+    /// yields min/max/null counts; unsupported columns are skipped.
+    #[test]
+    fn test_column_ranges_from_parquet_type_matrix() {
+        use arrow_array::{
+            ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+            StringArray, TimestampMicrosecondArray,
+        };
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Boolean, false),
+            Field::new("i", DataType::Int32, false),
+            Field::new("l", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("d", DataType::Date32, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BooleanArray::from(vec![false, true])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![3, 1])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Float64Array::from(vec![2.5, 1.5])),
+                Arc::new(StringArray::from(vec![Some("b"), None])),
+                Arc::new(Date32Array::from(vec![100, 200])),
+                Arc::new(TimestampMicrosecondArray::from(vec![7, 9]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+
+        let props = parquet::file::properties::WriterProperties::builder().build();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let ranges = column_ranges_from_parquet_bytes(&bytes).unwrap();
+        let by_name: std::collections::HashMap<&str, &ColumnRangeStats> =
+            ranges.iter().map(|r| (r.column_name.as_str(), r)).collect();
+
+        let int_range = by_name["i"];
+        assert_eq!(int_range.min_value, Some(ColumnStatValue::Int(1)));
+        assert_eq!(int_range.max_value, Some(ColumnStatValue::Int(3)));
+        assert_eq!(by_name["l"].max_value, Some(ColumnStatValue::Long(20)));
+        assert_eq!(by_name["f"].min_value, Some(ColumnStatValue::Double(1.5)));
+        assert_eq!(
+            by_name["s"].min_value,
+            Some(ColumnStatValue::String("b".to_string()))
+        );
+        assert_eq!(by_name["s"].null_count, 1);
+        assert_eq!(by_name["d"].min_value, Some(ColumnStatValue::Date(100)));
+        assert_eq!(
+            by_name["ts"].max_value,
+            Some(ColumnStatValue::TimestampMicros(9))
+        );
+        let bool_range = by_name["b"];
+        assert_eq!(bool_range.min_value, Some(ColumnStatValue::Boolean(false)));
+    }
 }
