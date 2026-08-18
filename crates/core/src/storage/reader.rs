@@ -17,11 +17,10 @@
  * under the License.
  */
 use crate::config::HudiConfigs;
-use crate::storage::{OBJECT_STORE_RUNTIME, OBJECT_STORE_RUNTIME_THREAD_NAME};
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore};
-use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 
 /// How much of a file a streaming reader keeps resident at once, when the table
@@ -73,67 +72,21 @@ pub fn stream_window_size(hudi_configs: &HudiConfigs) -> Result<u64> {
     }
 }
 
-/// Whether the calling thread is one of [`OBJECT_STORE_RUNTIME`]'s workers.
-///
-/// Recognised by thread name, which is the only handle available: a worker has no
-/// marker a caller can query, and `Handle::try_current()` cannot be compared to a
-/// `Runtime`'s own handle.
-pub(crate) fn in_object_store_runtime() -> bool {
-    std::thread::current()
-        .name()
-        .is_some_and(|name| name.starts_with(OBJECT_STORE_RUNTIME_THREAD_NAME))
-}
-
-/// Fetch a byte range synchronously, from any context.
-///
-/// See [`OBJECT_STORE_RUNTIME`] for why the work is spawned onto a shared
-/// runtime and waited on over a channel rather than driven with `block_on`.
-///
-/// # Where this may be called from
-///
-/// A blocking-pool thread (`spawn_blocking`) or an ordinary sync thread. Both are
-/// fine: the fetch runs on [`OBJECT_STORE_RUNTIME`], so the wait always ends.
-///
-/// **Not** from an async task on a worker thread — that blocks the worker for a
-/// whole round trip, starving every other task on that runtime, which is the
-/// "no blocking I/O in async" rule. Nothing here can detect that in general, so
-/// it remains the caller's obligation.
-///
-/// **Never** from an [`OBJECT_STORE_RUNTIME`] worker: the wait would depend on a
-/// task that can only be scheduled on the workers, and with enough concurrent
-/// callers every worker blocks and none of their tasks can ever run — a genuine
-/// deadlock rather than mere starvation. That case *is* detectable, and is
-/// refused below with a message rather than left to hang. It is unreachable
-/// today; the guard is here so wiring a new caller cannot make it reachable
-/// silently.
-fn get_range_blocking(
+/// Fetch `[offset, offset + length)` in one ranged request.
+async fn get_range(
     object_store: &Arc<dyn ObjectStore>,
     location: &ObjPath,
     offset: u64,
     length: u64,
 ) -> Result<Bytes> {
-    if in_object_store_runtime() {
-        return Err(Error::other(format!(
-            "a blocking ranged read was issued from an object-store runtime worker, which would \
-             deadlock: the wait can only be satisfied by a task on that same runtime. Drive this \
-             read from a blocking-pool thread instead (path '{location}')"
-        )));
-    }
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::other(format!(
             "ranged read offset {offset} + length {length} overflows u64"
         ))
     })?;
-    let store = object_store.clone();
-    let location = location.clone();
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    OBJECT_STORE_RUNTIME.spawn(async move {
-        let res = store.get_range(&location, offset..end).await;
-        // The receiver is gone only if the caller panicked.
-        let _ = tx.send(res);
-    });
-    rx.recv()
-        .map_err(|_| Error::other("ranged object-store read task dropped"))?
+    object_store
+        .get_range(location, offset..end)
+        .await
         .map_err(|e| Error::other(format!("ranged object-store read failed: {e}")))
 }
 
@@ -158,8 +111,8 @@ impl LogBlockFetcher {
     }
 
     /// Read `[offset, offset + length)` in one ranged request.
-    pub fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
-        get_range_blocking(&self.object_store, &self.location, offset, length)
+    pub async fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
+        get_range(&self.object_store, &self.location, offset, length).await
     }
 
     /// The file these ranges are read from, so a caller batching across blocks
@@ -174,10 +127,6 @@ impl LogBlockFetcher {
     /// request, so a run of adjacent blocks costs one round trip rather than
     /// one each. Reading them one at a time is the same bytes and many more
     /// round trips, which is what dominates on object storage.
-    ///
-    /// Async, unlike [`Self::read_content`]: the caller is expected to have a
-    /// runtime, and going through the blocking bridge here would serialise the
-    /// very requests this exists to overlap.
     pub async fn read_contents(&self, ranges: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
         self.object_store
             .get_ranges(&self.location, ranges)
@@ -198,6 +147,11 @@ impl LogBlockFetcher {
 /// small file or a full read wants. [`StorageReader::new_streaming`] fetches
 /// bounded windows as the cursor moves, so walking a large file's structure
 /// never holds more than one window.
+///
+/// Reads are `async` inherent methods rather than `std::io::Read`: every byte
+/// comes from an object store, and a synchronous `Read` over an async store can
+/// only be had by blocking some thread on a runtime, which is a contract the
+/// compiler cannot check and every caller has to be told about.
 #[derive(Debug)]
 pub struct StorageReader {
     object_store: Arc<dyn ObjectStore>,
@@ -245,7 +199,7 @@ impl StorageReader {
     /// `window_size` is how much is fetched per refill and therefore the peak
     /// this reader buffers; see [`stream_window_size`] for where it comes from.
     ///
-    /// Nothing is read until the first [`Read::read`].
+    /// Nothing is read until the first read.
     pub fn new_streaming(
         object_store: Arc<dyn ObjectStore>,
         object_meta: ObjectMeta,
@@ -269,62 +223,113 @@ impl StorageReader {
         LogBlockFetcher::new(self.object_store.clone(), self.location.clone())
     }
 
-    /// Refill the window if the cursor has moved outside it. No-op past the end.
-    fn ensure_window(&mut self) -> Result<()> {
-        if self.pos >= self.file_len {
-            return Ok(());
-        }
-        let in_window = self.pos >= self.window_start
-            && self.pos < self.window_start + self.window.len() as u64;
-        if in_window {
-            return Ok(());
-        }
-        let start = self.pos;
-        let end = (start + self.window_size).min(self.file_len);
-        self.window = get_range_blocking(&self.object_store, &self.location, start, end - start)?;
-        self.window_start = start;
+    /// Length of the whole file, known without reading any of it.
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// Where the cursor sits.
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Move the cursor. No I/O, and a position past the end of the file is
+    /// allowed: it fails at the next read, which is what lets a caller skip past
+    /// a block's content without paying for it.
+    pub fn seek_to(&mut self, pos: u64) {
+        self.pos = pos;
+    }
+
+    /// Whether `[start, end)` lies inside the resident window.
+    fn window_covers(&self, start: u64, end: u64) -> bool {
+        start >= self.window_start && end <= self.window_start + self.window.len() as u64
+    }
+
+    /// Fetch a window starting at the cursor.
+    async fn fill_window(&mut self) -> Result<()> {
+        let end = self.pos.saturating_add(self.window_size).min(self.file_len);
+        self.window =
+            get_range(&self.object_store, &self.location, self.pos, end - self.pos).await?;
+        self.window_start = self.pos;
         Ok(())
     }
-}
 
-impl Read for StorageReader {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if buf.is_empty() || self.pos >= self.file_len {
-            return Ok(0);
+    /// Read the next `len` bytes, advancing the cursor.
+    ///
+    /// A read that would run past the end of the file is
+    /// [`ErrorKind::UnexpectedEof`] and consumes nothing, which is how a caller
+    /// walking blocks recognises the end of the last one.
+    ///
+    /// Nothing is copied when the bytes are already resident: both the whole-file
+    /// buffer and the streaming window hand out `Bytes` slices of themselves.
+    pub async fn read_bytes(&mut self, len: u64) -> Result<Bytes> {
+        if len == 0 {
+            return Ok(Bytes::new());
         }
-        if let Some(ref whole) = self.whole {
-            let start = self.pos as usize;
-            let end = (start + buf.len()).min(whole.len());
-            let n = end - start;
-            buf[..n].copy_from_slice(&whole[start..end]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        self.ensure_window()?;
-        let off = (self.pos - self.window_start) as usize;
-        let avail = self.window.len() - off;
-        let n = avail.min(buf.len());
-        buf[..n].copy_from_slice(&self.window[off..off + n]);
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
-
-impl Seek for StorageReader {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p as i128,
-            SeekFrom::End(p) => self.file_len as i128 + p as i128,
-            SeekFrom::Current(p) => self.pos as i128 + p as i128,
-        };
-        if new_pos < 0 {
+        let end = self.pos.checked_add(len).ok_or_else(|| {
+            Error::other(format!(
+                "read of {len} byte(s) at offset {} overflows u64",
+                self.pos
+            ))
+        })?;
+        if end > self.file_len {
             return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "seek to a negative position",
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "read of {len} byte(s) at offset {} runs past the end of '{}' ({} bytes)",
+                    self.pos, self.location, self.file_len
+                ),
             ));
         }
-        self.pos = new_pos as u64;
-        Ok(self.pos)
+
+        if let Some(whole) = self.whole.as_ref() {
+            let bytes = whole.slice(self.pos as usize..end as usize);
+            self.pos = end;
+            return Ok(bytes);
+        }
+
+        // Longer than a window: fetch exactly this range and leave the window
+        // alone, rather than growing what the reader keeps resident to fit one
+        // read. A log block's content can be larger than the window a caller
+        // tuned for sweeping headers, and it has to be contiguous to decode.
+        if len > self.window_size {
+            let bytes = get_range(&self.object_store, &self.location, self.pos, len).await?;
+            self.pos = end;
+            return Ok(bytes);
+        }
+
+        if !self.window_covers(self.pos, end) {
+            // A refilled window starts at the cursor and runs `window_size`
+            // bytes or to the end of the file, whichever comes first, so it
+            // covers `len` — the end-of-file case was refused above.
+            self.fill_window().await?;
+        }
+        let off = (self.pos - self.window_start) as usize;
+        let resident = self.window.len() - off;
+        if resident < len as usize {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "a window fetched at offset {} holds {resident} byte(s), short of the {len} \
+                     asked for: '{}' was truncated while it was being read",
+                    self.pos, self.location
+                ),
+            ));
+        }
+        let bytes = self.window.slice(off..off + len as usize);
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    /// Fill `buf` from the cursor, advancing it. See [`Self::read_bytes`] for
+    /// what happens at the end of the file.
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let bytes = self.read_bytes(buf.len() as u64).await?;
+        buf.copy_from_slice(&bytes);
+        Ok(())
     }
 }
 
@@ -336,7 +341,9 @@ mod tests {
 
     /// A temp file of `len` bytes with a repeating pattern, plus the store and
     /// metadata needed to open it either way.
-    fn make_store(len: usize) -> (Arc<dyn ObjectStore>, ObjectMeta, Vec<u8>, tempfile::TempDir) {
+    async fn make_store(
+        len: usize,
+    ) -> (Arc<dyn ObjectStore>, ObjectMeta, Vec<u8>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
@@ -347,109 +354,72 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
         let location = ObjPath::from("data.bin");
-        let meta = OBJECT_STORE_RUNTIME
-            .block_on(async { store.head(&location).await })
-            .unwrap();
+        let meta = store.head(&location).await.unwrap();
         (store, meta, bytes, dir)
     }
 
-    fn read_all(reader: &mut StorageReader, chunk: usize) -> Vec<u8> {
+    /// Read the whole file in `chunk`-sized reads.
+    async fn read_all(reader: &mut StorageReader, chunk: u64) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut buf = vec![0u8; chunk];
         loop {
-            let n = reader.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
+            let want = chunk.min(reader.file_len() - reader.position());
+            if want == 0 {
+                return out;
             }
-            out.extend_from_slice(&buf[..n]);
+            out.extend_from_slice(&reader.read_bytes(want).await.unwrap());
         }
-        out
-    }
-
-    /// A blocking ranged read issued from an object-store runtime worker must be
-    /// refused, because it would deadlock rather than merely block: the wait can
-    /// only be satisfied by a task on the very runtime whose worker is waiting.
-    ///
-    /// Asserted from inside the runtime, since the guard keys off the calling
-    /// thread. The negative control matters as much as the positive: an ordinary
-    /// thread must still be allowed through, or the guard would break every real
-    /// caller.
-    #[test]
-    fn test_blocking_read_from_the_object_store_runtime_is_refused() {
-        let len = 4096;
-        let (store, meta, expected, _dir) = make_store(len);
-
-        // Positive: on a worker of that runtime, refused with a message naming
-        // the hazard.
-        let err = OBJECT_STORE_RUNTIME
-            .block_on(async {
-                let store = store.clone();
-                let location = meta.location.clone();
-                tokio::task::spawn(async move {
-                    assert!(
-                        in_object_store_runtime(),
-                        "a spawned task must run on an object-store worker"
-                    );
-                    get_range_blocking(&store, &location, 0, 16).err()
-                })
-                .await
-                .unwrap()
-            })
-            .expect("must be refused, not attempted");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("deadlock"),
-            "the error must say why it refused, got: {msg}"
-        );
-
-        // Negative control: an ordinary thread reads normally.
-        assert!(!in_object_store_runtime());
-        let bytes = get_range_blocking(&store, &meta.location, 0, 16).unwrap();
-        assert_eq!(bytes.as_ref(), &expected[..16]);
     }
 
     /// The two modes have to be indistinguishable to a caller. A streaming read
     /// serves out of a window and refills as the cursor advances, which is where
     /// an off-by-one would show up.
-    #[test]
-    fn test_streaming_read_matches_eager_across_window_refills() {
+    #[tokio::test]
+    async fn test_streaming_read_matches_eager_across_window_refills() {
         // Larger than one window, so the read spans several refills.
         let len = (DEFAULT_STREAM_WINDOW_SIZE as usize) * 2 + 4096;
-        let (store, meta, expected, _dir) = make_store(len);
+        let (store, meta, expected, _dir) = make_store(len).await;
 
-        let mut eager = OBJECT_STORE_RUNTIME
-            .block_on(StorageReader::new(store.clone(), meta.clone()))
+        let mut eager = StorageReader::new(store.clone(), meta.clone())
+            .await
             .unwrap();
-        assert_eq!(read_all(&mut eager, 64 * 1024), expected);
+        assert_eq!(read_all(&mut eager, 64 * 1024).await, expected);
 
         let mut streaming = StorageReader::new_streaming(store, meta, DEFAULT_STREAM_WINDOW_SIZE);
-        assert_eq!(read_all(&mut streaming, 64 * 1024), expected);
+        assert_eq!(read_all(&mut streaming, 64 * 1024).await, expected);
     }
 
-    /// Seeking backwards has to refill, and a seek past the end has to read
-    /// nothing rather than fetch. Both are what a block scan does when it walks
-    /// back to a header or jumps past a block it is skipping.
-    #[test]
-    fn test_streaming_seek_backwards_and_past_end() {
+    /// Seeking backwards has to refill, and a read that runs off the end has to
+    /// fail rather than come back short. Both are what a block scan does when it
+    /// walks back to a header or jumps past a block it is skipping.
+    #[tokio::test]
+    async fn test_streaming_seek_backwards_and_past_end() {
         let len = (DEFAULT_STREAM_WINDOW_SIZE as usize) + 1024;
-        let (store, meta, expected, _dir) = make_store(len);
+        let (store, meta, expected, _dir) = make_store(len).await;
         let mut reader = StorageReader::new_streaming(store, meta, DEFAULT_STREAM_WINDOW_SIZE);
 
         // Force a window near the end, then walk back to the start.
-        reader.seek(SeekFrom::Start(len as u64 - 512)).unwrap();
-        let mut tail = [0u8; 512];
-        reader.read_exact(&mut tail).unwrap();
+        reader.seek_to(len as u64 - 512);
+        let tail = reader.read_bytes(512).await.unwrap();
         assert_eq!(&tail[..], &expected[len - 512..]);
 
-        reader.seek(SeekFrom::Start(0)).unwrap();
-        let mut head = [0u8; 512];
-        reader.read_exact(&mut head).unwrap();
+        reader.seek_to(0);
+        let head = reader.read_bytes(512).await.unwrap();
         assert_eq!(&head[..], &expected[..512]);
 
-        reader.seek(SeekFrom::End(0)).unwrap();
-        assert_eq!(reader.read(&mut [0u8; 16]).unwrap(), 0);
-
-        assert!(reader.seek(SeekFrom::Current(-(len as i64) - 10)).is_err());
+        // At the end of the file, and past it, a read is refused rather than
+        // short — a caller walking blocks reads the refusal as the end.
+        reader.seek_to(len as u64);
+        assert_eq!(
+            reader.read_bytes(16).await.unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        reader.seek_to(len as u64 * 2);
+        assert_eq!(
+            reader.read_bytes(1).await.unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        // Nothing was consumed, so the cursor still says where the caller was.
+        assert_eq!(reader.position(), len as u64 * 2);
     }
 
     /// Absent config reads the same amount Hudi would: 16 MiB.
@@ -466,22 +436,48 @@ mod tests {
     /// The whole point of the knob: a caller tuning memory down must actually
     /// get less, not the default. Reading a file larger than the window they
     /// asked for proves the window, not just the field.
-    #[test]
-    fn test_configured_window_is_used_for_refills() {
+    #[tokio::test]
+    async fn test_configured_window_is_used_for_refills() {
         let window = 4096u64;
         let configs = HudiConfigs::new([(CONFIG_DFS_BUFFER_MAX_SIZE, window.to_string())]);
         assert_eq!(stream_window_size(&configs).unwrap(), window);
 
         let len = (window as usize) * 3 + 17;
-        let (store, meta, expected, _dir) = make_store(len);
+        let (store, meta, expected, _dir) = make_store(len).await;
         let mut reader = StorageReader::new_streaming(store, meta, window);
 
         // Same bytes as an eager read, across several refills of the smaller
         // window.
-        assert_eq!(read_all(&mut reader, 512), expected);
+        assert_eq!(read_all(&mut reader, 512).await, expected);
         assert!(
             reader.window.len() as u64 <= window,
             "a refill fetched {} bytes for a {window}-byte window",
+            reader.window.len()
+        );
+    }
+
+    /// A read longer than the window is served whole and without leaving that
+    /// much resident. This is the case a log block's content hits: it can be
+    /// larger than the window tuned for sweeping headers, and it has to be
+    /// contiguous to decode.
+    #[tokio::test]
+    async fn test_read_longer_than_the_window_does_not_grow_it() {
+        let window = 4096u64;
+        let len = (window as usize) * 4;
+        let (store, meta, expected, _dir) = make_store(len).await;
+        let mut reader = StorageReader::new_streaming(store, meta, window);
+
+        // Prime a window, so the oversized read below has one to leave alone.
+        reader.read_bytes(16).await.unwrap();
+        assert_eq!(reader.window.len() as u64, window);
+
+        reader.seek_to(1000);
+        let big = reader.read_bytes(window * 2).await.unwrap();
+        assert_eq!(&big[..], &expected[1000..1000 + (window * 2) as usize]);
+        assert_eq!(reader.position(), 1000 + window * 2);
+        assert!(
+            reader.window.len() as u64 <= window,
+            "an oversized read must not grow the resident window, now {} bytes",
             reader.window.len()
         );
     }
@@ -505,13 +501,17 @@ mod tests {
 
     /// A block fetcher reads only its own range, and does so without the file
     /// ever being resident.
-    #[test]
-    fn test_block_fetcher_reads_only_its_range() {
+    #[tokio::test]
+    async fn test_block_fetcher_reads_only_its_range() {
         let len = 8192;
-        let (store, meta, expected, _dir) = make_store(len);
+        let (store, meta, expected, _dir) = make_store(len).await;
         let reader = StorageReader::new_streaming(store, meta, DEFAULT_STREAM_WINDOW_SIZE);
 
-        let content = reader.block_fetcher().read_content(1000, 256).unwrap();
+        let content = reader
+            .block_fetcher()
+            .read_content(1000, 256)
+            .await
+            .unwrap();
         assert_eq!(&content[..], &expected[1000..1256]);
     }
 }

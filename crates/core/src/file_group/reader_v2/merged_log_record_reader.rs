@@ -493,7 +493,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let blocks = reader.read_all_blocks_metadata_only().unwrap();
+        let blocks = reader.read_all_blocks_metadata_only().await.unwrap();
 
         let path = dir.path().join(file_name);
         let mut bytes = std::fs::read(&path).unwrap();

@@ -505,7 +505,7 @@ impl BaseHoodieLogRecordReader {
                 let mut reader =
                     LogFileReader::new_streaming(hudi_configs.clone(), self.storage.clone(), path)
                         .await?;
-                let blocks = reader.read_all_blocks_metadata_only()?;
+                let blocks = reader.read_all_blocks_metadata_only().await?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
             }
@@ -754,6 +754,30 @@ impl BaseHoodieLogRecordReader {
         Ok(())
     }
 
+    /// Which bytes a queued block decodes from, given what the prefetch
+    /// returned for it. `None` means it needs none: it already holds content.
+    ///
+    /// The prefetch admits exactly the block types Pass 3 decodes, so a block
+    /// holding neither fetched bytes nor content of its own never recorded where
+    /// to read it from. That is refused rather than passed on as a silently
+    /// empty block. Answering it here, instead of having the block fetch its own
+    /// bytes, is what keeps Pass 3 free of I/O and therefore synchronous.
+    fn queued_block_content(
+        block: &LogBlock,
+        fetched: Option<bytes::Bytes>,
+    ) -> Result<Option<bytes::Bytes>> {
+        match fetched {
+            Some(bytes) => Ok(Some(bytes)),
+            None if !block.content.is_empty() => Ok(None),
+            None => Err(crate::error::CoreError::LogBlockError(format!(
+                "no content was fetched for the {:?} block at instant {}, and it carries none: \
+                 nothing recorded where to read it from",
+                block.block_type,
+                block.instant_time().unwrap_or("unknown"),
+            ))),
+        }
+    }
+
     fn process_queued_blocks_for_instant(
         &mut self,
         ordered: Vec<LogBlock>,
@@ -795,11 +819,8 @@ impl BaseHoodieLogRecordReader {
             // block that already has content passes straight through.
             match block.block_type {
                 BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
-                    match fetched.remove(&idx) {
-                        Some(bytes) => block.decode_fetched(&block_decoder, bytes)?,
-                        // No prefetch for this block: it was already decoded, or
-                        // the eager reader produced it and nothing was deferred.
-                        None => block.load_content(&block_decoder)?,
+                    if let Some(bytes) = Self::queued_block_content(&block, fetched.remove(&idx))? {
+                        block.decode_fetched(&block_decoder, bytes)?;
                     }
                 }
                 _ => {}
@@ -931,10 +952,44 @@ mod tests {
         );
     }
 
-    /// The prefetch must actually return bytes for the admitted blocks. Output is
-    /// identical whether or not it does, because Pass 3 falls back to fetching
-    /// per block, so nothing else in the suite can tell the difference: without
-    /// this the whole batching path could be dead and every test would pass.
+    /// A queued block with nothing prefetched and no content of its own is
+    /// refused. Pass 3 does no I/O, so a block that recorded nowhere to read
+    /// from cannot be recovered there — passing it on would drop its records
+    /// silently, which is exactly what a reader must never do.
+    #[test]
+    fn test_a_queued_block_with_neither_bytes_nor_content_is_refused() {
+        use crate::file_group::record_batches::RecordBatches;
+
+        let block = make_data_block("20250101000000000");
+        let prefetched = bytes::Bytes::from_static(b"content");
+        assert_eq!(
+            BaseHoodieLogRecordReader::queued_block_content(&block, Some(prefetched.clone()))
+                .unwrap(),
+            Some(prefetched),
+            "prefetched bytes are what the block decodes from"
+        );
+
+        let mut decoded = make_data_block("20250101000000000");
+        decoded.content = LogBlockContent::Records(RecordBatches::new());
+        assert_eq!(
+            BaseHoodieLogRecordReader::queued_block_content(&decoded, None).unwrap(),
+            None,
+            "a block that already holds content needs no bytes"
+        );
+
+        let err = BaseHoodieLogRecordReader::queued_block_content(&block, None)
+            .expect_err("a block with neither bytes nor content must be refused");
+        assert!(
+            err.to_string()
+                .contains("nothing recorded where to read it from"),
+            "the error must say why it cannot decode, got: {err}"
+        );
+    }
+
+    /// The prefetch must return bytes for every admitted block, keyed by that
+    /// block's own position. Pass 3 no longer fetches anything for itself, so a
+    /// block the prefetch misses is refused rather than read some other way —
+    /// this is what pins the keying that refusal rests on.
     #[tokio::test]
     async fn test_prefetch_returns_content_for_every_admitted_block() {
         use crate::config::HudiConfigs;
@@ -965,7 +1020,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let blocks = reader.read_all_blocks_metadata_only().unwrap();
+        let blocks = reader.read_all_blocks_metadata_only().await.unwrap();
         let admitted = blocks
             .iter()
             .filter(|b| {
