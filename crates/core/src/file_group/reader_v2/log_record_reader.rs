@@ -652,13 +652,32 @@ impl BaseHoodieLogRecordReader {
         hudi_configs: &crate::config::HudiConfigs,
         blocks: &[LogBlock],
     ) -> Result<HashMap<usize, bytes::Bytes>> {
-        use crate::file_group::log_file::log_block::DeferredContent;
-
         let budget = crate::storage::reader::stream_window_size(hudi_configs)
             .map_err(crate::error::CoreError::ReadLogFileError)?;
 
         // Group by file, preserving first-seen order so the requests go out in
         // the order the blocks will be consumed.
+        let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
+        for batch in Self::plan_content_batches(blocks, budget) {
+            Self::fetch_batch(blocks, &batch, &mut fetched).await?;
+        }
+        Ok(fetched)
+    }
+
+    /// Group the admitted blocks' content reads into batches, in issue order.
+    ///
+    /// Separated from the fetching so the two rules that matter can be tested
+    /// without any I/O: batches never span files, because a `LogBlockFetcher`
+    /// reads one file, and a batch stops before it would exceed `budget`, which
+    /// is what keeps peak memory near the one-block-at-a-time property the
+    /// header walk buys. A block bigger than the budget still goes out alone
+    /// rather than being split, since its content has to be whole to decode.
+    ///
+    /// Blocks that carry no content, or nothing deferred, are left out: they
+    /// have nothing to fetch.
+    fn plan_content_batches(blocks: &[LogBlock], budget: u64) -> Vec<Vec<usize>> {
+        use crate::file_group::log_file::log_block::DeferredContent;
+
         let mut by_file: Vec<(object_store::path::Path, Vec<usize>)> = Vec::new();
         for (idx, block) in blocks.iter().enumerate() {
             if !matches!(
@@ -677,32 +696,29 @@ impl BaseHoodieLogRecordReader {
             }
         }
 
-        let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
+        let mut batches: Vec<Vec<usize>> = Vec::new();
         for (_, idxs) in by_file {
             let mut batch: Vec<usize> = Vec::new();
             let mut batch_bytes: u64 = 0;
             for idx in idxs {
-                let location = blocks[idx]
+                let len = blocks[idx]
                     .deferred_content
                     .as_ref()
                     .expect("filtered above to blocks with deferred content")
                     .location
-                    .clone();
-                // A single block larger than the budget still goes out alone
-                // rather than being split: its content has to be whole to decode.
-                if !batch.is_empty() && batch_bytes + location.content_length > budget {
-                    Self::fetch_batch(blocks, &batch, &mut fetched).await?;
-                    batch.clear();
+                    .content_length;
+                if !batch.is_empty() && batch_bytes + len > budget {
+                    batches.push(std::mem::take(&mut batch));
                     batch_bytes = 0;
                 }
-                batch_bytes += location.content_length;
+                batch_bytes += len;
                 batch.push(idx);
             }
             if !batch.is_empty() {
-                Self::fetch_batch(blocks, &batch, &mut fetched).await?;
+                batches.push(batch);
             }
         }
-        Ok(fetched)
+        batches
     }
 
     /// Issue one batched read for `batch` and record the bytes against each index.
@@ -822,6 +838,98 @@ mod tests {
     use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// A block with deferred content of `len` bytes in `file`, for planning tests.
+    fn block_with_content(file: &str, position: u64, len: u64) -> LogBlock {
+        use crate::file_group::log_file::log_block::{DeferredContent, LogBlockContentLocation};
+        use crate::storage::reader::LogBlockFetcher;
+
+        let mut block = make_data_block("20250101000000000");
+        block.deferred_content = Some(DeferredContent {
+            location: LogBlockContentLocation {
+                content_position: position,
+                content_length: len,
+            },
+            fetcher: LogBlockFetcher::new(
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+                object_store::path::Path::from(file),
+            ),
+        });
+        block
+    }
+
+    /// A batch stops before it would exceed the budget. Without this the prefetch
+    /// reads a whole slice's admitted content at once, which hands back the peak
+    /// memory the header walk was added to bound.
+    #[test]
+    fn test_plan_content_batches_stops_at_the_byte_budget() {
+        let blocks = vec![
+            block_with_content("a.log", 0, 40),
+            block_with_content("a.log", 40, 40),
+            block_with_content("a.log", 80, 40),
+        ];
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_batches(&blocks, 100),
+            vec![vec![0, 1], vec![2]],
+            "two blocks fit in 100 bytes, the third starts a new batch"
+        );
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_batches(&blocks, 1_000),
+            vec![vec![0, 1, 2]],
+            "a budget above the total is one batch"
+        );
+    }
+
+    /// A block bigger than the whole budget still goes out, alone. Content has to
+    /// be whole to decode, so splitting it is not an option and skipping it would
+    /// lose data.
+    #[test]
+    fn test_plan_content_batches_sends_an_oversized_block_alone() {
+        let blocks = vec![
+            block_with_content("a.log", 0, 10),
+            block_with_content("a.log", 10, 5_000),
+            block_with_content("a.log", 5_010, 10),
+        ];
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_batches(&blocks, 100),
+            vec![vec![0], vec![1], vec![2]],
+            "the oversized block neither merges with its neighbours nor disappears"
+        );
+    }
+
+    /// Batches never span files: a fetcher reads one file, so mixing them would
+    /// read the wrong bytes for every range after the first.
+    #[test]
+    fn test_plan_content_batches_never_span_files() {
+        let blocks = vec![
+            block_with_content("a.log", 0, 10),
+            block_with_content("b.log", 0, 10),
+            block_with_content("a.log", 10, 10),
+        ];
+        let batches = BaseHoodieLogRecordReader::plan_content_batches(&blocks, 1_000);
+        assert_eq!(
+            batches,
+            vec![vec![0, 2], vec![1]],
+            "a.log's two blocks batch together, b.log's stays separate"
+        );
+    }
+
+    /// Command and corrupt blocks have no content to fetch, and a block whose
+    /// content is already present has nothing deferred.
+    #[test]
+    fn test_plan_content_batches_skips_blocks_with_nothing_to_fetch() {
+        let blocks = vec![
+            make_rollback_block("20250101000000000", "20241231000000000"),
+            make_corrupt_block(),
+            make_data_block("20250101000000000"),
+            block_with_content("a.log", 0, 10),
+        ];
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_batches(&blocks, 1_000),
+            vec![vec![3]],
+            "only the block with deferred content is planned"
+        );
+    }
 
     /// The prefetch must actually return bytes for the admitted blocks. Output is
     /// identical whether or not it does, because Pass 3 falls back to fetching
