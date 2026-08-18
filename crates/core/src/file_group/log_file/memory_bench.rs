@@ -163,6 +163,7 @@ async fn bench_log_read_memory() {
             let mut reader = LogFileReader::new(configs(), storage, name).await.unwrap();
             let blocks = reader
                 .read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))
+                .await
                 .unwrap();
             let rows: usize = blocks
                 .iter()
@@ -174,12 +175,12 @@ async fn bench_log_read_memory() {
             let mut reader = LogFileReader::new_streaming(configs(), storage, name)
                 .await
                 .unwrap();
-            let mut blocks = reader.read_all_blocks_metadata_only().unwrap();
+            let mut blocks = reader.read_all_blocks_metadata_only().await.unwrap();
             let decoder = Decoder::new(configs());
             let mut rows = 0usize;
             let mut peak = rss_mb();
             for block in blocks.iter_mut() {
-                block.load_content(&decoder).unwrap();
+                block.load_content(&decoder).await.unwrap();
                 rows += block
                     .content
                     .as_records()

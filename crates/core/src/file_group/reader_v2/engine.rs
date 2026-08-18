@@ -374,11 +374,10 @@ impl HoodieFileGroupReader {
     /// hands the buffer to the iterator. Re-opening requires constructing a
     /// new `HoodieFileGroupReader`.
     pub async fn open(&mut self) -> Result<FileGroupMergeIterator> {
-        // streaming mode — the base file is held as a lazy
-        // `ParquetSyncReader` that does per-batch `block_on` against
-        // OBJECT_STORE_RUNTIME. The caller MUST consume the returned
-        // iterator from a synchronous context (e.g. the FFI driver),
-        // never from inside another tokio runtime.
+        // streaming mode — the base file is held as a lazy reader that does a
+        // per-batch `block_on` against the runtime handle it was built with. The
+        // caller MUST consume the returned iterator from a synchronous context
+        // (e.g. the FFI driver), never from inside another tokio runtime.
         self.init_record_iterators(/* streaming */ true).await
     }
 
@@ -706,8 +705,8 @@ impl HoodieFileGroupReader {
     ///
     /// - `streaming=true`: returns a lazy [`ParquetSyncReader`] over the
     ///   parquet file. One row group per `RecordBatchReader::next` call.
-    ///   Sync iteration uses `block_on(stream.next())` against
-    ///   `OBJECT_STORE_RUNTIME` — caller MUST be in sync context.
+    ///   Sync iteration uses `block_on(stream.next())` against the runtime
+    ///   handle it was built with — caller MUST be in sync context.
     /// - `streaming=false` (or instant range present — see note): drains
     ///   the parquet stream into a `Vec<RecordBatch>` async, optionally
     ///   applies the instant range filter, and wraps the Vec in a
@@ -1477,7 +1476,7 @@ mod tests {
     /// This is a plain `#[test]` (NOT `#[tokio::test]`): the streaming source is
     /// a `ParquetSyncReader` that does `block_on(stream.next())` per row-group,
     /// which panics if driven from inside an async runtime. Async setup runs on
-    /// `OBJECT_STORE_RUNTIME` then we drain from this sync context — mirroring
+    /// the test's own runtime and we then drain from a sync context — mirroring
     /// the FFI driver's `open()` → sync `get_next` call shape.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_make_base_file_source_schema_on_write_evolution() {

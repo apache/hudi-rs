@@ -321,7 +321,7 @@ impl LogBlock {
     /// Reads only this block's own range, so a scan can walk a file without
     /// holding it and each admitted block costs its own content and no more.
     /// A block that already has content is left alone.
-    pub fn load_content(&mut self, decoder: &Decoder) -> Result<()> {
+    pub async fn load_content(&mut self, decoder: &Decoder) -> Result<()> {
         if !self.content.is_empty() {
             return Ok(());
         }
@@ -333,6 +333,7 @@ impl LogBlock {
 
         let bytes = fetcher
             .read_content(location.content_position, location.content_length)
+            .await
             .map_err(CoreError::ReadLogFileError)?;
         self.decode_fetched(decoder, bytes)
     }
