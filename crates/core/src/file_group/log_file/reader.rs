@@ -788,6 +788,57 @@ mod tests {
         Ok(())
     }
 
+    /// One batched read returns exactly what the same ranges return one at a
+    /// time. This is the property the Pass-3 prefetch rests on: fewer round
+    /// trips must not mean different bytes.
+    #[tokio::test]
+    async fn test_read_contents_matches_reading_each_range_alone() -> Result<()> {
+        // No shipped fixture holds more than one block, and a log file is just a
+        // sequence of self-contained blocks, so two of them concatenated is a
+        // valid two-block file and the smallest thing that can batch.
+        let (dir, file_name) = get_valid_log_avro_data();
+        let one = std::fs::read(PathBuf::from(&dir).join(&file_name)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doubled = one.clone();
+        doubled.extend_from_slice(&one);
+        std::fs::write(tmp.path().join(&file_name), &doubled).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+        let blocks = reader.read_all_blocks_metadata_only()?;
+
+        let deferred: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| b.deferred_content.as_ref())
+            .collect();
+        assert_eq!(
+            deferred.len(),
+            2,
+            "the doubled file must walk as two blocks for this to be a batch"
+        );
+
+        let fetcher = &deferred[0].fetcher;
+        let ranges: Vec<std::ops::Range<u64>> = deferred
+            .iter()
+            .map(|d| {
+                d.location.content_position..d.location.content_position + d.location.content_length
+            })
+            .collect();
+        let batched = fetcher.read_contents(&ranges).await?;
+        assert_eq!(batched.len(), ranges.len(), "one buffer per range");
+        for (i, d) in deferred.iter().enumerate() {
+            let alone = d
+                .fetcher
+                .read_content(d.location.content_position, d.location.content_length)?;
+            assert_eq!(
+                batched[i], alone,
+                "batched range {i} must be byte-identical to reading it alone"
+            );
+        }
+        Ok(())
+    }
+
     /// A block whose content runs past the end of the file must say so. The
     /// ranged read comes back CLAMPED rather than refused, so without a length
     /// check the decoder is handed a short buffer and fails somewhere inside the

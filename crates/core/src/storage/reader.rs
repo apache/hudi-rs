@@ -161,6 +161,35 @@ impl LogBlockFetcher {
     pub fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
         get_range_blocking(&self.object_store, &self.location, offset, length)
     }
+
+    /// The file these ranges are read from, so a caller batching across blocks
+    /// can group them by the file they belong to.
+    pub fn location(&self) -> &ObjPath {
+        &self.location
+    }
+
+    /// Read several ranges from this file in one call.
+    ///
+    /// `get_ranges` coalesces ranges that sit close together into a single
+    /// request, so a run of adjacent blocks costs one round trip rather than
+    /// one each. Reading them one at a time is the same bytes and many more
+    /// round trips, which is what dominates on object storage.
+    ///
+    /// Async, unlike [`Self::read_content`]: the caller is expected to have a
+    /// runtime, and going through the blocking bridge here would serialise the
+    /// very requests this exists to overlap.
+    pub async fn read_contents(&self, ranges: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
+        self.object_store
+            .get_ranges(&self.location, ranges)
+            .await
+            .map_err(|e| {
+                Error::other(format!(
+                    "batched ranged read of {} range(s) from '{}' failed: {e}",
+                    ranges.len(),
+                    self.location
+                ))
+            })
+    }
 }
 
 /// A seekable reader over a file in an object store.

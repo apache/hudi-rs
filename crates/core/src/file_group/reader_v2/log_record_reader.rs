@@ -545,9 +545,20 @@ impl BaseHoodieLogRecordReader {
         // Mirrors Java: if (!currentInstantLogBlocks.isEmpty() && !skipProcessingBlocks) { ... }
         if !pass2.current_instant_log_blocks.is_empty() && !skip_processing_blocks {
             log::debug!("Merging the final data blocks");
+            // Oldest first, matching the pop_back the deque was built for. Taking
+            // the order up front is what lets the content be fetched in batches:
+            // the I/O happens here, in async code, and Pass 3 below then does no
+            // I/O at all. Keeping the two apart also keeps the scan future `Send`,
+            // which it would not be if the record buffer were held across an await.
+            let mut ordered: Vec<LogBlock> =
+                Vec::with_capacity(pass2.current_instant_log_blocks.len());
+            while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
+                ordered.push(block);
+            }
+            let fetched = Self::prefetch_admitted_content(&hudi_configs, &ordered).await?;
             profile_once!(
                 self.merge_insert_ms,
-                self.process_queued_blocks_for_instant(&mut pass2.current_instant_log_blocks)
+                self.process_queued_blocks_for_instant(ordered, fetched)
             )?;
         }
 
@@ -620,13 +631,123 @@ impl BaseHoodieLogRecordReader {
     /// Dispatches each block to the record buffer — the buffer is responsible for
     /// inflating, extracting records, and deflating (matching Java's design where
     /// `processQueuedBlocksForInstant` does NOT call `inflate()`).
+    /// Fetch the content of every admitted block, batched per file.
+    ///
+    /// The gates have already chosen the set, so every range is known before any
+    /// byte is read. `get_ranges` coalesces ranges that sit close together, so a
+    /// run of adjacent blocks costs one round trip instead of one each; reading
+    /// them one at a time is the same bytes and many more round trips, which is
+    /// what dominates on object storage.
+    ///
+    /// Batches are bounded by a byte budget rather than issued all at once. The
+    /// header walk exists so a discarded block costs nothing and a kept one costs
+    /// only its own content; fetching every block up front would hand that back
+    /// and make peak memory the size of the slice's admitted log content. The
+    /// budget is `hoodie.memory.dfs.buffer.max.size`, already the knob for how
+    /// much of a log file may be resident at once.
+    ///
+    /// Returns the bytes keyed by position in `blocks`. A block absent from the
+    /// map has nothing deferred and decodes on its own.
+    async fn prefetch_admitted_content(
+        hudi_configs: &crate::config::HudiConfigs,
+        blocks: &[LogBlock],
+    ) -> Result<HashMap<usize, bytes::Bytes>> {
+        use crate::file_group::log_file::log_block::DeferredContent;
+
+        let budget = crate::storage::reader::stream_window_size(hudi_configs)
+            .map_err(crate::error::CoreError::ReadLogFileError)?;
+
+        // Group by file, preserving first-seen order so the requests go out in
+        // the order the blocks will be consumed.
+        let mut by_file: Vec<(object_store::path::Path, Vec<usize>)> = Vec::new();
+        for (idx, block) in blocks.iter().enumerate() {
+            if !matches!(
+                block.block_type,
+                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete
+            ) {
+                continue;
+            }
+            let Some(DeferredContent { fetcher, .. }) = block.deferred_content.as_ref() else {
+                continue;
+            };
+            let location = fetcher.location().clone();
+            match by_file.iter_mut().find(|(path, _)| *path == location) {
+                Some((_, idxs)) => idxs.push(idx),
+                None => by_file.push((location, vec![idx])),
+            }
+        }
+
+        let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
+        for (_, idxs) in by_file {
+            let mut batch: Vec<usize> = Vec::new();
+            let mut batch_bytes: u64 = 0;
+            for idx in idxs {
+                let location = blocks[idx]
+                    .deferred_content
+                    .as_ref()
+                    .expect("filtered above to blocks with deferred content")
+                    .location
+                    .clone();
+                // A single block larger than the budget still goes out alone
+                // rather than being split: its content has to be whole to decode.
+                if !batch.is_empty() && batch_bytes + location.content_length > budget {
+                    Self::fetch_batch(blocks, &batch, &mut fetched).await?;
+                    batch.clear();
+                    batch_bytes = 0;
+                }
+                batch_bytes += location.content_length;
+                batch.push(idx);
+            }
+            if !batch.is_empty() {
+                Self::fetch_batch(blocks, &batch, &mut fetched).await?;
+            }
+        }
+        Ok(fetched)
+    }
+
+    /// Issue one batched read for `batch` and record the bytes against each index.
+    async fn fetch_batch(
+        blocks: &[LogBlock],
+        batch: &[usize],
+        out: &mut HashMap<usize, bytes::Bytes>,
+    ) -> Result<()> {
+        use crate::file_group::log_file::log_block::DeferredContent;
+
+        let Some(DeferredContent { fetcher, .. }) = blocks[batch[0]].deferred_content.as_ref()
+        else {
+            return Ok(());
+        };
+        let ranges: Vec<std::ops::Range<u64>> = batch
+            .iter()
+            .map(|idx| {
+                let loc = &blocks[*idx]
+                    .deferred_content
+                    .as_ref()
+                    .expect("filtered above to blocks with deferred content")
+                    .location;
+                loc.content_position..loc.content_position + loc.content_length
+            })
+            .collect();
+        let bytes = fetcher
+            .read_contents(&ranges)
+            .await
+            .map_err(crate::error::CoreError::ReadLogFileError)?;
+        for (idx, b) in batch.iter().zip(bytes) {
+            out.insert(*idx, b);
+        }
+        Ok(())
+    }
+
     fn process_queued_blocks_for_instant(
         &mut self,
-        log_blocks: &mut VecDeque<LogBlock>,
+        ordered: Vec<LogBlock>,
+        mut fetched: HashMap<usize, bytes::Bytes>,
     ) -> Result<()> {
         log::debug!(
-            "[Pass3] processQueuedBlocksForInstant: {} blocks to process (pop_back = oldest first)",
-            log_blocks.len(),
+            "[Pass3] processQueuedBlocksForInstant: {} blocks to process (oldest first), {} \
+             prefetched",
+            ordered.len(),
+            fetched.len(),
         );
         let mut block_num = 0u64;
         // The same settings the sweep would have decoded with, so an inflated
@@ -646,7 +767,7 @@ impl BaseHoodieLogRecordReader {
                 .clone(),
         );
 
-        while let Some(mut block) = log_blocks.pop_back() {
+        for (idx, mut block) in ordered.into_iter().enumerate() {
             block_num += 1;
             let instant_time = block.instant_time().unwrap_or("unknown").to_string();
             log::debug!(
@@ -658,7 +779,12 @@ impl BaseHoodieLogRecordReader {
             // block that already has content passes straight through.
             match block.block_type {
                 BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
-                    block.load_content(&block_decoder)?;
+                    match fetched.remove(&idx) {
+                        Some(bytes) => block.decode_fetched(&block_decoder, bytes)?,
+                        // No prefetch for this block: it was already decoded, or
+                        // the eager reader produced it and nothing was deferred.
+                        None => block.load_content(&block_decoder)?,
+                    }
                 }
                 _ => {}
             }
@@ -696,6 +822,75 @@ mod tests {
     use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// The prefetch must actually return bytes for the admitted blocks. Output is
+    /// identical whether or not it does, because Pass 3 falls back to fetching
+    /// per block, so nothing else in the suite can tell the difference: without
+    /// this the whole batching path could be dead and every test would pass.
+    #[tokio::test]
+    async fn test_prefetch_returns_content_for_every_admitted_block() {
+        use crate::config::HudiConfigs;
+        use crate::storage::Storage;
+        use crate::storage::util::parse_uri;
+        use std::path::PathBuf;
+
+        // Two concatenated copies of a one-block fixture: a valid two-block file,
+        // and the smallest input for which a batch is a batch.
+        let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
+        let file_name =
+            ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string();
+        let one = std::fs::read(std::fs::canonicalize(&dir).unwrap().join(&file_name)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doubled = one.clone();
+        doubled.extend_from_slice(&one);
+        std::fs::write(tmp.path().join(&file_name), &doubled).unwrap();
+
+        let configs = HudiConfigs::new(std::collections::HashMap::<String, String>::new());
+        let storage =
+            Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap()).unwrap()).unwrap();
+        let mut reader = crate::file_group::log_file::reader::LogFileReader::new_streaming(
+            std::sync::Arc::new(HudiConfigs::new(
+                std::collections::HashMap::<String, String>::new(),
+            )),
+            storage,
+            &file_name,
+        )
+        .await
+        .unwrap();
+        let blocks = reader.read_all_blocks_metadata_only().unwrap();
+        let admitted = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.block_type,
+                    BlockType::AvroData | BlockType::ParquetData | BlockType::Delete
+                ) && b.deferred_content.is_some()
+            })
+            .count();
+        assert_eq!(admitted, 2, "the doubled fixture must offer two blocks");
+
+        let fetched = BaseHoodieLogRecordReader::prefetch_admitted_content(&configs, &blocks)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched.len(),
+            admitted,
+            "every admitted block must come back with its content prefetched"
+        );
+        for (idx, bytes) in &fetched {
+            let expected = blocks[*idx]
+                .deferred_content
+                .as_ref()
+                .unwrap()
+                .location
+                .content_length;
+            assert_eq!(
+                bytes.len() as u64,
+                expected,
+                "block {idx} must get exactly its own range"
+            );
+        }
+    }
 
     /// Create a data block with given instant time and a tag for identification.
     fn make_data_block(instant_time: &str) -> LogBlock {
