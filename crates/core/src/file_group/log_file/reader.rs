@@ -1040,6 +1040,153 @@ mod tests {
         Ok(())
     }
 
+    /// Options carrying a base path, and a streaming window when one is asked
+    /// for. `Storage::new_with_base_url` builds its own configs, so the window
+    /// knob has to be set on the storage the reader is opened from.
+    fn storage_with_window(dir: &str, window: Option<u64>) -> Result<Arc<Storage>> {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            parse_uri(dir)?.as_str().to_string(),
+        );
+        options.insert(
+            HudiTableConfig::OrderingFields.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        if let Some(window) = window {
+            options.insert(
+                crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE.to_string(),
+                window.to_string(),
+            );
+        }
+        Ok(Storage::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::new(options)),
+        )?)
+    }
+
+    /// A file whose first block is corrupt and whose second block's MAGIC starts
+    /// `straddle_by` bytes before the end of the recovery scan's first 1 MiB
+    /// window. Returns the directory, the file name, and where the good block
+    /// starts.
+    fn corrupt_then_good_file(straddle_by: u64) -> (tempfile::TempDir, String, u64) {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let good = std::fs::read(PathBuf::from(&dir).join(&file_name)).unwrap();
+
+        let magic_len = MAGIC.len() as u64;
+        let scan = LogFileReader::<StorageReader>::BLOCK_SCAN_READ_BUFFER_SIZE as u64;
+        // The scan starts at `magic_len` and reads `scan` bytes, so its first
+        // window ends at `magic_len + scan`. Landing the good block's MAGIC
+        // `straddle_by` bytes before that end splits the marker across two
+        // windows.
+        let block_start = magic_len + scan - straddle_by;
+
+        let mut bytes = Vec::with_capacity(block_start as usize + good.len());
+        bytes.extend_from_slice(MAGIC);
+        // A length no file can hold, so the block is corrupt by arithmetic
+        // rather than by a trailing-pointer mismatch. All-ones also cannot
+        // contain MAGIC, which the scan would otherwise find.
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        bytes.resize(block_start as usize, 0);
+        bytes.extend_from_slice(&good);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+        (tmp, file_name, block_start)
+    }
+
+    /// Recovery from a corrupt block scans forward for the next MAGIC over 1 MiB
+    /// windows, and consecutive windows overlap by `MAGIC.len() - 1` so a marker
+    /// split across a boundary is still found.
+    ///
+    /// This is the one place the header walk is not a forward parse, so it is
+    /// also the case a windowed fetch gets wrong most easily: dropping the
+    /// overlap, or refilling a fetch window without it, makes the scan miss the
+    /// marker, run to EOF, and swallow every later block into the corrupt span.
+    /// Asserted for the eager reader and for streaming readers whose fetch
+    /// window is smaller than, larger than, and unrelated to the scan window.
+    async fn assert_corrupt_recovery_finds_a_straddling_magic(window: Option<u64>) -> Result<()> {
+        let scan = LogFileReader::<StorageReader>::BLOCK_SCAN_READ_BUFFER_SIZE as u64;
+        let magic_len = MAGIC.len() as u64;
+        let (tmp, file_name, block_start) = corrupt_then_good_file(3);
+        assert!(
+            block_start < magic_len + scan && block_start + magic_len > magic_len + scan,
+            "the fixture must split MAGIC across the scan's first window boundary"
+        );
+
+        let dir = tmp.path().to_str().unwrap();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+
+        // The scan itself lands exactly on the good block's magic, not on EOF.
+        let storage = storage_with_window(dir, window)?;
+        let mut reader = match window {
+            None => LogFileReader::new(hudi_configs.clone(), storage.clone(), &file_name).await?,
+            Some(_) => {
+                LogFileReader::new_streaming(hudi_configs.clone(), storage.clone(), &file_name)
+                    .await?
+            }
+        };
+        assert_eq!(
+            reader.scan_for_next_block_offset(0)?,
+            block_start,
+            "recovery must land on the good block's magic, not run to EOF"
+        );
+
+        // ... and the walk therefore reports the corrupt block followed by the
+        // good one, rather than one corrupt block covering the whole file.
+        let mut eager =
+            LogFileReader::new(hudi_configs.clone(), storage.clone(), &file_name).await?;
+        let eager_blocks =
+            eager.read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))?;
+        assert_eq!(
+            eager_blocks
+                .iter()
+                .map(|b| b.block_type.clone())
+                .collect::<Vec<_>>(),
+            vec![BlockType::Corrupted, BlockType::AvroData],
+        );
+        assert!(
+            eager_blocks[1].record_batches().unwrap().num_data_rows() > 0,
+            "the block after the corrupt span must still decode"
+        );
+
+        let mut lazy =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
+        let mut lazy_blocks = lazy.read_all_blocks_metadata_only()?;
+        assert_eq!(
+            lazy_blocks
+                .iter()
+                .map(|b| b.block_type.clone())
+                .collect::<Vec<_>>(),
+            vec![BlockType::Corrupted, BlockType::AvroData],
+        );
+        let decoder = Decoder::new(hudi_configs);
+        lazy_blocks[1].load_content(&decoder)?;
+        assert_eq!(
+            lazy_blocks[1]
+                .content
+                .as_records()
+                .map(|b| b.num_data_rows()),
+            eager_blocks[1]
+                .content
+                .as_records()
+                .map(|b| b.num_data_rows()),
+            "the recovered block must decode the same either way"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_recovery_scan_finds_a_magic_split_across_windows() -> Result<()> {
+        let scan = LogFileReader::<StorageReader>::BLOCK_SCAN_READ_BUFFER_SIZE as u64;
+        // Eager (whole file resident), a fetch window smaller than the scan
+        // window, one larger than it, and one that is not a multiple of it.
+        for window in [None, Some(scan / 2), Some(scan + 1024), Some(64 * 1024 + 7)] {
+            assert_corrupt_recovery_finds_a_straddling_magic(window).await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_read_log_file_with_avro_data_block() -> Result<()> {
         let (dir, file_name) = get_valid_log_avro_data();
