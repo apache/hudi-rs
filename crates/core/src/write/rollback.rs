@@ -356,3 +356,83 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use crate::table::Table;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(id: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![id])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Fabricated crashed write (fencing + markers + partial file + orphan MDT
+    /// deltacommit) rolled back by the next write, from inside the crate.
+    #[tokio::test]
+    async fn test_eager_rollback_in_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([batch("a")]).await.unwrap();
+
+        let ts = "30000101000000000";
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::write(timeline.join(format!("{ts}.commit.requested")), b"").unwrap();
+        std::fs::write(timeline.join(format!("{ts}.inflight")), b"").unwrap();
+        let partial = format!("00000000-1111-2222-3333-444444444444-0_0-0-0_{ts}.parquet");
+        std::fs::write(dir.path().join(&partial), b"partial").unwrap();
+        let marker_dir = dir.path().join(".hoodie/.temp").join(ts);
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(marker_dir.join("MARKERS.type"), b"TIMELINE_SERVER_BASED").unwrap();
+        std::fs::write(
+            marker_dir.join("MARKERS0"),
+            format!("{partial}.marker.CREATE\n"),
+        )
+        .unwrap();
+        let mdt_timeline = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+        std::fs::write(
+            mdt_timeline.join(format!("{ts}.deltacommit.requested")),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(mdt_timeline.join(format!("{ts}.deltacommit.inflight")), b"").unwrap();
+        std::fs::write(mdt_timeline.join(format!("{ts}_{ts}.deltacommit")), b"x").unwrap();
+
+        table.append([batch("b")]).await.unwrap();
+
+        assert!(!dir.path().join(&partial).exists());
+        assert!(!timeline.join(format!("{ts}.commit.requested")).exists());
+        assert!(!timeline.join(format!("{ts}.inflight")).exists());
+        let leftovers = std::fs::read_dir(&marker_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "marker dir must be emptied");
+        assert!(!mdt_timeline.join(format!("{ts}_{ts}.deltacommit")).exists());
+        let rollbacks = std::fs::read_dir(&timeline)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.contains(".rollback") && !n.ends_with(".requested") && !n.ends_with(".inflight")
+            })
+            .count();
+        assert_eq!(rollbacks, 1, "one completed rollback instant");
+    }
+}

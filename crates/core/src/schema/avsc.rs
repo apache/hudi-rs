@@ -213,4 +213,53 @@ mod tests {
         assert!(!cleaned.contains("// note"));
         assert!(cleaned.contains("\"type\""));
     }
+
+    /// The replace-commit schema is built by inlining HoodieWriteStat into the
+    /// vendored replace avsc; both vendored schemas must parse and encode.
+    #[test]
+    fn test_commit_and_replace_schemas_encode_roundtrip() {
+        use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
+        use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
+        use std::collections::HashMap;
+
+        let stat = HoodieWriteStat {
+            file_id: Some("f1".to_string()),
+            path: Some("p/f1.parquet".to_string()),
+            num_writes: Some(3),
+            partition_path: Some("p".to_string()),
+            ..Default::default()
+        };
+        let commit = HoodieCommitMetadata {
+            version: Some(1),
+            operation_type: Some("UPSERT".to_string()),
+            partition_to_write_stats: Some(HashMap::from([("p".to_string(), vec![stat.clone()])])),
+            compacted: Some(false),
+            extra_metadata: Some(HashMap::new()),
+        };
+        let bytes = commit.to_avro_bytes().unwrap();
+        assert_eq!(&bytes[..4], b"Obj\x01");
+        let decoded = HoodieCommitMetadata::from_avro_bytes(&bytes).unwrap();
+        assert_eq!(decoded.operation_type.as_deref(), Some("UPSERT"));
+
+        let replace = HoodieReplaceCommitMetadata {
+            version: Some(1),
+            operation_type: Some("INSERT_OVERWRITE_TABLE".to_string()),
+            partition_to_write_stats: Some(HashMap::from([("p".to_string(), vec![stat])])),
+            compacted: Some(false),
+            extra_metadata: Some(HashMap::new()),
+            partition_to_replace_file_ids: Some(HashMap::from([(
+                "p".to_string(),
+                vec!["old-file-id".to_string()],
+            )])),
+        };
+        let bytes = replace.to_avro_bytes().unwrap();
+        assert_eq!(&bytes[..4], b"Obj\x01");
+        // JSON (layout v1) encoding of the same metadata also works.
+        let json = replace.to_json_bytes().unwrap();
+        assert!(
+            std::str::from_utf8(&json)
+                .unwrap()
+                .contains("INSERT_OVERWRITE_TABLE")
+        );
+    }
 }

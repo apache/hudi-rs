@@ -426,4 +426,53 @@ mod tests {
             "expected instant conflict, got: {err}"
         );
     }
+
+    /// Non-zero ordering values take the LongWrapper union branch; zero takes
+    /// IntWrapper (Java DEFAULT_ORDERING_VALUE). Both must produce parseable
+    /// delete blocks.
+    #[test]
+    fn test_build_delete_log_block_both_ordering_branches() {
+        for ordering in [0i64, 42i64] {
+            let block = build_delete_log_block(
+                "20260101000000000",
+                &[("k1".to_string(), "p".to_string())],
+                ordering,
+            )
+            .unwrap();
+            assert!(!block.is_empty());
+            assert_eq!(&block[..6], b"#HUDI#");
+        }
+    }
+
+    /// Bare-path partition metadata: empty partition is a no-op; a real
+    /// partition writes the metafile once and never rewrites it.
+    #[tokio::test]
+    async fn test_ensure_partition_metadata_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        ensure_partition_metadata(&storage, "", "20260101000000000")
+            .await
+            .unwrap();
+        ensure_partition_metadata(&storage, "city=sf", "20260101000000000")
+            .await
+            .unwrap();
+        let meta = dir.path().join("city=sf/.hoodie_partition_metadata");
+        let first = std::fs::read_to_string(&meta).unwrap();
+        assert!(first.contains("commitTime=20260101000000000"));
+        assert!(first.contains("partitionDepth=1"));
+        ensure_partition_metadata(&storage, "city=sf", "20270101000000000")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&meta).unwrap(), first);
+    }
+
+    /// Inflight commit metadata bytes: Avro OCF for layout v2, JSON for v1.
+    #[test]
+    fn test_inflight_commit_metadata_bytes_both_layouts() {
+        let avro = inflight_commit_metadata_bytes("UPSERT", true).unwrap();
+        assert_eq!(&avro[..4], b"Obj\x01");
+        let json = inflight_commit_metadata_bytes("UPSERT", false).unwrap();
+        assert!(std::str::from_utf8(&json).unwrap().contains("UPSERT"));
+    }
 }

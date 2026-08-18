@@ -419,3 +419,60 @@ pub(crate) async fn archived_instant_times(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use crate::table::Table;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(id: &str, v: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![id])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![v])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Drives repeated archival from inside the crate: manifest rotation,
+    /// retention, and reads across the boundary on the writing handle.
+    #[tokio::test]
+    async fn test_archival_rotation_in_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.keep.min.commits", "4")
+            .with_option("hoodie.keep.max.commits", "6")
+            .create()
+            .await
+            .unwrap();
+        for i in 0..12 {
+            table.append([batch(&format!("k{i}"), i)]).await.unwrap();
+        }
+        let history = dir.path().join(".hoodie/timeline/history");
+        let names: Vec<String> = std::fs::read_dir(&history)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.iter().filter(|n| n.ends_with(".parquet")).count() >= 2);
+        assert!(names.iter().filter(|n| n.starts_with("manifest_")).count() <= 3);
+        let rows: usize = table
+            .read(&crate::table::ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 12);
+    }
+}

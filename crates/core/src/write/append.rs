@@ -982,4 +982,79 @@ mod tests {
             vec!["id"]
         );
     }
+
+    fn id_batch(n: usize) -> arrow_array::RecordBatch {
+        use arrow_array::{ArrayRef, Int64Array, StringArray};
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("k{i:04}")).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                std::sync::Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Size-split path: a small max-file-size forces multiple base files in
+    /// one append commit, with unique auto-incrementing sequence metadata.
+    #[tokio::test]
+    async fn test_append_size_split_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = crate::table::Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.parquet.max.file.size", "4096")
+            .with_option("hoodie.copyonwrite.record.size.estimate", "1024")
+            .create()
+            .await
+            .unwrap();
+        table.append([id_batch(64)]).await.unwrap();
+        let files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+            .count();
+        assert!(files > 1, "expected a size split, got {files} file(s)");
+        let rows: usize = table
+            .read(&crate::table::ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(arrow_array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 64);
+    }
+
+    /// Append with a batch whose schema does not match the table's: rejected.
+    #[tokio::test]
+    async fn test_append_schema_mismatch_rejected() {
+        use arrow_array::{ArrayRef, Int64Array};
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = crate::table::Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([id_batch(2)]).await.unwrap();
+        let other = arrow_array::RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+            vec![std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        assert!(table.append([other]).await.is_err());
+        // Mixed schemas within one call are also rejected.
+        let other = arrow_array::RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+            vec![std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        assert!(table.append([id_batch(1), other]).await.is_err());
+    }
 }

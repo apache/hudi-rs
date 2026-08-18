@@ -2880,3 +2880,157 @@ fn prev_commit_from_base_path(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "null".to_string())
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use crate::config::table::TableTypeValue;
+    use crate::table::{ReadOptions, Table, UpsertOptions};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(rows: &[(&str, &str, i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn rows(table: &Table) -> usize {
+        table
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// Full COW verb lifecycle from inside the crate: append, keyed upsert
+    /// (update + insert + packing), partial upsert, expression update, keyed
+    /// and expression delete, dynamic partition overwrite, full overwrite.
+    #[tokio::test]
+    async fn test_cow_verb_lifecycle_in_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+
+        table
+            .append([batch(&[
+                ("a", "sf", 1, 10),
+                ("b", "sf", 1, 20),
+                ("c", "ny", 1, 30),
+            ])])
+            .await
+            .unwrap();
+        assert_eq!(rows(&table).await, 3);
+
+        let result = table
+            .upsert([batch(&[("a", "sf", 2, 11), ("d", "ny", 2, 40)])])
+            .await
+            .unwrap();
+        assert_eq!(result.num_updates, 1);
+        assert_eq!(result.num_inserts, 1);
+
+        table
+            .upsert_with(
+                [batch(&[("b", "sf", 3, 999)])],
+                UpsertOptions {
+                    update_columns: Some(vec!["v".to_string()]),
+                },
+            )
+            .await
+            .unwrap();
+
+        let set = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![777])) as ArrayRef],
+        )
+        .unwrap();
+        let result = table.update("city = 'ny'", set).await.unwrap();
+        assert_eq!(result.num_updates, 2);
+
+        let result = table.delete("id = 'b'").await.unwrap();
+        assert_eq!(result.num_deletes, 1);
+        let result = table.delete("v = 777").await.unwrap();
+        assert_eq!(result.num_deletes, 2);
+        assert_eq!(rows(&table).await, 1);
+
+        table
+            .dynamic_partition_overwrite([batch(&[("z1", "sf", 9, 1)])])
+            .await
+            .unwrap();
+        assert_eq!(rows(&table).await, 1, "sf replaced; ny had no rows left");
+
+        table
+            .overwrite([batch(&[("w", "ny", 10, 5)])])
+            .await
+            .unwrap();
+        assert_eq!(rows(&table).await, 1);
+    }
+
+    /// MOR verb lifecycle: log-block upserts, expression update, keyed and
+    /// expression deletes, read-back through base+log merge.
+    #[tokio::test]
+    async fn test_mor_verb_lifecycle_in_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(TableTypeValue::MergeOnRead)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+
+        table
+            .append([batch(&[("a", "sf", 1, 10), ("b", "ny", 1, 20)])])
+            .await
+            .unwrap();
+        let result = table
+            .upsert([batch(&[("a", "sf", 2, 11), ("c", "ny", 2, 30)])])
+            .await
+            .unwrap();
+        assert_eq!(result.num_updates, 1);
+        assert_eq!(result.num_inserts, 1);
+
+        let set = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![555])) as ArrayRef],
+        )
+        .unwrap();
+        table.update("id = 'b'", set).await.unwrap();
+
+        table.delete("id = 'c'").await.unwrap();
+        let result = table.delete("v = 555").await.unwrap();
+        assert_eq!(result.num_deletes, 1);
+        assert_eq!(rows(&table).await, 1);
+    }
+}

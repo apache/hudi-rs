@@ -535,3 +535,89 @@ mod tests {
         assert_eq!(table_checksum("", "trips_metadata"), 1_249_152_950);
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use crate::config::table::TableTypeValue;
+    use crate::table::Table;
+
+    /// Default create: COW tv9, partitioned, event-time ordering, MDT with
+    /// files/RLI/col-stats/partition-stats. Exercises the full property and
+    /// bootstrap body from inside the crate (tarpaulin registers lib-internal
+    /// runs reliably; integration binaries are inconsistently profiled).
+    #[tokio::test]
+    async fn test_create_cow_default_full_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+        assert!(table.is_metadata_table_enabled());
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        for expected in [
+            "hoodie.table.name=trips",
+            "hoodie.table.type=COPY_ON_WRITE",
+            "hoodie.table.version=9",
+            "hoodie.timeline.layout.version=2",
+            "hoodie.table.recordkey.fields=id",
+            "hoodie.table.partition.fields=city",
+            "hoodie.record.merge.mode=EVENT_TIME_ORDERING",
+            "hoodie.table.checksum=",
+        ] {
+            assert!(
+                props.contains(expected),
+                "missing `{expected}` in:\n{props}"
+            );
+        }
+        let mdt_props = std::fs::read_to_string(
+            dir.path()
+                .join(".hoodie/metadata/.hoodie/hoodie.properties"),
+        )
+        .unwrap();
+        assert!(mdt_props.contains("hoodie.table.name=trips_metadata"));
+        assert!(mdt_props.contains("hoodie.table.type=MERGE_ON_READ"));
+    }
+
+    /// tv8 MOR with commit-time ordering, no hive-style, no meta fields:
+    /// the other half of the property matrix.
+    #[tokio::test]
+    async fn test_create_mor_tv8_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips8")
+            .with_table_type(TableTypeValue::MergeOnRead)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_hive_style_partitioning(false)
+            .with_table_version(8)
+            .create()
+            .await
+            .unwrap();
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        assert!(props.contains("hoodie.table.version=8"));
+        assert!(props.contains("hoodie.table.type=MERGE_ON_READ"));
+        assert!(props.contains("hoodie.record.merge.mode=COMMIT_TIME_ORDERING"));
+        assert!(props.contains("hoodie.datasource.write.hive_style_partitioning=false"));
+
+        // Auto keys + MDT off + custom option passthrough + no meta fields.
+        let dir = tempfile::tempdir().unwrap();
+        let _ = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("nometa")
+            .with_metadata(false)
+            .with_record_index(false)
+            .with_column_stats(false)
+            .with_populates_meta_fields(false)
+            .with_option("hoodie.parquet.max.file.size", "1048576")
+            .create()
+            .await
+            .unwrap();
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        assert!(props.contains("hoodie.populate.meta.fields=false"));
+        assert!(props.contains("hoodie.parquet.max.file.size=1048576"));
+        assert!(!dir.path().join(".hoodie/metadata").exists());
+    }
+}
