@@ -428,17 +428,15 @@ pub(crate) fn stat_value_to_array(
         ColumnStatValue::Long(v) => Arc::new(arrow_array::Int64Array::from(vec![*v])),
         ColumnStatValue::Float(v) => Arc::new(arrow_array::Float32Array::from(vec![*v])),
         ColumnStatValue::Double(v) => Arc::new(arrow_array::Float64Array::from(vec![*v])),
-        ColumnStatValue::Bytes(v) => {
-            Arc::new(arrow_array::BinaryArray::from(vec![v.as_slice()]))
-        }
+        ColumnStatValue::Bytes(v) => Arc::new(arrow_array::BinaryArray::from(vec![v.as_slice()])),
         ColumnStatValue::String(v) => Arc::new(arrow_array::StringArray::from(vec![v.as_str()])),
         ColumnStatValue::Date(v) => Arc::new(arrow_array::Date32Array::from(vec![*v])),
         ColumnStatValue::TimeMicros(v) => {
             Arc::new(arrow_array::Time64MicrosecondArray::from(vec![*v]))
         }
-        ColumnStatValue::TimestampMicros(v) => Arc::new(
-            arrow_array::TimestampMicrosecondArray::from(vec![*v]).with_timezone_utc(),
-        ),
+        ColumnStatValue::TimestampMicros(v) => {
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![*v]).with_timezone_utc())
+        }
         ColumnStatValue::LocalTimestampMicros(v) => {
             Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![*v]))
         }

@@ -99,7 +99,11 @@ async fn main() {
     // Update: SQL-ish SET on rows matching a filter. The single-row SET batch
     // carries only the columns to change.
     let set_fare = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("fare", DataType::Int64, false)])),
+        Arc::new(Schema::new(vec![Field::new(
+            "fare",
+            DataType::Int64,
+            false,
+        )])),
         vec![Arc::new(Int64Array::from(vec![99])) as ArrayRef],
     )
     .unwrap();

@@ -1447,7 +1447,10 @@ async fn test_read_filter_prunes_via_mdt_column_stats() {
         .await
         .unwrap();
     table
-        .append([partitioned_batch(vec![("c", "nyc", 100), ("d", "nyc", 200)])])
+        .append([partitioned_batch(vec![
+            ("c", "nyc", 100),
+            ("d", "nyc", 200),
+        ])])
         .await
         .unwrap();
     assert!(
@@ -1458,7 +1461,9 @@ async fn test_read_filter_prunes_via_mdt_column_stats() {
     );
 
     // Filter matched only by the nyc group; the sf group prunes on its range.
-    let options = ReadOptions::new().with_filters([("value", ">", "50")]).unwrap();
+    let options = ReadOptions::new()
+        .with_filters([("value", ">", "50")])
+        .unwrap();
     let rows = rows_by_id(&table.read(&options).await.unwrap());
     assert_eq!(
         rows,

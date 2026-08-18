@@ -37,8 +37,8 @@ use crate::schema::avsc::{hoodie_metadata_schema, strip_avro_line_comments};
 /// `"avro.java.string":"String"` so Spark's `GenericDatumReader` materializes
 /// `java.lang.String` instead of `Utf8` (required by `constructFilesMetadataPayload`
 /// and `fetchBaseFileRecordsByKeys`).
-pub fn hoodie_metadata_schema_json() -> &'static str {
-    static JSON: OnceLock<String> = OnceLock::new();
+pub fn hoodie_metadata_schema_json() -> Result<&'static str> {
+    static JSON: OnceLock<std::result::Result<String, String>> = OnceLock::new();
     JSON.get_or_init(|| {
         let raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -51,15 +51,20 @@ pub fn hoodie_metadata_schema_json() -> &'static str {
             .unwrap_or(cleaned);
         inject_avro_java_string_props(&json)
     })
-    .as_str()
+    .as_deref()
+    .map_err(|e| {
+        crate::error::CoreError::MetadataTable(format!(
+            "vendored HoodieMetadata.avsc failed to annotate: {e}"
+        ))
+    })
 }
 
 /// Annotate Avro JSON so Java readers decode strings as `java.lang.String`.
-fn inject_avro_java_string_props(schema_json: &str) -> String {
+fn inject_avro_java_string_props(schema_json: &str) -> std::result::Result<String, String> {
     let mut value: serde_json::Value =
-        serde_json::from_str(schema_json).expect("HoodieMetadata.avsc must be valid JSON");
+        serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
     inject_avro_java_string_props_value(&mut value);
-    serde_json::to_string(&value).expect("serialize annotated metadata schema")
+    serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
 fn inject_avro_java_string_props_value(value: &mut serde_json::Value) {
@@ -99,12 +104,12 @@ fn inject_avro_java_string_props_value(value: &mut serde_json::Value) {
 }
 
 /// Alias kept for call sites that embed the files-partition schema into HFiles.
-pub fn files_metadata_avro_schema_json() -> &'static str {
+pub fn files_metadata_avro_schema_json() -> Result<&'static str> {
     hoodie_metadata_schema_json()
 }
 
 /// Alias kept for call sites that embed the record_index schema into HFiles.
-pub fn record_index_metadata_avro_schema_json() -> &'static str {
+pub fn record_index_metadata_avro_schema_json() -> Result<&'static str> {
     hoodie_metadata_schema_json()
 }
 
@@ -827,7 +832,7 @@ mod tests {
 
     #[test]
     fn embedded_metadata_schema_has_java_string_props() {
-        let json = hoodie_metadata_schema_json();
+        let json = hoodie_metadata_schema_json().unwrap();
         assert!(
             json.contains("avro.java.string"),
             "HFile-embedded schema must request Java String decoding"

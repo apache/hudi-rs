@@ -184,8 +184,7 @@ impl FileSystemView {
         if file_pruner.is_empty() {
             return false;
         }
-        if configured_base_file_format.is_some_and(|f| !matches!(f, BaseFileFormatValue::Parquet))
-        {
+        if configured_base_file_format.is_some_and(|f| !matches!(f, BaseFileFormatValue::Parquet)) {
             return false;
         }
         let metadata_partitions: Vec<String> = self

@@ -283,7 +283,9 @@ mod tests {
 
         // Test 2: Read specific keys
         let keys = vec![FilesPartitionRecord::ALL_PARTITIONS_KEY, "city=chennai"];
-        let filtered_records = reader.read_files_partition(&file_slice, &keys, None).await?;
+        let filtered_records = reader
+            .read_files_partition(&file_slice, &keys, None)
+            .await?;
 
         // Should only contain the requested keys
         assert_eq!(filtered_records.len(), 2);

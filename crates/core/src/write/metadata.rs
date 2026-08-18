@@ -160,7 +160,7 @@ pub async fn bootstrap_metadata_table(
         )],
         BTreeMap::from([(
             "schema".to_string(),
-            files_metadata_avro_schema_json().as_bytes().to_vec(),
+            files_metadata_avro_schema_json()?.as_bytes().to_vec(),
         )]),
     )
     .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
@@ -204,7 +204,7 @@ pub async fn bootstrap_metadata_table(
             MetadataPartitionType::ColumnStats.partition_name(),
             DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS,
             &column_stats_file_id,
-            hoodie_metadata_schema_json(),
+            hoodie_metadata_schema_json()?,
         )
         .await?;
         next_offset += 1;
@@ -216,7 +216,7 @@ pub async fn bootstrap_metadata_table(
             MetadataPartitionType::RecordIndex.partition_name(),
             DEFAULT_RLI_NUM_FILE_GROUPS,
             &record_index_file_id,
-            record_index_metadata_avro_schema_json(),
+            record_index_metadata_avro_schema_json()?,
         )
         .await?;
         next_offset += 1;
@@ -228,7 +228,7 @@ pub async fn bootstrap_metadata_table(
             MetadataPartitionType::PartitionStats.partition_name(),
             DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS,
             &partition_stats_file_id,
-            hoodie_metadata_schema_json(),
+            hoodie_metadata_schema_json()?,
         )
         .await?;
     }
@@ -349,7 +349,7 @@ pub async fn update_files_partition_entries(
             encode_files_record(&partition, MetadataRecordType::Files, files)?,
         ));
     }
-    let schema_json = files_metadata_avro_schema_json().to_string();
+    let schema_json = files_metadata_avro_schema_json()?.to_string();
     let hfile = HFileWriter::write(
         &entries,
         BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
@@ -399,7 +399,7 @@ pub async fn update_record_index(
         return Ok(Vec::new());
     }
     let num_groups = detect_rli_num_file_groups(data_storage).await?;
-    let schema_json = record_index_metadata_avro_schema_json().to_string();
+    let schema_json = record_index_metadata_avro_schema_json()?.to_string();
     let mut puts_by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
     let mut deletes_by_shard: HashMap<usize, Vec<(String, String)>> = HashMap::new();
     for entry in entries {
@@ -884,7 +884,7 @@ async fn write_stats_log_blocks(
     let num_groups =
         detect_num_file_groups(data_storage, partition_name, file_id_prefix, default_groups)
             .await?;
-    let schema_json = hoodie_metadata_schema_json().to_string();
+    let schema_json = hoodie_metadata_schema_json()?.to_string();
     let mut by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
     for (key, payload) in records {
         let bytes = if is_column_stats {
