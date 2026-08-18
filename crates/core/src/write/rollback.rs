@@ -61,6 +61,23 @@ pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
     Ok(())
 }
 
+/// The action infix of a fencing file name: `{ts}.{action}.requested|inflight`
+/// or the bare COW forms `{ts}.inflight` / `{ts}.requested` (empty action).
+///
+/// Must not depend on which of an instant's fencing files is listed first —
+/// directory listing order is filesystem-specific (ext4 returns hash order,
+/// so `.inflight` can precede `.commit.requested`).
+fn action_from_fencing_name(name: &str, timestamp: &str) -> String {
+    let rest = name.trim_start_matches(timestamp).trim_start_matches('.');
+    match rest {
+        "inflight" | "requested" => String::new(),
+        other => other
+            .trim_end_matches(".requested")
+            .trim_end_matches(".inflight")
+            .to_string(),
+    }
+}
+
 async fn find_pending_instants(
     storage: &Storage,
     timeline_dir: &str,
@@ -84,14 +101,7 @@ async fn find_pending_instants(
         }
         let timestamp: String = name.chars().take_while(char::is_ascii_digit).collect();
         if name.ends_with(".requested") || name.ends_with(".inflight") {
-            // `{ts}.{action}.requested|inflight` or COW `{ts}.inflight`.
-            let action = name
-                .trim_start_matches(&timestamp)
-                .trim_start_matches('.')
-                .trim_end_matches(".requested")
-                .trim_end_matches(".inflight")
-                .trim_end_matches('.')
-                .to_string();
+            let action = action_from_fencing_name(name, &timestamp);
             let entry = fenced
                 .entry(timestamp)
                 .or_insert_with(|| (action.clone(), Vec::new()));
@@ -312,4 +322,37 @@ async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Resul
         let _ = storage.delete_file(&format!("{mdt_timeline}/{name}")).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::action_from_fencing_name;
+
+    /// Regression: on ext4 the bare COW inflight can be listed before the
+    /// action-bearing requested file; "inflight" must never leak out as an
+    /// action name or the instant is silently skipped by rollback.
+    #[test]
+    fn test_action_from_fencing_name_all_forms() {
+        let ts = "30000101000000000";
+        assert_eq!(
+            action_from_fencing_name("30000101000000000.commit.requested", ts),
+            "commit"
+        );
+        assert_eq!(
+            action_from_fencing_name("30000101000000000.inflight", ts),
+            ""
+        );
+        assert_eq!(
+            action_from_fencing_name("30000101000000000.deltacommit.inflight", ts),
+            "deltacommit"
+        );
+        assert_eq!(
+            action_from_fencing_name("30000101000000000.replacecommit.requested", ts),
+            "replacecommit"
+        );
+        assert_eq!(
+            action_from_fencing_name("30000101000000000.rollback.requested", ts),
+            "rollback"
+        );
+    }
 }
