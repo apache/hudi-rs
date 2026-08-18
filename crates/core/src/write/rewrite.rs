@@ -151,7 +151,7 @@ pub async fn upsert_batches(
         ));
     }
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
-    let incoming = prepare_batches_for_write(table, batches, &instant, "pending")?;
+    let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
     if incoming.num_rows() == 0 {
         return Err(CoreError::Write(
@@ -160,16 +160,10 @@ pub async fn upsert_batches(
     }
     let key_name = record_key_name(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
-    let incoming_keys = keys(&incoming, &key_name)?;
-    let incoming_hoodie_keys = hoodie_keys_for_batch(table, &incoming, None)?;
+    let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
     let locations = for_table(table)
         .tag_location(table, &incoming_hoodie_keys)
         .await?;
-    let affected_file_ids = locations
-        .values()
-        .filter_map(|loc| loc.as_ref().map(|l| l.file_id.clone()))
-        .collect::<HashSet<_>>();
-
     // Small-file packing (Java UpsertPartitioner.assignInserts): assign insert
     // rows to existing small file groups first; chosen groups join the read
     // set so their rows are preserved through the rewrite.
@@ -220,99 +214,123 @@ pub async fn upsert_batches(
             cursor += count;
         }
     }
-    let read_ids: HashSet<String> = affected_file_ids
-        .union(&packed_group_ids)
-        .cloned()
-        .collect();
-    let (old, file_ids, old_paths, old_row_file_ids) = data_for_file_ids(table, &read_ids).await?;
-    let old = old.unwrap_or_else(|| RecordBatch::new_empty(incoming.schema()));
-    let incoming = if old.num_rows() > 0 {
-        crate::write::align_batch_to_schema(&incoming, &old.schema()).ok_or_else(|| {
-            CoreError::Schema(
-                "upsert batch schema does not match the current table schema".to_string(),
-            )
-        })?
-    } else {
-        incoming
-    };
-    let old_keys = if old.num_rows() > 0 {
-        keys(&old, &key_name)?
-    } else {
-        Vec::new()
-    };
-    let mut old_by_key = HashMap::with_capacity(old.num_rows());
-    for (index, key) in old_keys.iter().enumerate() {
-        old_by_key.insert(key.clone(), index as u32);
+    // MergeHandle model: route each input row to its target file group, then
+    // per-group workers read+merge+write. The driver only holds the input and
+    // plan metadata.
+    let mut slice_by_file_id: HashMap<String, (String, crate::file_group::file_slice::FileSlice)> =
+        HashMap::new();
+    for (partition, slices) in &slices_by_partition {
+        for slice in slices {
+            slice_by_file_id.insert(
+                slice.file_id().to_string(),
+                (partition.clone(), slice.clone()),
+            );
+        }
     }
-    let mut final_indices: HashMap<String, u32> = old_by_key.clone();
-    let mut updates = 0;
-    let mut inserts = 0;
-    for (index, key) in incoming_keys.iter().enumerate() {
-        if locations
-            .get(&incoming_hoodie_keys[index])
-            .and_then(Option::as_ref)
-            .is_some()
-        {
+
+    let mut updates = 0usize;
+    let mut inserts = 0usize;
+    let mut rows_by_group: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut new_rows_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut row_target: Vec<Option<String>> = Vec::with_capacity(incoming.num_rows());
+    for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
+        let target = if let Some(Some(location)) = locations.get(hoodie_key) {
             updates += 1;
+            Some(location.file_id.clone())
         } else {
             inserts += 1;
+            insert_target_by_row.get(&index).cloned().flatten()
+        };
+        match &target {
+            Some(file_id) => rows_by_group
+                .entry(file_id.clone())
+                .or_default()
+                .push(index as u32),
+            None => new_rows_by_partition
+                .entry(hoodie_key.partition_path.clone())
+                .or_default()
+                .push(index as u32),
         }
-        final_indices.insert(key.clone(), (old.num_rows() + index) as u32);
+        row_target.push(target);
     }
-    let mut selected = final_indices.into_values().collect::<Vec<_>>();
-    selected.sort_unstable();
-    let combined = if old.num_rows() == 0 {
-        incoming.clone()
-    } else {
-        concat_batches(&old.schema(), [&old, &incoming])?
-    };
-    let event_time_merge = uses_event_time_merge(table)?;
-    let selected = if event_time_merge && old.num_rows() > 0 {
-        merge_with_event_time(table, &old, &incoming, &combined)?
-    } else {
-        selected
-    };
-    let merged = if let Some(columns) = options.update_columns {
-        partial_merge(&combined, &old_by_key, &selected, &columns)?
-    } else {
-        take_batch(&combined, &selected)?
-    };
-    // Route each surviving row: old rows and tagged updates back to their file
-    // groups; packed inserts to their assigned small groups; the rest ("") to
-    // new size-split groups inside rewrite().
-    let row_targets: Vec<String> = selected
-        .iter()
-        .map(|&combined_index| {
-            let combined_index = combined_index as usize;
-            if combined_index < old.num_rows() {
-                old_row_file_ids[combined_index].clone()
-            } else {
-                let incoming_index = combined_index - old.num_rows();
-                if let Some(Some(location)) = locations.get(&incoming_hoodie_keys[incoming_index]) {
-                    location.file_id.clone()
-                } else {
-                    insert_target_by_row
-                        .get(&incoming_index)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_default()
-                }
+
+    let mut plans = Vec::new();
+    let mut sorted_groups: Vec<_> = rows_by_group.into_iter().collect();
+    sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
+    for (file_id, rows) in sorted_groups {
+        let (partition, slice) = slice_by_file_id.get(&file_id).cloned().ok_or_else(|| {
+            CoreError::Write(format!(
+                "missing latest file slice for file group '{file_id}'"
+            ))
+        })?;
+        let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+        plans.push(MergePlan {
+            partition,
+            file_id: file_id.clone(),
+            out_name,
+            prev_commit: slice.creation_instant_time().to_string(),
+            slice,
+            op: GroupOp::Upsert {
+                incoming: take_batch(&incoming, &rows)?,
+                partial_columns: options.update_columns.clone(),
+            },
+        });
+    }
+
+    // Untargeted inserts open new file groups, sized by the insert bucket.
+    let per_bucket = sizing.insert_records_per_bucket(avg_record_size);
+    let mut new_groups = Vec::new();
+    let mut new_group_by_row: HashMap<u32, String> = HashMap::new();
+    let mut sorted_new: Vec<_> = new_rows_by_partition.into_iter().collect();
+    sorted_new.sort_by(|a, b| a.0.cmp(&b.0));
+    for (partition, rows) in sorted_new {
+        for chunk in rows.chunks(per_bucket.max(1)) {
+            let file_id = crate::write::new_file_id();
+            let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+            for row in chunk {
+                new_group_by_row.insert(*row, file_id.clone());
             }
+            let batch = restamp_file_name(&take_batch(&incoming, chunk)?, &out_name)?;
+            new_groups.push(NewGroupWrite {
+                partition: partition.clone(),
+                file_id,
+                out_name,
+                prepared: vec![batch],
+            });
+        }
+    }
+
+    // RLI adds: every input row's final location is known from the plan.
+    let rli_entries = incoming_hoodie_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(row, key)| {
+            let file_id = row_target[row]
+                .clone()
+                .or_else(|| new_group_by_row.get(&(row as u32)).cloned())?;
+            Some(RecordIndexEntry {
+                record_key: key.record_key.clone(),
+                partition_path: key.partition_path.clone(),
+                file_id,
+                instant_time_millis: instant_to_epoch_millis(&instant),
+                is_deleted: false,
+            })
         })
         .collect();
-    rewrite(
+
+    let schema = incoming.schema();
+    commit_merge_plans(
         table,
         &instant,
-        &merged,
-        Some(row_targets),
-        file_ids,
-        old_paths,
         "UPSERT",
+        plans,
+        new_groups,
+        schema,
+        rli_entries,
         updates,
         inserts,
-        0,
-        Vec::new(),
-        RewriteKind::Commit,
+        MatchedSlot::None,
+        false,
     )
     .await
 }
@@ -355,79 +373,35 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
         return mor_delete_keys(table, &delete_key_list).await;
     }
 
-    // COW scan path — any column; no configured record key required. Only
-    // the file groups containing matching rows are loaded and rewritten.
+    // COW scan path — any column; no configured record key required. Each
+    // file group's worker evaluates the filter itself; groups without matches
+    // write nothing, and a zero-match delete aborts the fenced instant.
     ensure_rewrite_supported(table)?;
-    let Some((old, file_ids, old_paths, old_row_file_ids)) =
-        data_for_filter_matches(table, &filter).await?
-    else {
-        return Ok(WriteResult::default());
-    };
-    let old_paths = old_paths
-        .into_iter()
-        .zip(&file_ids)
-        .map(|(path, file_id)| {
-            path.ok_or_else(|| {
-                CoreError::Write(format!(
-                    "copy-on-write file slice for file group '{file_id}' has no base file"
-                ))
-            })
-        })
-        .collect::<Result<Vec<String>>>()?;
-    let mask = filters_to_row_mask(&[filter], &old)?;
-    let deleted_indices = mask
-        .iter()
-        .enumerate()
-        .filter_map(|(index, matches)| matches.unwrap_or(false).then_some(index as u32))
-        .collect::<Vec<_>>();
-    let selected = mask
-        .iter()
-        .enumerate()
-        .filter_map(|(index, matches)| (!matches.unwrap_or(false)).then_some(index as u32))
-        .collect::<Vec<_>>();
-    let deleted = deleted_indices.len();
-    if deleted == 0 {
-        return Ok(WriteResult::default());
-    }
-    let remaining = take_batch(&old, &selected)?;
-    let row_targets: Vec<String> = selected
-        .iter()
-        .map(|i| old_row_file_ids[*i as usize].clone())
-        .collect();
+    let schema = table.get_schema_with_meta_fields().await?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [&schema])?;
     let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
-    let mut rli_deletes = Vec::new();
-    if table.is_metadata_table_enabled()
-        && is_record_index_enabled(table)
-        && let Ok(key_name) = record_key_name(table, &old)
-    {
-        let deleted_batch = take_batch(&old, &deleted_indices)?;
-        let deleted_record_keys = keys(&deleted_batch, &key_name)?;
-        let partitions = partition_paths_for_batch(&deleted_batch);
-        rli_deletes = deleted_record_keys
-            .into_iter()
-            .zip(partitions)
-            .map(|(record_key, partition_path)| RecordIndexEntry {
-                record_key,
-                partition_path,
-                file_id: String::new(),
-                instant_time_millis: instant_to_epoch_millis(&instant),
-                is_deleted: true,
-            })
-            .collect();
-    }
-    rewrite(
+    let plans = merge_plans_for_slices(
         table,
         &instant,
-        &remaining,
-        Some(row_targets),
-        file_ids,
-        old_paths,
+        |_| true,
+        |_| GroupOp::DeleteWhere {
+            filter: filter.clone(),
+        },
+    )
+    .await?;
+    let schema = table.data_schema_for_read().await?;
+    commit_merge_plans(
+        table,
+        &instant,
         "DELETE",
+        plans,
+        Vec::new(),
+        std::sync::Arc::new(schema),
+        Vec::new(),
         0,
         0,
-        deleted,
-        rli_deletes,
-        RewriteKind::Commit,
+        MatchedSlot::Deletes,
+        true,
     )
     .await
 }
@@ -448,45 +422,40 @@ pub async fn update_filter(
         return mor_update_filter(table, filter, updates).await;
     }
     ensure_rewrite_supported(table)?;
-    let Some((old, file_ids, old_paths, old_row_file_ids)) =
-        data_for_filter_matches(table, &filter).await?
-    else {
-        return Ok(WriteResult::default());
-    };
-    let old_paths = old_paths
-        .into_iter()
-        .zip(&file_ids)
-        .map(|(path, file_id)| {
-            path.ok_or_else(|| {
-                CoreError::Write(format!(
-                    "copy-on-write file slice for file group '{file_id}' has no base file"
-                ))
-            })
-        })
-        .collect::<Result<Vec<String>>>()?;
-    let mask = filters_to_row_mask(&[filter], &old)?;
-    let (merged, num_updates) = apply_set_updates(&old, &mask, &updates)?;
-    if num_updates == 0 {
-        return Ok(WriteResult::default());
+    let schema = table.get_schema_with_meta_fields().await?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [&schema])?;
+    for field in updates.schema().fields() {
+        let name = field.name();
+        if schema.column_with_name(name).is_none() {
+            return Err(CoreError::Schema(format!(
+                "update column '{name}' is not in the table schema"
+            )));
+        }
     }
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
-    let data_only = strip_meta_columns(&merged)?;
-    let prepared = prepare_batches_for_write(table, &[data_only], &instant, "pending")?;
-    let merged = concat(&prepared)?;
-    // Rows keep their origin file groups (`merged` is `old` updated in place).
-    rewrite(
+    let plans = merge_plans_for_slices(
         table,
         &instant,
-        &merged,
-        Some(old_row_file_ids),
-        file_ids,
-        old_paths,
+        |_| true,
+        |_| GroupOp::UpdateWhere {
+            filter: filter.clone(),
+            set: updates.clone(),
+        },
+    )
+    .await?;
+    let schema = table.data_schema_for_read().await?;
+    commit_merge_plans(
+        table,
+        &instant,
         "UPSERT",
-        num_updates,
-        0,
-        0,
+        plans,
         Vec::new(),
-        RewriteKind::Commit,
+        std::sync::Arc::new(schema),
+        Vec::new(),
+        0,
+        0,
+        MatchedSlot::Updates,
+        true,
     )
     .await
 }
@@ -511,71 +480,104 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     if affected_file_ids.is_empty() {
         return Ok(WriteResult::default());
     }
-    let (Some(old), file_ids, old_paths, old_row_file_ids) =
-        data_for_file_ids(table, &affected_file_ids).await?
-    else {
-        return Ok(WriteResult::default());
-    };
-    let requested_exact = delete_keys
-        .iter()
-        .filter(|key| !key.partition_path.is_empty())
-        .map(|key| (key.record_key.clone(), key.partition_path.clone()))
-        .collect::<HashSet<_>>();
-    let requested_keys_only = delete_keys
-        .iter()
-        .filter(|key| key.partition_path.is_empty())
-        .map(|key| key.record_key.clone())
-        .collect::<HashSet<_>>();
-    let old_keys = hoodie_keys_for_batch(table, &old, None)?;
-    let is_requested = |key: &HoodieKey| {
-        requested_keys_only.contains(&key.record_key)
-            || requested_exact.contains(&(key.record_key.clone(), key.partition_path.clone()))
-    };
-    let selected = old_keys
-        .iter()
-        .enumerate()
-        .filter_map(|(index, key)| (!is_requested(key)).then_some(index as u32))
-        .collect::<Vec<_>>();
-    let deleted = old.num_rows() - selected.len();
-    if deleted == 0 {
-        return Ok(WriteResult::default());
-    }
-    let remaining = take_batch(&old, &selected)?;
-    let row_targets: Vec<String> = selected
-        .iter()
-        .map(|i| old_row_file_ids[*i as usize].clone())
-        .collect();
+    let requested_exact = std::sync::Arc::new(
+        delete_keys
+            .iter()
+            .filter(|key| !key.partition_path.is_empty())
+            .map(|key| (key.record_key.clone(), key.partition_path.clone()))
+            .collect::<HashSet<_>>(),
+    );
+    let requested_keys_only = std::sync::Arc::new(
+        delete_keys
+            .iter()
+            .filter(|key| key.partition_path.is_empty())
+            .map(|key| key.record_key.clone())
+            .collect::<HashSet<_>>(),
+    );
     let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
-    let rli_deletes = if table.is_metadata_table_enabled() && is_record_index_enabled(table) {
-        old_keys
-            .into_iter()
-            .filter(|key| is_requested(key))
-            .map(|key| RecordIndexEntry {
-                record_key: key.record_key,
-                partition_path: key.partition_path,
-                file_id: String::new(),
-                instant_time_millis: instant_to_epoch_millis(&instant),
-                is_deleted: true,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    rewrite(
+    let plans = merge_plans_for_slices(
         table,
         &instant,
-        &remaining,
-        Some(row_targets),
-        file_ids,
-        old_paths,
+        |slice| affected_file_ids.contains(slice.file_id()),
+        |_| GroupOp::DeleteKeys {
+            exact: requested_exact.clone(),
+            keys_only: requested_keys_only.clone(),
+        },
+    )
+    .await?;
+    let schema = table.data_schema_for_read().await?;
+    commit_merge_plans(
+        table,
+        &instant,
         "DELETE",
+        plans,
+        Vec::new(),
+        std::sync::Arc::new(schema),
+        Vec::new(),
         0,
         0,
-        deleted,
-        rli_deletes,
-        RewriteKind::Commit,
+        MatchedSlot::Deletes,
+        true,
     )
     .await
+}
+
+/// Enumerate the latest file slices' (file id, base path) pairs — the
+/// metadata a replace commit needs — without reading any data. `partitions`
+/// limits the listing; `None` covers the whole table.
+async fn replaced_groups_from_listing(
+    table: &Table,
+    partitions: Option<&HashSet<String>>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let mut file_ids = Vec::new();
+    let mut old_paths = Vec::new();
+    for slice in slices {
+        if let Some(partitions) = partitions
+            && !partitions.contains(&slice.partition_path)
+        {
+            continue;
+        }
+        let Some(path) = slice.base_file_relative_path()? else {
+            continue;
+        };
+        file_ids.push(slice.file_id().to_string());
+        old_paths.push(path);
+    }
+    Ok((file_ids, old_paths))
+}
+
+/// Build merge plans for the latest slices matching `include`, with `op`
+/// chosen per slice. Metadata-scale: no file group data is read here.
+async fn merge_plans_for_slices<F, O>(
+    table: &Table,
+    instant: &str,
+    include: F,
+    mut op: O,
+) -> Result<Vec<MergePlan>>
+where
+    F: Fn(&crate::file_group::file_slice::FileSlice) -> bool,
+    O: FnMut(&crate::file_group::file_slice::FileSlice) -> GroupOp,
+{
+    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let mut plans = Vec::new();
+    for slice in slices {
+        if !include(&slice) {
+            continue;
+        }
+        let file_id = slice.file_id().to_string();
+        let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+        plans.push(MergePlan {
+            partition: slice.partition_path.clone(),
+            file_id,
+            out_name,
+            prev_commit: slice.creation_instant_time().to_string(),
+            op: op(&slice),
+            slice,
+        });
+    }
+    plans.sort_by(|a, b| a.file_id.cmp(&b.file_id));
+    Ok(plans)
 }
 
 pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
@@ -588,12 +590,13 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
             "overwrite requires at least one RecordBatch".to_string(),
         ));
     }
-    let (_, file_ids, old_paths, _) = current_data(table).await?;
+    // Only the listing is needed to enumerate replaced groups — never the data.
+    let (file_ids, old_paths) = replaced_groups_from_listing(table, None).await?;
     let instant =
         request_rewrite_instant(table, "INSERT_OVERWRITE_TABLE", RewriteKind::Replace).await?;
     let file_id = crate::write::new_file_id();
     let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
-    let batches = prepare_batches_for_write(table, batches, &instant, &file_name)?;
+    let batches = prepare_batches_for_write(&table.hudi_configs, batches, &instant, &file_name)?;
     let replacement = concat(&batches)?;
     if replacement.num_rows() == 0 {
         return Err(CoreError::Write(
@@ -630,14 +633,14 @@ pub async fn dynamic_partition_overwrite_batches(
         ));
     }
     let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
-    let prepared = prepare_batches_for_write(table, batches, &instant, "pending")?;
+    let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let replacement = concat(&prepared)?;
     if replacement.num_rows() == 0 {
         return Err(CoreError::Write(
             "dynamic_partition_overwrite requires at least one row".to_string(),
         ));
     }
-    let partition_paths = hoodie_keys_for_batch(table, &replacement, Some(&instant))?
+    let partition_paths = hoodie_keys_for_batch(&table.hudi_configs, &replacement, Some(&instant))?
         .into_iter()
         .map(|key| key.partition_path)
         .collect::<HashSet<_>>();
@@ -647,9 +650,10 @@ pub async fn dynamic_partition_overwrite_batches(
                 .to_string(),
         ));
     }
-    let (old, file_ids, old_paths) = data_for_partitions(table, &partition_paths).await?;
-    let replacement = if let Some(old) = old {
-        crate::write::align_batch_to_schema(&replacement, &old.schema()).ok_or_else(|| {
+    let (file_ids, old_paths) = replaced_groups_from_listing(table, Some(&partition_paths)).await?;
+    let replacement = if !file_ids.is_empty() {
+        let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
+        crate::write::align_batch_to_schema(&replacement, &table_schema).ok_or_else(|| {
             CoreError::Schema(
                 "overwrite batch schema does not match the current table schema".to_string(),
             )
@@ -810,7 +814,7 @@ async fn mor_upsert_batches(
         ));
     }
     let schema_check_batches = prepare_batches_for_write(
-        table,
+        &table.hudi_configs,
         std::slice::from_ref(&incoming),
         "schema-check",
         "schema-check",
@@ -828,9 +832,9 @@ async fn mor_upsert_batches(
     }
     let key_name = record_key_name(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
-    let incoming_keys = keys(&incoming, &key_name)?;
     let instant = request_deltacommit(table, "UPSERT").await?;
-    let tagged_keys = hoodie_keys_for_batch(table, &incoming, Some(&instant))?;
+    let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
+    let incoming_keys = keys(&incoming, &key_name)?;
     let locations = mor_file_locations(table, &tagged_keys).await?;
     let mut update_indices: HashMap<(String, String), Vec<u32>> = HashMap::new();
     let mut insert_indices_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
@@ -961,7 +965,8 @@ async fn mor_upsert_batches(
     {
         let insert_batch = take_batch(&incoming, insert_indices)?;
         crate::write::ensure_partition_metadata(storage.as_ref(), partition_path, &instant).await?;
-        let prepared = prepare_batches_for_write(table, &[insert_batch], &instant, file_name)?;
+        let prepared =
+            prepare_batches_for_write(&table.hudi_configs, &[insert_batch], &instant, file_name)?;
         let base_file_path = relative_data_path(partition_path, file_name);
         insert_prepared.push((index, prepared, base_file_path));
     }
@@ -1077,7 +1082,8 @@ async fn mor_upsert_batches(
         let mut indices = update_rows.clone();
         indices.extend(&packed_rows);
         let update_batch = take_batch(&incoming, &indices)?;
-        let prepared = prepare_batches_for_write(table, &[update_batch], &instant, &log_name)?;
+        let prepared =
+            prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &log_name)?;
         log_plans.push(LogTaskPlan {
             partition_path,
             file_id,
@@ -1488,23 +1494,20 @@ async fn complete_deltacommit(
     Ok(())
 }
 
-fn uses_event_time_merge(table: &Table) -> Result<bool> {
-    let strategy: String = table
-        .hudi_configs
-        .get_or_default(RecordMergeStrategy)
-        .into();
+fn uses_event_time_merge(hudi_configs: &crate::config::HudiConfigs) -> Result<bool> {
+    let strategy: String = hudi_configs.get_or_default(RecordMergeStrategy).into();
     let strategy = RecordMergeStrategyValue::from_str(&strategy)?;
     Ok(strategy == RecordMergeStrategyValue::OverwriteWithLatest
-        && table.hudi_configs.try_get(OrderingFields)?.is_some())
+        && hudi_configs.try_get(OrderingFields)?.is_some())
 }
 
 fn merge_with_event_time(
-    table: &Table,
+    hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
     old: &RecordBatch,
     incoming: &RecordBatch,
     combined: &RecordBatch,
 ) -> Result<Vec<u32>> {
-    let merger = RecordMerger::new(old.schema(), table.hudi_configs.clone());
+    let merger = RecordMerger::new(old.schema(), hudi_configs);
     let merged = merger.merge_record_batches(RecordBatches::new_with_data_batches([
         old.clone(),
         incoming.clone(),
@@ -1533,105 +1536,6 @@ fn selected_indices_for_merged(combined: &RecordBatch, merged: &RecordBatch) -> 
             })
         })
         .collect()
-}
-
-/// All current data plus per-row origin file ids (parallel to the batch rows).
-async fn current_data(
-    table: &Table,
-) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>, Vec<String>)> {
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let file_ids: HashSet<String> = slices
-        .iter()
-        .map(|slice| slice.file_id().to_string())
-        .collect();
-    data_for_file_ids(table, &file_ids).await
-}
-
-/// Load only the listed file groups (for location-scoped COW rewrites),
-/// returning per-row origin file ids parallel to the concatenated batch.
-async fn data_for_file_ids(
-    table: &Table,
-    file_ids: &HashSet<String>,
-) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>, Vec<String>)> {
-    if file_ids.is_empty() {
-        return Ok((None, Vec::new(), Vec::new(), Vec::new()));
-    }
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let reader = table
-        .create_file_group_reader_with_options(
-            Some(&ReadOptions::new()),
-            std::iter::empty::<(&str, String)>(),
-        )
-        .await?;
-    let mut batches = Vec::new();
-    let mut kept_ids = Vec::new();
-    let mut kept_paths = Vec::new();
-    let mut row_file_ids = Vec::new();
-    for slice in slices {
-        if !file_ids.contains(slice.file_id()) {
-            continue;
-        }
-        kept_ids.push(slice.file_id().to_string());
-        kept_paths.push(slice.base_file_relative_path()?.ok_or_else(|| {
-            CoreError::Write(format!(
-                "copy-on-write file slice for file group '{}' has no base file",
-                slice.file_id()
-            ))
-        })?);
-        let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
-        row_file_ids.extend(std::iter::repeat_n(
-            slice.file_id().to_string(),
-            batch.num_rows(),
-        ));
-        batches.push(batch);
-    }
-    Ok((
-        (!batches.is_empty())
-            .then(|| concat(&batches))
-            .transpose()?,
-        kept_ids,
-        kept_paths,
-        row_file_ids,
-    ))
-}
-
-async fn data_for_partitions(
-    table: &Table,
-    partitions: &HashSet<String>,
-) -> Result<(Option<RecordBatch>, Vec<String>, Vec<String>)> {
-    if partitions.is_empty() {
-        return Ok((None, Vec::new(), Vec::new()));
-    }
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
-    let reader = table
-        .create_file_group_reader_with_options(
-            Some(&ReadOptions::new()),
-            std::iter::empty::<(&str, String)>(),
-        )
-        .await?;
-    let mut batches = Vec::new();
-    let mut kept_ids = Vec::new();
-    let mut kept_paths = Vec::new();
-    for slice in slices {
-        if !partitions.contains(&slice.partition_path) {
-            continue;
-        }
-        kept_ids.push(slice.file_id().to_string());
-        kept_paths.push(slice.base_file_relative_path()?.ok_or_else(|| {
-            CoreError::Write(format!(
-                "copy-on-write file slice for file group '{}' has no base file",
-                slice.file_id()
-            ))
-        })?);
-        batches.push(reader.read_file_slice(&slice, &ReadOptions::new()).await?);
-    }
-    Ok((
-        (!batches.is_empty())
-            .then(|| concat(&batches))
-            .transpose()?,
-        kept_ids,
-        kept_paths,
-    ))
 }
 
 /// Load only the file groups holding rows that match `filter`, with per-row
@@ -2028,7 +1932,7 @@ async fn rewrite(
     }
     let mut groups: Vec<GroupPlan> = Vec::new();
     if batch.num_rows() > 0 {
-        let row_keys = hoodie_keys_for_batch(table, batch, Some(instant))?;
+        let row_keys = hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?;
         let mut existing_groups: HashMap<String, usize> = HashMap::new();
         let mut new_rows_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
         for (row, key) in row_keys.iter().enumerate() {
@@ -2139,7 +2043,7 @@ async fn rewrite(
         crate::write::ensure_partition_metadata(storage.as_ref(), &group.partition, instant)
             .await?;
         let prepared = prepare_batches_for_write(
-            table,
+            &table.hudi_configs,
             std::slice::from_ref(&partition_batch),
             instant,
             &group.out_name,
@@ -2224,10 +2128,79 @@ async fn rewrite(
         return Err(error);
     }
 
+    let rli_entries = {
+        let mut entries = if batch.num_rows() > 0 && is_record_index_enabled(table) {
+            hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?
+                .into_iter()
+                .enumerate()
+                .filter_map(|(row, key)| {
+                    let file_id = row_group_file_ids.get(&(row as u32))?.clone();
+                    Some(RecordIndexEntry {
+                        record_key: key.record_key,
+                        partition_path: key.partition_path,
+                        file_id,
+                        instant_time_millis: instant_to_epoch_millis(instant),
+                        is_deleted: false,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        entries.append(&mut rli_deletes);
+        entries
+    };
+    finalize_rewrite_commit(
+        table,
+        instant,
+        kind,
+        action,
+        operation,
+        batch.schema(),
+        partition_to_write_stats,
+        partition_to_replace_file_ids,
+        additions,
+        written_paths,
+        stats_updates,
+        &old_paths,
+        rli_entries,
+        batch.num_rows(),
+        updates,
+        inserts,
+        deletes,
+    )
+    .await
+}
+
+/// Shared commit tail for COW rewrites: commit-metadata encode, MDT updates
+/// (files / record_index / column stats), then critical section 2 (MDT
+/// deltacommit -> completed instant -> bookkeeping). `rli_entries` must be
+/// fully computed by the caller (adds and tombstones).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_rewrite_commit(
+    table: &mut Table,
+    instant: &str,
+    kind: RewriteKind,
+    action: Action,
+    operation: &str,
+    schema: arrow_schema::SchemaRef,
+    partition_to_write_stats: HashMap<String, Vec<HoodieWriteStat>>,
+    partition_to_replace_file_ids: HashMap<String, Vec<String>>,
+    additions: Vec<(String, String, i64, bool)>,
+    written_paths: Vec<String>,
+    stats_updates: Vec<crate::write::metadata::StatsFileUpdate>,
+    old_paths: &[String],
+    rli_entries: Vec<RecordIndexEntry>,
+    num_writes: usize,
+    updates: usize,
+    inserts: usize,
+    deletes: usize,
+) -> Result<WriteResult> {
+    let storage = table.file_system_view.storage.clone();
     // Data schema only (no _hoodie_* meta fields) in commit metadata, like
     // the Java writer; delete/update paths pass batches read with meta fields.
     let schema_json = crate::write::append::arrow_schema_to_avro_json(
-        &crate::write::append::strip_meta_fields_from_schema(batch.schema().as_ref()),
+        &crate::write::append::strip_meta_fields_from_schema(schema.as_ref()),
     )?;
     let layout_two = is_layout_two(table);
     let bytes = match kind {
@@ -2276,25 +2249,7 @@ async fn rewrite(
                 );
             }
             if is_record_index_enabled(table) {
-                let mut entries = if batch.num_rows() > 0 {
-                    hoodie_keys_for_batch(table, batch, Some(instant))?
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(row, key)| {
-                            let file_id = row_group_file_ids.get(&(row as u32))?.clone();
-                            Some(RecordIndexEntry {
-                                record_key: key.record_key,
-                                partition_path: key.partition_path,
-                                file_id,
-                                instant_time_millis: instant_to_epoch_millis(instant),
-                                is_deleted: false,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                entries.append(&mut rli_deletes);
+                let entries = rli_entries;
                 if !entries.is_empty() {
                     let stats = update_record_index(storage.as_ref(), instant, &entries).await?;
                     if !stats.is_empty() {
@@ -2309,8 +2264,8 @@ async fn rewrite(
                     table,
                     instant,
                     &stats_updates,
-                    batch.schema().as_ref(),
-                    &old_paths,
+                    schema.as_ref(),
+                    old_paths,
                 )
                 .await?;
                 mdt_stats.extend(stats);
@@ -2358,11 +2313,552 @@ async fn rewrite(
     table.file_system_view.clear_cache();
     Ok(WriteResult {
         instant: instant.to_string(),
-        num_writes: batch.num_rows(),
+        num_writes,
         num_updates: updates,
         num_inserts: inserts,
         num_deletes: deletes,
     })
+}
+
+/// Context a merge worker needs, cloneable and `'static` (MergeHandle model:
+/// the driver stays at metadata scale; each worker reads, merges, stamps,
+/// encodes, and writes ONE file group).
+#[derive(Clone)]
+struct MergeCtx {
+    hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
+    storage: std::sync::Arc<crate::storage::Storage>,
+    /// Present only when merge plans exist (an empty table has no schema to
+    /// resolve, and pure-insert commits never read).
+    reader: Option<std::sync::Arc<crate::file_group::reader::FileGroupReader>>,
+    instant: String,
+    props: parquet::file::properties::WriterProperties,
+    collect_ranges: bool,
+    event_time: bool,
+    /// Collect (key, partition) of removed rows for RLI tombstones.
+    collect_rli_deletes: bool,
+}
+
+/// What a merge worker does to its file group's rows.
+enum GroupOp {
+    /// Merge `incoming` (meta-stamped) rows into the group; `partial_columns`
+    /// limits which data columns matched rows take from the input.
+    Upsert {
+        incoming: RecordBatch,
+        partial_columns: Option<Vec<String>>,
+    },
+    /// Remove rows by record key ((key, partition) exact or key-only).
+    DeleteKeys {
+        exact: std::sync::Arc<HashSet<(String, String)>>,
+        keys_only: std::sync::Arc<HashSet<String>>,
+    },
+    /// Remove rows matching the filter.
+    DeleteWhere { filter: Filter },
+    /// SET single-row `set` values on rows matching the filter.
+    UpdateWhere { filter: Filter, set: RecordBatch },
+}
+
+/// One file group's merge assignment.
+struct MergePlan {
+    partition: String,
+    file_id: String,
+    out_name: String,
+    slice: crate::file_group::file_slice::FileSlice,
+    op: GroupOp,
+    prev_commit: String,
+}
+
+/// A merge worker's result.
+struct MergeOutput {
+    /// False when the op matched nothing in this group (no file written).
+    wrote: bool,
+    size: i64,
+    num_rows: usize,
+    /// Rows the op affected in this group (updated or deleted).
+    matched: usize,
+    ranges: Option<Vec<crate::metadata::table::column_stats::ColumnRangeStats>>,
+    /// (record key, partition) tombstones for removed rows.
+    rli_deletes: Vec<(String, String)>,
+}
+
+/// Replace `_hoodie_file_name` with `out_name` for every row.
+fn restamp_file_name(batch: &RecordBatch, out_name: &str) -> Result<RecordBatch> {
+    let Some((index, _)) = batch
+        .schema()
+        .column_with_name(MetaField::FileName.as_ref())
+    else {
+        return Ok(batch.clone());
+    };
+    let mut columns = batch.columns().to_vec();
+    columns[index] = std::sync::Arc::new(StringArray::from(vec![out_name; batch.num_rows()]));
+    RecordBatch::try_new(batch.schema(), columns).map_err(CoreError::ArrowError)
+}
+
+/// Stamp `_hoodie_commit_time` / `_hoodie_commit_seqno` with `instant` on rows
+/// where `mask` is true, keeping other rows' values (Java MergeHandle: changed
+/// rows carry the writing commit; untouched rows keep their history).
+fn restamp_matched_rows(
+    batch: &RecordBatch,
+    mask: &BooleanArray,
+    instant: &str,
+) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let (Some((ct_idx, _)), Some((sq_idx, _))) = (
+        schema.column_with_name(MetaField::CommitTime.as_ref()),
+        schema.column_with_name(MetaField::CommitSeqno.as_ref()),
+    ) else {
+        return Ok(batch.clone());
+    };
+    let new_ct: ArrayRef = std::sync::Arc::new(StringArray::from(vec![instant; batch.num_rows()]));
+    let new_sq: ArrayRef = std::sync::Arc::new(StringArray::from(
+        (0..batch.num_rows())
+            .map(|row| format!("{instant}_0-{row}-0"))
+            .collect::<Vec<_>>(),
+    ));
+    let mut columns = batch.columns().to_vec();
+    columns[ct_idx] = zip(mask, &new_ct, &columns[ct_idx])?;
+    columns[sq_idx] = zip(mask, &new_sq, &columns[sq_idx])?;
+    RecordBatch::try_new(schema, columns).map_err(CoreError::ArrowError)
+}
+
+/// The MergeHandle body: read the group's current rows, apply the op, stamp
+/// meta, encode, and put — entirely inside the bounded write task pool.
+fn merge_file_group_task(
+    ctx: MergeCtx,
+    plan: MergePlan,
+) -> futures::future::BoxFuture<'static, Result<MergeOutput>> {
+    Box::pin(async move {
+        let reader = ctx.reader.as_ref().ok_or_else(|| {
+            CoreError::Write("merge worker requires a file group reader".to_string())
+        })?;
+        let old = reader
+            .read_file_slice(&plan.slice, &ReadOptions::new())
+            .await?;
+        let key_field = MetaField::RecordKey.as_ref();
+        let mut rli_deletes = Vec::new();
+        let (merged, matched) = match plan.op {
+            GroupOp::Upsert {
+                incoming,
+                partial_columns,
+            } => {
+                let incoming = if old.num_rows() > 0 {
+                    crate::write::align_batch_to_schema(&incoming, &old.schema()).ok_or_else(
+                        || {
+                            CoreError::Schema(
+                                "upsert batch schema does not match the current table schema"
+                                    .to_string(),
+                            )
+                        },
+                    )?
+                } else {
+                    incoming
+                };
+                let old_keys = keys(&old, key_field)?;
+                let mut old_by_key = HashMap::with_capacity(old.num_rows());
+                for (index, key) in old_keys.iter().enumerate() {
+                    old_by_key.insert(key.clone(), index as u32);
+                }
+                let incoming_keys = keys(&incoming, key_field)?;
+                let mut final_indices: HashMap<String, u32> = old_by_key.clone();
+                let mut matched = 0usize;
+                for (index, key) in incoming_keys.iter().enumerate() {
+                    if old_by_key.contains_key(key) {
+                        matched += 1;
+                    }
+                    final_indices.insert(key.clone(), (old.num_rows() + index) as u32);
+                }
+                let mut selected = final_indices.into_values().collect::<Vec<_>>();
+                selected.sort_unstable();
+                let combined = if old.num_rows() == 0 {
+                    incoming.clone()
+                } else {
+                    concat_batches(&old.schema(), [&old, &incoming])?
+                };
+                let selected = if ctx.event_time && old.num_rows() > 0 {
+                    merge_with_event_time(ctx.hudi_configs.clone(), &old, &incoming, &combined)?
+                } else {
+                    selected
+                };
+                let merged = if let Some(columns) = partial_columns {
+                    partial_merge(&combined, &old_by_key, &selected, &columns)?
+                } else {
+                    take_batch(&combined, &selected)?
+                };
+                (merged, matched)
+            }
+            GroupOp::DeleteKeys { exact, keys_only } => {
+                let old_keys = keys(&old, key_field)?;
+                let old_partitions = string_values(&old, MetaField::PartitionPath.as_ref())?;
+                let mut selected = Vec::with_capacity(old.num_rows());
+                for (index, (key, partition)) in
+                    old_keys.iter().zip(old_partitions.iter()).enumerate()
+                {
+                    let doomed = keys_only.contains(key)
+                        || exact.contains(&(key.clone(), partition.clone()));
+                    if doomed {
+                        if ctx.collect_rli_deletes {
+                            rli_deletes.push((key.clone(), partition.clone()));
+                        }
+                    } else {
+                        selected.push(index as u32);
+                    }
+                }
+                let matched = old.num_rows() - selected.len();
+                (take_batch(&old, &selected)?, matched)
+            }
+            GroupOp::DeleteWhere { filter } => {
+                let mask = filters_to_row_mask(std::slice::from_ref(&filter), &old)?;
+                let mut selected = Vec::with_capacity(old.num_rows());
+                let mut matched = 0usize;
+                let old_keys = keys(&old, key_field)?;
+                let old_partitions = string_values(&old, MetaField::PartitionPath.as_ref())?;
+                for index in 0..old.num_rows() {
+                    if mask.value(index) {
+                        matched += 1;
+                        if ctx.collect_rli_deletes {
+                            rli_deletes
+                                .push((old_keys[index].clone(), old_partitions[index].clone()));
+                        }
+                    } else {
+                        selected.push(index as u32);
+                    }
+                }
+                if matched == 0 {
+                    return Ok(MergeOutput {
+                        wrote: false,
+                        size: 0,
+                        num_rows: 0,
+                        matched: 0,
+                        ranges: None,
+                        rli_deletes,
+                    });
+                }
+                (take_batch(&old, &selected)?, matched)
+            }
+            GroupOp::UpdateWhere { filter, set } => {
+                let mask = filters_to_row_mask(std::slice::from_ref(&filter), &old)?;
+                let (updated, matched) = apply_set_updates(&old, &mask, &set)?;
+                if matched == 0 {
+                    return Ok(MergeOutput {
+                        wrote: false,
+                        size: 0,
+                        num_rows: 0,
+                        matched: 0,
+                        ranges: None,
+                        rli_deletes,
+                    });
+                }
+                (
+                    restamp_matched_rows(&updated, &mask, &ctx.instant)?,
+                    matched,
+                )
+            }
+        };
+        let merged = restamp_file_name(&merged, &plan.out_name)?;
+        let path = relative_data_path(&plan.partition, &plan.out_name);
+        let num_rows = merged.num_rows();
+        let props = ctx.props.clone();
+        let collect_ranges = ctx.collect_ranges;
+        let (bytes, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let bytes = crate::write::append::write_parquet_bytes_with_props(props, &[merged])?;
+            let ranges = if collect_ranges {
+                Some(
+                    crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
+                )
+            } else {
+                None
+            };
+            Ok((bytes, ranges))
+        })
+        .await
+        .map_err(|e| CoreError::Write(format!("merge task panicked: {e}")))??;
+        let size = bytes.len() as i64;
+        ctx.storage.put_file(&path, bytes).await?;
+        Ok(MergeOutput {
+            wrote: true,
+            size,
+            num_rows,
+            matched,
+            ranges,
+            rli_deletes,
+        })
+    })
+}
+
+/// Abort a fenced-but-empty instant: delete the fencing files and marker dir
+/// so a zero-match op leaves no timeline trace.
+async fn abort_requested_instant(table: &Table, instant: &str, action: Action) -> Result<()> {
+    let storage = table.file_system_view.storage.clone();
+    crate::write::markers::delete_marker_dir(storage.as_ref(), instant).await;
+    let dir = timeline_dir(table);
+    let requested = format!("{dir}/{instant}.{}.requested", action.as_ref());
+    let inflight = if action == Action::Commit {
+        format!("{dir}/{instant}.inflight")
+    } else {
+        format!("{dir}/{instant}.{}.inflight", action.as_ref())
+    };
+    storage.delete_file(&requested).await?;
+    storage.delete_file(&inflight).await?;
+    Ok(())
+}
+
+/// Which result slot worker `matched` counts land in.
+#[derive(Clone, Copy, PartialEq)]
+enum MatchedSlot {
+    None,
+    Updates,
+    Deletes,
+}
+
+/// A pre-stamped new file group write (inserts that open new groups).
+struct NewGroupWrite {
+    partition: String,
+    file_id: String,
+    out_name: String,
+    prepared: Vec<RecordBatch>,
+}
+
+/// Driver for MergeHandle-style COW commits: markers, then per-group merge
+/// workers + new-group insert tasks on the bounded pool, then stats/MDT/commit.
+/// The driver holds only plans, stats, and the caller's input rows — never a
+/// file group's data.
+#[allow(clippy::too_many_arguments)]
+async fn commit_merge_plans(
+    table: &mut Table,
+    instant: &str,
+    operation: &str,
+    plans: Vec<MergePlan>,
+    new_groups: Vec<NewGroupWrite>,
+    schema: arrow_schema::SchemaRef,
+    mut rli_entries: Vec<RecordIndexEntry>,
+    updates: usize,
+    inserts: usize,
+    matched_slot: MatchedSlot,
+    abort_on_noop: bool,
+) -> Result<WriteResult> {
+    let storage = table.file_system_view.storage.clone();
+    let props = crate::write::append::parquet_writer_props(table);
+    let collect_ranges = is_column_stats_enabled(table);
+    let rli_enabled = table.is_metadata_table_enabled() && is_record_index_enabled(table);
+    let ctx = MergeCtx {
+        hudi_configs: table.hudi_configs.clone(),
+        storage: storage.clone(),
+        reader: if plans.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(
+                table
+                    .create_file_group_reader_with_options(
+                        Some(&ReadOptions::new()),
+                        std::iter::empty::<(&str, String)>(),
+                    )
+                    .await?,
+            ))
+        },
+        instant: instant.to_string(),
+        props: props.clone(),
+        collect_ranges,
+        event_time: uses_event_time_merge(&table.hudi_configs)?,
+        collect_rli_deletes: rli_enabled && matched_slot == MatchedSlot::Deletes,
+    };
+
+    // Markers before any data write: MERGE for rewrites, CREATE for new groups.
+    let mut planned_markers = Vec::new();
+    for plan in &plans {
+        planned_markers.push(crate::write::markers::Marker::merge(
+            &plan.partition,
+            &plan.out_name,
+        ));
+    }
+    for group in &new_groups {
+        planned_markers.push(crate::write::markers::Marker::create(
+            &group.partition,
+            &group.out_name,
+        ));
+    }
+    crate::write::markers::write_markers(storage.as_ref(), instant, &planned_markers).await?;
+    for partition in plans
+        .iter()
+        .map(|p| p.partition.clone())
+        .chain(new_groups.iter().map(|g| g.partition.clone()))
+        .collect::<HashSet<_>>()
+    {
+        crate::write::ensure_partition_metadata(storage.as_ref(), &partition, instant).await?;
+    }
+
+    // All file work on one bounded pool: merge workers + new-group encoders.
+    let merge_tasks: Vec<_> = plans.iter().map(|_| ()).collect();
+    let mut tasks: Vec<futures::future::BoxFuture<'static, Result<MergeOutput>>> = Vec::new();
+    let mut plan_meta = Vec::with_capacity(plans.len());
+    for plan in plans {
+        plan_meta.push((
+            plan.partition.clone(),
+            plan.file_id.clone(),
+            plan.out_name.clone(),
+            plan.prev_commit.clone(),
+            plan.slice.base_file_relative_path()?,
+        ));
+        tasks.push(merge_file_group_task(ctx.clone(), plan));
+    }
+    drop(merge_tasks);
+    for group in &new_groups {
+        let path = relative_data_path(&group.partition, &group.out_name);
+        let storage = storage.clone();
+        let props = props.clone();
+        let prepared = group.prepared.clone();
+        tasks.push(Box::pin(async move {
+            let output = crate::write::parquet_file_task(
+                storage,
+                props,
+                prepared.clone(),
+                path,
+                collect_ranges,
+            )
+            .await?;
+            Ok(MergeOutput {
+                wrote: true,
+                size: output.size,
+                num_rows: prepared.iter().map(RecordBatch::num_rows).sum(),
+                matched: 0,
+                ranges: output.ranges,
+                rli_deletes: Vec::new(),
+            })
+        }));
+    }
+    let results =
+        crate::write::run_write_tasks(tasks, crate::write::write_task_parallelism(table)).await;
+
+    // Assemble in plan order; clean up written files on the first error.
+    let mut additions = Vec::new();
+    let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
+    let mut written_paths = Vec::new();
+    let mut stats_updates = Vec::new();
+    let mut old_paths = Vec::new();
+    let mut matched_total = 0usize;
+    let mut num_writes = 0usize;
+    let mut first_error = None;
+    let group_info: Vec<(String, String, String, String, Option<String>)> = plan_meta
+        .into_iter()
+        .chain(new_groups.iter().map(|g| {
+            (
+                g.partition.clone(),
+                g.file_id.clone(),
+                g.out_name.clone(),
+                "null".to_string(),
+                None,
+            )
+        }))
+        .collect();
+    let mut outputs = Vec::with_capacity(results.len());
+    for ((partition, file_id, out_name, prev_commit, replaced_path), result) in
+        group_info.iter().zip(results)
+    {
+        match result {
+            Ok(output) => {
+                if output.wrote {
+                    let path = relative_data_path(partition, out_name);
+                    written_paths.push(path.clone());
+                    if let Some(ranges) = &output.ranges {
+                        stats_updates.push(crate::write::metadata::StatsFileUpdate {
+                            partition_path: partition.clone(),
+                            file_name: out_name.clone(),
+                            is_deleted: false,
+                            ranges: ranges.clone(),
+                        });
+                    }
+                    additions.push((partition.clone(), out_name.clone(), output.size, false));
+                    if let Some(replaced) = replaced_path {
+                        old_paths.push(replaced.clone());
+                    }
+                    partition_to_write_stats
+                        .entry(partition.clone())
+                        .or_default()
+                        .push(HoodieWriteStat {
+                            file_id: Some(file_id.clone()),
+                            path: Some(path),
+                            base_file: Some(out_name.clone()),
+                            prev_commit: Some(prev_commit.clone()),
+                            num_writes: Some(output.num_rows as i64),
+                            partition_path: Some(partition.clone()),
+                            total_write_bytes: Some(output.size),
+                            file_size_in_bytes: Some(output.size),
+                            ..Default::default()
+                        });
+                    num_writes += output.num_rows;
+                }
+                matched_total += output.matched;
+                outputs.push(output);
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        for path in &written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
+    }
+
+    let (updates, deletes) = match matched_slot {
+        MatchedSlot::None => (updates, 0),
+        MatchedSlot::Updates => (matched_total, 0),
+        MatchedSlot::Deletes => (updates, matched_total),
+    };
+
+    // Fill the per-stat operation counters the way the previous driver did
+    // (totals on each stat).
+    for stats in partition_to_write_stats.values_mut() {
+        for stat in stats.iter_mut() {
+            stat.num_deletes = Some(deletes as i64);
+            stat.num_update_writes = Some(updates as i64);
+            stat.num_inserts = Some(inserts as i64);
+        }
+    }
+
+    // Zero effect anywhere: abort the fenced instant, leave no commit.
+    if abort_on_noop && written_paths.is_empty() {
+        abort_requested_instant(table, instant, Action::Commit).await?;
+        return Ok(WriteResult::default());
+    }
+
+    // RLI tombstones from the workers (deleted rows' actual key/partition).
+    if rli_enabled {
+        for output in &outputs {
+            for (record_key, partition_path) in &output.rli_deletes {
+                rli_entries.push(RecordIndexEntry {
+                    record_key: record_key.clone(),
+                    partition_path: partition_path.clone(),
+                    file_id: String::new(),
+                    instant_time_millis: instant_to_epoch_millis(instant),
+                    is_deleted: true,
+                });
+            }
+        }
+    }
+
+    finalize_rewrite_commit(
+        table,
+        instant,
+        RewriteKind::Commit,
+        Action::Commit,
+        operation,
+        schema,
+        partition_to_write_stats,
+        HashMap::new(),
+        additions,
+        written_paths,
+        stats_updates,
+        &old_paths,
+        if rli_enabled { rli_entries } else { Vec::new() },
+        num_writes,
+        updates,
+        inserts,
+        deletes,
+    )
+    .await
 }
 
 fn prev_commit_from_base_path(path: &str) -> String {

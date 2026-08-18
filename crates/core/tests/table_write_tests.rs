@@ -1478,3 +1478,88 @@ async fn test_read_filter_prunes_via_mdt_column_stats() {
     let rows = rows_by_id(&table.read(&options).await.unwrap());
     assert!(rows.is_empty());
 }
+
+/// Merged files must carry their own name in `_hoodie_file_name`, and an
+/// UPDATE must re-stamp `_hoodie_commit_time` ONLY on the rows it changed —
+/// untouched rows keep their original commit lineage (incremental queries
+/// depend on it).
+#[tokio::test]
+async fn test_merge_stamps_file_name_and_only_matched_commit_times() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    let first_instant = {
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        let commit_times = batches[0]
+            .column_by_name("_hoodie_commit_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        commit_times.value(0).to_string()
+    };
+
+    // UPDATE one row: commit time changes for it alone; file name is the new
+    // file for every row of the rewritten group.
+    let set = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![99]))],
+    )
+    .unwrap();
+    table.update("id = 'a'", set).await.unwrap();
+
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    for b in &batches {
+        let ids = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let commit_times = b
+            .column_by_name("_hoodie_commit_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let file_names = b
+            .column_by_name("_hoodie_file_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..b.num_rows() {
+            let file_name = file_names.value(row);
+            assert!(
+                dir.path().join(file_name).is_file(),
+                "_hoodie_file_name '{file_name}' must be a real file"
+            );
+            assert_ne!(file_name, "pending");
+            if ids.value(row) == "a" {
+                assert_ne!(
+                    commit_times.value(row),
+                    first_instant,
+                    "updated row must carry the updating commit"
+                );
+            } else {
+                assert_eq!(
+                    commit_times.value(row),
+                    first_instant,
+                    "untouched row must keep its original commit time"
+                );
+            }
+        }
+    }
+}

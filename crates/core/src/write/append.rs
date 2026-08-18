@@ -138,7 +138,7 @@ async fn append_batches_inner(
     // Group rows across batches by partition path and write one base file per partition.
     let mut partition_rows: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     for (batch_idx, batch) in batches.iter().enumerate() {
-        let keys = hoodie_keys_for_batch(table, batch, Some(&request_instant))?;
+        let keys = hoodie_keys_for_batch(&table.hudi_configs, batch, Some(&request_instant))?;
         for (row_idx, key) in keys.iter().enumerate() {
             partition_rows
                 .entry(key.partition_path.clone())
@@ -228,7 +228,7 @@ async fn append_batches_inner(
             let chunk = take_rows(&partition_batch, &indices)?;
             let chunk_row_offset = auto_key_row_offset;
             let chunk_keys = hoodie_keys_for_batch_with_offset(
-                table,
+                &table.hudi_configs,
                 &chunk,
                 Some(&request_instant),
                 chunk_row_offset,
@@ -248,7 +248,7 @@ async fn append_batches_inner(
                 primary_base_path = base_file_path.clone();
             }
             let prepared = prepare_batches_for_write_with_offset(
-                table,
+                &table.hudi_configs,
                 &[chunk],
                 &request_instant,
                 &file_name,
@@ -804,26 +804,23 @@ fn schemas_equal_by_fields(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -
 }
 
 pub(crate) fn prepare_batches_for_write(
-    table: &Table,
+    hudi_configs: &crate::config::HudiConfigs,
     batches: &[RecordBatch],
     instant: &str,
     file_name: &str,
 ) -> Result<Vec<RecordBatch>> {
-    prepare_batches_for_write_with_offset(table, batches, instant, file_name, 0, 0)
+    prepare_batches_for_write_with_offset(hudi_configs, batches, instant, file_name, 0, 0)
 }
 
 pub(crate) fn prepare_batches_for_write_with_offset(
-    table: &Table,
+    hudi_configs: &crate::config::HudiConfigs,
     batches: &[RecordBatch],
     instant: &str,
     file_name: &str,
     row_id_offset: usize,
     partition_id: u32,
 ) -> Result<Vec<RecordBatch>> {
-    let populates_meta_fields: bool = table
-        .hudi_configs
-        .get_or_default(PopulatesMetaFields)
-        .into();
+    let populates_meta_fields: bool = hudi_configs.get_or_default(PopulatesMetaFields).into();
     if !populates_meta_fields {
         return Ok(batches.to_vec());
     }
@@ -838,7 +835,7 @@ pub(crate) fn prepare_batches_for_write_with_offset(
                 return Ok(batch.clone());
             }
             let keys = hoodie_keys_for_batch_with_offset(
-                table,
+                hudi_configs,
                 batch,
                 Some(instant),
                 row_id_offset,

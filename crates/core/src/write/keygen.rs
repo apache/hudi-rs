@@ -22,12 +22,12 @@ use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig::{
     IsHiveStylePartitioning, PartitionFields, RecordKeyFields,
 };
 use crate::error::CoreError;
 use crate::index::HoodieKey;
-use crate::table::Table;
 
 /// Build per-row [`HoodieKey`]s from a write batch.
 ///
@@ -43,35 +43,30 @@ use crate::table::Table;
 /// segments. Null partition values are rejected. Partition columns are not stripped
 /// from the batch — callers must leave them in the written Parquet.
 pub fn hoodie_keys_for_batch(
-    table: &Table,
+    hudi_configs: &HudiConfigs,
     batch: &RecordBatch,
     instant: Option<&str>,
 ) -> Result<Vec<HoodieKey>> {
-    hoodie_keys_for_batch_with_offset(table, batch, instant, 0, 0)
+    hoodie_keys_for_batch_with_offset(hudi_configs, batch, instant, 0, 0)
 }
 
 /// Like [`hoodie_keys_for_batch`], with an explicit auto-key row offset and partition id.
 pub fn hoodie_keys_for_batch_with_offset(
-    table: &Table,
+    hudi_configs: &HudiConfigs,
     batch: &RecordBatch,
     instant: Option<&str>,
     row_id_offset: usize,
     partition_id: u32,
 ) -> Result<Vec<HoodieKey>> {
-    let record_key_fields: Option<Vec<String>> = table
-        .hudi_configs
-        .try_get(RecordKeyFields)?
-        .map(|v| v.into());
+    let record_key_fields: Option<Vec<String>> =
+        hudi_configs.try_get(RecordKeyFields)?.map(|v| v.into());
     let auto_keys = record_key_fields
         .as_ref()
         .map(|f| f.is_empty() || (f.len() == 1 && f[0].is_empty()))
         .unwrap_or(true);
 
-    let partition_fields: Vec<String> = table.hudi_configs.get_or_default(PartitionFields).into();
-    let hive_style: bool = table
-        .hudi_configs
-        .get_or_default(IsHiveStylePartitioning)
-        .into();
+    let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
+    let hive_style: bool = hudi_configs.get_or_default(IsHiveStylePartitioning).into();
 
     if auto_keys {
         let instant = instant.ok_or_else(|| {
