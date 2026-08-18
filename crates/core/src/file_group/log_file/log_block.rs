@@ -24,6 +24,7 @@ use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
 use crate::storage::reader::LogBlockFetcher;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -333,6 +334,24 @@ impl LogBlock {
         let bytes = fetcher
             .read_content(location.content_position, location.content_length)
             .map_err(CoreError::ReadLogFileError)?;
+        self.decode_fetched(decoder, bytes)
+    }
+
+    /// Decode content that was already fetched for this block.
+    ///
+    /// Pairs with the batched prefetch in Pass 3, which reads many blocks'
+    /// ranges in one call and then hands each block its own bytes. Identical to
+    /// [`Self::load_content`] from the length check onwards, so a prefetched
+    /// block and a self-fetched one decode by the same path.
+    pub fn decode_fetched(&mut self, decoder: &Decoder, bytes: Bytes) -> Result<()> {
+        if !self.content.is_empty() {
+            return Ok(());
+        }
+        let Some(DeferredContent { location, .. }) = self.deferred_content.as_ref() else {
+            return Err(CoreError::LogBlockError(
+                "Cannot load the content of a block that was not read headers-only".to_string(),
+            ));
+        };
         // A ranged read whose end runs past the file is CLAMPED rather than
         // refused, so an overlong content length comes back as a short buffer.
         // That length is read straight out of the file and nothing upstream
