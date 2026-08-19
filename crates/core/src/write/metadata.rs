@@ -495,22 +495,24 @@ async fn detect_num_file_groups(
     file_id_prefix: &str,
     default: usize,
 ) -> Result<usize> {
-    let dir = format!("{METADATA_BASE}/{partition_name}");
-    let listed = match storage.list_files(Some(&dir)).await {
-        Ok(files) => files,
-        Err(_) => return Ok(default),
-    };
+    // Committed slices only: an orphan HFile from a crashed writer must not
+    // change the shard modulus (it would diverge from what Java computes),
+    // and listing errors must propagate rather than silently changing it.
+    let slices = mdt_partition_latest_slices(storage, partition_name).await?;
     let mut shards = std::collections::BTreeSet::new();
-    for file in listed {
-        let name = file.name.trim_start_matches('.');
-        if let Some(rest) = name.strip_prefix(file_id_prefix)
+    for (file_id, _, _) in &slices {
+        if let Some(rest) = file_id.strip_prefix(file_id_prefix)
             && let Some(shard_str) = rest.get(..4)
             && let Ok(shard) = shard_str.parse::<usize>()
         {
             shards.insert(shard);
         }
     }
-    Ok(shards.len().max(1))
+    if shards.is_empty() {
+        Ok(default)
+    } else {
+        Ok(shards.len())
+    }
 }
 
 /// Whether `column_stats` is listed in `hoodie.table.metadata.partitions`.
@@ -1203,6 +1205,55 @@ mod tests {
                 "log {i} out of order: {log}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_detect_num_file_groups_ignores_uncommitted_shards() {
+        // An orphan HFile from a crashed writer must not change the shard
+        // modulus; only committed shards count, and an empty partition falls
+        // back to the caller's default.
+        let dir = tempfile::tempdir().unwrap();
+        let partition_dir = dir.path().join(".hoodie/metadata/record_index");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        for name in [
+            "record-index-0000-0_0-0-0_00000000000000010.hfile",
+            "record-index-0001-0_0-0-0_00000000000000010.hfile",
+            "record-index-0002-0_0-0-0_00000000000000099.hfile", // orphan
+        ] {
+            std::fs::write(partition_dir.join(name), b"").unwrap();
+        }
+        let timeline_dir = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+        std::fs::create_dir_all(&timeline_dir).unwrap();
+        std::fs::write(
+            timeline_dir.join("00000000000000010_00000000000000010.deltacommit"),
+            b"{}",
+        )
+        .unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let shards = detect_num_file_groups(
+            storage.as_ref(),
+            MetadataPartitionType::RecordIndex.partition_name(),
+            "record-index-",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shards, 2, "orphan shard must not count");
+
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(empty.path().join(".hoodie")).unwrap();
+        let base_url = url::Url::from_directory_path(empty.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let shards = detect_num_file_groups(
+            storage.as_ref(),
+            MetadataPartitionType::RecordIndex.partition_name(),
+            "record-index-",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shards, 10, "missing partition falls back to default");
     }
 
     #[tokio::test]
