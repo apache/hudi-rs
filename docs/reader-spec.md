@@ -60,7 +60,9 @@ Per-slice reads — reading a single `FileSlice` the caller already selected (ty
 | `with_as_of_timestamp(ts)`   | `hoodie.read.as.of.timestamp`                | latest commit (Snapshot only)             |
 | `with_start_timestamp(ts)`   | `hoodie.read.start.timestamp`                | `19700101000000000` (Incremental only)    |
 | `with_end_timestamp(ts)`     | `hoodie.read.end.timestamp`                  | latest commit (Incremental only)          |
-| `with_batch_size(n)`         | `hoodie.read.stream.batch_size`              | `1024` (streaming only)                   |
+| `with_batch_size(n)`         | `hoodie.read.stream.batch_size`              | `1024` (streaming, base-file-only slices) |
+
+`with_batch_size` scope: it sizes the batches of a slice that has **no log files**, which is read straight from the base file. A slice **with** log files is merged, and the merge sizes its own chunks (`MERGE_CHUNK_ROWS`) so that one chunk of merging is a bounded amount of synchronous work; `hoodie.read.stream.batch_size` has no effect there. The two happen to agree at 1024 today.
 
 Timestamp resolution: all four public entry points — `read`, `read_stream`, `get_file_slices`, and `create_file_group_reader_with_options` — go through a single `prepare_reader_options` step that (1) strips timestamps irrelevant to the query type (snapshot discards `start/end_timestamp`; incremental discards `as_of_timestamp`) and (2) resolves the remaining timestamps into the `EndTimestamp` / `StartTimestamp` that `FileGroupReader` needs for log-scan bounds and commit-time filtering. Callers may set all three for convenience; only the applicable ones take effect.
 
