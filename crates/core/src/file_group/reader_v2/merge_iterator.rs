@@ -1188,6 +1188,80 @@ mod tests {
         );
     }
 
+    /// A concurrent task makes progress *while* the merge runs, chunk by chunk.
+    ///
+    /// This is the non-blocking property, and it is separate from laziness: a
+    /// merge could pull one batch at a time and still hold its executor thread
+    /// for the whole read, which on a single-worker runtime starves everything
+    /// else on it. The base stream here awaits before yielding each batch, which
+    /// is what a ranged read looks like to the runtime; the assertion is that
+    /// the merge propagates that await rather than blocking through it.
+    ///
+    /// `current_thread` on purpose - one worker, so the ticker can only advance
+    /// if the merge actually gives the thread up. On a multi-threaded runtime
+    /// the ticker would run on another worker and prove nothing.
+    ///
+    /// The interleaving is checked per chunk rather than once at the end, and
+    /// that is what makes it discriminating: a merge that awaited the whole base
+    /// up front and then served chunks without awaiting again passes a single
+    /// end-of-read check and fails this one at chunk 2 (`4 -> 4`).
+    ///
+    /// The severe violation - blocking the thread *through* the base await -
+    /// shows up as a deadlock rather than a failed assertion, since on one
+    /// worker the pending read can never be rescheduled. Verified by mutation:
+    /// the test hangs instead of failing. Detected either way, but a hang is a
+    /// worse signal, so the per-chunk check above is what carries this test.
+    #[tokio::test]
+    async fn merge_stream_lets_other_tasks_run_between_chunks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let schema = small_schema();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                t.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let batches: Vec<Result<RecordBatch>> = (0..4)
+            .map(|i| Ok(batch(schema.clone(), &["k"], &[i])))
+            .collect();
+        // Awaits before handing over each batch, standing in for the ranged read
+        // a real base source performs.
+        let base = futures::stream::iter(batches)
+            .then(|b| async move {
+                tokio::task::yield_now().await;
+                b
+            })
+            .boxed();
+
+        let mut merge = FileGroupMergeStream::new_buffered(
+            MockBuffer::boxed(vec![], UpdateStats::default()),
+            base,
+            schema.clone(),
+            schema,
+            None,
+            new_stream_stats_handle(),
+        );
+
+        let mut seen = 0usize;
+        let mut chunks = 0usize;
+        while merge.next_chunk().await.is_some() {
+            chunks += 1;
+            let now = ticks.load(Ordering::SeqCst);
+            assert!(
+                now > seen,
+                "the ticker did not advance while chunk {chunks} was produced ({seen} -> \
+                 {now}); the merge held the only worker thread instead of awaiting"
+            );
+            seen = now;
+        }
+        assert_eq!(chunks, 4, "one chunk per base batch");
+        ticker.abort();
+    }
+
     // ---- Error/termination spine ----
 
     /// A buffer whose `has_next` always errors — pins the iterator's
