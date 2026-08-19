@@ -1133,6 +1133,11 @@ async fn mor_upsert_batches(
             .iter()
             .map(|key| (key.record_key.clone(), key.partition_path.clone()))
             .collect();
+        // Ordering value 0 is Java's DEFAULT_ORDERING_VALUE, which readers
+        // treat as "natural order": the delete wins regardless of the doomed
+        // row's event-time ordering (BufferedRecordMergerFactory
+        // deltaMergeDeleteRecord). Required for partition moves, where the
+        // evicted row may carry a higher ordering value than the mover.
         let content = crate::write::build_delete_log_block(&instant, &pairs, 0)?;
         let size = content.len() as i64;
         storage.put_file(&log_file, content).await?;
@@ -2017,10 +2022,19 @@ fn deduplicate_last_by_key(
         .try_get(OrderingFields)?
         .map(Into::into)
         .unwrap_or_default();
-    let ordering = ordering_fields
-        .first()
-        .and_then(|name| batch.column_by_name(name))
-        .cloned();
+    // One comparator per ordering field, hoisted out of the duplicate loop;
+    // fields compare lexicographically (first field breaks ties via the next).
+    let comparators = ordering_fields
+        .iter()
+        .filter_map(|name| batch.column_by_name(name))
+        .map(|column| {
+            arrow_ord::ord::make_comparator(
+                column.as_ref(),
+                column.as_ref(),
+                arrow_schema::SortOptions::default(),
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut winners: HashMap<String, u32> = HashMap::with_capacity(batch.num_rows());
     let keys = keys(batch, field)?;
     for (index, key) in keys.iter().enumerate() {
@@ -2030,18 +2044,12 @@ fn deduplicate_last_by_key(
                 winners.insert(key.clone(), index);
             }
             Some(&existing) => {
-                let keep_new = match &ordering {
-                    Some(column) => {
-                        // Row-wise compare via arrow ordering on the single column.
-                        let cmp = arrow_ord::ord::make_comparator(
-                            column.as_ref(),
-                            column.as_ref(),
-                            arrow_schema::SortOptions::default(),
-                        )?;
-                        cmp(index as usize, existing as usize) != std::cmp::Ordering::Less
-                    }
-                    None => true,
-                };
+                let keep_new = comparators
+                    .iter()
+                    .map(|cmp| cmp(index as usize, existing as usize))
+                    .find(|ordering| *ordering != std::cmp::Ordering::Equal)
+                    .unwrap_or(std::cmp::Ordering::Greater)
+                    != std::cmp::Ordering::Less;
                 if keep_new {
                     winners.insert(key.clone(), index);
                 }

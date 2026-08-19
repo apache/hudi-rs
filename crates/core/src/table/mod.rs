@@ -372,7 +372,9 @@ impl Table {
 
     /// Upsert complete records by their configured record key.
     ///
-    /// than once in an input batch, the final occurrence is retained.
+    /// If a key occurs more than once in an input batch, the row with the
+    /// highest ordering (precombine) value is retained when ordering fields
+    /// are configured; otherwise the final occurrence is retained.
     pub async fn upsert(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
