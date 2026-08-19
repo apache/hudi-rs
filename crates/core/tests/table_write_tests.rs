@@ -580,6 +580,40 @@ async fn test_invalid_input_leaves_no_pending_instant() {
         before,
         "upsert_with must not fence on unknown update column"
     );
+
+    // COW update(): SET value type mismatch and all-meta SET are deterministic
+    // input errors — no pending instant either.
+    let before = timeline_files();
+    let wrong_type = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["oops"]))],
+    )
+    .unwrap();
+    table.update("id = 'a'", wrong_type).await.unwrap_err();
+    assert_eq!(
+        timeline_files(),
+        before,
+        "update must not fence on SET type mismatch"
+    );
+    let all_meta = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "_hoodie_commit_time",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["x"]))],
+    )
+    .unwrap();
+    table.update("id = 'a'", all_meta).await.unwrap_err();
+    assert_eq!(
+        timeline_files(),
+        before,
+        "update must not fence on all-meta SET"
+    );
 }
 
 #[tokio::test]
@@ -1819,6 +1853,81 @@ async fn test_mor_unsupported_verbs_error_clearly() {
 /// partition column and path in agreement. (Regression: the row used to stay
 /// physically in the old partition with new-partition values, unreachable
 /// from either partition filter.)
+#[tokio::test]
+async fn test_stale_partition_move_rejected_by_event_time() {
+    // Java merges BEFORE deciding a partition move: a cross-partition update
+    // with a lower ordering value loses and must not destroy the newer row
+    // (HoodieIndexUtils.mergeForPartitionUpdatesAndDeletionsIfNeeded).
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["value"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([partitioned_batch(vec![("a", "sf", 5)])])
+            .await
+            .unwrap();
+        // Stale move: ordering 3 < 5 loses; the sf row survives untouched.
+        table
+            .upsert([partitioned_batch(vec![("a", "nyc", 3)])])
+            .await
+            .unwrap();
+        let rows = rows_by_id(&table.read(&ReadOptions::new()).await.unwrap());
+        assert_eq!(
+            rows,
+            vec![("a".to_string(), 5)],
+            "{table_type:?}: stale move"
+        );
+        let sf = rows_by_id(
+            &table
+                .read(
+                    &ReadOptions::new()
+                        .with_filters([("city", "=", "sf")])
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            sf,
+            vec![("a".to_string(), 5)],
+            "{table_type:?}: stays in sf"
+        );
+        // Winning move: ordering 7 > 5 moves the row to la.
+        table
+            .upsert([partitioned_batch(vec![("a", "la", 7)])])
+            .await
+            .unwrap();
+        let la = rows_by_id(
+            &table
+                .read(
+                    &ReadOptions::new()
+                        .with_filters([("city", "=", "la")])
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            la,
+            vec![("a".to_string(), 7)],
+            "{table_type:?}: winning move"
+        );
+        let total = rows_by_id(&table.read(&ReadOptions::new()).await.unwrap());
+        assert_eq!(
+            total,
+            vec![("a".to_string(), 7)],
+            "{table_type:?}: one copy"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_upsert_partition_change_moves_row() {
     for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {

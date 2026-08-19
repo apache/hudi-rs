@@ -57,9 +57,9 @@ struct Row {
 }
 
 /// In-memory oracle mirroring the intended single-writer semantics:
-/// - full upsert: same-partition merge by event-time ordering (ties: incoming
-///   wins); changed partition moves the row unconditionally (global-index
-///   update-partition-path).
+/// - full upsert: event-time merge decides regardless of partition (ties:
+///   incoming wins); a winning row with a changed partition value MOVES
+///   (global-index update-partition-path, merge-before-move like Java).
 /// - partial upsert (COW): only `v` updates when the incoming row wins the
 ///   event-time merge; `ts` keeps the OLD value (non-update column).
 /// - overwrite: table becomes the batch. dpo: touched partitions become the
@@ -286,8 +286,10 @@ async fn run_sequence(table_type: TableTypeValue, metadata: bool, seed: u64, ops
                 eprintln!("{context}: upsert {rows:?}");
                 table.upsert([batch_of(&rows)]).await.unwrap();
                 for (id, city, ts, v) in dedup_batch(rows) {
+                    // Merge-before-move: a stale update loses regardless of
+                    // whether it names a different partition (Java parity).
                     match oracle.get(&id) {
-                        Some(old) if old.city == city && old.ts > ts => {}
+                        Some(old) if old.ts > ts => {}
                         _ => {
                             oracle.insert(id, Row { city, ts, v });
                         }

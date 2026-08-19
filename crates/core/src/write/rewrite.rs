@@ -248,6 +248,27 @@ pub async fn upsert_batches(
     // inserted where its values say. Anything else leaves rows whose stored
     // partition columns disagree with the path they physically live in.
     let mut evictions_by_group: HashMap<String, HashSet<String>> = HashMap::new();
+    // Merge-before-move (Java parity): find the cross-partition updates whose
+    // incoming row loses the event-time merge; they stay in their old group.
+    let mut moved_candidates: HashMap<String, Vec<String>> = HashMap::new();
+    for hoodie_key in &incoming_hoodie_keys {
+        if let Some(location) = locations.get(hoodie_key).and_then(Option::as_ref)
+            && location.partition_path != hoodie_key.partition_path
+            && slice_by_file_id.contains_key(&location.file_id)
+        {
+            moved_candidates
+                .entry(location.file_id.clone())
+                .or_default()
+                .push(hoodie_key.record_key.clone());
+        }
+    }
+    let move_slices: HashMap<String, crate::file_group::file_slice::FileSlice> = slice_by_file_id
+        .iter()
+        .map(|(id, (_, slice))| (id.clone(), slice.clone()))
+        .collect();
+    let rejected_moves =
+        moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices)
+            .await?;
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
         // A location whose file group has no live slice is a stale index
         // entry (its group was replaced); the row no longer exists, so the
@@ -258,6 +279,12 @@ pub async fn upsert_batches(
             .filter(|location| slice_by_file_id.contains_key(&location.file_id));
         let target = match located {
             Some(location) if location.partition_path == hoodie_key.partition_path => {
+                updates += 1;
+                Some(location.file_id.clone())
+            }
+            // Losing cross-partition update: route to the OLD group as a
+            // plain update; the event-time merge keeps the old row.
+            Some(location) if rejected_moves.contains(&hoodie_key.record_key) => {
                 updates += 1;
                 Some(location.file_id.clone())
             }
@@ -483,13 +510,33 @@ pub async fn update_filter(
     ensure_rewrite_supported(table)?;
     let schema = table.get_schema_with_meta_fields().await?;
     validate_fields_against_schemas(std::slice::from_ref(&filter), [&schema])?;
+    let meta: HashSet<&str> = MetaField::field_names_with_operation()
+        .into_iter()
+        .collect();
+    let mut has_data_column = false;
     for field in updates.schema().fields() {
         let name = field.name();
-        if schema.column_with_name(name).is_none() {
+        let Some((_, table_field)) = schema.column_with_name(name) else {
             return Err(CoreError::Schema(format!(
                 "update column '{name}' is not in the table schema"
             )));
+        };
+        if meta.contains(name.as_str()) {
+            continue;
         }
+        has_data_column = true;
+        if field.data_type() != table_field.data_type() {
+            return Err(CoreError::Schema(format!(
+                "update column '{name}' has type {} but the table column is {}",
+                field.data_type(),
+                table_field.data_type()
+            )));
+        }
+    }
+    if !has_data_column {
+        return Err(CoreError::Write(
+            "update requires at least one data column to set".to_string(),
+        ));
     }
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let plans = merge_plans_for_slices(
@@ -1006,6 +1053,36 @@ async fn mor_upsert_batches(
     // differs from its located one moves — tombstoned in the old group via a
     // delete log block, inserted into its new partition.
     let mut moved_tombstones: HashMap<(String, String), Vec<HoodieKey>> = HashMap::new();
+    // Merge-before-move (Java parity, see the COW path): a cross-partition
+    // update that loses the event-time merge is appended to the OLD group as
+    // a plain update; the reader-side merge keeps the old row.
+    let mut moved_candidates: HashMap<String, Vec<String>> = HashMap::new();
+    let mut mor_slice_by_file_id: HashMap<String, crate::file_group::file_slice::FileSlice> =
+        HashMap::new();
+    for slice in table.get_file_slices(&ReadOptions::new()).await? {
+        mor_slice_by_file_id.insert(slice.file_id().to_string(), slice);
+    }
+    for (index, key) in incoming_keys.iter().enumerate() {
+        let incoming_partition = tagged_keys
+            .get(index)
+            .map(|k| k.partition_path.clone())
+            .unwrap_or_default();
+        if let Some(location) = locations.get(key)
+            && location.partition_path != incoming_partition
+        {
+            moved_candidates
+                .entry(location.file_id.clone())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    let rejected_moves = moved_keys_rejected_by_event_time(
+        table,
+        &incoming,
+        &moved_candidates,
+        &mor_slice_by_file_id,
+    )
+    .await?;
     for (index, key) in incoming_keys.iter().enumerate() {
         let incoming_partition = tagged_keys
             .get(index)
@@ -1013,6 +1090,13 @@ async fn mor_upsert_batches(
             .unwrap_or_default();
         match locations.get(key) {
             Some(location) if location.partition_path == incoming_partition => {
+                update_indices
+                    .entry((location.partition_path.clone(), location.file_id.clone()))
+                    .or_default()
+                    .push(index as u32);
+                updates += 1;
+            }
+            Some(location) if rejected_moves.contains(key) => {
                 update_indices
                     .entry((location.partition_path.clone(), location.file_id.clone()))
                     .or_default()
@@ -1731,6 +1815,77 @@ async fn complete_deltacommit(
     };
     storage.put_file_if_absent(&path, bytes).await?;
     Ok(())
+}
+
+/// Java merges the incoming record with the existing one BEFORE deciding a
+/// partition move (HoodieIndexUtils.mergeForPartitionUpdatesAndDeletionsIfNeeded):
+/// a cross-partition update that loses the event-time merge keeps the old row
+/// in its old partition. Returns the record keys whose incoming rows LOSE
+/// against the located slices (strictly lower ordering; ties move).
+async fn moved_keys_rejected_by_event_time(
+    table: &Table,
+    incoming: &RecordBatch,
+    moved: &HashMap<String, Vec<String>>, // file_id -> record keys moved from it
+    slices: &HashMap<String, crate::file_group::file_slice::FileSlice>,
+) -> Result<HashSet<String>> {
+    let mut rejected = HashSet::new();
+    if moved.is_empty() || !uses_event_time_merge(&table.hudi_configs)? {
+        return Ok(rejected);
+    }
+    let ordering_fields: Vec<String> = table
+        .hudi_configs
+        .try_get(OrderingFields)?
+        .map(Into::into)
+        .unwrap_or_default();
+    let Some(ordering_field) = ordering_fields.first() else {
+        return Ok(rejected);
+    };
+    let key_name = record_key_name(table, incoming)?;
+    let incoming_keys = keys(incoming, &key_name)?;
+    let mut incoming_row_by_key = HashMap::new();
+    for (row, key) in incoming_keys.iter().enumerate() {
+        incoming_row_by_key.insert(key.clone(), row);
+    }
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
+    for (file_id, moved_keys) in moved {
+        let Some(slice) = slices.get(file_id) else {
+            continue;
+        };
+        let old = reader.read_file_slice(slice, &ReadOptions::new()).await?;
+        if old.num_rows() == 0 {
+            continue;
+        }
+        let old_keys = keys(&old, MetaField::RecordKey.as_ref())?;
+        let wanted: HashSet<&String> = moved_keys.iter().collect();
+        let (Some(old_ordering), Some(new_ordering)) = (
+            old.column_by_name(ordering_field),
+            incoming.column_by_name(ordering_field),
+        ) else {
+            continue;
+        };
+        let cmp = arrow_ord::ord::make_comparator(
+            new_ordering.as_ref(),
+            old_ordering.as_ref(),
+            arrow_schema::SortOptions::default(),
+        )?;
+        for (old_row, old_key) in old_keys.iter().enumerate() {
+            if !wanted.contains(old_key) {
+                continue;
+            }
+            let Some(&new_row) = incoming_row_by_key.get(old_key) else {
+                continue;
+            };
+            if cmp(new_row, old_row) == std::cmp::Ordering::Less {
+                rejected.insert(old_key.clone());
+            }
+        }
+    }
+    Ok(rejected)
 }
 
 fn uses_event_time_merge(hudi_configs: &crate::config::HudiConfigs) -> Result<bool> {
@@ -3123,6 +3278,9 @@ async fn commit_merge_plans(
         for path in &written_paths {
             let _ = storage.delete_file(path).await;
         }
+        // The write failed before any completion: abort the fenced instant so
+        // a deterministic worker error leaves no pending timeline trace.
+        let _ = abort_requested_instant(table, instant, Action::Commit).await;
         return Err(error);
     }
 
