@@ -106,7 +106,13 @@ pub fn hoodie_keys_for_batch_with_offset(
         return Ok(keys);
     }
 
-    let fields = record_key_fields.unwrap();
+    let Some(fields) = record_key_fields else {
+        // Unreachable: auto_keys above covers None, but the no-panic rule
+        // wants an error, not an unwrap.
+        return Err(CoreError::Config(
+            crate::config::error::ConfigError::NotFound("record key fields".to_string()),
+        ));
+    };
     if fields.len() != 1 {
         return Err(CoreError::Unsupported(
             "writes currently require exactly one record key field (or none for auto keys)"

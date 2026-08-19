@@ -614,6 +614,55 @@ async fn test_invalid_input_leaves_no_pending_instant() {
         before,
         "update must not fence on all-meta SET"
     );
+
+    // A schema that cannot be expressed in commit metadata (UInt32 has no
+    // Avro mapping) must fail before fencing or writing anything.
+    let before = timeline_files();
+    let unmappable = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("value", DataType::UInt32, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["u"])),
+            Arc::new(StringArray::from(vec!["sf"])),
+            Arc::new(arrow::array::UInt32Array::from(vec![1u32])),
+        ],
+    )
+    .unwrap();
+    table.append([unmappable.clone()]).await.unwrap_err();
+    table.upsert([unmappable]).await.unwrap_err();
+    assert_eq!(
+        timeline_files(),
+        before,
+        "unmappable schema must not fence or write"
+    );
+}
+
+#[tokio::test]
+async fn test_create_rejects_unsupported_version_without_persisting() {
+    // tv10 must be rejected before hoodie.properties or MDT files exist, so
+    // the target stays usable for a corrected retry.
+    let dir = tempdir().unwrap();
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_table_version(10)
+        .create()
+        .await
+        .unwrap_err();
+    assert!(
+        !dir.path().join(".hoodie").exists(),
+        "rejected create must leave the target empty"
+    );
+    // The corrected retry succeeds in the same location.
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

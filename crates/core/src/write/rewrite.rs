@@ -385,7 +385,9 @@ pub async fn upsert_batches(
         }
     }
 
-    // RLI adds: every input row's final location is known from the plan.
+    // RLI adds: every input row's final location is known from the plan. A
+    // REJECTED cross-partition move keeps the old row, so its index entry
+    // must carry the old partition, not the losing incoming value.
     let rli_entries = incoming_hoodie_keys
         .iter()
         .enumerate()
@@ -393,9 +395,18 @@ pub async fn upsert_batches(
             let file_id = row_target[row]
                 .clone()
                 .or_else(|| new_group_by_row.get(&(row as u32)).cloned())?;
+            let partition_path = if rejected_moves.contains(&key.record_key) {
+                locations
+                    .get(key)
+                    .and_then(Option::as_ref)
+                    .map(|location| location.partition_path.clone())
+                    .unwrap_or_else(|| key.partition_path.clone())
+            } else {
+                key.partition_path.clone()
+            };
             Some(RecordIndexEntry {
                 record_key: key.record_key.clone(),
-                partition_path: key.partition_path.clone(),
+                partition_path,
                 file_id,
                 instant_time_millis: instant_to_epoch_millis(&instant),
                 is_deleted: false,
@@ -859,6 +870,12 @@ async fn validate_write_input(table: &Table, batches: &[RecordBatch], verb: &str
         )));
     }
     let first = batches[0].schema();
+    // Commit metadata carries the schema as Avro JSON; an inexpressible type
+    // (e.g. UInt32) must fail here, before an instant is fenced and data is
+    // written, not while building the commit.
+    crate::write::append::arrow_schema_to_avro_json(
+        &crate::write::append::strip_meta_fields_from_schema(&first),
+    )?;
     for batch in &batches[1..] {
         if crate::write::align_batch_to_schema(batch, &first).is_none() {
             return Err(CoreError::Schema(format!(
@@ -1546,9 +1563,10 @@ async fn mor_upsert_batches(
         }
         return Err(error);
     }
-    crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await?;
+    // Durable from here: best-effort maintenance must not fail the write.
+    let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
-    table.timeline.reload_completed_commits().await?;
+    let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
         instant,
@@ -1754,9 +1772,10 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         }
         return Err(error);
     }
-    crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await?;
+    // Durable from here: best-effort maintenance must not fail the write.
+    let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
-    table.timeline.reload_completed_commits().await?;
+    let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
         instant,
@@ -2761,9 +2780,10 @@ async fn finalize_rewrite_commit(
         }
         return Err(error.into());
     }
-    crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await?;
+    // Durable from here: best-effort maintenance must not fail the write.
+    let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await;
     drop(cs2);
-    table.timeline.reload_completed_commits().await?;
+    let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
         instant: instant.to_string(),
@@ -3408,6 +3428,45 @@ mod lifecycle_tests {
         super::complete_deltacommit(table, &instant, "UPSERT", vec![stat], schema.as_ref())
             .await
             .unwrap();
+    }
+
+    /// A REJECTED cross-partition move must leave the record index pointing
+    /// at the surviving old partition, not the losing incoming value.
+    #[tokio::test]
+    async fn test_rejected_move_keeps_rli_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+        table.append([batch(&[("a", "sf", 5, 100)])]).await.unwrap();
+        // Stale move: rejected, row stays in sf.
+        table
+            .upsert([batch(&[("a", "nyc", 3, 333)])])
+            .await
+            .unwrap();
+        table.reload_timeline_for_write().await.unwrap();
+        let key = crate::index::HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: "city=nyc".to_string(),
+        };
+        use crate::index::HoodieIndex;
+        let locations = crate::index::for_table(&table)
+            .tag_location(&table, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        let location = locations
+            .get(&key)
+            .and_then(Option::as_ref)
+            .expect("key must stay indexed");
+        assert_eq!(
+            location.partition_path, "city=sf",
+            "index must keep the surviving old partition"
+        );
     }
 
     /// Overwrite and dynamic partition overwrite must replace log-only MOR

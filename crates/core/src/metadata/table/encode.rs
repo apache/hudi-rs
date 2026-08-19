@@ -612,10 +612,10 @@ fn uuid_from_u64_pair(high: u64, low: u64) -> String {
     bytes[..8].copy_from_slice(&high.to_be_bytes());
     bytes[8..].copy_from_slice(&low.to_be_bytes());
     let (a, b, c, d, e) = (
-        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
-        u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
-        u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
-        u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
         &bytes[10..16],
     );
     format!(

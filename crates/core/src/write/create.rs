@@ -236,7 +236,7 @@ impl TableCreateBuilder {
         let partition_stats_enabled =
             self.partition_stats_enabled && !self.partition_fields.is_empty();
 
-        if self.table_version < 8 {
+        if !(8..=9).contains(&self.table_version) {
             return Err(CoreError::Unsupported(format!(
                 "creating table version {} is not supported; supported versions are 8 and 9",
                 self.table_version

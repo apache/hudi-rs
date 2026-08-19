@@ -105,6 +105,8 @@ async fn append_batches_inner(
         }
     }
     ensure_append_schema_matches_table(table, schema.as_ref()).await?;
+    // Must be expressible in commit metadata (Avro JSON) before fencing.
+    arrow_schema_to_avro_json(&strip_meta_fields_from_schema(schema.as_ref()))?;
     let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if num_rows == 0 {
         return Err(CoreError::Write(
@@ -211,10 +213,13 @@ async fn append_batches_inner(
         for (batch_idx, rows) in batch_indices {
             partition_batches.push(take_rows(&batches[batch_idx], &rows)?);
         }
-        let partition_batch = if partition_batches.len() == 1 {
-            partition_batches.pop().unwrap()
-        } else {
-            arrow::compute::concat_batches(&schema, &partition_batches)?
+        let partition_batch = match partition_batches.pop() {
+            Some(only) if partition_batches.is_empty() => only,
+            Some(last) => {
+                partition_batches.push(last);
+                arrow::compute::concat_batches(&schema, &partition_batches)?
+            }
+            None => continue,
         };
         crate::write::ensure_partition_metadata(
             storage.as_ref(),
@@ -439,10 +444,14 @@ async fn append_batches_inner(
         }
         return Err(error.into());
     }
-    crate::write::post_complete_bookkeeping(table, storage.as_ref(), &request_instant).await?;
+    // The commit is durable from here: post-commit maintenance (markers,
+    // archival) and handle refresh are best-effort — a transient failure must
+    // not turn a committed write into an Err the caller would retry.
+    let _ =
+        crate::write::post_complete_bookkeeping(table, storage.as_ref(), &request_instant).await;
     drop(cs2);
 
-    table.timeline.reload_completed_commits().await?;
+    let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
 
     Ok(AppendResult {
