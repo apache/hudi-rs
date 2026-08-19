@@ -1113,6 +1113,81 @@ mod tests {
         assert_eq!(chunks.len(), 2, "the merge stops after the error");
     }
 
+    /// The two properties that make this a stream rather than a differently-
+    /// shaped batch read, neither of which any output-level assertion can see.
+    ///
+    /// **Lazy.** Asking for one chunk must pull one base batch, not the whole
+    /// base file. A merge that collected the base up front would return exactly
+    /// the same rows in exactly the same order, so row and order assertions
+    /// cannot distinguish it - only counting the pulls can.
+    ///
+    /// **No thread hand-off.** The merge must run on the task that polls it. The
+    /// shape this replaced moved the whole merge loop onto a blocking-pool
+    /// thread and fed batches back through a channel, which also produced the
+    /// right rows; the observable difference is which thread the base pull
+    /// happens on. Asserted on a `current_thread` runtime, where the polling
+    /// task and the test share one thread, so a hand-off shows up as a different
+    /// thread id.
+    #[tokio::test]
+    async fn merge_stream_is_lazy_and_polls_on_the_callers_thread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let schema = small_schema();
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let pull_threads = Arc::new(std::sync::Mutex::new(Vec::<std::thread::ThreadId>::new()));
+
+        let (p, t) = (pulls.clone(), pull_threads.clone());
+        let base = futures::stream::iter(vec![
+            Ok(batch(schema.clone(), &["a"], &[1])),
+            Ok(batch(schema.clone(), &["b"], &[2])),
+            Ok(batch(schema.clone(), &["c"], &[3])),
+        ])
+        .inspect(move |_| {
+            p.fetch_add(1, Ordering::SeqCst);
+            t.lock().unwrap().push(std::thread::current().id());
+        })
+        .boxed();
+
+        let mut merge = FileGroupMergeStream::new_buffered(
+            MockBuffer::boxed(vec![], UpdateStats::default()),
+            base,
+            schema.clone(),
+            schema,
+            None,
+            new_stream_stats_handle(),
+        );
+
+        // One chunk asked for, one base batch read.
+        let first = merge.next_chunk().await.expect("a first chunk").unwrap();
+        assert_eq!(rows(&first), vec![("a".to_string(), 1)]);
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            1,
+            "one chunk must cost one base batch; a merge that pre-collected the \
+             base would read all three and still return this same chunk"
+        );
+
+        // ...and the rest only when asked for.
+        let second = merge.next_chunk().await.expect("a second chunk").unwrap();
+        assert_eq!(rows(&second), vec![("b".to_string(), 2)]);
+        assert_eq!(pulls.load(Ordering::SeqCst), 2, "still one pull per chunk");
+
+        while merge.next_chunk().await.is_some() {}
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            3,
+            "the whole base is read once"
+        );
+
+        let here = std::thread::current().id();
+        let threads = pull_threads.lock().unwrap();
+        assert!(
+            threads.iter().all(|t| *t == here),
+            "the base pull must happen on the polling task's own thread; saw {threads:?} \
+             from {here:?}, which means the merge was handed to another thread"
+        );
+    }
+
     // ---- Error/termination spine ----
 
     /// A buffer whose `has_next` always errors — pins the iterator's
