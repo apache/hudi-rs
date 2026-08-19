@@ -130,6 +130,20 @@ pub(crate) async fn archive_timeline_if_needed(
     }
 
     completed.sort_by(|a, b| a.requested.cmp(&b.requested));
+    // A replacecommit's partitionToReplaceFileIds is what hides the file
+    // groups it replaced; until a cleaner physically deletes those groups,
+    // archiving it resurrects their rows. Java blocks archival at the first
+    // uncleaned replace instant; with no cleaner implemented, that means
+    // never archiving at or past the earliest active replacecommit.
+    let earliest_replace = completed
+        .iter()
+        .filter(|c| c.action == "replacecommit")
+        .map(|c| c.requested.clone())
+        .min();
+    let earliest_pending = match (earliest_pending, earliest_replace) {
+        (Some(pending), Some(replace)) => Some(pending.min(replace)),
+        (pending, replace) => pending.or(replace),
+    };
     let is_commit_action =
         |action: &str| matches!(action, "commit" | "deltacommit" | "replacecommit");
     let commit_count = completed
