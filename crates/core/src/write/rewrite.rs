@@ -150,16 +150,12 @@ pub async fn upsert_batches(
             "upsert requires at least one RecordBatch".to_string(),
         ));
     }
+    validate_write_input(table, batches, "upsert").await?;
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
-    if incoming.num_rows() == 0 {
-        return Err(CoreError::Write(
-            "upsert requires at least one row".to_string(),
-        ));
-    }
     let key_name = record_key_name(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
+    let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
     let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
     let locations = for_table(table)
         .tag_location(table, &incoming_hoodie_keys)
@@ -185,7 +181,6 @@ pub async fn upsert_batches(
         }
     }
     let mut insert_target_by_row: HashMap<usize, Option<String>> = HashMap::new();
-    let mut packed_group_ids: HashSet<String> = HashSet::new();
     for (partition, rows) in &insert_rows_by_partition {
         let slices: Vec<&crate::file_group::file_slice::FileSlice> = slices_by_partition
             .get(partition)
@@ -204,7 +199,6 @@ pub async fn upsert_batches(
                 match &bucket {
                     crate::write::sizing::InsertBucket::Existing { file_id } => {
                         insert_target_by_row.insert(*row, Some(file_id.clone()));
-                        packed_group_ids.insert(file_id.clone());
                     }
                     crate::write::sizing::InsertBucket::New => {
                         insert_target_by_row.insert(*row, None);
@@ -212,6 +206,20 @@ pub async fn upsert_batches(
                 }
             }
             cursor += count;
+        }
+    }
+    if let Some(columns) = &options.update_columns {
+        for column in columns {
+            if incoming.column_by_name(column).is_none() {
+                return Err(CoreError::Schema(format!(
+                    "update column '{column}' is not in the write batch schema"
+                )));
+            }
+            if MetaField::field_names_with_operation().contains(&column.as_str()) {
+                return Err(CoreError::Write(format!(
+                    "update column '{column}' is a Hudi meta field"
+                )));
+            }
         }
     }
     // MergeHandle model: route each input row to its target file group, then
@@ -233,13 +241,30 @@ pub async fn upsert_batches(
     let mut rows_by_group: HashMap<String, Vec<u32>> = HashMap::new();
     let mut new_rows_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
     let mut row_target: Vec<Option<String>> = Vec::with_capacity(incoming.num_rows());
+    // Update-partition-path (global index): a key upserted with a different
+    // partition value MOVES — evicted from the group in its old partition and
+    // inserted where its values say. Anything else leaves rows whose stored
+    // partition columns disagree with the path they physically live in.
+    let mut evictions_by_group: HashMap<String, HashSet<String>> = HashMap::new();
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
-        let target = if let Some(Some(location)) = locations.get(hoodie_key) {
-            updates += 1;
-            Some(location.file_id.clone())
-        } else {
-            inserts += 1;
-            insert_target_by_row.get(&index).cloned().flatten()
+        let located = locations.get(hoodie_key).and_then(Option::as_ref);
+        let target = match located {
+            Some(location) if location.partition_path == hoodie_key.partition_path => {
+                updates += 1;
+                Some(location.file_id.clone())
+            }
+            Some(location) => {
+                updates += 1;
+                evictions_by_group
+                    .entry(location.file_id.clone())
+                    .or_default()
+                    .insert(hoodie_key.record_key.clone());
+                insert_target_by_row.get(&index).cloned().flatten()
+            }
+            None => {
+                inserts += 1;
+                insert_target_by_row.get(&index).cloned().flatten()
+            }
         };
         match &target {
             Some(file_id) => rows_by_group
@@ -264,6 +289,8 @@ pub async fn upsert_batches(
             ))
         })?;
         let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+        let evict_keys =
+            std::sync::Arc::new(evictions_by_group.remove(&file_id).unwrap_or_default());
         plans.push(MergePlan {
             partition,
             file_id: file_id.clone(),
@@ -273,6 +300,29 @@ pub async fn upsert_batches(
             op: GroupOp::Upsert {
                 incoming: take_batch(&incoming, &rows)?,
                 partial_columns: options.update_columns.clone(),
+                evict_keys,
+            },
+        });
+    }
+    // Groups that only lose rows (every touched key moved away).
+    let mut evict_only: Vec<_> = evictions_by_group.into_iter().collect();
+    evict_only.sort_by(|a, b| a.0.cmp(&b.0));
+    for (file_id, evicted) in evict_only {
+        let (partition, slice) = slice_by_file_id.get(&file_id).cloned().ok_or_else(|| {
+            CoreError::Write(format!(
+                "missing latest file slice for file group '{file_id}'"
+            ))
+        })?;
+        let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
+        plans.push(MergePlan {
+            partition,
+            file_id: file_id.clone(),
+            out_name,
+            prev_commit: slice.creation_instant_time().to_string(),
+            slice,
+            op: GroupOp::DeleteKeys {
+                exact: std::sync::Arc::new(HashSet::new()),
+                keys_only: std::sync::Arc::new(evicted),
             },
         });
     }
@@ -418,6 +468,7 @@ pub async fn update_filter(
             "update requires a single-row RecordBatch of SET values".to_string(),
         ));
     }
+    ensure_set_columns_updatable(table, &updates)?;
     if table.is_mor() {
         return mor_update_filter(table, filter, updates).await;
     }
@@ -590,6 +641,7 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
             "overwrite requires at least one RecordBatch".to_string(),
         ));
     }
+    validate_write_input(table, batches, "overwrite").await?;
     // Only the listing is needed to enumerate replaced groups — never the data.
     let (file_ids, old_paths) = replaced_groups_from_listing(table, None).await?;
     let instant =
@@ -598,11 +650,6 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
     let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let batches = prepare_batches_for_write(&table.hudi_configs, batches, &instant, &file_name)?;
     let replacement = concat(&batches)?;
-    if replacement.num_rows() == 0 {
-        return Err(CoreError::Write(
-            "overwrite requires at least one row".to_string(),
-        ));
-    }
     rewrite(
         table,
         &instant,
@@ -643,14 +690,10 @@ pub async fn dynamic_partition_overwrite_batches(
                 .to_string(),
         ));
     }
+    validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
     let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
     let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let replacement = concat(&prepared)?;
-    if replacement.num_rows() == 0 {
-        return Err(CoreError::Write(
-            "dynamic_partition_overwrite requires at least one row".to_string(),
-        ));
-    }
     let partition_paths = hoodie_keys_for_batch(&table.hudi_configs, &replacement, Some(&instant))?
         .into_iter()
         .map(|key| key.partition_path)
@@ -687,6 +730,86 @@ pub async fn dynamic_partition_overwrite_batches(
         RewriteKind::Replace,
     )
     .await
+}
+
+/// Writes support table versions 8 (1.0.x) and 9 (1.1.x/1.2) only. tv6 has
+/// divergent log naming, rollback markers, and archival; refuse rather than
+/// write a layout 0.x readers half-understand.
+pub(crate) fn ensure_writable_table_version(table: &Table) -> Result<()> {
+    let version: isize = table
+        .hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::TableVersion)
+        .into();
+    if !(8..=9).contains(&version) {
+        return Err(CoreError::Unsupported(format!(
+            "writing to table version {version} is not supported; supported versions are 8 and 9"
+        )));
+    }
+    Ok(())
+}
+
+/// Pre-fence input validation shared by write verbs: batches must agree with
+/// each other and (when the table already has data) with the table schema, and
+/// must contain at least one row — all checked BEFORE an instant is fenced so
+/// invalid input leaves no timeline trace. Returns the row count.
+/// SET may not target record-key or partition columns: changing a row's
+/// identity would strand its index entry and diverge the partition value from
+/// the path it physically lives in.
+fn ensure_set_columns_updatable(table: &Table, updates: &RecordBatch) -> Result<()> {
+    let mut identity: Vec<String> = Vec::new();
+    if let Some(fields) = table
+        .hudi_configs
+        .try_get(RecordKeyFields)?
+        .map(|v| -> Vec<String> { v.into() })
+    {
+        identity.extend(fields);
+    }
+    let partition_fields: Vec<String> = table
+        .hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::PartitionFields)
+        .into();
+    identity.extend(partition_fields);
+    for field in updates.schema().fields() {
+        if identity.iter().any(|name| name == field.name()) {
+            return Err(CoreError::Write(format!(
+                "update cannot SET record-key or partition column '{}'",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_write_input(table: &Table, batches: &[RecordBatch], verb: &str) -> Result<usize> {
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if rows == 0 {
+        return Err(CoreError::Write(format!(
+            "{verb} requires at least one row"
+        )));
+    }
+    let first = batches[0].schema();
+    for batch in &batches[1..] {
+        if crate::write::align_batch_to_schema(batch, &first).is_none() {
+            return Err(CoreError::Schema(format!(
+                "all {verb} batches must share one schema"
+            )));
+        }
+    }
+    if table
+        .timeline
+        .get_latest_commit_timestamp_as_option()
+        .is_some()
+    {
+        let table_schema = std::sync::Arc::new(table.get_schema().await?);
+        for batch in batches {
+            if crate::write::align_batch_to_schema(batch, &table_schema).is_none() {
+                return Err(CoreError::Schema(format!(
+                    "{verb} batch schema does not match the current table schema"
+                )));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn ensure_rewrite_supported(table: &Table) -> Result<()> {
@@ -830,19 +953,20 @@ async fn mor_upsert_batches(
         "schema-check",
         "schema-check",
     )?;
-    let existing_batches = table.read(&ReadOptions::new()).await?;
-    if !existing_batches.is_empty() {
-        let existing = concat(&existing_batches)?;
-        if crate::write::align_batch_to_schema(&schema_check_batches[0], &existing.schema())
-            .is_none()
-        {
+    if table
+        .timeline
+        .get_latest_commit_timestamp_as_option()
+        .is_some()
+    {
+        let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
+        if crate::write::align_batch_to_schema(&schema_check_batches[0], &table_schema).is_none() {
             return Err(CoreError::Schema(
                 "upsert batch schema does not match the current table schema".to_string(),
             ));
         }
     }
     let key_name = record_key_name(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &key_name)?;
+    let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
     let instant = request_deltacommit(table, "UPSERT").await?;
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
     let incoming_keys = keys(&incoming, &key_name)?;
@@ -851,23 +975,44 @@ async fn mor_upsert_batches(
     let mut insert_indices_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
     let mut updates = 0;
     let mut inserts = 0;
+    // Update-partition-path (global index): a key whose incoming partition
+    // differs from its located one moves — tombstoned in the old group via a
+    // delete log block, inserted into its new partition.
+    let mut moved_tombstones: HashMap<(String, String), Vec<HoodieKey>> = HashMap::new();
     for (index, key) in incoming_keys.iter().enumerate() {
-        if let Some(location) = locations.get(key) {
-            update_indices
-                .entry((location.partition_path.clone(), location.file_id.clone()))
-                .or_default()
-                .push(index as u32);
-            updates += 1;
-        } else {
-            let partition = tagged_keys
-                .get(index)
-                .map(|k| k.partition_path.clone())
-                .unwrap_or_default();
-            insert_indices_by_partition
-                .entry(partition)
-                .or_default()
-                .push(index as u32);
-            inserts += 1;
+        let incoming_partition = tagged_keys
+            .get(index)
+            .map(|k| k.partition_path.clone())
+            .unwrap_or_default();
+        match locations.get(key) {
+            Some(location) if location.partition_path == incoming_partition => {
+                update_indices
+                    .entry((location.partition_path.clone(), location.file_id.clone()))
+                    .or_default()
+                    .push(index as u32);
+                updates += 1;
+            }
+            Some(location) => {
+                moved_tombstones
+                    .entry((location.partition_path.clone(), location.file_id.clone()))
+                    .or_default()
+                    .push(HoodieKey {
+                        record_key: key.clone(),
+                        partition_path: location.partition_path.clone(),
+                    });
+                insert_indices_by_partition
+                    .entry(incoming_partition)
+                    .or_default()
+                    .push(index as u32);
+                updates += 1;
+            }
+            None => {
+                insert_indices_by_partition
+                    .entry(incoming_partition)
+                    .or_default()
+                    .push(index as u32);
+                inserts += 1;
+            }
         }
     }
 
@@ -951,8 +1096,22 @@ async fn mor_upsert_batches(
             file_name,
         ));
     }
-    for (partition_path, file_id) in log_tasks.keys() {
+    // Moved-key tombstones write their own delete log (version 1); a group
+    // also receiving data this commit rolls its data log to version 2.
+    for (partition_path, file_id) in moved_tombstones.keys() {
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        planned_markers.push(crate::write::markers::Marker::create(
+            partition_path,
+            &log_name,
+        ));
+    }
+    for (partition_path, file_id) in log_tasks.keys() {
+        let version = if moved_tombstones.contains_key(&(partition_path.clone(), file_id.clone())) {
+            2
+        } else {
+            1
+        };
+        let log_name = format!(".{file_id}_{instant}.log.{version}_0-0-0");
         planned_markers.push(crate::write::markers::Marker::create(
             partition_path,
             &log_name,
@@ -965,6 +1124,36 @@ async fn mor_upsert_batches(
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
     let mut stats_updates = Vec::new();
+    // Delete log blocks for keys that moved partitions.
+    for ((partition_path, file_id), moved) in &moved_tombstones {
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let log_file = relative_data_path(partition_path, &log_name);
+        crate::write::ensure_partition_metadata(storage.as_ref(), partition_path, &instant).await?;
+        let pairs: Vec<(String, String)> = moved
+            .iter()
+            .map(|key| (key.record_key.clone(), key.partition_path.clone()))
+            .collect();
+        let content = crate::write::build_delete_log_block(&instant, &pairs, 0)?;
+        let size = content.len() as i64;
+        storage.put_file(&log_file, content).await?;
+        written_paths.push(log_file.clone());
+        files_mdt.push((partition_path.clone(), log_name.clone(), size, false));
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id.clone()),
+            path: Some(log_file),
+            base_file: Some(String::new()),
+            log_files: Some(vec![log_name]),
+            num_writes: Some(moved.len() as i64),
+            num_deletes: Some(moved.len() as i64),
+            total_write_bytes: Some(size),
+            file_size_in_bytes: Some(size),
+            total_log_records: Some(moved.len() as i64),
+            total_log_files: Some(1),
+            total_log_blocks: Some(1),
+            partition_path: Some(partition_path.clone()),
+            ..Default::default()
+        });
+    }
     let props = crate::write::append::parquet_writer_props(table);
     let collect_ranges = is_column_stats_enabled(table);
     let parallelism = crate::write::write_task_parallelism(table);
@@ -1074,7 +1263,12 @@ async fn mor_upsert_batches(
                     "missing latest file slice for file group '{file_id}' in '{partition_path}'"
                 ))
             })?;
-        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let version = if moved_tombstones.contains_key(&(partition_path.clone(), file_id.clone())) {
+            2
+        } else {
+            1
+        };
+        let log_name = format!(".{file_id}_{instant}.log.{version}_0-0-0");
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
@@ -1286,7 +1480,9 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     let mut grouped: HashMap<(String, String), Vec<HoodieKey>> = HashMap::new();
     let mut seen = std::collections::HashSet::new();
     for key in delete_keys {
-        if seen.insert(&key.record_key)
+        // Dedupe by (key, requested partition): the same key may legitimately
+        // be requested in two partitions.
+        if seen.insert((&key.record_key, &key.partition_path))
             && let Some(location) = locations.get(&key.record_key)
         {
             grouped
@@ -1732,6 +1928,7 @@ fn apply_set_updates(
             "update requires a single-row RecordBatch of SET values".to_string(),
         ));
     }
+
     let meta: HashSet<&str> = MetaField::field_names_with_operation()
         .into_iter()
         .collect();
@@ -1805,12 +2002,53 @@ fn keys(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
 }
 
 /// Keep the final occurrence of each key, in original relative order.
-fn deduplicate_last_by_key(batch: &RecordBatch, field: &str) -> Result<RecordBatch> {
-    let mut last_indices = HashMap::with_capacity(batch.num_rows());
-    for (index, key) in keys(batch, field)?.into_iter().enumerate() {
-        last_indices.insert(key, index as u32);
+/// Deduplicate a write batch by record key.
+///
+/// With an ordering (precombine) field configured, the row with the highest
+/// ordering value wins (ties: later occurrence), matching Java precombine.
+/// Without one, the LAST occurrence wins — the pick among duplicates is
+/// arbitrary by design when no ordering field is configured.
+fn deduplicate_last_by_key(
+    batch: &RecordBatch,
+    field: &str,
+    hudi_configs: &crate::config::HudiConfigs,
+) -> Result<RecordBatch> {
+    let ordering_fields: Vec<String> = hudi_configs
+        .try_get(OrderingFields)?
+        .map(Into::into)
+        .unwrap_or_default();
+    let ordering = ordering_fields
+        .first()
+        .and_then(|name| batch.column_by_name(name))
+        .cloned();
+    let mut winners: HashMap<String, u32> = HashMap::with_capacity(batch.num_rows());
+    let keys = keys(batch, field)?;
+    for (index, key) in keys.iter().enumerate() {
+        let index = index as u32;
+        match winners.get(key) {
+            None => {
+                winners.insert(key.clone(), index);
+            }
+            Some(&existing) => {
+                let keep_new = match &ordering {
+                    Some(column) => {
+                        // Row-wise compare via arrow ordering on the single column.
+                        let cmp = arrow_ord::ord::make_comparator(
+                            column.as_ref(),
+                            column.as_ref(),
+                            arrow_schema::SortOptions::default(),
+                        )?;
+                        cmp(index as usize, existing as usize) != std::cmp::Ordering::Less
+                    }
+                    None => true,
+                };
+                if keep_new {
+                    winners.insert(key.clone(), index);
+                }
+            }
+        }
     }
-    let mut indices = last_indices.into_values().collect::<Vec<_>>();
+    let mut indices = winners.into_values().collect::<Vec<_>>();
     indices.sort_unstable();
     take_batch(batch, &indices)
 }
@@ -2058,7 +2296,13 @@ async fn rewrite(
             std::slice::from_ref(&partition_batch),
             instant,
             &group.out_name,
-        )?;
+        )?
+        .iter()
+        // The batch may carry meta fields stamped with a placeholder name
+        // from an earlier prepare; the file name is only real here, at the
+        // point the output file is actually being produced.
+        .map(|batch| restamp_file_name(batch, &group.out_name))
+        .collect::<Result<Vec<_>>>()?;
         let path = relative_data_path(&group.partition, &group.out_name);
         group_prepared.push((index, prepared, path));
     }
@@ -2353,9 +2597,12 @@ struct MergeCtx {
 enum GroupOp {
     /// Merge `incoming` (meta-stamped) rows into the group; `partial_columns`
     /// limits which data columns matched rows take from the input.
+    /// `evict_keys` are rows leaving this group for another partition
+    /// (update-partition-path semantics): removed here, inserted there.
     Upsert {
         incoming: RecordBatch,
         partial_columns: Option<Vec<String>>,
+        evict_keys: std::sync::Arc<HashSet<String>>,
     },
     /// Remove rows by record key ((key, partition) exact or key-only).
     DeleteKeys {
@@ -2450,6 +2697,7 @@ fn merge_file_group_task(
             GroupOp::Upsert {
                 incoming,
                 partial_columns,
+                evict_keys,
             } => {
                 let incoming = if old.num_rows() > 0 {
                     crate::write::align_batch_to_schema(&incoming, &old.schema()).ok_or_else(
@@ -2462,6 +2710,20 @@ fn merge_file_group_task(
                     )?
                 } else {
                     incoming
+                };
+                // Rows whose key moved to another partition leave this group.
+                let old = if evict_keys.is_empty() {
+                    old
+                } else {
+                    let old_keys = keys(&old, key_field)?;
+                    let survivors: Vec<u32> = old_keys
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, key)| {
+                            (!evict_keys.contains(key)).then_some(index as u32)
+                        })
+                        .collect();
+                    take_batch(&old, &survivors)?
                 };
                 let old_keys = keys(&old, key_field)?;
                 let mut old_by_key = HashMap::with_capacity(old.num_rows());
@@ -2490,7 +2752,17 @@ fn merge_file_group_task(
                     selected
                 };
                 let merged = if let Some(columns) = partial_columns {
-                    partial_merge(&combined, &old_by_key, &selected, &columns)?
+                    let merged = partial_merge(&combined, &old_by_key, &selected, &columns)?;
+                    // Partially-updated rows must carry the updating commit's
+                    // time/seqno, or incremental readers skip the change.
+                    let incoming_set: std::collections::HashSet<&String> =
+                        incoming_keys.iter().collect();
+                    let merged_keys = keys(&merged, key_field)?;
+                    let mask: BooleanArray = merged_keys
+                        .iter()
+                        .map(|key| Some(incoming_set.contains(key)))
+                        .collect();
+                    restamp_matched_rows(&merged, &mask, &ctx.instant)?
                 } else {
                     take_batch(&combined, &selected)?
                 };
@@ -2697,7 +2969,6 @@ async fn commit_merge_plans(
     }
 
     // All file work on one bounded pool: merge workers + new-group encoders.
-    let merge_tasks: Vec<_> = plans.iter().map(|_| ()).collect();
     let mut tasks: Vec<futures::future::BoxFuture<'static, Result<MergeOutput>>> = Vec::new();
     let mut plan_meta = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -2710,7 +2981,6 @@ async fn commit_merge_plans(
         ));
         tasks.push(merge_file_group_task(ctx.clone(), plan));
     }
-    drop(merge_tasks);
     for group in &new_groups {
         let path = relative_data_path(&group.partition, &group.out_name);
         let storage = storage.clone();

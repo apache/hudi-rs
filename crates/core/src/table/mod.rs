@@ -210,6 +210,7 @@ impl Table {
 
     /// Reload the active timeline and drop listing caches before a write plans.
     pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
+        crate::write::ensure_writable_table_version(self)?;
         // Instants must be minted in the table's declared timeline timezone
         // (Spark writers default to LOCAL); set before any instant is minted.
         crate::write::set_commit_timezone(&self.timezone());
@@ -371,7 +372,6 @@ impl Table {
 
     /// Upsert complete records by their configured record key.
     ///
-    /// Only unpartitioned tables are supported. When the same key occurs more
     /// than once in an input batch, the final occurrence is retained.
     pub async fn upsert(
         &mut self,

@@ -1626,23 +1626,6 @@ async fn test_create_builder_rejects_invalid_combinations() {
         err.to_string()
             .contains("requires timeline layout version 2")
     );
-
-    let dir = tempdir().unwrap();
-    let err = Table::create(dir.path().to_str().unwrap())
-        .with_table_name("t")
-        .with_record_key_fields(["id"])
-        .with_metadata(false)
-        .with_record_index(false)
-        .with_column_stats(false)
-        .with_table_version(6)
-        .with_timeline_layout_version(2)
-        .create()
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("requires timeline layout version 1")
-    );
 }
 
 /// MOR-unsupported combinations must return clear errors.
@@ -1708,4 +1691,65 @@ async fn test_mor_unsupported_verbs_error_clearly() {
         commits_after, commits_final,
         "failed validation must not fence an instant"
     );
+}
+
+/// Update-partition-path: upserting a key with a changed partition value must
+/// MOVE the row — visible in the new partition, gone from the old, with
+/// partition column and path in agreement. (Regression: the row used to stay
+/// physically in the old partition with new-partition values, unreachable
+/// from either partition filter.)
+#[tokio::test]
+async fn test_upsert_partition_change_moves_row() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([partitioned_batch(vec![("a", "sf", 1), ("b", "sf", 2)])])
+            .await
+            .unwrap();
+        let result = table
+            .upsert([partitioned_batch(vec![("a", "nyc", 10)])])
+            .await
+            .unwrap();
+        assert_eq!(result.num_updates, 1, "{table_type:?}");
+
+        // Whole-table read: exactly one copy of `a`, with the new value.
+        let rows = rows_by_id(&table.read(&ReadOptions::new()).await.unwrap());
+        assert_eq!(
+            rows,
+            vec![("a".to_string(), 10), ("b".to_string(), 2)],
+            "{table_type:?}"
+        );
+
+        // Partition-filtered reads: `a` only in nyc, `b` only in sf.
+        let nyc = rows_by_id(
+            &table
+                .read(
+                    &ReadOptions::new()
+                        .with_filters([("city", "=", "nyc")])
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(nyc, vec![("a".to_string(), 10)], "{table_type:?}");
+        let sf = rows_by_id(
+            &table
+                .read(
+                    &ReadOptions::new()
+                        .with_filters([("city", "=", "sf")])
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(sf, vec![("b".to_string(), 2)], "{table_type:?}");
+    }
 }

@@ -33,6 +33,7 @@ pub(crate) use append::set_commit_timezone;
 pub use append::{AppendResult, append_batches, append_batches_only};
 pub use create::TableCreateBuilder;
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
+pub(crate) use rewrite::ensure_writable_table_version;
 pub use rewrite::{
     UpsertOptions, WriteResult, delete_filter, delete_keys, dynamic_partition_overwrite_batches,
     overwrite_batches, update_filter, upsert_batches,

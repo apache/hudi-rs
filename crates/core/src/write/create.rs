@@ -133,9 +133,8 @@ impl TableCreateBuilder {
 
     /// Enable/disable the internal metadata table (`files`, and optionally indexes).
     ///
-    /// Defaults to enabled. Disabling also turns off record/column/partition stats
-    /// indexes and falls back to table version 6 / timeline layout 1 unless the
-    /// caller overrides versions later.
+    /// Defaults to enabled. Disabling also turns off record/column/partition
+    /// stats indexes; the table version is unchanged (v8+ works without MDT).
     pub fn with_metadata(mut self, enabled: bool) -> Self {
         self.metadata_enabled = enabled;
         if enabled {
@@ -148,8 +147,6 @@ impl TableCreateBuilder {
             self.record_index_enabled = false;
             self.column_stats_enabled = false;
             self.partition_stats_enabled = false;
-            self.table_version = 6;
-            self.timeline_layout_version = 1;
         }
         self
     }
@@ -208,6 +205,13 @@ impl TableCreateBuilder {
         let table_name = self.table_name.ok_or_else(|| {
             CoreError::Write("Table name is required to create a Hudi table".to_string())
         })?;
+        // Property files are line-oriented; control characters in the name
+        // would corrupt hoodie.properties.
+        if table_name.is_empty() || table_name.chars().any(|c| c.is_control() || c == '=') {
+            return Err(CoreError::Write(format!(
+                "invalid table name '{table_name}': must be non-empty without control characters or '='"
+            )));
+        }
 
         if self.record_index_enabled && !self.metadata_enabled {
             return Err(CoreError::Write(
@@ -232,6 +236,12 @@ impl TableCreateBuilder {
         let partition_stats_enabled =
             self.partition_stats_enabled && !self.partition_fields.is_empty();
 
+        if self.table_version < 8 {
+            return Err(CoreError::Unsupported(format!(
+                "creating table version {} is not supported; supported versions are 8 and 9",
+                self.table_version
+            )));
+        }
         if self.table_version >= 8 && self.timeline_layout_version != 2 {
             return Err(CoreError::Write(format!(
                 "Table version {} requires timeline layout version 2",
@@ -476,7 +486,7 @@ impl TableCreateBuilder {
             props[HudiTableConfig::Checksum.as_ref()]
         ));
         storage
-            .put_file(&properties_path, body.into_bytes())
+            .put_file_if_absent(&properties_path, body.into_bytes())
             .await?;
 
         if self.timeline_layout_version == 2 {
