@@ -48,7 +48,7 @@ use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
 use crate::storage::{RowFilterBuilder, Storage};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -418,17 +418,13 @@ impl HoodieFileGroupReader {
     /// Read the file group and return the merged output as a single
     /// `RecordBatch`.
     ///
-    /// Same merge as [`Self::open_stream`], but the base file is collapsed to
-    /// one batch first, so the merge emits a single chunk and the rows come back
-    /// in the order this entry point has always returned them. See
-    /// [`Self::collapse_base`].
+    /// Same merge as [`Self::open_stream`], collected into one batch. Both
+    /// entry points merge the base a row group at a time and therefore return
+    /// the same row sequence; this one just concatenates the chunks.
     pub async fn read(&mut self) -> Result<RecordBatch> {
         // Stage timing (perf harness): the base file open plus, here, its whole
         // decode — `collapse_base` drives the stream to completion.
-        let base = profile_once!(
-            self.read_stats.base_read_ms,
-            Self::collapse_base(self.base_file_source().await?).await
-        )?;
+        let base = profile_once!(self.read_stats.base_read_ms, self.base_file_source().await)?;
         let batch = self
             .init_record_iterators(base)
             .await?
@@ -851,35 +847,6 @@ impl HoodieFileGroupReader {
             schema: base_read_schema,
             batches: evolved.boxed(),
         })
-    }
-
-    /// Collapse a base source into a single batch.
-    ///
-    /// [`Self::read`] returns the file group as one `RecordBatch`, and merging
-    /// the base one row group at a time would interleave kept base rows with
-    /// log-side replacements per group instead of emitting all of the former
-    /// then all of the latter. The rows are the same either way and Hudi
-    /// promises no order, but the two are not the same sequence, so the
-    /// single-batch API keeps the shape it has always returned.
-    async fn collapse_base(base: BaseSource) -> Result<BaseSource> {
-        let BaseSource { schema, batches } = base;
-        let collected: Vec<RecordBatch> = batches.try_collect().await?;
-        let batches = match collected.len() {
-            0 => futures::stream::empty().boxed(),
-            1 => {
-                let only = collected.into_iter().next().expect("length checked");
-                futures::stream::once(async move { Ok(only) }).boxed()
-            }
-            _ => {
-                let one = arrow::compute::concat_batches(&schema, &collected).map_err(|e| {
-                    CoreError::ReadFileSliceError(format!(
-                        "Failed to concatenate the base file's row groups: {e}"
-                    ))
-                })?;
-                futures::stream::once(async move { Ok(one) }).boxed()
-            }
-        };
-        Ok(BaseSource { schema, batches })
     }
 
     /// Whether this slice's base file is inside the read's instant range.
@@ -1401,28 +1368,15 @@ mod tests {
             assert!(out.column(3).is_null(0), "added column null-filled");
         };
 
-        // One base source shape now. Compare it against its collapsed form -
-        // the shape `read()` merges - so the row-group path and the
-        // single-batch path are still pinned to each other.
+        // The evolution is applied per row group, so draining the source and
+        // concatenating must give the same rows as reading it whole would - the
+        // property `read()` relies on now that it collects the merged chunks
+        // rather than collapsing the base first.
         let dir = tmp.path().to_path_buf();
         let mut reader =
             test_file_group_reader_for_base_file(&dir, base_name, required.clone()).await;
         let streamed = drain_base_source(reader.base_file_source().await.unwrap()).await;
         assert_evolved(&streamed);
-
-        let mut reader2 =
-            test_file_group_reader_for_base_file(&dir, base_name, required.clone()).await;
-        let collapsed = drain_base_source(
-            HoodieFileGroupReader::collapse_base(reader2.base_file_source().await.unwrap())
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_evolved(&collapsed);
-        assert_eq!(
-            streamed, collapsed,
-            "collapsing the base to one batch must not change what it decodes to"
-        );
     }
 
     /// A base source feeding a position-based merge carries the row-position
