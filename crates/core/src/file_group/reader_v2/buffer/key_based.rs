@@ -3923,6 +3923,104 @@ mod tests {
         (recs, spilled)
     }
 
+    /// How long one `merge_base_batch` call blocks when the merge map has
+    /// spilled, which is the number that decides whether the merge needs
+    /// `spawn_blocking`.
+    ///
+    /// The probe is not per row: a spilled key is reconstructed from a whole
+    /// spilled Arrow batch (`SPILL_BATCH_ROWS` records), the RocksDB read is one
+    /// `get` per such batch, and the last `SPILL_BATCH_CACHE` of them are cached
+    /// decoded. So the cost per merged base batch is set by how many *distinct*
+    /// spill batches its keys touch, and whether they fit the cache.
+    ///
+    /// Two orders are measured because they differ by exactly that: base keys
+    /// ascending touch spill batches one at a time (cache-friendly), while base
+    /// keys strided across the whole key space touch a new spill batch almost
+    /// every row and evict continuously. The strided figure is the one a
+    /// `spawn_blocking` decision has to be made against.
+    ///
+    /// Ignored: a measurement, not an assertion. Run with
+    /// `cargo test -p hudi-core --release --lib spilled_merge_blocking_duration -- --ignored --nocapture`.
+    #[cfg(feature = "spill-rocksdb")]
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn spilled_merge_blocking_duration() {
+        use std::time::Instant;
+
+        // Enough distinct keys to span far more spill batches than the decoded
+        // cache holds, so a scattered probe order really does evict.
+        const KEYS: usize = 50_000;
+        // 1024 is what a real chunk holds: `base_read_options` never sets a
+        // parquet batch size, so arrow-rs's default applies. 8192 is an upper
+        // bound for what a caller that raised it would see.
+        const CHUNK_SIZES: [usize; 2] = [1_024, 8_192];
+
+        let build = |budget: &[(&str, &str)]| {
+            let mut buffer =
+                build_key_based_buffer_with_reader_config("COMMIT_TIME_ORDERING", budget);
+            let rows: Vec<(String, i32, i64)> = (0..KEYS)
+                .map(|i| (format!("k{i:06}"), i as i32, 1))
+                .collect();
+            // In chunks, so the map spills progressively as a real scan does.
+            for chunk in rows.chunks(4096) {
+                let refs: Vec<(&str, i32, i64)> =
+                    chunk.iter().map(|(k, c, t)| (k.as_str(), *c, *t)).collect();
+                buffer
+                    .process_data_block(&mut make_data_block(create_test_batch(&refs), "i0"))
+                    .unwrap();
+            }
+            buffer
+        };
+
+        let schema = create_test_schema();
+
+        // The control matters as much as the measurement: the merge kernel is
+        // synchronous CPU work whether or not the map spilled, so without the
+        // no-spill baseline there is no way to tell how much of the blocking the
+        // spill is actually responsible for.
+        let spill_budget: &[(&str, &str)] = &[("hoodie.memory.merge.max.size", "1024")];
+        let no_budget: &[(&str, &str)] = &[];
+        for rows in CHUNK_SIZES {
+            // Ascending: consecutive keys, so one spilled batch is exhausted
+            // before the next is touched.
+            let ascending: Vec<String> = (0..rows).map(|i| format!("k{i:06}")).collect();
+            // Spread across the whole key space, so consecutive base rows land in
+            // different spilled batches and evict each other from the decoded
+            // cache.
+            let scattered: Vec<String> = (0..rows)
+                .map(|i| format!("k{:06}", (i * 7919) % KEYS))
+                .collect();
+
+            for (tier, budget) in [("no-spill", no_budget), ("spilled", spill_budget)] {
+                for (order, keys) in [("ascending", &ascending), ("scattered", &scattered)] {
+                    let mut buffer = build(budget);
+                    let spilled = buffer.base.records.spill_fired();
+                    assert_eq!(
+                        spilled,
+                        tier == "spilled",
+                        "the {tier} leg must{} spill",
+                        if tier == "spilled" { "" } else { " not" }
+                    );
+                    let refs: Vec<(&str, i32, i64)> =
+                        keys.iter().map(|k| (k.as_str(), 0i32, 0i64)).collect();
+                    let base = create_test_batch(&refs);
+
+                    let start = Instant::now();
+                    let merged = buffer.merge_base_batch(&base, &schema).unwrap();
+                    let elapsed = start.elapsed();
+
+                    let rows_out = merged.map(|b| b.num_rows()).unwrap_or(0);
+                    println!(
+                        "[spill-blocking] {rows:5} rows | {tier:8} | {order:9} -> {:>12?} \
+                         ({rows_out} out, {:.2} us/row)",
+                        elapsed,
+                        elapsed.as_secs_f64() * 1e6 / rows as f64,
+                    );
+                }
+            }
+        }
+    }
+
     /// A churn workload under a `merge.max.size` low enough
     /// to force spilling produces output BYTE-IDENTICAL to the no-spill baseline,
     /// AND the spill actually fires. This is the unit-level equivalent of the

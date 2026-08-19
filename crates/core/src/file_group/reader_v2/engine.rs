@@ -137,6 +137,22 @@ pub struct HoodieFileGroupReader {
     // `base_file_source` below.
 }
 
+/// Rows per base batch handed to the merge, and therefore per merged chunk.
+///
+/// Load-bearing rather than cosmetic: merging a chunk is synchronous work on the
+/// task that polls the stream, and its cost is linear in the chunk's rows. On
+/// this machine, one merge of a 1024-row chunk against a 50k-key log map takes
+/// 0.4-1.1 ms, and 5.7-6.1 ms once the merge map has spilled to disk; at 8192
+/// rows those become 2.8 ms and ~40 ms. So the chunk size is what bounds how long
+/// a single poll occupies its executor, and it is set here rather than inherited.
+///
+/// 1024 is what `parquet` already defaults to, so this pins today's behaviour
+/// instead of changing it. Pinned because the bound is silent if it moves: a
+/// larger default upstream would multiply the blocking above with nothing
+/// failing. Measured by `spilled_merge_blocking_duration` (ignored; run with
+/// `--release --ignored --nocapture`).
+const MERGE_CHUNK_ROWS: usize = 1024;
+
 /// Base-file read options carrying an optional pushdown predicate, and the
 /// row-position column when the merge is by position.
 ///
@@ -150,6 +166,7 @@ fn base_read_options(
     use_record_position: bool,
 ) -> BaseFileReadOptions {
     let mut options = BaseFileReadOptions::new();
+    options = options.with_batch_size(MERGE_CHUNK_ROWS);
     if let Some(row_filter) = row_filter {
         options = options.with_row_filter(row_filter);
     }
@@ -1832,6 +1849,68 @@ mod tests {
         assert!(
             reader.reader_context.can_push_row_filter(),
             "CoW path always pushes regardless of mor_pk_safe"
+        );
+    }
+
+    /// A merged chunk is bounded, and the bound is the reader's, not the base
+    /// file's layout.
+    ///
+    /// Merging a chunk is synchronous work on the task that polls the stream and
+    /// its cost is linear in the chunk's rows, so an unbounded chunk is an
+    /// unbounded poll. The fixture puts 5000 rows in a single row group: if the
+    /// chunk followed the file's layout, one chunk would carry all 5000 and one
+    /// poll would do five times the work `MERGE_CHUNK_ROWS` allows for.
+    ///
+    /// The direct assertion on the option is deliberate. The bound currently
+    /// agrees with what `parquet` defaults to, so no output-level test can tell
+    /// the pin from the default — but a caller that passed a larger batch size
+    /// through here (making `hoodie.read.stream.batch_size` effective on the
+    /// merge path, say) would multiply every poll's cost, and this is what says
+    /// so out loud.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_merged_chunk_is_bounded_by_the_readers_own_batch_size() {
+        assert_eq!(
+            base_read_options(None, false).batch_size,
+            Some(MERGE_CHUNK_ROWS),
+            "the base read must ask for the merge's chunk bound rather than inherit one"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            true,
+        )]));
+        let rows = 5_000;
+        let ids: Vec<i32> = (0..rows).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from(ids.clone()))],
+        )
+        .unwrap();
+        let base_name = "one-big-group.parquet";
+        // One row group holding every row, so the file's layout cannot be what
+        // bounds the chunk.
+        write_parquet_file_in_row_groups(tmp.path(), base_name, &batch, rows as usize);
+
+        let mut reader =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+        let mut stream = reader.open_stream().await.unwrap();
+        let mut sizes: Vec<usize> = Vec::new();
+        let mut total = 0usize;
+        while let Some(b) = stream.next().await {
+            let b = b.unwrap();
+            sizes.push(b.num_rows());
+            total += b.num_rows();
+        }
+        assert_eq!(total, rows as usize, "every row must still come back");
+        assert!(
+            sizes.iter().all(|n| *n <= MERGE_CHUNK_ROWS),
+            "every chunk must respect the bound, got {sizes:?}"
+        );
+        assert!(
+            sizes.len() > 1,
+            "5000 rows cannot arrive in one chunk under a {MERGE_CHUNK_ROWS}-row bound"
         );
     }
 

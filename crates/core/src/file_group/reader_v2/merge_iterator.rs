@@ -353,10 +353,26 @@ impl FileGroupMergeStream {
 
     /// Produce the next merged chunk, or `None` once the merge is complete.
     ///
-    /// The only await is the base-file pull. Everything else — the merge
-    /// kernel, the drain, the output projection — is synchronous work on data
-    /// already in memory, so nothing here holds a lock or a borrow across the
-    /// await beyond the source itself.
+    /// The only await is the base-file pull. Everything else — the merge kernel,
+    /// the drain, the output projection — is synchronous work on data already in
+    /// memory, so nothing here holds a lock or a borrow across the await beyond
+    /// the source itself.
+    ///
+    /// That synchronous work is deliberately *not* moved to a blocking pool,
+    /// which is the question a reader of this arrives with. It was measured
+    /// rather than assumed: merging one chunk takes 0.4-1.1 ms, and 5.7-6.1 ms
+    /// once the merge map has spilled, so the spill is a ~6x amplifier on work
+    /// that is already synchronous and of the same kind. Handing each chunk to
+    /// `spawn_blocking` would reintroduce the sync/async crossing this type
+    /// exists to remove, and cost a task hop per chunk, to shave a
+    /// single-digit-millisecond poll — which is what a scan or join operator
+    /// costs anyway. What keeps that true is the chunk bound, not this comment:
+    /// see `MERGE_CHUNK_ROWS`, since the cost is linear in a chunk's rows.
+    ///
+    /// The one thing the measurement does not cover: it reads a spill file that
+    /// was just written, so the page cache is warm and the disk component is
+    /// understated. A cold spill file would be slower, though still bounded by
+    /// the same chunk size.
     ///
     /// Sticky: after an error, or after the merge completes, every later call
     /// returns `None`.
