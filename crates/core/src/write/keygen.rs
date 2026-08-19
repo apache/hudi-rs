@@ -42,6 +42,25 @@ use crate::index::HoodieKey;
 /// `hoodie.datasource.write.hive_style_partitioning` is true; otherwise value-only
 /// segments. Null partition values are rejected. Partition columns are not stripped
 /// from the batch — callers must leave them in the written Parquet.
+/// Placeholder instant for pre-fence validation passes: [`hoodie_keys_for_batch`]
+/// uses the instant only to FORMAT auto-generated keys, never to decide errors,
+/// so deriving keys with this dummy value surfaces every deterministic input
+/// error (missing/null/wrong-type key or partition columns) before an instant
+/// is requested.
+pub(crate) const VALIDATION_INSTANT: &str = "00000000000000000";
+
+/// Run key/partition derivation for its error side only — call before fencing
+/// an instant so invalid input leaves no timeline trace.
+pub(crate) fn validate_keygen_inputs(
+    hudi_configs: &HudiConfigs,
+    batches: &[RecordBatch],
+) -> Result<()> {
+    for batch in batches {
+        hoodie_keys_for_batch(hudi_configs, batch, Some(VALIDATION_INSTANT))?;
+    }
+    Ok(())
+}
+
 pub fn hoodie_keys_for_batch(
     hudi_configs: &HudiConfigs,
     batch: &RecordBatch,

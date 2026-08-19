@@ -462,6 +462,127 @@ async fn test_partial_upsert_preserves_unselected_columns() {
 }
 
 #[tokio::test]
+async fn test_partial_upsert_stale_event_time_keeps_lineage() {
+    // A partial update whose ordering value LOSES the event-time merge must
+    // not restamp the surviving old row: its commit lineage stays with the
+    // original commit, so incremental readers do not re-emit it.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 1, 100)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let commit_time = |batches: &Vec<RecordBatch>| {
+        batches[0]
+            .column_by_name("_hoodie_commit_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    };
+    let original_commit = commit_time(&batches);
+
+    table
+        .upsert_with(
+            [ordered_batch(vec![("a", 2, 50)])],
+            UpsertOptions {
+                update_columns: Some(vec!["value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 1, "stale partial update must not win");
+    assert_eq!(
+        commit_time(&batches),
+        original_commit,
+        "rejected row must keep its original commit lineage"
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_input_leaves_no_pending_instant() {
+    // Deterministic input errors must surface before an instant is fenced:
+    // the timeline is byte-identical before and after each failed call.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    let timeline_files = || {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Null partition value on a fresh table exercises the keygen validation
+    // pass in append (no table schema yet to catch it earlier).
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, true),
+    ]));
+    let null_partition = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("a")])),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        ],
+    )
+    .unwrap();
+    let before = timeline_files();
+    table.append([null_partition]).await.unwrap_err();
+    assert_eq!(
+        timeline_files(),
+        before,
+        "append must not fence on bad input"
+    );
+
+    table
+        .append([partitioned_batch(vec![("a", "sf", 1)])])
+        .await
+        .unwrap();
+
+    // Misspelled update column on COW upsert_with.
+    let before = timeline_files();
+    table
+        .upsert_with(
+            [partitioned_batch(vec![("a", "sf", 2)])],
+            UpsertOptions {
+                update_columns: Some(vec!["nope".to_string()]),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        timeline_files(),
+        before,
+        "upsert_with must not fence on unknown update column"
+    );
+}
+
+#[tokio::test]
 async fn test_upsert_uses_event_time_ordering() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();

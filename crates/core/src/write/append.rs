@@ -112,6 +112,8 @@ async fn append_batches_inner(
         ));
     }
 
+    crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
+
     let layout_two = is_layout_two(table);
     let action = if table.is_mor() {
         Action::DeltaCommit

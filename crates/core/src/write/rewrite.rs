@@ -151,6 +151,22 @@ pub async fn upsert_batches(
         ));
     }
     validate_write_input(table, batches, "upsert").await?;
+    if let Some(columns) = &options.update_columns {
+        let schema = batches[0].schema();
+        for column in columns {
+            if schema.field_with_name(column).is_err() {
+                return Err(CoreError::Schema(format!(
+                    "update column '{column}' is not in the write batch schema"
+                )));
+            }
+            if MetaField::field_names_with_operation().contains(&column.as_str()) {
+                return Err(CoreError::Write(format!(
+                    "update column '{column}' is a Hudi meta field"
+                )));
+            }
+        }
+    }
+    crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
@@ -206,20 +222,6 @@ pub async fn upsert_batches(
                 }
             }
             cursor += count;
-        }
-    }
-    if let Some(columns) = &options.update_columns {
-        for column in columns {
-            if incoming.column_by_name(column).is_none() {
-                return Err(CoreError::Schema(format!(
-                    "update column '{column}' is not in the write batch schema"
-                )));
-            }
-            if MetaField::field_names_with_operation().contains(&column.as_str()) {
-                return Err(CoreError::Write(format!(
-                    "update column '{column}' is a Hudi meta field"
-                )));
-            }
         }
     }
     // MergeHandle model: route each input row to its target file group, then
@@ -579,23 +581,28 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
 async fn replaced_groups_from_listing(
     table: &Table,
     partitions: Option<&HashSet<String>>,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>, Vec<(String, String)>)> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
     let mut file_ids = Vec::new();
     let mut old_paths = Vec::new();
+    // Log-only MOR slices have no base path but must still be excluded by
+    // the replace commit, or their records outlive the overwrite.
+    let mut log_only = Vec::new();
     for slice in slices {
         if let Some(partitions) = partitions
             && !partitions.contains(&slice.partition_path)
         {
             continue;
         }
-        let Some(path) = slice.base_file_relative_path()? else {
-            continue;
-        };
-        file_ids.push(slice.file_id().to_string());
-        old_paths.push(path);
+        match slice.base_file_relative_path()? {
+            Some(path) => {
+                file_ids.push(slice.file_id().to_string());
+                old_paths.push(path);
+            }
+            None => log_only.push((slice.partition_path.clone(), slice.file_id().to_string())),
+        }
     }
-    Ok((file_ids, old_paths))
+    Ok((file_ids, old_paths, log_only))
 }
 
 /// Build merge plans for the latest slices matching `include`, with `op`
@@ -643,7 +650,8 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
     }
     validate_write_input(table, batches, "overwrite").await?;
     // Only the listing is needed to enumerate replaced groups — never the data.
-    let (file_ids, old_paths) = replaced_groups_from_listing(table, None).await?;
+    crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
+    let (file_ids, old_paths, log_only) = replaced_groups_from_listing(table, None).await?;
     let instant =
         request_rewrite_instant(table, "INSERT_OVERWRITE_TABLE", RewriteKind::Replace).await?;
     let file_id = crate::write::new_file_id();
@@ -657,6 +665,7 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
         None,
         file_ids,
         old_paths,
+        log_only,
         "INSERT_OVERWRITE_TABLE",
         0,
         replacement.num_rows(),
@@ -691,20 +700,28 @@ pub async fn dynamic_partition_overwrite_batches(
         ));
     }
     validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
-    let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
-    let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
-    let replacement = concat(&prepared)?;
-    let partition_paths = hoodie_keys_for_batch(&table.hudi_configs, &replacement, Some(&instant))?
-        .into_iter()
-        .map(|key| key.partition_path)
-        .collect::<HashSet<_>>();
+    // Partition paths depend only on the input batches; derive and validate
+    // them before fencing so bad input leaves no timeline trace.
+    let raw = concat(batches)?;
+    let partition_paths = hoodie_keys_for_batch(
+        &table.hudi_configs,
+        &raw,
+        Some(crate::write::keygen::VALIDATION_INSTANT),
+    )?
+    .into_iter()
+    .map(|key| key.partition_path)
+    .collect::<HashSet<_>>();
     if partition_paths.is_empty() || partition_paths.iter().all(|path| path.is_empty()) {
         return Err(CoreError::Unsupported(
             "dynamic_partition_overwrite requires a partitioned table; use overwrite() for unpartitioned tables"
                 .to_string(),
         ));
     }
-    let (file_ids, old_paths) = replaced_groups_from_listing(table, Some(&partition_paths)).await?;
+    let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
+    let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
+    let replacement = concat(&prepared)?;
+    let (file_ids, old_paths, log_only) =
+        replaced_groups_from_listing(table, Some(&partition_paths)).await?;
     let replacement = if !file_ids.is_empty() {
         let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
         crate::write::align_batch_to_schema(&replacement, &table_schema).ok_or_else(|| {
@@ -722,6 +739,7 @@ pub async fn dynamic_partition_overwrite_batches(
         None,
         file_ids,
         old_paths,
+        log_only,
         "INSERT_OVERWRITE",
         0,
         replacement.num_rows(),
@@ -967,6 +985,10 @@ async fn mor_upsert_batches(
     }
     let key_name = record_key_name(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
+    crate::write::keygen::validate_keygen_inputs(
+        &table.hudi_configs,
+        std::slice::from_ref(&incoming),
+    )?;
     let instant = request_deltacommit(table, "UPSERT").await?;
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
     let incoming_keys = keys(&incoming, &key_name)?;
@@ -2142,6 +2164,7 @@ async fn rewrite(
     row_targets: Option<Vec<String>>,
     replaced_file_ids: Vec<String>,
     old_paths: Vec<String>,
+    log_only_replaced: Vec<(String, String)>,
     operation: &str,
     updates: usize,
     inserts: usize,
@@ -2171,6 +2194,14 @@ async fn rewrite(
         if kind == RewriteKind::Replace {
             partition_to_replace_file_ids
                 .entry(partition)
+                .or_default()
+                .push(file_id.clone());
+        }
+    }
+    if kind == RewriteKind::Replace {
+        for (partition, file_id) in &log_only_replaced {
+            partition_to_replace_file_ids
+                .entry(partition.clone())
                 .or_default()
                 .push(file_id.clone());
         }
@@ -2762,13 +2793,12 @@ fn merge_file_group_task(
                 let merged = if let Some(columns) = partial_columns {
                     let merged = partial_merge(&combined, &old_by_key, &selected, &columns)?;
                     // Partially-updated rows must carry the updating commit's
-                    // time/seqno, or incremental readers skip the change.
-                    let incoming_set: std::collections::HashSet<&String> =
-                        incoming_keys.iter().collect();
-                    let merged_keys = keys(&merged, key_field)?;
-                    let mask: BooleanArray = merged_keys
+                    // time/seqno, or incremental readers skip the change. Only
+                    // rows the merge resolved to the INCOMING side are updates;
+                    // a stale event-time row that lost keeps its old lineage.
+                    let mask: BooleanArray = selected
                         .iter()
-                        .map(|key| Some(incoming_set.contains(key)))
+                        .map(|index| Some(*index as usize >= old.num_rows()))
                         .collect();
                     restamp_matched_rows(&merged, &mask, &ctx.instant)?
                 } else {
@@ -3161,6 +3191,110 @@ fn prev_commit_from_base_path(path: &str) -> String {
 
 #[cfg(test)]
 mod lifecycle_tests {
+    /// Fabricate a committed log-only MOR file slice (data log block + fenced
+    /// and completed deltacommit, no base file) — the layout a Java writer
+    /// with log-only inserts produces, which rs verbs never create themselves.
+    async fn fabricate_log_only_slice(table: &Table, partition: &str, rows: RecordBatch) {
+        let storage = table.file_system_view.storage.clone();
+        let instant = crate::write::append::generate_instant_time().await;
+        crate::write::fence_timeline_instant(
+            storage.as_ref(),
+            &super::timeline_dir(table),
+            &instant,
+            crate::timeline::instant::Action::DeltaCommit,
+            Vec::new(),
+            crate::write::inflight_commit_metadata_bytes("UPSERT", true).unwrap(),
+        )
+        .await
+        .unwrap();
+        let file_id = crate::write::new_file_id();
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let rel = format!("{partition}/{log_name}");
+        crate::write::ensure_partition_metadata(storage.as_ref(), partition, &instant)
+            .await
+            .unwrap();
+        let prepared = super::prepare_batches_for_write(
+            &table.hudi_configs,
+            std::slice::from_ref(&rows),
+            &instant,
+            &log_name,
+        )
+        .unwrap();
+        let schema = prepared[0].schema();
+        let schema_json = crate::write::append::arrow_schema_to_avro_json(schema.as_ref()).unwrap();
+        crate::write::log_file_task(
+            storage.clone(),
+            crate::write::append::parquet_writer_props(table),
+            prepared,
+            rel.clone(),
+            instant.clone(),
+            schema_json,
+            false,
+        )
+        .await
+        .unwrap();
+        let stat = crate::metadata::commit::HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(rel),
+            base_file: Some(String::new()),
+            log_files: Some(vec![log_name]),
+            partition_path: Some(partition.to_string()),
+            num_writes: Some(rows.num_rows() as i64),
+            ..Default::default()
+        };
+        super::complete_deltacommit(table, &instant, "UPSERT", vec![stat], schema.as_ref())
+            .await
+            .unwrap();
+    }
+
+    /// Overwrite and dynamic partition overwrite must replace log-only MOR
+    /// file groups too: their ids must land in partitionToReplaceFileIds or
+    /// the old rows outlive the overwrite.
+    #[tokio::test]
+    async fn test_replace_verbs_exclude_log_only_mor_groups() {
+        for dpo in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut table = Table::create(dir.path().to_str().unwrap())
+                .with_table_name("t")
+                .with_table_type(TableTypeValue::MergeOnRead)
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_ordering_fields(["ts"])
+                .with_metadata(false)
+                .create()
+                .await
+                .unwrap();
+            table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
+            fabricate_log_only_slice(&table, "city=sf", batch(&[("b", "sf", 1, 20)])).await;
+            table.reload_timeline_for_write().await.unwrap();
+            assert_eq!(
+                rows(&table).await,
+                2,
+                "fabricated log-only row must be readable"
+            );
+
+            let replacement = batch(&[("c", "sf", 2, 30)]);
+            if dpo {
+                table
+                    .dynamic_partition_overwrite([replacement])
+                    .await
+                    .unwrap();
+            } else {
+                table.overwrite([replacement]).await.unwrap();
+            }
+            let batches = table.read(&ReadOptions::new()).await.unwrap();
+            let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total, 1, "dpo={dpo}: log-only group must be replaced");
+            let ids = batches[0]
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(ids.value(0), "c", "dpo={dpo}");
+        }
+    }
+
     use crate::config::table::TableTypeValue;
     use crate::table::{ReadOptions, Table, UpsertOptions};
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
