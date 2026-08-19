@@ -79,6 +79,9 @@ fn column_ranges_from_parquet_metadata(
         total_size: i64,
         total_uncompressed_size: i64,
         data_type: Option<DataType>,
+        /// Some chunk had truncated/absent stats: the accumulated range is a
+        /// lower bound on the true range and must not be published.
+        range_incomplete: bool,
     }
 
     let mut by_col: HashMap<String, Acc> = HashMap::new();
@@ -105,18 +108,25 @@ fn column_ranges_from_parquet_metadata(
             acc.total_uncompressed_size += col_chunk.uncompressed_size();
 
             if let Some(stats) = col_chunk.statistics() {
-                let nulls = if stats_is_empty(stats) {
-                    col_chunk.num_values()
-                } else {
-                    stats.null_count_opt().unwrap_or(0) as i64
-                };
-                acc.null_count += nulls;
-                if let Some((min, max)) = parquet_min_max_to_stat_values(stats, data_type) {
+                // Null count only when actually recorded; never fabricate
+                // "all null" for chunks with stats disabled.
+                acc.null_count += stats.null_count_opt().unwrap_or(0) as i64;
+                // Parquet writers truncate long min/max values (64 bytes by
+                // default); a truncated bound recorded as exact would let
+                // pruning skip files that match. Only exact bounds become
+                // column_stats ranges.
+                if stats.min_is_exact()
+                    && stats.max_is_exact()
+                    && let Some((min, max)) = parquet_min_max_to_stat_values(stats, data_type)
+                {
                     acc.min = merge_min(acc.min.take(), Some(min));
                     acc.max = merge_max(acc.max.take(), Some(max));
+                } else {
+                    acc.range_incomplete = true;
                 }
             } else {
-                acc.null_count += col_chunk.num_values();
+                // Stats disabled for the chunk: range and null count unknown.
+                acc.range_incomplete = true;
             }
         }
     }
@@ -125,8 +135,8 @@ fn column_ranges_from_parquet_metadata(
         .into_iter()
         .map(|(column_name, acc)| ColumnRangeStats {
             column_name,
-            min_value: acc.min,
-            max_value: acc.max,
+            min_value: (!acc.range_incomplete).then_some(acc.min).flatten(),
+            max_value: (!acc.range_incomplete).then_some(acc.max).flatten(),
             value_count: acc.value_count,
             null_count: acc.null_count,
             total_size: acc.total_size,
@@ -302,20 +312,6 @@ fn is_indexable_type(data_type: &DataType) -> bool {
             | DataType::Time64(TimeUnit::Microsecond)
             | DataType::Timestamp(_, _)
     )
-}
-
-fn stats_is_empty(stats: &ParquetStatistics) -> bool {
-    // parquet-rs: missing min/max with null_count == num values → empty-ish.
-    match stats {
-        ParquetStatistics::Boolean(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-        ParquetStatistics::Int32(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-        ParquetStatistics::Int64(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-        ParquetStatistics::Int96(_) => true,
-        ParquetStatistics::Float(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-        ParquetStatistics::Double(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-        ParquetStatistics::ByteArray(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-        ParquetStatistics::FixedLenByteArray(s) => s.min_opt().is_none() && s.max_opt().is_none(),
-    }
 }
 
 fn parquet_min_max_to_stat_values(

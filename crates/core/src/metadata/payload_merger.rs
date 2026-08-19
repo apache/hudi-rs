@@ -65,7 +65,12 @@ impl MetadataPayloadMerger {
         );
         let bytes = match storage.get_file_data(&props_path).await {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(Self),
+            Err(crate::storage::error::StorageError::ObjectStoreError(
+                object_store::Error::NotFound { .. },
+            )) => return Ok(Self),
+            // Any other failure would silently skip the validation this
+            // function exists to perform.
+            Err(error) => return Err(error.into()),
         };
         let text = String::from_utf8_lossy(&bytes);
         let props: HashMap<&str, &str> = text

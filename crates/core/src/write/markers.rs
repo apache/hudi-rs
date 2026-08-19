@@ -199,14 +199,22 @@ async fn list_files_recursive(storage: &Storage, dir: &str) -> Result<Vec<String
             )) => {}
             Err(error) => return Err(error.into()),
         }
-        if let Ok(dirs) = storage.list_dirs(Some(&full)).await {
-            for child in dirs {
-                stack.push(if rel.is_empty() {
-                    child
-                } else {
-                    format!("{rel}/{child}")
-                });
+        match storage.list_dirs(Some(&full)).await {
+            Ok(dirs) => {
+                for child in dirs {
+                    stack.push(if rel.is_empty() {
+                        child
+                    } else {
+                        format!("{rel}/{child}")
+                    });
+                }
             }
+            Err(crate::storage::error::StorageError::ObjectStoreError(
+                object_store::Error::NotFound { .. },
+            )) => {}
+            // A partition we cannot list is a partition we cannot roll back;
+            // surfacing beats silently skipping it.
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(out)

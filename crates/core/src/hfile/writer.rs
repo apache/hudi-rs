@@ -46,15 +46,17 @@ impl HFileWriter {
         let first_key = entries
             .first()
             .map(|(key, _)| structured_key(key))
+            .transpose()?
             .unwrap_or_default();
         let last_key = entries
             .last()
             .map(|(key, _)| structured_key(key))
+            .transpose()?
             .unwrap_or_default();
 
         let mut data = Vec::new();
         for (key, value) in &entries {
-            let key = structured_key(key);
+            let key = structured_key(key)?;
             let key_len = i32::try_from(key.len())
                 .map_err(|_| HFileError::InvalidFormat("HFile key is too large".to_string()))?;
             let value_len = i32::try_from(value.len())
@@ -145,14 +147,21 @@ impl HFileWriter {
     }
 }
 
-fn structured_key(content: &str) -> Vec<u8> {
+fn structured_key(content: &str) -> crate::hfile::error::Result<Vec<u8>> {
+    // The KeyValue row-length field is u16; truncating would corrupt framing.
+    let len = u16::try_from(content.len()).map_err(|_| {
+        crate::hfile::error::HFileError::InvalidFormat(format!(
+            "HFile row key exceeds 64KiB: {} bytes",
+            content.len()
+        ))
+    })?;
     let mut key = Vec::with_capacity(content.len() + 12);
-    key.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    key.extend_from_slice(&len.to_be_bytes());
     key.extend_from_slice(content.as_bytes());
     key.push(0);
     key.extend_from_slice(&i64::MAX.to_be_bytes());
     key.push(4);
-    key
+    Ok(key)
 }
 
 fn write_block(block_type: HFileBlockType, data: &[u8], previous_offset: i64) -> Result<Vec<u8>> {

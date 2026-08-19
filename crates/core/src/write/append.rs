@@ -196,8 +196,10 @@ async fn append_batches_inner(
     }
     let mut chunk_plans: Vec<ChunkPlan> = Vec::new();
     for (partition_path, row_refs) in partition_rows_sorted {
-        let batch_indices: HashMap<usize, Vec<u32>> = {
-            let mut map: HashMap<usize, Vec<u32>> = HashMap::new();
+        // BTreeMap: deterministic row order in the written file.
+        let batch_indices: std::collections::BTreeMap<usize, Vec<u32>> = {
+            let mut map: std::collections::BTreeMap<usize, Vec<u32>> =
+                std::collections::BTreeMap::new();
             for (batch_idx, row_idx) in &row_refs {
                 map.entry(*batch_idx).or_default().push(*row_idx as u32);
             }

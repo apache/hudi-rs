@@ -136,6 +136,9 @@ pub(crate) async fn archive_timeline_if_needed(
         .iter()
         .filter(|c| is_commit_action(&c.action))
         .count();
+    // Misconfigured min > max would underflow below and archive the whole
+    // timeline; treat min as the effective floor.
+    let min_keep = min_keep.min(max_keep);
     if commit_count <= max_keep {
         return Ok(());
     }
