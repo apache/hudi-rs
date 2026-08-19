@@ -285,6 +285,25 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// batch from the source).
     fn next_merged_base_batch(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>>;
 
+    /// Merge one base-file batch against the in-buffer log map.
+    ///
+    /// The same work [`Self::next_merged_base_batch`] does, minus the pull: the
+    /// caller supplies the batch. That split is what lets the base file be read
+    /// asynchronously while the merge itself stays synchronous — the buffer
+    /// holds no source, so nothing it owns has to be awaited.
+    ///
+    /// `Ok(None)` means this batch contributed no rows (empty input, or every
+    /// row lost to a log delete). It does **not** mean the base is exhausted:
+    /// only the caller, who owns the source, knows that.
+    ///
+    /// `target_schema` is the schema the returned batch must conform to, as in
+    /// [`Self::next_merged_base_batch`].
+    fn merge_base_batch(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>>;
+
     /// Drain remaining log-only records (keys never matched by any base row)
     /// as merged inserts. Returns `Ok(None)` if no log-only inserts remain
     /// (delete-only or fully consumed by base merge).
