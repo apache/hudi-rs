@@ -2965,7 +2965,7 @@ mod tests {
     }
 
     /// Drive a populated-buffer base-vs-log merge through the production
-    /// streaming path (log block → base source → `FileGroupMergeIterator`)
+    /// streaming path (log block → base source → `FileGroupMergeStream`)
     /// and return the concatenated output in the requested schema.
     fn merge_log_block_with_base_streaming(
         mut buffer: KeyBasedFileGroupRecordBuffer,
@@ -5366,7 +5366,7 @@ mod tests {
     }
 
     // =========================================================================
-    // streaming output via FileGroupMergeIterator.
+    // streaming output via FileGroupMergeStream.
     //
     // These tests compare the streaming iterator's output against the
     // legacy `merge_and_collect` path on the same buffer fixture. The
@@ -5376,7 +5376,7 @@ mod tests {
     // =========================================================================
 
     use crate::file_group::reader_v2::merge_iterator::{
-        FileGroupMergeIterator, new_stream_stats_handle,
+        FileGroupMergeStream, new_stream_stats_handle,
     };
 
     /// Test shim: build a streaming iterator with a throwaway stats handle.
@@ -5392,9 +5392,9 @@ mod tests {
             Box<dyn crate::file_group::reader_v2::output_converter::OutputConverter>,
         >,
         _batch_size: usize,
-    ) -> FileGroupMergeIterator {
+    ) -> FileGroupMergeStream {
         let base_source = take_base_source(&mut buffer, &merge_schema);
-        FileGroupMergeIterator::new_buffered(
+        FileGroupMergeStream::new_buffered(
             Box::new(buffer),
             base_source,
             merge_schema,
@@ -5411,13 +5411,50 @@ mod tests {
     /// group looks like.
     fn take_base_source(
         buffer: &mut KeyBasedFileGroupRecordBuffer,
-        schema: &SchemaRef,
-    ) -> Box<dyn arrow_array::RecordBatchReader + Send> {
-        buffer.base.base_file_source.take().unwrap_or_else(|| {
-            Box::new(arrow_array::RecordBatchIterator::new(
-                std::iter::empty(),
-                schema.clone(),
-            ))
+        _schema: &SchemaRef,
+    ) -> crate::file_group::reader_v2::merge_iterator::BaseBatchStream {
+        use futures::StreamExt;
+        match buffer.base.base_file_source.take() {
+            Some(reader) => futures::stream::iter(
+                reader
+                    .map(|b| {
+                        b.map_err(|e| {
+                            crate::error::CoreError::ReadFileSliceError(format!(
+                                "base file source error: {e}"
+                            ))
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .boxed(),
+            None => futures::stream::empty().boxed(),
+        }
+    }
+
+    /// As [`drain_ok`], but keeping each chunk's `Result`.
+    fn drain(
+        mut merge: crate::file_group::reader_v2::merge_iterator::FileGroupMergeStream,
+    ) -> Vec<Result<RecordBatch>> {
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(chunk) = merge.next_chunk().await {
+                out.push(chunk);
+            }
+            out
+        })
+    }
+
+    /// Drive a merge to exhaustion from a synchronous test. The base sources
+    /// here are in-memory, so a local executor is enough.
+    fn drain_ok(
+        mut merge: crate::file_group::reader_v2::merge_iterator::FileGroupMergeStream,
+    ) -> Vec<RecordBatch> {
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(chunk) = merge.next_chunk().await {
+                out.push(chunk.unwrap());
+            }
+            out
         })
     }
 
@@ -5459,7 +5496,7 @@ mod tests {
         batch_size: usize,
     ) -> Vec<RecordBatch> {
         let it = new_buffered_test(buffer, schema.clone(), schema, None, batch_size);
-        it.map(|r| r.unwrap()).collect()
+        drain_ok(it)
     }
 
     /// Streaming with batch_size larger than the merged-row count → one chunk;
@@ -5535,7 +5572,7 @@ mod tests {
     }
 
     /// A3 — the production chunked streaming iterator
-    /// (`FileGroupMergeIterator::Buffered`) driving a base source split across
+    /// (`FileGroupMergeStream::Buffered`) driving a base source split across
     /// MULTIPLE row-groups produces output byte-identical to the eager single
     /// base-batch fixture, at every chunk size. This is the end-to-end proof
     /// that the streamed base (decoded row-group-at-a-time, fed into A2
@@ -5643,7 +5680,7 @@ mod tests {
         let stats = new_stream_stats_handle();
         let mut buffer = buffer;
         let base_source = take_base_source(&mut buffer, &schema);
-        let it = FileGroupMergeIterator::new_buffered(
+        let it = FileGroupMergeStream::new_buffered(
             Box::new(buffer),
             base_source,
             schema.clone(),
@@ -5651,7 +5688,7 @@ mod tests {
             None,
             stats.clone(),
         );
-        let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let chunks: Vec<RecordBatch> = drain_ok(it);
         assert_eq!(chunks.len(), 1, "should fit in one chunk");
         let records = extract_records(&chunks[0]);
         assert_eq!(chunks[0].num_rows(), 2);
@@ -5673,7 +5710,7 @@ mod tests {
             None,
             1, // batch_size ignored on the new path
         );
-        let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let chunks: Vec<RecordBatch> = drain_ok(it);
         let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
         assert_eq!(total_rows, 2, "two output rows total");
 
@@ -5865,23 +5902,22 @@ mod tests {
     }
 
     // =========================================================================
-    // T1-T4: probe the STREAMING output path (FileGroupMergeIterator::new_buffered)
+    // T1-T4: probe the STREAMING output path (FileGroupMergeStream::new_buffered)
     //
     // The tests above (Part B / Phase A-C) all exercise `merge_and_collect`,
     // which is the legacy bulk-materialise API. The streaming API is what the
     // FFI now uses, over the lazy base-file source. T1-T4 verify that driving the same
-    // populated buffer through `FileGroupMergeIterator::new_buffered` produces
+    // populated buffer through `FileGroupMergeStream::new_buffered` produces
     // the same record counts.
     // =========================================================================
 
     use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 
-    /// Helper: drain a `FileGroupMergeIterator` into a Vec<RecordBatch>,
+    /// Helper: drain a `FileGroupMergeStream` into a Vec<RecordBatch>,
     /// panicking on any iteration error. Mirrors how the FFI driver consumes
     /// the stream (no error swallowing).
-    fn drain_streaming(iter: FileGroupMergeIterator) -> Vec<RecordBatch> {
-        iter.map(|r| r.expect("streaming iterator yielded error"))
-            .collect()
+    fn drain_streaming(iter: FileGroupMergeStream) -> Vec<RecordBatch> {
+        drain_ok(iter)
     }
 
     /// T1 — pins B1/B2.
@@ -6929,8 +6965,7 @@ mod tests {
 
         // Catch the panic from records_to_batch → reconcile_batch_to_schema.
         // Either a panic OR an Err — but NOT a silent 0-row stream.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.collect::<Vec<_>>()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drain(iter)));
 
         match result {
             Ok(chunks) => {
@@ -7172,7 +7207,7 @@ mod tests {
     //
     // i.e. PostMergePredicateFilter saw the iterator emit EXACTLY ONE chunk
     // of 4096 rows then stop. We need to know:
-    //   (a) does FileGroupMergeIterator::Buffered correctly continue past
+    //   (a) does FileGroupMergeStream::Buffered correctly continue past
     //       the first chunk when base_file_source has more rows?
     //   (b) if YES — the production stop is downstream (Velox/FFI/Drop).
     //   (c) if NO — the bug is here in the Buffered iterator.
@@ -7262,7 +7297,7 @@ mod tests {
         );
 
         // Minimal Rust analogue of PostMergePredicateFilter that returns
-        // an EMPTY batch for every inner chunk (i.e. filter rejects all).
+        // an EMPTY batch for every merged chunk (i.e. filter rejects all).
         struct AlwaysFalseFilter<I> {
             inner: I,
             chunks_in: usize,
@@ -7270,11 +7305,11 @@ mod tests {
         }
         impl<I> Iterator for AlwaysFalseFilter<I>
         where
-            I: Iterator<Item = Result<RecordBatch, arrow_schema::ArrowError>>,
+            I: Iterator<Item = RecordBatch>,
         {
-            type Item = Result<RecordBatch, arrow_schema::ArrowError>;
+            type Item = Result<RecordBatch>;
             fn next(&mut self) -> Option<Self::Item> {
-                let batch = self.inner.next()?.ok()?;
+                let batch = self.inner.next()?;
                 self.chunks_in += 1;
                 let empty = RecordBatch::new_empty(batch.schema());
                 self.chunks_out += 1;
@@ -7283,7 +7318,7 @@ mod tests {
         }
 
         let mut wrapped = AlwaysFalseFilter {
-            inner,
+            inner: drain_ok(inner).into_iter(),
             chunks_in: 0,
             chunks_out: 0,
         };
@@ -7657,8 +7692,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(buffer, required, requested, conv, DEFAULT_BATCH_SIZE);
-        let collected: std::result::Result<Vec<RecordBatch>, arrow_schema::ArrowError> =
-            iter.collect();
+        let collected: Result<Vec<RecordBatch>> = drain(iter).into_iter().collect();
         let err = collected.expect_err(
             "toasted log-only insert with no prior must fail loudly, not leak sentinel",
         );
@@ -7694,8 +7728,9 @@ mod tests {
             .unwrap();
         let conv2 = buffer2.reader_context.schema_handler.get_output_converter();
         let iter2 = new_buffered_test(buffer2, required2, requested2, conv2, DEFAULT_BATCH_SIZE);
-        let batches: Vec<RecordBatch> = iter2
-            .collect::<std::result::Result<Vec<RecordBatch>, arrow_schema::ArrowError>>()
+        let batches: Vec<RecordBatch> = drain(iter2)
+            .into_iter()
+            .collect::<Result<Vec<RecordBatch>>>()
             .expect("a clean (non-sentinel) log-only insert must drain without error");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1, "the real-value insert should emit exactly one row");

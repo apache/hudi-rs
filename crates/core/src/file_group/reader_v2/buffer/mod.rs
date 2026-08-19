@@ -173,14 +173,14 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Snapshot the insert / update / delete counts the buffer's
     /// `UpdateProcessor` has accumulated so far.
     ///
-    /// With streaming output, the [`FileGroupMergeIterator`] drives
+    /// With streaming output, the [`FileGroupMergeStream`] drives
     /// `has_next/next` and the update processor increments these counters as a
     /// side effect; after the stream is exhausted the iterator reads them back
     /// through this accessor instead of through `merge_and_collect_with_stats`
     /// (which consumes the buffer). Defaults to zero for buffers that don't
     /// track update stats.
     ///
-    /// [`FileGroupMergeIterator`]: crate::file_group::reader_v2::merge_iterator::FileGroupMergeIterator
+    /// [`FileGroupMergeStream`]: crate::file_group::reader_v2::merge_iterator::FileGroupMergeStream
     fn update_stats_snapshot(&self) -> UpdateStats {
         UpdateStats::default()
     }
