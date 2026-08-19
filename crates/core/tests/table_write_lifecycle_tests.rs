@@ -502,7 +502,7 @@ async fn test_cow_and_mor_mutable_ops_roundtrip() {
                 layout.log_files >= 2,
                 "MOR mutable path should produce update + delete logs, got {layout:?}"
             );
-            // overwrite not yet supported for MOR — skip
+            // MOR overwrite is covered by table_write_tests::test_mor_overwrite_replaces_file_groups
         }
     }
 }
