@@ -37,7 +37,7 @@ use crate::file_group::reader_v2::buffered_record_converter::BufferedRecordConve
 use crate::file_group::reader_v2::input_split::InputSplit;
 use crate::file_group::reader_v2::iterator_mode::IteratorMode;
 use crate::file_group::reader_v2::merge_iterator::{
-    DEFAULT_BATCH_SIZE, FileGroupMergeIterator, StreamStatsHandle, new_stream_stats_handle,
+    FileGroupMergeIterator, StreamStatsHandle, new_stream_stats_handle,
 };
 use crate::file_group::reader_v2::output_converter::OutputConverter;
 use crate::file_group::reader_v2::profiling::profile_once;
@@ -590,7 +590,7 @@ impl HoodieFileGroupReader {
             )
             .await?;
 
-        let mut record_buffer = load_result.record_buffer;
+        let record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
 
         // Anything this read expects that is quietly not done, said once, before
@@ -648,14 +648,12 @@ impl HoodieFileGroupReader {
 
         let output_schema = post_projection_schema.unwrap_or_else(|| merge_schema.clone());
 
-        // Step 5: Hand the base source to the buffer + return the streaming
-        // iterator. The iterator owns the buffer from here on; the reader's
-        // role ends.
-        record_buffer.set_base_file_source(base_source);
-        log::debug!(
-            "[HoodieFileGroupReader] set base file source on buffer, \
-             returning Buffered iterator (batch_size={DEFAULT_BATCH_SIZE})"
-        );
+        // Step 5: return the streaming iterator, which owns both the buffer and
+        // the base source from here on; the reader's role ends. The source is
+        // the iterator's rather than the buffer's because only its holder can
+        // say when the base is exhausted, and because the base file is the one
+        // part of the merge that has to be read rather than computed.
+        log::debug!("[HoodieFileGroupReader] returning Buffered iterator");
 
         // Step 6: Hand the buffer to a Buffered streaming iterator. The
         // iterator owns the buffer and drives `has_next/next` per chunk; it
@@ -671,34 +669,14 @@ impl HoodieFileGroupReader {
             .expect("stream_stats mutex poisoned")
             .merge_map_peak_entries = record_buffer.merge_map_peak_entries();
 
-        // Chunk size: honor `hoodie.read.stream.batch_size` from the reader
-        // config, falling back to DEFAULT_BATCH_SIZE when unset/unparseable.
-        let batch_size = self.stream_batch_size();
-
         Ok(FileGroupMergeIterator::new_buffered(
             record_buffer,
+            base_source,
             merge_schema,
             output_schema,
             output_converter,
-            batch_size,
             self.stream_stats.clone(),
         ))
-    }
-
-    /// Resolve the streaming chunk size from `hoodie.read.stream.batch_size`
-    /// on the reader config, defaulting to [`DEFAULT_BATCH_SIZE`] when the key
-    /// is absent or unparseable.
-    ///
-    /// The key lives on `reader_context.hoodie_reader_config` (the same map the
-    /// buffer loader reads `hoodie.datasource.merge.type` from). Mirrors Java's
-    /// chunked `getClosableIterator` batch sizing.
-    fn stream_batch_size(&self) -> usize {
-        self.reader_context
-            .hoodie_reader_config
-            .get(crate::config::read::HudiReadConfig::StreamBatchSize.as_ref())
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_BATCH_SIZE)
     }
 
     /// Open the base file as a `RecordBatchReader` source.

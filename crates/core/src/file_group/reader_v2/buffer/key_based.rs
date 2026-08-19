@@ -1834,6 +1834,16 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         self.pull_and_merge_next_base_batch(target_schema, BaseMatch::RecordKey)
     }
 
+    /// Merge one caller-supplied base batch. See
+    /// [`HoodieFileGroupRecordBuffer::merge_base_batch`].
+    fn merge_base_batch(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>> {
+        self.merge_one_base_batch_kernel(base, target_schema, BaseMatch::RecordKey)
+    }
+
     /// Drain any log records that were never matched by a base row, as one
     /// final batch of inserts. Deletes are filtered out (they contribute
     /// no output rows). Idempotent: subsequent calls return `Ok(None)`.
@@ -2387,7 +2397,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -2483,7 +2493,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -2627,7 +2637,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -2984,7 +2994,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -5375,22 +5385,40 @@ mod tests {
     /// production concern (FFI timing/update-count reporting) the streaming-parity
     /// tests don't assert on, so it's defaulted here.
     fn new_buffered_test(
-        buffer: Box<dyn crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer>,
+        mut buffer: KeyBasedFileGroupRecordBuffer,
         merge_schema: SchemaRef,
         output_schema: SchemaRef,
         output_converter: Option<
             Box<dyn crate::file_group::reader_v2::output_converter::OutputConverter>,
         >,
-        batch_size: usize,
+        _batch_size: usize,
     ) -> FileGroupMergeIterator {
+        let base_source = take_base_source(&mut buffer, &merge_schema);
         FileGroupMergeIterator::new_buffered(
-            buffer,
+            Box::new(buffer),
+            base_source,
             merge_schema,
             output_schema,
             output_converter,
-            batch_size,
             new_stream_stats_handle(),
         )
+    }
+
+    /// Move the base source a test attached to the buffer into the iterator,
+    /// which is where production puts it: the iterator owns the pull, and the
+    /// buffer only merges a batch it is handed. A buffer with none set reads as
+    /// an empty base file rather than panicking, which is what a log-only file
+    /// group looks like.
+    fn take_base_source(
+        buffer: &mut KeyBasedFileGroupRecordBuffer,
+        schema: &SchemaRef,
+    ) -> Box<dyn arrow_array::RecordBatchReader + Send> {
+        buffer.base.base_file_source.take().unwrap_or_else(|| {
+            Box::new(arrow_array::RecordBatchIterator::new(
+                std::iter::empty(),
+                schema.clone(),
+            ))
+        })
     }
 
     /// Build the same buffer state used by `test_read_with_commit_time_ordering`
@@ -5430,14 +5458,7 @@ mod tests {
         schema: SchemaRef,
         batch_size: usize,
     ) -> Vec<RecordBatch> {
-        let it = FileGroupMergeIterator::new_buffered(
-            Box::new(buffer),
-            schema.clone(),
-            schema,
-            None,
-            batch_size,
-            new_stream_stats_handle(),
-        );
+        let it = new_buffered_test(buffer, schema.clone(), schema, None, batch_size);
         it.map(|r| r.unwrap()).collect()
     }
 
@@ -5620,12 +5641,14 @@ mod tests {
     fn stream_snapshots_update_stats_on_exhaustion() {
         let (buffer, schema) = build_commit_time_ordering_fixture();
         let stats = new_stream_stats_handle();
+        let mut buffer = buffer;
+        let base_source = take_base_source(&mut buffer, &schema);
         let it = FileGroupMergeIterator::new_buffered(
             Box::new(buffer),
+            base_source,
             schema.clone(),
             schema,
             None,
-            4096,
             stats.clone(),
         );
         let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
@@ -5644,7 +5667,7 @@ mod tests {
     fn stream_matches_legacy_row_content() {
         let (buffer1, schema1) = build_commit_time_ordering_fixture();
         let it = new_buffered_test(
-            Box::new(buffer1),
+            buffer1,
             schema1.clone(),
             schema1.clone(),
             None,
@@ -5668,16 +5691,89 @@ mod tests {
     #[test]
     fn stream_schema_is_constructor_schema() {
         let (buffer, schema) = build_commit_time_ordering_fixture();
-        let it = FileGroupMergeIterator::new_buffered(
-            Box::new(buffer),
-            schema.clone(),
-            schema.clone(),
-            None,
-            1,
-            new_stream_stats_handle(),
-        );
+        let it = new_buffered_test(buffer, schema.clone(), schema.clone(), None, 1);
         use arrow_array::RecordBatchReader as _;
         assert_eq!(it.schema(), schema);
+    }
+
+    /// The log side of `build_commit_time_ordering_fixture`, with no base
+    /// source attached, so the same buffer can be driven either by the pull it
+    /// owns or by batches handed to it.
+    fn commit_time_ordering_log_side() -> KeyBasedFileGroupRecordBuffer {
+        let mut buffer =
+            build_key_based_buffer_with_delete_marker("COMMIT_TIME_ORDERING", "counter", "3");
+        buffer
+            .process_data_block(&mut make_data_block(
+                create_test_batch(&[("1", 2, 1), ("2", 1, 2), ("2", 1, 0)]),
+                "instant1",
+            ))
+            .unwrap();
+        buffer
+            .process_data_block(&mut make_data_block(
+                create_test_batch(&[("2", 1, 0), ("3", 1, 2), ("3", 3, 1)]),
+                "instant2",
+            ))
+            .unwrap();
+        buffer
+    }
+
+    /// Merging a batch the caller supplies must produce exactly what merging
+    /// the same batch pulled from the buffer's own source produces — including
+    /// the log-only drain that follows, since a merge that consumed different
+    /// log entries would show up there rather than in the merged batches.
+    ///
+    /// The two differ only in who owns the pull. If that changed the answer,
+    /// how the base file is read would be a correctness variable, which is the
+    /// whole premise of moving the pull out to an async caller.
+    #[test]
+    fn merge_base_batch_matches_the_source_owning_pull() {
+        let schema = create_test_schema();
+        // Two batches, so the pulling route crosses a batch boundary mid-merge
+        // rather than seeing the base file as one lump. Key "4" has no log
+        // entry at all: without it every base key would be superseded by a log
+        // record, and a buffer that merged nothing and drained everything would
+        // produce the same rows as one that merged correctly — the comparison
+        // could not tell the two apart.
+        let base = vec![
+            create_test_batch(&[("1", 1, 1), ("2", 1, 1)]),
+            create_test_batch(&[("3", 1, 1), ("4", 7, 7)]),
+        ];
+
+        // Route A: the buffer owns the source and pulls each batch itself.
+        let mut pulling = commit_time_ordering_log_side();
+        pulling.set_base_file_source(Box::new(arrow_array::RecordBatchIterator::new(
+            base.iter().cloned().map(Ok).collect::<Vec<_>>().into_iter(),
+            schema.clone(),
+        )));
+        let mut pulled: Vec<(String, i32, i64)> = Vec::new();
+        while let Some(b) = pulling.next_merged_base_batch(&schema).unwrap() {
+            pulled.extend(extract_records(&b));
+        }
+        while let Some(b) = pulling.drain_log_only_inserts(&schema).unwrap() {
+            pulled.extend(extract_records(&b));
+        }
+
+        // Route B: the caller owns the batches and hands them over one at a time.
+        let mut handed = commit_time_ordering_log_side();
+        let mut handed_rows: Vec<(String, i32, i64)> = Vec::new();
+        for b in &base {
+            if let Some(m) = handed.merge_base_batch(b, &schema).unwrap() {
+                handed_rows.extend(extract_records(&m));
+            }
+        }
+        while let Some(b) = handed.drain_log_only_inserts(&schema).unwrap() {
+            handed_rows.extend(extract_records(&b));
+        }
+
+        assert!(
+            pulled.iter().any(|(k, _, _)| k == "4"),
+            "the base-only key must reach the output, or this comparison cannot \
+             distinguish merging from draining"
+        );
+        assert_eq!(
+            handed_rows, pulled,
+            "who pulls the base batch must not change what the merge produces"
+        );
     }
 
     /// lazy base source: instead of `set_base_file_iterator(vec![...])`
@@ -5818,7 +5914,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(empty_reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -5850,7 +5946,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -5883,7 +5979,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -5942,7 +6038,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6152,7 +6248,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6185,7 +6281,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6304,7 +6400,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6603,7 +6699,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6638,7 +6734,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6678,7 +6774,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(empty_reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6765,7 +6861,7 @@ mod tests {
         let converter = Box::new(ProjectionConverter::new(&target_schema));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             merge_schema.clone(),
             target_schema.clone(),
             Some(converter),
@@ -6824,7 +6920,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(empty_reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             bogus_schema.clone(),
             bogus_schema.clone(),
             None,
@@ -7019,7 +7115,7 @@ mod tests {
             .unwrap();
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required_schema,
             requested_schema.clone(),
             output_converter,
@@ -7104,7 +7200,7 @@ mod tests {
         assert_eq!(buffer.size(), 0, "log map must be empty");
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7158,7 +7254,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let inner = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7249,7 +7345,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7303,7 +7399,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7349,7 +7445,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7481,7 +7577,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -7560,13 +7656,7 @@ mod tests {
             .clone()
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
-        let iter = new_buffered_test(
-            Box::new(buffer),
-            required,
-            requested,
-            conv,
-            DEFAULT_BATCH_SIZE,
-        );
+        let iter = new_buffered_test(buffer, required, requested, conv, DEFAULT_BATCH_SIZE);
         let collected: std::result::Result<Vec<RecordBatch>, arrow_schema::ArrowError> =
             iter.collect();
         let err = collected.expect_err(
@@ -7603,13 +7693,7 @@ mod tests {
             .clone()
             .unwrap();
         let conv2 = buffer2.reader_context.schema_handler.get_output_converter();
-        let iter2 = new_buffered_test(
-            Box::new(buffer2),
-            required2,
-            requested2,
-            conv2,
-            DEFAULT_BATCH_SIZE,
-        );
+        let iter2 = new_buffered_test(buffer2, required2, requested2, conv2, DEFAULT_BATCH_SIZE);
         let batches: Vec<RecordBatch> = iter2
             .collect::<std::result::Result<Vec<RecordBatch>, arrow_schema::ArrowError>>()
             .expect("a clean (non-sentinel) log-only insert must drain without error");
@@ -7727,7 +7811,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
