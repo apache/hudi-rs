@@ -2792,7 +2792,18 @@ mod tests {
             "both paths must return the same schema"
         );
 
-        // Same rows, not merely the same count.
+        // Same rows in the same ORDER, not merely the same multiset. Both entry
+        // points merge the base a row group at a time, so the sequence is a
+        // shared property and sorting here would stop guarding it.
+        //
+        // Honest limit: this fixture cannot yet detect a violation. The order
+        // only diverges when one base batch holds both surviving and replaced
+        // rows, and every MOR fixture in this repo updates every key, so
+        // collapsing the base on one path is invisible here — verified by
+        // mutation. `batch_boundaries_change_the_merged_row_order` in
+        // `buffer::key_based` is what discriminates; this pins the two entry
+        // points together and will discriminate given a fixture with surviving
+        // base rows across more than one batch.
         let key_of = |batches: &[RecordBatch]| {
             let mut keys: Vec<String> = Vec::new();
             for batch in batches {
@@ -2803,10 +2814,13 @@ mod tests {
                     .unwrap();
                 keys.extend((0..batch.num_rows()).map(|i| strings.value(i).to_string()));
             }
-            keys.sort();
             keys
         };
-        assert_eq!(key_of(&streamed), key_of(&eager));
+        assert_eq!(
+            key_of(&streamed),
+            key_of(&eager),
+            "the two entry points must return the same rows in the same order"
+        );
     }
 
     /// A read config that selects WHICH read to perform is dropped at table

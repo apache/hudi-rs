@@ -5754,6 +5754,94 @@ mod tests {
         buffer
     }
 
+    /// Where the batch boundaries fall changes the ORDER of the merged output,
+    /// and this is the test that says so out loud.
+    ///
+    /// The kernel emits a batch as kept base rows first, then the log records
+    /// that replaced the rest. So a base delivered whole yields
+    /// `[all kept][all replaced]`, while the same base split in two yields
+    /// `[kept][replaced][kept][replaced]` — the same rows, a different sequence.
+    ///
+    /// It matters because both read entry points merge a row group at a time:
+    /// that is what makes their orders equal, and it is why nothing may collapse
+    /// the base on one path only. The property is invisible on a table where
+    /// every key is updated (no base row survives to be ordered against), which
+    /// is every MOR fixture in this repo and both benchmark datasets — hence a
+    /// hand-built mixed batch here.
+    #[test]
+    fn batch_boundaries_change_the_merged_row_order() {
+        let schema = create_test_schema();
+        // Log replaces "b" and "d" only; "a", "c", "e" survive from the base.
+        // Counters avoid 3, which this fixture treats as a delete marker.
+        let mut whole =
+            build_key_based_buffer_with_delete_marker("COMMIT_TIME_ORDERING", "counter", "3");
+        let mut split =
+            build_key_based_buffer_with_delete_marker("COMMIT_TIME_ORDERING", "counter", "3");
+        for buffer in [&mut whole, &mut split] {
+            buffer
+                .process_data_block(&mut make_data_block(
+                    create_test_batch(&[("b", 20, 5), ("d", 40, 5)]),
+                    "instant1",
+                ))
+                .unwrap();
+        }
+
+        let all = create_test_batch(&[
+            ("a", 10, 1),
+            ("b", 11, 1),
+            ("c", 12, 1),
+            ("d", 13, 1),
+            ("e", 14, 1),
+        ]);
+        let first = create_test_batch(&[("a", 10, 1), ("b", 11, 1), ("c", 12, 1)]);
+        let second = create_test_batch(&[("d", 13, 1), ("e", 14, 1)]);
+
+        // In ROW order. `extract_records` sorts by key, which would make this
+        // test assert nothing about the very thing it exists to pin.
+        let keys_of = |b: &RecordBatch| -> Vec<String> {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("key column");
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect()
+        };
+
+        let mut whole_rows: Vec<String> = Vec::new();
+        if let Some(b) = whole.merge_base_batch(&all, &schema).unwrap() {
+            whole_rows.extend(keys_of(&b));
+        }
+        let mut split_rows: Vec<String> = Vec::new();
+        for b in [&first, &second] {
+            if let Some(m) = split.merge_base_batch(b, &schema).unwrap() {
+                split_rows.extend(keys_of(&m));
+            }
+        }
+
+        assert_eq!(
+            whole_rows,
+            vec!["a", "c", "e", "b", "d"],
+            "a whole base batch emits the surviving base rows, then the replacements"
+        );
+        assert_eq!(
+            split_rows,
+            vec!["a", "c", "b", "e", "d"],
+            "a split base interleaves them per batch"
+        );
+
+        let mut w = whole_rows.clone();
+        let mut sp = split_rows.clone();
+        w.sort();
+        sp.sort();
+        assert_eq!(w, sp, "the same rows either way - only the order differs");
+        assert_ne!(
+            whole_rows, split_rows,
+            "if these ever match, this test has stopped pinning anything"
+        );
+    }
+
     /// Merging a batch the caller supplies must produce exactly what merging
     /// the same batch pulled from the buffer's own source produces — including
     /// the log-only drain that follows, since a merge that consumed different
