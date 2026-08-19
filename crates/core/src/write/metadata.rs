@@ -86,8 +86,10 @@ pub(crate) fn map_record_key_to_file_group_index(
         return 0;
     }
     let mut h: i32 = 0;
-    for ch in record_key.chars() {
-        h = h.wrapping_mul(31).wrapping_add(ch as i32);
+    // Java's String.hashCode iterates UTF-16 code units (charAt), not Unicode
+    // scalars; supplementary-plane keys must hash to the same shard as Java.
+    for unit in record_key.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(unit as i32);
     }
     (h.unsigned_abs() as usize) % num_file_groups
 }
@@ -765,6 +767,84 @@ async fn compute_partition_stats_records(
 ///
 /// `storage` and `hudi_configs` must belong to the DATA table (paths are
 /// resolved under `.hoodie/metadata` and fencing lists the data timeline).
+/// Latest file slice per file group in an MDT partition, via the same
+/// FileGroup/FileSlice machinery the data table uses: multi-base aware (a
+/// Spark MDT compaction leaves several base versions; only the newest slice
+/// is live) and log files ordered by version/completion, not lexicographically.
+///
+/// Returns `(file id, base hfile relative path, ordered log relative paths)`.
+pub(crate) async fn mdt_partition_latest_slices(
+    storage: &Storage,
+    partition: &str,
+) -> Result<Vec<(String, String, Vec<String>)>> {
+    use std::str::FromStr;
+    let dir = format!("{METADATA_BASE}/{partition}");
+    let listed = match storage.list_files(Some(&dir)).await {
+        Ok(files) => files,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    // Two passes: log-to-slice association requires the base files to be in
+    // place first, and storage listing order is not guaranteed.
+    let mut bases = Vec::new();
+    let mut logs = Vec::new();
+    for file in listed {
+        let name = file.name;
+        if name.ends_with(".hfile") && !name.starts_with('.') {
+            bases.push(crate::file_group::base_file::BaseFile::from_str(&name)?);
+        } else if name.starts_with('.')
+            && name.contains(".log.")
+            && crate::file_group::log_file::LogFile::is_log_file_name(&name)
+        {
+            let mut log = crate::file_group::log_file::LogFile::from_str(&name)?;
+            // MDT logs are named by their deltacommit instant; using it as the
+            // completion time gives v8 completion-based slice attachment (and
+            // correctly excludes pre-compaction logs from a newer base slice).
+            log.completion_timestamp = Some(log.timestamp.clone());
+            logs.push(log);
+        }
+    }
+    let mut groups: HashMap<String, crate::file_group::FileGroup> = HashMap::new();
+    for base in bases {
+        groups
+            .entry(base.file_id.clone())
+            .or_insert_with(|| {
+                crate::file_group::FileGroup::new(base.file_id.clone(), partition.to_string())
+            })
+            .add_base_file(base)?;
+    }
+    for log in logs {
+        // Skip log-only groups: an MDT file group is unreadable without its
+        // bootstrap HFile base, and slice association needs a base slice.
+        let Some(group) = groups.get_mut(&log.file_id) else {
+            continue;
+        };
+        group.add_log_file(log)?;
+    }
+    let mut out = Vec::new();
+    let mut ids: Vec<_> = groups.keys().cloned().collect();
+    ids.sort();
+    for id in ids {
+        let group = &groups[&id];
+        let Some(slice) = group.get_file_slice_as_of("99999999999999999") else {
+            continue;
+        };
+        let Some(base) = slice.base_file.as_ref() else {
+            continue;
+        };
+        let base_path = format!("{dir}/{}", base.file_name());
+        let logs = slice
+            .log_files
+            .iter()
+            .map(|log| format!("{dir}/{}", log.file_name()))
+            .collect();
+        out.push((id, base_path, logs));
+    }
+    Ok(out)
+}
+
 pub(crate) async fn load_column_stats_records(
     storage: std::sync::Arc<Storage>,
     hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
@@ -774,26 +854,12 @@ pub(crate) async fn load_column_stats_records(
         return Ok(HashMap::new());
     }
     let partition = MetadataPartitionType::ColumnStats.partition_name();
-    let dir = format!("{METADATA_BASE}/{partition}");
-    let listed = match storage.list_files(Some(&dir)).await {
-        Ok(files) => files,
-        Err(crate::storage::error::StorageError::ObjectStoreError(
-            object_store::Error::NotFound { .. },
-        )) => return Ok(HashMap::new()),
-        Err(error) => return Err(error.into()),
-    };
     let mut base_paths = Vec::new();
     let mut log_paths = Vec::new();
-    for file in listed {
-        let name = file.name;
-        if name.ends_with(".hfile") && name.starts_with("col-stats-") {
-            base_paths.push(format!("{dir}/{name}"));
-        } else if name.starts_with('.') && name.contains(".log.") {
-            log_paths.push(format!("{dir}/{name}"));
-        }
+    for (_, base, logs) in mdt_partition_latest_slices(storage.as_ref(), partition).await? {
+        base_paths.push(base);
+        log_paths.extend(logs);
     }
-    base_paths.sort();
-    log_paths.sort();
 
     let mut sorted_keys: Vec<&str> = wanted.keys().map(String::as_str).collect();
     sorted_keys.sort_unstable();
@@ -981,7 +1047,16 @@ pub(crate) async fn write_metadata_commit(
 pub fn instant_to_epoch_millis(instant: &str) -> i64 {
     Instant::parse_datetime(instant, "UTC")
         .map(|dt| dt.timestamp_millis())
-        .unwrap_or_else(|_| instant.parse::<i64>().unwrap_or(0))
+        .unwrap_or_else(|_| {
+            // Instants reaching here are self-generated and always parse; a
+            // failure is a programming error, caught loudly in debug builds
+            // rather than silently writing epoch 0 into the record index.
+            debug_assert!(
+                instant.parse::<i64>().is_ok(),
+                "unparseable instant '{instant}'"
+            );
+            instant.parse::<i64>().unwrap_or(0)
+        })
 }
 
 /// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`).
@@ -1006,4 +1081,83 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn slices_for(files: &[&str]) -> Result<Vec<(String, String, Vec<String>)>> {
+        let dir = tempfile::tempdir().unwrap();
+        let partition_dir = dir.path().join(".hoodie/metadata/column_stats");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        for name in files {
+            std::fs::write(partition_dir.join(name), b"").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url)?;
+        mdt_partition_latest_slices(storage.as_ref(), "column_stats").await
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_multi_base_excludes_pre_compaction_logs() {
+        // Post-compaction layout: bootstrap base + old logs, then a compacted
+        // base at t=30. Only the newer base and the post-compaction log form
+        // the live slice.
+        let slices = slices_for(&[
+            "col-stats-0000-0_0-0-0_00000000000000010.hfile",
+            ".col-stats-0000-0_00000000000000020.log.1_0-0-0",
+            "col-stats-0000-0_0-1-0_00000000000000030.hfile",
+            ".col-stats-0000-0_00000000000000040.log.1_0-0-0",
+            ".hoodie_partition_metadata",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(slices.len(), 1);
+        let (file_id, base, logs) = &slices[0];
+        assert_eq!(file_id, "col-stats-0000-0");
+        assert!(base.ends_with("col-stats-0000-0_0-1-0_00000000000000030.hfile"));
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].ends_with(".col-stats-0000-0_00000000000000040.log.1_0-0-0"));
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_orders_logs_numerically_past_ten() {
+        // Log versions 1..=12 must come back in numeric order, not the
+        // lexicographic order a raw listing sort would produce (1, 10, 11, ...).
+        let names: Vec<String> = (1..=12)
+            .map(|v| format!(".col-stats-0000-0_00000000000000020.log.{v}_0-0-0"))
+            .collect();
+        let mut files: Vec<&str> = names.iter().map(String::as_str).collect();
+        files.push("col-stats-0000-0_0-0-0_00000000000000010.hfile");
+        let slices = slices_for(&files).await.unwrap();
+        assert_eq!(slices.len(), 1);
+        let logs = &slices[0].2;
+        assert_eq!(logs.len(), 12);
+        for (i, log) in logs.iter().enumerate() {
+            assert!(
+                log.ends_with(&format!(".log.{}_0-0-0", i + 1)),
+                "log {i} out of order: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_skips_log_only_group_and_missing_partition() {
+        // A group with logs but no HFile base is unreadable and skipped.
+        let slices = slices_for(&[".col-stats-0000-0_00000000000000020.log.1_0-0-0"])
+            .await
+            .unwrap();
+        assert!(slices.is_empty());
+
+        // Missing partition directory is an empty result, not an error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".hoodie")).unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let slices = mdt_partition_latest_slices(storage.as_ref(), "column_stats")
+            .await
+            .unwrap();
+        assert!(slices.is_empty());
+    }
 }

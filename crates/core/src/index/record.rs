@@ -19,7 +19,6 @@
 //! Record-level index backed by the metadata table `record_index` partition.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
@@ -34,8 +33,6 @@ use crate::storage::Storage;
 use crate::table::Table;
 use crate::timeline::selector::InstantRange;
 use crate::write::metadata::epoch_millis_to_instant;
-
-const METADATA_BASE: &str = ".hoodie/metadata";
 
 /// Metadata-table record-level index (global: key = record key).
 #[derive(Clone, Debug, Default)]
@@ -85,29 +82,16 @@ async fn load_record_index_map(
     storage: Arc<Storage>,
 ) -> Result<HashMap<String, LoadedLocation>> {
     let partition = MetadataPartitionType::RecordIndex.partition_name();
-    let dir = format!("{METADATA_BASE}/{partition}");
-    let listed = match storage.list_files(Some(&dir)).await {
-        Ok(files) => files,
-        Err(crate::storage::error::StorageError::ObjectStoreError(
-            object_store::Error::NotFound { .. },
-        )) => return Ok(HashMap::new()),
-        Err(error) => return Err(error.into()),
-    };
-
+    // Slice-resolved: only each file group's LIVE slice (multi-base aware
+    // after a Spark MDT compaction), logs in version order.
     let mut base_paths = Vec::new();
     let mut log_paths = Vec::new();
-    for file in listed {
-        let name = file.name;
-        if name.ends_with(".hfile") && name.starts_with("record-index-") {
-            let relative = PathBuf::from(&dir).join(&name);
-            base_paths.push(relative.to_string_lossy().to_string());
-        } else if name.starts_with('.') && name.contains(".log.") {
-            let relative = PathBuf::from(&dir).join(&name);
-            log_paths.push(relative.to_string_lossy().to_string());
-        }
+    for (_, base, logs) in
+        crate::write::metadata::mdt_partition_latest_slices(storage.as_ref(), partition).await?
+    {
+        base_paths.push(base);
+        log_paths.extend(logs);
     }
-    base_paths.sort();
-    log_paths.sort();
 
     let mut merged: HashMap<String, Option<LoadedLocation>> = HashMap::new();
     for base in base_paths {
