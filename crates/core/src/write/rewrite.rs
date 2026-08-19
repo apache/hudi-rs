@@ -249,7 +249,13 @@ pub async fn upsert_batches(
     // partition columns disagree with the path they physically live in.
     let mut evictions_by_group: HashMap<String, HashSet<String>> = HashMap::new();
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
-        let located = locations.get(hoodie_key).and_then(Option::as_ref);
+        // A location whose file group has no live slice is a stale index
+        // entry (its group was replaced); the row no longer exists, so the
+        // incoming record is an insert (Java re-validates tags the same way).
+        let located = locations
+            .get(hoodie_key)
+            .and_then(Option::as_ref)
+            .filter(|location| slice_by_file_id.contains_key(&location.file_id));
         let target = match located {
             Some(location) if location.partition_path == hoodie_key.partition_path => {
                 updates += 1;
@@ -920,14 +926,13 @@ async fn mor_file_locations(
     let mut locations = HashMap::with_capacity(tagged.len());
     for (key, location) in tagged {
         if let Some(location) = location {
-            let (base_file_path, base_instant) = slices_by_file_id
-                .get(&(location.partition_path.clone(), location.file_id.clone()))
-                .ok_or_else(|| {
-                    CoreError::Write(format!(
-                        "record index returned missing file group '{}'",
-                        location.file_id
-                    ))
-                })?;
+            // Stale index entry (group replaced, row gone): treat as absent
+            // so the incoming record inserts instead of erroring.
+            let Some((base_file_path, base_instant)) =
+                slices_by_file_id.get(&(location.partition_path.clone(), location.file_id.clone()))
+            else {
+                continue;
+            };
             locations.insert(
                 key.record_key,
                 MorFileLocation {
