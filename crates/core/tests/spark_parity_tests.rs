@@ -21,8 +21,14 @@
 //! Gated behind `HUDI_SPARK_PARITY=1` (needs a local Spark + Hudi bundle; see
 //! `scripts/parity/README.md`). Run with `make parity`.
 //!
-//! Scenarios: hudi-rs writes → Spark reads; Spark writes → hudi-rs reads;
-//! Spark table services on hudi-rs-written tables; interleaved writers.
+//! Scenarios: hudi-rs writes → Spark reads; Spark writes → rs reads;
+//! Spark table services on rs-written tables; interleaved writers.
+//!
+//! MDT HFile interop is exercised here too: whenever Spark reads or compacts
+//! an rs-written table with metadata enabled, its native HFile reader parses
+//! the rs-written MDT base files and log blocks (it ignores the comparator
+//! class name and block checksums, which are the two places our minimal
+//! writer diverges from HBase output).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -82,6 +88,12 @@ fn run_spark(env: &SparkEnv, script: &str, args: &[&str]) {
         .arg("spark.serializer=org.apache.spark.serializer.KryoSerializer")
         .arg("--conf")
         .arg("spark.ui.enabled=false")
+        // Pin the driver to loopback so parity runs survive offline /
+        // hostname-changing environments (laptop off Wi-Fi, VPN flips).
+        .arg("--conf")
+        .arg("spark.driver.bindAddress=127.0.0.1")
+        .arg("--conf")
+        .arg("spark.driver.host=127.0.0.1")
         .arg("--driver-memory")
         .arg("2g")
         .arg(env.scripts_dir.join(script))
@@ -344,6 +356,7 @@ fn row(id: &str, part: Option<&str>, ts: i64, value: i64) -> Row {
 // Scenario A: hudi-rs writes → Spark reads.
 // ---------------------------------------------------------------------------
 #[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_a_rs_writes_spark_reads() {
     if !enabled() {
         return;
@@ -396,6 +409,7 @@ async fn parity_a_rs_writes_spark_reads() {
 // Scenario B: Spark writes → hudi-rs reads.
 // ---------------------------------------------------------------------------
 #[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_b_spark_writes_rs_reads() {
     if !enabled() {
         return;
@@ -459,6 +473,7 @@ async fn parity_b_spark_writes_rs_reads() {
 // Scenario C: Spark table services on hudi-rs-written tables.
 // ---------------------------------------------------------------------------
 #[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_c_spark_services_on_rs_tables() {
     if !enabled() {
         return;
@@ -584,6 +599,7 @@ async fn parity_c_spark_services_on_rs_tables() {
 // Scenario D: interleaved writers.
 // ---------------------------------------------------------------------------
 #[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_d_interleaved_writers() {
     if !enabled() {
         return;
@@ -645,6 +661,7 @@ async fn parity_d_interleaved_writers() {
 // time-travel, and incremental queries in both engines.
 // ---------------------------------------------------------------------------
 #[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_e_mixed_workload_archival_and_query_types() {
     use std::collections::BTreeMap;
 
@@ -822,6 +839,7 @@ async fn parity_e_mixed_workload_archival_and_query_types() {
 // queries are not yet implemented.)
 // ---------------------------------------------------------------------------
 #[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_f_cdc_enabled_spark_table() {
     if !enabled() {
         return;
