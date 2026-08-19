@@ -37,7 +37,7 @@ use crate::file_group::reader_v2::buffered_record_converter::BufferedRecordConve
 use crate::file_group::reader_v2::input_split::InputSplit;
 use crate::file_group::reader_v2::iterator_mode::IteratorMode;
 use crate::file_group::reader_v2::merge_iterator::{
-    FileGroupMergeIterator, StreamStatsHandle, new_stream_stats_handle,
+    FileGroupMergeStream, StreamStatsHandle, new_stream_stats_handle,
 };
 use crate::file_group::reader_v2::output_converter::OutputConverter;
 use crate::file_group::reader_v2::profiling::profile_once;
@@ -48,6 +48,7 @@ use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
 use crate::storage::{RowFilterBuilder, Storage};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use futures::{StreamExt, TryStreamExt};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -101,7 +102,7 @@ pub struct HoodieFileGroupReader {
     // ── Mutable state (populated during read) ──────────────────────────
     // NOTE: the record buffer and base-file batches are not stored on the
     // reader — they are local to `init_record_iterators` and owned by the
-    // returned `FileGroupMergeIterator` for the rest of the read.
+    // returned `FileGroupMergeStream` for the rest of the read.
     /// Optional converter for projecting/transforming output records.
     /// Mirrors Java's `Option<UnaryOperator<T>> outputConverter`.
     output_converter: Option<Box<dyn OutputConverter>>,
@@ -109,7 +110,7 @@ pub struct HoodieFileGroupReader {
     /// Read statistics accumulator.
     read_stats: HoodieReadStats,
 
-    /// Stage-timing sink shared with the [`FileGroupMergeIterator`] returned by
+    /// Stage-timing sink shared with the [`FileGroupMergeStream`] returned by
     /// [`Self::open`]. The streaming iterator
     /// owns the buffer once `open()` returns, so the merge-phase timings
     /// (final_merge_ms, output_build_ms) and the update-processor
@@ -133,7 +134,7 @@ pub struct HoodieFileGroupReader {
     // visible to (a) the base parquet read here, and (b) the parquet log
     // block decoder in `file_group::log_file::content::Decoder`. The gate
     // (CoW || mor_pk_safe) lives at the use sites; this file's gate is at
-    // `make_base_file_source` below.
+    // `base_file_source` below.
 }
 
 /// Base-file read options carrying an optional pushdown predicate, and the
@@ -156,6 +157,28 @@ fn base_read_options(
         options = options.with_row_index_column(ROW_INDEX_TEMPORARY_COLUMN_NAME);
     }
     options
+}
+
+/// A base file as the merge consumes it: batches, plus the schema they carry.
+///
+/// The schema travels with the stream because a `Stream` has no `schema()` the
+/// way a `RecordBatchReader` does, and the merge needs it before the first
+/// batch arrives — to derive the merge schema, and to describe a base file that
+/// yields no batches at all.
+struct BaseSource {
+    schema: SchemaRef,
+    batches: crate::file_group::reader_v2::merge_iterator::BaseBatchStream,
+}
+
+impl BaseSource {
+    /// A base file that contributes nothing: no base file at all, or one the
+    /// instant range excludes.
+    fn empty(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            batches: futures::stream::empty().boxed(),
+        }
+    }
 }
 
 /// `schema` without the internal row-position column.
@@ -358,29 +381,6 @@ impl HoodieFileGroupReader {
     // Main read API (mirrors Java's getClosableIterator / getBufferedRecordIterator)
     // =========================================================================
 
-    /// Driven by the test harness and the FFI surface; `FileGroupReader` reaches the
-    /// engine through `adapter` instead.
-    #[allow(dead_code)]
-    /// Open the file group and return a streaming iterator over the merged
-    /// output. This is the modern entry point matching Java's
-    /// `getClosableIterator()` semantics.
-    ///
-    /// Async work — base file decode + log file scan + buffer population —
-    /// runs once, here. The returned [`FileGroupMergeIterator`] is then a
-    /// purely synchronous [`arrow_array::RecordBatchReader`] that emits one
-    /// chunk per `next()` (default chunk size [`DEFAULT_BATCH_SIZE`] rows).
-    ///
-    /// This is single-use: it consumes the output_converter and (for MOR)
-    /// hands the buffer to the iterator. Re-opening requires constructing a
-    /// new `HoodieFileGroupReader`.
-    pub async fn open(&mut self) -> Result<FileGroupMergeIterator> {
-        // streaming mode — the base file is held as a lazy reader that does a
-        // per-batch `block_on` against the runtime handle it was built with. The
-        // caller MUST consume the returned iterator from a synchronous context
-        // (e.g. the FFI driver), never from inside another tokio runtime.
-        self.init_record_iterators(/* streaming */ true).await
-    }
-
     /// The reader for this slice's base file format.
     ///
     /// Built per call rather than held: the format comes from the reader
@@ -396,74 +396,48 @@ impl HoodieFileGroupReader {
         Ok(create_base_file_reader(&self.storage, &format)?)
     }
 
-    /// Stream the merged output to an async caller.
+    /// Stream the merged output.
     ///
     /// [`Self::read`] returns the whole file group as one batch, so peak memory
     /// tracks the base file. This reads the base file one row group at a time
-    /// instead.
+    /// instead, merging and emitting a chunk per group.
     ///
-    /// The merge loop is synchronous and has to block on the base stream, which
-    /// is only legal off the async worker threads. So it runs on a
-    /// blocking-pool thread and hands batches back over a channel; the caller
-    /// gets an ordinary stream and never sees the blocking.
-    ///
-    /// The channel holds one batch. That lets the producer decode row group
-    /// N+1 while the consumer works on N, while bounding the extra memory to a
-    /// single row group — a deeper channel would multiply peak memory by its
-    /// depth, which is what streaming is meant to avoid.
-    pub(crate) async fn open_blocking_stream(
+    /// Demand-driven: nothing is merged until the consumer asks for it, so the
+    /// memory this adds over the merge map is one chunk. The previous shape ran
+    /// the merge on a blocking thread behind a depth-1 channel to get the same
+    /// bound; a `Stream` has it by construction.
+    pub(crate) async fn open_stream(
         &mut self,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        use futures::StreamExt;
-
-        let iter = self.init_record_iterators(/* streaming */ true).await?;
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
-        tokio::task::spawn_blocking(move || {
-            for batch in iter {
-                let item = batch.map_err(CoreError::ArrowError);
-                // A send error means the consumer dropped the stream; stop
-                // rather than decoding row groups nobody will take.
-                if tx.blocking_send(item).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        })
-        .boxed())
+        // Stage timing (perf harness): opening the base file. Only the open —
+        // the per-row-group decode is paid lazily, inside the merge.
+        let base = profile_once!(self.read_stats.base_read_ms, self.base_file_source().await)?;
+        Ok(self.init_record_iterators(base).await?.into_stream())
     }
 
     /// Read the file group and return the merged output as a single
-    /// `RecordBatch`. Internally uses the same merge code path as
-    /// [`Self::open`] but with **eager** base file decode — the parquet
-    /// stream is drained async during this method's async body, then the
-    /// resulting `Vec<RecordBatch>` is wrapped in a sync
-    /// `RecordBatchIterator` for the merge loop. That makes the merge
-    /// iterator safe to consume from async callers (no nested block_on).
+    /// `RecordBatch`.
     ///
-    /// New consumers that can use a sync iterator should prefer
-    /// [`Self::open`] for true streaming.
+    /// Same merge as [`Self::open_stream`], but the base file is collapsed to
+    /// one batch first, so the merge emits a single chunk and the rows come back
+    /// in the order this entry point has always returned them. See
+    /// [`Self::collapse_base`].
     pub async fn read(&mut self) -> Result<RecordBatch> {
-        // Eager mode — the base parquet stream is drained
-        // async during `init_record_iterators` (streaming=false), so the
-        // returned iterator's `next()` is pure in-memory work and can be driven
-        // from an async caller (no nested `block_on`). `open()` (streaming=true)
-        // instead holds a lazy `ParquetSyncReader` for true streaming peak
-        // memory, but requires a sync consumer (the FFI driver).
+        // Stage timing (perf harness): the base file open plus, here, its whole
+        // decode — `collapse_base` drives the stream to completion.
+        let base = profile_once!(
+            self.read_stats.base_read_ms,
+            Self::collapse_base(self.base_file_source().await?).await
+        )?;
         let batch = self
-            .init_record_iterators(/* streaming */ false)
+            .init_record_iterators(base)
             .await?
-            .collect_into_one_batch()?;
-        // The streaming iterator accumulated the merge-phase
-        // timings + insert/update/delete counts into the shared `stream_stats`
-        // while `collect_into_one_batch` drove it to exhaustion. Drain them back
-        // into `self.read_stats` so `read_stats()`-based callers (fg-bench,
-        // tests, reader_v1) observe the same stats the pre-streaming `read()`
-        // surfaced. (The FFI `open()` path does not read these back — Velox
-        // consumes the stream directly.)
+            .collect_into_one_batch()
+            .await?;
+        // The merge accumulated the merge-phase timings + insert/update/delete
+        // counts into the shared `stream_stats` while `collect_into_one_batch`
+        // drove it to exhaustion. Drain them back into `self.read_stats` so
+        // `read_stats()`-based callers (fg-bench, tests, reader_v1) observe them.
         self.drain_stream_stats();
         Ok(batch)
     }
@@ -484,33 +458,21 @@ impl HoodieFileGroupReader {
     }
 
     /// Initialize record iterators: read base file + scan/merge log files,
-    /// hand state to a [`FileGroupMergeIterator`].
+    /// hand state to a [`FileGroupMergeStream`].
     ///
     /// Mirrors Java's `HoodieFileGroupReader.initRecordIterators()`. The
     /// fast path (no log files = CoW / empty) returns an `Eager` iterator
     /// over the base file source; the MOR path returns a `Buffered`
     /// iterator that drives `buffer.has_next() / buffer.next()` in chunks.
     ///
-    /// The `streaming` flag controls how the base file is read:
-    /// - `true` — lazy `ParquetSyncReader` (one row group per
-    ///   `next()`; does `block_on` per call → sync-context only).
-    /// - `false` — async drain into `Vec<RecordBatch>`, wrap in
-    ///   `RecordBatchIterator` (no `block_on`; safe from async callers).
-    ///
-    /// `apply_instant_range_filter` requires a materialised Vec today, so
-    /// streaming mode falls back to eager when an instant range is active
-    /// (rare; a per-batch variant of the filter is not yet implemented).
-    ///
     /// ```text
     /// initRecordIterators()
-    ///   ├─ make_base_file_source(streaming)
     ///   └─ recordBufferLoader.getRecordBuffer(...)
-    ///        → recordBuffer.set_base_file_source(...)
-    ///        → FileGroupMergeIterator::new_buffered(...)
+    ///        → FileGroupMergeStream::new_buffered(...)
     /// ```
-    async fn init_record_iterators(&mut self, streaming: bool) -> Result<FileGroupMergeIterator> {
+    async fn init_record_iterators(&mut self, base: BaseSource) -> Result<FileGroupMergeStream> {
         log::debug!(
-            "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={} streaming={streaming}",
+            "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
             self.input_split.partition_path,
             self.input_split
                 .base_file_path
@@ -519,28 +481,17 @@ impl HoodieFileGroupReader {
             self.input_split.log_file_paths.len(),
         );
 
-        // Step 1: Open the base file source.
-        //   - streaming=true:  a lazy `ParquetSyncReader` — one parquet
-        //     row-group per `RecordBatchReader::next` call. The whole base
-        //     file never lives in memory at once.
-        //   - streaming=false (or instant-range filter active, which still
-        //     needs a materialised Vec): drain async into a `Vec<RecordBatch>`,
-        //     optionally instant-range-filter it, wrap in a `RecordBatchIterator`.
-        // Stage timing (perf harness): base parquet open + (eager) read.
-        // In streaming mode this only covers the open; the per-row-group decode
-        // cost is paid lazily inside the merge loop's `next_base_row` pulls.
-        let base_source = profile_once!(
-            self.read_stats.base_read_ms,
-            self.make_base_file_source(streaming).await
-        )?;
-        let base_source_schema = base_source.schema();
+        let BaseSource {
+            schema: base_source_schema,
+            batches: base_source,
+        } = base;
         log::debug!(
-            "[HoodieFileGroupReader] makeBaseFileSource: schema_cols={} streaming={streaming}",
+            "[HoodieFileGroupReader] base file source: schema_cols={}",
             base_source_schema.fields().len(),
         );
 
         // The post-projection output schema is the same regardless of
-        // CoW vs MOR — used as the iterator's RecordBatchReader::schema().
+        // CoW vs MOR — it is the schema every emitted chunk carries.
         let output_converter = self.output_converter.take();
         let post_projection_schema = output_converter.as_ref().map(|c| c.target_schema());
 
@@ -549,10 +500,9 @@ impl HoodieFileGroupReader {
         if self.input_split.is_base_only() {
             log::debug!("[HoodieFileGroupReader] no log files → Eager iterator");
 
-            // The base source exposes its (post-projection) schema via
-            // `RecordBatchReader::schema()` without forcing a row-group
-            // decode. For a log-only Eager FG the source is
-            // an empty `RecordBatchIterator` carrying the required schema.
+            // The schema travels with the source, so it is known without
+            // forcing a row-group decode. A log-only file group's source is
+            // empty and carries the required schema.
             let merge_schema: SchemaRef = if let Some(rs) = &self.schema_handler.required_schema {
                 rs.clone()
             } else {
@@ -564,7 +514,7 @@ impl HoodieFileGroupReader {
             // per-chunk output_build_ms (concat is gone — each base batch flows
             // through the converter as its own chunk) into `stream_stats`, which
             // `read()` drains back into `self.read_stats`.
-            return Ok(FileGroupMergeIterator::new_eager(
+            return Ok(FileGroupMergeStream::new_eager(
                 base_source,
                 output_schema,
                 output_converter,
@@ -599,7 +549,7 @@ impl HoodieFileGroupReader {
         // gave up partway through is visible (the buffer flips its own type when
         // it falls back, and nothing else records it); and every entry point goes
         // through here, so the streaming read is covered too — reporting from
-        // `read()` alone left `open_blocking_stream` silent.
+        // `read()` alone left the streaming entry point silent.
         crate::file_group::reader_v2::gaps::report_for_read(
             &self.reader_context,
             &self.reader_parameters,
@@ -618,9 +568,8 @@ impl HoodieFileGroupReader {
             self.read_stats.total_rollback_blocks,
         );
 
-        // Step 4: Determine merge_schema BEFORE handing the source to the
-        // buffer. Schema is available via `RecordBatchReader::schema()`
-        // without forcing a row-group decode.
+        // Step 4: Determine merge_schema. The base source's schema travels
+        // with it, so this needs no row-group decode.
         let merge_schema: SchemaRef = if let Some(rs) = &self.schema_handler.required_schema {
             rs.clone()
         } else if self.input_split.base_file_path.is_some() {
@@ -669,7 +618,7 @@ impl HoodieFileGroupReader {
             .expect("stream_stats mutex poisoned")
             .merge_map_peak_entries = record_buffer.merge_map_peak_entries();
 
-        Ok(FileGroupMergeIterator::new_buffered(
+        Ok(FileGroupMergeStream::new_buffered(
             record_buffer,
             base_source,
             merge_schema,
@@ -679,23 +628,6 @@ impl HoodieFileGroupReader {
         ))
     }
 
-    /// Open the base file as a `RecordBatchReader` source.
-    ///
-    /// - `streaming=true`: returns a lazy [`ParquetSyncReader`] over the
-    ///   parquet file. One row group per `RecordBatchReader::next` call.
-    ///   Sync iteration uses `block_on(stream.next())` against the runtime
-    ///   handle it was built with — caller MUST be in sync context.
-    /// - `streaming=false` (or instant range present — see note): drains
-    ///   the parquet stream into a `Vec<RecordBatch>` async, optionally
-    ///   applies the instant range filter, and wraps the Vec in a
-    ///   `RecordBatchIterator` (no `block_on` at iteration time → safe
-    ///   to consume from async callers).
-    ///
-    /// Returns an **empty** `RecordBatchIterator` (no rows) when the
-    /// input split has no base file (log-only file group).
-    ///
-    /// Mirrors Java's `HoodieFileGroupReader.makeBaseFileIterator()`,
-    /// adapted for the Rust streaming/eager split.
     /// Whether this read should merge base + log records by base-file row
     /// position (rather than by record key). Mirrors Java
     /// `HoodieFileGroupReader`'s `setShouldMergeUseRecordPosition`:
@@ -736,30 +668,37 @@ impl HoodieFileGroupReader {
         )
     }
 
-    async fn make_base_file_source(
-        &mut self,
-        streaming: bool,
-    ) -> Result<Box<dyn arrow_array::RecordBatchReader + Send>> {
+    /// Open the base file as a stream of batches, with the schema they carry.
+    ///
+    /// One shape for every caller: the base file is read asynchronously, one
+    /// row group at a time, and the whole file is never resident. A caller that
+    /// needs it as a single batch collapses it afterwards
+    /// ([`Self::collapse_base`]) — that is a choice about chunking, not about
+    /// what is safe to call from where.
+    ///
+    /// Returns an empty stream when the input split has no base file (log-only
+    /// file group), and when the instant range excludes this base file: the
+    /// range is a per-file decision, so it is settled here rather than by
+    /// reading the file and discarding its rows.
+    ///
+    /// Mirrors Java's `HoodieFileGroupReader.makeBaseFileIterator()`.
+    async fn base_file_source(&mut self) -> Result<BaseSource> {
         let Some(path) = self.input_split.base_file_path.clone() else {
             // Log-only file group — empty base. Use the required_schema
-            // as the reader's reported schema when available; otherwise
-            // empty schema (the buffer's reader_schema fallback handles
-            // schema selection downstream).
+            // as the reported schema when available; otherwise an empty
+            // schema (the buffer's reader_schema fallback handles schema
+            // selection downstream).
             let schema = self
                 .schema_handler
                 .required_schema
                 .clone()
                 .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-            let empty = arrow_array::RecordBatchIterator::new(
-                std::iter::empty::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>(),
-                schema,
-            );
-            return Ok(Box::new(empty));
+            return Ok(BaseSource::empty(schema));
         };
 
         if self.buffered_record_converter.is_none() {
             log::debug!(
-                "[HoodieFileGroupReader] make_base_file_source: no bufferedRecordConverter set \
+                "[HoodieFileGroupReader] base_file_source: no bufferedRecordConverter set \
                  (batch-level read does not require per-record conversion)"
             );
         }
@@ -795,12 +734,10 @@ impl HoodieFileGroupReader {
         // schema (`base_read_schema` = required + row-index).
         let use_position = self.use_record_position();
 
-        // No projection schema → fall back to the unprojected eager helper
-        // (rare; FFI always supplies a required_schema). Streaming variant
-        // of the unprojected helper is not exposed yet — eager Vec here.
-        // The instant-range filter (if active) must still be applied on this
-        // path — it gates the base file by its commit instant regardless of
-        // projection, so every branch of this method honors it.
+        // No projection schema → fall back to the unprojected helper (rare; FFI
+        // always supplies a required_schema). It reads the file as one batch,
+        // because its schema is only known once the file has been read, so the
+        // instant-range decision below cannot be made before reading it.
         let Some(required_schema) = self.schema_handler.required_schema.clone() else {
             let batch = self
                 .base_file_reader()?
@@ -812,17 +749,13 @@ impl HoodieFileGroupReader {
                     ))
                 })?;
             let schema = batch.schema();
-            let mut batches = vec![batch];
-            if self.reader_context.instant_range.is_some() {
-                let pre: usize = batches.iter().map(|b| b.num_rows()).sum();
-                batches = self.apply_instant_range_filter(batches)?;
-                let post: usize = batches.iter().map(|b| b.num_rows()).sum();
-                log::debug!(
-                    "[HoodieFileGroupReader] applyInstantRangeFilter (unprojected): {pre} → {post} rows"
-                );
+            if !self.base_file_in_range()? {
+                return Ok(BaseSource::empty(schema));
             }
-            let iter = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-            return Ok(Box::new(iter));
+            return Ok(BaseSource {
+                schema: schema.clone(),
+                batches: futures::stream::once(async move { Ok(batch) }).boxed(),
+            });
         };
 
         // Schema-evolution intersection (Java parity:
@@ -831,10 +764,8 @@ impl HoodieFileGroupReader {
         //   2. ask parquet only for the INTERSECTION (in the file's own types);
         //   3. project to required per batch: null-fill added columns, cast
         //      promotions (float→double string-mediated so it is value-exact).
-        // Step 3 is applied PER ROW-GROUP so it works identically on the eager
-        // (drain-then-project) and streaming (`ProjectingBatchReader`) paths —
-        // Every base batch the merge interleaves must already be in
-        // `required_schema`.
+        // Step 3 is applied PER ROW-GROUP, so every base batch the merge
+        // interleaves is already in `required_schema`.
         let file_schema = self
             .base_file_reader()?
             .read_stream(&path, BaseFileReadOptions::new())
@@ -862,7 +793,7 @@ impl HoodieFileGroupReader {
         let present_len = present.len();
         let intersection: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(present));
         log::debug!(
-            "[base-file-evolution] path={} file_cols={} required_cols={} intersect_cols={} streaming={streaming}",
+            "[base-file-evolution] path={} file_cols={} required_cols={} intersect_cols={}",
             path,
             file_schema.fields().len(),
             required_schema.fields().len(),
@@ -882,103 +813,82 @@ impl HoodieFileGroupReader {
             required_schema.clone()
         };
 
-        // Fallback to eager when the instant-range filter is active — the
-        // filter currently needs a materialised Vec. A streaming per-batch
-        // variant is not implemented yet.
-        let instant_range_active = self.reader_context.instant_range.is_some();
-        // Streaming reads the base file one row group at a time, but the merge
-        // loop is synchronous, so it has to block on the stream. That is only
-        // safe off the async worker threads — `open_blocking_stream` is the one
-        // caller that arranges it, and it is the only one that passes
-        // `streaming = true`. The instant-range filter still forces eager: it
-        // needs the batches materialized to filter them.
-        let force_eager = !streaming || instant_range_active;
-
-        if force_eager {
-            // Async drain to the intersection, evolve to `required_schema`,
-            // apply the instant-range filter, wrap the Vec. the
-            // (CoW-gated) RowFilter is threaded through the intersection read so
-            // row groups can be pruned via column-index stats (the builder
-            // resolves predicate columns by name and returns None when any
-            // referenced column is absent — safe even for evolved/added cols).
-            let raw = self
-                .base_file_reader()?
-                .read_data(
-                    &path,
-                    base_read_options(row_filter.clone(), use_position)
-                        .with_projection(intersection.fields().iter().map(|f| f.name())),
-                )
-                .await
-                .map_err(|e| {
-                    CoreError::ReadFileSliceError(format!(
-                        "Failed to read base file '{path}' with projection: {e:?}"
-                    ))
-                })?;
-            let evolved =
-                crate::schema::batch_evolution::project_batch_to_schema(&raw, &base_read_schema)?;
-            let mut batches = vec![evolved];
-            if instant_range_active {
-                let pre: usize = batches.iter().map(|b| b.num_rows()).sum();
-                batches = self.apply_instant_range_filter(batches)?;
-                let post: usize = batches.iter().map(|b| b.num_rows()).sum();
-                log::debug!("[HoodieFileGroupReader] applyInstantRangeFilter: {pre} → {post} rows");
-            }
-            let iter = arrow_array::RecordBatchIterator::new(
-                batches.into_iter().map(Ok),
-                base_read_schema,
-            );
-            Ok(Box::new(iter))
-        } else {
-            // Open the base file as a stream and adapt it back to the iterator
-            // the merge loop wants. The whole file never lives in memory; one
-            // row group does.
-            let base_stream = self
-                .base_file_reader()?
-                .read_stream(
-                    &path,
-                    base_read_options(row_filter.clone(), use_position)
-                        .with_projection(intersection.fields().iter().map(|f| f.name())),
-                )
-                .await
-                .map_err(|e| {
-                    CoreError::ReadFileSliceError(format!(
-                        "Failed to open base file stream '{path}': {e:?}"
-                    ))
-                })?;
-
-            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                CoreError::Unsupported(
-                    "A streaming base file read needs a tokio runtime to block on.".to_string(),
-                )
-            })?;
-            let evolve_to = base_read_schema.clone();
-            let evolved = futures::StreamExt::map(base_stream.into_stream(), move |b| match b {
-                Ok(batch) => {
-                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
-                }
-                Err(e) => Err(CoreError::from(e)),
-            });
-
-            Ok(Box::new(BlockingBatchReader {
-                schema: base_read_schema,
-                stream: futures::StreamExt::boxed(evolved),
-                handle,
-            }))
+        // The instant range excludes whole base files, and the decision needs
+        // only the file's commit instant, so it is made before opening rather
+        // than by reading every row and dropping them.
+        if !self.base_file_in_range()? {
+            return Ok(BaseSource::empty(base_read_schema));
         }
+
+        // Open the base file as a stream. The whole file never lives in memory;
+        // one row group does. The (CoW-gated) RowFilter is threaded through the
+        // intersection read so row groups can be pruned via column-index stats
+        // (the builder resolves predicate columns by name and returns None when
+        // any referenced column is absent — safe even for evolved/added cols).
+        let base_stream = self
+            .base_file_reader()?
+            .read_stream(
+                &path,
+                base_read_options(row_filter.clone(), use_position)
+                    .with_projection(intersection.fields().iter().map(|f| f.name())),
+            )
+            .await
+            .map_err(|e| {
+                CoreError::ReadFileSliceError(format!(
+                    "Failed to open base file stream '{path}': {e:?}"
+                ))
+            })?;
+
+        let evolve_to = base_read_schema.clone();
+        let evolved = futures::StreamExt::map(base_stream.into_stream(), move |b| match b {
+            Ok(batch) => {
+                crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+            }
+            Err(e) => Err(CoreError::from(e)),
+        });
+
+        Ok(BaseSource {
+            schema: base_read_schema,
+            batches: evolved.boxed(),
+        })
     }
 
-    // NOTE: the FileGroupMergeIterator owns the OutputConverter and applies
-    // it per emitted chunk in its `Iterator::next()`. The reader's
-    // `output_converter` field only lives up to
-    // `open()`, which takes ownership and hands it to the iterator.
+    /// Collapse a base source into a single batch.
+    ///
+    /// [`Self::read`] returns the file group as one `RecordBatch`, and merging
+    /// the base one row group at a time would interleave kept base rows with
+    /// log-side replacements per group instead of emitting all of the former
+    /// then all of the latter. The rows are the same either way and Hudi
+    /// promises no order, but the two are not the same sequence, so the
+    /// single-batch API keeps the shape it has always returned.
+    async fn collapse_base(base: BaseSource) -> Result<BaseSource> {
+        let BaseSource { schema, batches } = base;
+        let collected: Vec<RecordBatch> = batches.try_collect().await?;
+        let batches = match collected.len() {
+            0 => futures::stream::empty().boxed(),
+            1 => {
+                let only = collected.into_iter().next().expect("length checked");
+                futures::stream::once(async move { Ok(only) }).boxed()
+            }
+            _ => {
+                let one = arrow::compute::concat_batches(&schema, &collected).map_err(|e| {
+                    CoreError::ReadFileSliceError(format!(
+                        "Failed to concatenate the base file's row groups: {e}"
+                    ))
+                })?;
+                futures::stream::once(async move { Ok(one) }).boxed()
+            }
+        };
+        Ok(BaseSource { schema, batches })
+    }
 
-    /// Filter a base file's rows by the instant range, at the **file level**.
+    /// Whether this slice's base file is inside the read's instant range.
     ///
     /// A Hudi base file belongs to exactly one commit instant — encoded in its
     /// file name (`<fileId>_<writeToken>_<commit>.<ext>`) and surfaced as
-    /// [`InputSplit::base_file_commit_time`]. So every row in the file shares that
-    /// one instant, and the range test is a single per-file decision: keep the
-    /// whole file or drop it.
+    /// [`InputSplit::base_file_commit_time`]. So every row in the file shares
+    /// that one instant, and the range test is a single per-file decision: keep
+    /// the whole file or drop it.
     ///
     /// This mirrors the Java reader. `HoodieFileGroupReader` only applies
     /// `applyInstantRangeFilter` when `getInstantRange().isPresent()` (empty on a
@@ -994,15 +904,14 @@ impl HoodieFileGroupReader {
     /// (`hoodie.populate.meta.fields=false`) persist a NULL `_hoodie_commit_time`,
     /// so every base row would be masked out and the read would silently return
     /// 0 rows even though the file's own instant is in range.
-    fn apply_instant_range_filter(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
-        let instant_range = match &self.reader_context.instant_range {
-            Some(range) => range,
-            None => return Ok(batches),
+    fn base_file_in_range(&self) -> Result<bool> {
+        let Some(instant_range) = &self.reader_context.instant_range else {
+            return Ok(true);
         };
 
         // Skip filtering for metadata table (mirrors Java line 356).
         if crate::util::path::is_metadata_table_path(&self.reader_context.table_path) {
-            return Ok(batches);
+            return Ok(true);
         }
 
         // Production: the FFI sets `base_file_commit_time`. Fall back to parsing it
@@ -1016,20 +925,24 @@ impl HoodieFileGroupReader {
         });
 
         let timezone = self.reader_context.timezone();
-        if Self::base_file_in_instant_range(file_commit_time.as_deref(), instant_range, &timezone)?
-        {
-            Ok(batches)
-        } else {
+        let keep = Self::base_file_in_instant_range(
+            file_commit_time.as_deref(),
+            instant_range,
+            &timezone,
+        )?;
+        if !keep {
             log::debug!(
-                "[HoodieFileGroupReader] applyInstantRangeFilter: base file commit {file_commit_time:?} \
-                 outside instant range — excluding the whole base file"
+                "[HoodieFileGroupReader] base file commit {file_commit_time:?} outside the \
+                 instant range — excluding the whole base file"
             );
-            // Whole base file excluded (inflight / rolled-back commit). The caller
-            // wraps the result Vec in a RecordBatchIterator carrying an explicit
-            // schema, so an empty Vec is a correct 0-row base source.
-            Ok(Vec::new())
         }
+        Ok(keep)
     }
+
+    // NOTE: the FileGroupMergeStream owns the OutputConverter and applies
+    // it per emitted chunk in its `Iterator::next()`. The reader's
+    // `output_converter` field only lives up to
+    // `open()`, which takes ownership and hands it to the iterator.
 
     /// Best-effort parse of a base file's commit instant from its path
     /// (`…/<fileId>_<writeToken>_<commit>.<ext>`). Fallback for when
@@ -1252,38 +1165,6 @@ impl HoodieFileGroupReaderBuilder {
     }
 }
 
-/// Pulls an async base file stream from a synchronous caller, one batch per
-/// `next()`.
-///
-/// The merge loop is synchronous, so a streaming base file has to be turned
-/// back into an iterator somewhere. Doing that means blocking on the stream,
-/// which is only legal off the async worker threads — so this must be driven
-/// from a blocking-pool thread, which is what
-/// [`FileGroupReader::open_blocking_stream`] arranges. Driving it from a worker
-/// would deadlock.
-struct BlockingBatchReader {
-    schema: SchemaRef,
-    stream: futures::stream::BoxStream<'static, Result<RecordBatch>>,
-    handle: tokio::runtime::Handle,
-}
-
-impl Iterator for BlockingBatchReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        use futures::StreamExt;
-        self.handle
-            .block_on(self.stream.next())
-            .map(|r| r.map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e))))
-    }
-}
-
-impl arrow_array::RecordBatchReader for BlockingBatchReader {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,6 +1269,26 @@ mod tests {
         writer.close().unwrap();
     }
 
+    /// As [`write_parquet_file`], but capping the row-group size so the file has
+    /// several of them. A base file with one row group cannot tell a reader that
+    /// keeps every group from one that keeps the first.
+    fn write_parquet_file_in_row_groups(
+        dir: &std::path::Path,
+        name: &str,
+        batch: &RecordBatch,
+        rows_per_group: usize,
+    ) {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(rows_per_group)
+            .build();
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+
     /// Build a `HoodieFileGroupReader` rooted at `dir`, with a base file at
     /// `base_name` and `required` set as the `required_schema` driving the read.
     async fn test_file_group_reader_for_base_file(
@@ -1421,19 +1322,17 @@ mod tests {
         )
         .unwrap();
 
-        // Drive make_base_file_source with the exact required schema under test,
+        // Drive base_file_source with the exact required schema under test,
         // bypassing prepare_required_schema's meta/key-field augmentation.
         reader.schema_handler.required_schema = Some(required);
         reader
     }
 
-    /// Drain a base-file source reader into one concatenated `RecordBatch`,
-    /// asserting it reports the requested schema. Shared by the eager + streaming
-    /// schema-evolution tests.
-    fn drain_base_source(source: Box<dyn arrow_array::RecordBatchReader + Send>) -> RecordBatch {
-        use arrow_array::RecordBatchReader as _;
-        let schema = source.schema();
-        let batches: Vec<RecordBatch> = source.map(|r| r.unwrap()).collect();
+    /// Drain a base file source into one concatenated `RecordBatch`, under the
+    /// schema the source reports.
+    async fn drain_base_source(source: BaseSource) -> RecordBatch {
+        let BaseSource { schema, batches } = source;
+        let batches: Vec<RecordBatch> = batches.map(|r| r.unwrap()).collect().await;
         if batches.is_empty() {
             RecordBatch::new_empty(schema)
         } else {
@@ -1446,18 +1345,12 @@ mod tests {
     /// widened, float→double value-exact. Mirrors Java's HoodieParquetFileFormatHelper.
     ///
     /// Runs against BOTH base-file source modes —
-    /// `streaming=false` (eager drain + per-batch evolve) and `streaming=true`
-    /// (lazy `ParquetSyncReader` + `ProjectingBatchReader` per row-group) — to
-    /// prove the streaming path enforces the same schema evolution as the eager
-    /// path. The two outputs must be byte-identical.
-    ///
-    /// This is a plain `#[test]` (NOT `#[tokio::test]`): the streaming source is
-    /// a `ParquetSyncReader` that does `block_on(stream.next())` per row-group,
-    /// which panics if driven from inside an async runtime. Async setup runs on
-    /// the test's own runtime and we then drain from a sync context — mirroring
-    /// the FFI driver's `open()` → sync `get_next` call shape.
+    /// Runs against the base source as the merge sees it and against its
+    /// collapsed single-batch form — the shape `read()` merges — to prove the
+    /// evolution is applied per row group and does not depend on how the base is
+    /// chunked. The two outputs must be byte-identical.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_make_base_file_source_schema_on_write_evolution() {
+    async fn test_base_file_source_schema_on_write_evolution() {
         use arrow_array::{Float32Array, Int32Array};
         // -- write a parquet base file with OLD schema --
         let tmp = tempfile::tempdir().unwrap();
@@ -1508,35 +1401,27 @@ mod tests {
             assert!(out.column(3).is_null(0), "added column null-filled");
         };
 
-        // Open both base-file sources with async setup; the eager one is
-        // drained here and the streaming one on a blocking-pool thread below.
-        let req = required.clone();
+        // One base source shape now. Compare it against its collapsed form -
+        // the shape `read()` merges - so the row-group path and the
+        // single-batch path are still pinned to each other.
         let dir = tmp.path().to_path_buf();
-        let (eager_src, stream_src) = async {
-            let mut reader =
-                test_file_group_reader_for_base_file(&dir, base_name, req.clone()).await;
-            let eager_src = reader.make_base_file_source(false).await.unwrap();
-            let mut reader2 =
-                test_file_group_reader_for_base_file(&dir, base_name, req.clone()).await;
-            let stream_src = reader2.make_base_file_source(true).await.unwrap();
-            (eager_src, stream_src)
-        }
+        let mut reader =
+            test_file_group_reader_for_base_file(&dir, base_name, required.clone()).await;
+        let streamed = drain_base_source(reader.base_file_source().await.unwrap()).await;
+        assert_evolved(&streamed);
+
+        let mut reader2 =
+            test_file_group_reader_for_base_file(&dir, base_name, required.clone()).await;
+        let collapsed = drain_base_source(
+            HoodieFileGroupReader::collapse_base(reader2.base_file_source().await.unwrap())
+                .await
+                .unwrap(),
+        )
         .await;
-
-        // Eager path (streaming=false): async drain + per-batch evolve.
-        let eager_out = drain_base_source(eager_src);
-        assert_evolved(&eager_out);
-
-        // The streaming source blocks on its base stream, so it has to be
-        // drained off the worker threads — the same contract every real caller
-        // honors via `open_blocking_stream`.
-        let stream_out = tokio::task::spawn_blocking(move || drain_base_source(stream_src))
-            .await
-            .unwrap();
-        assert_evolved(&stream_out);
+        assert_evolved(&collapsed);
         assert_eq!(
-            eager_out, stream_out,
-            "streaming base source must produce byte-identical output to the eager path"
+            streamed, collapsed,
+            "collapsing the base to one batch must not change what it decodes to"
         );
     }
 
@@ -1549,7 +1434,7 @@ mod tests {
     /// on both the eager and streaming sources, which open the parquet file
     /// through different calls and could disagree.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_make_base_file_source_carries_row_positions_for_position_merge() {
+    async fn test_base_file_source_carries_row_positions_for_position_merge() {
         use arrow_array::{Int32Array, Int64Array};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1594,7 +1479,7 @@ mod tests {
         };
 
         let mut positional = build(true).await;
-        let eager = drain_base_source(positional.make_base_file_source(false).await.unwrap());
+        let eager = drain_base_source(positional.base_file_source().await.unwrap()).await;
         let positions = eager
             .column_by_name(ROW_INDEX_TEMPORARY_COLUMN_NAME)
             .expect("position merge needs the row-position column on the base source")
@@ -1603,21 +1488,8 @@ mod tests {
             .expect("row positions are Int64");
         assert_eq!(positions.values(), &[0, 1, 2]);
 
-        let mut positional_streaming = build(true).await;
-        let streaming_source = positional_streaming
-            .make_base_file_source(true)
-            .await
-            .unwrap();
-        let streamed = tokio::task::spawn_blocking(move || drain_base_source(streaming_source))
-            .await
-            .unwrap();
-        assert_eq!(
-            streamed, eager,
-            "the streaming base source must carry the same positions as the eager one"
-        );
-
         let mut keyed = build(false).await;
-        let without = drain_base_source(keyed.make_base_file_source(false).await.unwrap());
+        let without = drain_base_source(keyed.base_file_source().await.unwrap()).await;
         assert_eq!(
             without.schema(),
             required,
@@ -1656,8 +1528,8 @@ mod tests {
 
         let mut reader =
             test_file_group_reader_for_base_file(tmp.path(), base_name, required.clone()).await;
-        let source = reader.make_base_file_source(false).await.unwrap();
-        let out = drain_base_source(source);
+        let source = reader.base_file_source().await.unwrap();
+        let out = drain_base_source(source).await;
         assert_eq!(out.schema(), required);
         let id = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
         assert!(
@@ -1674,7 +1546,7 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════
     // builder routes `with_row_filter_builder` and
     // `with_mor_pk_safe` onto the shared `reader_context` so both the base
-    // parquet read site (this file's `make_base_file_source`) and the
+    // parquet read site (this file's `base_file_source`) and the
     // parquet log block decoder (`file_group::log_file::content::Decoder`)
     // see the same gating decision.
     //
@@ -1992,14 +1864,71 @@ mod tests {
         );
     }
 
-    /// The streaming path must return exactly what the eager one does. It reads
-    /// the base file a row group at a time instead of whole, which is a memory
-    /// difference, not a data one — so any divergence here is a bug rather than
-    /// a tradeoff.
+    /// Every row group of the base file reaches the output, on both entry
+    /// points.
     ///
-    /// Multi-threaded flavor on purpose: the merge loop blocks on the base
-    /// stream from a blocking-pool thread, which needs worker threads still
-    /// available to drive it.
+    /// `read()` collapses the base to one batch before merging, and a collapse
+    /// that kept only the first row group would return fewer rows and raise
+    /// nothing — the exact shape of silent data loss this path must not have.
+    /// No other test can see it: every base file elsewhere in the suite fits in
+    /// a single row group, so keeping one group and keeping all of them look
+    /// identical. The stream side asserts more than one chunk, which is what
+    /// proves the fixture really has several groups.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_every_base_row_group_reaches_the_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            true,
+        )]));
+        let ids: Vec<i32> = (0..40).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from(ids.clone()))],
+        )
+        .unwrap();
+        let base_name = "many-groups.parquet";
+        write_parquet_file_in_row_groups(tmp.path(), base_name, &batch, 10);
+
+        let read_ids = |b: &RecordBatch| -> Vec<i32> {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+
+        let mut eager =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+        let one = eager.read().await.unwrap();
+        assert_eq!(
+            read_ids(&one),
+            ids,
+            "read() must return every row of every row group"
+        );
+
+        let mut streamed =
+            test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
+        let mut stream = streamed.open_stream().await.unwrap();
+        let mut chunks = 0usize;
+        let mut got: Vec<i32> = Vec::new();
+        while let Some(b) = stream.next().await {
+            chunks += 1;
+            got.extend(read_ids(&b.unwrap()));
+        }
+        assert!(
+            chunks > 1,
+            "the fixture must span several row groups for this test to mean anything, got {chunks}"
+        );
+        assert_eq!(got, ids, "the streamed read must return every row too");
+    }
+
+    /// The streaming path must return exactly what the single-batch one does.
+    /// It merges the base file a row group at a time instead of whole, which is
+    /// a memory and chunking difference, not a data one — so any divergence in
+    /// the rows is a bug rather than a tradeoff.
     #[tokio::test(flavor = "multi_thread")]
     async fn streaming_and_eager_reads_agree() {
         use futures::StreamExt;
@@ -2029,18 +1958,44 @@ mod tests {
 
         let mut stream_reader =
             test_file_group_reader_for_base_file(tmp.path(), base_name, schema.clone()).await;
-        let mut stream = stream_reader.open_blocking_stream().await.unwrap();
-        let mut streamed_rows = 0usize;
-        let mut streamed_batches = 0usize;
+        let mut stream = stream_reader.open_stream().await.unwrap();
+        let mut streamed: Vec<RecordBatch> = Vec::new();
         while let Some(b) = stream.next().await {
-            streamed_rows += b.unwrap().num_rows();
-            streamed_batches += 1;
+            streamed.push(b.unwrap());
         }
-
-        assert_eq!(streamed_rows, eager.num_rows());
         assert!(
-            streamed_batches > 0,
+            !streamed.is_empty(),
             "the stream yielded nothing; it should emit at least one batch"
+        );
+
+        // Row content, not just a count. Counting alone passes for a stream that
+        // returns the right number of wrong rows, which is the failure a merge
+        // rewrite actually produces. Sorted, because the two entry points chunk
+        // the base differently and Hudi promises no row order.
+        let render = |batches: &[RecordBatch]| -> Vec<String> {
+            let mut out: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    (0..b.num_rows()).map(move |r| {
+                        (0..b.num_columns())
+                            .map(|c| {
+                                format!(
+                                    "{:?}",
+                                    arrow::util::display::array_value_to_string(b.column(c), r)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            render(&streamed),
+            render(std::slice::from_ref(&eager)),
+            "the streamed read must return the same rows as the single-batch read"
         );
     }
 }

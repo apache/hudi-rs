@@ -2216,7 +2216,7 @@ mod streaming_queries {
     ///
     /// Deliberately does NOT assert a chunk count for version 2. Its cadence
     /// follows the base file's row groups, not `batch_size` — which
-    /// `FileGroupMergeIterator::new_buffered` accepts and discards (see its
+    /// `FileGroupMergeStream::new_buffered` accepts and discards (see its
     /// `_batch_size` parameter). These fixtures are a single row group, so one
     /// chunk is the correct answer for them, and asserting more would pin the
     /// fixture's size rather than the reader's behavior.
