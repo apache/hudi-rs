@@ -986,6 +986,23 @@ impl HoodieFileGroupReader {
     /// Java-parity accessors; the adapter reads the stats it needs off the returned
     /// value.
     #[allow(dead_code)]
+    /// The stats this read accumulated.
+    ///
+    /// Complete after [`Self::read`], which folds the merge-phase counters back
+    /// in once the merge is exhausted. **After [`Self::open_stream`] the
+    /// merge-phase counters read zero** - `final_merge_ms`, `output_build_ms`,
+    /// `merge_map_peak_entries` and the insert/update/delete counts accumulate
+    /// into the shared `stream_stats` handle as the stream is consumed, and
+    /// nothing folds them back, because the caller owns the stream and the
+    /// reader cannot know when it ended. The scan-phase counters (log blocks,
+    /// log records, corrupt blocks, rollbacks, base read) are populated on both
+    /// paths.
+    ///
+    /// Worth stating because the gap is silent and reads as data: a streaming
+    /// read of a fixture with five deletes reports `num_deletes: 0` while
+    /// returning exactly the same rows as the eager read that reports five. No
+    /// production caller reads these - only the test harness and the benchmark
+    /// do - but that is precisely where a zero would be believed.
     pub fn read_stats(&self) -> &HoodieReadStats {
         &self.read_stats
     }
