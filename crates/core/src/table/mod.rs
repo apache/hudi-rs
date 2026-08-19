@@ -2753,6 +2753,92 @@ mod tests {
     /// had a bounded row-group-at-a-time form with no caller. Asserting more than
     /// one batch is what keeps this honest: with the old fallback it was always
     /// exactly one.
+    /// A real merge-on-read read completes on a single-worker runtime without
+    /// starving a task sharing it, and returns the same rows as the eager read.
+    ///
+    /// `current_thread` is the point: one worker, so a read that monopolised it
+    /// outright - or that reached the deleted blocking bridge from inside the
+    /// runtime - would deadlock or starve the ticker completely, and this test
+    /// would hang or fail. It is a liveness check over the whole production path:
+    /// table open, log scan and gating, log-content fetch, base file, merge.
+    ///
+    /// **What it does NOT prove, established by mutation rather than assumed:**
+    /// it cannot detect blocking. Making `StorageReader::fill_window` sleep
+    /// 200 ms on the worker thread - twice, inside the log read - leaves this
+    /// test passing, because the assertions only require the ticker to advance
+    /// somewhere in each window and a real read has many other await points that
+    /// mask a blocked one. A pass here is not evidence that nothing blocks.
+    ///
+    /// What does pin non-blocking, and where:
+    ///   - the merge loop: `merge_stream_lets_other_tasks_run_between_chunks`,
+    ///     which owns every await in its base source and so cannot be masked;
+    ///   - the log read: no `block_on` remains in this crate outside test
+    ///     helpers - a structural property, asserted by no test.
+    #[tokio::test]
+    async fn test_a_merge_on_read_read_runs_on_a_single_worker_runtime() {
+        use crate::config::read::HudiReadConfig;
+        use futures::StreamExt;
+        use hudi_test::QuickstartTripsTable;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
+
+        let mut stream = table.read_stream(&options).await.unwrap();
+        let before_first = ticks.load(Ordering::SeqCst);
+
+        let first = stream
+            .next()
+            .await
+            .expect("the fixture yields at least one chunk")
+            .unwrap();
+        let after_first = ticks.load(Ordering::SeqCst);
+        assert!(
+            after_first > before_first,
+            "the ticker never ran while the log scan and base open happened \
+             ({before_first} -> {after_first}); that phase starved the only worker"
+        );
+
+        let mut rows = first.num_rows();
+        let mut chunks = 1usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch.unwrap().num_rows();
+            chunks += 1;
+        }
+        let after_all = ticks.load(Ordering::SeqCst);
+        assert!(
+            after_all > after_first,
+            "the ticker did not advance across the remaining {} chunk(s) \
+             ({after_first} -> {after_all}); the merge held the only worker thread",
+            chunks - 1
+        );
+
+        // The read still has to be a read.
+        assert!(rows > 0, "the fixture must return rows");
+        let eager: usize = table
+            .read(&options)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, eager, "the streamed read must return the same rows");
+
+        ticker.abort();
+    }
+
     #[tokio::test]
     async fn test_stream_merges_a_slice_incrementally_and_matches_the_eager_read() {
         use crate::config::read::HudiReadConfig;
