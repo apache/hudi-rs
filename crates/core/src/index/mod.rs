@@ -81,3 +81,15 @@ pub fn for_table(table: &Table) -> TableIndex {
         TableIndex::Simple(SimpleIndex)
     }
 }
+
+/// Like [`for_table`], but also confirms the record index actually has file
+/// groups before choosing it — an advertised-but-unpopulated index answers
+/// every lookup with "not found", which turns updates into duplicate inserts.
+/// Java applies the same two-part check before tagging.
+pub async fn for_table_checked(table: &Table) -> TableIndex {
+    if record::record_index_has_file_groups(table).await {
+        TableIndex::Record(RecordIndex)
+    } else {
+        TableIndex::Simple(SimpleIndex)
+    }
+}

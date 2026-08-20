@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::Result;
-use crate::config::table::HudiTableConfig::RecordIndexEnabled;
 use crate::error::CoreError;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use crate::hfile::{HFileReader, HFileRecord};
@@ -158,19 +157,42 @@ fn apply_hfile_records(
     Ok(())
 }
 
-/// Whether the table has record index enabled.
+/// Whether the table's record index is available for use.
 ///
-/// Prefer the Java table property `hoodie.table.metadata.partitions` containing
-/// `record_index`. The write-side key `hoodie.metadata.record.index.enable` is
-/// also honored when present (runtime option), but is not required on disk.
+/// Only `hoodie.table.metadata.partitions` can answer this: it is written after
+/// the partition is actually bootstrapped, so it means "initialized", not
+/// "wanted". Java gates on the same property (`isMetadataPartitionAvailable`)
+/// and falls back to a global simple index otherwise. Honoring the write-side
+/// wish `hoodie.metadata.record.index.enable` here would select an index that
+/// was never built: every lookup would miss, so upserts would duplicate rows
+/// and deletes would silently do nothing. That key still enables the partition
+/// at table-create time, where it is bootstrapped for real.
 pub fn is_record_index_enabled(table: &Table) -> bool {
     use crate::config::table::HudiTableConfig::MetadataTablePartitions;
     let from_partitions: Vec<String> = table
         .hudi_configs
         .get_or_default(MetadataTablePartitions)
         .into();
-    if from_partitions.iter().any(|p| p == "record_index") {
-        return true;
+    from_partitions.iter().any(|p| p == "record_index")
+}
+
+/// Whether the record index is both advertised and actually populated.
+///
+/// Java requires BOTH (`isMetadataPartitionAvailable` AND a non-zero file
+/// group count) before tagging through the RLI, falling back to a global index
+/// otherwise "so that tagLocation is still accurate and there are no
+/// duplicates". A partition that advertises the index but has no file groups
+/// would answer every lookup with "not found", turning updates into duplicate
+/// inserts and deletes into no-ops.
+pub(crate) async fn record_index_has_file_groups(table: &Table) -> bool {
+    if !is_record_index_enabled(table) {
+        return false;
     }
-    table.hudi_configs.get_or_default(RecordIndexEnabled).into()
+    crate::write::metadata::mdt_partition_latest_slices(
+        table.file_system_view.storage.as_ref(),
+        MetadataPartitionType::RecordIndex.partition_name(),
+    )
+    .await
+    .map(|slices| !slices.is_empty())
+    .unwrap_or(false)
 }

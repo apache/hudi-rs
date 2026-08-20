@@ -32,7 +32,7 @@ use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, filters_to_row_mask, validate_fields_against_schemas};
 use crate::file_group::record_batches::RecordBatches;
-use crate::index::{HoodieIndex, HoodieKey, for_table, is_record_index_enabled};
+use crate::index::{HoodieIndex, HoodieKey, is_record_index_enabled};
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
@@ -173,7 +173,8 @@ pub async fn upsert_batches(
     let key_name = record_key_name(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
     let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
-    let locations = for_table(table)
+    let locations = crate::index::for_table_checked(table)
+        .await
         .tag_location(table, &incoming_hoodie_keys)
         .await?;
     // Small-file packing (Java UpsertPartitioner.assignInserts): assign insert
@@ -408,7 +409,10 @@ pub async fn upsert_batches(
                 record_key: key.record_key.clone(),
                 partition_path,
                 file_id,
-                instant_time_millis: instant_to_epoch_millis(&instant),
+                instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                    &instant,
+                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                ),
                 is_deleted: false,
             })
         })
@@ -589,7 +593,10 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         return mor_delete_keys(table, delete_keys).await;
     }
     ensure_rewrite_supported(table)?;
-    let locations = for_table(table).tag_location(table, delete_keys).await?;
+    let locations = crate::index::for_table_checked(table)
+        .await
+        .tag_location(table, delete_keys)
+        .await?;
     let affected_file_ids = locations
         .values()
         .filter_map(|loc| loc.as_ref().map(|l| l.file_id.clone()))
@@ -642,16 +649,25 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
 /// Enumerate the latest file slices' (file id, base path) pairs — the
 /// metadata a replace commit needs — without reading any data. `partitions`
 /// limits the listing; `None` covers the whole table.
+#[allow(clippy::type_complexity)]
 async fn replaced_groups_from_listing(
     table: &Table,
     partitions: Option<&HashSet<String>>,
-) -> Result<(Vec<String>, Vec<String>, Vec<(String, String)>)> {
+) -> Result<(
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String)>,
+    Vec<crate::file_group::file_slice::FileSlice>,
+    Vec<String>,
+)> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
     let mut file_ids = Vec::new();
     let mut old_paths = Vec::new();
     // Log-only MOR slices have no base path but must still be excluded by
     // the replace commit, or their records outlive the overwrite.
     let mut log_only = Vec::new();
+    let mut replaced_log_paths = Vec::new();
+    let mut replaced_slices = Vec::new();
     for slice in slices {
         if let Some(partitions) = partitions
             && !partitions.contains(&slice.partition_path)
@@ -665,8 +681,80 @@ async fn replaced_groups_from_listing(
             }
             None => log_only.push((slice.partition_path.clone(), slice.file_id().to_string())),
         }
+        // Log files of replaced slices are replaced too, but they must stay
+        // OUT of `old_paths`, which is positionally zipped with `file_ids`.
+        for log in &slice.log_files {
+            replaced_log_paths.push(relative_data_path(&slice.partition_path, &log.file_name()));
+        }
+        replaced_slices.push(slice);
     }
-    Ok((file_ids, old_paths, log_only))
+    Ok((
+        file_ids,
+        old_paths,
+        log_only,
+        replaced_slices,
+        replaced_log_paths,
+    ))
+}
+
+/// RLI tombstones for keys that a replace commit drops.
+///
+/// Java emits these at replacecommit time (BaseRecordIndexer's left-anti-join
+/// of the replaced groups' keys against the commit's upserts): without them the
+/// index keeps pointing at replaced file groups forever — there is no cleaner
+/// to remove them — and a Java writer, whose tagging does no live-slice
+/// validation, routes updates into dead groups.
+///
+/// Reads one replaced slice at a time, projected to the record-key column, so
+/// no file group's data columns are ever materialized. The returned tombstone
+/// list is still proportional to the number of dropped keys, which is inherent
+/// to the operation: Java does the same work spread across a Spark job, while
+/// this writer is single-node (see docs/gaps.md).
+async fn rli_deletes_for_replaced_groups(
+    table: &Table,
+    replaced: &[crate::file_group::file_slice::FileSlice],
+    surviving_keys: &HashSet<String>,
+    instant: &str,
+) -> Result<Vec<RecordIndexEntry>> {
+    if !is_record_index_enabled(table) || replaced.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key_field = MetaField::RecordKey.as_ref();
+    // Record keys only: never materialize a replaced group's data columns.
+    let options = ReadOptions::new().with_projection([key_field]);
+    let reader = table
+        .create_file_group_reader_with_options(Some(&options), std::iter::empty::<(&str, String)>())
+        .await?;
+    let millis = instant_to_epoch_millis(instant);
+    let mut entries = Vec::new();
+    for slice in replaced {
+        let batch = reader.read_file_slice(slice, &options).await?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // A table without populated meta fields has no record keys to index;
+        // there is nothing to tombstone and nothing to fail over.
+        if batch.column_by_name(key_field).is_none() {
+            continue;
+        }
+        for key in keys(&batch, key_field)? {
+            if surviving_keys.contains(&key) {
+                continue;
+            }
+            entries.push(RecordIndexEntry {
+                record_key: key,
+                // update_record_index shards by record key and writes into the
+                // MDT partition, so the data partition path is not consulted
+                // for deletes; reading it here would fail tables that do not
+                // carry the column.
+                partition_path: slice.partition_path.clone(),
+                file_id: String::new(),
+                instant_time_millis: millis,
+                is_deleted: true,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 /// Build merge plans for the latest slices matching `include`, with `op`
@@ -713,15 +801,22 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
         ));
     }
     validate_write_input(table, batches, "overwrite").await?;
-    // Only the listing is needed to enumerate replaced groups — never the data.
+    // Listing enumerates the replaced groups; their record keys are read
+    // (key column only) afterwards to tombstone dropped index entries.
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
-    let (file_ids, old_paths, log_only) = replaced_groups_from_listing(table, None).await?;
+    let (file_ids, old_paths, log_only, replaced_slices, replaced_log_paths) =
+        replaced_groups_from_listing(table, None).await?;
     let instant =
         request_rewrite_instant(table, "INSERT_OVERWRITE_TABLE", RewriteKind::Replace).await?;
     let file_id = crate::write::new_file_id();
     let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let batches = prepare_batches_for_write(&table.hudi_configs, batches, &instant, &file_name)?;
     let replacement = concat(&batches)?;
+    let surviving: HashSet<String> = keys(&replacement, MetaField::RecordKey.as_ref())?
+        .into_iter()
+        .collect();
+    let rli_deletes =
+        rli_deletes_for_replaced_groups(table, &replaced_slices, &surviving, &instant).await?;
     rewrite(
         table,
         &instant,
@@ -730,11 +825,12 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
         file_ids,
         old_paths,
         log_only,
+        replaced_log_paths,
         "INSERT_OVERWRITE_TABLE",
         0,
         replacement.num_rows(),
         0,
-        Vec::new(),
+        rli_deletes,
         RewriteKind::Replace,
     )
     .await
@@ -784,7 +880,7 @@ pub async fn dynamic_partition_overwrite_batches(
     let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
     let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let replacement = concat(&prepared)?;
-    let (file_ids, old_paths, log_only) =
+    let (file_ids, old_paths, log_only, replaced_slices, replaced_log_paths) =
         replaced_groups_from_listing(table, Some(&partition_paths)).await?;
     let replacement = if !file_ids.is_empty() {
         let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
@@ -796,6 +892,11 @@ pub async fn dynamic_partition_overwrite_batches(
     } else {
         replacement
     };
+    let surviving: HashSet<String> = keys(&replacement, MetaField::RecordKey.as_ref())?
+        .into_iter()
+        .collect();
+    let rli_deletes =
+        rli_deletes_for_replaced_groups(table, &replaced_slices, &surviving, &instant).await?;
     rewrite(
         table,
         &instant,
@@ -804,11 +905,12 @@ pub async fn dynamic_partition_overwrite_batches(
         file_ids,
         old_paths,
         log_only,
+        replaced_log_paths,
         "INSERT_OVERWRITE",
         0,
         replacement.num_rows(),
         0,
-        Vec::new(),
+        rli_deletes,
         RewriteKind::Replace,
     )
     .await
@@ -986,7 +1088,10 @@ async fn mor_file_locations(
         );
     }
 
-    let tagged = for_table(table).tag_location(table, keys).await?;
+    let tagged = crate::index::for_table_checked(table)
+        .await
+        .tag_location(table, keys)
+        .await?;
     let mut locations = HashMap::with_capacity(tagged.len());
     for (key, location) in tagged {
         if let Some(location) = location {
@@ -1342,7 +1447,10 @@ async fn mor_upsert_batches(
                         record_key: key.record_key.clone(),
                         partition_path: partition_path.clone(),
                         file_id: file_id.clone(),
-                        instant_time_millis: instant_to_epoch_millis(&instant),
+                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                            &instant,
+                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                        ),
                         is_deleted: false,
                     }
                 }));
@@ -1413,7 +1521,10 @@ async fn mor_upsert_batches(
                 record_key: key.record_key.clone(),
                 partition_path: partition_path.clone(),
                 file_id: file_id.clone(),
-                instant_time_millis: instant_to_epoch_millis(&instant),
+                instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                    &instant,
+                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                ),
                 is_deleted: false,
             }
         }));
@@ -1723,7 +1834,10 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
                         record_key: key.record_key.clone(),
                         partition_path: key.partition_path.clone(),
                         file_id: String::new(),
-                        instant_time_millis: instant_to_epoch_millis(&instant),
+                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                            &instant,
+                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                        ),
                         is_deleted: true,
                     })
                     .collect::<Vec<_>>();
@@ -1907,11 +2021,31 @@ async fn moved_keys_rejected_by_event_time(
     Ok(rejected)
 }
 
+/// Whether writes merge by event time, resolved exactly as the reader resolves
+/// it (`hoodie.record.merge.mode` when stated, else Java's inference from
+/// payload class / merge strategy / ordering field). Deriving it from the
+/// ordering field alone applied event-time semantics to COMMIT_TIME_ORDERING
+/// tables — including every 0.x table upgraded with a precombine field — and
+/// silently dropped updates Java would have kept.
 fn uses_event_time_merge(hudi_configs: &crate::config::HudiConfigs) -> Result<bool> {
+    use crate::file_group::reader_v2::reader_context::MergeMode;
+    // An unresolvable mode (exotic payload class) is left to the heuristic
+    // below rather than failing a write that previously succeeded; writes with
+    // a genuinely custom merger are refused by ensure_supported_merge_configs.
+    if let Ok(mode) = crate::file_group::reader_v2::resolver::resolve_merge_mode(hudi_configs)
+        && mode == MergeMode::CommitTimeOrdering
+    {
+        return Ok(false);
+    }
+    // Event-time merging needs an ordering field to compare; without one there
+    // is nothing to order by and the newest write wins.
     let strategy: String = hudi_configs.get_or_default(RecordMergeStrategy).into();
     let strategy = RecordMergeStrategyValue::from_str(&strategy)?;
     Ok(strategy == RecordMergeStrategyValue::OverwriteWithLatest
-        && hudi_configs.try_get(OrderingFields)?.is_some())
+        && hudi_configs
+            .try_get(OrderingFields)?
+            .map(|v| -> Vec<String> { v.into() })
+            .is_some_and(|fields| fields.iter().any(|f| !f.trim().is_empty())))
 }
 
 fn merge_with_event_time(
@@ -2219,10 +2353,17 @@ fn deduplicate_last_by_key(
     field: &str,
     hudi_configs: &crate::config::HudiConfigs,
 ) -> Result<RecordBatch> {
-    let ordering_fields: Vec<String> = hudi_configs
-        .try_get(OrderingFields)?
-        .map(Into::into)
-        .unwrap_or_default();
+    // Java routes in-batch dedupe through the merge-mode-derived merger
+    // (BaseWriteHelper.reduceRecords), so a COMMIT_TIME_ORDERING table never
+    // consults the ordering value here either — last occurrence wins.
+    let ordering_fields: Vec<String> = if uses_event_time_merge(hudi_configs)? {
+        hudi_configs
+            .try_get(OrderingFields)?
+            .map(Into::into)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     // One comparator per ordering field, hoisted out of the duplicate loop;
     // fields compare lexicographically (first field breaks ties via the next).
     let comparators = ordering_fields
@@ -2342,8 +2483,9 @@ async fn rewrite(
     batch: &RecordBatch,
     row_targets: Option<Vec<String>>,
     replaced_file_ids: Vec<String>,
-    old_paths: Vec<String>,
+    mut old_paths: Vec<String>,
     log_only_replaced: Vec<(String, String)>,
+    extra_replaced_paths: Vec<String>,
     operation: &str,
     updates: usize,
     inserts: usize,
@@ -2377,6 +2519,8 @@ async fn rewrite(
                 .push(file_id.clone());
         }
     }
+    // Safe only after the positional zip above.
+    old_paths.extend(extra_replaced_paths);
     if kind == RewriteKind::Replace {
         for (partition, file_id) in &log_only_replaced {
             partition_to_replace_file_ids
@@ -3295,12 +3439,18 @@ async fn commit_merge_plans(
         }
     }
     if let Some(error) = first_error {
+        let mut all_deleted = true;
         for path in &written_paths {
-            let _ = storage.delete_file(path).await;
+            if storage.delete_file(path).await.is_err() {
+                all_deleted = false;
+            }
         }
-        // The write failed before any completion: abort the fenced instant so
-        // a deterministic worker error leaves no pending timeline trace.
-        let _ = abort_requested_instant(table, instant, Action::Commit).await;
+        // Abort only when nothing this write produced is left behind: the
+        // markers and fencing files are the trail a rollback follows, so
+        // removing them while a data file survives orphans that file forever.
+        if all_deleted {
+            let _ = abort_requested_instant(table, instant, Action::Commit).await;
+        }
         return Err(error);
     }
 
@@ -3428,6 +3578,110 @@ mod lifecycle_tests {
         super::complete_deltacommit(table, &instant, "UPSERT", vec![stat], schema.as_ref())
             .await
             .unwrap();
+    }
+
+    /// MOR coverage for the replace-commit tombstones: keys living in a
+    /// base+log slice and in a log-only slice must be tombstoned too — those
+    /// read through different reader paths than a plain COW base file.
+    #[tokio::test]
+    async fn test_replace_emits_rli_deletes_for_mor_slices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(TableTypeValue::MergeOnRead)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+        // Base + log slice: "a" in the base, updated through a log block.
+        table
+            .append([batch(&[("a", "sf", 1, 10), ("b", "sf", 1, 20)])])
+            .await
+            .unwrap();
+        table.upsert([batch(&[("a", "sf", 2, 11)])]).await.unwrap();
+        table.reload_timeline_for_write().await.unwrap();
+
+        table
+            .overwrite([batch(&[("z", "sf", 3, 99)])])
+            .await
+            .unwrap();
+        table.reload_timeline_for_write().await.unwrap();
+
+        use crate::index::HoodieIndex;
+        let dropped: Vec<crate::index::HoodieKey> = ["a", "b"]
+            .iter()
+            .map(|k| crate::index::HoodieKey {
+                record_key: k.to_string(),
+                partition_path: "city=sf".to_string(),
+            })
+            .collect();
+        let located = crate::index::for_table(&table)
+            .tag_location(&table, &dropped)
+            .await
+            .unwrap();
+        for key in &dropped {
+            assert!(
+                located.get(key).and_then(Option::as_ref).is_none(),
+                "MOR: dropped key '{}' must not stay indexed",
+                key.record_key
+            );
+        }
+    }
+
+    /// A replace commit must remove index entries for keys it drops, or the
+    /// RLI points at replaced file groups forever (no cleaner removes them)
+    /// and a Java writer routes updates into dead groups.
+    #[tokio::test]
+    async fn test_replace_verbs_emit_rli_deletes_for_dropped_keys() {
+        for dpo in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut table = Table::create(dir.path().to_str().unwrap())
+                .with_table_name("t")
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_ordering_fields(["ts"])
+                .create()
+                .await
+                .unwrap();
+            table
+                .append([batch(&[("a", "sf", 1, 10), ("b", "sf", 1, 20)])])
+                .await
+                .unwrap();
+            let replacement = batch(&[("a", "sf", 2, 11)]);
+            if dpo {
+                table
+                    .dynamic_partition_overwrite([replacement])
+                    .await
+                    .unwrap();
+            } else {
+                table.overwrite([replacement]).await.unwrap();
+            }
+            table.reload_timeline_for_write().await.unwrap();
+
+            use crate::index::HoodieIndex;
+            let dropped = crate::index::HoodieKey {
+                record_key: "b".to_string(),
+                partition_path: "city=sf".to_string(),
+            };
+            let kept = crate::index::HoodieKey {
+                record_key: "a".to_string(),
+                partition_path: "city=sf".to_string(),
+            };
+            let located = crate::index::for_table(&table)
+                .tag_location(&table, &[dropped.clone(), kept.clone()])
+                .await
+                .unwrap();
+            assert!(
+                located.get(&dropped).and_then(Option::as_ref).is_none(),
+                "dpo={dpo}: dropped key must not stay indexed"
+            );
+            assert!(
+                located.get(&kept).and_then(Option::as_ref).is_some(),
+                "dpo={dpo}: surviving key must stay indexed"
+            );
+        }
     }
 
     /// A REJECTED cross-partition move must leave the record index pointing
