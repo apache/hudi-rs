@@ -48,8 +48,8 @@ use crate::write::keygen::{
     hoodie_keys_for_batch, hoodie_keys_for_batch_with_offset, relative_data_path,
 };
 use crate::write::metadata::{
-    instant_to_epoch_millis, is_column_stats_enabled, update_column_stats_partitions,
-    update_files_partition, update_record_index,
+    is_column_stats_enabled, update_column_stats_partitions, update_files_partition,
+    update_record_index,
 };
 
 /// Result of an append write.
@@ -336,7 +336,10 @@ async fn append_batches_inner(
                         record_key: key.record_key.clone(),
                         partition_path: plan.partition_path.clone(),
                         file_id: plan.file_id.clone(),
-                        instant_time_millis: instant_to_epoch_millis(&request_instant),
+                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                            &request_instant,
+                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                        ),
                         is_deleted: false,
                     });
                 }
@@ -680,8 +683,15 @@ pub(crate) fn arrow_schema_to_avro_json(schema: &arrow_schema::Schema) -> Result
     let fields: Vec<String> = schema
         .fields()
         .iter()
-        .map(|f| {
-            let avro_type = arrow_type_to_avro_type_json(f.data_type())?;
+        .enumerate()
+        .map(|(index, f)| {
+            ensure_legal_avro_name(f.name())?;
+            // Field INDEX, not name: a name-derived path is not injective
+            // (`a.b` and `a_b` collide), and Avro refuses a redefined record.
+            let avro_type = arrow_type_to_avro_type_json_named(
+                f.data_type(),
+                &format!("hoodie_record_f{index}"),
+            )?;
             let ty = if f.is_nullable() {
                 format!("[\"null\",{avro_type}]")
             } else {
@@ -700,7 +710,29 @@ pub(crate) fn arrow_schema_to_avro_json(schema: &arrow_schema::Schema) -> Result
     ))
 }
 
-fn arrow_type_to_avro_type_json(dt: &arrow_schema::DataType) -> Result<String> {
+/// Avro field names must match [A-Za-z_][A-Za-z0-9_]*. A name that does not is
+/// rejected rather than renamed: renaming would diverge from the parquet column
+/// and silently mislabel the data, while an unparseable commit schema makes the
+/// table unreadable by every engine (including this one).
+fn ensure_legal_avro_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let legal = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if legal {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "column name '{name}' is not a legal Avro name ([A-Za-z_][A-Za-z0-9_]*), \
+         so it cannot be written into Hudi commit metadata"
+    )))
+}
+
+/// `path` makes every nested Avro record name unique: Avro forbids redefining
+/// a named type, so a fixed name breaks any schema with two structs — Java's
+/// `Schema.Parser` rejects the whole commit schema.
+fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -> Result<String> {
     use arrow_schema::DataType;
     match dt {
         DataType::Boolean => Ok("\"boolean\"".to_string()),
@@ -713,8 +745,14 @@ fn arrow_type_to_avro_type_json(dt: &arrow_schema::DataType) -> Result<String> {
         }
         DataType::Binary | DataType::LargeBinary => Ok("\"bytes\"".to_string()),
         DataType::Date32 => Ok("{\"type\":\"int\",\"logicalType\":\"date\"}".to_string()),
-        DataType::Timestamp(unit, _) => {
+        DataType::Timestamp(unit, tz) => {
+            // A timezone-less Arrow timestamp is Spark's TimestampNTZType,
+            // which maps to Avro local-timestamp-*; mapping it to the
+            // UTC-adjusted logical type shifts values on read.
+            let local = tz.is_none();
             let logical = match unit {
+                arrow_schema::TimeUnit::Millisecond if local => "local-timestamp-millis",
+                arrow_schema::TimeUnit::Microsecond if local => "local-timestamp-micros",
                 arrow_schema::TimeUnit::Millisecond => "timestamp-millis",
                 arrow_schema::TimeUnit::Microsecond => "timestamp-micros",
                 other => {
@@ -733,7 +771,8 @@ fn arrow_type_to_avro_type_json(dt: &arrow_schema::DataType) -> Result<String> {
             ))
         }
         DataType::List(field) | DataType::LargeList(field) => {
-            let item = arrow_type_to_avro_type_json(field.data_type())?;
+            let item =
+                arrow_type_to_avro_type_json_named(field.data_type(), &format!("{path}_item"))?;
             let item = if field.is_nullable() {
                 format!("[\"null\",{item}]")
             } else {
@@ -744,8 +783,13 @@ fn arrow_type_to_avro_type_json(dt: &arrow_schema::DataType) -> Result<String> {
         DataType::Struct(fields) => {
             let nested: Vec<String> = fields
                 .iter()
-                .map(|f| {
-                    let avro_type = arrow_type_to_avro_type_json(f.data_type())?;
+                .enumerate()
+                .map(|(index, f)| {
+                    ensure_legal_avro_name(f.name())?;
+                    let avro_type = arrow_type_to_avro_type_json_named(
+                        f.data_type(),
+                        &format!("{path}f{index}"),
+                    )?;
                     let ty = if f.is_nullable() {
                         format!("[\"null\",{avro_type}]")
                     } else {
@@ -759,7 +803,7 @@ fn arrow_type_to_avro_type_json(dt: &arrow_schema::DataType) -> Result<String> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(format!(
-                "{{\"type\":\"record\",\"name\":\"nested_record\",\"fields\":[{}]}}",
+                "{{\"type\":\"record\",\"name\":\"{path}_record\",\"fields\":[{}]}}",
                 nested.join(",")
             ))
         }
@@ -803,6 +847,39 @@ pub(crate) fn strip_meta_fields_from_schema(schema: &arrow_schema::Schema) -> ar
         .filter(|f| !f.name().starts_with("_hoodie_"))
         .cloned()
         .collect();
+    arrow_schema::Schema::new(fields)
+}
+
+/// Prepend the Hudi meta fields to a data schema when absent — written files
+/// always carry them, so index bookkeeping must consider them.
+pub(crate) fn schema_with_meta_fields(schema: &arrow_schema::Schema) -> arrow_schema::Schema {
+    // Match the meta fields by exact name: a data column may legitimately
+    // begin with `_hoodie_` (Hudi's own `_hoodie_is_deleted` marker does), and
+    // treating it as proof the meta fields are present would silently skip
+    // them.
+    let meta: std::collections::HashSet<&str> =
+        crate::metadata::meta_field::MetaField::field_names()
+            .into_iter()
+            .collect();
+    if schema
+        .fields()
+        .iter()
+        .any(|f| meta.contains(f.name().as_str()))
+    {
+        return schema.clone();
+    }
+    let mut fields: Vec<arrow_schema::FieldRef> =
+        crate::metadata::meta_field::MetaField::field_names()
+            .into_iter()
+            .map(|name| {
+                std::sync::Arc::new(arrow_schema::Field::new(
+                    name,
+                    arrow_schema::DataType::Utf8,
+                    true,
+                ))
+            })
+            .collect();
+    fields.extend(schema.fields().iter().cloned());
     arrow_schema::Schema::new(fields)
 }
 
@@ -938,11 +1015,88 @@ mod tests {
         assert_eq!(type_of("i16")[0], serde_json::json!("null"));
         assert_eq!(type_of("i64"), serde_json::json!("long"));
         assert_eq!(type_of("d")["logicalType"], "date");
-        assert_eq!(type_of("ts_ms")["logicalType"], "timestamp-millis");
+        // Timezone-less == Spark TimestampNTZType == Avro local-timestamp-*.
+        assert_eq!(type_of("ts_ms")["logicalType"], "local-timestamp-millis");
         assert_eq!(type_of("ts_us")["logicalType"], "timestamp-micros");
         assert_eq!(type_of("dec")["logicalType"], "decimal");
         assert_eq!(type_of("dec")["precision"], 10);
         assert_eq!(type_of("list")["type"], "array");
+    }
+
+    #[test]
+    fn test_arrow_schema_to_avro_json_names_each_record_uniquely() {
+        // Avro forbids redefining a named type: two struct columns sharing one
+        // record name make Java's Schema.Parser reject the whole commit schema.
+        let member = |name: &str| {
+            std::sync::Arc::new(Field::new(name, DataType::Int64, false)) as arrow_schema::FieldRef
+        };
+        let schema = Schema::new(vec![
+            Field::new("first", DataType::Struct(vec![member("x")].into()), false),
+            Field::new("second", DataType::Struct(vec![member("y")].into()), false),
+        ]);
+        let json = arrow_schema_to_avro_json(&schema).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let names: Vec<&str> = value["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["type"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "nested record names must be unique");
+    }
+
+    #[test]
+    fn test_arrow_schema_to_avro_json_name_paths_cannot_collide() {
+        // `a.b` and `a_b` collide under any name-derived path; record names
+        // are built from field indexes precisely so they cannot.
+        let long = std::sync::Arc::new(Field::new("x", DataType::Int64, false));
+        let inner = DataType::Struct(vec![long.clone()].into());
+        let schema = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Struct(vec![std::sync::Arc::new(Field::new("b", inner, false))].into()),
+                false,
+            ),
+            Field::new("a_b", DataType::Struct(vec![long].into()), false),
+        ]);
+        let json = arrow_schema_to_avro_json(&schema).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        fn collect(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::String(name)) = map.get("name")
+                        && map.get("type").is_some_and(|t| t == "record")
+                    {
+                        out.push(name.clone());
+                    }
+                    for v in map.values() {
+                        collect(v, out);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| collect(v, out)),
+                _ => {}
+            }
+        }
+        collect(&serde_json::from_str(&json).unwrap(), &mut names);
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "record names collided: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_avro_json_rejects_illegal_field_name() {
+        // Renaming would diverge from the parquet column; an unparseable
+        // commit schema would make the table unreadable. Reject instead.
+        let schema = Schema::new(vec![Field::new("a-b", DataType::Int64, false)]);
+        let error = arrow_schema_to_avro_json(&schema).unwrap_err();
+        assert!(
+            error.to_string().contains("legal Avro name"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
