@@ -162,6 +162,10 @@ fn long_stat(value: i64) -> Option<ColumnStatValue> {
     Some(ColumnStatValue::Long(value))
 }
 
+fn string_stat(value: &str) -> Option<ColumnStatValue> {
+    Some(ColumnStatValue::String(value.to_string()))
+}
+
 /// Find the completed deltacommit `{requested}_{completion}.deltacommit` for a
 /// requested instant and return its completion time.
 fn completed_deltacommit_completion_time(timeline: &Path, requested: &str) -> String {
@@ -262,6 +266,104 @@ async fn test_bootstrap_layout_unpartitioned_drops_partition_stats() {
         }),
         "partition_stats bootstrap commit must not exist for unpartitioned tables"
     );
+}
+
+#[tokio::test]
+async fn test_partition_stats_meta_columns_span_all_commits() {
+    // partition_stats must aggregate the always-indexed meta columns across
+    // ALL surviving files. Writers pass the raw user schema (no _hoodie_*
+    // fields); if that schema decided which columns to fetch for survivors,
+    // the aggregate would collapse onto the newest commit's files and Spark
+    // pruning would skip partitions that still hold matching rows.
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path(), TableTypeValue::CopyOnWrite).await;
+    table.append([batch(vec![("aaa", "sf", 1)])]).await.unwrap();
+    table.append([batch(vec![("zzz", "sf", 2)])]).await.unwrap();
+
+    let stats = read_stats_records(&table, dir.path(), "partition_stats").await;
+    let key = partition_stats_index_key("city=sf", "_hoodie_record_key");
+    let record_key_stats = stats
+        .get(&key)
+        .expect("_hoodie_record_key must be indexed in partition_stats");
+    assert_eq!(
+        record_key_stats.min_value,
+        string_stat("aaa"),
+        "partition_stats must still cover the first commit's file"
+    );
+    assert_eq!(record_key_stats.max_value, string_stat("zzz"));
+}
+
+#[tokio::test]
+async fn test_truncated_stats_stay_indexed_as_non_tight_bounds() {
+    // Parquet truncates long min/max (64 bytes by default), so the bounds are
+    // UNKNOWN. Publishing a live record with null min/max would read as
+    // "column is all nulls" and make data skipping prune a file that matches;
+    // omitting the record instead leaves the file in the reader's
+    // not-indexed rescue set.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let long_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("blob", DataType::Utf8, false),
+    ]));
+    let long_value = "x".repeat(400);
+    table
+        .append([RecordBatch::try_new(
+            long_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec![long_value.as_str()])),
+            ],
+        )
+        .unwrap()])
+        .await
+        .unwrap();
+
+    // Truncated bounds are still valid bounds (parquet truncates min down and
+    // max up), so the record IS published — never tight — and pruning stays
+    // correct. Suppressing it instead would half-index the file, and Spark's
+    // rescue set is per file, not per column.
+    let stats = read_stats_records(&table, dir.path(), "column_stats").await;
+    let blob: Vec<_> = stats
+        .values()
+        .filter(|r| r.column_name == "blob" && !r.is_deleted)
+        .collect();
+    assert_eq!(blob.len(), 1, "blob must stay indexed");
+    assert!(
+        blob[0].min_value.is_some(),
+        "truncated bounds are still bounds"
+    );
+    assert!(!blob[0].is_tight_bound, "truncated bounds are never tight");
+    let long_value = "x".repeat(400);
+    if let Some(ColumnStatValue::String(min)) = &blob[0].min_value {
+        assert!(
+            long_value.starts_with(min.as_str()) || min.as_str() <= long_value.as_str(),
+            "truncated min must remain a valid lower bound"
+        );
+    }
+
+    // partition_stats must never publish null bounds: Spark's partition
+    // pruning has no not-indexed rescue set, so that would prune everything.
+    if !dir.path().join(".hoodie/metadata/partition_stats").exists() {
+        return;
+    }
+    let partition_stats = read_stats_records(&table, dir.path(), "partition_stats").await;
+    for (key, record) in &partition_stats {
+        if record.is_deleted {
+            continue;
+        }
+        assert!(
+            record.min_value.is_some()
+                || record.max_value.is_some()
+                || record.value_count == record.null_count,
+            "partition_stats record with null bounds prunes the partition: {key}"
+        );
+    }
 }
 
 #[tokio::test]

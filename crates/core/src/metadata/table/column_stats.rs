@@ -36,6 +36,12 @@ pub struct ColumnRangeStats {
     pub column_name: String,
     pub min_value: Option<ColumnStatValue>,
     pub max_value: Option<ColumnStatValue>,
+    /// False when the parquet footer gave truncated/absent statistics, so the
+    /// bounds are UNKNOWN rather than absent. Readers treat a published record
+    /// with null min/max as "all nulls" and prune the file, so a record with
+    /// an unknown range must not be published at all (the file then falls into
+    /// the reader's not-indexed rescue set).
+    pub range_known: bool,
     pub value_count: i64,
     pub null_count: i64,
     pub total_size: i64,
@@ -79,8 +85,11 @@ fn column_ranges_from_parquet_metadata(
         total_size: i64,
         total_uncompressed_size: i64,
         data_type: Option<DataType>,
-        /// Some chunk had truncated/absent stats: the accumulated range is a
-        /// lower bound on the true range and must not be published.
+        /// A chunk carried no statistics at all, so the accumulated range does
+        /// not cover the whole column and must not be published as a bound.
+        /// Truncated bounds do NOT set this: parquet truncates min downward
+        /// and max upward, so they stay valid (just not tight) bounds, and
+        /// Java publishes them as-is (ParquetUtils.readColumnStatsFromMetadata).
         range_incomplete: bool,
     }
 
@@ -111,18 +120,20 @@ fn column_ranges_from_parquet_metadata(
                 // Null count only when actually recorded; never fabricate
                 // "all null" for chunks with stats disabled.
                 acc.null_count += stats.null_count_opt().unwrap_or(0) as i64;
-                // Parquet writers truncate long min/max values (64 bytes by
-                // default); a truncated bound recorded as exact would let
-                // pruning skip files that match. Only exact bounds become
-                // column_stats ranges.
-                if stats.min_is_exact()
-                    && stats.max_is_exact()
-                    && let Some((min, max)) = parquet_min_max_to_stat_values(stats, data_type)
-                {
-                    acc.min = merge_min(acc.min.take(), Some(min));
-                    acc.max = merge_max(acc.max.take(), Some(max));
-                } else {
-                    acc.range_incomplete = true;
+                match parquet_min_max_to_stat_values(stats, data_type) {
+                    // Truncated bounds are still bounds; publish them (the
+                    // record is never marked tight).
+                    Some((min, max)) => {
+                        acc.min = merge_min(acc.min.take(), Some(min));
+                        acc.max = merge_max(acc.max.take(), Some(max));
+                    }
+                    // Parquet emits stubbed stats for an all-null chunk: no
+                    // bounds exist, and none are needed — it cannot widen the
+                    // column's range (Java equates nulls to the value count).
+                    None if stats
+                        .null_count_opt()
+                        .is_some_and(|nulls| nulls as i64 == col_chunk.num_values()) => {}
+                    None => acc.range_incomplete = true,
                 }
             } else {
                 // Stats disabled for the chunk: range and null count unknown.
@@ -135,6 +146,7 @@ fn column_ranges_from_parquet_metadata(
         .into_iter()
         .map(|(column_name, acc)| ColumnRangeStats {
             column_name,
+            range_known: !acc.range_incomplete,
             min_value: (!acc.range_incomplete).then_some(acc.min).flatten(),
             max_value: (!acc.range_incomplete).then_some(acc.max).flatten(),
             value_count: acc.value_count,
@@ -155,6 +167,7 @@ pub fn column_stats_for_file(
 ) -> Vec<ColumnStatsMetadata> {
     ranges
         .iter()
+        .filter(|r| is_deleted || r.range_known || r.null_count == r.value_count)
         .map(|r| ColumnStatsMetadata {
             file_name: file_name.to_string(),
             column_name: r.column_name.clone(),
@@ -220,11 +233,18 @@ pub fn aggregate_partition_stats(
         null_count: i64,
         total_size: i64,
         total_uncompressed_size: i64,
+        range_incomplete: bool,
     }
     let mut by_col: HashMap<String, Acc> = HashMap::new();
     for ranges in ranges_by_file {
         for r in ranges {
             let acc = by_col.entry(r.column_name.clone()).or_default();
+            // One file with unknown bounds makes the partition aggregate a
+            // non-tight (advisory) bound: publishing it tight would let
+            // pruning skip a partition whose unknown file may match.
+            if !r.range_known && r.null_count != r.value_count {
+                acc.range_incomplete = true;
+            }
             acc.min = merge_min(acc.min.take(), r.min_value.clone());
             acc.max = merge_max(acc.max.take(), r.max_value.clone());
             acc.value_count += r.value_count;
@@ -241,6 +261,13 @@ pub fn aggregate_partition_stats(
     };
     let mut out: Vec<ColumnStatsMetadata> = by_col
         .into_iter()
+        // A partition record with null bounds reads as "all nulls" and Spark's
+        // partition pruning has no not-indexed rescue set, so it would prune
+        // the whole partition. Publish nothing instead — unless the column
+        // really is all nulls, where null bounds are the correct encoding.
+        .filter(|(_, acc)| {
+            acc.min.is_some() || acc.max.is_some() || acc.null_count == acc.value_count
+        })
         .map(|(column_name, acc)| ColumnStatsMetadata {
             file_name: file_name.clone(),
             column_name,
@@ -251,7 +278,7 @@ pub fn aggregate_partition_stats(
             total_size: acc.total_size,
             total_uncompressed_size: acc.total_uncompressed_size,
             is_deleted: false,
-            is_tight_bound,
+            is_tight_bound: is_tight_bound && !acc.range_incomplete,
             decoded_value_type_ordinal: None,
         })
         .collect();

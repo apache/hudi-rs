@@ -572,7 +572,12 @@ pub async fn update_column_stats_partitions(
         return Ok(out);
     }
     let data_storage = table.file_system_view.storage.clone();
-    let indexed_columns = columns_to_index(schema);
+    // Written files always carry the meta fields, so their footers contribute
+    // meta-column ranges. If the caller passed the raw user schema, those
+    // columns would be missing from the survivor fetch and the partition
+    // aggregate would collapse onto this commit's files (Java indexes the
+    // three meta columns unconditionally).
+    let indexed_columns = columns_to_index(&crate::write::append::schema_with_meta_fields(schema));
     let mut column_records: Vec<(String, ColumnStatsMetadata)> = Vec::new();
 
     for update in updates {
@@ -744,6 +749,7 @@ async fn compute_partition_stats_records(
             .or_default()
             .push(ColumnRangeStats {
                 column_name: stats.column_name,
+                range_known: true,
                 min_value: stats.min_value,
                 max_value: stats.max_value,
                 value_count: stats.value_count,
@@ -1080,20 +1086,33 @@ pub(crate) async fn write_metadata_commit(
     Ok(())
 }
 
-/// Parse a Hudi instant timestamp string into epoch millis for RLI storage.
-pub fn instant_to_epoch_millis(instant: &str) -> i64 {
-    Instant::parse_datetime(instant, "UTC")
+/// Convert a timeline instant to epoch millis for the record index.
+///
+/// The zone is the table's `hoodie.table.timeline.timezone`, matching Java's
+/// HoodieInstantTimeGenerator: parsing a LOCAL-zone table's instants as UTC
+/// writes an offset instantTime into the index.
+pub(crate) fn instant_to_epoch_millis_in(instant: &str, timezone: &str) -> i64 {
+    Instant::parse_datetime(instant, timezone)
         .map(|dt| dt.timestamp_millis())
         .unwrap_or_else(|_| {
-            // Instants reaching here are self-generated and always parse; a
-            // failure is a programming error, caught loudly in debug builds
-            // rather than silently writing epoch 0 into the record index.
             debug_assert!(
                 instant.parse::<i64>().is_ok(),
                 "unparseable instant '{instant}'"
             );
             instant.parse::<i64>().unwrap_or(0)
         })
+}
+
+/// Resolve the table's timeline timezone for [`instant_to_epoch_millis_in`].
+pub(crate) fn timeline_timezone(hudi_configs: &crate::config::HudiConfigs) -> String {
+    let value: String = hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::TimelineTimezone)
+        .into();
+    value
+}
+
+pub(crate) fn instant_to_epoch_millis(instant: &str) -> i64 {
+    instant_to_epoch_millis_in(instant, "UTC")
 }
 
 /// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`).
