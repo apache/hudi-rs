@@ -56,7 +56,10 @@ jobs:
         os: [ ubuntu-24.04 ]
     runs-on: ${{ matrix.os }}
     container:
-      image: xd009642/tarpaulin:0.32.7
+      # 0.32.7 produced broken coverage maps for async fn bodies in some
+      # build configurations (executed lines reported as uncovered, or absent
+      # from the map entirely), understating patch coverage.
+      image: xd009642/tarpaulin:0.37.2
       options: --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v6

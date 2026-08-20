@@ -33,6 +33,9 @@ pub struct InstantRange {
     end_timestamp: Option<String>,
     start_inclusive: bool,
     end_inclusive: bool,
+    /// Java `InstantRange.RangeType.EXACT_MATCH`: when set, only these exact
+    /// instant timestamps are in range (start/end are ignored).
+    exact_instants: Option<std::collections::HashSet<String>>,
 }
 
 impl InstantRange {
@@ -49,6 +52,21 @@ impl InstantRange {
             end_timestamp,
             start_inclusive,
             end_inclusive,
+            exact_instants: None,
+        }
+    }
+
+    /// Create a range matching only the given instant timestamps (Java
+    /// `RangeType.EXACT_MATCH`) — used to fence MDT log-block reads by the set
+    /// of valid (data-timeline-completed) instants.
+    pub fn exact_match(instants: std::collections::HashSet<String>, timezone: &str) -> Self {
+        Self {
+            timezone: timezone.to_string(),
+            start_timestamp: None,
+            end_timestamp: None,
+            start_inclusive: false,
+            end_inclusive: false,
+            exact_instants: Some(instants),
         }
     }
 
@@ -133,6 +151,9 @@ impl InstantRange {
     }
 
     pub fn is_in_range(&self, timestamp: &str, timezone: &str) -> Result<bool> {
+        if let Some(instants) = &self.exact_instants {
+            return Ok(instants.contains(timestamp));
+        }
         let t = Instant::parse_datetime(timestamp, timezone)?;
         if let Some(start) = self.start_timestamp()? {
             if self.start_inclusive {

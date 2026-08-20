@@ -357,7 +357,7 @@ fn infer_merge_mode(hudi_configs: &HudiConfigs) -> Result<InferredMode> {
 /// A table from version 9 on states it outright. Older ones are inferred the way
 /// Java infers them, from the payload class, the merge strategy id, and finally
 /// whether an ordering field is set.
-fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
+pub(crate) fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
     if let Some(mode) = hudi_configs.as_options().get(RECORD_MERGE_MODE) {
         log::debug!("merge mode {mode}: stated by the table");
         return match mode.to_ascii_uppercase().as_str() {

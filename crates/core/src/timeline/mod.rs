@@ -25,6 +25,10 @@ pub(crate) mod selector;
 pub(crate) mod util;
 pub mod view;
 
+// `LogFileScanner::scan` takes an `InstantRange`; export it so external callers
+// can actually invoke that public API.
+pub use selector::InstantRange;
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -119,6 +123,33 @@ impl Timeline {
             .filter(|instant| instant.state == State::Completed)
             .collect();
         Ok(timeline)
+    }
+
+    /// Reload completed commits from storage after a write.
+    pub(crate) async fn reload_completed_commits(&mut self) -> Result<()> {
+        // Same listing as `new_from_storage`: every state, so the archival
+        // boundary can be refreshed together with the completed commits.
+        // Archival (running inside writes) raises the boundary; a reload that
+        // kept the old one would leave newly-archived instants neither in the
+        // completed set nor below the boundary — read as uncommitted, silently
+        // hiding their file groups from this handle's later reads and writes.
+        let selector = TimelineSelector::actions_in_range(
+            DEFAULT_LOADING_ACTIONS,
+            &[State::Requested, State::Inflight, State::Completed],
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        let all_active = self.load_instants(&selector, false).await?;
+        self.earliest_active_instant = all_active
+            .iter()
+            .map(|instant| instant.timestamp.clone())
+            .min();
+        self.completed_commits = all_active
+            .into_iter()
+            .filter(|instant| instant.state == State::Completed)
+            .collect();
+        Ok(())
     }
 
     /// Load instants from the timeline based on the selector criteria.

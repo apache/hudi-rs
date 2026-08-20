@@ -67,6 +67,11 @@ impl FileSystemView {
         })
     }
 
+    /// Drop cached partition → file-group mappings so the next planning call reloads from storage.
+    pub(crate) fn clear_cache(&self) {
+        self.partition_to_file_groups.clear();
+    }
+
     /// Load file groups from the appropriate source (storage or metadata table records)
     /// and apply stats-based pruning.
     ///
@@ -117,29 +122,199 @@ impl FileSystemView {
                 .await?
         };
 
-        // Apply partition pruning (for metadata table path) and stats pruning
-        for (partition_path, file_groups) in file_groups_map {
-            if files_partition_records.is_some()
-                && !partition_pruner.is_empty()
-                && !partition_pruner.should_include(&partition_path)
-            {
-                continue;
-            }
+        // Apply partition pruning (for metadata table path) first.
+        let mut pruned_map: Vec<(String, Vec<FileGroup>)> = file_groups_map
+            .into_iter()
+            .filter(|(partition_path, _)| {
+                files_partition_records.is_none()
+                    || partition_pruner.is_empty()
+                    || partition_pruner.should_include(partition_path)
+            })
+            .collect();
 
-            let retained = self
-                .apply_stats_pruning_from_footers(
+        // MDT column_stats pruning: one bulk point lookup for every candidate
+        // base file x filter column, instead of a parquet footer read per file.
+        // Files without an MDT stats record fall back to the footer path below.
+        let mdt_pruned = self
+            .apply_stats_pruning_from_mdt_column_stats(
+                &mut pruned_map,
+                file_pruner,
+                table_schema,
+                timeline_view.as_of_timestamp(),
+                configured_base_file_format.as_ref(),
+            )
+            .await;
+
+        for (partition_path, file_groups) in pruned_map {
+            let retained = if mdt_pruned {
+                file_groups
+            } else {
+                self.apply_stats_pruning_from_footers(
                     file_groups,
                     file_pruner,
                     table_schema,
                     timeline_view.as_of_timestamp(),
                     configured_base_file_format.as_ref(),
                 )
-                .await;
+                .await
+            };
             self.partition_to_file_groups
                 .insert(partition_path, retained);
         }
 
         Ok(())
+    }
+
+    /// Prune file groups with MDT `column_stats` ranges when the partition is
+    /// enabled, avoiding a parquet-footer read per candidate file.
+    ///
+    /// Returns `true` when MDT-based pruning ran (the caller skips footer
+    /// pruning). Files with no MDT stats record for some filter column are
+    /// kept (conservative), matching the footer path's missing-stats behavior.
+    async fn apply_stats_pruning_from_mdt_column_stats(
+        &self,
+        partitions: &mut [(String, Vec<FileGroup>)],
+        file_pruner: &FilePruner,
+        table_schema: &Schema,
+        as_of_timestamp: &str,
+        configured_base_file_format: Option<&BaseFileFormatValue>,
+    ) -> bool {
+        use crate::metadata::table::records::MetadataPartitionType;
+
+        if file_pruner.is_empty() {
+            return false;
+        }
+        if configured_base_file_format.is_some_and(|f| !matches!(f, BaseFileFormatValue::Parquet)) {
+            return false;
+        }
+        let metadata_partitions: Vec<String> = self
+            .hudi_configs
+            .get_or_default(crate::config::table::HudiTableConfig::MetadataTablePartitions)
+            .into();
+        if !metadata_partitions
+            .iter()
+            .any(|p| p == MetadataPartitionType::ColumnStats.partition_name())
+        {
+            return false;
+        }
+
+        let filter_columns: Vec<String> = {
+            let mut cols: Vec<String> = file_pruner
+                .referenced_columns()
+                .map(str::to_string)
+                .collect();
+            cols.sort();
+            cols.dedup();
+            cols
+        };
+
+        // key -> (file name, column) for every candidate base file x column.
+        let mut wanted: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        for (partition_path, file_groups) in partitions.iter() {
+            for fg in file_groups.iter() {
+                let Some(fsl) = fg.get_file_slice_as_of(as_of_timestamp) else {
+                    continue;
+                };
+                let Some(base_file) = fsl.base_file.as_ref() else {
+                    continue;
+                };
+                let file_name = base_file.file_name();
+                for column in &filter_columns {
+                    wanted.insert(
+                        crate::metadata::table::hash::column_stats_index_key(
+                            partition_path,
+                            &file_name,
+                            column,
+                        ),
+                        (file_name.clone(), column.clone()),
+                    );
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return false;
+        }
+
+        let stats = match crate::write::metadata::load_column_stats_records(
+            self.storage.clone(),
+            self.hudi_configs.clone(),
+            &wanted,
+        )
+        .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                log::warn!("MDT column_stats load failed, falling back to footers: {e}");
+                return false;
+            }
+        };
+        if stats.is_empty() {
+            // Partition enabled but nothing indexed (e.g. older data): let the
+            // footer path decide.
+            return false;
+        }
+
+        // (partition, file, column) -> metadata, keyed the way files are walked.
+        let mut by_file: std::collections::HashMap<(String, String), Vec<&_>> =
+            std::collections::HashMap::new();
+        for meta in stats.values() {
+            by_file
+                .entry((meta.file_name.clone(), meta.column_name.clone()))
+                .or_default()
+                .push(meta);
+        }
+
+        for (_, file_groups) in partitions.iter_mut() {
+            file_groups.retain_mut(|fg| {
+                let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) else {
+                    return true;
+                };
+                let Some(base_file) = fsl.base_file.as_ref() else {
+                    return true;
+                };
+                let file_name = base_file.file_name();
+                let mut container = crate::statistics::StatisticsContainer {
+                    granularity: crate::statistics::StatsGranularity::File,
+                    num_rows: None,
+                    columns: std::collections::HashMap::new(),
+                };
+                for column in &filter_columns {
+                    let Some(metas) = by_file.get(&(file_name.clone(), column.clone())) else {
+                        continue;
+                    };
+                    let Some(meta) = metas.iter().find(|m| !m.is_deleted) else {
+                        continue;
+                    };
+                    let Ok(field) = table_schema.field_with_name(column) else {
+                        continue;
+                    };
+                    let min = meta.min_value.as_ref().and_then(|v| {
+                        crate::metadata::table::column_stats::stat_value_to_array(
+                            v,
+                            field.data_type(),
+                        )
+                    });
+                    let max = meta.max_value.as_ref().and_then(|v| {
+                        crate::metadata::table::column_stats::stat_value_to_array(
+                            v,
+                            field.data_type(),
+                        )
+                    });
+                    container.columns.insert(
+                        column.clone(),
+                        crate::statistics::ColumnStatistics {
+                            column_name: column.clone(),
+                            data_type: field.data_type().clone(),
+                            min_value: min,
+                            max_value: max,
+                        },
+                    );
+                }
+                file_pruner.should_include(&container)
+            });
+        }
+        true
     }
 
     /// Apply file-level stats pruning using Parquet file footers.
@@ -288,7 +463,15 @@ impl FileSystemView {
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
         let files_partition_records = if let Some(mdt) = metadata_table {
-            Some(mdt.fetch_files_partition_records(partition_pruner).await?)
+            // Fence MDT log blocks by the data timeline (self is the data
+            // table's view; its storage roots both timelines).
+            let valid_instants =
+                crate::metadata::table::valid_metadata_instants(&self.storage, &self.hudi_configs)
+                    .await?;
+            Some(
+                mdt.fetch_files_partition_records(partition_pruner, Some(&valid_instants))
+                    .await?,
+            )
         } else {
             None
         };
@@ -965,7 +1148,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                Some(metadata_table),
+                Some(&metadata_table),
                 None,
             )
             .await

@@ -59,6 +59,11 @@ impl MetadataTableFileGroupReader {
     /// # Arguments
     /// * `file_slice` - The file slice to read from
     /// * `keys` - Only read records with these keys. If empty, reads all records.
+    /// * `valid_instants` - When set, only log blocks whose instant is in this
+    ///   data-timeline-fenced set are applied (Java `getValidInstantTimestamps`).
+    ///   A writer crash can leave an MDT log block whose data commit never
+    ///   completed; the end-timestamp range alone would still admit it once any
+    ///   later commit succeeds. `None` trusts all blocks in range.
     ///
     /// # Returns
     /// HashMap containing the requested keys (or all keys if `keys` is empty).
@@ -66,6 +71,7 @@ impl MetadataTableFileGroupReader {
         &self,
         file_slice: &FileSlice,
         keys: &[&str],
+        valid_instants: Option<&std::collections::HashSet<String>>,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths: Vec<String> = if file_slice.has_log_file() {
@@ -121,7 +127,16 @@ impl MetadataTableFileGroupReader {
         let log_records = if log_file_paths.is_empty() {
             vec![]
         } else {
-            let instant_range = self.create_instant_range_for_log_file_scan()?;
+            let instant_range = match valid_instants {
+                Some(instants) => {
+                    let timezone: String = self
+                        .hudi_configs
+                        .get_or_default(HudiTableConfig::TimelineTimezone)
+                        .into();
+                    InstantRange::exact_match(instants.clone(), &timezone)
+                }
+                None => self.create_instant_range_for_log_file_scan()?,
+            };
             let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan(log_file_paths, &instant_range)
                 .await?;
@@ -240,7 +255,7 @@ mod tests {
         let file_slice = create_test_file_slice()?;
 
         // Test 1: Read all records (empty keys)
-        let all_records = reader.read_files_partition(&file_slice, &[]).await?;
+        let all_records = reader.read_files_partition(&file_slice, &[], None).await?;
 
         // Should have 4 keys after merging
         assert_eq!(
@@ -268,7 +283,9 @@ mod tests {
 
         // Test 2: Read specific keys
         let keys = vec![FilesPartitionRecord::ALL_PARTITIONS_KEY, "city=chennai"];
-        let filtered_records = reader.read_files_partition(&file_slice, &keys).await?;
+        let filtered_records = reader
+            .read_files_partition(&file_slice, &keys, None)
+            .await?;
 
         // Should only contain the requested keys
         assert_eq!(filtered_records.len(), 2);

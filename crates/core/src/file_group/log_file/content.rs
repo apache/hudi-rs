@@ -451,6 +451,13 @@ impl Decoder {
         let mut hfile_reader =
             HFileReader::new(hfile_bytes).map_err(|e| CoreError::HFile(e.to_string()))?;
 
+        // Records must carry the block's own writer schema: log blocks may be
+        // written by a different writer (e.g. Spark) than the base file they
+        // are later merged against.
+        let schema = hfile_reader
+            .get_avro_schema_arc()
+            .map_err(|e| CoreError::HFile(e.to_string()))?;
+
         let mut records = Vec::new();
         let iter = hfile_reader
             .iter()
@@ -458,10 +465,10 @@ impl Decoder {
 
         for kv_result in iter {
             let kv = kv_result.map_err(|e| CoreError::HFile(e.to_string()))?;
-            records.push(HFileRecord::new(
-                kv.key().content().to_vec(),
-                kv.value().to_vec(),
-            ));
+            records.push(
+                HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
+                    .with_avro_schema(schema.clone()),
+            );
         }
 
         Ok(records)

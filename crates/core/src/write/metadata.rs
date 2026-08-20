@@ -1,0 +1,1320 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+//! Metadata table bootstrap and files / record_index / stats partition updates.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::Result;
+use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::log_file::writer::LogFileWriter;
+use crate::file_group::log_file::{BlockMetadataKey, BlockType};
+use crate::hfile::{HFileReader, HFileWriter};
+use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
+use crate::metadata::table::column_stats::{
+    ColumnRangeStats, aggregate_partition_stats, column_stats_for_file, column_stats_tombstones,
+    columns_to_index,
+};
+use crate::metadata::table::encode::{
+    ColumnStatsMetadata, FilesMetadataEntry, RecordIndexEntry, StatsIndexVersion,
+    decode_column_stats_entry, encode_all_partitions, encode_column_stats, encode_files_record,
+    encode_partition_stats, encode_record_index_entry, files_metadata_avro_schema_json,
+    hoodie_metadata_schema_json, record_index_metadata_avro_schema_json,
+};
+use crate::metadata::table::hash::{column_stats_index_key, partition_stats_index_key};
+use crate::metadata::table::records::{
+    FilesPartitionRecord, MetadataPartitionType, MetadataRecordType,
+};
+use crate::storage::Storage;
+use crate::table::{ReadOptions, Table};
+use crate::timeline::instant::{Action, Instant};
+use crate::timeline::selector::InstantRange;
+use arrow_schema::Schema;
+
+const METADATA_BASE: &str = ".hoodie/metadata";
+const FILES_FILE_ID: &str = "files-0000-0";
+/// Java `hoodie.metadata.record.index.min.filegroup.count` default.
+pub(crate) const DEFAULT_RLI_NUM_FILE_GROUPS: usize = 10;
+/// Java `hoodie.metadata.index.column.stats.file.group.count` default.
+pub(crate) const DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS: usize = 2;
+/// Java `hoodie.metadata.index.partition.stats.file.group.count` default.
+pub(crate) const DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS: usize = 1;
+
+fn column_stats_file_id(shard: usize) -> String {
+    format!("col-stats-{shard:04}-0")
+}
+
+fn partition_stats_file_id(shard: usize) -> String {
+    format!("partition-stats-{shard:04}-0")
+}
+
+/// A parquet (or deleted) data file whose column ranges should update MDT stats.
+#[derive(Debug, Clone)]
+pub struct StatsFileUpdate {
+    pub partition_path: String,
+    pub file_name: String,
+    pub is_deleted: bool,
+    /// Footer-derived ranges for adds; ignored when `is_deleted`.
+    pub ranges: Vec<ColumnRangeStats>,
+}
+
+fn record_index_file_id(shard: usize) -> String {
+    format!("record-index-{shard:04}-0")
+}
+
+/// Java `HoodieTableMetadataUtil.mapRecordKeyToFileGroupIndex` (31-hash, signed i32).
+pub(crate) fn map_record_key_to_file_group_index(
+    record_key: &str,
+    num_file_groups: usize,
+) -> usize {
+    if num_file_groups <= 1 {
+        return 0;
+    }
+    let mut h: i32 = 0;
+    // Java's String.hashCode iterates UTF-16 code units (charAt), not Unicode
+    // scalars; supplementary-plane keys must hash to the same shard as Java.
+    for unit in record_key.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(unit as i32);
+    }
+    (h.unsigned_abs() as usize) % num_file_groups
+}
+
+/// Java `HoodieBackedTableMetadataWriter.generateUniqueInstantTime` on a fresh table:
+/// `SOLO_COMMIT_TIMESTAMP` plus `offset` millis, zero-padded to 17 digits.
+fn bootstrap_instant(offset: usize) -> String {
+    format!("{offset:017}")
+}
+
+/// Create the metadata table properties and its initial partitions.
+///
+/// Each MDT partition is initialized in its own deltacommit with a unique
+/// instant (`00000000000000000`, `...001`, ...) in Java's enum order:
+/// files, column_stats, record_index, partition_stats.
+pub async fn bootstrap_metadata_table(
+    data_table_storage: &Storage,
+    table_name: &str,
+    table_version: isize,
+    record_index_enabled: bool,
+    column_stats_enabled: bool,
+    partition_stats_enabled: bool,
+) -> Result<()> {
+    let mdt_name = format!("{table_name}_metadata");
+    let checksum = crc32(format!(".{mdt_name}").as_bytes());
+    // The MDT's table version follows the data table's (Java initializes the
+    // MDT meta client with the data write config's version).
+    let properties = format!(
+        "# Generated by hudi-rs\n\
+         hoodie.table.name={mdt_name}\n\
+         hoodie.table.type=MERGE_ON_READ\n\
+         hoodie.table.base.file.format=HFILE\n\
+         hoodie.table.recordkey.fields=key\n\
+         hoodie.populate.meta.fields=false\n\
+         hoodie.table.version={table_version}\n\
+         hoodie.table.initial.version={table_version}\n\
+         hoodie.timeline.layout.version=2\n\
+         hoodie.timeline.path=timeline\n\
+         hoodie.timeline.history.path=history\n\
+         hoodie.archivelog.folder=history\n\
+         hoodie.table.keygenerator.type=HOODIE_TABLE_METADATA\n\
+         hoodie.compaction.payload.class=org.apache.hudi.metadata.HoodieMetadataPayload\n\
+         hoodie.record.merge.mode=CUSTOM\n\
+         hoodie.record.merge.strategy.id=00000000-0000-0000-0000-000000000000\n\
+         hoodie.datasource.write.drop.partition.columns=false\n\
+         hoodie.table.checksum={checksum}\n"
+    );
+    data_table_storage
+        .put_file(
+            &format!("{METADATA_BASE}/.hoodie/hoodie.properties"),
+            properties.into_bytes(),
+        )
+        .await?;
+    data_table_storage
+        .put_file(
+            &format!("{METADATA_BASE}/.hoodie/timeline/.keep"),
+            b"".as_slice(),
+        )
+        .await?;
+
+    // Java initializeFilesPartition on an empty table writes only the
+    // __all_partitions__ record with an empty partition list — no "." entry.
+    let files_instant = bootstrap_instant(0);
+    let all_partitions = encode_all_partitions(Vec::new())?;
+    let files_base_name = format!("{FILES_FILE_ID}_0-0-0_{files_instant}.hfile");
+    let hfile = HFileWriter::write(
+        &[(
+            FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
+            all_partitions,
+        )],
+        BTreeMap::from([(
+            "schema".to_string(),
+            files_metadata_avro_schema_json()?.as_bytes().to_vec(),
+        )]),
+    )
+    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+    let files_base_size = hfile.len() as i64;
+    crate::write::ensure_partition_metadata(
+        data_table_storage,
+        &format!("{METADATA_BASE}/files"),
+        &files_instant,
+    )
+    .await?;
+    data_table_storage
+        .put_file(&format!("{METADATA_BASE}/files/{files_base_name}"), hfile)
+        .await?;
+    write_metadata_commit(
+        data_table_storage,
+        &files_instant,
+        HashMap::from([(
+            "files".to_string(),
+            vec![HoodieWriteStat {
+                file_id: Some(FILES_FILE_ID.to_string()),
+                path: Some(format!("files/{files_base_name}")),
+                base_file: Some(files_base_name),
+                prev_commit: Some("null".to_string()),
+                num_writes: Some(1),
+                total_write_bytes: Some(files_base_size),
+                file_size_in_bytes: Some(files_base_size),
+                partition_path: Some("files".to_string()),
+                ..Default::default()
+            }],
+        )]),
+    )
+    .await?;
+
+    // Remaining partitions in Java MetadataPartitionType enum order, each with
+    // the next unique bootstrap instant and its own deltacommit.
+    let mut next_offset = 1usize;
+    if column_stats_enabled {
+        bootstrap_empty_hfile_partition(
+            data_table_storage,
+            &bootstrap_instant(next_offset),
+            MetadataPartitionType::ColumnStats.partition_name(),
+            DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS,
+            &column_stats_file_id,
+            hoodie_metadata_schema_json()?,
+        )
+        .await?;
+        next_offset += 1;
+    }
+    if record_index_enabled {
+        bootstrap_empty_hfile_partition(
+            data_table_storage,
+            &bootstrap_instant(next_offset),
+            MetadataPartitionType::RecordIndex.partition_name(),
+            DEFAULT_RLI_NUM_FILE_GROUPS,
+            &record_index_file_id,
+            record_index_metadata_avro_schema_json()?,
+        )
+        .await?;
+        next_offset += 1;
+    }
+    if partition_stats_enabled {
+        bootstrap_empty_hfile_partition(
+            data_table_storage,
+            &bootstrap_instant(next_offset),
+            MetadataPartitionType::PartitionStats.partition_name(),
+            DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS,
+            &partition_stats_file_id,
+            hoodie_metadata_schema_json()?,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn bootstrap_empty_hfile_partition(
+    storage: &Storage,
+    instant: &str,
+    partition_name: &str,
+    num_file_groups: usize,
+    file_id_fn: &dyn Fn(usize) -> String,
+    schema_json: &str,
+) -> Result<()> {
+    crate::write::ensure_partition_metadata(
+        storage,
+        &format!("{METADATA_BASE}/{partition_name}"),
+        instant,
+    )
+    .await?;
+    let mut stats = Vec::with_capacity(num_file_groups);
+    for shard in 0..num_file_groups {
+        let file_id = file_id_fn(shard);
+        let base_name = format!("{file_id}_0-0-0_{instant}.hfile");
+        let empty = HFileWriter::write(
+            &[],
+            BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+        )
+        .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+        let size = empty.len() as i64;
+        storage
+            .put_file(
+                &format!("{METADATA_BASE}/{partition_name}/{base_name}"),
+                empty,
+            )
+            .await?;
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(format!("{partition_name}/{base_name}")),
+            base_file: Some(base_name),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(0),
+            total_write_bytes: Some(size),
+            file_size_in_bytes: Some(size),
+            partition_path: Some(partition_name.to_string()),
+            ..Default::default()
+        });
+    }
+    write_metadata_commit(
+        storage,
+        instant,
+        HashMap::from([(partition_name.to_string(), stats)]),
+    )
+    .await
+}
+
+/// Append a files-partition HFile data block to the metadata table log file.
+///
+/// Returns the `files` partition write stats for the caller's single MDT
+/// deltacommit (see [`write_metadata_commit`]).
+pub async fn update_files_partition(
+    data_storage: &Storage,
+    instant: &str,
+    files: &[(String, String, i64)],
+) -> Result<Vec<HoodieWriteStat>> {
+    let entries = files
+        .iter()
+        .map(|(partition, file_name, size)| (partition.clone(), file_name.clone(), *size, false))
+        .collect::<Vec<_>>();
+    update_files_partition_entries(data_storage, instant, &entries).await
+}
+
+/// Apply file additions and deletions to the metadata table files partition.
+///
+/// Returns the `files` partition write stats for the caller's single MDT
+/// deltacommit (see [`write_metadata_commit`]).
+pub async fn update_files_partition_entries(
+    data_storage: &Storage,
+    instant: &str,
+    files: &[(String, String, i64, bool)],
+) -> Result<Vec<HoodieWriteStat>> {
+    let mut by_partition: BTreeMap<String, Vec<FilesMetadataEntry>> = BTreeMap::new();
+    for (partition, file_name, size, is_deleted) in files {
+        let partition = if partition.is_empty() {
+            FilesPartitionRecord::NON_PARTITIONED_NAME.to_string()
+        } else {
+            partition.clone()
+        };
+        by_partition
+            .entry(partition)
+            .or_default()
+            .push(FilesMetadataEntry {
+                name: file_name.clone(),
+                size: *size,
+                is_deleted: *is_deleted,
+            });
+    }
+    let partitions = by_partition.keys().cloned().collect::<Vec<_>>();
+    let all_partition_entries: Vec<FilesMetadataEntry> = partitions
+        .iter()
+        .map(|name| FilesMetadataEntry {
+            name: name.clone(),
+            size: 0,
+            is_deleted: false,
+        })
+        .collect();
+    let mut entries = vec![(
+        FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
+        encode_files_record(
+            FilesPartitionRecord::ALL_PARTITIONS_KEY,
+            MetadataRecordType::AllPartitions,
+            all_partition_entries,
+        )?,
+    )];
+    for (partition, files) in by_partition {
+        entries.push((
+            partition.clone(),
+            encode_files_record(&partition, MetadataRecordType::Files, files)?,
+        ));
+    }
+    let schema_json = files_metadata_avro_schema_json()?.to_string();
+    let hfile = HFileWriter::write(
+        &entries,
+        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+    )
+    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+    // Java HFile data blocks embed SCHEMA (ordinal 2) alongside INSTANT_TIME.
+    let block = LogFileWriter::write_log_block(
+        BlockType::HfileData,
+        HashMap::from([
+            (BlockMetadataKey::InstantTime, instant.to_string()),
+            (BlockMetadataKey::Schema, schema_json),
+        ]),
+        &hfile,
+    );
+    let log_name = format!(".{FILES_FILE_ID}_{instant}.log.1_0-0-0");
+    let log_rel = format!("files/{log_name}");
+    let log_size = block.len() as i64;
+    data_storage
+        .put_file(&format!("{METADATA_BASE}/{log_rel}"), block)
+        .await?;
+    Ok(vec![HoodieWriteStat {
+        file_id: Some(FILES_FILE_ID.to_string()),
+        path: Some(log_rel),
+        log_files: Some(vec![log_name]),
+        prev_commit: Some("null".to_string()),
+        num_writes: Some(entries.len() as i64),
+        total_write_bytes: Some(log_size),
+        file_size_in_bytes: Some(log_size),
+        partition_path: Some("files".to_string()),
+        ..Default::default()
+    }])
+}
+
+/// Append record-index put/delete entries.
+///
+/// Puts are HFile data blocks. Deletes are v3 delete log blocks — never type-5
+/// records with null `recordIndexMetadata`, which NPEs Java's RLI reader.
+///
+/// Returns the `record_index` partition write stats for the caller's single
+/// MDT deltacommit (see [`write_metadata_commit`]).
+pub async fn update_record_index(
+    data_storage: &Storage,
+    instant: &str,
+    entries: &[RecordIndexEntry],
+) -> Result<Vec<HoodieWriteStat>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let num_groups = detect_rli_num_file_groups(data_storage).await?;
+    let schema_json = record_index_metadata_avro_schema_json()?.to_string();
+    let mut puts_by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
+    let mut deletes_by_shard: HashMap<usize, Vec<(String, String)>> = HashMap::new();
+    for entry in entries {
+        let shard = map_record_key_to_file_group_index(&entry.record_key, num_groups);
+        if entry.is_deleted {
+            // DeleteRecord.partitionPath is the MDT partition (Java HoodieKey for RLI deletes).
+            deletes_by_shard.entry(shard).or_default().push((
+                entry.record_key.clone(),
+                MetadataPartitionType::RecordIndex
+                    .partition_name()
+                    .to_string(),
+            ));
+        } else {
+            let bytes = encode_record_index_entry(entry)?;
+            puts_by_shard
+                .entry(shard)
+                .or_default()
+                .push((entry.record_key.clone(), bytes));
+        }
+    }
+
+    let shards: std::collections::BTreeSet<usize> = puts_by_shard
+        .keys()
+        .chain(deletes_by_shard.keys())
+        .copied()
+        .collect();
+    let mut stats = Vec::new();
+    for shard in shards {
+        let file_id = record_index_file_id(shard);
+        let puts = puts_by_shard.remove(&shard).unwrap_or_default();
+        let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
+        let mut log_bytes = Vec::new();
+        let mut num_writes = 0i64;
+        if !puts.is_empty() {
+            num_writes += puts.len() as i64;
+            let hfile = HFileWriter::write(
+                &puts,
+                BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+            )
+            .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+            log_bytes.extend(LogFileWriter::write_log_block(
+                BlockType::HfileData,
+                HashMap::from([
+                    (BlockMetadataKey::InstantTime, instant.to_string()),
+                    (BlockMetadataKey::Schema, schema_json.clone()),
+                ]),
+                &hfile,
+            ));
+        }
+        if !deletes.is_empty() {
+            num_writes += deletes.len() as i64;
+            log_bytes.extend(crate::write::build_delete_log_block(instant, &deletes, 0)?);
+        }
+        if log_bytes.is_empty() {
+            continue;
+        }
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let log_rel = format!("record_index/{log_name}");
+        let log_size = log_bytes.len() as i64;
+        data_storage
+            .put_file(&format!("{METADATA_BASE}/{log_rel}"), log_bytes)
+            .await?;
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(log_rel),
+            log_files: Some(vec![log_name]),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(num_writes),
+            total_write_bytes: Some(log_size),
+            file_size_in_bytes: Some(log_size),
+            partition_path: Some("record_index".to_string()),
+            ..Default::default()
+        });
+    }
+    Ok(stats)
+}
+
+async fn detect_rli_num_file_groups(storage: &Storage) -> Result<usize> {
+    detect_num_file_groups(
+        storage,
+        MetadataPartitionType::RecordIndex.partition_name(),
+        "record-index-",
+        DEFAULT_RLI_NUM_FILE_GROUPS,
+    )
+    .await
+}
+
+async fn detect_num_file_groups(
+    storage: &Storage,
+    partition_name: &str,
+    file_id_prefix: &str,
+    default: usize,
+) -> Result<usize> {
+    // Committed slices only: an orphan HFile from a crashed writer must not
+    // change the shard modulus (it would diverge from what Java computes),
+    // and listing errors must propagate rather than silently changing it.
+    let slices = mdt_partition_latest_slices(storage, partition_name).await?;
+    let mut shards = std::collections::BTreeSet::new();
+    for (file_id, _, _) in &slices {
+        if let Some(rest) = file_id.strip_prefix(file_id_prefix)
+            && let Some(shard_str) = rest.get(..4)
+            && let Ok(shard) = shard_str.parse::<usize>()
+        {
+            shards.insert(shard);
+        }
+    }
+    if shards.is_empty() {
+        Ok(default)
+    } else {
+        Ok(shards.len())
+    }
+}
+
+/// Whether `column_stats` is listed in `hoodie.table.metadata.partitions`.
+pub fn is_column_stats_enabled(table: &Table) -> bool {
+    mdt_partition_enabled(table, MetadataPartitionType::ColumnStats)
+}
+
+/// Whether `partition_stats` is listed in `hoodie.table.metadata.partitions`.
+pub fn is_partition_stats_enabled(table: &Table) -> bool {
+    mdt_partition_enabled(table, MetadataPartitionType::PartitionStats)
+}
+
+fn mdt_partition_enabled(table: &Table, partition: MetadataPartitionType) -> bool {
+    use crate::config::table::HudiTableConfig::MetadataTablePartitions;
+    let partitions: Vec<String> = table
+        .hudi_configs
+        .get_or_default(MetadataTablePartitions)
+        .into();
+    partitions
+        .iter()
+        .any(|p| p.trim() == partition.partition_name())
+}
+
+/// Java `HoodieIndexVersion.getCurrentVersion`: column/partition stats are V2
+/// from table version 9 (primitive wrappers + `valueType`).
+fn stats_index_version(table: &Table) -> StatsIndexVersion {
+    let table_version: isize = table
+        .hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::TableVersion)
+        .into();
+    if table_version >= 9 {
+        StatsIndexVersion::V2
+    } else {
+        StatsIndexVersion::V1
+    }
+}
+
+/// Update MDT `column_stats` and `partition_stats` for written files.
+///
+/// Partition stats follow Java `convertMetadataToPartitionStatRecords`: for each
+/// touched partition, recompute a tight-bound aggregate over this commit's new
+/// files plus the existing MDT `column_stats` of all files still in the latest
+/// file slices. `replaced_files` lists relative paths superseded by this commit
+/// (COW rewrites / replacecommits) to exclude from that scan.
+///
+/// Returns per-MDT-partition write stats for the caller's single MDT
+/// deltacommit (see [`write_metadata_commit`]).
+pub async fn update_column_stats_partitions(
+    table: &Table,
+    instant: &str,
+    updates: &[StatsFileUpdate],
+    schema: &Schema,
+    replaced_files: &[String],
+) -> Result<HashMap<String, Vec<HoodieWriteStat>>> {
+    let mut out: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
+    if updates.is_empty() {
+        return Ok(out);
+    }
+    let data_storage = table.file_system_view.storage.clone();
+    // Written files always carry the meta fields, so their footers contribute
+    // meta-column ranges. If the caller passed the raw user schema, those
+    // columns would be missing from the survivor fetch and the partition
+    // aggregate would collapse onto this commit's files (Java indexes the
+    // three meta columns unconditionally).
+    let indexed_columns = columns_to_index(&crate::write::append::schema_with_meta_fields(schema));
+    let mut column_records: Vec<(String, ColumnStatsMetadata)> = Vec::new();
+
+    for update in updates {
+        let payloads = if update.is_deleted {
+            column_stats_tombstones(&update.file_name, &indexed_columns)
+        } else {
+            column_stats_for_file(&update.file_name, &update.ranges, false)
+        };
+        for payload in payloads {
+            let key = column_stats_index_key(
+                &update.partition_path,
+                &update.file_name,
+                &payload.column_name,
+            );
+            column_records.push((key, payload));
+        }
+    }
+
+    if !column_records.is_empty() {
+        let stats = write_stats_log_blocks(
+            data_storage.as_ref(),
+            instant,
+            MetadataPartitionType::ColumnStats.partition_name(),
+            "col-stats-",
+            DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS,
+            &column_stats_file_id,
+            &column_records,
+            true,
+            stats_index_version(table),
+        )
+        .await?;
+        out.insert(
+            MetadataPartitionType::ColumnStats
+                .partition_name()
+                .to_string(),
+            stats,
+        );
+    }
+
+    if is_partition_stats_enabled(table) {
+        let partition_records =
+            compute_partition_stats_records(table, updates, &indexed_columns, replaced_files)
+                .await?;
+        if !partition_records.is_empty() {
+            let stats = write_stats_log_blocks(
+                data_storage.as_ref(),
+                instant,
+                MetadataPartitionType::PartitionStats.partition_name(),
+                "partition-stats-",
+                DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS,
+                &partition_stats_file_id,
+                &partition_records,
+                false,
+                stats_index_version(table),
+            )
+            .await?;
+            out.insert(
+                MetadataPartitionType::PartitionStats
+                    .partition_name()
+                    .to_string(),
+                stats,
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn split_partition_and_name(relative_path: &str) -> (String, String) {
+    match relative_path.rsplit_once('/') {
+        Some((partition, name)) => (partition.to_string(), name.to_string()),
+        None => (String::new(), relative_path.to_string()),
+    }
+}
+
+/// Tight-bound partition_stats recompute (Java `convertMetadataToPartitionStatRecords`
+/// with `isShouldScanColStatsForTightBound = true`, which holds whenever the
+/// `column_stats` partition exists — a prerequisite of `partition_stats`).
+async fn compute_partition_stats_records(
+    table: &Table,
+    updates: &[StatsFileUpdate],
+    indexed_columns: &[String],
+    replaced_files: &[String],
+) -> Result<Vec<(String, ColumnStatsMetadata)>> {
+    let touched: std::collections::BTreeSet<String> = updates
+        .iter()
+        .filter(|u| !u.is_deleted)
+        .map(|u| u.partition_path.clone())
+        .collect();
+    if touched.is_empty() {
+        return Ok(Vec::new());
+    }
+    let excluded: std::collections::HashSet<(String, String)> = replaced_files
+        .iter()
+        .map(|path| split_partition_and_name(path))
+        .chain(
+            updates
+                .iter()
+                .map(|u| (u.partition_path.clone(), u.file_name.clone())),
+        )
+        .collect();
+
+    // Files still live in the latest pre-commit file slices of touched partitions.
+    let mut survivors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for slice in table.get_file_slices(&ReadOptions::new()).await? {
+        let partition = slice.partition_path.clone();
+        if !touched.contains(&partition) {
+            continue;
+        }
+        // Log-only slices contribute no base file name.
+        let mut names = Vec::new();
+        if let Some(base_path) = slice.base_file_relative_path()? {
+            let (_, base_name) = split_partition_and_name(&base_path);
+            names.push(base_name);
+        }
+        for log_file in &slice.log_files {
+            let (_, log_name) = split_partition_and_name(&slice.log_file_relative_path(log_file)?);
+            names.push(log_name);
+        }
+        for name in names {
+            if !excluded.contains(&(partition.clone(), name.clone())) {
+                survivors.entry(partition.clone()).or_default().push(name);
+            }
+        }
+    }
+
+    // Fetch the survivors' column_stats from the MDT.
+    let mut wanted: HashMap<String, (String, String)> = HashMap::new();
+    for (partition, files) in &survivors {
+        for file in files {
+            for column in indexed_columns {
+                wanted.insert(
+                    column_stats_index_key(partition, file, column),
+                    (partition.clone(), file.clone()),
+                );
+            }
+        }
+    }
+    let existing = load_column_stats_records(
+        table.file_system_view.storage.clone(),
+        table.hudi_configs.clone(),
+        &wanted,
+    )
+    .await?;
+
+    // Ranges per (partition, file): this commit's in-memory ranges + survivors.
+    let mut ranges: BTreeMap<String, BTreeMap<String, Vec<ColumnRangeStats>>> = BTreeMap::new();
+    for update in updates {
+        if update.is_deleted || update.ranges.is_empty() {
+            continue;
+        }
+        ranges
+            .entry(update.partition_path.clone())
+            .or_default()
+            .entry(update.file_name.clone())
+            .or_default()
+            .extend(update.ranges.iter().cloned());
+    }
+    for (key, stats) in existing {
+        if stats.is_deleted {
+            continue;
+        }
+        let Some((partition, file)) = wanted.get(&key) else {
+            continue;
+        };
+        ranges
+            .entry(partition.clone())
+            .or_default()
+            .entry(file.clone())
+            .or_default()
+            .push(ColumnRangeStats {
+                column_name: stats.column_name,
+                range_known: true,
+                min_value: stats.min_value,
+                max_value: stats.max_value,
+                value_count: stats.value_count,
+                null_count: stats.null_count,
+                total_size: stats.total_size,
+                total_uncompressed_size: stats.total_uncompressed_size,
+            });
+    }
+
+    let mut out = Vec::new();
+    for (partition, by_file) in ranges {
+        let file_ranges: Vec<Vec<ColumnRangeStats>> = by_file.into_values().collect();
+        for payload in aggregate_partition_stats(&partition, &file_ranges, true) {
+            let key = partition_stats_index_key(&partition, &payload.column_name);
+            out.push((key, payload));
+        }
+    }
+    Ok(out)
+}
+
+/// Read `column_stats` records for the requested keys from the MDT partition
+/// (HFile bases + log blocks, later blocks win), mirroring the RLI loader.
+///
+/// `storage` and `hudi_configs` must belong to the DATA table (paths are
+/// resolved under `.hoodie/metadata` and fencing lists the data timeline).
+/// Latest file slice per file group in an MDT partition, via the same
+/// FileGroup/FileSlice machinery the data table uses: multi-base aware (a
+/// Spark MDT compaction leaves several base versions; only the newest slice
+/// is live) and log files ordered by version/completion, not lexicographically.
+///
+/// Returns `(file id, base hfile relative path, ordered log relative paths)`.
+pub(crate) async fn mdt_partition_latest_slices(
+    storage: &Storage,
+    partition: &str,
+) -> Result<Vec<(String, String, Vec<String>)>> {
+    use std::str::FromStr;
+    let dir = format!("{METADATA_BASE}/{partition}");
+    let listed = match storage.list_files(Some(&dir)).await {
+        Ok(files) => files,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    // Admit only bases whose instant completed on the MDT timeline: a crash
+    // between writing a compaction HFile and completing its .commit must not
+    // let the orphan base shadow the committed slice (and silently drop the
+    // still-live pre-compaction logs). Log blocks are fenced separately by
+    // the callers via valid_metadata_instants.
+    let mdt_timeline_dir = format!("{METADATA_BASE}/.hoodie/timeline");
+    let mut completed_mdt_instants: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    match storage.list_files(Some(&mdt_timeline_dir)).await {
+        Ok(files) => {
+            for file in files {
+                let name = file.name;
+                if !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    || name.ends_with(".requested")
+                    || name.ends_with(".inflight")
+                {
+                    continue;
+                }
+                completed_mdt_instants
+                    .insert(name.chars().take_while(char::is_ascii_digit).collect());
+            }
+        }
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Archived MDT instants completed before leaving the active timeline.
+    completed_mdt_instants
+        .extend(crate::write::archival::archived_instant_times(storage, &mdt_timeline_dir).await?);
+
+    // Two passes: log-to-slice association requires the base files to be in
+    // place first, and storage listing order is not guaranteed.
+    let mut bases = Vec::new();
+    let mut logs = Vec::new();
+    for file in listed {
+        let name = file.name;
+        if name.ends_with(".hfile") && !name.starts_with('.') {
+            let base = crate::file_group::base_file::BaseFile::from_str(&name)?;
+            if !completed_mdt_instants.contains(&base.commit_timestamp) {
+                continue;
+            }
+            bases.push(base);
+        } else if name.starts_with('.')
+            && name.contains(".log.")
+            && crate::file_group::log_file::LogFile::is_log_file_name(&name)
+        {
+            let mut log = crate::file_group::log_file::LogFile::from_str(&name)?;
+            // MDT logs are named by their deltacommit instant; using it as the
+            // completion time gives v8 completion-based slice attachment (and
+            // correctly excludes pre-compaction logs from a newer base slice).
+            log.completion_timestamp = Some(log.timestamp.clone());
+            logs.push(log);
+        }
+    }
+    let mut groups: HashMap<String, crate::file_group::FileGroup> = HashMap::new();
+    for base in bases {
+        groups
+            .entry(base.file_id.clone())
+            .or_insert_with(|| {
+                crate::file_group::FileGroup::new(base.file_id.clone(), partition.to_string())
+            })
+            .add_base_file(base)?;
+    }
+    for log in logs {
+        // Skip log-only groups: an MDT file group is unreadable without its
+        // bootstrap HFile base, and slice association needs a base slice.
+        let Some(group) = groups.get_mut(&log.file_id) else {
+            continue;
+        };
+        group.add_log_file(log)?;
+    }
+    let mut out = Vec::new();
+    let mut ids: Vec<_> = groups.keys().cloned().collect();
+    ids.sort();
+    for id in ids {
+        let group = &groups[&id];
+        let Some(slice) = group.get_file_slice_as_of("99999999999999999") else {
+            continue;
+        };
+        let Some(base) = slice.base_file.as_ref() else {
+            continue;
+        };
+        let base_path = format!("{dir}/{}", base.file_name());
+        let logs = slice
+            .log_files
+            .iter()
+            .map(|log| format!("{dir}/{}", log.file_name()))
+            .collect();
+        out.push((id, base_path, logs));
+    }
+    Ok(out)
+}
+
+pub(crate) async fn load_column_stats_records(
+    storage: std::sync::Arc<Storage>,
+    hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
+    wanted: &HashMap<String, (String, String)>,
+) -> Result<HashMap<String, ColumnStatsMetadata>> {
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let partition = MetadataPartitionType::ColumnStats.partition_name();
+    let mut base_paths = Vec::new();
+    let mut log_paths = Vec::new();
+    for (_, base, logs) in mdt_partition_latest_slices(storage.as_ref(), partition).await? {
+        base_paths.push(base);
+        log_paths.extend(logs);
+    }
+
+    let mut sorted_keys: Vec<&str> = wanted.keys().map(String::as_str).collect();
+    sorted_keys.sort_unstable();
+
+    let mut merged: HashMap<String, ColumnStatsMetadata> = HashMap::new();
+    for base in base_paths {
+        let mut reader = HFileReader::open(storage.as_ref(), &base)
+            .await
+            .map_err(|e| crate::error::CoreError::HFile(format!("failed to open {base}: {e:?}")))?;
+        let records = reader
+            .lookup_records(&sorted_keys)
+            .map_err(|e| crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}")))?;
+        for (_, record) in records {
+            let Some(record) = record else { continue };
+            apply_column_stats_record(&mut merged, wanted, &record)?;
+        }
+    }
+    if !log_paths.is_empty() {
+        // Only trust log blocks whose instant completed on the data timeline
+        // (Java getValidInstantTimestamps) — orphan MDT commits are skipped.
+        let valid =
+            crate::metadata::table::valid_metadata_instants(storage.as_ref(), &hudi_configs)
+                .await?;
+        let scanner = LogFileScanner::new(hudi_configs, storage);
+        let range = InstantRange::exact_match(valid, "UTC");
+        match scanner.scan(log_paths, &range).await? {
+            ScanResult::HFileRecords(records) => {
+                for record in &records {
+                    apply_column_stats_record(&mut merged, wanted, record)?;
+                }
+            }
+            ScanResult::Empty => {}
+            ScanResult::RecordBatches(_) => {
+                return Err(crate::error::CoreError::MetadataTable(
+                    "column_stats logs must contain HFile data blocks".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(merged)
+}
+
+fn apply_column_stats_record(
+    merged: &mut HashMap<String, ColumnStatsMetadata>,
+    wanted: &HashMap<String, (String, String)>,
+    record: &crate::hfile::HFileRecord,
+) -> Result<()> {
+    let Some(key) = record.key_as_str() else {
+        return Ok(());
+    };
+    if !wanted.contains_key(key) {
+        return Ok(());
+    }
+    if let Some(stats) = decode_column_stats_entry(record.value(), record.avro_schema())? {
+        // Java HoodieMetadataPayload semantics: successive stats for a key
+        // merge (range union + count sums) unless the newer record is a
+        // tombstone or tight-bound, which replaces. Plain last-wins would
+        // shrink bounds written by non-tight-bound writers (e.g. Spark
+        // partition_stats).
+        let payload_merger = crate::metadata::payload_merger::MetadataPayloadMerger;
+        match merged.remove(key) {
+            Some(existing) => {
+                merged.insert(
+                    key.to_string(),
+                    payload_merger.merge_column_stats(&existing, &stats),
+                );
+            }
+            None => {
+                merged.insert(key.to_string(), stats);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_stats_log_blocks(
+    data_storage: &Storage,
+    instant: &str,
+    partition_name: &str,
+    file_id_prefix: &str,
+    default_groups: usize,
+    file_id_fn: &dyn Fn(usize) -> String,
+    records: &[(String, ColumnStatsMetadata)],
+    is_column_stats: bool,
+    version: StatsIndexVersion,
+) -> Result<Vec<HoodieWriteStat>> {
+    let num_groups =
+        detect_num_file_groups(data_storage, partition_name, file_id_prefix, default_groups)
+            .await?;
+    let schema_json = hoodie_metadata_schema_json()?.to_string();
+    let mut by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
+    for (key, payload) in records {
+        let bytes = if is_column_stats {
+            encode_column_stats(payload, version)?
+        } else {
+            encode_partition_stats(payload, version)?
+        };
+        let shard = map_record_key_to_file_group_index(key, num_groups);
+        by_shard
+            .entry(shard)
+            .or_default()
+            .push((key.clone(), bytes));
+    }
+    let mut stats = Vec::new();
+    for (shard, entries) in by_shard {
+        let file_id = file_id_fn(shard);
+        let hfile = HFileWriter::write(
+            &entries,
+            BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+        )
+        .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+        let block = LogFileWriter::write_log_block(
+            BlockType::HfileData,
+            HashMap::from([
+                (BlockMetadataKey::InstantTime, instant.to_string()),
+                (BlockMetadataKey::Schema, schema_json.clone()),
+            ]),
+            &hfile,
+        );
+        let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
+        let log_rel = format!("{partition_name}/{log_name}");
+        let log_size = block.len() as i64;
+        data_storage
+            .put_file(&format!("{METADATA_BASE}/{log_rel}"), block)
+            .await?;
+        stats.push(HoodieWriteStat {
+            file_id: Some(file_id),
+            path: Some(log_rel),
+            log_files: Some(vec![log_name]),
+            prev_commit: Some("null".to_string()),
+            num_writes: Some(entries.len() as i64),
+            total_write_bytes: Some(log_size),
+            file_size_in_bytes: Some(log_size),
+            partition_path: Some(partition_name.to_string()),
+            ..Default::default()
+        });
+    }
+    Ok(stats)
+}
+
+/// Write the MDT deltacommit for one data instant: requested + inflight fencing
+/// then a completed `{instant}_{completion}.deltacommit` (Java MOR MDT).
+///
+/// One deltacommit per instant — callers collect write stats from all touched
+/// MDT partitions and commit once, like Java `commitInternal`. Completed bytes
+/// must be valid Avro `HoodieCommitMetadata` — Spark skips instants whose
+/// metadata does not parse, which drops MDT log files from the file slice.
+pub(crate) async fn write_metadata_commit(
+    storage: &Storage,
+    instant: &str,
+    partition_to_write_stats: HashMap<String, Vec<HoodieWriteStat>>,
+) -> Result<()> {
+    if partition_to_write_stats.values().all(|s| s.is_empty()) {
+        return Ok(());
+    }
+    let timeline = format!("{METADATA_BASE}/.hoodie/timeline");
+    crate::write::fence_timeline_instant(
+        storage,
+        &timeline,
+        instant,
+        Action::DeltaCommit,
+        Vec::new(),
+        crate::write::inflight_commit_metadata_bytes("UPSERT", true)?,
+    )
+    .await?;
+    let metadata = HoodieCommitMetadata {
+        version: Some(1),
+        operation_type: Some("UPSERT".to_string()),
+        partition_to_write_stats: Some(partition_to_write_stats),
+        compacted: Some(false),
+        extra_metadata: Some(HashMap::new()),
+    };
+    // Completion time is minted at completion, after the requested time (Java
+    // generates it through the same monotonic skew-adjusting time generator).
+    let completion = crate::write::append::generate_instant_time().await;
+    let completed_path = format!("{timeline}/{instant}_{completion}.deltacommit");
+    storage
+        .put_file_if_absent(&completed_path, metadata.to_avro_bytes()?)
+        .await?;
+    Ok(())
+}
+
+/// Convert a timeline instant to epoch millis for the record index.
+///
+/// The zone is the table's `hoodie.table.timeline.timezone`, matching Java's
+/// HoodieInstantTimeGenerator: parsing a LOCAL-zone table's instants as UTC
+/// writes an offset instantTime into the index.
+pub(crate) fn instant_to_epoch_millis_in(instant: &str, timezone: &str) -> i64 {
+    Instant::parse_datetime(instant, timezone)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|_| {
+            debug_assert!(
+                instant.parse::<i64>().is_ok(),
+                "unparseable instant '{instant}'"
+            );
+            instant.parse::<i64>().unwrap_or(0)
+        })
+}
+
+/// Resolve the table's timeline timezone for [`instant_to_epoch_millis_in`].
+pub(crate) fn timeline_timezone(hudi_configs: &crate::config::HudiConfigs) -> String {
+    let value: String = hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::TimelineTimezone)
+        .into();
+    value
+}
+
+pub(crate) fn instant_to_epoch_millis(instant: &str) -> i64 {
+    instant_to_epoch_millis_in(instant, "UTC")
+}
+
+/// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`).
+pub fn epoch_millis_to_instant(millis: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    match Utc.timestamp_millis_opt(millis) {
+        chrono::LocalResult::Single(dt) => dt.format("%Y%m%d%H%M%S%3f").to_string(),
+        _ => format!("{millis:017}"),
+    }
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fabricate an MDT partition dir plus a timeline whose completed
+    /// instants are `committed`; base admission depends on the latter.
+    async fn slices_for_with_timeline(
+        files: &[&str],
+        committed: &[&str],
+    ) -> Result<Vec<(String, String, Vec<String>)>> {
+        let dir = tempfile::tempdir().unwrap();
+        let partition_dir = dir.path().join(".hoodie/metadata/column_stats");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        for name in files {
+            std::fs::write(partition_dir.join(name), b"").unwrap();
+        }
+        let timeline_dir = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+        std::fs::create_dir_all(&timeline_dir).unwrap();
+        for instant in committed {
+            std::fs::write(
+                timeline_dir.join(format!("{instant}_{instant}.deltacommit")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url)?;
+        mdt_partition_latest_slices(storage.as_ref(), "column_stats").await
+    }
+
+    async fn slices_for(files: &[&str]) -> Result<Vec<(String, String, Vec<String>)>> {
+        // All referenced instants committed.
+        slices_for_with_timeline(
+            files,
+            &[
+                "00000000000000010",
+                "00000000000000020",
+                "00000000000000030",
+                "00000000000000040",
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_multi_base_excludes_pre_compaction_logs() {
+        // Post-compaction layout: bootstrap base + old logs, then a compacted
+        // base at t=30. Only the newer base and the post-compaction log form
+        // the live slice.
+        let slices = slices_for(&[
+            "col-stats-0000-0_0-0-0_00000000000000010.hfile",
+            ".col-stats-0000-0_00000000000000020.log.1_0-0-0",
+            "col-stats-0000-0_0-1-0_00000000000000030.hfile",
+            ".col-stats-0000-0_00000000000000040.log.1_0-0-0",
+            ".hoodie_partition_metadata",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(slices.len(), 1);
+        let (file_id, base, logs) = &slices[0];
+        assert_eq!(file_id, "col-stats-0000-0");
+        assert!(base.ends_with("col-stats-0000-0_0-1-0_00000000000000030.hfile"));
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].ends_with(".col-stats-0000-0_00000000000000040.log.1_0-0-0"));
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_orders_logs_numerically_past_ten() {
+        // Log versions 1..=12 must come back in numeric order, not the
+        // lexicographic order a raw listing sort would produce (1, 10, 11, ...).
+        let names: Vec<String> = (1..=12)
+            .map(|v| format!(".col-stats-0000-0_00000000000000020.log.{v}_0-0-0"))
+            .collect();
+        let mut files: Vec<&str> = names.iter().map(String::as_str).collect();
+        files.push("col-stats-0000-0_0-0-0_00000000000000010.hfile");
+        let slices = slices_for(&files).await.unwrap();
+        assert_eq!(slices.len(), 1);
+        let logs = &slices[0].2;
+        assert_eq!(logs.len(), 12);
+        for (i, log) in logs.iter().enumerate() {
+            assert!(
+                log.ends_with(&format!(".log.{}_0-0-0", i + 1)),
+                "log {i} out of order: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detect_num_file_groups_ignores_uncommitted_shards() {
+        // An orphan HFile from a crashed writer must not change the shard
+        // modulus; only committed shards count, and an empty partition falls
+        // back to the caller's default.
+        let dir = tempfile::tempdir().unwrap();
+        let partition_dir = dir.path().join(".hoodie/metadata/record_index");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        for name in [
+            "record-index-0000-0_0-0-0_00000000000000010.hfile",
+            "record-index-0001-0_0-0-0_00000000000000010.hfile",
+            "record-index-0002-0_0-0-0_00000000000000099.hfile", // orphan
+        ] {
+            std::fs::write(partition_dir.join(name), b"").unwrap();
+        }
+        let timeline_dir = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+        std::fs::create_dir_all(&timeline_dir).unwrap();
+        std::fs::write(
+            timeline_dir.join("00000000000000010_00000000000000010.deltacommit"),
+            b"{}",
+        )
+        .unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let shards = detect_num_file_groups(
+            storage.as_ref(),
+            MetadataPartitionType::RecordIndex.partition_name(),
+            "record-index-",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shards, 2, "orphan shard must not count");
+
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(empty.path().join(".hoodie")).unwrap();
+        let base_url = url::Url::from_directory_path(empty.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let shards = detect_num_file_groups(
+            storage.as_ref(),
+            MetadataPartitionType::RecordIndex.partition_name(),
+            "record-index-",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shards, 10, "missing partition falls back to default");
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_ignores_uncommitted_compaction_base() {
+        // A compaction HFile whose MDT .commit never completed (crash between
+        // file write and commit) must not shadow the committed slice: the
+        // older committed base stays active WITH its logs.
+        let slices = slices_for_with_timeline(
+            &[
+                "col-stats-0000-0_0-0-0_00000000000000010.hfile",
+                ".col-stats-0000-0_00000000000000020.log.1_0-0-0",
+                "col-stats-0000-0_0-1-0_00000000000000030.hfile",
+            ],
+            &["00000000000000010", "00000000000000020"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(slices.len(), 1);
+        let (_, base, logs) = &slices[0];
+        assert!(
+            base.ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile"),
+            "committed base must stay active, got {base}"
+        );
+        assert_eq!(logs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_skips_log_only_group_and_missing_partition() {
+        // A group with logs but no HFile base is unreadable and skipped.
+        let slices = slices_for(&[".col-stats-0000-0_00000000000000020.log.1_0-0-0"])
+            .await
+            .unwrap();
+        assert!(slices.is_empty());
+
+        // Missing partition directory is an empty result, not an error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".hoodie")).unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let slices = mdt_partition_latest_slices(storage.as_ref(), "column_stats")
+            .await
+            .unwrap();
+        assert!(slices.is_empty());
+    }
+}

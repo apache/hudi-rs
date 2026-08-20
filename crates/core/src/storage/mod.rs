@@ -26,7 +26,7 @@ use std::sync::Arc;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, parse_url_opts};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, parse_url_opts};
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -257,6 +257,78 @@ impl Storage {
         }
         Ok(file_metadata)
     }
+
+    /// Resolve a relative path to an [`ObjPath`] under this storage's base URL.
+    fn relative_obj_path(&self, relative_path: &str) -> Result<ObjPath> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        Ok(ObjPath::from_url_path(obj_url.path())?)
+    }
+
+    /// Write bytes to a path relative to the table base path.
+    pub async fn put_file(&self, relative_path: &str, bytes: impl Into<Bytes>) -> Result<()> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        self.object_store
+            .put(&obj_path, PutPayload::from(bytes.into()))
+            .await?;
+        Ok(())
+    }
+
+    /// Write a file only if nothing exists at the path (`PutMode::Create`).
+    ///
+    /// Timeline files must never silently replace one another: two writers
+    /// minting the same instant otherwise clobber each other's commit with no
+    /// error. An existing object surfaces as
+    /// [`StorageError::AlreadyExists`](error::StorageError) so callers can
+    /// report the conflict.
+    pub async fn put_file_if_absent(
+        &self,
+        relative_path: &str,
+        bytes: impl Into<Bytes>,
+    ) -> Result<()> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        let options = PutOptions::from(PutMode::Create);
+        match self
+            .object_store
+            .put_opts(&obj_path, PutPayload::from(bytes.into()), options)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { path, source }) => {
+                Err(error::StorageError::AlreadyExists(path, source))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete a file at a path relative to the table base path.
+    ///
+    /// Missing objects are treated as success (idempotent cleanup).
+    pub async fn delete_file(&self, relative_path: &str) -> Result<()> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        match self.object_store.delete(&obj_path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Return true if an object exists at the relative path.
+    pub async fn exists(&self, relative_path: &str) -> Result<bool> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        match self.object_store.head(&obj_path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Rename/move an object from `from_relative` to `to_relative`.
+    pub async fn rename(&self, from_relative: &str, to_relative: &str) -> Result<()> {
+        let from_path = self.relative_obj_path(from_relative)?;
+        let to_path = self.relative_obj_path(to_relative)?;
+        self.object_store.rename(&from_path, &to_path).await?;
+        Ok(())
+    }
 }
 
 /// Get relative paths of leaf directories under a given directory.
@@ -460,5 +532,60 @@ mod tests {
             .unwrap();
         assert_eq!(file_metadata.name, "a.parquet");
         assert_eq!(file_metadata.size, 866);
+    }
+
+    #[tokio::test]
+    async fn storage_put_exists_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+
+        assert!(!storage.exists("nested/file.txt").await.unwrap());
+        storage
+            .put_file("nested/file.txt", b"hello".as_slice())
+            .await
+            .unwrap();
+        assert!(storage.exists("nested/file.txt").await.unwrap());
+        let data = storage.get_file_data("nested/file.txt").await.unwrap();
+        assert_eq!(data.as_ref(), b"hello");
+
+        storage
+            .rename("nested/file.txt", "nested/renamed.txt")
+            .await
+            .unwrap();
+        assert!(!storage.exists("nested/file.txt").await.unwrap());
+        assert!(storage.exists("nested/renamed.txt").await.unwrap());
+
+        storage.delete_file("nested/renamed.txt").await.unwrap();
+        assert!(!storage.exists("nested/renamed.txt").await.unwrap());
+        // Idempotent delete of missing object
+        storage.delete_file("nested/renamed.txt").await.unwrap();
+    }
+
+    /// Timeline files rely on create-if-absent: a second write to the same
+    /// path must error rather than replace, and must leave the original
+    /// contents untouched.
+    #[tokio::test]
+    async fn storage_put_file_if_absent_rejects_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+
+        storage
+            .put_file_if_absent("timeline/0001.commit", b"first".as_slice())
+            .await
+            .unwrap();
+
+        let err = storage
+            .put_file_if_absent("timeline/0001.commit", b"second".as_slice())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, error::StorageError::AlreadyExists(_, _)),
+            "expected AlreadyExists, got: {err:?}"
+        );
+
+        let data = storage.get_file_data("timeline/0001.commit").await.unwrap();
+        assert_eq!(data.as_ref(), b"first", "loser must not clobber the winner");
     }
 }

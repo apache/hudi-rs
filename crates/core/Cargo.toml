@@ -74,6 +74,9 @@ paste = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
+md-5 = { workspace = true }
+xxhash-rust = { workspace = true }
 
 # runtime / async
 async-recursion = { workspace = true }

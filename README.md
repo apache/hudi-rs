@@ -315,6 +315,107 @@ std::vector<std::string> log_file_paths{};
 ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path.parquet", log_file_paths);
 ```
 
+## Writing Tables (Rust)
+
+hudi-rs includes a native, single-node write path that is storage-compatible
+with the Apache Hudi Spark writer: tables written here are readable — and
+serviceable (compaction, clustering, cleaning) — by Spark, and vice versa.
+Writes target COPY_ON_WRITE and MERGE_ON_READ tables at table version 9
+(Hudi 1.1.x; version 8 via `with_table_version(8)`), and maintain the
+metadata table (file listings, column/partition stats, record-level index) on
+every commit. See [docs/writer-design.md](docs/writer-design.md) for the full
+design.
+
+> [!NOTE]
+> Write APIs are currently Rust-only; Python and C++ bindings expose the read
+> APIs shown above.
+
+### Create a Table
+
+```rust
+use hudi::table::Table;
+use hudi::config::table::TableTypeValue;
+
+let mut table = Table::create("/tmp/trips_table")
+    .with_table_name("trips")
+    .with_table_type(TableTypeValue::MergeOnRead)   // or CopyOnWrite
+    .with_record_key_fields(["uuid"])
+    .with_partition_fields(["city"])
+    .with_ordering_fields(["ts"])                   // event-time ordering
+    .create()
+    .await?;
+```
+
+### Append
+
+`append` behaves like Hudi's bulk insert: it writes new file groups without
+an index lookup, splitting input into files bounded by
+`hoodie.parquet.max.file.size`.
+
+```rust
+use arrow_array::RecordBatch;
+
+let batch: RecordBatch = /* columns: uuid, city, ts, fare, ... */
+# unimplemented!();
+table.append([batch]).await?;
+```
+
+### Upsert
+
+`upsert` tags incoming records against the record-level index: existing keys
+update their file group in place (a rewritten base file on COW, a log file on
+MOR); new keys pack into existing small files first and then form new file
+groups.
+
+```rust
+let result = table.upsert([batch]).await?;
+println!(
+    "instant={} updates={} inserts={}",
+    result.instant, result.num_updates, result.num_inserts
+);
+```
+
+### Update and Delete
+
+```rust
+use hudi::table::HoodieKey;
+
+// SQL-style update: set columns from a one-row batch on matching rows.
+table.update("city = 'san_francisco'", updates_batch).await?;
+
+// Delete by predicate (single comparison, or IN for multiple keys).
+table.delete("uuid = 'e96c4396-3fad-413a-a942-4cb36106d721'").await?;
+table.delete("uuid IN ('a', 'b')").await?;
+
+// Delete by key.
+table.delete_keys([HoodieKey {
+    record_key: "a".to_string(),
+    partition_path: "city=san_francisco".to_string(),
+}]).await?;
+```
+
+### Overwrite
+
+```rust
+// INSERT_OVERWRITE_TABLE: replace all file groups.
+table.overwrite([batch]).await?;
+
+// INSERT_OVERWRITE: replace only the partitions present in the input.
+table.dynamic_partition_overwrite([batch]).await?;
+```
+
+### Behavior Notes
+
+- Every write runs as a full Hudi transaction: instants are requested and
+  completed with completion times, marker files enable automatic rollback of
+  crashed writes, and the timeline is archived into the LSM history once it
+  grows past `hoodie.keep.max.commits`.
+- Writes update all metadata table partitions in the same transaction, so
+  Spark readers with `hoodie.metadata.enable=true` see consistent listings
+  and stats.
+- Write parallelism is configurable with `hoodie.write.task.parallelism`
+  (default `2 × cores`), passed via `with_option`.
+
 ## Query Engine Integration
 
 Hudi-rs provides APIs to support integration with query engines. The sections below highlight some commonly used APIs.

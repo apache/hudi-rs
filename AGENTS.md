@@ -34,6 +34,7 @@ cargo test -p hudi-core                                        # one crate
 cargo test -p hudi-core table::tests::hudi_table_get_schema    # one test
 pytest python/tests/test_table_read.py -s -k "<expr>"          # one Python test
 make coverage-rust                                             # tarpaulin HTML at cov-reports/
+make parity                  # Spark-in-the-loop parity tests (needs SPARK_HOME; scripts/parity/README.md)
 
 # hudi-core without the spill backend — CI runs this leg, so check it before a PR
 # that touches the merge map or its dependencies.

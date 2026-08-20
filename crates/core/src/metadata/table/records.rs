@@ -282,7 +282,11 @@ pub fn decode_files_partition_record_with_schema(
         });
     }
 
-    let avro_value = decode_avro_value(value, schema)?;
+    // Prefer the record's own writer schema (from the HFile or log block it
+    // was read from) — `schema` is only a fallback for records with no
+    // container schema. Mixed-writer tables (rs + Spark) have differing
+    // HoodieMetadataRecord schemas per container.
+    let avro_value = decode_avro_value(value, record.avro_schema().unwrap_or(schema))?;
     let record_type = get_record_type(&avro_value);
     let mut files = extract_filesystem_metadata(&avro_value);
 

@@ -47,6 +47,7 @@ mod proto;
 mod reader;
 mod record;
 mod trailer;
+mod writer;
 
 pub use block::BlockIndexEntry;
 pub use block_type::HFileBlockType;
@@ -54,3 +55,4 @@ pub use error::{HFileError, Result};
 pub use key::{Key, KeyValue, Utf8Key};
 pub use reader::{HFileReader, HFileRecordIterator, SeekResult};
 pub use record::HFileRecord;
+pub use writer::HFileWriter;

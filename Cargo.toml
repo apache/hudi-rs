@@ -49,7 +49,7 @@ arrow-row = { version = "57" }
 arrow-schema = { version = "57", features = ["serde"] }
 arrow-select = { version = "57" }
 object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
-parquet = { version = "57", features = ["async", "object_store"] }
+parquet = { version = "57", features = ["async", "object_store", "zstd"] }
 
 # avro
 arrow-avro = { version = "57" }
@@ -82,6 +82,9 @@ paste = { version = "1" }
 strum = { version = "0.28", features = ["derive"] }
 strum_macros = { version = "0.28" }
 url = { version = "2" }
+uuid = { version = "1" }
+md-5 = { version = "0.10" }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # runtime / async
 async-recursion = { version = "1" }
