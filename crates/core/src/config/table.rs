@@ -279,7 +279,15 @@ impl ConfigParser for HudiTableConfig {
                 )
             }),
             Self::OrderingFields => get_result.and_then(|v| {
-                let fields: Vec<String> = v.split(',').map(str::to_string).collect();
+                // Java filters empties after the split; keeping [""] would make
+                // an empty property look like a configured ordering field and
+                // engage event-time merging with nothing to order by.
+                let fields: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 if fields.len() > 1 {
                     return Err(UnsupportedValue(format!(
                         "Multiple ordering fields '{v}' are not yet supported"

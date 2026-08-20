@@ -666,6 +666,147 @@ async fn test_create_rejects_unsupported_version_without_persisting() {
 }
 
 #[tokio::test]
+async fn test_commit_time_ordering_ignores_ordering_field() {
+    // A COMMIT_TIME_ORDERING table with an ordering field configured (the
+    // common 0.x OverwriteWithLatestAvroPayload upgrade shape) must let the
+    // newest write win, exactly as Java's CommitTimeRecordMerger does.
+    // Deriving event-time semantics from the ordering field alone silently
+    // dropped these updates.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_option("hoodie.record.merge.mode", "COMMIT_TIME_ORDERING")
+        .with_option(
+            "hoodie.record.merge.strategy.id",
+            // Java's COMMIT_TIME_ORDERING strategy id: leaving create()'s
+            // event-time id in place would be a self-contradictory table that
+            // Java itself rejects (inferMergingConfigsForPreV9Table).
+            "ce9acb64-bde0-424c-9b91-f6ebba25356d",
+        )
+        .create()
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 1, 100)])])
+        .await
+        .unwrap();
+    // Lower ordering value, newer commit: commit-time ordering keeps it.
+    table
+        .upsert([ordered_batch(vec![("a", 2, 50)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        values.value(0),
+        2,
+        "COMMIT_TIME_ORDERING must take the newest write"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_time_ordering_in_batch_dedup_takes_last() {
+    // In-batch dedupe must follow the merge mode too (Java routes it through
+    // the merge-mode-derived merger): under COMMIT_TIME_ORDERING the last
+    // occurrence wins even though its ordering value is lower.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_option("hoodie.record.merge.mode", "COMMIT_TIME_ORDERING")
+        .with_option(
+            "hoodie.record.merge.strategy.id",
+            "ce9acb64-bde0-424c-9b91-f6ebba25356d",
+        )
+        .create()
+        .await
+        .unwrap();
+    // One batch, same key twice: ordering 100 then 50.
+    table
+        .upsert([ordered_batch(vec![("a", 1, 100), ("a", 2, 50)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total, 1, "in-batch duplicates must collapse");
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        values.value(0),
+        2,
+        "COMMIT_TIME_ORDERING dedupe keeps the last occurrence"
+    );
+}
+
+#[tokio::test]
+async fn test_commit_time_ordering_inferred_from_legacy_payload() {
+    // The shape this fix exists for: no explicit merge mode, a precombine
+    // field, and the 0.x default payload class — Java infers
+    // COMMIT_TIME_ORDERING, so the newest write must win.
+    let dir = tempdir().unwrap();
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+    // Rewrite hoodie.properties into the legacy shape: drop the merge mode and
+    // strategy, name the deprecated payload class.
+    let props_path = dir.path().join(".hoodie/hoodie.properties");
+    let props = std::fs::read_to_string(&props_path).unwrap();
+    let rewritten: String = props
+        .lines()
+        .filter(|l| {
+            !l.starts_with("hoodie.record.merge.mode")
+                && !l.starts_with("hoodie.record.merge.strategy.id")
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(
+        &props_path,
+        format!(
+            "{rewritten}hoodie.compaction.payload.class=org.apache.hudi.common.model.OverwriteWithLatestAvroPayload\n"
+        ),
+    )
+    .unwrap();
+    let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+
+    table
+        .upsert([ordered_batch(vec![("a", 1, 100)])])
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 2, 50)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        values.value(0),
+        2,
+        "an inferred COMMIT_TIME_ORDERING table must take the newest write"
+    );
+}
+
+#[tokio::test]
 async fn test_upsert_uses_event_time_ordering() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();
