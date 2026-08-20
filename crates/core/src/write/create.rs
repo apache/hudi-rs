@@ -497,8 +497,8 @@ impl TableCreateBuilder {
             let marker = format!("{HUDI_METADATA_DIR}/{timeline_path}/.keep");
             storage.put_file(&marker, b"".as_slice()).await?;
         }
-        if self.metadata_enabled {
-            bootstrap_metadata_table(
+        if self.metadata_enabled
+            && let Err(error) = bootstrap_metadata_table(
                 &storage,
                 &table_name,
                 self.table_version,
@@ -506,7 +506,18 @@ impl TableCreateBuilder {
                 self.column_stats_enabled,
                 partition_stats_enabled,
             )
-            .await?;
+            .await
+        {
+            // hoodie.properties already advertises the MDT partitions this
+            // bootstrap failed to build. Leaving it behind would make the
+            // half-created table open normally with an index that claims to
+            // exist but is empty. The partial metadata table must go too:
+            // its timeline instants are written with put-if-absent under
+            // deterministic names, so leaving them makes every retry fail.
+            // Only files this call created are removed.
+            let _ = remove_partial_metadata_table(&storage).await;
+            let _ = storage.delete_file(&properties_path).await;
+            return Err(error);
         }
 
         Table::new_with_options(&self.base_uri, self.storage_options).await
@@ -630,4 +641,28 @@ mod lifecycle_tests {
         assert!(props.contains("hoodie.parquet.max.file.size=1048576"));
         assert!(!dir.path().join(".hoodie/metadata").exists());
     }
+}
+
+/// Best-effort removal of a partially bootstrapped metadata table, so a failed
+/// `create` can be retried. Only reachable from the create path, where every
+/// file under `.hoodie/metadata` was written by the failing call itself.
+async fn remove_partial_metadata_table(storage: &Storage) -> Result<()> {
+    let root = format!("{HUDI_METADATA_DIR}/metadata");
+    let mut dirs = vec![root.clone()];
+    let mut seen = 0usize;
+    while let Some(dir) = dirs.pop() {
+        // Bounded: the bootstrap layout is shallow, and a runaway listing must
+        // not turn cleanup into an unbounded walk.
+        seen += 1;
+        if seen > 64 {
+            break;
+        }
+        for file in storage.list_files(Some(&dir)).await.unwrap_or_default() {
+            let _ = storage.delete_file(&format!("{dir}/{}", file.name)).await;
+        }
+        for sub in storage.list_dirs(Some(&dir)).await.unwrap_or_default() {
+            dirs.push(format!("{dir}/{sub}"));
+        }
+    }
+    Ok(())
 }

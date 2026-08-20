@@ -140,10 +140,19 @@ pub(crate) async fn archive_timeline_if_needed(
         .filter(|c| c.action == "replacecommit")
         .map(|c| c.requested.clone())
         .min();
-    let earliest_pending = match (earliest_pending, earliest_replace) {
-        (Some(pending), Some(replace)) => Some(pending.min(replace)),
-        (pending, replace) => pending.or(replace),
-    };
+    // A savepoint pins its commit and everything after it: archiving past one
+    // would discard the very files the savepoint exists to retain (Java's
+    // TimelineArchiverV2 stops at the first savepoint unless
+    // hoodie.archive.beyond.savepoint, default false).
+    let earliest_savepoint = completed
+        .iter()
+        .filter(|c| c.action == "savepoint")
+        .map(|c| c.requested.clone())
+        .min();
+    let earliest_pending = [earliest_pending, earliest_replace, earliest_savepoint]
+        .into_iter()
+        .flatten()
+        .min();
     let is_commit_action =
         |action: &str| matches!(action, "commit" | "deltacommit" | "replacecommit");
     let commit_count = completed
@@ -176,6 +185,11 @@ pub(crate) async fn archive_timeline_if_needed(
             commits_to_archive -= 1;
             max_archived_commit = Some(instant.requested.clone());
             to_archive.push(instant.clone());
+        } else if instant.action == "savepoint" {
+            // A savepoint must never be swept along as an incidental
+            // non-commit action; it also shares its commit's instant time, so
+            // the fencing-file deletion below must not reach it.
+            break;
         } else {
             to_archive.push(instant.clone());
         }
@@ -457,6 +471,59 @@ mod lifecycle_tests {
             ],
         )
         .unwrap()
+    }
+
+    /// A savepoint pins its commit: archival must not cross it, and must not
+    /// sweep the `.savepoint` instant off the active timeline.
+    #[tokio::test]
+    async fn test_archival_stops_at_savepoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.keep.min.commits", "2")
+            .with_option("hoodie.keep.max.commits", "3")
+            .create()
+            .await
+            .unwrap();
+        for i in 0..3 {
+            table.append([batch(&format!("k{i}"), i)]).await.unwrap();
+        }
+        let timeline = dir.path().join(".hoodie/timeline");
+        // Savepoint the OLDEST commit, the one archival would take first.
+        let mut completed: Vec<String> = std::fs::read_dir(&timeline)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".commit") || n.ends_with(".deltacommit"))
+            .collect();
+        completed.sort();
+        let oldest = completed.first().expect("a completed commit").clone();
+        let requested = oldest.split('_').next().unwrap().to_string();
+        std::fs::write(
+            timeline.join(format!("{requested}_{requested}.savepoint")),
+            b"{}",
+        )
+        .unwrap();
+
+        for i in 3..10 {
+            table.append([batch(&format!("k{i}"), i)]).await.unwrap();
+        }
+
+        let names: Vec<String> = std::fs::read_dir(&timeline)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with(".savepoint")),
+            "the savepoint instant must stay on the active timeline: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with(&format!("{requested}_"))
+                && (n.ends_with(".commit") || n.ends_with(".deltacommit"))),
+            "the savepointed commit must not be archived: {names:?}"
+        );
     }
 
     /// Drives repeated archival from inside the crate: manifest rotation,
