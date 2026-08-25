@@ -797,6 +797,19 @@ impl HFileReader {
     ///
     /// The schema is cached after the first successful parse.
     /// Returns `None` if no schema is present in the file info.
+    /// The Avro schema exactly as the writer stored it.
+    ///
+    /// Not the parsed schema's canonical form: canonicalising rewrites named-type
+    /// references and a decoder built from the result cannot resolve them.
+    pub fn avro_schema_json(&self) -> Result<Option<&str>> {
+        let Some(bytes) = self.file_info.get(FILE_INFO_SCHEMA) else {
+            return Ok(None);
+        };
+        std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {e}")))
+    }
+
     pub fn get_avro_schema(&self) -> Result<Option<&AvroSchema>> {
         // Check if schema exists in file info
         let schema_bytes = match self.file_info.get(FILE_INFO_SCHEMA) {

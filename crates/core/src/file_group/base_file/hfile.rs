@@ -21,23 +21,23 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryArray, RecordBatch, RecordBatchOptions, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow_schema::{Schema, SchemaRef};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
-use crate::hfile::{HFileReader, HFileRecord};
+use crate::file_group::log_file::avro::AvroBlockDecoder;
+use crate::hfile::HFileReader;
+use crate::hfile::record_key::fill_empty_entry_keys;
 use crate::statistics::{StatisticsContainer, StatsGranularity};
 use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
+use crate::util::arrow::project_batch_by_names;
 
-/// An HFile stores a key and a value that is still serialized. Decoding the
-/// value needs the payload's own schema, which a base-file reader does not
-/// resolve, so it is handed on as bytes.
-const KEY_COLUMN: &str = "key";
-const VALUE_COLUMN: &str = "value";
+/// Records per Arrow batch while decoding an HFile's values.
+const DECODE_BATCH_SIZE: usize = 1024;
 
 /// Only reached if a reader reports no budget, which a ranged reader always does.
 const DEFAULT_WINDOW_BUDGET_FALLBACK: u64 = 16 * 1024 * 1024;
@@ -53,75 +53,48 @@ impl HFileBaseFileReader {
         Self { storage }
     }
 
-    fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(KEY_COLUMN, DataType::Utf8, false),
-            Field::new(VALUE_COLUMN, DataType::Binary, true),
-        ]))
+    /// The record schema an HFile was written with, as Avro JSON and as Arrow.
+    ///
+    /// An HFile stores each value Avro-encoded and carries the schema it used in
+    /// its own file info. Decoding against that is what makes a base file and a
+    /// log block of the same table yield the same columns, which is the whole
+    /// reason they can merge; handing the value on as bytes does not.
+    fn decoded_schema(reader: &HFileReader, relative_path: &str) -> Result<(String, SchemaRef)> {
+        let json = reader
+            .avro_schema_json()
+            .map_err(|e| {
+                StorageError::Creation(format!(
+                    "Failed to read the Avro schema of HFile {relative_path}: {e:?}"
+                ))
+            })?
+            .ok_or_else(|| {
+                StorageError::Creation(format!(
+                    "HFile {relative_path} carries no Avro schema, so its values cannot be decoded"
+                ))
+            })?
+            .to_string();
+        // The schema comes from the decoder, not from converting the Avro JSON:
+        // `avro_to_arrow` does not handle named-type references, and the metadata
+        // table's record schema uses them.
+        let decoder = AvroBlockDecoder::try_new_with_reader(&json, None, DECODE_BATCH_SIZE)
+            .map_err(|e| StorageError::Creation(format!("{e}")))?;
+        Ok((json, decoder.schema()))
     }
 
-    /// The projected schema, or an error naming a column the format does not
-    /// have. An empty projection is the row-count-only request shape.
-    fn project(projection: Option<&[String]>) -> Result<SchemaRef> {
-        let full = Self::schema();
+    /// The projected schema, or an error naming a column the file does not have.
+    /// An empty projection is the row-count-only request shape.
+    fn project(full: &SchemaRef, projection: Option<&[String]>) -> Result<SchemaRef> {
         let Some(names) = projection else {
-            return Ok(full);
+            return Ok(full.clone());
         };
         let mut fields = Vec::with_capacity(names.len());
         for name in names {
             let field = full.field_with_name(name).map_err(|_| {
-                StorageError::InvalidColumn(format!("HFile base files have no column {name}"))
+                StorageError::InvalidColumn(format!("{name} is not a column of this HFile"))
             })?;
             fields.push(field.clone());
         }
         Ok(Arc::new(Schema::new(fields)))
-    }
-
-    fn batch(schema: &SchemaRef, records: Vec<HFileRecord>) -> Result<RecordBatch> {
-        let row_count = records.len();
-        let mut keys: Option<Vec<String>> = None;
-        let mut values: Option<Vec<Vec<u8>>> = None;
-
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        for field in schema.fields() {
-            match field.name().as_str() {
-                KEY_COLUMN => {
-                    if keys.is_none() {
-                        let mut decoded = Vec::with_capacity(records.len());
-                        for record in &records {
-                            let key = record.key_as_str().ok_or_else(|| {
-                                StorageError::Creation(
-                                    "an HFile record key is not valid UTF-8".to_string(),
-                                )
-                            })?;
-                            decoded.push(key.to_string());
-                        }
-                        keys = Some(decoded);
-                    }
-                    let keys = keys.as_ref().expect("just populated");
-                    columns.push(Arc::new(StringArray::from(keys.clone())));
-                }
-                VALUE_COLUMN => {
-                    let values = values
-                        .get_or_insert_with(|| records.iter().map(|r| r.value.clone()).collect());
-                    columns.push(Arc::new(BinaryArray::from_iter_values(
-                        values.iter().map(|v| v.as_slice()),
-                    )));
-                }
-                other => {
-                    return Err(StorageError::InvalidColumn(format!(
-                        "HFile base files have no column {other}"
-                    )));
-                }
-            }
-        }
-
-        RecordBatch::try_new_with_options(
-            schema.clone(),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(row_count)),
-        )
-        .map_err(StorageError::ArrowError)
     }
 
     async fn open(&self, relative_path: &str) -> Result<HFileReader> {
@@ -140,12 +113,12 @@ impl BaseFileReader for HFileBaseFileReader {
         options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
-            let schema = Self::project(options.projection.as_deref())?;
             let reader = self.open(relative_path).await?;
 
-            // `Some(vec![])` asks for the row count only. The trailer already
-            // carries it, so no data block is read.
-            if schema.fields().is_empty() {
+            // `Some(vec![])` asks for the row count only. The trailer carries it,
+            // so no data block is read and no schema is needed.
+            if options.projection.as_ref().is_some_and(|p| p.is_empty()) {
+                let schema: SchemaRef = Arc::new(Schema::empty());
                 let row_count = usize::try_from(reader.num_entries()).unwrap_or(usize::MAX);
                 let batch = RecordBatch::try_new_with_options(
                     schema.clone(),
@@ -159,28 +132,52 @@ impl BaseFileReader for HFileBaseFileReader {
                 ));
             }
 
+            let (writer_json, full_schema) = Self::decoded_schema(&reader, relative_path)?;
+            let schema = Self::project(&full_schema, options.projection.as_deref())?;
+            let projection: Option<Vec<String>> =
+                options.projection.as_ref().map(|names| names.to_vec());
+
             let budget = reader
                 .window_budget()
                 .unwrap_or(DEFAULT_WINDOW_BUDGET_FALLBACK);
             let windows = HFileReader::plan_windows(&reader.data_block_entries(), budget);
 
             let stream = futures::stream::unfold(
-                (reader, windows.into_iter(), schema.clone(), false),
-                |(reader, mut windows, schema, failed)| async move {
+                (
+                    reader,
+                    windows.into_iter(),
+                    writer_json,
+                    full_schema,
+                    projection,
+                    false,
+                ),
+                |(reader, mut windows, writer_json, full_schema, projection, failed)| async move {
                     // Sticky: once a window fails the read is not whole, so no
                     // later window is handed out as though it were.
                     if failed {
                         return None;
                     }
                     let window = windows.next()?;
-                    let item = match reader.read_records_batched(&window).await {
-                        Ok(records) => Self::batch(&schema, records),
-                        Err(e) => Err(StorageError::Creation(format!(
-                            "Failed to read HFile data blocks: {e:?}"
-                        ))),
-                    };
+                    let item = decode_window(
+                        &reader,
+                        &window,
+                        &writer_json,
+                        &full_schema,
+                        projection.as_deref(),
+                    )
+                    .await;
                     let failed = item.is_err();
-                    Some((item, (reader, windows, schema, failed)))
+                    Some((
+                        item,
+                        (
+                            reader,
+                            windows,
+                            writer_json,
+                            full_schema,
+                            projection,
+                            failed,
+                        ),
+                    ))
                 },
             )
             .boxed();
@@ -189,13 +186,14 @@ impl BaseFileReader for HFileBaseFileReader {
         })
     }
 
+    /// The record count comes from the trailer, and the ranged open already
+    /// learned the file length, so neither costs an extra request.
     fn get_metadata_and_stats<'a>(
         &'a self,
         relative_path: &'a str,
         _table_schema: &'a Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
         Box::pin(async move {
-            // `open` already learned the length, so no second head request.
             let reader = self.open(relative_path).await?;
             let size = reader.file_len();
 
@@ -216,6 +214,67 @@ impl BaseFileReader for HFileBaseFileReader {
             Ok((metadata, stats))
         })
     }
+}
+
+/// Decode one window's records into a single batch, projected if asked.
+///
+/// Each value is an Avro datum on its own, so it needs no de-framing; the
+/// decoder batches them and is flushed once per window.
+async fn decode_window(
+    reader: &HFileReader,
+    window: &[crate::hfile::BlockIndexEntry],
+    writer_json: &str,
+    decoded_schema: &SchemaRef,
+    projection: Option<&[String]>,
+) -> Result<RecordBatch> {
+    let records = reader
+        .read_records_batched(window)
+        .await
+        .map_err(|e| StorageError::Creation(format!("Failed to read HFile data blocks: {e:?}")))?;
+
+    let mut decoder = AvroBlockDecoder::try_new_with_reader(writer_json, None, DECODE_BATCH_SIZE)
+        .map_err(|e| StorageError::Creation(format!("{e}")))?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for record in &records {
+        if let Some(batch) = decoder
+            .decode(&record.value)
+            .map_err(|e| StorageError::Creation(format!("{e}")))?
+        {
+            batches.push(batch);
+        }
+    }
+    if let Some(batch) = decoder
+        .flush()
+        .map_err(|e| StorageError::Creation(format!("{e}")))?
+        && batch.num_rows() > 0
+    {
+        batches.push(batch);
+    }
+
+    // The stream declares the decoded schema, so an empty window must carry that
+    // schema too: a batch whose schema disagrees with the stream's breaks
+    // projection and the merge downstream.
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| decoded_schema.clone());
+    let combined =
+        arrow::compute::concat_batches(&schema, &batches).map_err(StorageError::ArrowError)?;
+
+    // A writer may leave the record's key field empty because the HFile entry key
+    // already carries it. Positional, so the decode order above is load-bearing.
+    let entry_keys: Vec<&str> = records
+        .iter()
+        .map(|r| {
+            r.key_as_str().ok_or_else(|| {
+                StorageError::Creation("an HFile record key is not valid UTF-8".to_string())
+            })
+        })
+        .collect::<Result<Vec<&str>>>()?;
+    let combined = fill_empty_entry_keys(combined, &entry_keys)
+        .map_err(|e| StorageError::Creation(format!("{e}")))?;
+
+    project_batch_by_names(combined, projection).map_err(|e| StorageError::Creation(format!("{e}")))
 }
 
 #[cfg(test)]
@@ -321,8 +380,8 @@ mod tests {
         let batch = reader.read().await?;
 
         let keys: HashSet<String> = batch
-            .column_by_name(KEY_COLUMN)
-            .expect("the reader emits a key column")
+            .column_by_name("key")
+            .expect("the metadata table's record key column, decoded from the HFile's values")
             .as_string::<i32>()
             .iter()
             .flatten()
