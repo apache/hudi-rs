@@ -101,6 +101,15 @@ impl AvroBlockDecoder {
         })
     }
 
+    /// The Arrow schema decoded records will carry.
+    ///
+    /// Taken from the decoder rather than converted from the Avro JSON, because
+    /// `avro_to_arrow` does not handle named-type references and the metadata
+    /// table's schema uses them.
+    pub fn schema(&self) -> SchemaRef {
+        self.decoder.schema()
+    }
+
     /// Project each decoded batch to `schema` instead of resolving during the
     /// read.
     ///
