@@ -85,6 +85,9 @@ enum Source {
         /// `[tail_start, file_len)`, resident for the life of the reader.
         tail: bytes::Bytes,
         tail_start: usize,
+        file_len: u64,
+        /// Bytes per fetch, so index levels are bounded like data blocks are.
+        window_budget: u64,
     },
 }
 
@@ -266,6 +269,14 @@ impl HFileReader {
         let trailer = HFileTrailer::read(&trailer_bytes)?;
 
         let tail_start = trailer.load_on_open_data_offset;
+        // A trailer is file data, so its offsets are not trustworthy. Left
+        // unchecked, the length below underflows and asks for a nonsense range.
+        if tail_start > file_len {
+            return Err(HFileError::InvalidFormat(format!(
+                "HFile {relative_path} has a load-on-open offset of {tail_start}, \
+                 past the end of its {file_len} bytes"
+            )));
+        }
         let tail = fetcher
             .read_content(tail_start, file_len - tail_start)
             .await
@@ -275,16 +286,61 @@ impl HFileReader {
                 ))
             })?;
 
+        let window_budget = crate::storage::reader::stream_window_size(&storage.hudi_configs)
+            .map_err(|e| HFileError::InvalidFormat(format!("{e}")))?;
         let mut reader = Self::with_source(
             Source::Ranged {
                 fetcher,
                 tail,
                 tail_start: tail_start as usize,
+                file_len,
+                window_budget,
             },
             trailer,
         );
         reader.initialize_metadata_ranged().await?;
         Ok(reader)
+    }
+
+    /// Group consecutive blocks into runs that each stay under `budget`.
+    ///
+    /// A run is read in one request, so this bounds both peak memory and the
+    /// number of round trips. A block larger than the budget goes out alone
+    /// rather than being split: a block has to be whole to decode.
+    pub fn plan_windows(entries: &[BlockIndexEntry], budget: u64) -> Vec<Vec<BlockIndexEntry>> {
+        let mut windows: Vec<Vec<BlockIndexEntry>> = Vec::new();
+        let mut current: Vec<BlockIndexEntry> = Vec::new();
+        let mut current_bytes: u64 = 0;
+
+        for entry in entries {
+            let len = entry.size as u64;
+            if !current.is_empty() && current_bytes.saturating_add(len) > budget {
+                windows.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_bytes = current_bytes.saturating_add(len);
+            current.push(entry.clone());
+        }
+        if !current.is_empty() {
+            windows.push(current);
+        }
+        windows
+    }
+
+    /// The window budget a ranged reader was opened with.
+    pub fn window_budget(&self) -> Option<u64> {
+        match &self.source {
+            Source::Ranged { window_budget, .. } => Some(*window_budget),
+            Source::Whole(_) => None,
+        }
+    }
+
+    /// Length of the whole file, known without reading it.
+    pub fn file_len(&self) -> u64 {
+        match &self.source {
+            Source::Ranged { file_len, .. } => *file_len,
+            Source::Whole(bytes) => bytes.len() as u64,
+        }
     }
 
     /// The data blocks in key order, each with the range it occupies, so a
@@ -479,11 +535,24 @@ impl HFileReader {
         let mut current_entries: Vec<BlockIndexEntry> =
             self.data_block_index.values().cloned().collect();
 
+        let budget = match &self.source {
+            Source::Ranged { window_budget, .. } => *window_budget,
+            Source::Whole(_) => {
+                return Err(HFileError::InvalidFormat(
+                    "the batched index walk needs a ranged HFile reader".to_string(),
+                ));
+            }
+        };
+
         while levels_remaining > 0 {
-            let blocks = self.fetch_blocks(&current_entries).await?;
             let mut next_level_entries = Vec::new();
-            for block in &blocks {
-                next_level_entries.extend(self.parse_leaf_index_entries(&block.data)?);
+            // A level can hold many leaf blocks, so it is read in runs under the
+            // same budget the data blocks use rather than all at once.
+            for window in Self::plan_windows(&current_entries, budget) {
+                let blocks = self.fetch_blocks(&window).await?;
+                for block in &blocks {
+                    next_level_entries.extend(self.parse_leaf_index_entries(&block.data)?);
+                }
             }
             current_entries = next_level_entries;
             levels_remaining -= 1;
@@ -1333,6 +1402,38 @@ mod tests {
         let url =
             url::Url::from_directory_path(std::fs::canonicalize(test_data_dir()).unwrap()).unwrap();
         Storage::new_with_base_url(url).unwrap()
+    }
+
+    /// A trailer is file data, so its offsets are attacker- or corruption-
+    /// controlled. Taking a valid fixture's final trailer alone gives a file
+    /// whose `load_on_open_data_offset` points far past its own end, which is
+    /// what the length arithmetic in `open_ranged` must not be handed
+    /// unchecked: unguarded it underflows a `u64` and asks for a nonsense range.
+    #[tokio::test]
+    async fn a_load_on_open_offset_past_the_end_is_refused() -> Result<()> {
+        let whole = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let trailer_only = &whole[whole.len() - TRAILER_SIZE..];
+
+        let dir = std::env::temp_dir().join("hudi_rs_hfile_trailer_only_case");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "trailer_only.hfile";
+        std::fs::write(dir.join(name), trailer_only).unwrap();
+
+        let url = url::Url::from_directory_path(std::fs::canonicalize(&dir).unwrap()).unwrap();
+        let storage = Storage::new_with_base_url(url).unwrap();
+
+        let message = match HFileReader::open_ranged(&storage, name).await {
+            Ok(_) => panic!("a load-on-open offset past the end must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("past the end of its"),
+            "expected the offset to be named as past the end, got: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     /// Every fixture, read both ways, must yield identical records.
