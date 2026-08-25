@@ -362,7 +362,11 @@ mod tests {
 
         let configs = mdt_configs();
         let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
-        let context = resolve_reader_context(&configs, /* has_log_files */ false)?;
+        let mut context = resolve_reader_context(&configs, /* has_log_files */ false)?;
+        // The production path rebuilds this immediately (`adapter.rs`), and without
+        // it the merge keys on `_hoodie_record_key` whatever the table says. A test
+        // that skips it is not exercising the context the reader is really given.
+        context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
 
         let mut reader = HoodieFileGroupReader::new(
             Arc::new(context),
