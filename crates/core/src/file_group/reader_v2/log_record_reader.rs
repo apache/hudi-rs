@@ -238,7 +238,10 @@ pub fn forward_scan_pass1(
 
         // Classify the block
         match block.block_type {
-            BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
+            BlockType::AvroData
+            | BlockType::ParquetData
+            | BlockType::Delete
+            | BlockType::HfileData => {
                 let blocks_list = instant_to_blocks_map
                     .entry(instant_time.clone())
                     .or_default();
@@ -711,7 +714,10 @@ impl BaseHoodieLogRecordReader {
         for (idx, block) in blocks.iter().enumerate() {
             if !matches!(
                 block.block_type,
-                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete
+                BlockType::AvroData
+                    | BlockType::ParquetData
+                    | BlockType::Delete
+                    | BlockType::HfileData
             ) {
                 continue;
             }
@@ -813,6 +819,9 @@ impl BaseHoodieLogRecordReader {
         crate::file_group::log_file::content::Decoder::new(Arc::new(
             crate::config::HudiConfigs::new(self.reader_context.table_config.clone()),
         ))
+        // The merge buffer takes Arrow and nothing else, so an HFile block's
+        // records are decoded rather than handed over as key-value pairs.
+        .with_hfile_as_records(true)
         .with_row_filter(if self.reader_context.can_push_row_filter() {
             self.reader_context.row_filter_builder.clone()
         } else {
@@ -856,7 +865,10 @@ impl BaseHoodieLogRecordReader {
             // Decode this block's content now that it is known to be admitted. A
             // block that already has content passes straight through.
             match block.block_type {
-                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
+                BlockType::AvroData
+                | BlockType::ParquetData
+                | BlockType::Delete
+                | BlockType::HfileData => {
                     if let Some(bytes) = Self::queued_block_content(block, fetched.remove(&idx))? {
                         block.decode_fetched(block_decoder, bytes)?;
                     }
@@ -865,7 +877,7 @@ impl BaseHoodieLogRecordReader {
             }
 
             match block.block_type {
-                BlockType::AvroData | BlockType::ParquetData => {
+                BlockType::AvroData | BlockType::ParquetData | BlockType::HfileData => {
                     self.record_buffer.process_data_block(block)?;
                     log::debug!(
                         "[Pass3] after processing data block #{block_num}: buffer size={}",

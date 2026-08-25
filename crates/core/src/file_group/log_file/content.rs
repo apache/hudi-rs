@@ -25,6 +25,7 @@ use crate::file_group::log_file::log_block::{
 };
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
+use crate::hfile::record_key::fill_empty_entry_keys;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::delete_record_list_schema_json;
 use crate::schema::extended_promotion::record_needs_rewrite_for_extended_promotion;
@@ -140,6 +141,10 @@ pub struct Decoder {
     /// Schema an Avro block is resolved up to, as Avro JSON. See
     /// [`Decoder::with_reader_schema`].
     reader_schema_json: Option<String>,
+    /// Whether an HFile block's records are decoded into Arrow batches rather
+    /// than handed back as key-value pairs. See
+    /// [`Decoder::with_hfile_as_records`].
+    hfile_as_records: bool,
 }
 
 impl Decoder {
@@ -164,6 +169,17 @@ impl Decoder {
     ///
     /// Blocks carrying `IsPartial` are excluded — see
     /// [`Self::decode_avro_record_content`].
+    /// Decode an HFile block's records into Arrow batches.
+    ///
+    /// The two consumers of an HFile block want different shapes and neither is
+    /// wrong: a merge needs Arrow like every other block type, while the
+    /// metadata table wants the raw key and the still-serialized value so it can
+    /// decode against its own schema. Only the caller knows which, so it says.
+    pub fn with_hfile_as_records(mut self, hfile_as_records: bool) -> Self {
+        self.hfile_as_records = hfile_as_records;
+        self
+    }
+
     pub fn with_reader_schema(mut self, reader_schema_json: Option<String>) -> Self {
         self.reader_schema_json = reader_schema_json;
         self
@@ -175,6 +191,7 @@ impl Decoder {
             hudi_configs,
             row_filter: None,
             reader_schema_json: None,
+            hfile_as_records: false,
         }
     }
     pub fn decode_content(
@@ -204,9 +221,7 @@ impl Decoder {
             BlockType::Delete => self
                 .decode_delete_record_content(reader, header)
                 .map(LogBlockContent::Records),
-            BlockType::HfileData => self
-                .decode_hfile_record_content(reader)
-                .map(LogBlockContent::HFileRecords),
+            BlockType::HfileData => self.decode_hfile_content(reader, header),
             BlockType::Command => Ok(LogBlockContent::Empty),
             _ => Err(CoreError::LogBlockError(format!(
                 "Unsupported block type: {block_type:?}"
@@ -232,29 +247,26 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_avro_record_content(
+    /// A decoder for records written with `writer_schema_json`, resolved up to
+    /// the reader schema when the block's header permits it.
+    ///
+    /// Shared by the Avro and HFile paths: both hold Avro-encoded records and so
+    /// need the same schema resolution, and having one place for it is what stops
+    /// the two drifting apart on promotions.
+    fn avro_decoder_for(
         &self,
-        mut reader: impl Read,
+        writer_schema_json: &str,
         header: &HashMap<BlockMetadataKey, String>,
-    ) -> Result<RecordBatches> {
-        Decoder::validate_log_block_version(&mut reader)?;
-
-        let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
-            CoreError::LogBlockError("Schema not found in block header".to_string())
-        })?;
-
-        let mut record_count_buf = [0u8; 4];
-        reader.read_exact(&mut record_count_buf)?;
-        let record_count = u32::from_be_bytes(record_count_buf);
-
+    ) -> Result<AvroBlockDecoder> {
         // A partial-update block carries only the columns that were written, and
         // the merge needs to know which those are. Resolving it up to the table
         // schema would fabricate the rest, so it decodes against its own schema.
+        //
         // The header's *value*, not its presence: Java reads this as
         // `Boolean.parseBoolean(getOrDefault(IS_PARTIAL, "false"))`, so a writer
         // that emits `IS_PARTIAL=false` on a full block would otherwise have it
-        // decoded writer-only — skipping the reader-schema resolution and
-        // reintroducing the int→long mismatch at merge time on an evolved table.
+        // decoded writer-only, skipping the reader-schema resolution and
+        // reintroducing the int-to-long mismatch at merge time on an evolved table.
         let is_partial = header
             .get(&BlockMetadataKey::IsPartial)
             .is_some_and(|v| v.eq_ignore_ascii_case("true"));
@@ -267,7 +279,7 @@ impl Decoder {
             self.reader_schema_json.as_deref()
         };
         // Avro resolves what it defines as a promotion; Hudi permits more than
-        // that — a number, or anything with a logical type, to string — and Avro
+        // that (a number, or anything with a logical type, to string) and Avro
         // refuses to build a reader for those at all. Such a block is decoded at
         // the schema it was written with and converted afterwards, which is what
         // the Java reader does when `recordNeedsRewriteForExtendedAvroTypePromotion`
@@ -277,9 +289,6 @@ impl Decoder {
                 let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
                 let required = apache_avro::Schema::parse_str(required_json)?;
                 if record_needs_rewrite_for_extended_promotion(&writer, &required)? {
-                    // Worth saying out loud: the table evolved in a way Avro
-                    // cannot express, so the block is read at its own schema and
-                    // converted, rather than resolved as it is read.
                     log::warn!(
                         "log block rewritten rather than resolved: its schema differs from the \
                          table's in a way Avro does not define a promotion for"
@@ -301,6 +310,92 @@ impl Decoder {
         if let Some(rewrite_to) = rewrite_to {
             decoder = decoder.with_rewrite_to(rewrite_to);
         }
+        Ok(decoder)
+    }
+
+    /// An HFile block, in whichever shape the caller asked for.
+    ///
+    /// The records are Avro-encoded values under HFile keys, so decoding them to
+    /// Arrow is the same resolution the Avro path performs; the only difference is
+    /// that each value arrives already framed by the HFile rather than by a
+    /// four-byte length.
+    fn decode_hfile_content(
+        &self,
+        reader: impl Read,
+        header: &HashMap<BlockMetadataKey, String>,
+    ) -> Result<LogBlockContent> {
+        let records = self.decode_hfile_record_content(reader)?;
+        if !self.hfile_as_records {
+            return Ok(LogBlockContent::HFileRecords(records));
+        }
+
+        let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+            CoreError::LogBlockError(
+                "an HFile block has no schema in its header, so its records cannot be decoded"
+                    .to_string(),
+            )
+        })?;
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
+        let mut decoded: Vec<arrow_array::RecordBatch> = Vec::new();
+        for record in &records {
+            if let Some(batch) = decoder.decode(&record.value)? {
+                decoded.push(batch);
+            }
+        }
+        if let Some(batch) = decoder.flush()?
+            && batch.num_rows() > 0
+        {
+            decoded.push(batch);
+        }
+
+        // A writer may leave the record's key field empty because the HFile entry
+        // key already holds it. The keys are positional across the whole batch
+        // sequence, not per batch, so the offset tracks which records produced
+        // which batch.
+        let entry_keys: Vec<&str> = records
+            .iter()
+            .map(|r| {
+                r.key_as_str().ok_or_else(|| {
+                    CoreError::LogBlockError("an HFile record key is not valid UTF-8".to_string())
+                })
+            })
+            .collect::<Result<Vec<&str>>>()?;
+
+        let mut batches = RecordBatches::new_with_capacity(decoded.len(), 0);
+        let mut offset = 0usize;
+        for batch in decoded {
+            let rows = batch.num_rows();
+            let keys = entry_keys.get(offset..offset + rows).ok_or_else(|| {
+                CoreError::LogBlockError(format!(
+                    "{rows} rows decoded at offset {offset} from {} HFile records; the key of \
+                     each row cannot be identified",
+                    entry_keys.len()
+                ))
+            })?;
+            batches.push_data_batch(
+                fill_empty_entry_keys(batch, keys).map_err(|e| CoreError::HFile(e.to_string()))?,
+            );
+            offset += rows;
+        }
+        Ok(LogBlockContent::Records(batches))
+    }
+
+    fn decode_avro_record_content(
+        &self,
+        mut reader: impl Read,
+        header: &HashMap<BlockMetadataKey, String>,
+    ) -> Result<RecordBatches> {
+        Decoder::validate_log_block_version(&mut reader)?;
+
+        let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+            CoreError::LogBlockError("Schema not found in block header".to_string())
+        })?;
+
+        let mut record_count_buf = [0u8; 4];
+        reader.read_exact(&mut record_count_buf)?;
+        let record_count = u32::from_be_bytes(record_count_buf);
+
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
 
