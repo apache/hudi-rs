@@ -25,6 +25,7 @@
 use crate::Result;
 use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
+use crate::file_group::base_file::hfile::HFileBaseFileReader;
 use crate::file_group::base_file::reader::{
     BaseFileReadOptions, BaseFileReader, create_base_file_reader,
 };
@@ -410,6 +411,13 @@ impl HoodieFileGroupReader {
         } else {
             BaseFileFormatValue::from_str(&self.reader_context.base_file_format)?
         };
+        // The shared factory refuses HFile, which is what keeps the legacy
+        // reader from serving it; this reader has its own.
+        if matches!(format, BaseFileFormatValue::HFile) {
+            return Ok(std::sync::Arc::new(HFileBaseFileReader::new(
+                self.storage.clone(),
+            )));
+        }
         Ok(create_base_file_reader(&self.storage, &format)?)
     }
 

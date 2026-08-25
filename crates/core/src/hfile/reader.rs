@@ -29,11 +29,12 @@ use crate::hfile::error::{HFileError, Result};
 use crate::hfile::key::{Key, KeyValue, Utf8Key, compare_keys};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
-use crate::hfile::trailer::HFileTrailer;
+use crate::hfile::trailer::{HFileTrailer, TRAILER_SIZE};
 use crate::storage::Storage;
+use crate::storage::reader::LogBlockFetcher;
 use apache_avro::Schema as AvroSchema;
 use prost::Message;
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 
 /// Magic bytes indicating protobuf format in file info block
 const PBUF_MAGIC: &[u8; 4] = b"PBUF";
@@ -70,10 +71,80 @@ const FILE_INFO_MIN_RECORD_KEY: &str = "minRecordKey";
 /// File info key for max record key
 const FILE_INFO_MAX_RECORD_KEY: &str = "maxRecordKey";
 
+/// Where the decoder reads bytes from.
+///
+/// `Whole` is the file already in memory, which is what an HFile arriving as a
+/// log block's content is. `Ranged` holds only the section from
+/// `load_on_open_data_offset` to the end of the file, which carries the index,
+/// the file info and the trailer; data blocks are fetched when they are read,
+/// so peak memory tracks what is being read rather than the file.
+enum Source {
+    Whole(Vec<u8>),
+    Ranged {
+        fetcher: LogBlockFetcher,
+        /// `[tail_start, file_len)`, resident for the life of the reader.
+        tail: bytes::Bytes,
+        tail_start: usize,
+    },
+}
+
+impl Source {
+    /// Bytes from `offset` to the end of the resident region.
+    ///
+    /// The load-on-open blocks are self-describing: a caller reads the length
+    /// out of the block header rather than being told one, so this hands back
+    /// an open-ended slice rather than an exact range.
+    fn metadata_at(&self, offset: usize) -> Result<&[u8]> {
+        match self {
+            Source::Whole(bytes) => bytes.get(offset..).ok_or_else(|| {
+                HFileError::InvalidFormat(format!(
+                    "offset {offset} is past the end of a {}-byte HFile",
+                    bytes.len()
+                ))
+            }),
+            Source::Ranged {
+                tail, tail_start, ..
+            } => {
+                let relative = offset.checked_sub(*tail_start).ok_or_else(|| {
+                    HFileError::InvalidFormat(format!(
+                        "offset {offset} is below the resident section starting at {tail_start}"
+                    ))
+                })?;
+                tail.get(relative..).ok_or_else(|| {
+                    HFileError::InvalidFormat(format!(
+                        "offset {offset} is past the resident section of {} bytes",
+                        tail.len()
+                    ))
+                })
+            }
+        }
+    }
+
+    /// An exact range, when it is already resident. A ranged source must fetch
+    /// its data blocks instead, which is asynchronous, so it refuses here
+    /// rather than reading the wrong bytes.
+    fn resident_range(&self, offset: usize, size: usize) -> Result<&[u8]> {
+        match self {
+            Source::Whole(bytes) => bytes.get(offset..offset + size).ok_or_else(|| {
+                HFileError::InvalidFormat(format!(
+                    "range {offset}..{} is past the end of a {}-byte HFile",
+                    offset + size,
+                    bytes.len()
+                ))
+            }),
+            Source::Ranged { .. } => Err(HFileError::InvalidFormat(
+                "a ranged HFile reader fetches data blocks asynchronously; \
+                 this path needs the file to be resident"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
 /// HFile reader that supports sequential reads and seeks.
 pub struct HFileReader {
-    /// Raw file bytes
-    bytes: Vec<u8>,
+    /// Where bytes come from.
+    source: Source,
     /// Parsed trailer
     trailer: HFileTrailer,
     /// Compression codec from trailer
@@ -87,7 +158,7 @@ pub struct HFileReader {
     /// Last key in the file
     last_key: Option<Key>,
     /// Cached Avro schema (parsed lazily from file info)
-    cached_schema: OnceCell<AvroSchema>,
+    cached_schema: OnceLock<AvroSchema>,
     /// Current cursor position
     cursor: Cursor,
     /// Currently loaded data block
@@ -113,24 +184,27 @@ impl HFileReader {
     /// Create a new HFile reader from raw bytes.
     pub fn new(bytes: Vec<u8>) -> Result<Self> {
         let trailer = HFileTrailer::read(&bytes)?;
-        let codec = trailer.compression_codec;
+        let mut reader = Self::with_source(Source::Whole(bytes), trailer);
+        reader.initialize_metadata()?;
+        Ok(reader)
+    }
 
-        let mut reader = Self {
-            bytes,
+    /// A reader with its metadata not yet parsed.
+    fn with_source(source: Source, trailer: HFileTrailer) -> Self {
+        let codec = trailer.compression_codec;
+        Self {
+            source,
             trailer,
             codec,
             data_block_index: BTreeMap::new(),
             meta_block_index: BTreeMap::new(),
             file_info: BTreeMap::new(),
             last_key: None,
-            cached_schema: OnceCell::new(),
+            cached_schema: OnceLock::new(),
             cursor: Cursor::default(),
             current_block: None,
             current_block_entry: None,
-        };
-
-        reader.initialize_metadata()?;
-        Ok(reader)
+        }
     }
 
     /// Open an HFile from storage.
@@ -156,36 +230,135 @@ impl HFileReader {
         Self::new(bytes.to_vec())
     }
 
+    /// Open an HFile without holding it.
+    ///
+    /// Two ranged reads before any data is touched: the trailer, which is the
+    /// final [`TRAILER_SIZE`] bytes, then the load-on-open section it points at,
+    /// which carries the index and the file info. Data blocks are read later,
+    /// through [`Self::read_records_batched`].
+    pub async fn open_ranged(storage: &Storage, relative_path: &str) -> Result<Self> {
+        let reader = storage
+            .get_streaming_storage_reader(relative_path)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!("Failed to open HFile {relative_path}: {e:?}"))
+            })?;
+        let file_len = reader.file_len();
+        let fetcher = reader.block_fetcher();
+
+        let trailer_size = TRAILER_SIZE as u64;
+        if file_len < trailer_size {
+            return Err(HFileError::InvalidFormat(format!(
+                "File too small for HFile trailer: {file_len} bytes, need at least {TRAILER_SIZE}"
+            )));
+        }
+
+        // The trailer occupies exactly the last TRAILER_SIZE bytes, so it parses
+        // from that slice alone.
+        let trailer_bytes = fetcher
+            .read_content(file_len - trailer_size, trailer_size)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!(
+                    "Failed to read the trailer of HFile {relative_path}: {e:?}"
+                ))
+            })?;
+        let trailer = HFileTrailer::read(&trailer_bytes)?;
+
+        let tail_start = trailer.load_on_open_data_offset;
+        let tail = fetcher
+            .read_content(tail_start, file_len - tail_start)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!(
+                    "Failed to read the load-on-open section of HFile {relative_path}: {e:?}"
+                ))
+            })?;
+
+        let mut reader = Self::with_source(
+            Source::Ranged {
+                fetcher,
+                tail,
+                tail_start: tail_start as usize,
+            },
+            trailer,
+        );
+        reader.initialize_metadata_ranged().await?;
+        Ok(reader)
+    }
+
+    /// The data blocks in key order, each with the range it occupies, so a
+    /// caller can decide how many to read at once.
+    pub fn data_block_entries(&self) -> Vec<BlockIndexEntry> {
+        self.data_block_index.values().cloned().collect()
+    }
+
+    /// Decode the records of several data blocks, fetching their ranges in one
+    /// request. Peak memory is what `entries` covers, so the caller bounds it by
+    /// choosing how many blocks to pass.
+    pub async fn read_records_batched(
+        &self,
+        entries: &[BlockIndexEntry],
+    ) -> Result<Vec<HFileRecord>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let blocks = self.fetch_blocks(entries).await?;
+        let mut records = Vec::new();
+        for block in blocks {
+            if block.block_type() != HFileBlockType::Data {
+                return Err(HFileError::UnexpectedBlockType {
+                    expected: HFileBlockType::Data.to_string(),
+                    actual: block.block_type().to_string(),
+                });
+            }
+            let data_block = DataBlock::from_block(block);
+            for kv in data_block.iter() {
+                records.push(Self::key_value_to_record(&kv));
+            }
+        }
+        Ok(records)
+    }
+
     /// Initialize metadata by reading index blocks and file info.
     fn initialize_metadata(&mut self) -> Result<()> {
-        // Read the "load-on-open" section starting from load_on_open_data_offset
-        let start = self.trailer.load_on_open_data_offset as usize;
-
-        // Read root data index block
-        let (data_index, offset) = self.read_root_index_block(start)?;
-        self.data_block_index = data_index;
-
-        // Handle multi-level index if needed
+        let offset = self.read_root_index()?;
         if self.trailer.num_data_index_levels > 1 {
             self.load_multi_level_index()?;
         }
+        self.read_meta_and_file_info(offset)
+    }
 
-        // Read meta index block
+    /// As [`Self::initialize_metadata`], but the leaf index blocks of a
+    /// multi-level index are fetched rather than sliced. They live in the data
+    /// region, not the load-on-open section, so a ranged reader has to go back
+    /// to storage for them; every other step reads resident bytes.
+    async fn initialize_metadata_ranged(&mut self) -> Result<()> {
+        let offset = self.read_root_index()?;
+        if self.trailer.num_data_index_levels > 1 {
+            self.load_multi_level_index_batched().await?;
+        }
+        self.read_meta_and_file_info(offset)
+    }
+
+    /// Root data index. Returns the offset just past it.
+    fn read_root_index(&mut self) -> Result<usize> {
+        let start = self.trailer.load_on_open_data_offset as usize;
+        let (data_index, offset) = self.read_root_index_block(start)?;
+        self.data_block_index = data_index;
+        Ok(offset)
+    }
+
+    /// Meta index, file info, last key and the MVCC check: the rest of the
+    /// load-on-open section, all resident.
+    fn read_meta_and_file_info(&mut self, offset: usize) -> Result<()> {
         let (meta_index, offset) = self.read_meta_index_block(offset)?;
         self.meta_block_index = meta_index;
-
-        // Read file info block
         self.read_file_info_block(offset)?;
-
-        // Parse last key from file info
         if let Some(last_key_bytes) = self.file_info.get(FILE_INFO_LAST_KEY) {
             self.last_key = Some(Key::from_bytes(last_key_bytes.clone()));
         }
-
-        // Check MVCC timestamp support
-        self.check_mvcc_support()?;
-
-        Ok(())
+        self.check_mvcc_support()
     }
 
     /// Check if the file uses MVCC timestamps (not supported).
@@ -226,7 +399,7 @@ impl HFileReader {
         &self,
         start: usize,
     ) -> Result<(BTreeMap<Key, BlockIndexEntry>, usize)> {
-        let block = HFileBlock::parse(&self.bytes[start..], self.codec)?;
+        let block = HFileBlock::parse(self.source.metadata_at(start)?, self.codec)?;
         if block.block_type() != HFileBlockType::RootIndex {
             return Err(HFileError::UnexpectedBlockType {
                 expected: HFileBlockType::RootIndex.to_string(),
@@ -280,23 +453,64 @@ impl HFileReader {
             levels_remaining -= 1;
         }
 
-        // Build final index map from leaf entries
+        self.data_block_index = Self::index_from_leaf_entries(&current_entries);
+        Ok(())
+    }
+
+    /// Key-ordered index over leaf entries, each carrying the next entry's
+    /// first key so a seek knows where a block's range ends.
+    fn index_from_leaf_entries(entries: &[BlockIndexEntry]) -> BTreeMap<Key, BlockIndexEntry> {
         let mut index_map = BTreeMap::new();
-        for i in 0..current_entries.len() {
-            let entry = &current_entries[i];
-            let next_key = if i + 1 < current_entries.len() {
-                Some(current_entries[i + 1].first_key.clone())
-            } else {
-                None
-            };
+        for (i, entry) in entries.iter().enumerate() {
+            let next_key = entries.get(i + 1).map(|next| next.first_key.clone());
             index_map.insert(
                 entry.first_key.clone(),
                 BlockIndexEntry::new(entry.first_key.clone(), next_key, entry.offset, entry.size),
             );
         }
+        index_map
+    }
 
-        self.data_block_index = index_map;
+    /// The multi-level walk for a ranged source: one batched request per level
+    /// instead of one per leaf block, since `read_contents` coalesces ranges
+    /// that sit close together.
+    async fn load_multi_level_index_batched(&mut self) -> Result<()> {
+        let mut levels_remaining = self.trailer.num_data_index_levels - 1;
+        let mut current_entries: Vec<BlockIndexEntry> =
+            self.data_block_index.values().cloned().collect();
+
+        while levels_remaining > 0 {
+            let blocks = self.fetch_blocks(&current_entries).await?;
+            let mut next_level_entries = Vec::new();
+            for block in &blocks {
+                next_level_entries.extend(self.parse_leaf_index_entries(&block.data)?);
+            }
+            current_entries = next_level_entries;
+            levels_remaining -= 1;
+        }
+
+        self.data_block_index = Self::index_from_leaf_entries(&current_entries);
         Ok(())
+    }
+
+    /// Fetch and parse several blocks in one request. Ranged sources only.
+    async fn fetch_blocks(&self, entries: &[BlockIndexEntry]) -> Result<Vec<HFileBlock>> {
+        let Source::Ranged { fetcher, .. } = &self.source else {
+            return Err(HFileError::InvalidFormat(
+                "batched block reads need a ranged HFile reader".to_string(),
+            ));
+        };
+        let ranges: Vec<std::ops::Range<u64>> = entries
+            .iter()
+            .map(|e| e.offset..e.offset + e.size as u64)
+            .collect();
+        let fetched = fetcher.read_contents(&ranges).await.map_err(|e| {
+            HFileError::InvalidFormat(format!("Failed to read HFile block ranges: {e:?}"))
+        })?;
+        fetched
+            .iter()
+            .map(|bytes| HFileBlock::parse(bytes, self.codec))
+            .collect()
     }
 
     /// Parse root index entries from block data.
@@ -421,7 +635,7 @@ impl HFileReader {
         &self,
         start: usize,
     ) -> Result<(BTreeMap<String, BlockIndexEntry>, usize)> {
-        let block = HFileBlock::parse(&self.bytes[start..], self.codec)?;
+        let block = HFileBlock::parse(self.source.metadata_at(start)?, self.codec)?;
         if block.block_type() != HFileBlockType::RootIndex {
             return Err(HFileError::UnexpectedBlockType {
                 expected: HFileBlockType::RootIndex.to_string(),
@@ -448,7 +662,7 @@ impl HFileReader {
 
     /// Read file info block.
     fn read_file_info_block(&mut self, start: usize) -> Result<()> {
-        let block = HFileBlock::parse(&self.bytes[start..], self.codec)?;
+        let block = HFileBlock::parse(self.source.metadata_at(start)?, self.codec)?;
         if block.block_type() != HFileBlockType::FileInfo {
             return Err(HFileError::UnexpectedBlockType {
                 expected: HFileBlockType::FileInfo.to_string(),
@@ -479,7 +693,7 @@ impl HFileReader {
 
     /// Read a block at the given offset and size.
     fn read_block_at(&self, offset: usize, size: usize) -> Result<HFileBlock> {
-        HFileBlock::parse(&self.bytes[offset..offset + size], self.codec)
+        HFileBlock::parse(self.source.resident_range(offset, size)?, self.codec)
     }
 
     /// Get the number of key-value entries in the file.
@@ -1111,6 +1325,63 @@ mod tests {
     fn read_test_hfile(filename: &str) -> Vec<u8> {
         let path = test_data_dir().join(filename);
         std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {path:?}"))
+    }
+
+    /// Storage rooted at the fixture directory, so a ranged read addresses the
+    /// fixtures by name.
+    fn fixture_storage() -> std::sync::Arc<Storage> {
+        let url =
+            url::Url::from_directory_path(std::fs::canonicalize(test_data_dir()).unwrap()).unwrap();
+        Storage::new_with_base_url(url).unwrap()
+    }
+
+    /// Every fixture, read both ways, must yield identical records.
+    ///
+    /// This is the guard on the two multi-level index walks: the resident one
+    /// slices each leaf block, the ranged one fetches a level per request, and
+    /// nothing else forces them to agree. `..._deep_index` is the fixture with
+    /// more than one index level, so it is the one that exercises the split.
+    #[tokio::test]
+    async fn ranged_and_resident_reads_agree_on_every_fixture() -> Result<()> {
+        let fixtures = [
+            "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile",
+            "hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile",
+            "hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile",
+            "hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile",
+            "hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile",
+            "hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile",
+            "hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile",
+            "hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile",
+            "hudi_1_0_hbase_2_4_9_no_entry.hfile",
+        ];
+        let storage = fixture_storage();
+
+        for name in fixtures {
+            let mut resident = HFileReader::new(read_test_hfile(name))?;
+            let expected = resident.collect_records()?;
+
+            let ranged = HFileReader::open_ranged(&storage, name).await?;
+            let entries = ranged.data_block_entries();
+            let actual = ranged.read_records_batched(&entries).await?;
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{name}: ranged read returned {} records, resident read {}",
+                actual.len(),
+                expected.len()
+            );
+            assert_eq!(
+                actual, expected,
+                "{name}: records differ between the two reads"
+            );
+            assert_eq!(
+                ranged.num_entries(),
+                resident.num_entries(),
+                "{name}: trailer entry count differs"
+            );
+        }
+        Ok(())
     }
 
     #[test]
