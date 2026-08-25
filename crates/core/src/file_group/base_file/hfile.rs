@@ -25,22 +25,22 @@ use arrow::array::{ArrayRef, BinaryArray, RecordBatch, RecordBatchOptions, Strin
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use object_store::path::Path as ObjPath;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
-use crate::hfile::{BlockIndexEntry, HFileReader, HFileRecord};
+use crate::hfile::{HFileReader, HFileRecord};
 use crate::statistics::{StatisticsContainer, StatsGranularity};
 use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
-use crate::storage::reader::stream_window_size;
-use crate::storage::util::join_url_segments;
 
 /// An HFile stores a key and a value that is still serialized. Decoding the
 /// value needs the payload's own schema, which a base-file reader does not
 /// resolve, so it is handed on as bytes.
 const KEY_COLUMN: &str = "key";
 const VALUE_COLUMN: &str = "value";
+
+/// Only reached if a reader reports no budget, which a ranged reader always does.
+const DEFAULT_WINDOW_BUDGET_FALLBACK: u64 = 16 * 1024 * 1024;
 
 /// Reads HFile base files.
 #[derive(Debug)]
@@ -77,31 +77,6 @@ impl HFileBaseFileReader {
         Ok(Arc::new(Schema::new(fields)))
     }
 
-    /// Group consecutive data blocks into runs that each stay under `budget`.
-    ///
-    /// A run is read in one request, so this is what bounds both peak memory and
-    /// the number of round trips. A block larger than the budget goes out alone
-    /// rather than being split, since a block has to be whole to decode.
-    fn plan_block_windows(entries: &[BlockIndexEntry], budget: u64) -> Vec<Vec<BlockIndexEntry>> {
-        let mut windows: Vec<Vec<BlockIndexEntry>> = Vec::new();
-        let mut current: Vec<BlockIndexEntry> = Vec::new();
-        let mut current_bytes: u64 = 0;
-
-        for entry in entries {
-            let len = entry.size as u64;
-            if !current.is_empty() && current_bytes.saturating_add(len) > budget {
-                windows.push(std::mem::take(&mut current));
-                current_bytes = 0;
-            }
-            current_bytes = current_bytes.saturating_add(len);
-            current.push(entry.clone());
-        }
-        if !current.is_empty() {
-            windows.push(current);
-        }
-        windows
-    }
-
     fn batch(schema: &SchemaRef, records: Vec<HFileRecord>) -> Result<RecordBatch> {
         let row_count = records.len();
         let mut keys: Option<Vec<String>> = None;
@@ -111,12 +86,19 @@ impl HFileBaseFileReader {
         for field in schema.fields() {
             match field.name().as_str() {
                 KEY_COLUMN => {
-                    let keys = keys.get_or_insert_with(|| {
-                        records
-                            .iter()
-                            .map(|r| String::from_utf8_lossy(&r.key).into_owned())
-                            .collect()
-                    });
+                    if keys.is_none() {
+                        let mut decoded = Vec::with_capacity(records.len());
+                        for record in &records {
+                            let key = record.key_as_str().ok_or_else(|| {
+                                StorageError::Creation(
+                                    "an HFile record key is not valid UTF-8".to_string(),
+                                )
+                            })?;
+                            decoded.push(key.to_string());
+                        }
+                        keys = Some(decoded);
+                    }
+                    let keys = keys.as_ref().expect("just populated");
                     columns.push(Arc::new(StringArray::from(keys.clone())));
                 }
                 VALUE_COLUMN => {
@@ -149,12 +131,6 @@ impl HFileBaseFileReader {
                 StorageError::Creation(format!("Failed to read HFile {relative_path}: {e:?}"))
             })
     }
-
-    async fn file_size(&self, relative_path: &str) -> Result<u64> {
-        let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        Ok(self.storage.object_store.head(&obj_path).await?.size)
-    }
 }
 
 impl BaseFileReader for HFileBaseFileReader {
@@ -183,13 +159,19 @@ impl BaseFileReader for HFileBaseFileReader {
                 ));
             }
 
-            let budget = stream_window_size(&self.storage.hudi_configs)
-                .map_err(StorageError::ReaderError)?;
-            let windows = Self::plan_block_windows(&reader.data_block_entries(), budget);
+            let budget = reader
+                .window_budget()
+                .unwrap_or(DEFAULT_WINDOW_BUDGET_FALLBACK);
+            let windows = HFileReader::plan_windows(&reader.data_block_entries(), budget);
 
             let stream = futures::stream::unfold(
-                (reader, windows.into_iter(), schema.clone()),
-                |(reader, mut windows, schema)| async move {
+                (reader, windows.into_iter(), schema.clone(), false),
+                |(reader, mut windows, schema, failed)| async move {
+                    // Sticky: once a window fails the read is not whole, so no
+                    // later window is handed out as though it were.
+                    if failed {
+                        return None;
+                    }
                     let window = windows.next()?;
                     let item = match reader.read_records_batched(&window).await {
                         Ok(records) => Self::batch(&schema, records),
@@ -197,7 +179,8 @@ impl BaseFileReader for HFileBaseFileReader {
                             "Failed to read HFile data blocks: {e:?}"
                         ))),
                     };
-                    Some((item, (reader, windows, schema)))
+                    let failed = item.is_err();
+                    Some((item, (reader, windows, schema, failed)))
                 },
             )
             .boxed();
@@ -212,8 +195,9 @@ impl BaseFileReader for HFileBaseFileReader {
         _table_schema: &'a Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
         Box::pin(async move {
-            let size = self.file_size(relative_path).await?;
+            // `open` already learned the length, so no second head request.
             let reader = self.open(relative_path).await?;
+            let size = reader.file_len();
 
             let name = std::path::Path::new(relative_path)
                 .file_name()
@@ -246,7 +230,7 @@ mod tests {
     use crate::file_group::reader_v2::input_split::InputSplit;
     use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
     use crate::file_group::reader_v2::resolver::resolve_reader_context;
-    use crate::hfile::Key;
+    use crate::hfile::{BlockIndexEntry, Key};
     use crate::metadata::table::reader::MetadataTableFileGroupReader;
     use arrow_array::cast::AsArray;
     use std::collections::{HashMap, HashSet};
@@ -360,14 +344,14 @@ mod tests {
     fn windows_stop_at_the_budget_and_never_split_a_block() {
         let entries = vec![entry(0, 40), entry(40, 40), entry(80, 40)];
 
-        let windows = HFileBaseFileReader::plan_block_windows(&entries, 100);
+        let windows = HFileReader::plan_windows(&entries, 100);
         assert_eq!(
             windows.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![2, 1],
             "40 + 40 fits under 100, the third block starts a new window"
         );
 
-        let windows = HFileBaseFileReader::plan_block_windows(&entries, 1_000);
+        let windows = HFileReader::plan_windows(&entries, 1_000);
         assert_eq!(
             windows.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![3],
@@ -376,9 +360,9 @@ mod tests {
 
         // A block bigger than the budget still goes out whole: it cannot decode
         // in pieces.
-        let windows = HFileBaseFileReader::plan_block_windows(&[entry(0, 500)], 100);
+        let windows = HFileReader::plan_windows(&[entry(0, 500)], 100);
         assert_eq!(windows, vec![vec![entry(0, 500)]]);
 
-        assert!(HFileBaseFileReader::plan_block_windows(&[], 100).is_empty());
+        assert!(HFileReader::plan_windows(&[], 100).is_empty());
     }
 }
