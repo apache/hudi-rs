@@ -67,6 +67,28 @@ pub const CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB: &str = "hoodie.metadata.file.cach
 /// a constant set from it would be far too low for the deployment that matters.
 pub const DEFAULT_HFILE_WHOLE_READ_MAX_SIZE_MB: u64 = 50;
 
+/// The size below which an HFile is read whole even when the caller named keys.
+///
+/// A separate, much smaller bound because a scan and a seek want opposite things,
+/// and the reader knows which it is doing before it opens the file. Reading whole
+/// never costs a scan anything, since a scan touches every byte either way. A seek
+/// touches one block, so reading whole makes it pay for the file: measured on
+/// generated HFiles, a ranged seek is 1.54x faster at 8 KB (fixed cost dominates)
+/// but a whole-file seek is 1.24x slower at 2 MB, 3.66x at 8 MB and 9.40x at 32 MB.
+/// 512 KB is the largest size measured at which whole does not lose.
+///
+/// This is where Hudi is deliberately not followed. Its single threshold is
+/// `hoodie.metadata.file.cache.max.size.mb` and the name says why it can be coarse:
+/// the whole read populates a cache, so one file read is amortised over many
+/// lookups. There is no such cache here, so the read would be repaid on every
+/// lookup instead.
+///
+/// The number is a local measurement and therefore conservative. A local `head`
+/// and range read are nearly free, where each is a round trip on object storage, so
+/// the real crossover there is higher and this bound gives up part of the available
+/// win rather than risking the regression above.
+pub const HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE: u64 = 512 * 1024;
+
 /// The size below which an HFile should be read whole, in bytes.
 pub fn hfile_whole_read_max_size(hudi_configs: &HudiConfigs) -> Result<u64> {
     let mb = match hudi_configs
