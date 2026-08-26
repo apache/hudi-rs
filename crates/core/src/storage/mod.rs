@@ -37,6 +37,8 @@ use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
 use crate::storage::util::join_url_segments;
 
+#[cfg(test)]
+pub(crate) mod counting;
 pub mod error;
 pub mod file_metadata;
 pub mod reader;
@@ -94,6 +96,27 @@ impl Storage {
             })),
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
+    }
+
+    /// Build storage over a caller-supplied object store.
+    ///
+    /// Test-only, so a test can wrap the real store and observe the requests a
+    /// reader makes. Note that a wrapper takes the trait's default `get_ranges`,
+    /// which coalesces, where `LocalFileSystem` overrides it and does not: the
+    /// counts a test sees are therefore the ones an object store would serve, not
+    /// the ones the local filesystem would.
+    #[cfg(test)]
+    pub(crate) fn new_with_object_store(
+        base_url: Url,
+        object_store: Arc<dyn ObjectStore>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Arc<Storage> {
+        Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options: Arc::new(HashMap::new()),
+            hudi_configs,
+        })
     }
 
     #[cfg(test)]

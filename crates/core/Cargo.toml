@@ -105,6 +105,9 @@ datafusion-physical-expr = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 
 [dev-dependencies]
+# Needed only to implement `object_store::ObjectStore` for the test-only counting
+# wrapper: that trait is declared with `#[async_trait]`, so an impl must be too.
+async-trait = { workspace = true }
 hudi-test = { path = "../test" }
 serial_test = { workspace = true }
 # Also a regular dependency, but only an optional one behind `spill-rocksdb`.

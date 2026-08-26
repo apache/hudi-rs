@@ -233,6 +233,49 @@ impl HFileReader {
         Self::new(bytes.to_vec())
     }
 
+    /// Open the file whole when it is at most `whole_read_max_size` bytes, and in
+    /// ranges when it is larger.
+    ///
+    /// Mirrors `HFileReaderFactory.createInputStream`, which reads the file whole
+    /// below `hoodie.metadata.file.cache.max.size.mb` and opens a seekable stream
+    /// above it. Both directions matter, measured locally on generated HFiles: a
+    /// ranged point lookup is 2.7x slower than a whole read at 8 KB, because a
+    /// `head` plus a trailer range plus a load-on-open range are three round trips
+    /// where one would do, and 25x faster at 512 MB, because it pays for the blocks
+    /// it needs rather than for every byte.
+    ///
+    /// `known_file_size` skips the size lookup when the caller already has it. When
+    /// it does not, the size comes from the streaming reader that the ranged path
+    /// would open anyway, so the decision costs no request of its own.
+    pub async fn open_sized(
+        storage: &Storage,
+        relative_path: &str,
+        whole_read_max_size: u64,
+        known_file_size: Option<u64>,
+    ) -> Result<Self> {
+        if let Some(size) = known_file_size {
+            return if size <= whole_read_max_size {
+                Self::open(storage, relative_path).await
+            } else {
+                Self::open_ranged(storage, relative_path).await
+            };
+        }
+        // Zero means never whole, so the size cannot change the outcome.
+        if whole_read_max_size == 0 {
+            return Self::open_ranged(storage, relative_path).await;
+        }
+        let reader = storage
+            .get_streaming_storage_reader(relative_path)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!("Failed to open HFile {relative_path}: {e:?}"))
+            })?;
+        if reader.file_len() <= whole_read_max_size {
+            return Self::open(storage, relative_path).await;
+        }
+        Self::open_ranged_with(storage, relative_path, reader).await
+    }
+
     /// Open an HFile without holding it.
     ///
     /// Two ranged reads before any data is touched: the trailer, which is the
@@ -246,6 +289,18 @@ impl HFileReader {
             .map_err(|e| {
                 HFileError::InvalidFormat(format!("Failed to open HFile {relative_path}: {e:?}"))
             })?;
+        Self::open_ranged_with(storage, relative_path, reader).await
+    }
+
+    /// Open in ranges from a storage reader already in hand.
+    ///
+    /// Split out so a caller that needed the file's length to decide between
+    /// whole and ranged does not pay a second `head` for it.
+    async fn open_ranged_with(
+        storage: &Storage,
+        relative_path: &str,
+        reader: crate::storage::reader::StorageReader,
+    ) -> Result<Self> {
         let file_len = reader.file_len();
         let fetcher = reader.block_fetcher();
 
@@ -564,10 +619,17 @@ impl HFileReader {
 
     /// Fetch and parse several blocks in one request. Ranged sources only.
     async fn fetch_blocks(&self, entries: &[BlockIndexEntry]) -> Result<Vec<HFileBlock>> {
+        // Resident: the bytes are already here, so a "fetch" is a slice.
         let Source::Ranged { fetcher, .. } = &self.source else {
-            return Err(HFileError::InvalidFormat(
-                "batched block reads need a ranged HFile reader".to_string(),
-            ));
+            return entries
+                .iter()
+                .map(|e| {
+                    let bytes = self
+                        .source
+                        .resident_range(e.offset as usize, e.size as usize)?;
+                    HFileBlock::parse(bytes, self.codec)
+                })
+                .collect();
         };
         let ranges: Vec<std::ops::Range<u64>> = entries
             .iter()

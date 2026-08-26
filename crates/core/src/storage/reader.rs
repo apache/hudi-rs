@@ -50,6 +50,42 @@ pub const DEFAULT_STREAM_WINDOW_SIZE: u64 = 16 * 1024 * 1024;
 /// reads file slices concurrently (`hoodie.read.file.slice.read.concurrency`).
 pub const CONFIG_DFS_BUFFER_MAX_SIZE: &str = "hoodie.memory.dfs.buffer.max.size";
 
+/// Size below which an HFile is read whole rather than in ranges.
+///
+/// Hudi's own key and meaning: `HFileReaderFactory.createInputStream` reads the
+/// whole file when it is under this, and only opens a seekable stream above it.
+pub const CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB: &str = "hoodie.metadata.file.cache.max.size.mb";
+
+/// 50 MB, matching Hudi's default for [`CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB`].
+///
+/// Taken from Hudi rather than derived here, deliberately. Measured on a local
+/// filesystem the crossover is about 2 MB for a point lookup and a full scan is a
+/// wash above roughly 512 KB — but a local `head` and range read are nearly free,
+/// where on object storage each is a round trip and a ranged open pays three
+/// before the first data byte. So the local number is a floor, not the answer, and
+/// a constant set from it would be far too low for the deployment that matters.
+pub const DEFAULT_HFILE_WHOLE_READ_MAX_SIZE_MB: u64 = 50;
+
+/// The size below which an HFile should be read whole, in bytes.
+pub fn hfile_whole_read_max_size(hudi_configs: &HudiConfigs) -> Result<u64> {
+    let mb = match hudi_configs
+        .as_options()
+        .get(CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB)
+        .map(|raw| raw.trim().parse::<u64>())
+    {
+        None => DEFAULT_HFILE_WHOLE_READ_MAX_SIZE_MB,
+        // Zero is meaningful: always read in ranges, never whole.
+        Some(Ok(mb)) => mb,
+        Some(Err(_)) => {
+            return Err(Error::other(format!(
+                "{CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB} must be a non-negative integer \
+                 count of megabytes"
+            )));
+        }
+    };
+    Ok(mb.saturating_mul(1024 * 1024))
+}
+
 /// The streaming window size a set of configs asks for.
 ///
 /// Absent means [`DEFAULT_STREAM_WINDOW_SIZE`]. A value that is not a positive

@@ -97,12 +97,28 @@ impl HFileBaseFileReader {
         Ok(Arc::new(Schema::new(fields)))
     }
 
-    async fn open(&self, relative_path: &str) -> Result<HFileReader> {
-        HFileReader::open_ranged(&self.storage, relative_path)
-            .await
-            .map_err(|e| {
-                StorageError::Creation(format!("Failed to read HFile {relative_path}: {e:?}"))
-            })
+    /// Open the file, reading it whole when it is small enough and in ranges when it
+    /// is not.
+    ///
+    /// The threshold and the reason for it live on [`HFileReader::open_sized`].
+    /// `known_file_size` lets the caller spare the size lookup when the listing
+    /// already told it.
+    async fn open(
+        &self,
+        relative_path: &str,
+        options: &BaseFileReadOptions,
+    ) -> Result<HFileReader> {
+        let whole_below =
+            crate::storage::reader::hfile_whole_read_max_size(&self.storage.hudi_configs)
+                .map_err(|e| StorageError::Creation(format!("{e}")))?;
+        HFileReader::open_sized(
+            &self.storage,
+            relative_path,
+            whole_below,
+            options.known_file_size,
+        )
+        .await
+        .map_err(|e| StorageError::Creation(format!("Failed to read HFile {relative_path}: {e:?}")))
     }
 }
 
@@ -113,7 +129,7 @@ impl BaseFileReader for HFileBaseFileReader {
         options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
-            let reader = self.open(relative_path).await?;
+            let reader = self.open(relative_path, &options).await?;
 
             // `Some(vec![])` asks for the row count only. The trailer carries it,
             // so no data block is read and no schema is needed.
@@ -194,7 +210,14 @@ impl BaseFileReader for HFileBaseFileReader {
         _table_schema: &'a Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>> {
         Box::pin(async move {
-            let reader = self.open(relative_path).await?;
+            // Ranged unconditionally here, whatever the threshold: this reports the
+            // file's length and record count, both of which come from the trailer, so
+            // buffering the file would be paid for nothing.
+            let reader = HFileReader::open_ranged(&self.storage, relative_path)
+                .await
+                .map_err(|e| {
+                    StorageError::Creation(format!("Failed to read HFile {relative_path}: {e:?}"))
+                })?;
             let size = reader.file_len();
 
             let name = std::path::Path::new(relative_path)
@@ -352,6 +375,94 @@ mod tests {
 
     /// An HFile base file read through the v2 file group reader returns the same
     /// keys the metadata-table reader returns for the same base-file-only slice.
+    /// The size threshold picks the read strategy, and the two strategies are told
+    /// apart by the requests they issue.
+    ///
+    /// Rows cannot separate them: whole and ranged return the same records over the
+    /// same file, which is the point. So the assertion is on request counts, taken
+    /// from a store that wraps the real one and counts what passes through.
+    #[tokio::test]
+    async fn the_size_threshold_picks_whole_or_ranged() -> crate::Result<()> {
+        use crate::storage::counting::CountingObjectStore;
+
+        fn configs_with(threshold_mb: &str) -> Arc<HudiConfigs> {
+            let mut options = mdt_configs().as_options();
+            options.insert(
+                crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
+                threshold_mb.to_string(),
+            );
+            Arc::new(HudiConfigs::new(options))
+        }
+
+        async fn read(
+            threshold_mb: &str,
+            known_file_size: Option<u64>,
+        ) -> crate::Result<(usize, usize, usize)> {
+            let (store, counts) =
+                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+            let storage = Storage::new_with_object_store(
+                Url::parse(&metadata_table_uri()).unwrap(),
+                store,
+                configs_with(threshold_mb),
+            );
+            let reader = HFileBaseFileReader::new(storage);
+            let mut options = BaseFileReadOptions::default();
+            if let Some(size) = known_file_size {
+                options = options.with_known_file_size(size);
+            }
+            let batch = reader.read_data(MDT_FILES_BASE_FILE, options).await?;
+            Ok((batch.num_rows(), counts.gets(), counts.heads()))
+        }
+
+        // The file's own size, so the below-threshold read can be asked for without
+        // a size lookup.
+        let file_size = std::fs::metadata(
+            PathBuf::from(Url::parse(&metadata_table_uri()).unwrap().path())
+                .join(MDT_FILES_BASE_FILE),
+        )
+        .expect("the fixture base file")
+        .len();
+
+        // Below the default threshold, with the size already in hand: one read of
+        // the whole file and nothing else, not even a metadata lookup.
+        let (whole_rows, whole_gets, whole_heads) = read("50", Some(file_size)).await?;
+        assert_eq!(
+            (whole_gets, whole_heads),
+            (1, 0),
+            "a whole read of a known-size file is one request"
+        );
+
+        // Same threshold, size not supplied: one lookup to learn the size, then the
+        // same single read.
+        let (sized_rows, sized_gets, sized_heads) = read("50", None).await?;
+        assert_eq!(
+            (sized_gets, sized_heads),
+            (1, 1),
+            "learning the size costs one lookup and no extra read"
+        );
+
+        // Zero means never whole. The ranged open reads the trailer and the
+        // load-on-open section before any data block, so it cannot come in at one.
+        let (ranged_rows, ranged_gets, _) = read("0", Some(file_size)).await?;
+        assert!(
+            ranged_gets > whole_gets,
+            "a ranged read issues more requests than a whole one, got {ranged_gets} \
+             against {whole_gets}"
+        );
+
+        assert!(
+            whole_rows > 0,
+            "the fixture must return rows, or the counts above prove nothing"
+        );
+        assert_eq!(whole_rows, sized_rows);
+        assert_eq!(
+            whole_rows, ranged_rows,
+            "both strategies must return the same records; only their request \
+             counts differ"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn v2_reads_an_hfile_base_file_matching_the_metadata_table_reader() -> crate::Result<()> {
         let expected = reference_keys().await?;
