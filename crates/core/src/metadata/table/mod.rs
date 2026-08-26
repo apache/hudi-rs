@@ -32,6 +32,7 @@ pub mod records;
 // compare against or no longer need to.
 #[cfg(test)]
 pub(crate) mod reader;
+pub(crate) mod routing;
 
 pub(crate) mod v2_reader;
 
