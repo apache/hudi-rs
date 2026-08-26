@@ -25,6 +25,12 @@
 pub mod records;
 
 pub(crate) mod reader;
+// The version two metadata layer. Not yet on the read path: it matches `reader` on
+// values and is slower, so `read_files_partition` still calls `reader`. Reachable from
+// its own parity tests, which is what keeps the comparison honest while the cost is
+// worked on.
+#[allow(dead_code)]
+pub(crate) mod v2_reader;
 
 use crate::config::HudiConfigs;
 use crate::storage::Storage;
@@ -272,6 +278,13 @@ impl Table {
         ));
         let storage = Storage::new(Arc::new(self.storage_options()), configs.clone())?;
 
+        // Still the existing reader, deliberately. `MetadataTableV2Reader` matches it
+        // record for record and value for value, and is 3.4x slower end to end: the
+        // ranged base-file open costs extra requests, version two's log scan walks
+        // every log file twice, and the metadata merger rebuilds an Arrow map per
+        // merged pair. Swapping the default metadata read onto that would be a
+        // regression no value-equality test can see, so the swap waits for the cost
+        // to come down rather than shipping with it.
         reader::MetadataTableFileGroupReader::new(configs, storage)
             .read_files_partition(&file_slice, keys)
             .await
@@ -335,6 +348,59 @@ mod tests {
             ])
         );
         assert!(chennai.total_size() > 0);
+    }
+
+    /// The pruned-keys branch of `fetch_files_partition_records`: read
+    /// `__all_partitions__` first, prune, then read only the surviving partitions.
+    ///
+    /// The three branches are the reason this matters. The unfiltered branch is
+    /// covered by `hudi_table_read_metadata_table_files_partition` above, which now
+    /// runs through the version two layer since the seam was swapped. This covers
+    /// the filtered one. The **non-partitioned** branch, which asks for `.`, cannot
+    /// be covered end to end: no fixture in this repo is a non-partitioned table
+    /// with a metadata table (`v9_mor_nonpart_3commits` has none), so the `.` to
+    /// empty-string normalisation it depends on is unit-tested in `v2_reader`
+    /// instead, and said so there.
+    #[tokio::test]
+    async fn hudi_table_read_metadata_table_files_partition_with_pruning() {
+        let data_table = get_data_table().await;
+        let partition_schema = data_table.get_partition_schema().await.unwrap();
+        let filters = crate::expr::filter::from_str_tuples([("city", "=", "chennai")]).unwrap();
+        let partition_pruner = PartitionPruner::new(
+            &filters,
+            &partition_schema,
+            data_table.hudi_configs.as_ref(),
+        )
+        .unwrap();
+
+        let records = data_table
+            .read_metadata_table_files_partition(&partition_pruner)
+            .await
+            .unwrap();
+
+        // Only the surviving partition, and not the `__all_partitions__` record the
+        // pruning read to find it: that read is an intermediate step, and returning
+        // it would make a pruned listing include a record no caller asked for.
+        assert_eq!(
+            records.keys().collect::<Vec<_>>(),
+            vec!["city=chennai"],
+            "a pruned read must return the matching partition and nothing else"
+        );
+
+        // Same values as the unfiltered read gives for that partition, so pruning
+        // changes which records come back and not what they say.
+        let chennai = records.get("city=chennai").unwrap();
+        assert_eq!(chennai.record_type, MetadataRecordType::Files);
+        let names: HashSet<_> = chennai.active_file_names().into_iter().collect();
+        assert_eq!(
+            names,
+            HashSet::from([
+                "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_2-986-2794_20251220210108078.parquet",
+                "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_0-1112-3190_20251220210129235.parquet",
+                ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210127080.log.1_0-1072-3078",
+                ".6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc-0_20251220210128625.log.1_0-1097-3150",
+            ])
+        );
     }
 
     #[tokio::test]

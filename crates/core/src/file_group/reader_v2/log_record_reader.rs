@@ -822,6 +822,11 @@ impl BaseHoodieLogRecordReader {
         // The merge buffer takes Arrow and nothing else, so an HFile block's
         // records are decoded rather than handed over as key-value pairs.
         .with_hfile_as_records(true)
+        // The same predicate the base file read seeks with. No gate, unlike the row
+        // filter below: the merge is per key, so a log record whose key nobody asked
+        // for cannot change what the requested keys merge to, and dropping it before
+        // the Avro decode is the whole saving.
+        .with_key_predicate(self.reader_context.key_predicate.clone())
         .with_row_filter(if self.reader_context.can_push_row_filter() {
             self.reader_context.row_filter_builder.clone()
         } else {
