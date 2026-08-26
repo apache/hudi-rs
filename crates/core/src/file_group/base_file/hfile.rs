@@ -100,17 +100,25 @@ impl HFileBaseFileReader {
     /// Open the file, reading it whole when it is small enough and in ranges when it
     /// is not.
     ///
-    /// The threshold and the reason for it live on [`HFileReader::open_sized`].
+    /// The bound depends on what the read is going to do, because a scan and a seek
+    /// want opposite things: see [`HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE`] for the
+    /// measurement and for why Hudi's single threshold is not followed here.
     /// `known_file_size` lets the caller spare the size lookup when the listing
     /// already told it.
+    ///
+    /// [`HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE`]: crate::storage::reader::HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE
     async fn open(
         &self,
         relative_path: &str,
         options: &BaseFileReadOptions,
     ) -> Result<HFileReader> {
-        let whole_below =
+        let mut whole_below =
             crate::storage::reader::hfile_whole_read_max_size(&self.storage.hudi_configs)
                 .map_err(|e| StorageError::Creation(format!("{e}")))?;
+        if options.key_predicate.is_some() {
+            whole_below =
+                whole_below.min(crate::storage::reader::HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE);
+        }
         HFileReader::open_sized(
             &self.storage,
             relative_path,
@@ -446,171 +454,6 @@ mod tests {
 
     /// An HFile base file read through the v2 file group reader returns the same
     /// keys the metadata-table reader returns for the same base-file-only slice.
-    /// The size threshold picks the read strategy, and the two strategies are told
-    /// apart by the requests they issue.
-    ///
-    /// Rows cannot separate them: whole and ranged return the same records over the
-    /// same file, which is the point. So the assertion is on request counts, taken
-    /// from a store that wraps the real one and counts what passes through.
-    #[tokio::test]
-    async fn the_size_threshold_picks_whole_or_ranged() -> crate::Result<()> {
-        use crate::storage::counting::CountingObjectStore;
-
-        fn configs_with(threshold_mb: &str) -> Arc<HudiConfigs> {
-            let mut options = mdt_configs().as_options();
-            options.insert(
-                crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
-                threshold_mb.to_string(),
-            );
-            Arc::new(HudiConfigs::new(options))
-        }
-
-        async fn read(
-            threshold_mb: &str,
-            known_file_size: Option<u64>,
-        ) -> crate::Result<(usize, usize, usize)> {
-            let (store, counts) =
-                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
-            let storage = Storage::new_with_object_store(
-                Url::parse(&metadata_table_uri()).unwrap(),
-                store,
-                configs_with(threshold_mb),
-            );
-            let reader = HFileBaseFileReader::new(storage);
-            let mut options = BaseFileReadOptions::default();
-            if let Some(size) = known_file_size {
-                options = options.with_known_file_size(size);
-            }
-            let batch = reader.read_data(MDT_FILES_BASE_FILE, options).await?;
-            Ok((batch.num_rows(), counts.gets(), counts.heads()))
-        }
-
-        // The file's own size, so the below-threshold read can be asked for without
-        // a size lookup.
-        let file_size = std::fs::metadata(
-            PathBuf::from(Url::parse(&metadata_table_uri()).unwrap().path())
-                .join(MDT_FILES_BASE_FILE),
-        )
-        .expect("the fixture base file")
-        .len();
-
-        // Below the default threshold, with the size already in hand: one read of
-        // the whole file and nothing else, not even a metadata lookup.
-        let (whole_rows, whole_gets, whole_heads) = read("50", Some(file_size)).await?;
-        assert_eq!(
-            (whole_gets, whole_heads),
-            (1, 0),
-            "a whole read of a known-size file is one request"
-        );
-
-        // Same threshold, size not supplied: one lookup to learn the size, then the
-        // same single read.
-        let (sized_rows, sized_gets, sized_heads) = read("50", None).await?;
-        assert_eq!(
-            (sized_gets, sized_heads),
-            (1, 1),
-            "learning the size costs one lookup and no extra read"
-        );
-
-        // Zero means never whole. The ranged open reads the trailer and the
-        // load-on-open section before any data block, so it cannot come in at one.
-        let (ranged_rows, ranged_gets, _) = read("0", Some(file_size)).await?;
-        assert!(
-            ranged_gets > whole_gets,
-            "a ranged read issues more requests than a whole one, got {ranged_gets} \
-             against {whole_gets}"
-        );
-
-        assert!(
-            whole_rows > 0,
-            "the fixture must return rows, or the counts above prove nothing"
-        );
-        assert_eq!(whole_rows, sized_rows);
-        assert_eq!(
-            whole_rows, ranged_rows,
-            "both strategies must return the same records; only their request \
-             counts differ"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn v2_reads_an_hfile_base_file_matching_the_metadata_table_reader() -> crate::Result<()> {
-        let expected = reference_keys().await?;
-        assert!(
-            !expected.is_empty(),
-            "the oracle must return keys, or the comparison is vacuous"
-        );
-
-        let configs = mdt_configs();
-        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
-        let mut context = resolve_reader_context(&configs, /* has_log_files */ false)?;
-        // The production path rebuilds this immediately (`adapter.rs`), and without
-        // it the merge keys on `_hoodie_record_key` whatever the table says. A test
-        // that skips it is not exercising the context the reader is really given.
-        context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
-
-        let mut reader = HoodieFileGroupReader::new(
-            Arc::new(context),
-            storage,
-            InputSplit::new(
-                Some(MDT_FILES_BASE_FILE.to_string()),
-                Some("00000000000000000".to_string()),
-                vec![],
-                MDT_FILES_PARTITION.to_string(),
-            ),
-            ReaderParameters::default(),
-            None,
-            None,
-        )?;
-        let batch = reader.read().await?;
-
-        let keys: HashSet<String> = batch
-            .column_by_name("key")
-            .expect("the metadata table's record key column, decoded from the HFile's values")
-            .as_string::<i32>()
-            .iter()
-            .flatten()
-            .map(str::to_string)
-            .collect();
-
-        assert_eq!(
-            keys, expected,
-            "v2's key set must equal the metadata-table reader's for the same slice"
-        );
-        Ok(())
-    }
-
-    fn entry(offset: u64, size: u32) -> BlockIndexEntry {
-        BlockIndexEntry::new(Key::from_bytes(vec![0]), None, offset, size)
-    }
-
-    #[test]
-    fn windows_stop_at_the_budget_and_never_split_a_block() {
-        let entries = vec![entry(0, 40), entry(40, 40), entry(80, 40)];
-
-        let windows = HFileReader::plan_windows(&entries, 100);
-        assert_eq!(
-            windows.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![2, 1],
-            "40 + 40 fits under 100, the third block starts a new window"
-        );
-
-        let windows = HFileReader::plan_windows(&entries, 1_000);
-        assert_eq!(
-            windows.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![3],
-            "a budget above the total is one window"
-        );
-
-        // A block bigger than the budget still goes out whole: it cannot decode
-        // in pieces.
-        let windows = HFileReader::plan_windows(&[entry(0, 500)], 100);
-        assert_eq!(windows, vec![vec![entry(0, 500)]]);
-
-        assert!(HFileReader::plan_windows(&[], 100).is_empty());
-    }
-
     /// The `files` partition's pre-compaction slice: the initial base HFile plus
     /// every log file written before the compaction at 20251220210130942.
     const MDT_FILES_PRECOMPACT_BASE: &str = "files-0000-0_0-955-2690_00000000000000000.hfile";
@@ -1006,6 +849,230 @@ mod tests {
             vec![wanted],
             "a key predicate must return exactly the keys it named, since a \
              selected block holds others"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_reads_an_hfile_base_file_matching_the_metadata_table_reader() -> crate::Result<()> {
+        let expected = reference_keys().await?;
+        assert!(
+            !expected.is_empty(),
+            "the oracle must return keys, or the comparison is vacuous"
+        );
+
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let mut context = resolve_reader_context(&configs, /* has_log_files */ false)?;
+        // The production path rebuilds this immediately (`adapter.rs`), and without
+        // it the merge keys on `_hoodie_record_key` whatever the table says. A test
+        // that skips it is not exercising the context the reader is really given.
+        context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
+
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(context),
+            storage,
+            InputSplit::new(
+                Some(MDT_FILES_BASE_FILE.to_string()),
+                Some("00000000000000000".to_string()),
+                vec![],
+                MDT_FILES_PARTITION.to_string(),
+            ),
+            ReaderParameters::default(),
+            None,
+            None,
+        )?;
+        let batch = reader.read().await?;
+
+        let keys: HashSet<String> = batch
+            .column_by_name("key")
+            .expect("the metadata table's record key column, decoded from the HFile's values")
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(
+            keys, expected,
+            "v2's key set must equal the metadata-table reader's for the same slice"
+        );
+        Ok(())
+    }
+
+    fn entry(offset: u64, size: u32) -> BlockIndexEntry {
+        BlockIndexEntry::new(Key::from_bytes(vec![0]), None, offset, size)
+    }
+
+    #[test]
+    fn windows_stop_at_the_budget_and_never_split_a_block() {
+        let entries = vec![entry(0, 40), entry(40, 40), entry(80, 40)];
+
+        let windows = HFileReader::plan_windows(&entries, 100);
+        assert_eq!(
+            windows.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 1],
+            "40 + 40 fits under 100, the third block starts a new window"
+        );
+
+        let windows = HFileReader::plan_windows(&entries, 1_000);
+        assert_eq!(
+            windows.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3],
+            "a budget above the total is one window"
+        );
+
+        // A block bigger than the budget still goes out whole: it cannot decode
+        // in pieces.
+        let windows = HFileReader::plan_windows(&[entry(0, 500)], 100);
+        assert_eq!(windows, vec![vec![entry(0, 500)]]);
+
+        assert!(HFileReader::plan_windows(&[], 100).is_empty());
+    }
+
+    /// The size threshold picks the read strategy, and the two strategies are told
+    /// apart by the requests they issue.
+    ///
+    /// Rows cannot separate them: whole and ranged return the same records over the
+    /// same file, which is the point. So the assertion is on request counts, taken
+    /// from a store that wraps the real one and counts what passes through.
+    #[tokio::test]
+    async fn the_size_threshold_picks_whole_or_ranged() -> crate::Result<()> {
+        use crate::storage::counting::CountingObjectStore;
+
+        fn configs_with(threshold_mb: &str) -> Arc<HudiConfigs> {
+            let mut options = mdt_configs().as_options();
+            options.insert(
+                crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
+                threshold_mb.to_string(),
+            );
+            Arc::new(HudiConfigs::new(options))
+        }
+
+        async fn read(
+            threshold_mb: &str,
+            known_file_size: Option<u64>,
+        ) -> crate::Result<(Vec<String>, usize, usize)> {
+            read_with(threshold_mb, known_file_size, None).await
+        }
+
+        async fn read_with(
+            threshold_mb: &str,
+            known_file_size: Option<u64>,
+            key_predicate: Option<KeyPredicate>,
+        ) -> crate::Result<(Vec<String>, usize, usize)> {
+            let (store, counts) =
+                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+            let storage = Storage::new_with_object_store(
+                Url::parse(&metadata_table_uri()).unwrap(),
+                store,
+                configs_with(threshold_mb),
+            );
+            let reader = HFileBaseFileReader::new(storage);
+            let mut options = BaseFileReadOptions::default();
+            if let Some(size) = known_file_size {
+                options = options.with_known_file_size(size);
+            }
+            if let Some(predicate) = key_predicate {
+                options = options.with_key_predicate(predicate);
+            }
+            let batch = reader
+                .read_data(MDT_FILES_COMPACTED_BASE_FILE, options)
+                .await?;
+            let keys: Vec<String> = batch
+                .column_by_name("key")
+                .expect("the metadata record key column")
+                .as_string::<i32>()
+                .iter()
+                .flatten()
+                .map(str::to_string)
+                .collect();
+            Ok((keys, counts.gets(), counts.heads()))
+        }
+
+        // The file's own size, so the below-threshold read can be asked for
+        // without a size lookup.
+        let file_size = std::fs::metadata(
+            PathBuf::from(Url::parse(&metadata_table_uri()).unwrap().path())
+                .join(MDT_FILES_COMPACTED_BASE_FILE),
+        )
+        .expect("the fixture base file")
+        .len();
+
+        // Below the default threshold, with the size already in hand: one read of
+        // the whole file and nothing else, not even a metadata lookup.
+        let (whole_keys, whole_gets, whole_heads) = read("50", Some(file_size)).await?;
+        assert_eq!(
+            (whole_gets, whole_heads),
+            (1, 0),
+            "a whole read of a known-size file is one request"
+        );
+
+        // Same threshold, size not supplied: one lookup to learn the size, then the
+        // same single read.
+        let (sized_keys, sized_gets, sized_heads) = read("50", None).await?;
+        assert_eq!(
+            (sized_gets, sized_heads),
+            (1, 1),
+            "learning the size costs one lookup and no extra read"
+        );
+
+        // Zero means never whole. The ranged open reads the trailer and the
+        // load-on-open section before any data block, so it cannot come in at one.
+        let (ranged_keys, ranged_gets, _) = read("0", Some(file_size)).await?;
+        assert!(
+            ranged_gets > whole_gets,
+            "a ranged read issues more requests than a whole one, got {ranged_gets} \
+             against {whole_gets}"
+        );
+
+        // A keyed read takes the same whole side here, because the fixture is far
+        // below the keyed bound too. What is asserted is that naming keys does not
+        // by itself force the ranged side.
+        let (keyed_keys, keyed_gets, keyed_heads) = read_with(
+            "50",
+            Some(file_size),
+            Some(KeyPredicate::Keys(vec![
+                whole_keys.last().expect("the fixture returns keys").clone(),
+            ])),
+        )
+        .await?;
+        assert_eq!(
+            (keyed_gets, keyed_heads),
+            (1, 0),
+            "a keyed read of a file below the keyed bound is still one request"
+        );
+        assert_eq!(keyed_keys.len(), 1, "the predicate must still filter");
+
+        // Raising the file's apparent size past the keyed bound flips a keyed read
+        // to ranged while a scan of the same file stays whole. This is the whole
+        // point of the keyed bound, so it is asserted rather than assumed.
+        let over_keyed_bound = crate::storage::reader::HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE + 1;
+        let (_, keyed_big_gets, _) = read_with(
+            "50",
+            Some(over_keyed_bound),
+            Some(KeyPredicate::Keys(vec![whole_keys.last().unwrap().clone()])),
+        )
+        .await?;
+        let (_, scan_big_gets, _) = read("50", Some(over_keyed_bound)).await?;
+        assert!(
+            keyed_big_gets > 1,
+            "past the keyed bound a keyed read must go ranged, got {keyed_big_gets} requests"
+        );
+        assert_eq!(
+            scan_big_gets, 1,
+            "a scan of the same size must stay whole; only the keyed bound moved"
+        );
+
+        assert!(
+            !whole_keys.is_empty(),
+            "the fixture must return rows, or the counts above prove nothing"
+        );
+        assert_eq!(whole_keys, sized_keys);
+        assert_eq!(
+            whole_keys, ranged_keys,
+            "both strategies must return the same records; only their request \
+             counts differ"
         );
         Ok(())
     }

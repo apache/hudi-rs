@@ -3405,3 +3405,162 @@ mod key_pushdown_tests {
         assert_eq!(prefix_upper_bound(b""), None);
     }
 }
+
+#[cfg(test)]
+mod threshold_sweep {
+    use super::*;
+    use crate::config::HudiConfigs;
+    use crate::config::table::HudiTableConfig;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn storage_for(dir: &str, threshold_mb: &str) -> Arc<Storage> {
+        let url = url::Url::from_directory_path(std::fs::canonicalize(dir).unwrap()).unwrap();
+        let configs = HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                url.as_str().to_string(),
+            ),
+            (
+                crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
+                threshold_mb.to_string(),
+            ),
+        ]);
+        Storage::new(Arc::new(HashMap::new()), Arc::new(configs)).unwrap()
+    }
+
+    async fn point_lookup(storage: &Storage, name: &str, threshold_mb: u64, key: &str) -> usize {
+        let reader = HFileReader::open_sized(storage, name, threshold_mb, None)
+            .await
+            .unwrap();
+        let blocks = reader.blocks_for_keys(&[key]);
+        reader.read_records_batched(&blocks).await.unwrap().len()
+    }
+
+    async fn full_scan(storage: &Storage, name: &str, threshold_mb: u64) -> usize {
+        let reader = HFileReader::open_sized(storage, name, threshold_mb, None)
+            .await
+            .unwrap();
+        let entries = reader.data_block_entries();
+        let budget = reader.window_budget().unwrap_or(4 * 1024 * 1024);
+        let mut total = 0;
+        for window in HFileReader::plan_windows(&entries, budget) {
+            total += reader.read_records_batched(&window).await.unwrap().len();
+        }
+        total
+    }
+
+    /// Does the threshold pick the faster strategy at every file size?
+    ///
+    /// Set `HFILE_SWEEP_DIR` to a directory of generated `.hfile` files. Ignored
+    /// otherwise: the files are hundreds of megabytes and are not committed.
+    #[tokio::test]
+    #[ignore]
+    async fn the_threshold_picks_the_faster_strategy_across_sizes() {
+        let Ok(dir) = std::env::var("HFILE_SWEEP_DIR") else {
+            eprintln!("HFILE_SWEEP_DIR unset");
+            return;
+        };
+        // The shipped policy: a scan gets Hudi's threshold, a seek gets the much
+        // smaller keyed bound. `HFileBaseFileReader::open` applies the same min.
+        const SCAN_WHOLE_BELOW: u64 = 50 * 1024 * 1024;
+        const SEEK_WHOLE_BELOW: u64 = crate::storage::reader::HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE;
+        const ALWAYS_RANGED: u64 = 0;
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().to_str()?.to_string();
+                name.ends_with(".hfile").then_some(name)
+            })
+            .collect();
+        names.sort_by_key(|n| {
+            std::fs::metadata(std::path::Path::new(&dir).join(n))
+                .unwrap()
+                .len()
+        });
+
+        let default_storage = storage_for(&dir, "50");
+        let ranged_storage = storage_for(&dir, "0");
+
+        println!(
+            "{:<16} {:>12} {:>13} | {:>10} {:>10} {:>7} | {:>10} {:>10} {:>7}",
+            "file", "bytes", "seek/scan", "seek d", "seek r", "ratio", "scan d", "scan r", "ratio"
+        );
+        for name in &names {
+            let bytes = std::fs::metadata(std::path::Path::new(&dir).join(name))
+                .unwrap()
+                .len();
+            let rounds = if bytes > 32 * 1024 * 1024 { 5 } else { 15 };
+
+            // A key from the middle of the file, so a seek is a real seek.
+            let probe = HFileReader::open_ranged(&ranged_storage, name)
+                .await
+                .unwrap();
+            let entries = probe.data_block_entries();
+            let mid = &entries[entries.len() / 2];
+            let key = String::from_utf8(
+                probe
+                    .read_records_batched(std::slice::from_ref(mid))
+                    .await
+                    .unwrap()[0]
+                    .key
+                    .clone(),
+            )
+            .unwrap();
+            drop(probe);
+
+            // Correctness first: a fast wrong answer is not a win.
+            let seek_d = point_lookup(&default_storage, name, SEEK_WHOLE_BELOW, &key).await;
+            let seek_r = point_lookup(&ranged_storage, name, ALWAYS_RANGED, &key).await;
+            assert_eq!(seek_d, seek_r, "{name}: the two arms disagree on a seek");
+            let scan_d = full_scan(&default_storage, name, SCAN_WHOLE_BELOW).await;
+            let scan_r = full_scan(&ranged_storage, name, ALWAYS_RANGED).await;
+            assert_eq!(scan_d, scan_r, "{name}: the two arms disagree on a scan");
+
+            let mut sd = Vec::new();
+            let mut sr = Vec::new();
+            let mut cd = Vec::new();
+            let mut cr = Vec::new();
+            for _ in 0..rounds {
+                let t = Instant::now();
+                point_lookup(&default_storage, name, SEEK_WHOLE_BELOW, &key).await;
+                sd.push(t.elapsed().as_micros());
+                let t = Instant::now();
+                point_lookup(&ranged_storage, name, ALWAYS_RANGED, &key).await;
+                sr.push(t.elapsed().as_micros());
+                let t = Instant::now();
+                full_scan(&default_storage, name, SCAN_WHOLE_BELOW).await;
+                cd.push(t.elapsed().as_micros());
+                let t = Instant::now();
+                full_scan(&ranged_storage, name, ALWAYS_RANGED).await;
+                cr.push(t.elapsed().as_micros());
+            }
+            for v in [&mut sd, &mut sr, &mut cd, &mut cr] {
+                v.sort();
+            }
+            let m = |v: &Vec<u128>| v[rounds / 2] as f64 / 1000.0;
+            let side = match (bytes <= SEEK_WHOLE_BELOW, bytes <= SCAN_WHOLE_BELOW) {
+                (true, _) => "whole/whole",
+                (false, true) => "ranged/whole",
+                (false, false) => "ranged/ranged",
+            };
+            println!(
+                "{:<16} {:>12} {:>13} | {:>10.2} {:>10.2} {:>7.2} | {:>10.2} {:>10.2} {:>7.2}",
+                name,
+                bytes,
+                side,
+                m(&sd),
+                m(&sr),
+                m(&sd) / m(&sr),
+                m(&cd),
+                m(&cr),
+                m(&cd) / m(&cr)
+            );
+        }
+        println!(
+            "d = default (whole below 50MB), r = always ranged; ratio < 1 means the default wins"
+        );
+    }
+}
