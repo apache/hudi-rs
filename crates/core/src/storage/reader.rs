@@ -22,6 +22,7 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore};
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How much of a file a streaming reader keeps resident at once, when the table
 /// does not say.
@@ -136,6 +137,55 @@ async fn get_range(
 pub struct LogBlockFetcher {
     object_store: Arc<dyn ObjectStore>,
     location: ObjPath,
+    /// What this fetcher has actually read, shared across clones so a caller
+    /// holding one clone can account for reads made through another.
+    reads: Arc<FetchCounts>,
+}
+
+/// What a fetcher read, as opposed to what it was asked for.
+///
+/// Both numbers are what this side of the API can observe, and neither is a
+/// count of what a remote store transferred. Read them with that in mind.
+///
+/// **`bytes` is the total length of the buffers the store returned**, so it is
+/// the number to judge a narrowed read on — but only exactly on a backend that
+/// reads each range as asked. `LocalFileSystem` does
+/// (`object_store::local`, which overrides `get_ranges` to read range by range),
+/// which is why tests measure real reductions against it. The **default**
+/// `get_ranges` runs `coalesce_ranges` with a 1 MiB threshold, merging ranges
+/// closer than that into one GET and slicing the result, so on the cloud
+/// backends `bytes` is the total *asked for* and the transfer can be larger. The
+/// practical consequence is worth stating: selecting blocks only reduces cloud
+/// transfer when the selected blocks sit more than that threshold apart.
+///
+/// **`calls` is not a request count.** It counts calls made into the
+/// object-store API; coalescing and any internal fan-out are invisible from
+/// here. A full scan of a thousand adjacent blocks reports one call, and a
+/// scattered three-block seek also reports one, so `calls` must not be read as
+/// "the seek did not reduce round trips".
+#[derive(Debug, Default)]
+pub struct FetchCounts {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl FetchCounts {
+    /// Calls made into the object-store API. See the type's note: this is not a
+    /// count of GETs.
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    /// Total length of the buffers the object store returned. See the type's
+    /// note before treating this as bytes transferred.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, calls: u64, bytes: u64) {
+        self.calls.fetch_add(calls, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 impl LogBlockFetcher {
@@ -143,12 +193,20 @@ impl LogBlockFetcher {
         Self {
             object_store,
             location,
+            reads: Arc::new(FetchCounts::default()),
         }
+    }
+
+    /// What this fetcher has read so far.
+    pub fn reads(&self) -> &FetchCounts {
+        &self.reads
     }
 
     /// Read `[offset, offset + length)` in one ranged request.
     pub async fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
-        get_range(&self.object_store, &self.location, offset, length).await
+        let bytes = get_range(&self.object_store, &self.location, offset, length).await?;
+        self.reads.record(1, bytes.len() as u64);
+        Ok(bytes)
     }
 
     /// The file these ranges are read from, so a caller batching across blocks
@@ -164,7 +222,8 @@ impl LogBlockFetcher {
     /// one each. Reading them one at a time is the same bytes and many more
     /// round trips, which is what dominates on object storage.
     pub async fn read_contents(&self, ranges: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
-        self.object_store
+        let fetched = self
+            .object_store
             .get_ranges(&self.location, ranges)
             .await
             .map_err(|e| {
@@ -173,7 +232,12 @@ impl LogBlockFetcher {
                     ranges.len(),
                     self.location
                 ))
-            })
+            })?;
+        // One call, whatever coalescing and fan-out did underneath, and the
+        // bytes it handed back. Counting `ranges.len()` would count the plan.
+        self.reads
+            .record(1, fetched.iter().map(|b| b.len() as u64).sum());
+        Ok(fetched)
     }
 }
 

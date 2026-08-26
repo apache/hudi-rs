@@ -26,7 +26,7 @@ use arrow_schema::{Schema, SchemaRef};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 
-use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
+use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream, KeyPredicate};
 use crate::file_group::log_file::avro::AvroBlockDecoder;
 use crate::hfile::HFileReader;
 use crate::hfile::record_key::fill_empty_entry_keys;
@@ -133,7 +133,14 @@ impl BaseFileReader for HFileBaseFileReader {
 
             // `Some(vec![])` asks for the row count only. The trailer carries it,
             // so no data block is read and no schema is needed.
-            if options.projection.as_ref().is_some_and(|p| p.is_empty()) {
+            //
+            // Not when a key predicate is set: the trailer counts the whole file,
+            // so answering from it would report every record as though it matched.
+            // A caller asking how many of five keys a file holds must get five or
+            // fewer, so that combination reads blocks like any other.
+            if options.key_predicate.is_none()
+                && options.projection.as_ref().is_some_and(|p| p.is_empty())
+            {
                 let schema: SchemaRef = Arc::new(Schema::empty());
                 let row_count = usize::try_from(reader.num_entries()).unwrap_or(usize::MAX);
                 let batch = RecordBatch::try_new_with_options(
@@ -156,7 +163,16 @@ impl BaseFileReader for HFileBaseFileReader {
             let budget = reader
                 .window_budget()
                 .unwrap_or(DEFAULT_WINDOW_BUDGET_FALLBACK);
-            let windows = HFileReader::plan_windows(&reader.data_block_entries(), budget);
+            // Seek when the caller named keys, scan when it did not. Selection
+            // over-includes, so `decode_window` filters below; this only changes
+            // which blocks are fetched.
+            let entries = match options.key_predicate.as_ref() {
+                Some(predicate) => reader.blocks_for_predicate(predicate),
+                None => reader.data_block_entries(),
+            };
+            // Windows still bound peak memory over whatever was selected.
+            let windows = HFileReader::plan_windows(&entries, budget);
+            let key_predicate = options.key_predicate.clone();
 
             let stream = futures::stream::unfold(
                 (
@@ -165,9 +181,18 @@ impl BaseFileReader for HFileBaseFileReader {
                     writer_json,
                     full_schema,
                     projection,
+                    key_predicate,
                     false,
                 ),
-                |(reader, mut windows, writer_json, full_schema, projection, failed)| async move {
+                |(
+                    reader,
+                    mut windows,
+                    writer_json,
+                    full_schema,
+                    projection,
+                    key_predicate,
+                    failed,
+                )| async move {
                     // Sticky: once a window fails the read is not whole, so no
                     // later window is handed out as though it were.
                     if failed {
@@ -180,6 +205,7 @@ impl BaseFileReader for HFileBaseFileReader {
                         &writer_json,
                         &full_schema,
                         projection.as_deref(),
+                        key_predicate.as_ref(),
                     )
                     .await;
                     let failed = item.is_err();
@@ -191,6 +217,7 @@ impl BaseFileReader for HFileBaseFileReader {
                             writer_json,
                             full_schema,
                             projection,
+                            key_predicate,
                             failed,
                         ),
                     ))
@@ -249,11 +276,29 @@ async fn decode_window(
     writer_json: &str,
     decoded_schema: &SchemaRef,
     projection: Option<&[String]>,
+    key_predicate: Option<&KeyPredicate>,
 ) -> Result<RecordBatch> {
-    let records = reader
+    let mut records = reader
         .read_records_batched(window)
         .await
         .map_err(|e| StorageError::Creation(format!("Failed to read HFile data blocks: {e:?}")))?;
+
+    // A block is the smallest thing that can be read, so a selected block holds
+    // keys nobody asked for. Dropping them here rather than after decoding keeps
+    // the entry-key fill below aligned with the rows it fills, since that fill is
+    // positional over `records`.
+    if let Some(predicate) = key_predicate {
+        // Built once per window, not per record: a record-index lookup names
+        // thousands of keys and this runs on every record the window holds.
+        let matcher = predicate.matcher();
+        records.retain(|record| match std::str::from_utf8(&record.key) {
+            Ok(key) => matcher.admits(key),
+            // A key that is not UTF-8 cannot match a predicate expressed as
+            // strings. Keeping it would put a row through that the caller asked
+            // not to see.
+            Err(_) => false,
+        });
+    }
 
     let mut decoder = AvroBlockDecoder::try_new_with_reader(writer_json, None, DECODE_BATCH_SIZE)
         .map_err(|e| StorageError::Creation(format!("{e}")))?;
@@ -323,6 +368,13 @@ mod tests {
     /// The metadata table's `files` partition, base file only. The seven log
     /// files beside it belong to the log-block merge path, not this one.
     const MDT_FILES_BASE_FILE: &str = "files/files-0000-0_0-955-2690_00000000000000000.hfile";
+    /// The `files` partition's base file *after* the compaction at
+    /// 20251220210130942, which carries the whole listing: `__all_partitions__`
+    /// and one record per partition. The pre-compaction base file above holds a
+    /// single record, so it cannot show a predicate filtering anything.
+    const MDT_FILES_COMPACTED_BASE_FILE: &str =
+        "files/files-0000-0_23-1133-3302_20251220210130942.hfile";
+
     const MDT_FILES_FILE_GROUP: &str = "files-0000-0";
     const MDT_FILES_PARTITION: &str = "files";
 
@@ -894,6 +946,179 @@ mod tests {
             merged.num_rows(),
             0,
             "a delete must cancel the base record rather than leaving it readable"
+        );
+        Ok(())
+    }
+
+    /// A key predicate given to the reader narrows what is read and returns only
+    /// the keys asked for.
+    ///
+    /// Driven through `read_data`, the trait method callers use, rather than
+    /// through `blocks_for_keys` directly — the selection has its own tests in
+    /// `hfile::reader`; this one is about the predicate surviving the trip through
+    /// `BaseFileReadOptions` and being both applied and filtered by.
+    #[tokio::test]
+    async fn a_key_predicate_narrows_the_read_and_filters_the_rows() -> crate::Result<()> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs)?;
+        let reader = HFileBaseFileReader::new(storage);
+
+        let all = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions::default(),
+            )
+            .await?;
+        let keys: Vec<String> = all
+            .column_by_name("key")
+            .expect("the metadata record key column")
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            keys.len() > 1,
+            "the fixture must hold several keys, or filtering cannot be observed"
+        );
+
+        let wanted = keys.last().unwrap().clone();
+        let filtered = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions {
+                    key_predicate: Some(KeyPredicate::Keys(vec![wanted.clone()])),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let got: Vec<String> = filtered
+            .column_by_name("key")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            got,
+            vec![wanted],
+            "a key predicate must return exactly the keys it named, since a \
+             selected block holds others"
+        );
+        Ok(())
+    }
+
+    /// A prefix predicate returns every key carrying the prefix and nothing else.
+    #[tokio::test]
+    async fn a_prefix_predicate_returns_the_matching_keys() -> crate::Result<()> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs)?;
+        let reader = HFileBaseFileReader::new(storage);
+
+        let all = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions::default(),
+            )
+            .await?;
+        let keys: Vec<String> = all
+            .column_by_name("key")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+
+        // The metadata table's partition keys share a "city=" head, so that
+        // prefix matches a strict subset: the partitions but not
+        // `__all_partitions__`.
+        let expected: Vec<String> = keys
+            .iter()
+            .filter(|k| k.starts_with("city="))
+            .cloned()
+            .collect();
+        assert!(
+            !expected.is_empty() && expected.len() < keys.len(),
+            "the prefix must match a strict subset, got {} of {}",
+            expected.len(),
+            keys.len()
+        );
+
+        let filtered = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions {
+                    key_predicate: Some(KeyPredicate::Prefixes(vec!["city=".to_string()])),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let got: Vec<String> = filtered
+            .column_by_name("key")
+            .unwrap()
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    /// A count-only projection with a key predicate counts the matching records,
+    /// not the file's.
+    ///
+    /// The row count comes from the trailer, which counts everything, so the fast
+    /// path had to learn to stand aside. A caller asking how many of one key a
+    /// file holds must not be told how many records the file holds.
+    #[tokio::test]
+    async fn a_count_only_projection_respects_the_predicate() -> crate::Result<()> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs)?;
+        let reader = HFileBaseFileReader::new(storage);
+
+        let count_all = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions {
+                    projection: Some(vec![]),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .num_rows();
+        assert!(count_all > 1, "the fixture must hold several records");
+
+        let all = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions::default(),
+            )
+            .await?;
+        let one = all
+            .column_by_name("key")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0)
+            .to_string();
+
+        let count_one = reader
+            .read_data(
+                MDT_FILES_COMPACTED_BASE_FILE,
+                BaseFileReadOptions {
+                    projection: Some(vec![]),
+                    key_predicate: Some(KeyPredicate::Keys(vec![one.clone()])),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .num_rows();
+        assert_eq!(
+            count_one, 1,
+            "a count with a one-key predicate must be 1, not the file's {count_all}"
         );
         Ok(())
     }

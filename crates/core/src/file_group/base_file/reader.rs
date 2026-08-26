@@ -33,6 +33,64 @@ use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::{RowFilterBuilder, Storage};
 
+/// Which record keys a read is interested in.
+///
+/// Mirrors the two shapes Hudi pushes into a metadata read: `Predicates.in` over
+/// a full key set, and `startsWithAny` over prefixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyPredicate {
+    /// Exactly these record keys.
+    Keys(Vec<String>),
+    /// Keys beginning with any of these prefixes.
+    Prefixes(Vec<String>),
+}
+
+impl KeyPredicate {
+    /// A form of this predicate for testing many keys against.
+    ///
+    /// [`Self::admits`] scans the key list, which is fine for a handful and not
+    /// for the thousands a record-index or bloom lookup names: the filter runs
+    /// once per record read, so a linear scan makes it records times keys. Build
+    /// this once per read and use it instead.
+    pub fn matcher(&self) -> KeyMatcher<'_> {
+        match self {
+            Self::Keys(keys) => KeyMatcher::Keys(keys.iter().map(String::as_str).collect()),
+            Self::Prefixes(prefixes) => KeyMatcher::Prefixes(prefixes),
+        }
+    }
+
+    /// Whether `key` satisfies this predicate.
+    ///
+    /// Selection reads whole blocks and so returns keys outside the predicate;
+    /// this is what the caller filters with. For a large key set, build a
+    /// [`Self::matcher`] once rather than calling this per record.
+    pub fn admits(&self, key: &str) -> bool {
+        match self {
+            Self::Keys(keys) => keys.iter().any(|k| k == key),
+            Self::Prefixes(prefixes) => prefixes.iter().any(|p| key.starts_with(p.as_str())),
+        }
+    }
+}
+
+/// A [`KeyPredicate`] prepared for repeated tests, borrowing from it.
+pub enum KeyMatcher<'a> {
+    /// Exact keys, hashed, so a test is constant-time in the key count.
+    Keys(std::collections::HashSet<&'a str>),
+    /// Prefixes stay a list: there is no hash of "starts with", and a read
+    /// carries few prefixes where it can carry very many keys.
+    Prefixes(&'a [String]),
+}
+
+impl KeyMatcher<'_> {
+    /// Whether `key` satisfies the predicate this was built from.
+    pub fn admits(&self, key: &str) -> bool {
+        match self {
+            Self::Keys(keys) => keys.contains(key),
+            Self::Prefixes(prefixes) => prefixes.iter().any(|p| key.starts_with(p.as_str())),
+        }
+    }
+}
+
 /// Options for reading a base file.
 #[derive(Clone, Default)]
 pub struct BaseFileReadOptions {
@@ -50,6 +108,15 @@ pub struct BaseFileReadOptions {
     /// against the file's own schema, which the caller does not have until the
     /// footer is open.
     pub row_filter: Option<RowFilterBuilder>,
+    /// Record keys or key prefixes to read, so a key-ordered format can seek to
+    /// the blocks that can hold them instead of reading the file.
+    ///
+    /// Only the HFile reader honors this; other formats ignore it and return
+    /// every row, which is the fallback Java takes when a reader reports no key
+    /// predicate support. A reader that honors it may still return rows outside
+    /// the predicate, because a block is the smallest thing it can read — the
+    /// caller filters, and this only changes what is read.
+    pub key_predicate: Option<KeyPredicate>,
     /// Name for a synthetic `Int64` column carrying each row's physical position
     /// in the file, appended after the file's own columns.
     ///
@@ -73,6 +140,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
             .field("batch_size", &self.batch_size)
             .field("projection", &self.projection)
             .field("known_file_size", &self.known_file_size)
+            .field("key_predicate", &self.key_predicate)
             .field("row_filter", &self.row_filter.is_some())
             .field("row_index_column", &self.row_index_column)
             .finish()
@@ -87,6 +155,13 @@ impl BaseFileReadOptions {
     /// Sets a predicate to push into the read. See [`Self::row_filter`].
     pub fn with_row_filter(mut self, row_filter: RowFilterBuilder) -> Self {
         self.row_filter = Some(row_filter);
+        self
+    }
+
+    /// Read only the records a key predicate admits, where the format can seek
+    /// by key. See [`Self::key_predicate`].
+    pub fn with_key_predicate(mut self, predicate: KeyPredicate) -> Self {
+        self.key_predicate = Some(predicate);
         self
     }
 
