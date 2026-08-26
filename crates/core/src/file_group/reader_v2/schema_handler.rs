@@ -26,6 +26,7 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::reader_v2::delete_context::DeleteContext;
+use crate::file_group::reader_v2::metadata_merger::{CustomMerger, resolve_custom_merger};
 use crate::file_group::reader_v2::output_converter::{OutputConverter, ProjectionConverter};
 use crate::schema::avro_schema_utils::are_schemas_projection_equivalent;
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -70,6 +71,12 @@ pub struct FileGroupReaderSchemaHandler {
     ///
     /// Mirrors Java's `FileGroupReaderSchemaHandler.schemaForUpdates`.
     schema_for_updates: Option<SchemaRef>,
+
+    /// Which custom merger the table's payload class selects, resolved during
+    /// `prepare_required_schema()`. `None` means CUSTOM stays refused, which is
+    /// also what a handler built by hand gets, so a test that never calls
+    /// `prepare_required_schema` sees the old refusal unchanged.
+    pub(crate) custom_merger: Option<CustomMerger>,
 
     /// Canonical delete context, created during `prepare_required_schema()`.
     /// Single source of truth — downstream consumers (record buffer, etc.)
@@ -218,14 +225,17 @@ impl FileGroupReaderSchemaHandler {
             return Ok(Some(base_schema.clone()));
         }
 
-        // CUSTOM merge mode is not supported in hudi-rs. Reachable via table
+        // CUSTOM merge mode is served only when the table's payload class names a
+        // merger this crate implements, which `prepare_required_schema` resolved
+        // into `custom_merger`. Any other CUSTOM table is refused loudly rather
+        // than merged by an ordering rule it did not ask for. Reachable via table
         // config (the merge-mode string flows in from the reader context at
-        // construction time, before the loader's merge-mode gate), so this is a
-        // loud error rather than a panic. Mirrors Java lines 209-213.
-        if merge_mode.eq_ignore_ascii_case("CUSTOM") {
+        // construction time, before the loader's merge-mode gate). Mirrors Java
+        // lines 209-213, which delegate the same decision to the record merger.
+        if merge_mode.eq_ignore_ascii_case("CUSTOM") && self.custom_merger.is_none() {
             return Err(CoreError::Unsupported(
-                "CUSTOM merge mode is not supported in hudi-rs. \
-                 Use COMMIT_TIME_ORDERING (the only supported merge mode)."
+                "CUSTOM merge mode is supported only for a payload class this crate \
+                 implements a merger for."
                     .to_string(),
             ));
         }
@@ -324,6 +334,10 @@ impl FileGroupReaderSchemaHandler {
             DeleteContext::from_props(props)
         };
         self.delete_context = Some(delete_context.clone());
+
+        // Resolve which custom merger, if any, the table selects. The CUSTOM gate
+        // in `generate_required_schema` reads this.
+        self.custom_merger = resolve_custom_merger(props);
 
         // Compute required schema (Java line 105).
         self.required_schema = self.generate_required_schema(
@@ -819,34 +833,85 @@ mod tests {
         assert_eq!(required, requested_schema);
     }
 
-    /// CUSTOM merge mode is reachable via table config and must return a loud
-    /// `Err` (not panic). The merge-mode string flows in at reader construction
+    /// A CUSTOM table whose payload class this crate has no merger for must
+    /// return a loud `Err` (not panic), and must not be quietly remapped onto an
+    /// ordering mode. The merge-mode string flows in at reader construction
     /// before the loader's merge-mode gate, so this is the API boundary.
     #[test]
-    fn test_custom_merge_mode_returns_err() {
+    fn test_custom_merge_mode_with_unknown_payload_returns_err() {
         let table_schema = make_table_schema();
         let requested_schema = make_schema(&["begin_lat"]);
 
-        let handler = FileGroupReaderSchemaHandler::new()
+        let mut handler = FileGroupReaderSchemaHandler::new()
             .with_table_schema(table_schema.clone())
             .with_data_schema(table_schema.clone())
             .with_requested_schema(requested_schema);
 
-        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
-        let result = handler.generate_required_schema(
-            true,
-            &["_hoodie_record_key".to_string()],
-            &[],
-            &delete_context,
-            false,
-            "CUSTOM",
-        );
+        let props = HashMap::from([(
+            "hoodie.compaction.payload.class".to_string(),
+            "com.example.SomeOtherPayload".to_string(),
+        )]);
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &props,
+                false,
+                "CUSTOM",
+            )
+            .expect_err("an unrecognised custom payload must be a loud error");
 
-        let err = result.expect_err("CUSTOM merge mode must be a loud error");
+        let delete_context = DeleteContext::new(&props, &table_schema);
+        let err = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "CUSTOM",
+            )
+            .expect_err("CUSTOM merge mode must be a loud error");
         assert!(
-            format!("{err:?}").contains("CUSTOM merge mode is not supported"),
-            "error should name CUSTOM merge mode, got: {err:?}"
+            format!("{err:?}").contains("CUSTOM merge mode is supported only for a payload class"),
+            "error should name the payload class as the reason, got: {err:?}"
         );
+    }
+
+    /// The counterpart: a CUSTOM table naming the metadata payload is admitted,
+    /// so the refusal above is narrow rather than a blanket ban.
+    #[test]
+    fn test_custom_merge_mode_with_metadata_payload_is_admitted() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let props = HashMap::from([
+            (
+                "hoodie.compaction.payload.class".to_string(),
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+            (
+                "hoodie.record.merge.strategy.id".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+        ]);
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &props,
+                false,
+                "CUSTOM",
+            )
+            .expect("the metadata payload's merge mode must be admitted");
+        assert!(handler.required_schema.is_some());
     }
 
     // =========================================================================

@@ -349,6 +349,25 @@ mod tests {
                 HudiReadConfig::EndTimestamp.as_ref(),
                 MAX_INSTANT_TIME.to_string(),
             ),
+            // The metadata table's own record-key config. Without it the key
+            // resolves to `_hoodie_record_key`, which every MDT record leaves
+            // empty, and a merge collapses all keys into one.
+            (HudiTableConfig::RecordKeyFields.as_ref(), "key".to_string()),
+            // The metadata table's real merge semantics: CUSTOM, deferred to the
+            // metadata payload by the all-zeros strategy id.
+            ("hoodie.record.merge.mode", "CUSTOM".to_string()),
+            (
+                "hoodie.record.merge.strategy.id",
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+            (
+                "hoodie.compaction.payload.class",
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+            (
+                HudiTableConfig::PopulatesMetaFields.as_ref(),
+                "false".to_string(),
+            ),
         ]))
     }
 
@@ -538,5 +557,344 @@ mod tests {
         assert_eq!(windows, vec![vec![entry(0, 500)]]);
 
         assert!(HFileReader::plan_windows(&[], 100).is_empty());
+    }
+
+    /// The `files` partition's pre-compaction slice: the initial base HFile plus
+    /// every log file written before the compaction at 20251220210130942.
+    const MDT_FILES_PRECOMPACT_BASE: &str = "files-0000-0_0-955-2690_00000000000000000.hfile";
+    const MDT_FILES_PRECOMPACT_LOGS: &[&str] = &[
+        ".files-0000-0_20251220210108078.log.1_10-999-2838",
+        ".files-0000-0_20251220210123755.log.1_3-1032-2950",
+        ".files-0000-0_20251220210125441.log.1_5-1057-3024",
+        ".files-0000-0_20251220210127080.log.1_3-1082-3100",
+        ".files-0000-0_20251220210128625.log.1_5-1107-3174",
+        ".files-0000-0_20251220210129235.log.1_3-1118-3220",
+        ".files-0000-0_20251220210130911.log.1_3-1149-3338",
+    ];
+
+    fn precompact_slice() -> crate::Result<crate::file_group::FileSlice> {
+        let mut fg = FileGroup::new(
+            MDT_FILES_FILE_GROUP.to_string(),
+            MDT_FILES_PARTITION.to_string(),
+        );
+        fg.add_base_file_from_name(MDT_FILES_PRECOMPACT_BASE)?;
+        fg.add_log_files_from_names(MDT_FILES_PRECOMPACT_LOGS.iter().copied())?;
+        Ok(fg
+            .get_file_slice_as_of(MAX_INSTANT_TIME)
+            .expect("the file group has a slice")
+            .clone())
+    }
+
+    /// Every `filesystemMetadata` entry the metadata-table reader's own fold
+    /// produces, so the comparison is on file names and sizes rather than counts.
+    fn entries_by_key(
+        records: &HashMap<String, crate::metadata::table::records::FilesPartitionRecord>,
+    ) -> std::collections::BTreeMap<String, Vec<(String, i64, bool)>> {
+        records
+            .iter()
+            .map(|(key, record)| {
+                let mut entries: Vec<(String, i64, bool)> = record
+                    .files
+                    .iter()
+                    .map(|(name, info)| (name.clone(), info.size, info.is_deleted))
+                    .collect();
+                entries.sort();
+                (key.clone(), entries)
+            })
+            .collect()
+    }
+
+    /// The same, read off v2's merged Arrow batch.
+    fn entries_from_batch(
+        batch: &arrow_array::RecordBatch,
+    ) -> std::collections::BTreeMap<String, Vec<(String, i64, bool)>> {
+        use arrow_array::Array;
+        let keys = batch
+            .column_by_name("key")
+            .expect("the metadata record key column")
+            .as_string::<i32>();
+        let map = batch
+            .column_by_name("filesystemMetadata")
+            .expect("the files-partition map column")
+            .as_map();
+        (0..batch.num_rows())
+            .map(|row| {
+                let entries = map.value(row);
+                let names = entries.column(0).as_string::<i32>();
+                let values = entries.column(1).as_struct();
+                let sizes = values
+                    .column_by_name("size")
+                    .expect("size")
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                let deleted = values
+                    .column_by_name("isDeleted")
+                    .expect("isDeleted")
+                    .as_boolean();
+                let mut out: Vec<(String, i64, bool)> = (0..names.len())
+                    .map(|i| (names.value(i).to_string(), sizes.value(i), deleted.value(i)))
+                    .collect();
+                out.sort();
+                (keys.value(row).to_string(), out)
+            })
+            .collect()
+    }
+
+    /// A metadata-table `files` slice with log blocks, merged by v2 under the
+    /// table's own CUSTOM merge mode, lists exactly what the metadata-table
+    /// reader's fold lists.
+    ///
+    /// Under `COMMIT_TIME_ORDERING` the same read returns all four keys but one
+    /// file entry each, because the newest log block's map replaces the base
+    /// record's rather than folding into it: four entries where the fold has
+    /// fourteen. That is the regression this pins.
+    #[tokio::test]
+    async fn v2_folds_a_metadata_files_slice_like_the_metadata_table_reader() -> crate::Result<()> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+
+        let expected = entries_by_key(
+            &MetadataTableFileGroupReader::new(configs.clone(), storage.clone())
+                .read_files_partition(&precompact_slice()?, &[])
+                .await?,
+        );
+        assert!(
+            expected.values().map(Vec::len).sum::<usize>() > expected.len(),
+            "the oracle must fold several entries per key, or the comparison is vacuous"
+        );
+
+        let mut context = resolve_reader_context(&configs, /* has_log_files */ true)?;
+        context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
+        assert_eq!(
+            context.merge_mode, "CUSTOM",
+            "the metadata table's own merge mode must reach the reader"
+        );
+
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(context),
+            storage,
+            InputSplit::new(
+                Some(format!("{MDT_FILES_PARTITION}/{MDT_FILES_PRECOMPACT_BASE}")),
+                Some("00000000000000000".to_string()),
+                MDT_FILES_PRECOMPACT_LOGS
+                    .iter()
+                    .map(|f| format!("{MDT_FILES_PARTITION}/{f}"))
+                    .collect(),
+                MDT_FILES_PARTITION.to_string(),
+            ),
+            ReaderParameters::default(),
+            None,
+            None,
+        )?;
+        let batch = reader.read().await?;
+
+        assert_eq!(entries_from_batch(&batch), expected);
+        Ok(())
+    }
+
+    /// The `partition_stats` file group's log-only slice: eight log files, no base
+    /// file, written before the compaction at 20251220210130942.
+    const MDT_PARTITION_STATS_LOGS: &[&str] = &[
+        ".partition-stats-0000-0_00000000000000003.log.1_0-0-0",
+        ".partition-stats-0000-0_20251220210108078.log.1_9-999-2837",
+        ".partition-stats-0000-0_20251220210123755.log.1_2-1032-2949",
+        ".partition-stats-0000-0_20251220210125441.log.1_4-1057-3023",
+        ".partition-stats-0000-0_20251220210127080.log.1_2-1082-3099",
+        ".partition-stats-0000-0_20251220210128625.log.1_4-1107-3173",
+        ".partition-stats-0000-0_20251220210129235.log.1_2-1118-3219",
+        ".partition-stats-0000-0_20251220210130911.log.1_2-1149-3337",
+    ];
+    const MDT_PARTITION_STATS_PARTITION: &str = "partition_stats";
+
+    /// Read a `partition_stats` slice through v2, keyed by record key.
+    async fn read_partition_stats(
+        logs: &[String],
+    ) -> crate::Result<Option<arrow_array::RecordBatch>> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let mut context = resolve_reader_context(&configs, /* has_log_files */ true)?;
+        context.rebuild_record_context(MDT_PARTITION_STATS_PARTITION.to_string());
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(context),
+            storage,
+            InputSplit::new(
+                None,
+                Some("00000000000000003".to_string()),
+                logs.to_vec(),
+                MDT_PARTITION_STATS_PARTITION.to_string(),
+            ),
+            ReaderParameters::default(),
+            None,
+            None,
+        )?;
+        // The first log file carries no data blocks, so a single-file read of it
+        // has no schema to build an output from. That is the input's shape, not a
+        // failure of the merge.
+        Ok(reader.read().await.ok())
+    }
+
+    /// One row of a partition-statistics record, rendered so a comparison reads
+    /// as values rather than as Arrow internals.
+    fn stats_row(batch: &arrow_array::RecordBatch, row: usize) -> (String, String, String, i64) {
+        use arrow_array::Array;
+        let stats = batch
+            .column_by_name("ColumnStatsMetadata")
+            .expect("the column-statistics column")
+            .as_struct();
+        let render = |name: &str| -> String {
+            let union = stats
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::UnionArray>()
+                .expect("a bound is a union of typed wrappers");
+            let child = union.child(union.type_id(row));
+            let offset = union.value_offset(row);
+            match child.as_struct_opt() {
+                Some(wrapper) => arrow_cast::display::array_value_to_string(
+                    wrapper.column_by_name("value").unwrap(),
+                    offset,
+                )
+                .unwrap(),
+                None => "null".to_string(),
+            }
+        };
+        (
+            stats
+                .column_by_name("columnName")
+                .unwrap()
+                .as_string::<i32>()
+                .value(row)
+                .to_string(),
+            render("minValue"),
+            render("maxValue"),
+            stats
+                .column_by_name("valueCount")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(row),
+        )
+    }
+
+    /// A `partition_stats` slice merges through v2's CUSTOM path and lands on the
+    /// newest record for each key.
+    ///
+    /// Every record this table writes is tight-bound, so
+    /// `mergeColumnStatsRecords`'s second short-circuit applies to all of them and
+    /// the merged result must equal the newest log file's record for that key.
+    /// The oracle is therefore derived from the inputs: read each log file alone,
+    /// in commit order, and keep the last occurrence.
+    ///
+    /// This pins the short-circuit and that the fold survives real dense unions.
+    /// It does **not** cover the bound widening or the counter sums; no fixture in
+    /// this repo writes a non-tight-bound statistics record, so those are covered
+    /// by unit tests on `fold_column_stats` instead.
+    #[tokio::test]
+    async fn v2_merges_a_partition_stats_slice_to_the_newest_record() -> crate::Result<()> {
+        let logs: Vec<String> = MDT_PARTITION_STATS_LOGS
+            .iter()
+            .map(|f| format!("{MDT_PARTITION_STATS_PARTITION}/{f}"))
+            .collect();
+
+        // The oracle: last writer per key, across the log files in commit order.
+        let mut expected: std::collections::BTreeMap<String, (String, String, String, i64)> =
+            std::collections::BTreeMap::new();
+        let mut records_seen = 0usize;
+        for log in &logs {
+            let Some(batch) = read_partition_stats(std::slice::from_ref(log)).await? else {
+                continue;
+            };
+            let keys = batch.column_by_name("key").unwrap().as_string::<i32>();
+            for row in 0..batch.num_rows() {
+                records_seen += 1;
+                expected.insert(keys.value(row).to_string(), stats_row(&batch, row));
+            }
+        }
+        assert!(
+            records_seen > expected.len(),
+            "the slice must contain repeated keys, or nothing merges and this test \
+             proves nothing: {records_seen} records over {} keys",
+            expected.len()
+        );
+
+        let merged = read_partition_stats(&logs)
+            .await?
+            .expect("the full slice must read");
+        let keys = merged.column_by_name("key").unwrap().as_string::<i32>();
+        let actual: std::collections::BTreeMap<String, (String, String, String, i64)> = (0..merged
+            .num_rows())
+            .map(|row| (keys.value(row).to_string(), stats_row(&merged, row)))
+            .collect();
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    /// The `secondary_index` file group's earliest slice: a base HFile written at
+    /// instant 4, and one log file written later that deletes its record.
+    const MDT_SECONDARY_INDEX_PARTITION: &str = "secondary_index_rider_idx";
+    const MDT_SECONDARY_INDEX_BASE: &str =
+        "secondary-index-rider-idx-0000-0_0-1008-2875_00000000000000004.hfile";
+    const MDT_SECONDARY_INDEX_LOG: &str =
+        ".secondary-index-rider-idx-0000-0_20251220210128625.log.1_0-1107-3169";
+
+    /// A delete in a metadata log block cancels the base record, under the
+    /// metadata table's own CUSTOM merge mode.
+    ///
+    /// This is the only end-to-end coverage of the custom merger's delete path:
+    /// `delta_merge_delete` returns the tombstone whatever the partition type,
+    /// mirroring `preCombine`'s short-circuit on `isDeletedRecord`, and the base
+    /// record must not survive it.
+    ///
+    /// It covers a third partition type reaching the merger (secondary index,
+    /// type 7). It does **not** cover that type's data-vs-data rule: no fixture
+    /// here holds the same index key as live data in both a base file and a log,
+    /// so "the newer record wins" is covered by a unit test and by nothing else.
+    #[tokio::test]
+    async fn a_metadata_log_delete_cancels_the_base_record() -> crate::Result<()> {
+        let base = format!("{MDT_SECONDARY_INDEX_PARTITION}/{MDT_SECONDARY_INDEX_BASE}");
+        let log = format!("{MDT_SECONDARY_INDEX_PARTITION}/{MDT_SECONDARY_INDEX_LOG}");
+
+        async fn read(
+            base: String,
+            logs: Vec<String>,
+        ) -> crate::Result<(arrow_array::RecordBatch, u64)> {
+            let configs = mdt_configs();
+            let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+            let mut context = resolve_reader_context(&configs, !logs.is_empty())?;
+            context.rebuild_record_context(MDT_SECONDARY_INDEX_PARTITION.to_string());
+            let mut reader = HoodieFileGroupReader::new(
+                Arc::new(context),
+                storage,
+                InputSplit::new(
+                    Some(base),
+                    Some("00000000000000004".to_string()),
+                    logs,
+                    MDT_SECONDARY_INDEX_PARTITION.to_string(),
+                ),
+                ReaderParameters::default(),
+                None,
+                None,
+            )?;
+            let batch = reader.read().await?;
+            let deletes = reader.read_stats().num_deletes;
+            Ok((batch, deletes))
+        }
+
+        let (base_only, _) = read(base.clone(), vec![]).await?;
+        assert_eq!(
+            base_only.num_rows(),
+            1,
+            "the base file must hold the record the log then deletes, or this test \
+             would pass on an empty base"
+        );
+
+        let (merged, deletes) = read(base, vec![log]).await?;
+        assert_eq!(deletes, 1, "the log block must contribute one delete");
+        assert_eq!(
+            merged.num_rows(),
+            0,
+            "a delete must cancel the base record rather than leaving it readable"
+        );
+        Ok(())
     }
 }

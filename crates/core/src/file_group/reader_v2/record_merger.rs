@@ -240,21 +240,43 @@ impl BufferedRecordMerger for CommitTimeRecordMerger {
     }
 }
 
+use crate::file_group::reader_v2::metadata_merger::{
+    CustomMerger, MetadataPayloadMerger, resolve_custom_merger,
+};
+
 /// Factory for creating `BufferedRecordMerger` instances.
 ///
 /// Mirrors Java's `BufferedRecordMergerFactory`.
 pub struct BufferedRecordMergerFactory;
 
 impl BufferedRecordMergerFactory {
-    /// Create a merger based on the merge mode.
+    /// Create a merger for the table's merge mode.
     ///
     /// - `"COMMIT_TIME_ORDERING"` → `CommitTimeRecordMerger` (last writer wins)
     /// - `"EVENT_TIME_ORDERING"` → `EventTimeRecordMerger` (ordering value comparison)
-    /// - Others → Error (CUSTOM merge mode not yet supported)
-    pub fn create(merge_mode: &str) -> Result<Box<dyn BufferedRecordMerger>> {
+    /// - `"CUSTOM"` → the merger its payload class names, if this crate has one
+    /// - Others → Error
+    ///
+    /// A CUSTOM table whose payload has no merger here keeps erroring rather than
+    /// being merged by an ordering rule it did not ask for, which is why the table
+    /// config is a parameter: the merge mode alone cannot decide it.
+    pub fn create_with(
+        merge_mode: &str,
+        table_config: &std::collections::HashMap<String, String>,
+    ) -> Result<Box<dyn BufferedRecordMerger>> {
         match merge_mode {
             "COMMIT_TIME_ORDERING" => Ok(Box::new(CommitTimeRecordMerger)),
             "EVENT_TIME_ORDERING" => Ok(Box::new(EventTimeRecordMerger)),
+            _ if merge_mode.eq_ignore_ascii_case("CUSTOM") => {
+                match resolve_custom_merger(table_config) {
+                    Some(CustomMerger::MetadataPayload) => Ok(Box::new(MetadataPayloadMerger)),
+                    None => Err(crate::error::CoreError::ReadFileSliceError(
+                        "CUSTOM merge mode names a payload class this crate does not \
+                         implement a merger for."
+                            .to_string(),
+                    )),
+                }
+            }
             unsupported => Err(crate::error::CoreError::ReadFileSliceError(format!(
                 "Unsupported merge mode for record merger: '{unsupported}'"
             ))),
@@ -797,7 +819,11 @@ mod tests {
 
     #[test]
     fn test_factory_commit_time_ordering() {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let new_rec = make_data_record("k", Some(0));
         let existing = make_data_record("k", Some(100));
         // CommitTime: new always wins regardless of ordering
@@ -807,7 +833,11 @@ mod tests {
 
     #[test]
     fn test_factory_event_time_ordering() {
-        let merger = BufferedRecordMergerFactory::create("EVENT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "EVENT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let new_rec = make_data_record("k", Some(0));
         let existing = make_data_record("k", Some(100));
         // EventTime: higher ordering wins → existing survives

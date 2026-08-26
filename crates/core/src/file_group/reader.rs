@@ -31,6 +31,7 @@ use crate::file_group::base_file::reader::{
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::reader_v2::metadata_merger::resolve_custom_merger;
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
@@ -485,11 +486,15 @@ impl FileGroupReader {
             // no copy of the option map per read.
             && let Some(mode) = self.hudi_configs.get_raw("hoodie.record.merge.mode")
             && mode.eq_ignore_ascii_case("CUSTOM")
+            // Unless the table's payload class names a merger version 2
+            // implements. The same resolution decides this gate and the four
+            // inside the reader, so they admit or refuse together.
+            && resolve_custom_merger(&self.hudi_configs.as_options()).is_none()
         {
             return Err(CoreError::Unsupported(
                 "A table with a CUSTOM record merge mode needs its own merger, \
-                 which no reader here implements. Set \
-                 hoodie.read.file.group.reader.version=1 to read it with the \
+                 which no reader here implements for this table's payload class. \
+                 Set hoodie.read.file.group.reader.version=1 to read it with the \
                  reader that served it before, which merges without that merger"
                     .to_string(),
             ));
@@ -1753,6 +1758,9 @@ mod tests {
 
     pub(super) fn get_metadata_table_base_uri() -> String {
         use hudi_test::QuickstartTripsTable;
+        use std::fs::canonicalize;
+        use std::path::PathBuf;
+        use url::Url;
         let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
         let metadata_table_path = PathBuf::from(table_path).join(".hoodie").join("metadata");
         let url = Url::from_file_path(canonicalize(&metadata_table_path).unwrap()).unwrap();
@@ -2321,6 +2329,46 @@ mod file_group_reader_version_tests {
         assert!(
             err.to_string().contains("CUSTOM"),
             "the error must name why"
+        );
+        Ok(())
+    }
+
+    /// The CUSTOM refusal is narrow: it no longer fires for a table whose payload
+    /// class names a merger version 2 implements.
+    ///
+    /// Read on the real metadata table, which is the only such table there is: it
+    /// states `hoodie.record.merge.mode=CUSTOM` and names `HoodieMetadataPayload`.
+    /// The read is still refused, by the *metadata table* gate one check later, and
+    /// that is what this asserts — the reason changed, which is exactly the scope
+    /// of this change. Lifting the metadata-table routing is separate work, so
+    /// until then the merger stays unreachable through this entry point.
+    ///
+    /// Asserting on which refusal fires, rather than that none does, keeps the
+    /// test honest about that: a test demanding `is_ok()` here could only pass by
+    /// also lifting a gate this change deliberately leaves alone.
+    #[tokio::test]
+    async fn test_the_custom_gate_no_longer_refuses_the_metadata_payload() -> Result<()> {
+        let url = super::tests::get_metadata_table_base_uri();
+        let reader =
+            FileGroupReader::new_with_options(&url, crate::config::util::empty_options()).await?;
+
+        assert_eq!(
+            reader.hudi_configs.get_raw("hoodie.record.merge.mode"),
+            Some("CUSTOM"),
+            "the fixture must really be a CUSTOM table, or this test is vacuous"
+        );
+
+        let err = reader
+            .version_two_unsupported_reason("f.hfile", false)
+            .expect_err("the metadata table is still refused, by a later gate");
+        let message = err.to_string();
+        assert!(
+            !message.contains("CUSTOM record merge mode"),
+            "the CUSTOM gate must no longer be the one refusing this table, got: {message}"
+        );
+        assert!(
+            message.contains("metadata table"),
+            "the refusal must come from the metadata-table gate, got: {message}"
         );
         Ok(())
     }
