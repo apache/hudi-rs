@@ -164,12 +164,16 @@ const MERGE_CHUNK_ROWS: usize = 1024;
 /// not the read that dropped it.
 fn base_read_options(
     row_filter: Option<RowFilterBuilder>,
+    key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
     use_record_position: bool,
 ) -> BaseFileReadOptions {
     let mut options = BaseFileReadOptions::new();
     options = options.with_batch_size(MERGE_CHUNK_ROWS);
     if let Some(row_filter) = row_filter {
         options = options.with_row_filter(row_filter);
+    }
+    if let Some(key_predicate) = key_predicate {
+        options = options.with_key_predicate(key_predicate);
     }
     if use_record_position {
         options = options.with_row_index_column(ROW_INDEX_TEMPORARY_COLUMN_NAME);
@@ -745,6 +749,12 @@ impl HoodieFileGroupReader {
             None
         };
 
+        // The key predicate needs no such gate. It narrows *which blocks are read*
+        // and the reader filters the records it brings back, so it cannot change the
+        // merge's outcome the way a non-primary-key row filter can — and a format
+        // that cannot seek ignores it and returns every row.
+        let key_predicate = self.reader_context.key_predicate.clone();
+
         // Position-based merge: ask the base read for a synthetic row-index
         // column carrying each row's TRUE physical base-file position (a parquet
         // virtual RowNumber column — correct even under RowFilter pushdown). It
@@ -762,7 +772,10 @@ impl HoodieFileGroupReader {
         let Some(required_schema) = self.schema_handler.required_schema.clone() else {
             let batch = self
                 .base_file_reader()?
-                .read_data(&path, base_read_options(row_filter.clone(), use_position))
+                .read_data(
+                    &path,
+                    base_read_options(row_filter.clone(), key_predicate.clone(), use_position),
+                )
                 .await
                 .map_err(|e| {
                     CoreError::ReadFileSliceError(format!(
@@ -850,7 +863,7 @@ impl HoodieFileGroupReader {
             .base_file_reader()?
             .read_stream(
                 &path,
-                base_read_options(row_filter.clone(), use_position)
+                base_read_options(row_filter.clone(), key_predicate.clone(), use_position)
                     .with_projection(intersection.fields().iter().map(|f| f.name())),
             )
             .await
@@ -1878,7 +1891,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_merged_chunk_is_bounded_by_the_readers_own_batch_size() {
         assert_eq!(
-            base_read_options(None, false).batch_size,
+            base_read_options(None, None, false).batch_size,
             Some(MERGE_CHUNK_ROWS),
             "the base read must ask for the merge's chunk bound rather than inherit one"
         );

@@ -142,6 +142,20 @@ pub struct ReaderContext {
     /// Groundwork for a caller that supplies one; no performance claim about this
     /// crate's reads rests on it.
     pub row_filter_builder: Option<RowFilterBuilder>,
+    /// Record keys or key prefixes the read is interested in, pushed into the base
+    /// file reader so a key-ordered format seeks instead of scanning.
+    ///
+    /// Beside `row_filter_builder` because it is the same kind of thing — a caller's
+    /// predicate travelling to the reader — and the two are attached to the read
+    /// options in one place for the same reason: a read that silently lost one
+    /// returns the right rows more slowly, which is the hard kind of regression to
+    /// notice.
+    ///
+    /// Only a format that can seek by key honours it; the others return every row,
+    /// which is the fallback Java takes when a reader reports no key-predicate
+    /// support. Set by callers above the reader, such as the metadata table's, and
+    /// `None` for an ordinary table read.
+    pub key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
     /// True when [`Self::row_filter_builder`] references only primary-key
     /// columns and is therefore safe to push into MERGE_ON_READ base + log
     /// readers. Mirrors Java's `morFilters` filter set, which is computed via
@@ -306,6 +320,7 @@ impl ReaderContext {
             table_config: HashMap::new(),
             hoodie_reader_config: HashMap::new(),
             row_filter_builder: None,
+            key_predicate: None,
             mor_pk_safe: false,
             completion_gate_inputs: None,
         }

@@ -1122,4 +1122,75 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A key predicate set on the reader context reaches the base file reader
+    /// through the engine.
+    ///
+    /// The other predicate tests call `read_data` directly, which is the trait
+    /// method but not the path a caller takes. That left the plumbing from
+    /// `ReaderContext` to `BaseFileReadOptions` untested, and it was in fact
+    /// missing: nothing outside tests could set the predicate at all, so the
+    /// criterion "a predicate reaches the reader through the reader context" was
+    /// unmet while every predicate test passed. This is the test that fails when
+    /// that route is broken.
+    #[tokio::test]
+    async fn a_key_predicate_on_the_reader_context_reaches_the_reader() -> crate::Result<()> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+
+        async fn read(
+            configs: Arc<HudiConfigs>,
+            storage: Arc<Storage>,
+            predicate: Option<KeyPredicate>,
+        ) -> crate::Result<Vec<String>> {
+            {
+                let mut context = resolve_reader_context(&configs, /* has_log_files */ false)?;
+                context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
+                context.key_predicate = predicate;
+                let mut reader = HoodieFileGroupReader::new(
+                    Arc::new(context),
+                    storage,
+                    InputSplit::new(
+                        Some(MDT_FILES_COMPACTED_BASE_FILE.to_string()),
+                        Some("20251220210130942".to_string()),
+                        vec![],
+                        MDT_FILES_PARTITION.to_string(),
+                    ),
+                    ReaderParameters::default(),
+                    None,
+                    None,
+                )?;
+                let batch = reader.read().await?;
+                Ok(batch
+                    .column_by_name("key")
+                    .expect("the metadata record key column")
+                    .as_string::<i32>()
+                    .iter()
+                    .flatten()
+                    .map(str::to_string)
+                    .collect::<Vec<String>>())
+            }
+        }
+
+        let all = read(configs.clone(), storage.clone(), None).await?;
+        assert!(
+            all.len() > 1,
+            "the fixture must hold several keys, or filtering cannot be observed"
+        );
+
+        let wanted = all.last().unwrap().clone();
+        let filtered = read(
+            configs.clone(),
+            storage.clone(),
+            Some(KeyPredicate::Keys(vec![wanted.clone()])),
+        )
+        .await?;
+        assert_eq!(
+            filtered,
+            vec![wanted],
+            "a predicate set on the reader context must reach the base file reader; \
+             getting every key back means the engine dropped it"
+        );
+        Ok(())
+    }
 }
