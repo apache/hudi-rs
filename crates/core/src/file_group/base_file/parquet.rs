@@ -578,4 +578,36 @@ mod tests {
         assert_eq!(meta.file_metadata().num_rows(), 5);
         assert!(!meta.row_groups().is_empty());
     }
+
+    /// Parquet has no key seek, so it ignores a key predicate and returns every
+    /// row. That is the fallback Java takes when a reader reports no key-predicate
+    /// support, and it is asserted rather than argued from the source: a silent
+    /// change here would drop rows from every parquet read that carries one.
+    #[tokio::test]
+    async fn a_key_predicate_is_ignored_rather_than_applied() {
+        use super::super::reader::KeyPredicate;
+        let reader = ParquetBaseFileReader::new(test_storage());
+
+        let all = reader
+            .read_data("a.parquet", BaseFileReadOptions::default())
+            .await
+            .unwrap();
+        assert!(all.num_rows() > 0, "the fixture must have rows");
+
+        let with_predicate = reader
+            .read_data(
+                "a.parquet",
+                BaseFileReadOptions {
+                    key_predicate: Some(KeyPredicate::Keys(vec!["no-such-key".to_string()])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            with_predicate.num_rows(),
+            all.num_rows(),
+            "a format that cannot seek by key must return every row, not fewer"
+        );
+    }
 }

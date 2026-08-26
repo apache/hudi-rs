@@ -71,6 +71,21 @@ const FILE_INFO_MIN_RECORD_KEY: &str = "minRecordKey";
 /// File info key for max record key
 const FILE_INFO_MAX_RECORD_KEY: &str = "maxRecordKey";
 
+/// The exclusive upper bound of everything beginning with `prefix`.
+///
+/// `b"ab"` bounds at `b"ac"`. `None` when the prefix is all `0xFF`, since then
+/// nothing sorts above it and the caller must take the tail instead of a range.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last != u8::MAX {
+            upper.push(last + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
 /// Where the decoder reads bytes from.
 ///
 /// `Whole` is the file already in memory, which is what an HFile arriving as a
@@ -395,6 +410,133 @@ impl HFileReader {
         match &self.source {
             Source::Ranged { file_len, .. } => *file_len,
             Source::Whole(bytes) => bytes.len() as u64,
+        }
+    }
+
+    /// The data blocks a key predicate can be satisfied from.
+    ///
+    /// Over-includes, like the two functions it dispatches to, so the caller must
+    /// still filter the records it gets back.
+    pub fn blocks_for_predicate(
+        &self,
+        predicate: &crate::file_group::base_file::reader::KeyPredicate,
+    ) -> Vec<BlockIndexEntry> {
+        use crate::file_group::base_file::reader::KeyPredicate;
+        match predicate {
+            KeyPredicate::Keys(keys) => {
+                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                self.blocks_for_keys(&refs)
+            }
+            KeyPredicate::Prefixes(prefixes) => {
+                // Union the prefixes, deduplicated by offset and back in file
+                // order so the result still coalesces.
+                let mut selected: BTreeMap<u64, BlockIndexEntry> = BTreeMap::new();
+                for prefix in prefixes {
+                    for entry in self.blocks_for_prefix(prefix) {
+                        selected.insert(entry.offset, entry);
+                    }
+                }
+                selected.into_values().collect()
+            }
+        }
+    }
+
+    /// The data blocks that can contain any of `keys`.
+    ///
+    /// Pure index arithmetic, no I/O: for each key, the entry with the greatest
+    /// index key not exceeding it, which is what `find_block_for_key` does for a
+    /// single key. Deduplicated and returned in file order, so the result can go
+    /// straight to [`Self::read_records_batched`] and coalesce.
+    ///
+    /// A block's index key is a *lower bound* on its first real key, since the
+    /// writer may shorten it. So this over-includes rather than under-includes: a
+    /// selected block may turn out to hold nothing the caller asked for, which
+    /// costs one block read. `SeekResult::BeforeBlockFirstKey` is the sync path
+    /// naming the same case.
+    ///
+    /// One case needs the block *before* the selected one as well. Row keys are
+    /// not required to be unique, and when a key's copies straddle a block
+    /// boundary HBase's midpoint falls back to the right-hand cell, so the
+    /// separator equals the key itself. Selecting only the entry at or below the
+    /// key would then take the later block and drop the copies in the earlier
+    /// one. So when the probe lands exactly on a separator, the preceding block
+    /// is taken too — one extra block read on an exact hit, against silently
+    /// losing rows.
+    pub fn blocks_for_keys(&self, keys: &[&str]) -> Vec<BlockIndexEntry> {
+        let mut selected: BTreeMap<u64, BlockIndexEntry> = BTreeMap::new();
+        for key in keys {
+            // A key too long for the length prefix cannot be compared against
+            // the index, so it selects every block rather than none: a wrong
+            // answer is worse than a slow one.
+            let Some(probe) = Key::from_content(key.as_bytes()) else {
+                return self.data_block_entries();
+            };
+            // No entry at or below the key means every block starts above it, so
+            // no block can hold it. Selecting nothing is correct, not a miss.
+            let mut at_or_below = self.data_block_index.range(..=probe.clone()).rev();
+            if let Some((index_key, entry)) = at_or_below.next() {
+                selected.insert(entry.offset, entry.clone());
+                // An exact hit on a separator means the key may also end the
+                // previous block; see the note above on non-unique row keys.
+                if index_key == &probe
+                    && let Some((_, previous)) = at_or_below.next()
+                {
+                    selected.insert(previous.offset, previous.clone());
+                }
+            }
+        }
+        selected.into_values().collect()
+    }
+
+    /// The data blocks that can contain keys beginning with `prefix`.
+    ///
+    /// The block holding the prefix's lower bound, plus every block whose index
+    /// key sorts below the prefix's exclusive upper bound. Over-includes for the
+    /// same reason [`Self::blocks_for_keys`] does.
+    pub fn blocks_for_prefix(&self, prefix: &str) -> Vec<BlockIndexEntry> {
+        let Some(lower) = Key::from_content(prefix.as_bytes()) else {
+            return self.data_block_entries();
+        };
+        let mut selected: BTreeMap<u64, BlockIndexEntry> = BTreeMap::new();
+
+        // The block the prefix's first possible key falls in. Its index key sorts
+        // at or below the prefix, so `range(prefix..)` below would skip it.
+        if let Some((_, entry)) = self.data_block_index.range(..=lower.clone()).next_back() {
+            selected.insert(entry.offset, entry.clone());
+        }
+
+        match prefix_upper_bound(prefix.as_bytes()) {
+            // Every block that starts inside the prefix's span.
+            Some(upper) => {
+                // `upper` is never longer than the prefix, and an over-long
+                // prefix already returned above, so this cannot fail.
+                let upper = Key::from_content(&upper).unwrap_or_else(|| {
+                    unreachable!("an upper bound is never longer than its prefix")
+                });
+                for (_, entry) in self.data_block_index.range(lower..upper) {
+                    selected.insert(entry.offset, entry.clone());
+                }
+            }
+            // The prefix is all 0xFF, so nothing sorts above it: take the tail.
+            None => {
+                for (_, entry) in self.data_block_index.range(lower..) {
+                    selected.insert(entry.offset, entry.clone());
+                }
+            }
+        }
+        selected.into_values().collect()
+    }
+
+    /// What this reader has actually read from storage, or `None` for a resident
+    /// source, which reads nothing after construction.
+    ///
+    /// Reports what storage returned, not the ranges asked for. A seek is judged
+    /// on `bytes` rather than on the rows it returns; see `FetchCounts` for why
+    /// `calls` is not a round-trip count.
+    pub fn reads(&self) -> Option<&crate::storage::reader::FetchCounts> {
+        match &self.source {
+            Source::Ranged { fetcher, .. } => Some(fetcher.reads()),
+            Source::Whole(_) => None,
         }
     }
 
@@ -1473,7 +1615,20 @@ mod tests {
 
     /// Storage rooted at the fixture directory, so a ranged read addresses the
     /// fixtures by name.
-    fn fixture_storage() -> std::sync::Arc<Storage> {
+    /// Every HFile fixture in the repo, spanning one, two and three index levels.
+    pub(super) const ALL_FIXTURES: &[&str] = &[
+        "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile",
+        "hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile",
+        "hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile",
+        "hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile",
+        "hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile",
+        "hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile",
+        "hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile",
+        "hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile",
+        "hudi_1_0_hbase_2_4_9_no_entry.hfile",
+    ];
+
+    pub(super) fn fixture_storage() -> std::sync::Arc<Storage> {
         let url =
             url::Url::from_directory_path(std::fs::canonicalize(test_data_dir()).unwrap()).unwrap();
         Storage::new_with_base_url(url).unwrap()
@@ -1519,17 +1674,7 @@ mod tests {
     /// more than one index level, so it is the one that exercises the split.
     #[tokio::test]
     async fn ranged_and_resident_reads_agree_on_every_fixture() -> Result<()> {
-        let fixtures = [
-            "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile",
-            "hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile",
-            "hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile",
-            "hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile",
-            "hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile",
-            "hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile",
-            "hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile",
-            "hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile",
-            "hudi_1_0_hbase_2_4_9_no_entry.hfile",
-        ];
+        let fixtures = ALL_FIXTURES;
         let storage = fixture_storage();
 
         for name in fixtures {
@@ -2981,5 +3126,282 @@ mod tests {
             results[5].1.is_none(),
             "Nonexistent key should not be found"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_pushdown_tests {
+    use super::*;
+
+    /// Fixtures with enough data blocks for selection to mean anything, and the
+    /// worst-case reduction each must still achieve. The metadata table's own
+    /// HFiles are deliberately absent: every one of them holds a single data
+    /// block, so selecting one of one is the whole file and no seek can be shown.
+    /// Budgets are set just above what the read currently costs, so widening
+    /// selection by even a block or two fails rather than fitting inside slack.
+    /// A budget of "less than the full scan" would pass on a selection of all but
+    /// one block.
+    const MULTI_BLOCK_FIXTURES: &[(&str, u64)] = &[
+        // (fixture, the most bytes a three-key seek may read)
+        ("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile", 52_000),
+        (
+            "hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile",
+            600,
+        ),
+        // The writer shortens block index keys here, which is the case selection
+        // has to over-include rather than miss on.
+        (
+            "hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile",
+            3_200,
+        ),
+    ];
+
+    /// Read every record of a fixture, and what that cost.
+    async fn full_scan(path: &str) -> Result<(Vec<HFileRecord>, u64)> {
+        let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+        let entries = reader.data_block_entries();
+        let counts = reader.reads().expect("a ranged reader counts its reads");
+        let before = counts.bytes();
+        let records = reader.read_records_batched(&entries).await?;
+        Ok((records, counts.bytes() - before))
+    }
+
+    /// A key-set seek returns every key it asked for, and reads far less than a
+    /// full scan.
+    ///
+    /// Both halves matter and neither implies the other. Returning the right
+    /// records proves selection did not *miss* a block; reading fewer bytes
+    /// proves it actually narrowed rather than quietly selecting everything.
+    /// A test asserting only the records would pass on `data_block_entries()`.
+    #[tokio::test]
+    async fn a_key_seek_finds_its_keys_and_reads_less() -> Result<()> {
+        for (path, byte_budget) in MULTI_BLOCK_FIXTURES {
+            let (all, scan_bytes) = full_scan(path).await?;
+            assert!(
+                all.len() > 1000,
+                "{path}: the fixture must be large enough for selection to matter"
+            );
+
+            // First, middle and last, so the selected blocks are scattered rather
+            // than adjacent and cannot be coalesced into the whole file.
+            let keys: Vec<String> = [0, all.len() / 2, all.len() - 1]
+                .iter()
+                .map(|i| String::from_utf8_lossy(&all[*i].key).to_string())
+                .collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+
+            let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+            let picked = reader.blocks_for_keys(&key_refs);
+            // Three keys touch at most six blocks, counting the boundary rule.
+            // "fewer than all" would pass on a selection of all but one.
+            assert!(
+                picked.len() <= 6,
+                "{path}: three keys must select at most six blocks, picked {} of {}",
+                picked.len(),
+                reader.data_block_entries().len()
+            );
+
+            let counts = reader.reads().unwrap();
+            let before = counts.bytes();
+            let got = reader.read_records_batched(&picked).await?;
+            let seek_bytes = counts.bytes() - before;
+
+            let found: std::collections::HashSet<&[u8]> =
+                got.iter().map(|r| r.key.as_slice()).collect();
+            for key in &key_refs {
+                assert!(
+                    found.contains(key.as_bytes()),
+                    "{path}: key {key:?} was in the file but not in the selected blocks"
+                );
+            }
+            assert!(
+                seek_bytes <= *byte_budget && seek_bytes < scan_bytes,
+                "{path}: seek read {seek_bytes} bytes, budget {byte_budget}, \
+                 full scan {scan_bytes}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A prefix seek returns every record carrying the prefix, and no record that
+    /// does not, after the caller filters what the over-included blocks bring.
+    #[tokio::test]
+    async fn a_prefix_seek_covers_every_matching_record() -> Result<()> {
+        for (path, _) in MULTI_BLOCK_FIXTURES {
+            let (all, scan_bytes) = full_scan(path).await?;
+
+            // A prefix taken from a real key by dropping its last two characters,
+            // so it matches a neighbourhood rather than the whole file. A short
+            // fixed prefix is not selective on every fixture: these keys share a
+            // long common head, and six characters of it match everything, which
+            // is why the narrowing assertion below is conditional.
+            let sample = String::from_utf8_lossy(&all[all.len() / 3].key).to_string();
+            let prefix = &sample[..sample.len().saturating_sub(2)];
+            let expected: Vec<&[u8]> = all
+                .iter()
+                .map(|r| r.key.as_slice())
+                .filter(|k| k.starts_with(prefix.as_bytes()))
+                .collect();
+            assert!(
+                !expected.is_empty(),
+                "{path}: prefix {prefix:?} must match something"
+            );
+
+            let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+            let picked = reader.blocks_for_prefix(prefix);
+            let counts = reader.reads().unwrap();
+            let before = counts.bytes();
+            let got = reader.read_records_batched(&picked).await?;
+            let seek_bytes = counts.bytes() - before;
+
+            let matched: Vec<&[u8]> = got
+                .iter()
+                .map(|r| r.key.as_slice())
+                .filter(|k| k.starts_with(prefix.as_bytes()))
+                .collect();
+            assert_eq!(
+                matched, expected,
+                "{path}: a prefix seek must cover every matching record, in order"
+            );
+            // Narrowing is only required of a prefix that is actually selective.
+            // One matching every record in the file has nothing to narrow, and
+            // reading the file is then the right answer rather than a failure.
+            if expected.len() < all.len() {
+                assert!(
+                    seek_bytes < scan_bytes,
+                    "{path}: prefix {prefix:?} matches {} of {} records, so the seek \
+                     must narrow, but it read {seek_bytes} bytes against a full scan's \
+                     {scan_bytes}",
+                    expected.len(),
+                    all.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Selection is exhaustive over the whole key space: for *every* key in the
+    /// file, the blocks selected for it must include one that holds it.
+    ///
+    /// This is what rules out the failure the design most fears — index bounds
+    /// that under-include, dropping a key that exists. A sampled key cannot rule
+    /// out an off-by-one bound; every key can.
+    ///
+    /// Run over **every** fixture, because the multi-level index walk is a second
+    /// population path for `data_block_index` and the one most likely to break
+    /// the lower-bound invariant. The fixtures span one, two and three levels.
+    ///
+    /// Each block is read once, up front, rather than once per key: at ~79,000
+    /// keys over ~5,900 blocks the per-key read made this the slowest test in the
+    /// crate by an order of magnitude, and it was checking the same thing.
+    #[tokio::test]
+    async fn no_key_in_any_fixture_is_missed_by_selection() -> Result<()> {
+        for path in tests::ALL_FIXTURES {
+            let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+            let entries = reader.data_block_entries();
+            if entries.is_empty() {
+                continue; // the empty fixture has no keys to seek to
+            }
+
+            // offset -> the keys that block holds, from one pass over the blocks.
+            let mut by_block: BTreeMap<u64, std::collections::HashSet<Vec<u8>>> = BTreeMap::new();
+            for entry in &entries {
+                let records = reader
+                    .read_records_batched(std::slice::from_ref(entry))
+                    .await?;
+                by_block.insert(entry.offset, records.into_iter().map(|r| r.key).collect());
+            }
+            let all_keys: Vec<Vec<u8>> = by_block.values().flatten().cloned().collect();
+            assert!(
+                !all_keys.is_empty(),
+                "{path}: the fixture must hold keys for this to check anything"
+            );
+
+            // Every key at once must reach every block, or a block is unreachable
+            // through selection and its records can never be read.
+            let owned: Vec<String> = all_keys
+                .iter()
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect();
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            assert_eq!(
+                reader.blocks_for_keys(&refs).len(),
+                entries.len(),
+                "{path}: selecting every key must select every block"
+            );
+
+            // And one key at a time, which is where an off-by-one bound shows up.
+            for (key, text) in all_keys.iter().zip(&owned) {
+                let picked = reader.blocks_for_keys(&[text.as_str()]);
+                assert!(
+                    !picked.is_empty() && picked.len() <= 2,
+                    "{path}: key {text:?} selected {} blocks; expected one, or two \
+                     when the probe lands exactly on a separator",
+                    picked.len()
+                );
+                assert!(
+                    picked.iter().any(|e| by_block[&e.offset].contains(key)),
+                    "{path}: key {text:?} exists but no selected block holds it"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A key that is exactly a block's index key selects that block **and** the
+    /// one before it.
+    ///
+    /// Not an optimisation lost: row keys need not be unique, and when a key's
+    /// copies straddle a block boundary the writer's separator equals the key, so
+    /// taking only the entry at or below it would drop the copies in the earlier
+    /// block. Asserted here because no fixture in the repo actually straddles, so
+    /// nothing else would notice if this rule were removed.
+    #[tokio::test]
+    async fn a_key_on_a_block_boundary_takes_the_previous_block_too() -> Result<()> {
+        let path = "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile";
+        let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+        let entries = reader.data_block_entries();
+        assert!(entries.len() > 2, "the fixture needs several blocks");
+
+        // The second block's index key: an exact separator with a block before it.
+        let separator = entries[1].first_key.clone();
+        let key = std::str::from_utf8(separator.content()).expect("a utf8 row key");
+        let picked = reader.blocks_for_keys(&[key]);
+        assert_eq!(
+            picked.len(),
+            2,
+            "an exact separator hit must take the previous block as well"
+        );
+        assert_eq!(picked[0].offset, entries[0].offset);
+        assert_eq!(picked[1].offset, entries[1].offset);
+
+        // The first block has nothing before it, so it stays a single selection.
+        let first = entries[0].first_key.clone();
+        let first_key = std::str::from_utf8(first.content()).expect("a utf8 row key");
+        assert_eq!(reader.blocks_for_keys(&[first_key]).len(), 1);
+        Ok(())
+    }
+
+    /// A key below everything in the file selects nothing, rather than selecting
+    /// the first block and reading it for no reason.
+    #[tokio::test]
+    async fn a_key_below_the_file_selects_nothing() -> Result<()> {
+        let path = "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile";
+        let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+        assert!(
+            reader.blocks_for_keys(&[""]).is_empty(),
+            "the empty key sorts below every block's index key, so nothing can hold it"
+        );
+        Ok(())
+    }
+
+    /// The exclusive upper bound of a prefix, including the all-0xFF case that
+    /// has no bound and must fall back to the file's tail.
+    #[test]
+    fn prefix_upper_bound_increments_the_last_byte_it_can() {
+        assert_eq!(prefix_upper_bound(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_upper_bound(&[b'a', 0xFF]), Some(b"b".to_vec()));
+        assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
+        assert_eq!(prefix_upper_bound(b""), None);
     }
 }

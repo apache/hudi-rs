@@ -65,6 +65,24 @@ impl Key {
         }
     }
 
+    /// Create a probe key whose content is `content`.
+    ///
+    /// [`Self::from_bytes`] takes bytes that *already* carry the two-byte
+    /// big-endian content-length prefix that [`Self::content`] skips, so handing
+    /// it raw key bytes makes the first two characters read as a length and the
+    /// comparison read garbage. This prepends the prefix, so the result orders
+    /// against keys read out of a file.
+    ///
+    /// `None` when `content` is longer than `i16::MAX`, the largest length the
+    /// prefix can express.
+    pub fn from_content(content: &[u8]) -> Option<Self> {
+        let length = i16::try_from(content.len()).ok()?;
+        let mut bytes = Vec::with_capacity(content.len() + SIZEOF_INT16);
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(content);
+        Some(Self::from_bytes(bytes))
+    }
+
     /// Returns the offset to the key content (after length prefix).
     pub fn content_offset(&self) -> usize {
         self.offset + SIZEOF_INT16
