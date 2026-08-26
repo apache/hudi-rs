@@ -268,7 +268,8 @@ impl KeyBasedFileGroupRecordBuffer {
         merge_mode: String,
         emit_delete: bool,
     ) -> crate::Result<Self> {
-        let merger = BufferedRecordMergerFactory::create(&merge_mode)?;
+        let merger =
+            BufferedRecordMergerFactory::create_with(&merge_mode, &reader_context.table_config)?;
         let update_processor = create_update_processor(emit_delete);
         // Get the shared RecordContext from ReaderContext (mirrors Java's
         // readerContext.getRecordContext() returning the same instance).
@@ -573,6 +574,39 @@ impl KeyBasedFileGroupRecordBuffer {
                 Some(log_rec) => {
                     // Build the base ordering value only now — on a conflict row.
                     let base_ordering = orderings.value_at(idx);
+
+                    // A merge mode `pick_winner` cannot express decides through
+                    // the merger, which sees whole records rather than ordering
+                    // values. Falling into `pick_winner`'s ordering branch would
+                    // take the log record whole, dropping whatever the base row
+                    // contributed — for a metadata record that is every file the
+                    // base listed. Mirrors the row path's `has_next_base_record`.
+                    if !pick_winner_decides(merge_mode) {
+                        let base_rec = BufferedRecord::new_data(
+                            key.to_string(),
+                            base.slice(idx, 1),
+                            base_ordering.clone(),
+                        );
+                        let merged = self
+                            .base
+                            .buffered_record_merger
+                            .final_merge(&base_rec, &log_rec)?;
+                        self.base.update_processor.process_update(
+                            key,
+                            Some(&base_rec),
+                            &merged,
+                            merged.is_delete(),
+                        )?;
+                        keep.append(false);
+                        any_dropped = true;
+                        // A merged delete drops both rows, matching `Winner::LogDelete`;
+                        // this kernel never emits tombstones.
+                        if !merged.is_delete() {
+                            replacements.push(merged);
+                        }
+                        continue;
+                    }
+
                     let winner = pick_winner(merge_mode, &log_rec, &base_ordering);
                     // Mirror the per-record counting the per-row path performs in
                     // `FileGroupRecordBuffer::has_next_base_record`: a key present
@@ -801,6 +835,17 @@ enum Winner {
 /// `BufferedRecord::new_data` + `RecordBatch::slice` cost on the dominant
 /// no-conflict path. For the conflict path the cost is identical — the
 /// `BufferedRecord` only materialises if there *is* a log entry to match.
+/// Whether [`pick_winner`] can decide this merge mode from ordering values alone.
+///
+/// It models exactly the two ordering modes. Anything else — a CUSTOM table's own
+/// merger — has to go through [`BufferedRecordMerger::final_merge`], because the
+/// decision depends on the records' contents and can be a fold rather than a
+/// choice between them. Kept beside `pick_winner` so a mode added to one is
+/// visibly missing from the other.
+fn pick_winner_decides(merge_mode: &str) -> bool {
+    matches!(merge_mode, "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING")
+}
+
 fn pick_winner(
     merge_mode: &str,
     log: &BufferedRecord,
@@ -3827,6 +3872,161 @@ mod tests {
                 ("b2".to_string(), 12, 102),
             ],
             "base-only rows must pass through the BatchRef path with exact data"
+        );
+    }
+
+    // =========================================================================
+    // CUSTOM merge mode: the merger decides base-vs-log, not `pick_winner`
+    // =========================================================================
+
+    /// One metadata record of the FILES type, holding `entries`.
+    fn metadata_batch(key: &str, entries: &[(&str, i64)]) -> RecordBatch {
+        use arrow_array::builder::{
+            BooleanBuilder, Int64Builder, MapBuilder, StringBuilder, StructBuilder,
+        };
+        let value_fields = vec![
+            Field::new("size", DataType::Int64, false),
+            Field::new("isDeleted", DataType::Boolean, false),
+        ];
+        let mut builder = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            StructBuilder::new(
+                arrow_schema::Fields::from(value_fields),
+                vec![
+                    Box::new(Int64Builder::new()),
+                    Box::new(BooleanBuilder::new()),
+                ],
+            ),
+        );
+        for (name, size) in entries {
+            builder.keys().append_value(name);
+            let values = builder.values();
+            values
+                .field_builder::<Int64Builder>(0)
+                .unwrap()
+                .append_value(*size);
+            values
+                .field_builder::<BooleanBuilder>(1)
+                .unwrap()
+                .append_value(false);
+            values.append(true);
+        }
+        builder.append(true).unwrap();
+        let map = builder.finish();
+
+        // The builder names the entries struct and its fields its own way; the
+        // schema is taken from the built array so the batch is self-consistent.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::Int32, false),
+            Field::new("filesystemMetadata", map.data_type().clone(), false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![key])),
+                Arc::new(arrow_array::Int32Array::from(vec![2])),
+                Arc::new(map),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A buffer whose table config names the metadata payload, so CUSTOM resolves
+    /// to the metadata merger.
+    fn build_metadata_buffer(schema: SchemaRef) -> KeyBasedFileGroupRecordBuffer {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::RecordKeyFields.as_ref().to_string(),
+            "key".to_string(),
+        );
+        ctx.table_config.insert(
+            HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
+            "false".to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.compaction.payload.class".to_string(),
+            "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.record.merge.strategy.id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(schema.clone())
+            .with_data_schema(schema);
+        let key_field = ctx.record_key_field().to_string();
+        handler
+            .prepare_required_schema(true, &[key_field], &[], &ctx.table_config, false, "CUSTOM")
+            .unwrap();
+        ctx.schema_handler = handler;
+        KeyBasedFileGroupRecordBuffer::new(Arc::new(ctx), "CUSTOM".to_string(), false).unwrap()
+    }
+
+    /// The `filesystemMetadata` entries of the merged output, sorted.
+    fn merged_entries(batch: &RecordBatch) -> Vec<(String, i64)> {
+        use arrow_array::Array;
+        use arrow_array::cast::AsArray;
+        let map = batch
+            .column_by_name("filesystemMetadata")
+            .expect("the map column")
+            .as_map();
+        assert_eq!(batch.num_rows(), 1, "one key was merged");
+        let entries = map.value(0);
+        let names = entries.column(0).as_string::<i32>();
+        let sizes = entries
+            .column(1)
+            .as_struct()
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let mut out: Vec<(String, i64)> = (0..names.len())
+            .map(|i| (names.value(i).to_string(), sizes.value(i)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A CUSTOM merge mode folds the base row into the log record instead of
+    /// replacing it.
+    ///
+    /// Driven through `merge_base_batch`, the vectorized kernel the streaming read
+    /// actually uses (`merge_iterator.rs:470`), not through `merge_and_collect`,
+    /// which takes the row path where `final_merge` was already being called. That
+    /// distinction is the whole point of this test: the kernel decides conflicts
+    /// through `pick_winner`, which models only the two ordering modes, so CUSTOM
+    /// fell into its event-time branch, both sides carried no ordering value, and
+    /// the log record won whole. Every file listed only in the base file
+    /// disappeared from the listing, silently, on any slice with a base file and
+    /// log files, which is the steady state after a compaction.
+    ///
+    /// The metadata-table end-to-end tests do not catch it: their base file holds
+    /// one record whose entries are a subset of what the log fold already
+    /// produces, so they pass with the base row dropped.
+    #[test]
+    fn custom_merge_mode_folds_the_base_row_rather_than_replacing_it() {
+        let base = metadata_batch("p", &[("a.parquet", 100)]);
+        let schema = base.schema();
+        let mut buffer = build_metadata_buffer(schema.clone());
+
+        // The log names a file the base does not, and vice versa.
+        let mut block = make_data_block(metadata_batch("p", &[("b.parquet", 200)]), "002");
+        buffer.process_data_block(&mut block).unwrap();
+
+        let merged = buffer
+            .merge_base_batch(&base, &schema)
+            .unwrap()
+            .expect("the conflicting row is merged, so a batch is produced");
+        assert_eq!(
+            merged_entries(&merged),
+            vec![
+                ("a.parquet".to_string(), 100),
+                ("b.parquet".to_string(), 200)
+            ],
+            "the base file's entry must survive the merge; taking the log record \
+             whole loses every file only the base listed"
         );
     }
 

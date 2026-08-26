@@ -57,6 +57,7 @@ pub(crate) mod log_record_reader;
 mod memory_limit_tests;
 pub(crate) mod merge_iterator;
 pub(crate) mod merged_log_record_reader;
+pub(crate) mod metadata_merger;
 pub(crate) mod output_converter;
 pub(crate) mod profiling;
 pub(crate) mod read_stats;

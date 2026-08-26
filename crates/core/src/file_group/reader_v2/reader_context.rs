@@ -442,6 +442,10 @@ pub(crate) enum MergeMode {
     CommitTimeOrdering,
     /// Highest ordering-field value wins.
     EventTimeOrdering,
+    /// The table's payload class decides, and this crate implements a merger for
+    /// it. A CUSTOM table whose payload has no merger here never reaches this
+    /// variant; the resolver refuses it instead.
+    Custom,
 }
 
 impl AsRef<str> for MergeMode {
@@ -449,6 +453,7 @@ impl AsRef<str> for MergeMode {
         match self {
             MergeMode::CommitTimeOrdering => "COMMIT_TIME_ORDERING",
             MergeMode::EventTimeOrdering => "EVENT_TIME_ORDERING",
+            MergeMode::Custom => "CUSTOM",
         }
     }
 }

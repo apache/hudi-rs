@@ -26,6 +26,7 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::file_group::reader_v2::buffer::spillable_map;
+use crate::file_group::reader_v2::metadata_merger::resolve_custom_merger;
 use crate::file_group::reader_v2::reader_context::{CONFIG_MERGE_TYPE, MergeMode, ReaderContext};
 use crate::file_group::reader_v2::record_context::RecordContext;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
@@ -61,6 +62,11 @@ pub(crate) fn resolve_reader_context(
     let base_file_format = BaseFileFormatValue::resolve_from_configs(hudi_configs, None)?;
     let instant_range = resolve_instant_range(hudi_configs)?;
     let (table_config, hoodie_reader_config) = partition_configs(hudi_configs);
+    let merge_strategy_id = RECORD_MERGE_STRATEGY_ID_KEYS
+        .iter()
+        .find_map(|k| table_config.get(*k))
+        .cloned()
+        .unwrap_or_default();
 
     Ok(ReaderContext {
         table_path,
@@ -74,8 +80,9 @@ pub(crate) fn resolve_reader_context(
         should_merge_use_record_position: resolve_use_record_position(hudi_configs)?,
         // Only one iterator mode is implemented.
         iterator_mode: "ENGINE_RECORD".to_string(),
-        // Dispatch is on `merge_mode`; the strategy id is carried, not consulted.
-        merge_strategy_id: String::new(),
+        // Carried so a CUSTOM table's merger selection can confirm the id defers
+        // to the payload class rather than naming a merger of its own.
+        merge_strategy_id,
         // No bootstrap support in this crate.
         has_bootstrap_base_file: false,
         needs_bootstrap_merge: false,
@@ -201,11 +208,11 @@ fn resolve_use_record_position(hudi_configs: &HudiConfigs) -> Result<bool> {
 /// a pre-v8 table — the only kind that reaches the inference without stating a
 /// merge mode — writes the older one, so reading only the new key means the
 /// strategy is always empty for exactly the tables it exists to serve.
-const RECORD_MERGE_STRATEGY_ID_KEYS: [&str; 2] = [
+pub(crate) const RECORD_MERGE_STRATEGY_ID_KEYS: [&str; 2] = [
     "hoodie.record.merge.strategy.id",
     "hoodie.compaction.record.merger.strategy",
 ];
-const PAYLOAD_CLASS_KEYS: [&str; 3] = [
+pub(crate) const PAYLOAD_CLASS_KEYS: [&str; 3] = [
     "hoodie.compaction.payload.class",
     "hoodie.datasource.write.payload.class",
     "hoodie.table.legacy.payload.class",
@@ -363,6 +370,12 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         return match mode.to_ascii_uppercase().as_str() {
             "COMMIT_TIME_ORDERING" => Ok(MergeMode::CommitTimeOrdering),
             "EVENT_TIME_ORDERING" => Ok(MergeMode::EventTimeOrdering),
+            // A CUSTOM table is served only when its payload class names a merger
+            // this crate implements. The strategy id cannot make this call: every
+            // payload-based custom table carries the same all-zeros sentinel.
+            "CUSTOM" if resolve_custom_merger(&hudi_configs.as_options()).is_some() => {
+                Ok(MergeMode::Custom)
+            }
             other => Err(CoreError::Unsupported(format!(
                 "Record merge mode '{other}' is not supported. Set \
                  hoodie.read.file.group.reader.version=1 to read with the \
@@ -380,6 +393,11 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         // marker its merge needs) says so by setting the merge mode outright,
         // which is handled above. Inferring the same thing here would read such
         // a table without those configs and drop its deletes silently.
+        // A payload this crate implements a merger for is reproducible, so it is
+        // served rather than refused. Anything else keeps the refusal.
+        InferredMode::Custom if resolve_custom_merger(&hudi_configs.as_options()).is_some() => {
+            Ok(MergeMode::Custom)
+        }
         InferredMode::Custom => Err(CoreError::Unsupported(
             "This table merges with a merger of its own, which the merge-on-read \
              reader cannot reproduce. Set hoodie.read.file.group.reader.version=1 \
