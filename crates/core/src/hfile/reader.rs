@@ -413,6 +413,31 @@ impl HFileReader {
         }
     }
 
+    /// The records of one data block, from a resident source.
+    ///
+    /// The synchronous counterpart to [`Self::read_records_batched`], which needs a
+    /// ranged source because it fetches. An HFile arriving as a log block's content
+    /// is already in memory, so a caller that has narrowed the blocks with
+    /// [`Self::blocks_for_predicate`] wants to parse just those rather than walk the
+    /// file — the saving is parsing and decompression, not I/O.
+    pub fn records_in_block(&self, entry: &BlockIndexEntry) -> Result<Vec<HFileRecord>> {
+        let block = self.read_block_at(entry.offset as usize, entry.size as usize)?;
+        if block.block_type() != HFileBlockType::Data {
+            return Err(HFileError::UnexpectedBlockType {
+                expected: HFileBlockType::Data.to_string(),
+                actual: block.block_type().to_string(),
+            });
+        }
+        let data_block = DataBlock::from_block(block);
+        // The shared helper, not a second copy of it: two places building an
+        // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
+        // would drift on what a record key is.
+        Ok(data_block
+            .iter()
+            .map(|kv| Self::key_value_to_record(&kv))
+            .collect())
+    }
+
     /// The data blocks a key predicate can be satisfied from.
     ///
     /// Over-includes, like the two functions it dispatches to, so the caller must

@@ -145,6 +145,8 @@ pub struct Decoder {
     /// than handed back as key-value pairs. See
     /// [`Decoder::with_hfile_as_records`].
     hfile_as_records: bool,
+    /// Keys the caller asked for, pushed into the HFile block index.
+    key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
 }
 
 impl Decoder {
@@ -175,6 +177,25 @@ impl Decoder {
     /// wrong: a merge needs Arrow like every other block type, while the
     /// metadata table wants the raw key and the still-serialized value so it can
     /// decode against its own schema. Only the caller knows which, so it says.
+    /// Read only the records a key predicate admits.
+    ///
+    /// An HFile log block is an HFile, so its own block index says which of its
+    /// blocks can hold the wanted keys and the rest are never parsed. The content
+    /// is already resident, so this saves decode and merge work rather than I/O:
+    /// on a named-key read the alternative is decoding every record in every log
+    /// block, merging them, and dropping almost all of it.
+    ///
+    /// Sound because the merge is per key: a record's outcome depends only on
+    /// records sharing its key, so dropping other keys from the log side cannot
+    /// change what the requested keys merge to.
+    pub fn with_key_predicate(
+        mut self,
+        key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
+    ) -> Self {
+        self.key_predicate = key_predicate;
+        self
+    }
+
     pub fn with_hfile_as_records(mut self, hfile_as_records: bool) -> Self {
         self.hfile_as_records = hfile_as_records;
         self
@@ -192,6 +213,7 @@ impl Decoder {
             row_filter: None,
             reader_schema_json: None,
             hfile_as_records: false,
+            key_predicate: None,
         }
     }
     pub fn decode_content(
@@ -547,6 +569,27 @@ impl Decoder {
             HFileReader::new(hfile_bytes).map_err(|e| CoreError::HFile(e.to_string()))?;
 
         let mut records = Vec::new();
+
+        // With a predicate, walk only the blocks its keys can be in. The whole
+        // block index is in hand, so this costs an index lookup and saves parsing
+        // and decompressing every other block.
+        if let Some(predicate) = self.key_predicate.as_ref() {
+            let matcher = predicate.matcher();
+            for entry in hfile_reader.blocks_for_predicate(predicate) {
+                for record in hfile_reader
+                    .records_in_block(&entry)
+                    .map_err(|e| CoreError::HFile(e.to_string()))?
+                {
+                    // A block is the smallest readable unit, so a selected block
+                    // holds keys nobody asked for.
+                    if record.key_as_str().is_some_and(|key| matcher.admits(key)) {
+                        records.push(record);
+                    }
+                }
+            }
+            return Ok(records);
+        }
+
         let iter = hfile_reader
             .iter()
             .map_err(|e| CoreError::HFile(e.to_string()))?;
