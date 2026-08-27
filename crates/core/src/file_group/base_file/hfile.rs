@@ -27,7 +27,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream, KeyPredicate};
-use crate::file_group::log_file::avro::AvroBlockDecoder;
+use crate::file_group::log_file::avro::{AvroBlockDecoder, RegisteredWriterSchema};
 use crate::hfile::HFileReader;
 use crate::hfile::record_key::fill_empty_entry_keys;
 use crate::statistics::{StatisticsContainer, StatsGranularity};
@@ -60,15 +60,17 @@ impl HFileBaseFileReader {
     /// log block of the same table yield the same columns, which is the whole
     /// reason they can merge; handing the value on as bytes does not.
     ///
-    /// The decoder comes back rather than being dropped because building one is the
-    /// dominant cost of reading a small HFile: `arrow_avro` re-parses the writer
-    /// schema's JSON on every construction, which for the metadata table's
-    /// eight-kilobyte record schema is more than reading the file. This one has
-    /// decoded nothing yet, so the first window can decode through it.
+    /// The decoder and the registration come back rather than being dropped, because
+    /// building a decoder is the dominant cost of reading a small HFile: `arrow_avro`
+    /// re-parses the writer schema's JSON on every construction, which for the
+    /// metadata table's eight-kilobyte record schema is more than reading the file.
+    /// The decoder has decoded nothing yet, so the first window can decode through
+    /// it; the registration is immutable and serves every later window, which then
+    /// pays only to build.
     fn decoded_schema(
         reader: &HFileReader,
         relative_path: &str,
-    ) -> Result<(String, SchemaRef, AvroBlockDecoder)> {
+    ) -> Result<(SchemaRef, AvroBlockDecoder, RegisteredWriterSchema)> {
         let json = reader
             .avro_schema_json()
             .map_err(|e| {
@@ -85,10 +87,13 @@ impl HFileBaseFileReader {
         // The schema comes from the decoder, not from converting the Avro JSON:
         // `avro_to_arrow` does not handle named-type references, and the metadata
         // table's record schema uses them.
-        let decoder = AvroBlockDecoder::try_new_with_reader(&json, None, DECODE_BATCH_SIZE)
+        let registered = RegisteredWriterSchema::new(&json)
             .map_err(|e| StorageError::Creation(format!("{e}")))?;
+        let decoder =
+            AvroBlockDecoder::try_new_with_registered(&registered, None, DECODE_BATCH_SIZE)
+                .map_err(|e| StorageError::Creation(format!("{e}")))?;
         let schema = decoder.schema();
-        Ok((json, schema, decoder))
+        Ok((schema, decoder, registered))
     }
 
     /// The projected schema, or an error naming a column the file does not have.
@@ -173,7 +178,7 @@ impl BaseFileReader for HFileBaseFileReader {
                 ));
             }
 
-            let (writer_json, full_schema, decoder) = Self::decoded_schema(&reader, relative_path)?;
+            let (full_schema, decoder, registered) = Self::decoded_schema(&reader, relative_path)?;
             let schema = Self::project(&full_schema, options.projection.as_deref())?;
             let projection: Option<Vec<String>> =
                 options.projection.as_ref().map(|names| names.to_vec());
@@ -196,7 +201,6 @@ impl BaseFileReader for HFileBaseFileReader {
                 (
                     reader,
                     windows.into_iter(),
-                    writer_json,
                     full_schema,
                     projection,
                     key_predicate,
@@ -206,16 +210,17 @@ impl BaseFileReader for HFileBaseFileReader {
                     // flush (arrow-rs#10876), so carrying one across a window boundary
                     // would decode the next window against stale offsets.
                     Some(decoder),
+                    registered,
                     false,
                 ),
                 |(
                     reader,
                     mut windows,
-                    writer_json,
                     full_schema,
                     projection,
                     key_predicate,
                     decoder,
+                    registered,
                     failed,
                 )| async move {
                     // Sticky: once a window fails the read is not whole, so no
@@ -227,11 +232,11 @@ impl BaseFileReader for HFileBaseFileReader {
                     let item = decode_window(
                         &reader,
                         &window,
-                        &writer_json,
                         &full_schema,
                         projection.as_deref(),
                         key_predicate.as_ref(),
                         decoder,
+                        &registered,
                     )
                     .await;
                     let failed = item.is_err();
@@ -240,11 +245,11 @@ impl BaseFileReader for HFileBaseFileReader {
                         (
                             reader,
                             windows,
-                            writer_json,
                             full_schema,
                             projection,
                             key_predicate,
                             None,
+                            registered,
                             failed,
                         ),
                     ))
@@ -300,11 +305,11 @@ impl BaseFileReader for HFileBaseFileReader {
 async fn decode_window(
     reader: &HFileReader,
     window: &[crate::hfile::BlockIndexEntry],
-    writer_json: &str,
     decoded_schema: &SchemaRef,
     projection: Option<&[String]>,
     key_predicate: Option<&KeyPredicate>,
     decoder: Option<AvroBlockDecoder>,
+    registered: &RegisteredWriterSchema,
 ) -> Result<RecordBatch> {
     let mut records = reader
         .read_records_batched(window)
@@ -328,9 +333,13 @@ async fn decode_window(
         });
     }
 
+    // A later window builds its own decoder, since the previous one was flushed and
+    // `arrow_avro` does not fully reset a union's state on flush (arrow-rs#10876).
+    // It builds from the registration rather than the JSON, which is the schema-sized
+    // half of the cost and is immutable.
     let mut decoder = match decoder {
         Some(decoder) => decoder,
-        None => AvroBlockDecoder::try_new_with_reader(writer_json, None, DECODE_BATCH_SIZE)
+        None => AvroBlockDecoder::try_new_with_registered(registered, None, DECODE_BATCH_SIZE)
             .map_err(|e| StorageError::Creation(format!("{e}")))?,
     };
     let mut batches: Vec<RecordBatch> = Vec::new();
