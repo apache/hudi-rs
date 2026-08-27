@@ -59,7 +59,16 @@ impl HFileBaseFileReader {
     /// its own file info. Decoding against that is what makes a base file and a
     /// log block of the same table yield the same columns, which is the whole
     /// reason they can merge; handing the value on as bytes does not.
-    fn decoded_schema(reader: &HFileReader, relative_path: &str) -> Result<(String, SchemaRef)> {
+    ///
+    /// The decoder comes back rather than being dropped because building one is the
+    /// dominant cost of reading a small HFile: `arrow_avro` re-parses the writer
+    /// schema's JSON on every construction, which for the metadata table's
+    /// eight-kilobyte record schema is more than reading the file. This one has
+    /// decoded nothing yet, so the first window can decode through it.
+    fn decoded_schema(
+        reader: &HFileReader,
+        relative_path: &str,
+    ) -> Result<(String, SchemaRef, AvroBlockDecoder)> {
         let json = reader
             .avro_schema_json()
             .map_err(|e| {
@@ -78,7 +87,8 @@ impl HFileBaseFileReader {
         // table's record schema uses them.
         let decoder = AvroBlockDecoder::try_new_with_reader(&json, None, DECODE_BATCH_SIZE)
             .map_err(|e| StorageError::Creation(format!("{e}")))?;
-        Ok((json, decoder.schema()))
+        let schema = decoder.schema();
+        Ok((json, schema, decoder))
     }
 
     /// The projected schema, or an error naming a column the file does not have.
@@ -163,7 +173,7 @@ impl BaseFileReader for HFileBaseFileReader {
                 ));
             }
 
-            let (writer_json, full_schema) = Self::decoded_schema(&reader, relative_path)?;
+            let (writer_json, full_schema, decoder) = Self::decoded_schema(&reader, relative_path)?;
             let schema = Self::project(&full_schema, options.projection.as_deref())?;
             let projection: Option<Vec<String>> =
                 options.projection.as_ref().map(|names| names.to_vec());
@@ -190,6 +200,12 @@ impl BaseFileReader for HFileBaseFileReader {
                     full_schema,
                     projection,
                     key_predicate,
+                    // The decoder the schema was resolved with, for the first window.
+                    // Later windows build their own: a decoder is flushed at the end of
+                    // a window and `arrow_avro` does not fully reset a union's state on
+                    // flush (arrow-rs#10876), so carrying one across a window boundary
+                    // would decode the next window against stale offsets.
+                    Some(decoder),
                     false,
                 ),
                 |(
@@ -199,6 +215,7 @@ impl BaseFileReader for HFileBaseFileReader {
                     full_schema,
                     projection,
                     key_predicate,
+                    decoder,
                     failed,
                 )| async move {
                     // Sticky: once a window fails the read is not whole, so no
@@ -214,6 +231,7 @@ impl BaseFileReader for HFileBaseFileReader {
                         &full_schema,
                         projection.as_deref(),
                         key_predicate.as_ref(),
+                        decoder,
                     )
                     .await;
                     let failed = item.is_err();
@@ -226,6 +244,7 @@ impl BaseFileReader for HFileBaseFileReader {
                             full_schema,
                             projection,
                             key_predicate,
+                            None,
                             failed,
                         ),
                     ))
@@ -285,6 +304,7 @@ async fn decode_window(
     decoded_schema: &SchemaRef,
     projection: Option<&[String]>,
     key_predicate: Option<&KeyPredicate>,
+    decoder: Option<AvroBlockDecoder>,
 ) -> Result<RecordBatch> {
     let mut records = reader
         .read_records_batched(window)
@@ -308,8 +328,11 @@ async fn decode_window(
         });
     }
 
-    let mut decoder = AvroBlockDecoder::try_new_with_reader(writer_json, None, DECODE_BATCH_SIZE)
-        .map_err(|e| StorageError::Creation(format!("{e}")))?;
+    let mut decoder = match decoder {
+        Some(decoder) => decoder,
+        None => AvroBlockDecoder::try_new_with_reader(writer_json, None, DECODE_BATCH_SIZE)
+            .map_err(|e| StorageError::Creation(format!("{e}")))?,
+    };
     let mut batches: Vec<RecordBatch> = Vec::new();
     for record in &records {
         if let Some(batch) = decoder
@@ -928,6 +951,89 @@ mod tests {
         assert_eq!(windows, vec![vec![entry(0, 500)]]);
 
         assert!(HFileReader::plan_windows(&[], 100).is_empty());
+    }
+
+    /// A read split over several windows must equal a read that used one.
+    ///
+    /// The first window decodes through the decoder the schema was resolved with,
+    /// and later windows build their own, because `arrow_avro` does not fully reset
+    /// a union's state on flush (arrow-rs#10876) and a decoder is flushed at the end
+    /// of every window. Reusing one across that boundary decodes the next window
+    /// against stale offsets, which surfaces as wrong values rather than an error,
+    /// so this pins the values and not only the row count.
+    ///
+    /// The fixture is a fifty-record HFile written with one-kilobyte blocks, because
+    /// the tables in this repo hold their `files` partition in a single data block
+    /// and a one-block file has only ever one window however small the budget.
+    #[tokio::test]
+    async fn a_read_split_over_windows_decodes_what_one_window_does() -> crate::Result<()> {
+        async fn read(windowed: bool) -> crate::Result<(Vec<(String, i32)>, usize)> {
+            let dir =
+                std::fs::canonicalize(std::path::Path::new("tests/data/metadata_slices")).unwrap();
+            let mut options = HashMap::from([
+                (
+                    HudiTableConfig::BasePath.as_ref().to_string(),
+                    Url::from_directory_path(&dir).unwrap().to_string(),
+                ),
+                (
+                    HudiTableConfig::BaseFileFormat.as_ref().to_string(),
+                    "hfile".to_string(),
+                ),
+            ]);
+            if windowed {
+                // Ranged, because windows exist only when the file is not read whole,
+                // and a one-byte budget plans a window per block without splitting one.
+                options.insert(
+                    crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
+                    "0".to_string(),
+                );
+                options.insert(
+                    crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE.to_string(),
+                    "1".to_string(),
+                );
+            }
+            let storage = Storage::new(
+                Arc::new(HashMap::new()),
+                Arc::new(HudiConfigs::new(options)),
+            )?;
+            let mut stream = HFileBaseFileReader::new(storage)
+                .read_stream("files-multiblock.hfile", BaseFileReadOptions::default())
+                .await?
+                .into_stream();
+            let mut rows = Vec::new();
+            let mut batches = 0;
+            while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                let batch = batch?;
+                batches += 1;
+                let keys = batch
+                    .column_by_name("key")
+                    .expect("the metadata record key column")
+                    .as_string::<i32>();
+                let types = batch
+                    .column_by_name("type")
+                    .expect("the metadata record type column")
+                    .as_primitive::<arrow_array::types::Int32Type>();
+                for row in 0..batch.num_rows() {
+                    rows.push((keys.value(row).to_string(), types.value(row)));
+                }
+            }
+            rows.sort();
+            Ok((rows, batches))
+        }
+
+        let (split, split_batches) = read(true).await?;
+        let (whole, _) = read(false).await?;
+        assert!(
+            split_batches > 1,
+            "this test is vacuous unless the budget splits the read: got \
+             {split_batches} batch(es)"
+        );
+        assert_eq!(
+            split, whole,
+            "a windowed read must decode the same keys and types as a single-window read"
+        );
+        assert_eq!(whole.len(), 50, "the fixture holds fifty records");
+        Ok(())
     }
 
     /// The size threshold picks the read strategy, and the two strategies are told

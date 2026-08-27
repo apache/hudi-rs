@@ -1,6 +1,6 @@
 # Synthetic metadata-table HFiles
 
-Five HFiles holding Avro-encoded `HoodieMetadataRecord` values, plus the writer schema
+Six HFiles holding Avro-encoded `HoodieMetadataRecord` values, plus the writer schema
 those values were encoded against. They exist because the real fixture tables in this
 repo cannot produce the cases below: their metadata tables were never cleaned, and none
 of them is non-partitioned.
@@ -17,6 +17,13 @@ HFile of metadata values without that entry cannot be decoded.
 | `nonpartitioned-base.hfile` | `.` | 2 | `f00000000-0_0-1-1_20250101000000000.parquet` → size 1024, `isDeleted` false |
 | `nonpartitioned-log.hfile` | `.` | 2 | `f00000001-0_0-1-1_20250101000000000.parquet` → size 1024, `isDeleted` false |
 | `allpartitions-dot.hfile` | `__all_partitions__` | 1 | `.` → size 0, `isDeleted` false |
+| `files-multiblock.hfile` | `city=p00000000` … `city=p00000049` | 2 | one file each, size 1024 + i |
+
+`files-multiblock.hfile` is the odd one out: fifty records written with one-kilobyte
+data blocks, so it spans many HFile blocks. Every other HFile here, and every
+metadata table in this repo's fixtures, holds its records in a single data block, and
+a one-block file is read in one window however small the window budget is. It exists
+so a read can be forced across a window boundary.
 
 `type` is the discriminator on `HoodieMetadataRecord`: 1 is the all-partitions record,
 whose map keys name partitions, and 2 is a files record, whose map keys name files. A
