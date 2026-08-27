@@ -37,9 +37,9 @@ pub const KEY_VALUE_HEADER_SIZE: usize = SIZEOF_INT32 * 2;
 /// For comparison and hashing, only the key content is used.
 #[derive(Debug, Clone)]
 pub struct Key {
-    /// Raw key bytes including the length prefix
+    /// This key's own bytes, including the length prefix
     bytes: Vec<u8>,
-    /// Offset to the start of the key within bytes
+    /// Offset to the start of the key within `bytes`; zero when parsed from a block
     offset: usize,
     /// Total length of the key part (including length prefix and other info)
     length: usize,
@@ -47,10 +47,18 @@ pub struct Key {
 
 impl Key {
     /// Create a new Key from bytes at the given offset with the specified length.
+    ///
+    /// Copies the key's own bytes, not the buffer it came from. `bytes` is a whole
+    /// data block, so copying it here cost the block once per key: parsing a block
+    /// of N keys copied it N times, which is quadratic in the block's record count.
     pub fn new(bytes: &[u8], offset: usize, length: usize) -> Self {
+        let end = offset.saturating_add(length).min(bytes.len());
+        let start = offset.min(end);
         Self {
-            bytes: bytes.to_vec(),
-            offset,
+            bytes: bytes[start..end].to_vec(),
+            // Zero because the bytes above start at the key, so every accessor's
+            // arithmetic stays as it was when this held the whole block.
+            offset: 0,
             length,
         }
     }
@@ -65,8 +73,12 @@ impl Key {
         }
     }
 
-    /// Returns the offset to the key content (after length prefix).
-    pub fn content_offset(&self) -> usize {
+    /// Returns the offset to the key content (after the length prefix).
+    ///
+    /// Private: this is an offset into *this key's* bytes, so it is only meaningful
+    /// with [`Self::bytes`]. It used to be an offset into the enclosing block, and a
+    /// caller pairing it with a block buffer would now index the wrong place.
+    fn content_offset(&self) -> usize {
         self.offset + SIZEOF_INT16
     }
 
@@ -80,6 +92,12 @@ impl Key {
     }
 
     /// Returns the key content as a byte slice.
+    ///
+    /// The bound below is against this key's own bytes. For a key parsed out of a
+    /// block that is `length` bytes, so a corrupt inner prefix claiming more content
+    /// than the key holds yields empty rather than reading on into the value that
+    /// follows it. A well-formed HFile cannot reach that: `key_length` is
+    /// `2 + row + 1 + family + qualifier + 9`, always at least `2 + content`.
     pub fn content(&self) -> &[u8] {
         let start = self.content_offset();
         let len = self.content_length();
@@ -99,7 +117,7 @@ impl Key {
         self.length
     }
 
-    /// Returns the raw bytes.
+    /// Returns this key's own bytes, prefix included.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -206,9 +224,9 @@ impl std::fmt::Display for Utf8Key {
 /// - 1 byte: MVCC timestamp version (always 0 for Hudi)
 #[derive(Debug, Clone)]
 pub struct KeyValue {
-    /// The backing byte array containing the entire key-value record
+    /// This record's own bytes: header, key and value
     bytes: Vec<u8>,
-    /// Offset to the start of this record in bytes
+    /// Offset to the start of this record within `bytes`; zero when parsed
     offset: usize,
     /// The parsed key
     key: Key,
@@ -238,9 +256,21 @@ impl KeyValue {
         let key_offset = offset + KEY_VALUE_HEADER_SIZE;
         let key = Key::new(bytes, key_offset, key_length);
 
+        // This record's own bytes, not the block's. Copying the block here cost it
+        // once per record, so a block of N records copied itself N times on top of
+        // the N copies `Key::new` made.
+        let record_end = offset
+            .saturating_add(KEY_VALUE_HEADER_SIZE)
+            .saturating_add(key_length)
+            .saturating_add(value_length)
+            .min(bytes.len());
+        let record_start = offset.min(record_end);
+
         Self {
-            bytes: bytes.to_vec(),
-            offset,
+            bytes: bytes[record_start..record_end].to_vec(),
+            // Zero for the same reason as in `Key::new`: the bytes now start at the
+            // record, so `value()`'s arithmetic is unchanged.
+            offset: 0,
             key,
             key_length,
             value_length,
@@ -464,5 +494,74 @@ mod tests {
         assert_eq!(compare_keys(&key, &lookup1), Ordering::Equal);
         assert_eq!(compare_keys(&key, &lookup2), Ordering::Less);
         assert_eq!(compare_keys(&key, &lookup3), Ordering::Greater);
+    }
+
+    /// A record parsed at a nonzero offset reads its own key and value, and holds
+    /// only its own bytes.
+    ///
+    /// Every other test here parses at offset 0, where a record and the buffer it
+    /// came from are nearly the same thing, so none of them would notice a parse
+    /// that ignored the offset or sliced from the start. The narrowing is what this
+    /// pins: the second record's buffer must span that record, not the block, since
+    /// holding the block is what made parsing a block quadratic in its record count.
+    #[test]
+    fn a_record_at_a_nonzero_offset_reads_itself_and_holds_only_itself() {
+        // Two records in one buffer, laid out as an HFile data block does it:
+        // 4-byte key length, 4-byte value length, key, value, 1-byte MVCC.
+        fn record(key_content: &[u8], value: &[u8]) -> Vec<u8> {
+            let mut key = Vec::new();
+            key.extend_from_slice(&(key_content.len() as i16).to_be_bytes());
+            key.extend_from_slice(key_content);
+            let mut out = Vec::new();
+            out.extend_from_slice(&(key.len() as i32).to_be_bytes());
+            out.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            out.extend_from_slice(&key);
+            out.extend_from_slice(value);
+            out.push(0); // MVCC timestamp version
+            out
+        }
+
+        let first = record(b"aaa", b"value-of-first");
+        let second = record(b"bbbb", b"second-value");
+        let mut block = first.clone();
+        block.extend_from_slice(&second);
+
+        let kv0 = KeyValue::parse(&block, 0);
+        assert_eq!(kv0.key().content(), b"aaa");
+        assert_eq!(kv0.value(), b"value-of-first");
+        assert_eq!(kv0.record_size(), first.len());
+
+        // The offset the block iterator would advance to.
+        let kv1 = KeyValue::parse(&block, kv0.record_size());
+        assert_eq!(
+            kv1.key().content(),
+            b"bbbb",
+            "the second record's key must be read from its own offset"
+        );
+        assert_eq!(
+            kv1.value(),
+            b"second-value",
+            "the second record's value must be read from its own offset"
+        );
+        assert_eq!(kv1.record_size(), second.len());
+
+        // Narrow, not the whole block: this is the property whose absence made a
+        // block of N records copy itself N times.
+        assert_eq!(
+            kv1.key().bytes().len(),
+            kv1.key_length(),
+            "a parsed key must hold exactly its own bytes, not the block's"
+        );
+        assert!(
+            kv1.bytes.len() < block.len(),
+            "a parsed record must hold less than the whole block, got {} of {}",
+            kv1.bytes.len(),
+            block.len()
+        );
+        assert_eq!(
+            kv1.bytes.len(),
+            KEY_VALUE_HEADER_SIZE + kv1.key_length() + kv1.value_length(),
+            "a parsed record must hold exactly its header, key and value"
+        );
     }
 }
