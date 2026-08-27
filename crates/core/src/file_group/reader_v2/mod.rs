@@ -57,6 +57,21 @@ pub(crate) mod log_record_reader;
 mod memory_limit_tests;
 pub(crate) mod merge_iterator;
 pub(crate) mod merged_log_record_reader;
+// The one module here that names something outside this reader: it holds Hudi's
+// metadata payload merge, so `filesystemMetadata` and the payload's class name appear
+// below a reader that otherwise knows nothing about the metadata table.
+//
+// Deliberate, and narrower than it looks. What it implements is the generic
+// `BufferedRecordMerger`, so the interface a second custom payload would need already
+// exists and the merge itself is not special-cased anywhere else. What keeps the module
+// here rather than above the reader is that `resolver` and `schema_handler` consult the
+// merger while resolving the merge mode and the schema, before any record is read, so
+// moving it means giving the reader a merger at construction and threading it through
+// setup. That is worth doing when a second custom payload exists to justify the
+// injection; with one, it buys a file move and a new parameter.
+//
+// The cost of leaving it: a second payload cannot be added without editing this
+// directory.
 pub(crate) mod metadata_merger;
 pub(crate) mod output_converter;
 pub(crate) mod profiling;
