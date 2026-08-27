@@ -282,12 +282,14 @@ impl Table {
         let storage = Storage::new(Arc::new(self.storage_options()), configs.clone())?;
 
         // Still the existing reader, deliberately. `MetadataTableV2Reader` matches it
-        // record for record and value for value, and is 3.4x slower end to end: the
-        // ranged base-file open costs extra requests, version two's log scan walks
-        // every log file twice, and the metadata merger rebuilds an Arrow map per
-        // merged pair. Swapping the default metadata read onto that would be a
-        // regression no value-equality test can see, so the swap waits for the cost
-        // to come down rather than shipping with it.
+        // record for record and value for value, and is about 2.4x slower end to end
+        // on this table's own `files` partition, measured by
+        // `v2_reader::tests::reader_cost_on_a_metadata_slice`. The gap is fixed cost
+        // per read, not cost per record: it survives on a base-file-only slice, where
+        // the ranged open spends requests a whole-file read does not, and a metadata
+        // base file is a few kilobytes. Swapping the default metadata read onto that
+        // would be a regression no value-equality test can see, so the swap waits for
+        // the cost to come down rather than shipping with it.
         reader::MetadataTableFileGroupReader::new(configs, storage)
             .read_files_partition(&file_slice, keys)
             .await
