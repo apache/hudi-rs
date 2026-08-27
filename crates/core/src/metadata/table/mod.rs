@@ -24,12 +24,15 @@
 
 pub mod records;
 
+// The reader the metadata read used before `v2_reader` replaced it. Kept, and kept
+// out of the production build, because it is the oracle every parity test compares
+// against: an Avro-decoding implementation of the same semantics, written
+// independently, is worth more as a check on the new reader than as one fewer file.
+// Deleting it is a separate step, once the parity tests have something else to
+// compare against or no longer need to.
+#[cfg(test)]
 pub(crate) mod reader;
-// The version two metadata layer. Not yet on the read path: it matches `reader` on
-// values and is slower, so `read_files_partition` still calls `reader`. Reachable from
-// its own parity tests, which is what keeps the comparison honest while the cost is
-// worked on.
-#[allow(dead_code)]
+
 pub(crate) mod v2_reader;
 
 #[cfg(test)]
@@ -281,16 +284,17 @@ impl Table {
         ));
         let storage = Storage::new(Arc::new(self.storage_options()), configs.clone())?;
 
-        // Still the existing reader, deliberately. `MetadataTableV2Reader` matches it
-        // record for record and value for value, and is about 2.4x slower end to end
-        // on this table's own `files` partition, measured by
-        // `v2_reader::tests::reader_cost_on_a_metadata_slice`. The gap is fixed cost
-        // per read, not cost per record: it survives on a base-file-only slice, where
-        // the ranged open spends requests a whole-file read does not, and a metadata
-        // base file is a few kilobytes. Swapping the default metadata read onto that
-        // would be a regression no value-equality test can see, so the swap waits for
-        // the cost to come down rather than shipping with it.
-        reader::MetadataTableFileGroupReader::new(configs, storage)
+        // About 2.1x the cost of the reader it replaces on this table's own `files`
+        // partition, measured by `v2_reader::tests::reader_cost_on_a_metadata_slice`,
+        // and accepted: roughly a quarter of that is `arrow_avro` re-parsing the
+        // writer schema's JSON on every decoder construction, which no change here
+        // can remove while a flushed decoder cannot be reused (arrow-rs#10876).
+        //
+        // The fixture is also this reader's worst case, holding 2.6 records per block,
+        // where per-block fixed cost cannot amortise; on larger blocks it overtakes
+        // the reader it replaces. So the ratio above is not the production ratio, and
+        // nothing measured here establishes what that is.
+        v2_reader::MetadataTableV2Reader::new(configs, storage)
             .read_files_partition(&file_slice, keys)
             .await
     }
