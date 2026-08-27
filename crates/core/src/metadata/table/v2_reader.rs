@@ -343,6 +343,89 @@ mod tests {
 
     use crate::metadata::table::test_support::comparable;
 
+    /// A slice of just the base file, so the base side's cost can be read apart
+    /// from the log side's.
+    fn base_only_slice() -> crate::Result<FileSlice> {
+        let mut fg = FileGroup::new(
+            FILE_GROUP.to_string(),
+            FilesPartitionRecord::PARTITION_NAME.to_string(),
+        );
+        fg.add_base_file_from_name(PRECOMPACT_BASE)?;
+        Ok(fg
+            .get_file_slice_as_of(crate::file_group::reader_v2::MAX_INSTANT_TIME)
+            .expect("the file group has a slice")
+            .clone())
+    }
+
+    /// What each reader costs on the same metadata slice, which decides whether the
+    /// seam can move.
+    ///
+    /// Parity is not only values: a replacement that agrees on every record while
+    /// doing more work is a regression every equality test above passes. So this
+    /// asserts agreement first, and only then times, which also means a fast wrong
+    /// answer fails the run instead of printing a good number.
+    ///
+    /// `#[ignore]`d because a wall time is a measurement, not an assertion: it moves
+    /// with the machine and would make CI flaky. Run it deliberately, in release,
+    /// since the two readers' work is different in kind (Avro decode against Arrow
+    /// kernels) and a debug build penalises them differently:
+    ///
+    /// ```text
+    /// cargo test --release -p hudi-core --lib reader_cost_on_a_metadata_slice \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn reader_cost_on_a_metadata_slice() -> crate::Result<()> {
+        use std::time::Instant;
+
+        let configs = metadata_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let v1 = MetadataTableFileGroupReader::new(configs.clone(), storage.clone());
+        let v2 = MetadataTableV2Reader::new(configs.clone(), storage.clone());
+        let full = precompact_slice()?;
+        let base_only = base_only_slice()?;
+
+        const WARM: usize = 20;
+        const ITERS: usize = 60;
+        println!("{:28} {:>10} {:>10} {:>8}", "slice", "v1", "v2", "ratio");
+        for (label, slice, keys) in [
+            ("base + 8 logs, all keys", &full, &[][..]),
+            ("base + 8 logs, one key", &full, &["city=chennai"][..]),
+            ("base only, all keys", &base_only, &[][..]),
+        ] {
+            let a = v1.read_files_partition(slice, keys).await?;
+            let b = v2.read_files_partition(slice, keys).await?;
+            assert_eq!(
+                comparable(&a),
+                comparable(&b),
+                "{label}: the readers must agree before a timing means anything"
+            );
+
+            for _ in 0..WARM {
+                v1.read_files_partition(slice, keys).await?;
+                v2.read_files_partition(slice, keys).await?;
+            }
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                v1.read_files_partition(slice, keys).await?;
+            }
+            let d1 = t.elapsed() / ITERS as u32;
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                v2.read_files_partition(slice, keys).await?;
+            }
+            let d2 = t.elapsed() / ITERS as u32;
+            println!(
+                "{label:28} {:>8}us {:>8}us {:>7.2}x",
+                d1.as_micros(),
+                d2.as_micros(),
+                d2.as_secs_f64() / d1.as_secs_f64()
+            );
+        }
+        Ok(())
+    }
+
     /// The v2-backed reader returns what the existing reader returns, record for
     /// record and value for value.
     ///
