@@ -294,7 +294,6 @@ fn normalise_partition(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::table::HudiTableConfig;
     use crate::file_group::FileGroup;
     use crate::metadata::table::reader::MetadataTableFileGroupReader;
     use hudi_test::QuickstartTripsTable;
@@ -326,35 +325,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .to_string();
-        // The metadata table's own properties, as its `hoodie.properties` states
-        // them. The record-key pair is load-bearing: without it the key resolves to
-        // `_hoodie_record_key`, which every metadata record leaves empty, and the
-        // merge collapses every key onto one entry.
-        Arc::new(HudiConfigs::new([
-            (HudiTableConfig::BasePath.as_ref(), uri),
-            (
-                HudiTableConfig::BaseFileFormat.as_ref(),
-                "hfile".to_string(),
-            ),
-            (HudiTableConfig::RecordKeyFields.as_ref(), "key".to_string()),
-            (
-                HudiTableConfig::PopulatesMetaFields.as_ref(),
-                "false".to_string(),
-            ),
-            ("hoodie.record.merge.mode", "CUSTOM".to_string()),
-            (
-                "hoodie.record.merge.strategy.id",
-                "00000000-0000-0000-0000-000000000000".to_string(),
-            ),
-            (
-                "hoodie.compaction.payload.class",
-                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
-            ),
-            (
-                crate::config::read::HudiReadConfig::EndTimestamp.as_ref(),
-                crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string(),
-            ),
-        ]))
+        crate::metadata::table::test_support::metadata_table_configs(&uri)
     }
 
     fn precompact_slice() -> crate::Result<FileSlice> {
@@ -370,29 +341,7 @@ mod tests {
             .clone())
     }
 
-    /// One file entry, flattened for comparison: name, size, tombstone flag.
-    type FileEntry = (String, i64, bool);
-    /// One record, flattened: key, partition type, and its entries in a stable order.
-    type ComparableRecord = (String, i32, Vec<FileEntry>);
-
-    /// Both readers' output in a comparable shape, so a mismatch prints the values
-    /// that differ rather than a pair of hash maps.
-    fn comparable(records: &HashMap<String, FilesPartitionRecord>) -> Vec<ComparableRecord> {
-        let mut out: Vec<_> = records
-            .values()
-            .map(|r| {
-                let mut files: Vec<FileEntry> = r
-                    .files
-                    .values()
-                    .map(|f| (f.name.clone(), f.size, f.is_deleted))
-                    .collect();
-                files.sort();
-                (r.key.clone(), r.record_type as i32, files)
-            })
-            .collect();
-        out.sort();
-        out
-    }
+    use crate::metadata::table::test_support::comparable;
 
     /// The v2-backed reader returns what the existing reader returns, record for
     /// record and value for value.

@@ -32,6 +32,9 @@ pub(crate) mod reader;
 #[allow(dead_code)]
 pub(crate) mod v2_reader;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use crate::config::HudiConfigs;
 use crate::storage::Storage;
 use std::collections::HashMap;
@@ -350,177 +353,247 @@ mod tests {
         assert!(chennai.total_size() > 0);
     }
 
-    /// Does v2 fold an entry-level tombstone the way v1 does?
-    ///
-    /// A cleaned file arrives in the metadata table as a `filesystemMetadata` entry
-    /// with `size = 0, isDeleted = true`, written by
-    /// `HoodieMetadataPayload.DELETE_FILE_METADATA`. No fixture in this repo carries
-    /// one, because the fixture table was never cleaned, so this builds the slice:
-    /// a base file naming a file live and a log block naming the same file deleted.
-    ///
-    /// Both readers must agree, and they do: the key survives with an empty file
-    /// map, so a tombstone cancels the entry rather than lingering as a deleted one.
-    ///
-    /// The two HFiles are committed fixtures, 12.5 KB each, written by the generator
-    /// described in `tasks/eng-47790-v2-multi-batch-decode/log.md`. The log file
-    /// around one of them is built here rather than committed, so the framing this
-    /// test depends on is visible in the test.
-    #[tokio::test]
-    async fn an_entry_level_tombstone_folds_the_same_in_both_readers() {
-        use crate::file_group::FileGroup;
-        use crate::table::ReadOptions;
-
-        let dir = std::path::PathBuf::from("tests/data/metadata_tombstone");
-        let schema_json = std::fs::read_to_string(dir.join("metadata-record.avsc")).unwrap();
-        let live = std::fs::read(dir.join("files-live.hfile")).unwrap();
-        let tomb = std::fs::read(dir.join("files-tombstone.hfile")).unwrap();
-
-        // An HFile block inside a Hudi log file. Framing mirrors `memory_bench`'s
-        // `build_block`, with the block type set to HFile and the content being the
-        // HFile's own bytes rather than length-prefixed Avro data.
-        fn hfile_log_block(hfile: &[u8], schema: &str, instant: &str) -> Vec<u8> {
-            const MAGIC: &[u8] = b"#HUDI#";
-            let mut header = Vec::new();
-            header.extend_from_slice(&2u32.to_be_bytes());
-            for (key, value) in [(0u32, instant), (2u32, schema)] {
-                header.extend_from_slice(&key.to_be_bytes());
-                header.extend_from_slice(&(value.len() as u32).to_be_bytes());
-                header.extend_from_slice(value.as_bytes());
-            }
-            let mut body = Vec::new();
-            body.extend_from_slice(&1u32.to_be_bytes()); // log format version
-            body.extend_from_slice(&4u32.to_be_bytes()); // BlockType::HfileData
-            body.extend_from_slice(&header);
-            body.extend_from_slice(&(hfile.len() as u64).to_be_bytes());
-            body.extend_from_slice(hfile);
-            body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
-            let block_length = (body.len() + 8) as u64;
-            let mut out = Vec::new();
-            out.extend_from_slice(MAGIC);
-            out.extend_from_slice(&block_length.to_be_bytes());
-            out.extend_from_slice(&body);
-            out.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
-            out
+    /// An HFile block inside a Hudi log file. Framing mirrors `memory_bench`'s
+    /// `build_block`, with the block type set to HFile and the content being the
+    /// HFile's own bytes rather than length-prefixed Avro data. Built here rather
+    /// than committed, so the framing the tests below depend on stays readable.
+    fn hfile_log_block(hfile: &[u8], schema: &str, instant: &str) -> Vec<u8> {
+        const MAGIC: &[u8] = b"#HUDI#";
+        let mut header = Vec::new();
+        header.extend_from_slice(&2u32.to_be_bytes());
+        for (key, value) in [(0u32, instant), (2u32, schema)] {
+            header.extend_from_slice(&key.to_be_bytes());
+            header.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            header.extend_from_slice(value.as_bytes());
         }
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // log format version
+        body.extend_from_slice(&4u32.to_be_bytes()); // BlockType::HfileData
+        body.extend_from_slice(&header);
+        body.extend_from_slice(&(hfile.len() as u64).to_be_bytes());
+        body.extend_from_slice(hfile);
+        body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
+        let block_length = (body.len() + 8) as u64;
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&block_length.to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
+        out
+    }
 
-        // A metadata file group on disk: the live base file, then a log file whose
-        // one block deletes the file the base named.
+    /// The committed HFiles under `tests/data/metadata_slices`, whose contents and
+    /// provenance that directory's `README.md` states.
+    fn slice_fixture(name: &str) -> Vec<u8> {
+        std::fs::read(std::path::Path::new("tests/data/metadata_slices").join(name)).unwrap()
+    }
+
+    /// A one-file-group `files` partition on disk: the base HFile, and when one is
+    /// given, a log file whose single block holds the other HFile.
+    ///
+    /// Returns the temp dir so the caller keeps it alive for the length of the read.
+    fn metadata_slice_on_disk(
+        base_hfile: &[u8],
+        log_hfile: Option<&[u8]>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<HudiConfigs>,
+        Arc<Storage>,
+        crate::file_group::file_slice::FileSlice,
+    ) {
+        use crate::file_group::FileGroup;
+
+        let schema_json = String::from_utf8(slice_fixture("metadata-record.avsc")).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let part = tmp.path().join("files");
         std::fs::create_dir_all(&part).unwrap();
         let base_name = "files-0000-0_0-1-1_00000000000000000.hfile";
         let log_name = ".files-0000-0_00000000000000000.log.1_0-2-2";
-        std::fs::write(part.join(base_name), &live).unwrap();
-        std::fs::write(
-            part.join(log_name),
-            hfile_log_block(&tomb, &schema_json, "20250101000000000"),
-        )
-        .unwrap();
+        std::fs::write(part.join(base_name), base_hfile).unwrap();
+        if let Some(log_hfile) = log_hfile {
+            std::fs::write(
+                part.join(log_name),
+                hfile_log_block(log_hfile, &schema_json, "20250101000000000"),
+            )
+            .unwrap();
+        }
 
         let base_url =
             url::Url::from_directory_path(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
-        let opts =
-            ReadOptions::new().with_end_timestamp(crate::file_group::reader_v2::MAX_INSTANT_TIME);
-        let configs = Arc::new(HudiConfigs::new(
-            [
-                (
-                    crate::config::table::HudiTableConfig::BasePath
-                        .as_ref()
-                        .to_string(),
-                    base_url.as_str().to_string(),
-                ),
-                (
-                    crate::config::table::HudiTableConfig::BaseFileFormat
-                        .as_ref()
-                        .to_string(),
-                    "hfile".to_string(),
-                ),
-                (
-                    crate::config::table::HudiTableConfig::RecordKeyFields
-                        .as_ref()
-                        .to_string(),
-                    "key".to_string(),
-                ),
-                (
-                    crate::config::table::HudiTableConfig::PopulatesMetaFields
-                        .as_ref()
-                        .to_string(),
-                    "false".to_string(),
-                ),
-                ("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()),
-                (
-                    "hoodie.record.merge.strategy.id".to_string(),
-                    "00000000-0000-0000-0000-000000000000".to_string(),
-                ),
-                (
-                    "hoodie.compaction.payload.class".to_string(),
-                    "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
-                ),
-            ]
-            .into_iter()
-            .chain(opts.hudi_options.clone()),
-        ));
+        let configs = test_support::metadata_table_configs(base_url.as_str());
         let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
 
         let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
         fg.add_base_file_from_name(base_name).unwrap();
-        fg.add_log_files_from_names(vec![log_name]).unwrap();
+        if log_hfile.is_some() {
+            fg.add_log_files_from_names(vec![log_name]).unwrap();
+        }
         let slice = fg
             .get_file_slice_as_of(crate::file_group::reader_v2::MAX_INSTANT_TIME)
             .expect("a slice")
             .clone();
 
+        (tmp, configs, storage, slice)
+    }
+
+    /// Read one metadata slice through both readers, requiring they agree.
+    ///
+    /// Agreement is half the point: v2 is intended to replace v1 at the seam, so any
+    /// value the two disagree on is a regression regardless of which one is right.
+    /// The other half is the caller's, which asserts the absolute values, since two
+    /// readers can agree and both be wrong.
+    async fn read_both(
+        configs: Arc<HudiConfigs>,
+        storage: Arc<Storage>,
+        slice: &crate::file_group::file_slice::FileSlice,
+        keys: &[&str],
+    ) -> Vec<test_support::ComparableRecord> {
         let v1 = reader::MetadataTableFileGroupReader::new(configs.clone(), storage.clone())
-            .read_files_partition(&slice, &[])
+            .read_files_partition(slice, keys)
             .await;
         let v2 = v2_reader::MetadataTableV2Reader::new(configs.clone(), storage.clone())
-            .read_files_partition(&slice, &[])
+            .read_files_partition(slice, keys)
             .await;
 
         match (&v1, &v2) {
             (Ok(a), Ok(b)) => {
-                assert_eq!(
-                    a.len(),
-                    1,
-                    "the fixture holds one partition record, or this tests nothing"
-                );
-                for (k, ra) in a {
-                    let rb = b.get(k).expect("v2 must return the same keys");
-                    let mut fa: Vec<_> = ra
-                        .files
-                        .iter()
-                        .map(|(n, i)| (n.clone(), i.size, i.is_deleted))
-                        .collect();
-                    let mut fb: Vec<_> = rb
-                        .files
-                        .iter()
-                        .map(|(n, i)| (n.clone(), i.size, i.is_deleted))
-                        .collect();
-                    fa.sort();
-                    fb.sort();
-                    assert_eq!(fa, fb, "the tombstone fold must agree for key {k}");
-                    assert!(
-                        fa.is_empty(),
-                        "a tombstone over the only live entry must cancel it, leaving \
-                         the key with no files, got {fa:?}"
-                    );
-                }
+                let (a, b) = (test_support::comparable(a), test_support::comparable(b));
+                assert_eq!(a, b, "the two readers must agree record for record");
+                a
             }
             (a, b) => panic!("v1: {a:?}\nv2: {b:?}"),
         }
+    }
+
+    /// Does v2 fold an entry-level tombstone the way v1 does?
+    ///
+    /// A cleaned file arrives in the metadata table as a `filesystemMetadata` entry
+    /// with `size = 0, isDeleted = true`, written by
+    /// `HoodieMetadataPayload.DELETE_FILE_METADATA`. No fixture table in this repo
+    /// carries one, because none of them was ever cleaned, so this builds the slice:
+    /// a base file naming a file live and a log block naming the same file deleted.
+    ///
+    /// The key survives with an empty file map, so a tombstone cancels the entry
+    /// rather than lingering as a deleted one.
+    #[tokio::test]
+    async fn an_entry_level_tombstone_folds_the_same_in_both_readers() {
+        let (_tmp, configs, storage, slice) = metadata_slice_on_disk(
+            &slice_fixture("files-live.hfile"),
+            Some(&slice_fixture("files-tombstone.hfile")),
+        );
+        let agreed = read_both(configs, storage, &slice, &[]).await;
+
+        assert_eq!(
+            agreed,
+            vec![(
+                "city=p00000000".to_string(),
+                MetadataRecordType::Files as i32,
+                vec![]
+            )],
+            "a tombstone over the only live entry must cancel it, leaving the key \
+             with no files"
+        );
+    }
+
+    /// Does a non-partitioned table's `.` record read the same through both readers?
+    ///
+    /// The `files` partition of a non-partitioned table holds one record keyed `.`,
+    /// which both readers must hand back as the empty string, since that is the form
+    /// `fetch_files_partition_records` and every caller above it work in. No fixture
+    /// in this repo is a non-partitioned table with a metadata table
+    /// (`v9_mor_nonpart_3commits` has none), so this builds the slice from two
+    /// `.`-keyed HFiles naming two different files.
+    ///
+    /// A base file plus a log block, rather than a base file alone, for two reasons.
+    /// The union of the two file maps is what catches a merge that overwrites the
+    /// record instead of folding its `filesystemMetadata`. And the read is a keyed
+    /// one, where the predicate narrows only the base file and never the log
+    /// records, so a predicate compared against the normalised key rather than the
+    /// key as stored drops the base record while the log record survives, which a
+    /// base-only slice would not show. Asking for `""` instead of `.` finds nothing
+    /// in either reader.
+    #[tokio::test]
+    async fn a_non_partitioned_record_reads_as_an_empty_key_in_both_readers() {
+        let (_tmp, configs, storage, slice) = metadata_slice_on_disk(
+            &slice_fixture("nonpartitioned-base.hfile"),
+            Some(&slice_fixture("nonpartitioned-log.hfile")),
+        );
+        let agreed = read_both(
+            configs,
+            storage,
+            &slice,
+            &[FilesPartitionRecord::NON_PARTITIONED_NAME],
+        )
+        .await;
+
+        assert_eq!(
+            agreed,
+            vec![(
+                String::new(),
+                MetadataRecordType::Files as i32,
+                vec![
+                    (
+                        "f00000000-0_0-1-1_20250101000000000.parquet".to_string(),
+                        1024,
+                        false
+                    ),
+                    (
+                        "f00000001-0_0-1-1_20250101000000000.parquet".to_string(),
+                        1024,
+                        false
+                    ),
+                ]
+            )],
+            "the one `.` record must come back keyed by the empty string, with the \
+             log block's file merged into the base file's"
+        );
+    }
+
+    /// The other `.`: inside the all-partitions record's map, where it names a
+    /// partition rather than a file.
+    ///
+    /// This one has a production consumer the record key does not, `partition_names`,
+    /// which feeds the pruner. A `.` left unnormalised there makes the pruner compare
+    /// the data table's empty partition path against `.` and prune the table's only
+    /// partition away, so both the map key and the entry's own `name` field have to
+    /// be cleared.
+    #[tokio::test]
+    async fn a_non_partitioned_all_partitions_entry_reads_as_empty_in_both_readers() {
+        let (_tmp, configs, storage, slice) =
+            metadata_slice_on_disk(&slice_fixture("allpartitions-dot.hfile"), None);
+        let agreed = read_both(
+            configs,
+            storage,
+            &slice,
+            &[FilesPartitionRecord::ALL_PARTITIONS_KEY],
+        )
+        .await;
+
+        assert_eq!(
+            agreed,
+            vec![(
+                FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
+                MetadataRecordType::AllPartitions as i32,
+                vec![(String::new(), 0, false)]
+            )],
+            "the `.` partition entry must come back named by the empty string"
+        );
     }
 
     /// The pruned-keys branch of `fetch_files_partition_records`: read
     /// `__all_partitions__` first, prune, then read only the surviving partitions.
     ///
     /// The three branches are the reason this matters. The unfiltered branch is
-    /// covered by `hudi_table_read_metadata_table_files_partition` above, which now
-    /// runs through the version two layer since the seam was swapped. This covers
-    /// the filtered one. The **non-partitioned** branch, which asks for `.`, cannot
-    /// be covered end to end: no fixture in this repo is a non-partitioned table
-    /// with a metadata table (`v9_mor_nonpart_3commits` has none), so the `.` to
-    /// empty-string normalisation it depends on is unit-tested in `v2_reader`
-    /// instead, and said so there.
+    /// covered by `hudi_table_read_metadata_table_files_partition` above; this
+    /// covers the filtered one; and the keys the non-partitioned branch asks for are
+    /// covered by `a_non_partitioned_record_reads_as_an_empty_key_in_both_readers`,
+    /// which reads a `.` record through both readers.
+    ///
+    /// What none of the three exercises is the branch *selection* itself, since no
+    /// fixture here is a non-partitioned table carrying a metadata table
+    /// (`v9_mor_nonpart_3commits` has none). That selection sits above the reader
+    /// seam and so is the same code whichever reader runs underneath, which is why
+    /// covering the keys it passes was the part worth building a fixture for.
     #[tokio::test]
     async fn hudi_table_read_metadata_table_files_partition_with_pruning() {
         let data_table = get_data_table().await;
