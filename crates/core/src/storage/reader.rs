@@ -367,6 +367,20 @@ impl StorageReader {
         start >= self.window_start && end <= self.window_start + self.window.len() as u64
     }
 
+    /// Whether `[start, end)` can be handed out without another request.
+    ///
+    /// True for a whole-file reader, and for a streaming one whose current window
+    /// already spans the range. A caller that would otherwise defer a read can ask
+    /// this first and take the bytes it already paid for: a log file smaller than
+    /// one window is fetched entirely by the first fill, so deferring its blocks'
+    /// content buys nothing and costs a second request.
+    pub fn has_resident(&self, start: u64, end: u64) -> bool {
+        if self.whole.is_some() {
+            return end <= self.file_len;
+        }
+        self.window_covers(start, end)
+    }
+
     /// Fetch a window starting at the cursor.
     async fn fill_window(&mut self) -> Result<()> {
         let end = self.pos.saturating_add(self.window_size).min(self.file_len);

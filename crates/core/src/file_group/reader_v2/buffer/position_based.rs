@@ -357,10 +357,6 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
             }
         };
 
-        let decode_start = std::time::Instant::now();
-        // Blocks arrive with their content read; nothing to fetch here.
-        self.inner.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
-
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let mut pos_idx = 0usize;
             for batch in record_batches.data_batches {
@@ -417,10 +413,6 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                 return self.inner.process_delete_block(block);
             }
         };
-
-        let decode_start = std::time::Instant::now();
-        // Blocks arrive with their content read; nothing to fetch here.
-        self.inner.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let mut pos_idx = 0usize;
@@ -494,10 +486,6 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
 
     fn get_total_log_records(&self) -> u64 {
         self.inner.get_total_log_records()
-    }
-
-    fn stage_decode_ms(&self) -> u64 {
-        self.inner.stage_decode_ms()
     }
 
     fn merge_map_peak_entries(&self) -> u64 {

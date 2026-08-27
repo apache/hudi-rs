@@ -117,10 +117,27 @@ impl LogFileReader {
     ///
     /// `instant_range` is not applied here — the caller decides what to admit
     /// from the headers, which is the point of not decoding yet.
-    pub async fn read_all_blocks_metadata_only(&mut self) -> Result<Vec<LogBlock>> {
+    /// Walk with no residency bound.
+    ///
+    /// For callers that are measuring or exercising the walk itself rather than a
+    /// scan. Production goes through [`Self::read_all_blocks_metadata_only`] with a
+    /// budget shared across every log file, which is what keeps peak residency at
+    /// one window.
+    pub async fn read_all_blocks_metadata_only_unbounded(&mut self) -> Result<Vec<LogBlock>> {
+        let mut budget = u64::MAX;
+        self.read_all_blocks_metadata_only(&mut budget).await
+    }
+
+    pub async fn read_all_blocks_metadata_only(
+        &mut self,
+        resident_budget: &mut u64,
+    ) -> Result<Vec<LogBlock>> {
         let fetcher = self.reader.block_fetcher();
         let mut blocks = Vec::new();
-        while let Some(block) = self.read_next_block_metadata_only(&fetcher).await? {
+        while let Some(block) = self
+            .read_next_block_metadata_only(&fetcher, resident_budget)
+            .await?
+        {
             blocks.push(block);
         }
         Ok(blocks)
@@ -427,6 +444,7 @@ impl LogFileReader {
     async fn read_next_block_metadata_only(
         &mut self,
         fetcher: &LogBlockFetcher,
+        resident_budget: &mut u64,
     ) -> Result<Option<LogBlock>> {
         let magic_pos = self.reader.position();
         if !self.read_magic().await? {
@@ -472,10 +490,37 @@ impl LogFileReader {
             payload_length
         };
 
-        // Skip the content; the footer and trailing length follow it.
+        // Take the content when it is already in hand, and skip past it otherwise.
+        //
+        // Deferring is what lets a scan walk a large file without holding it, and
+        // it is why a block the gates discard costs no bytes. It buys nothing when
+        // the bytes have already been transferred: a log file smaller than one
+        // fetch window arrives whole on the first fill, so deferring its blocks
+        // would re-request bytes this reader is already holding, one extra round
+        // trip per file. The slice is zero-copy, sharing the window's allocation.
         let after_content = content_position
             .checked_add(content_length)
             .ok_or_else(|| CoreError::LogFormatError("Content length overflow".to_string()))?;
+        let affordable = *resident_budget >= content_length;
+        let resident_content =
+            if affordable && self.reader.has_resident(content_position, after_content) {
+                self.reader.seek_to(content_position);
+                let window_slice = self
+                    .reader
+                    .read_bytes(content_length)
+                    .await
+                    .map_err(CoreError::ReadLogFileError)?;
+                *resident_budget -= content_length;
+                // Copied, not sliced. `Bytes` slices share their allocation, so keeping
+                // a slice would pin the whole fetch window: one retained block would
+                // hold `hoodie.memory.dfs.buffer.max.size` rather than its own content,
+                // and a scan accumulates blocks from every log file before the gates
+                // run. Copying makes residency the block's own length, which the budget
+                // above then bounds.
+                Some(bytes::Bytes::copy_from_slice(&window_slice))
+            } else {
+                None
+            };
         self.reader.seek_to(after_content);
         let footer = self
             .read_block_metadata(BlockMetadataType::Footer, &format_version)
@@ -496,6 +541,9 @@ impl LogFileReader {
             },
             fetcher: fetcher.clone(),
         });
+        // Bytes already in hand short-circuit the fetch, not the checks: the
+        // location above is what the decode validates the byte count against.
+        block.resident_content = resident_content;
         Ok(Some(block))
     }
 
@@ -581,6 +629,125 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::PathBuf;
 
+    /// The walk keeps at most the budget it was given, whatever the file holds.
+    ///
+    /// Without a bound, a block's kept bytes are memory the header walk exists to
+    /// avoid: a scan accumulates blocks from every log file before the gates run,
+    /// so residency would sum across the slice rather than staying at one window.
+    #[tokio::test]
+    async fn the_walk_keeps_no_more_than_its_residency_budget() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let base_url = parse_uri(&dir)?;
+        let configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+            (HudiTableConfig::OrderingFields.as_ref(), "ts"),
+        ]));
+
+        let walk = async |budget: u64| -> Result<(usize, u64, u64)> {
+            let storage =
+                Storage::new(Arc::new(std::collections::HashMap::new()), configs.clone())?;
+            let mut reader =
+                LogFileReader::new_streaming(configs.clone(), storage, &file_name).await?;
+            let mut left = budget;
+            let blocks = reader.read_all_blocks_metadata_only(&mut left).await?;
+            let kept: u64 = blocks
+                .iter()
+                .filter_map(|b| b.resident_content.as_ref().map(|c| c.len() as u64))
+                .sum();
+            Ok((blocks.len(), kept, budget - left))
+        };
+
+        // Generous: the file is far inside one window, so every block is kept.
+        let (blocks, kept, charged) = walk(u64::MAX).await?;
+        assert!(blocks > 0, "the fixture must hold blocks");
+        assert!(kept > 0, "a generous budget must let the walk keep content");
+        assert_eq!(kept, charged, "what is kept must be what is charged");
+
+        // Zero: nothing may be kept, and the deferred path takes over.
+        let (_, kept_none, charged_none) = walk(0).await?;
+        assert_eq!(
+            (kept_none, charged_none),
+            (0, 0),
+            "a zero budget must leave the walk holding nothing"
+        );
+
+        // One byte under what the first block needs: still nothing kept, which is
+        // what makes the budget a bound rather than a suggestion.
+        let (_, kept_short, _) = walk(kept - 1).await?;
+        assert!(
+            kept_short < kept,
+            "a budget below the total must keep less than everything: {kept_short} against {kept}"
+        );
+        Ok(())
+    }
+
+    /// A log file inside one fetch window costs one request, not two.
+    ///
+    /// Asserted by request count rather than by the records returned, because both
+    /// paths return the same records over the same file: that is the point. The
+    /// counts come from a store that wraps the real one and counts what passes
+    /// through.
+    #[tokio::test]
+    async fn a_log_file_inside_one_window_is_read_in_a_single_request() -> Result<()> {
+        use crate::storage::counting::CountingObjectStore;
+
+        let (dir, file_name) = get_valid_log_avro_data();
+        let base_url = parse_uri(&dir)?;
+
+        async fn walk(
+            base_url: url::Url,
+            file_name: &str,
+            window: &str,
+        ) -> Result<(usize, usize, usize, usize)> {
+            let configs = Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+                (HudiTableConfig::OrderingFields.as_ref(), "ts"),
+                (crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE, window),
+            ]));
+            let (store, counts) =
+                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+            let storage = Storage::new_with_object_store(base_url, store, configs.clone());
+            let mut reader = LogFileReader::new_streaming(configs, storage, file_name).await?;
+            let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+            let resident = blocks
+                .iter()
+                .filter(|b| b.resident_content.is_some())
+                .count();
+            Ok((blocks.len(), resident, counts.gets(), counts.heads()))
+        }
+
+        // Inside one window: the walk holds every block's content, so nothing is
+        // left to fetch and the whole file cost one request.
+        let (blocks, resident, gets, heads) =
+            walk(base_url.clone(), &file_name, "16777216").await?;
+        assert!(blocks > 0, "the fixture must hold blocks");
+        assert_eq!(
+            resident, blocks,
+            "every block in a file inside one window must hold its own content"
+        );
+        assert_eq!(
+            (gets, heads),
+            (1, 1),
+            "one window fill and the size lookup, and nothing else"
+        );
+
+        // Smaller than the file: the walk cannot hold the content, so blocks defer
+        // and each one's bytes cost a request of its own later. Unchanged behaviour.
+        let (blocks_small, resident_small, gets_small, _) =
+            walk(base_url, &file_name, "64").await?;
+        assert_eq!(blocks_small, blocks, "the same file holds the same blocks");
+        assert_eq!(
+            resident_small, 0,
+            "a window smaller than the file must leave every block deferred"
+        );
+        assert!(
+            gets_small > gets,
+            "the windowed walk issues more requests than the single fill, got \
+             {gets_small} against {gets}"
+        );
+        Ok(())
+    }
+
     fn get_valid_log_avro_data() -> (String, String) {
         let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
         (
@@ -640,7 +807,7 @@ mod tests {
 
         let mut lazy =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, file_name).await?;
-        let mut lazy_blocks = lazy.read_all_blocks_metadata_only().await?;
+        let mut lazy_blocks = lazy.read_all_blocks_metadata_only_unbounded().await?;
 
         assert_eq!(
             lazy_blocks.len(),
@@ -737,7 +904,7 @@ mod tests {
         let storage = Storage::new_with_base_url(dir_url)?;
         let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
 
-        let blocks = reader.read_all_blocks_metadata_only().await?;
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
         assert!(!blocks.is_empty(), "the fixture has blocks to walk");
         for block in &blocks {
             assert!(
@@ -774,7 +941,7 @@ mod tests {
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
         let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
         let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
-        let blocks = reader.read_all_blocks_metadata_only().await?;
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
 
         let deferred: Vec<_> = blocks
             .iter()
@@ -820,13 +987,32 @@ mod tests {
         let copied = tmp.path().join(&file_name);
         std::fs::copy(PathBuf::from(&dir).join(&file_name), &copied).unwrap();
 
-        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
-        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        // A window of one byte forces every block to defer its content, which is
+        // the path where a ranged read can come back short. Left at the default,
+        // the walk would hold the whole file and decode from bytes it read before
+        // the truncation below, so the case would never arise.
+        //
+        // The window is read from the STORAGE's configs, not the reader's, so it
+        // has to be set on the storage or the setting is silently ignored.
+        let base_url = parse_uri(tmp.path().to_str().unwrap())?;
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::OrderingFields.as_ref(), "ts"),
+            (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+            (crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE, "1"),
+        ]));
+        let storage = Storage::new(
+            Arc::new(std::collections::HashMap::new()),
+            hudi_configs.clone(),
+        )?;
         let mut reader =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
-        let mut blocks = reader.read_all_blocks_metadata_only().await?;
+        let mut blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
 
         let block = blocks.last_mut().expect("the fixture has a block to walk");
+        assert!(
+            block.resident_content.is_none(),
+            "the tiny window must have forced deferral, or this tests nothing"
+        );
         let location = block
             .deferred_content
             .as_ref()
@@ -866,7 +1052,7 @@ mod tests {
         let storage = Storage::new_with_base_url(parse_uri(&dir)?)?;
         let mut reader =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
-        let mut blocks = reader.read_all_blocks_metadata_only().await?;
+        let mut blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
         assert!(
             blocks.iter().any(|b| b.block_type == BlockType::Command),
             "this fixture is chosen for its command block, which decodes to no content"
@@ -900,7 +1086,9 @@ mod tests {
         let storage = Storage::new_with_base_url(dir_url)?;
         let mut lazy_reader =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
-        let mut lazy = lazy_reader.read_all_blocks_metadata_only().await?;
+        let mut lazy = lazy_reader
+            .read_all_blocks_metadata_only_unbounded()
+            .await?;
 
         let decoder = Decoder::new(hudi_configs);
         for block in lazy.iter_mut() {
@@ -1127,7 +1315,7 @@ mod tests {
 
         let mut lazy =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
-        let mut lazy_blocks = lazy.read_all_blocks_metadata_only().await?;
+        let mut lazy_blocks = lazy.read_all_blocks_metadata_only_unbounded().await?;
         assert_eq!(
             lazy_blocks
                 .iter()

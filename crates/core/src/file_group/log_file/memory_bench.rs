@@ -175,7 +175,10 @@ async fn bench_log_read_memory() {
             let mut reader = LogFileReader::new_streaming(configs(), storage, name)
                 .await
                 .unwrap();
-            let mut blocks = reader.read_all_blocks_metadata_only().await.unwrap();
+            let mut blocks = reader
+                .read_all_blocks_metadata_only_unbounded()
+                .await
+                .unwrap();
             let decoder = Decoder::new(configs());
             let mut rows = 0usize;
             let mut peak = rss_mb();

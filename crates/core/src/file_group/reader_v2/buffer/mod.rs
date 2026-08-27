@@ -132,14 +132,6 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Returns the total number of log records processed.
     fn get_total_log_records(&self) -> u64;
 
-    /// Stage timing (perf harness): cumulative wall ms spent inflating /
-    /// decoding log blocks inside `process_data_block` / `process_delete_block`.
-    /// A subset of the merge-insert stat window. Default 0 for buffers
-    /// that don't instrument decode.
-    fn stage_decode_ms(&self) -> u64 {
-        0
-    }
-
     /// Stage stat (perf harness): peak number of entries the merge map
     /// held during the scan. Default 0 for buffers that don't track it.
     fn merge_map_peak_entries(&self) -> u64 {

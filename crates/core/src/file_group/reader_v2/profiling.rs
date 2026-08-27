@@ -29,7 +29,11 @@
 //! `process_queued_blocks_for_instant`); a macro releases the body's borrow before
 //! the field write.
 
-/// Record wall-ms of `$body` once into the u64 place `$dst`.
+/// Record wall-us of `$body` once into the u64 place `$dst`.
+///
+/// Microseconds, not milliseconds: a metadata-table read completes in about 1.3ms
+/// in release, where every millisecond-granular stage rounds to zero and the
+/// counters say nothing about where the time went.
 ///
 /// Where the body is a single fallible expression, keep `?` OUTSIDE the macro so
 /// the elapsed time is still attributed on the error path.
@@ -38,9 +42,25 @@ macro_rules! profile_once {
         let __start = std::time::Instant::now();
         #[allow(clippy::let_unit_value)]
         let __out = $body;
-        $dst = __start.elapsed().as_millis() as u64;
+        $dst = __start.elapsed().as_micros() as u64;
         __out
     }};
 }
 
+/// Add wall-us of `$body` to the u64 place `$dst`.
+///
+/// The accumulating form, for a stage entered once per block or per window rather
+/// than once per read. `profile_once!` assigns, so using it in a loop would report
+/// only the last iteration.
+macro_rules! profile_add {
+    ($dst:expr, $body:expr) => {{
+        let __start = std::time::Instant::now();
+        #[allow(clippy::let_unit_value)]
+        let __out = $body;
+        $dst += __start.elapsed().as_micros() as u64;
+        __out
+    }};
+}
+
+pub(crate) use profile_add;
 pub(crate) use profile_once;

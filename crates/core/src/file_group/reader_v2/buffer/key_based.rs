@@ -1447,11 +1447,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     fn process_data_block(&mut self, block: &mut LogBlock) -> Result<()> {
         // Mirrors Java: getRecordsIterator → getEngineRecordIterator
         //   → readRecordsFromBlockPayload → inflate → deserializeRecords → deflate
-        let decode_start = std::time::Instant::now();
-        // Upstream fetches a lazy block's content here. Pass 3 loads it for every
-        // admitted block before dispatch, so there is nothing left to fetch and
-        // the take below finds it present.
-        self.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let total_rows: usize = record_batches
@@ -1614,12 +1609,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// Inflates the block on demand, then iterates delete records and calls
     /// `process_next_deleted_record` for each.
     fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()> {
-        let decode_start = std::time::Instant::now();
-        // Upstream fetches a lazy block's content here. Pass 3 loads it for every
-        // admitted block before dispatch, so there is nothing left to fetch and
-        // the take below finds it present.
-        self.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
-
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let total_deletes: usize = record_batches
                 .delete_batches
@@ -1697,10 +1686,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
 
     fn get_total_log_records(&self) -> u64 {
         self.base.total_log_records
-    }
-
-    fn stage_decode_ms(&self) -> u64 {
-        self.base.stage_decode_ms
     }
 
     fn merge_map_peak_entries(&self) -> u64 {

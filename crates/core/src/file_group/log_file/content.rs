@@ -19,7 +19,7 @@
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
-use crate::file_group::log_file::avro::AvroBlockDecoder;
+use crate::file_group::log_file::avro::{AvroBlockDecoder, RegisteredWriterSchema};
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
 };
@@ -147,6 +147,18 @@ pub struct Decoder {
     hfile_as_records: bool,
     /// Keys the caller asked for, pushed into the HFile block index.
     key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
+    /// The last writer schema parsed and fingerprinted, reused by the next block
+    /// that carries the same one.
+    ///
+    /// Registering is schema-sized: it parses the schema to fingerprint it, which
+    /// on the metadata table's 8 KB record schema is about half the cost of
+    /// building a decoder, and a log file's blocks normally all share one writer
+    /// schema. Holds only data, so unlike the decoder it is safe to share; the
+    /// decoder itself is still built per block because it carries per-stream state.
+    ///
+    /// `RefCell` because `decode_content` takes `&self`, and a `Decoder` is built
+    /// per scan and used sequentially.
+    registered: std::cell::RefCell<Option<(String, RegisteredWriterSchema)>>,
 }
 
 impl Decoder {
@@ -214,6 +226,7 @@ impl Decoder {
             reader_schema_json: None,
             hfile_as_records: false,
             key_predicate: None,
+            registered: std::cell::RefCell::new(None),
         }
     }
     pub fn decode_content(
@@ -324,8 +337,23 @@ impl Decoder {
             None => (None, None),
         };
 
-        let mut decoder = AvroBlockDecoder::try_new_with_reader(
-            writer_schema_json,
+        // Registered once per writer schema rather than once per block. Compared,
+        // not hashed: a block with a different schema must not reuse another's
+        // fingerprint. One entry, since a log file normally carries one schema and
+        // a file that alternates simply re-registers rather than growing a map.
+        let registered = {
+            let mut slot = self.registered.borrow_mut();
+            match slot.as_ref() {
+                Some((json, reg)) if json == writer_schema_json => reg.clone(),
+                _ => {
+                    let reg = RegisteredWriterSchema::new(writer_schema_json)?;
+                    *slot = Some((writer_schema_json.to_string(), reg.clone()));
+                    reg
+                }
+            }
+        };
+        let mut decoder = AvroBlockDecoder::try_new_with_registered(
+            &registered,
             reader_schema_json,
             self.batch_size,
         )?;
