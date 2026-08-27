@@ -322,9 +322,14 @@ pub fn create_base_file_reader(
         BaseFileFormatValue::HFile => Ok(Arc::new(super::hfile::HFileBaseFileReader::new(
             storage.clone(),
         ))),
+        #[cfg(feature = "lance")]
         BaseFileFormatValue::Lance => Ok(Arc::new(super::lance::LanceBaseFileReader::new(
             storage.clone(),
         ))),
+        #[cfg(not(feature = "lance"))]
+        BaseFileFormatValue::Lance => Err(StorageError::UnsupportedBaseFileFormat(
+            "lance support is not enabled".to_string(),
+        )),
     }
 }
 

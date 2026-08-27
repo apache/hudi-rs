@@ -34,6 +34,9 @@ default = ["spill-rocksdb"]
 # re-enable that tier through feature unification whatever the umbrella crate
 # asked for.
 spill-rocksdb = ["hudi-core/spill-rocksdb"]
+# Forwarded the same way, for the Lance base-file reader that hudi-core keeps
+# behind its own `lance` feature.
+lance = ["hudi-core/lance"]
 
 [dependencies]
 hudi-core = { version = "0.5.0-dev", path = "../core", default-features = false, features = [

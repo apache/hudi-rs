@@ -19,7 +19,7 @@
 use crate::config::HudiConfigs;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

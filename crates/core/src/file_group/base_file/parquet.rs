@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};

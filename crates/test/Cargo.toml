@@ -40,7 +40,7 @@ parquet = { workspace = true }
 
 # datafusion (optional, for verification helpers)
 datafusion = { workspace = true, optional = true }
-hudi-datafusion = { path = "../datafusion", optional = true }
+hudi-datafusion = { path = "../datafusion", optional = true, default-features = false }
 
 # serde (reading the gold_options manifests shipped inside fixtures)
 serde = { workspace = true }

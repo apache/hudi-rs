@@ -20,7 +20,6 @@
 pub(crate) mod hudi_exec;
 pub(crate) mod util;
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
@@ -46,7 +45,6 @@ use datafusion_common::stats::Precision;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_expr::utils::split_conjunction;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
-use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
 use crate::hudi_exec::HudiScanExec;
@@ -122,6 +120,7 @@ fn filter_field_matches_partition_column(filter_field: &str, partition_column: &
 #[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
+    options: HashMap<String, String>,
     /// Cached table schema (with meta fields) for synchronous access in `TableProvider::schema()`.
     /// This provider is a construction-time metadata snapshot; create a new
     /// provider to observe schema/stat changes from later commits.
@@ -232,6 +231,7 @@ impl HudiDataSource {
             }
             None => default_file_slice_read_concurrency(),
         };
+        let options = all_options.iter().cloned().collect();
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| external_error("Failed to create Hudi table", e))?;
@@ -293,6 +293,7 @@ impl HudiDataSource {
 
         Ok(Self {
             table: Arc::new(table),
+            options,
             schema,
             partition_schema,
             cached_stats,
@@ -301,6 +302,16 @@ impl HudiDataSource {
             file_slice_read_concurrency,
             base_file_format,
         })
+    }
+
+    /// Returns the table location needed to reconstruct this provider.
+    pub fn base_uri(&self) -> String {
+        self.table.base_url().to_string()
+    }
+
+    /// Returns the caller-supplied options needed to reconstruct this provider.
+    pub fn options(&self) -> &HashMap<String, String> {
+        &self.options
     }
 
     fn get_input_partitions(&self) -> usize {
@@ -683,7 +694,7 @@ impl HudiDataSource {
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
-            let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
+            let predicate = state.create_physical_expr(expr, &df_schema)?;
             parquet_source = parquet_source.with_predicate(predicate)
         }
 
@@ -787,10 +798,6 @@ impl HudiDataSource {
 
 #[async_trait]
 impl TableProvider for HudiDataSource {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -1015,7 +1022,7 @@ impl TableProviderFactory for HudiTableFactory {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
         let options = HudiTableFactory::resolve_options(state, cmd)?;
-        let base_uri = cmd.location.as_str();
+        let base_uri = cmd.locations[0].as_str();
         let table_provider = HudiDataSource::new_with_options(base_uri, options).await?;
         Ok(Arc::new(table_provider))
     }
