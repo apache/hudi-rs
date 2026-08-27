@@ -589,7 +589,9 @@ mod tests {
             "the oracle must fold several entries per key, or the comparison is vacuous"
         );
 
-        let mut context = resolve_reader_context(&configs, /* has_log_files */ true)?;
+        let base = format!("{MDT_FILES_PARTITION}/{MDT_FILES_PRECOMPACT_BASE}");
+        let mut context =
+            resolve_reader_context(&configs, /* has_log_files */ true, Some(&base))?;
         context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
         assert_eq!(
             context.merge_mode, "CUSTOM",
@@ -600,7 +602,7 @@ mod tests {
             Arc::new(context),
             storage,
             InputSplit::new(
-                Some(format!("{MDT_FILES_PARTITION}/{MDT_FILES_PRECOMPACT_BASE}")),
+                Some(base.clone()),
                 Some("00000000000000000".to_string()),
                 MDT_FILES_PRECOMPACT_LOGS
                     .iter()
@@ -638,7 +640,9 @@ mod tests {
     ) -> crate::Result<Option<arrow_array::RecordBatch>> {
         let configs = mdt_configs();
         let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
-        let mut context = resolve_reader_context(&configs, /* has_log_files */ true)?;
+        let mut context = resolve_reader_context(
+            &configs, /* has_log_files */ true, /* base */ None,
+        )?;
         context.rebuild_record_context(MDT_PARTITION_STATS_PARTITION.to_string());
         let mut reader = HoodieFileGroupReader::new(
             Arc::new(context),
@@ -787,7 +791,8 @@ mod tests {
         ) -> crate::Result<(arrow_array::RecordBatch, u64)> {
             let configs = mdt_configs();
             let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
-            let mut context = resolve_reader_context(&configs, !logs.is_empty())?;
+            let mut context =
+                resolve_reader_context(&configs, !logs.is_empty(), Some(base.as_str()))?;
             context.rebuild_record_context(MDT_SECONDARY_INDEX_PARTITION.to_string());
             let mut reader = HoodieFileGroupReader::new(
                 Arc::new(context),
@@ -895,7 +900,11 @@ mod tests {
 
         let configs = mdt_configs();
         let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
-        let mut context = resolve_reader_context(&configs, /* has_log_files */ false)?;
+        let mut context = resolve_reader_context(
+            &configs,
+            /* has_log_files */ false,
+            Some(MDT_FILES_BASE_FILE),
+        )?;
         // The production path rebuilds this immediately (`adapter.rs`), and without
         // it the merge keys on `_hoodie_record_key` whatever the table says. A test
         // that skips it is not exercising the context the reader is really given.
@@ -1326,7 +1335,11 @@ mod tests {
             predicate: Option<KeyPredicate>,
         ) -> crate::Result<Vec<String>> {
             {
-                let mut context = resolve_reader_context(&configs, /* has_log_files */ false)?;
+                let mut context = resolve_reader_context(
+                    &configs,
+                    /* has_log_files */ false,
+                    Some(MDT_FILES_COMPACTED_BASE_FILE),
+                )?;
                 context.rebuild_record_context(MDT_FILES_PARTITION.to_string());
                 context.key_predicate = predicate;
                 let mut reader = HoodieFileGroupReader::new(

@@ -91,8 +91,11 @@ impl MetadataTableV2Reader {
             vec![]
         };
 
-        let mut reader_context =
-            resolve_reader_context(&self.hudi_configs, !log_file_paths.is_empty())?;
+        let mut reader_context = resolve_reader_context(
+            &self.hudi_configs,
+            !log_file_paths.is_empty(),
+            base_file_path.as_deref(),
+        )?;
         // The metadata table sets `hoodie.populate.meta.fields=false`, so the record
         // key is its own `key` column rather than `_hoodie_record_key`. Without this
         // the merge keys every record on an empty string and collapses them into one.
@@ -707,7 +710,9 @@ mod tests {
         slice: &FileSlice,
         keys: &[&str],
     ) -> crate::Result<u64> {
-        let mut context = resolve_reader_context(&configs, slice.has_log_file())?;
+        let base_file_path = slice.base_file_relative_path()?;
+        let mut context =
+            resolve_reader_context(&configs, slice.has_log_file(), base_file_path.as_deref())?;
         context.rebuild_record_context(FilesPartitionRecord::PARTITION_NAME.to_string());
         context.key_predicate = (!keys.is_empty())
             .then(|| KeyPredicate::Keys(keys.iter().map(|k| (*k).to_string()).collect()));

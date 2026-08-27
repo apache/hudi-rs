@@ -112,17 +112,19 @@ fn build_reader(
 ) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
     let hudi_configs = with_unbounded_end_timestamp(hudi_configs);
-    let mut context = resolve_reader_context(&hudi_configs, has_log_files)?;
+    // A slice with no base file reports an empty path; the engine keys its
+    // log-only handling on `None`, not on an empty string, and an empty path
+    // names no format either.
+    let base_file_path = (!base_file_path.is_empty()).then_some(base_file_path);
+    let mut context = resolve_reader_context(&hudi_configs, has_log_files, base_file_path)?;
     // The scan's committed/inflight gate. Supplied by a caller holding the
     // timeline; `None` leaves the gate a no-op, which is what a caller reading
     // from paths alone (the cxx bridge) can offer.
     context.completion_gate_inputs = completion_gate_inputs;
     context.rebuild_record_context(partition_path.clone());
 
-    // A slice with no base file reports an empty path; the engine keys its
-    // log-only handling on `None`, not on an empty string.
-    let base_file_path = (!base_file_path.is_empty()).then(|| base_file_path.to_string());
-    let base_file_commit_time = base_file_path.as_deref().and_then(base_file_commit_time);
+    let base_file_commit_time = base_file_path.and_then(base_file_commit_time);
+    let base_file_path = base_file_path.map(str::to_string);
 
     let input_split = InputSplit::new(
         base_file_path,
@@ -288,7 +290,7 @@ mod tests {
             ("hoodie.read.end.timestamp", "20240101000000000"),
             (HudiTableConfig::OrderingFields.as_ref(), "ts"),
         ]);
-        let context = resolve_reader_context(&configs, false).unwrap();
+        let context = resolve_reader_context(&configs, false, /* base */ None).unwrap();
         assert!(!context.has_log_files);
     }
 }

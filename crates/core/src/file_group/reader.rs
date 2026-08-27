@@ -511,16 +511,21 @@ impl FileGroupReader {
             ));
         }
 
-        // Version 2 resolves the base file format from config alone, so it
-        // reads a file whose format is only knowable from its extension as
-        // parquet and fails on the footer. Version 1 resolves per path and
-        // reads it, so this falls back rather than refusing. Decided from the
-        // path, which is a string — still no I/O.
+        // HFile outside a metadata table. Version 1 refuses it by name
+        // (`create_base_file_reader`), and falling back keeps that honest error
+        // rather than reaching version 2's `HFileBaseFileReader`, which is set
+        // up for the metadata table's records and not for a regular table's.
+        // Whether version 2 should serve a regular table's HFile base files is
+        // a separate question from this gate. Parquet and Lance both pass:
+        // version 2 resolves the format from the path with the same call this
+        // gate makes, so the two cannot disagree about a slice's format.
+        // Decided from the path, which is a string — still no I/O.
         if BaseFileFormatValue::resolve_from_configs(&self.hudi_configs, Some(base_file_path))?
-            != BaseFileFormatValue::Parquet
+            == BaseFileFormatValue::HFile
         {
             return Ok(Some(
-                "file group reader version 2 reads parquet base files only",
+                "file group reader version 2 reads an HFile base file only through the \
+                 metadata-table reader",
             ));
         }
 
@@ -2473,20 +2478,33 @@ mod file_group_reader_version_tests {
     /// Regression test: a base file whose format is only knowable from its extension
     /// falls back to version 1 rather than being read as parquet.
     ///
-    /// Version 2 resolves the format from `hoodie.table.base.file.format`
-    /// alone, so a Lance table that never sets it — the extension-fallback case
-    /// version 1 handles — reached the parquet reader and failed on the footer.
-    /// Version 2 being the default made that every such read.
+    /// The gate refuses a format by name, not by "not parquet".
+    ///
+    /// It used to refuse every non-parquet format. That was load-bearing rather
+    /// than merely coarse: behind it, version 2 resolved the format from
+    /// `hoodie.table.base.file.format` alone, so a base file whose format only
+    /// its extension names would have been opened with the parquet reader. The
+    /// gate refusing first is what kept that unreachable, which is why the
+    /// narrowing here and the per-path resolution in `resolve_reader_context`
+    /// are one change: narrowing alone would make it reachable.
+    ///
+    /// HFile still falls back — version 1 refuses it by name, and that is a
+    /// better answer than reaching version 2's `HFileBaseFileReader`, which is
+    /// set up for the metadata table's records.
     #[tokio::test]
-    async fn test_version_two_unsupported_reason_non_parquet_base_file_returns_reason() -> Result<()>
-    {
+    async fn test_version_two_unsupported_reason_refuses_hfile_and_admits_lance() -> Result<()> {
         let reader = reader_with(Vec::<(&'static str, String)>::new()).await?;
 
         assert!(
             reader
-                .version_two_unsupported_reason("part/f.lance", false)?
-                .is_some_and(|reason| reason.contains("parquet")),
-            "a non-parquet base file must fall back to version 1"
+                .version_two_unsupported_reason("part/f.hfile", false)?
+                .is_some_and(|reason| reason.contains("HFile")),
+            "an HFile base file must fall back to version 1, naming HFile"
+        );
+        assert_eq!(
+            reader.version_two_unsupported_reason("part/f.lance", false)?,
+            None,
+            "a Lance base file must be served by version 2, not diverted"
         );
         assert_eq!(
             reader.version_two_unsupported_reason("part/f.parquet", false)?,
@@ -2494,6 +2512,89 @@ mod file_group_reader_version_tests {
             "a parquet base file must still be served by version 2"
         );
         Ok(())
+    }
+
+    /// The gate admits a real Lance fixture's own base file, under that
+    /// fixture's own configs.
+    ///
+    /// The sibling test above uses a synthetic `"part/f.lance"` and the minimal
+    /// props fixture, so a gate reason that depends on a *table's* configuration
+    /// would slip past it: the read would quietly fall back to version 1 and the
+    /// end-to-end Lance test, which only compares the two versions' rows, would
+    /// still pass. Asserting `None` here with the fixture's configuration loaded
+    /// is what pins that this fixture reaches version 2 at all.
+    #[tokio::test]
+    async fn test_version_two_admits_the_lance_fixtures_own_base_file() -> Result<()> {
+        use std::fs::canonicalize;
+        use url::Url;
+
+        let table_path = SampleTable::V9LanceNonhivestyle.path_to_mor_avro();
+        let url = Url::from_file_path(canonicalize(&table_path).unwrap()).unwrap();
+        let reader =
+            FileGroupReader::new_with_options(url.as_ref(), Vec::<(&'static str, String)>::new())
+                .await?;
+
+        assert_eq!(
+            reader
+                .hudi_configs
+                .get_raw(HudiTableConfig::BaseFileFormat.as_ref()),
+            Some("LANCE"),
+            "the fixture must load its own LANCE format config, or this test is vacuous"
+        );
+
+        let base_file = first_base_file_with_extension(&table_path, "lance")
+            .expect("the Lance fixture must ship a .lance base file");
+
+        for base_file_only in [false, true] {
+            assert_eq!(
+                reader.version_two_unsupported_reason(&base_file, base_file_only)?,
+                None,
+                "base_file_only={base_file_only}: '{base_file}' must reach version 2, \
+                 not fall back"
+            );
+        }
+        Ok(())
+    }
+
+    /// The first base file under `table_path` with the given extension, as a
+    /// path relative to the table root — which is the shape the reader is given.
+    ///
+    /// Discovered rather than hardcoded: the fixtures' base file names carry a
+    /// UUID and a commit instant, so a literal would rot the next time one is
+    /// regenerated.
+    fn first_base_file_with_extension(table_path: &str, extension: &str) -> Option<String> {
+        fn walk(dir: &std::path::Path, extension: &str, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `.hoodie` holds the timeline and the metadata table, not
+                    // this table's base files.
+                    if path.file_name().is_some_and(|name| name == ".hoodie") {
+                        continue;
+                    }
+                    walk(&path, extension, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|found| found.eq_ignore_ascii_case(extension))
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(table_path);
+        let mut found = Vec::new();
+        walk(root, extension, &mut found);
+        found.sort();
+        found.first().map(|path| {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string()
+        })
     }
 
     /// Regression test: a table that drops its partition columns from the data files
