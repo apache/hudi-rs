@@ -350,6 +350,166 @@ mod tests {
         assert!(chennai.total_size() > 0);
     }
 
+    /// Does v2 fold an entry-level tombstone the way v1 does?
+    ///
+    /// A cleaned file arrives in the metadata table as a `filesystemMetadata` entry
+    /// with `size = 0, isDeleted = true`, written by
+    /// `HoodieMetadataPayload.DELETE_FILE_METADATA`. No fixture in this repo carries
+    /// one, because the fixture table was never cleaned, so this builds the slice:
+    /// a base file naming a file live and a log block naming the same file deleted.
+    ///
+    /// Both readers must agree, and they do: the key survives with an empty file
+    /// map, so a tombstone cancels the entry rather than lingering as a deleted one.
+    ///
+    /// The two HFiles are committed fixtures, 12.5 KB each, written by the generator
+    /// described in `tasks/eng-47790-v2-multi-batch-decode/log.md`. The log file
+    /// around one of them is built here rather than committed, so the framing this
+    /// test depends on is visible in the test.
+    #[tokio::test]
+    async fn an_entry_level_tombstone_folds_the_same_in_both_readers() {
+        use crate::file_group::FileGroup;
+        use crate::table::ReadOptions;
+
+        let dir = std::path::PathBuf::from("tests/data/metadata_tombstone");
+        let schema_json = std::fs::read_to_string(dir.join("metadata-record.avsc")).unwrap();
+        let live = std::fs::read(dir.join("files-live.hfile")).unwrap();
+        let tomb = std::fs::read(dir.join("files-tombstone.hfile")).unwrap();
+
+        // An HFile block inside a Hudi log file. Framing mirrors `memory_bench`'s
+        // `build_block`, with the block type set to HFile and the content being the
+        // HFile's own bytes rather than length-prefixed Avro data.
+        fn hfile_log_block(hfile: &[u8], schema: &str, instant: &str) -> Vec<u8> {
+            const MAGIC: &[u8] = b"#HUDI#";
+            let mut header = Vec::new();
+            header.extend_from_slice(&2u32.to_be_bytes());
+            for (key, value) in [(0u32, instant), (2u32, schema)] {
+                header.extend_from_slice(&key.to_be_bytes());
+                header.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                header.extend_from_slice(value.as_bytes());
+            }
+            let mut body = Vec::new();
+            body.extend_from_slice(&1u32.to_be_bytes()); // log format version
+            body.extend_from_slice(&4u32.to_be_bytes()); // BlockType::HfileData
+            body.extend_from_slice(&header);
+            body.extend_from_slice(&(hfile.len() as u64).to_be_bytes());
+            body.extend_from_slice(hfile);
+            body.extend_from_slice(&0u32.to_be_bytes()); // empty footer
+            let block_length = (body.len() + 8) as u64;
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            out.extend_from_slice(&block_length.to_be_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&(block_length + MAGIC.len() as u64).to_be_bytes());
+            out
+        }
+
+        // A metadata file group on disk: the live base file, then a log file whose
+        // one block deletes the file the base named.
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("files");
+        std::fs::create_dir_all(&part).unwrap();
+        let base_name = "files-0000-0_0-1-1_00000000000000000.hfile";
+        let log_name = ".files-0000-0_00000000000000000.log.1_0-2-2";
+        std::fs::write(part.join(base_name), &live).unwrap();
+        std::fs::write(
+            part.join(log_name),
+            hfile_log_block(&tomb, &schema_json, "20250101000000000"),
+        )
+        .unwrap();
+
+        let base_url =
+            url::Url::from_directory_path(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        let opts =
+            ReadOptions::new().with_end_timestamp(crate::file_group::reader_v2::MAX_INSTANT_TIME);
+        let configs = Arc::new(HudiConfigs::new(
+            [
+                (
+                    crate::config::table::HudiTableConfig::BasePath
+                        .as_ref()
+                        .to_string(),
+                    base_url.as_str().to_string(),
+                ),
+                (
+                    crate::config::table::HudiTableConfig::BaseFileFormat
+                        .as_ref()
+                        .to_string(),
+                    "hfile".to_string(),
+                ),
+                (
+                    crate::config::table::HudiTableConfig::RecordKeyFields
+                        .as_ref()
+                        .to_string(),
+                    "key".to_string(),
+                ),
+                (
+                    crate::config::table::HudiTableConfig::PopulatesMetaFields
+                        .as_ref()
+                        .to_string(),
+                    "false".to_string(),
+                ),
+                ("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()),
+                (
+                    "hoodie.record.merge.strategy.id".to_string(),
+                    "00000000-0000-0000-0000-000000000000".to_string(),
+                ),
+                (
+                    "hoodie.compaction.payload.class".to_string(),
+                    "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+                ),
+            ]
+            .into_iter()
+            .chain(opts.hudi_options.clone()),
+        ));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+
+        let mut fg = FileGroup::new("files-0000-0".to_string(), "files".to_string());
+        fg.add_base_file_from_name(base_name).unwrap();
+        fg.add_log_files_from_names(vec![log_name]).unwrap();
+        let slice = fg
+            .get_file_slice_as_of(crate::file_group::reader_v2::MAX_INSTANT_TIME)
+            .expect("a slice")
+            .clone();
+
+        let v1 = reader::MetadataTableFileGroupReader::new(configs.clone(), storage.clone())
+            .read_files_partition(&slice, &[])
+            .await;
+        let v2 = v2_reader::MetadataTableV2Reader::new(configs.clone(), storage.clone())
+            .read_files_partition(&slice, &[])
+            .await;
+
+        match (&v1, &v2) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(
+                    a.len(),
+                    1,
+                    "the fixture holds one partition record, or this tests nothing"
+                );
+                for (k, ra) in a {
+                    let rb = b.get(k).expect("v2 must return the same keys");
+                    let mut fa: Vec<_> = ra
+                        .files
+                        .iter()
+                        .map(|(n, i)| (n.clone(), i.size, i.is_deleted))
+                        .collect();
+                    let mut fb: Vec<_> = rb
+                        .files
+                        .iter()
+                        .map(|(n, i)| (n.clone(), i.size, i.is_deleted))
+                        .collect();
+                    fa.sort();
+                    fb.sort();
+                    assert_eq!(fa, fb, "the tombstone fold must agree for key {k}");
+                    assert!(
+                        fa.is_empty(),
+                        "a tombstone over the only live entry must cancel it, leaving \
+                         the key with no files, got {fa:?}"
+                    );
+                }
+            }
+            (a, b) => panic!("v1: {a:?}\nv2: {b:?}"),
+        }
+    }
+
     /// The pruned-keys branch of `fetch_files_partition_records`: read
     /// `__all_partitions__` first, prune, then read only the surviving partitions.
     ///
