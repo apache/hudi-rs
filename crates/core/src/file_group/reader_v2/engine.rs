@@ -114,7 +114,7 @@ pub struct HoodieFileGroupReader {
     /// Stage-timing sink shared with the [`FileGroupMergeStream`] returned by
     /// [`Self::open`]. The streaming iterator
     /// owns the buffer once `open()` returns, so the merge-phase timings
-    /// (final_merge_ms, output_build_ms) and the update-processor
+    /// (final_merge_us, output_build_us) and the update-processor
     /// insert/update/delete counts are accumulated through this handle during
     /// iteration and drained back into [`Self::read_stats`] by [`Self::read`]
     /// after the stream is exhausted. Wrapped in `Arc<Mutex<…>>` because the FFI
@@ -440,7 +440,7 @@ impl HoodieFileGroupReader {
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         // Stage timing (perf harness): opening the base file. Only the open —
         // the per-row-group decode is paid lazily, inside the merge.
-        let base = profile_once!(self.read_stats.base_read_ms, self.base_file_source().await)?;
+        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
         Ok(self.init_record_iterators(base).await?.into_stream())
     }
 
@@ -453,7 +453,7 @@ impl HoodieFileGroupReader {
     pub async fn read(&mut self) -> Result<RecordBatch> {
         // Stage timing (perf harness): the base file open plus, here, its whole
         // decode — `collapse_base` drives the stream to completion.
-        let base = profile_once!(self.read_stats.base_read_ms, self.base_file_source().await)?;
+        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
         let batch = self
             .init_record_iterators(base)
             .await?
@@ -474,8 +474,8 @@ impl HoodieFileGroupReader {
             .stream_stats
             .lock()
             .expect("stream_stats mutex poisoned");
-        self.read_stats.final_merge_ms = s.final_merge_ms;
-        self.read_stats.output_build_ms = s.output_build_ms;
+        self.read_stats.final_merge_us = s.final_merge_us;
+        self.read_stats.output_build_us = s.output_build_us;
         self.read_stats.merge_map_peak_entries = s.merge_map_peak_entries;
         self.read_stats.num_inserts = s.num_inserts;
         self.read_stats.num_updates = s.num_updates;
@@ -536,7 +536,7 @@ impl HoodieFileGroupReader {
 
             let output_schema = post_projection_schema.unwrap_or(merge_schema);
             // Stage timing (perf harness): the Eager iterator accumulates
-            // per-chunk output_build_ms (concat is gone — each base batch flows
+            // per-chunk output_build_us (concat is gone — each base batch flows
             // through the converter as its own chunk) into `stream_stats`, which
             // `read()` drains back into `self.read_stats`.
             return Ok(FileGroupMergeStream::new_eager(
@@ -631,7 +631,7 @@ impl HoodieFileGroupReader {
 
         // Step 6: Hand the buffer to a Buffered streaming iterator. The
         // iterator owns the buffer and drives `has_next/next` per chunk; it
-        // accumulates final_merge_ms + output_build_ms and the update-processor
+        // accumulates final_merge_us + output_build_us and the update-processor
         // insert/update/delete counts into the shared `stream_stats`, which
         // `read()` drains back into `self.read_stats` after the stream is
         // exhausted (mirrors Java, where StandardUpdateProcessor increments
@@ -1028,7 +1028,7 @@ impl HoodieFileGroupReader {
     ///
     /// Complete after [`Self::read`], which folds the merge-phase counters back
     /// in once the merge is exhausted. **After [`Self::open_stream`] the
-    /// merge-phase counters read zero** - `final_merge_ms`, `output_build_ms`,
+    /// merge-phase counters read zero** - `final_merge_us`, `output_build_us`,
     /// `merge_map_peak_entries` and the insert/update/delete counts accumulate
     /// into the shared `stream_stats` handle as the stream is consumed, and
     /// nothing folds them back, because the caller owns the stream and the

@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// Statistics from the log scanning operation.
 #[derive(Debug, Clone, Default)]
 pub struct ScanStats {
-    pub total_time_taken_to_read_and_merge_blocks_ms: u64,
+    pub total_time_taken_to_read_and_merge_blocks_us: u64,
     /// Parity with Java's scan result; the reader reports its own counters.
     #[allow(dead_code)]
     pub num_merged_records_in_log: u64,
@@ -53,12 +53,16 @@ pub struct ScanStats {
     pub total_rollbacks: u64,
 
     // ── Stage timings (perf harness) ───────────────────────
-    /// Wall ms reading log-block metadata + bytes off storage (Pass 1).
-    pub log_block_read_ms: u64,
-    /// Wall ms inflating/decoding log blocks (nested inside merge insert).
-    pub log_block_decode_ms: u64,
-    /// Wall ms dispatching decoded records into the merge map (Pass 3).
-    pub merge_insert_ms: u64,
+    /// Wall us walking log-block headers off storage (Pass 1).
+    pub log_block_read_us: u64,
+    /// Wall us fetching admitted blocks' content (Pass 3's prefetch).
+    pub log_block_fetch_us: u64,
+    /// Wall us decoding fetched bytes into arrow batches.
+    pub log_block_decode_us: u64,
+    /// Wall us upserting decoded records into the merge map.
+    pub merge_upsert_us: u64,
+    /// Wall us dispatching blocks in Pass 3, spanning decode and upsert.
+    pub merge_insert_us: u64,
     /// Peak merge-map entry count observed during the scan.
     pub merge_map_peak_entries: u64,
     /// True if the merge map spilled to disk during the scan.
@@ -89,7 +93,7 @@ pub struct ScanStats {
 pub struct HoodieMergedLogRecordReader {
     pub(crate) base: BaseHoodieLogRecordReader,
     num_merged_records_in_log: u64,
-    total_time_taken_to_read_and_merge_blocks_ms: u64,
+    total_time_taken_to_read_and_merge_blocks_us: u64,
 }
 
 impl std::fmt::Debug for HoodieMergedLogRecordReader {
@@ -97,8 +101,8 @@ impl std::fmt::Debug for HoodieMergedLogRecordReader {
         f.debug_struct("HoodieMergedLogRecordReader")
             .field("num_merged_records", &self.num_merged_records_in_log)
             .field(
-                "total_time_ms",
-                &self.total_time_taken_to_read_and_merge_blocks_ms,
+                "total_time_us",
+                &self.total_time_taken_to_read_and_merge_blocks_us,
             )
             .finish()
     }
@@ -159,7 +163,7 @@ impl HoodieMergedLogRecordReader {
         // KeySpec filtering not yet implemented in Rust; pass skip=false
         self.base.scan_internal(false).await?;
 
-        self.total_time_taken_to_read_and_merge_blocks_ms = start.elapsed().as_millis() as u64;
+        self.total_time_taken_to_read_and_merge_blocks_us = start.elapsed().as_micros() as u64;
         self.num_merged_records_in_log = self.base.record_buffer.size() as u64;
 
         log::debug!(
@@ -178,17 +182,19 @@ impl HoodieMergedLogRecordReader {
     /// valid block instants, and scan statistics.
     pub fn into_parts(self) -> (Box<dyn HoodieFileGroupRecordBuffer>, Vec<String>, ScanStats) {
         let stats = ScanStats {
-            total_time_taken_to_read_and_merge_blocks_ms: self
-                .total_time_taken_to_read_and_merge_blocks_ms,
+            total_time_taken_to_read_and_merge_blocks_us: self
+                .total_time_taken_to_read_and_merge_blocks_us,
             num_merged_records_in_log: self.num_merged_records_in_log,
             total_log_files: self.base.total_log_files,
             total_log_blocks: self.base.total_log_blocks,
             total_log_records: self.base.total_log_records,
             total_corrupt_blocks: self.base.total_corrupt_blocks,
             total_rollbacks: self.base.total_rollbacks,
-            log_block_read_ms: self.base.log_block_read_ms,
-            log_block_decode_ms: self.base.record_buffer.stage_decode_ms(),
-            merge_insert_ms: self.base.merge_insert_ms,
+            log_block_read_us: self.base.log_block_read_us,
+            merge_insert_us: self.base.merge_insert_us,
+            log_block_fetch_us: self.base.log_block_fetch_us,
+            log_block_decode_us: self.base.log_block_decode_us,
+            merge_upsert_us: self.base.merge_upsert_us,
             merge_map_peak_entries: self.base.record_buffer.merge_map_peak_entries(),
             merge_map_spilled: self.base.record_buffer.merge_map_spilled(),
             merge_map_peak_in_memory_bytes: self
@@ -216,7 +222,7 @@ impl HoodieMergedLogRecordReader {
     }
 
     pub fn get_total_time_taken_to_read_and_merge_blocks(&self) -> u64 {
-        self.total_time_taken_to_read_and_merge_blocks_ms
+        self.total_time_taken_to_read_and_merge_blocks_us
     }
 
     pub fn get_total_log_files(&self) -> u64 {
@@ -400,14 +406,17 @@ impl Builder {
             total_corrupt_blocks: 0,
             total_rollbacks: 0,
             progress: 0.0,
-            log_block_read_ms: 0,
-            merge_insert_ms: 0,
+            log_block_read_us: 0,
+            merge_insert_us: 0,
+            log_block_fetch_us: 0,
+            log_block_decode_us: 0,
+            merge_upsert_us: 0,
         };
 
         let mut reader = HoodieMergedLogRecordReader {
             base,
             num_merged_records_in_log: 0,
-            total_time_taken_to_read_and_merge_blocks_ms: 0,
+            total_time_taken_to_read_and_merge_blocks_us: 0,
         };
 
         // Mirrors Java constructor: if (forceFullScan) { performScan(); }
@@ -493,7 +502,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let blocks = reader.read_all_blocks_metadata_only().await.unwrap();
+        let blocks = reader
+            .read_all_blocks_metadata_only_unbounded()
+            .await
+            .unwrap();
 
         let path = dir.path().join(file_name);
         let mut bytes = std::fs::read(&path).unwrap();

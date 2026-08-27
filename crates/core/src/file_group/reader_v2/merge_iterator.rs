@@ -80,12 +80,12 @@ pub const DEFAULT_BATCH_SIZE: usize = 4096;
 /// [`HoodieReadStats`]: crate::file_group::reader_v2::read_stats::HoodieReadStats
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamReadStats {
-    /// Cumulative wall ms spent driving `buffer.has_next/next` (the base+log
+    /// Cumulative wall us spent driving `buffer.has_next/next` (the base+log
     /// merge) across all chunks. Zero for the Eager (no-merge) source.
-    pub final_merge_ms: u64,
-    /// Cumulative wall ms spent turning merged records into the output batch:
+    pub final_merge_us: u64,
+    /// Cumulative wall us spent turning merged records into the output batch:
     /// `records_to_batch` + the per-chunk `OutputConverter` projection.
-    pub output_build_ms: u64,
+    pub output_build_us: u64,
     /// Peak number of entries the merge map held during the log scan. Recorded
     /// off the buffer by `HoodieFileGroupReader::open` before iteration starts
     /// (it is finalized at scan time, not during output streaming).
@@ -168,7 +168,7 @@ pub struct FileGroupMergeStream {
     /// runs off the end, subsequent calls return `None`.
     done: bool,
     /// Shared stage-stats sink. The iterator accumulates
-    /// final_merge_ms + output_build_ms per chunk here, and on exhaustion
+    /// final_merge_us + output_build_us per chunk here, and on exhaustion
     /// snapshots the buffer's update-processor counts (Buffered source). The
     /// owning reader drains it into `HoodieReadStats` after `read()`.
     stream_stats: StreamStatsHandle,
@@ -267,12 +267,12 @@ impl FileGroupMergeStream {
         }
     }
 
-    /// Add `final_merge_ms` / `output_build_ms` deltas to the shared stats sink.
+    /// Add `final_merge_us` / `output_build_us` deltas to the shared stats sink.
     /// Called once per emitted chunk; the lock is held only for the add.
-    fn record_chunk_timing(&self, merge_ms: u64, build_ms: u64) {
+    fn record_chunk_timing(&self, merge_us: u64, build_us: u64) {
         if let Ok(mut s) = self.stream_stats.lock() {
-            s.final_merge_ms = s.final_merge_ms.saturating_add(merge_ms);
-            s.output_build_ms = s.output_build_ms.saturating_add(build_ms);
+            s.final_merge_us = s.final_merge_us.saturating_add(merge_us);
+            s.output_build_us = s.output_build_us.saturating_add(build_us);
         }
     }
 
@@ -386,9 +386,9 @@ impl FileGroupMergeStream {
         // which must end before we touch `&self`-borrowing helpers
         // (`finish_chunk`, `record_chunk_timing`, `snapshot_update_stats`).
         // Returns:
-        //   Ok(Some((batch, merge_ms, records_build_ms))) — emit this chunk
+        //   Ok(Some((batch, merge_us, records_build_us))) — emit this chunk
         //   Ok(None)                                       — stream exhausted
-        //   Err((e, merge_ms, build_ms))                   — terminal error
+        //   Err((e, merge_us, build_us))                   — terminal error
         type Chunk = (RecordBatch, u64, u64);
         let produced: std::result::Result<Option<Chunk>, (CoreError, u64, u64)> =
             match &mut self.source {
@@ -419,8 +419,8 @@ impl FileGroupMergeStream {
                     //
                     // Only the merge itself is timed. Timing the whole loop
                     // would fold the base file's read latency into
-                    // `final_merge_ms`, which is meant to measure merging.
-                    let mut merge_ms = 0u64;
+                    // `final_merge_us`, which is meant to measure merging.
+                    let mut merge_us = 0u64;
                     let mut chunk_err: Option<CoreError> = None;
                     let mut out_batch: Option<RecordBatch> = None;
                     loop {
@@ -468,8 +468,8 @@ impl FileGroupMergeStream {
                                 }
                                 let merge_start = Instant::now();
                                 let merged = buffer.merge_base_batch(&base, merge_schema);
-                                merge_ms = merge_ms
-                                    .saturating_add(merge_start.elapsed().as_millis() as u64);
+                                merge_us = merge_us
+                                    .saturating_add(merge_start.elapsed().as_micros() as u64);
                                 match merged {
                                     Ok(Some(b)) => {
                                         if b.num_rows() == 0 {
@@ -492,8 +492,8 @@ impl FileGroupMergeStream {
                                 // remaining log-only inserts once, then Ok(None).
                                 let drain_start = Instant::now();
                                 let drained = buffer.drain_log_only_inserts(merge_schema);
-                                merge_ms = merge_ms
-                                    .saturating_add(drain_start.elapsed().as_millis() as u64);
+                                merge_us = merge_us
+                                    .saturating_add(drain_start.elapsed().as_micros() as u64);
                                 match drained {
                                     Ok(Some(b)) if b.num_rows() > 0 => {
                                         out_batch = Some(b);
@@ -509,14 +509,14 @@ impl FileGroupMergeStream {
                         }
                     }
                     if let Some(e) = chunk_err {
-                        Err((e, merge_ms, 0))
+                        Err((e, merge_us, 0))
                     } else if let Some(b) = out_batch {
-                        Ok(Some((b, merge_ms, 0)))
+                        Ok(Some((b, merge_us, 0)))
                     } else {
                         // Exhausted. Record the merge probe time before the
                         // exhaustion handler (Step 2) runs.
                         if let Ok(mut s) = self.stream_stats.lock() {
-                            s.final_merge_ms = s.final_merge_ms.saturating_add(merge_ms);
+                            s.final_merge_us = s.final_merge_us.saturating_add(merge_us);
                         }
                         Ok(None)
                     }
@@ -526,12 +526,12 @@ impl FileGroupMergeStream {
         // Step 2: the source borrow has ended — handle timing / projection /
         // exhaustion via `&self` helpers.
         match produced {
-            Ok(Some((batch, merge_ms, records_build_ms))) => {
-                // output_build_ms part 2: the per-chunk OutputConverter.
+            Ok(Some((batch, merge_us, records_build_us))) => {
+                // output_build_us part 2: the per-chunk OutputConverter.
                 let convert_start = Instant::now();
                 let out = self.finish_chunk(batch);
-                let build_ms = records_build_ms + convert_start.elapsed().as_millis() as u64;
-                self.record_chunk_timing(merge_ms, build_ms);
+                let build_us = records_build_us + convert_start.elapsed().as_micros() as u64;
+                self.record_chunk_timing(merge_us, build_us);
                 if out.is_err() {
                     self.done = true;
                 }
@@ -544,9 +544,9 @@ impl FileGroupMergeStream {
                 self.snapshot_update_stats();
                 None
             }
-            Err((e, merge_ms, build_ms)) => {
+            Err((e, merge_us, build_us)) => {
                 self.done = true;
-                self.record_chunk_timing(merge_ms, build_ms);
+                self.record_chunk_timing(merge_us, build_us);
                 Some(Err(e))
             }
         }
@@ -830,7 +830,6 @@ mod tests {
     fn test_record_buffer_default_stat_accessors_report_nothing() {
         let buffer = MockBuffer::boxed(Vec::new(), UpdateStats::default());
 
-        assert_eq!(buffer.stage_decode_ms(), 0);
         assert_eq!(buffer.merge_map_peak_entries(), 0);
         assert!(!buffer.merge_map_spilled());
         assert_eq!(buffer.merge_map_peak_in_memory_bytes(), 0);

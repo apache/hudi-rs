@@ -28,7 +28,7 @@ pub struct HoodieReadStats {
     pub num_inserts: u64,
     pub num_updates: u64,
     pub num_deletes: u64,
-    pub total_log_read_time_ms: u64,
+    pub total_log_read_time_us: u64,
     pub total_log_records: u64,
     pub total_log_files_compacted: u64,
     pub total_log_blocks: u64,
@@ -41,27 +41,52 @@ pub struct HoodieReadStats {
     // Used by `benchmark/filegroup` (fg-bench) to attribute wall time across
     // the read pipeline. Zero behavioral effect — instrumentation only.
     //
-    /// Wall ms spent reading + projecting the base parquet file
+    /// Wall us spent reading + projecting the base parquet file
     /// (`HoodieFileGroupReader::make_base_file_batches`).
-    pub base_read_ms: u64,
-    /// Wall ms spent reading log-block metadata + bytes off storage during the
+    pub base_read_us: u64,
+    /// Wall us spent reading log-block metadata + bytes off storage during the
     /// log scan Pass-1 (`BaseHoodieLogRecordReader::scan_internal`).
-    pub log_block_read_ms: u64,
-    /// Wall ms spent inflating/decoding log blocks into arrow batches
-    /// (`LogBlock::inflate`, accumulated inside the record buffer).
-    /// NOTE: in hudi-rs inflate/decode is triggered lazily inside the buffer's
-    /// `process_data_block`, so this is measured there and is a SUBSET of the
-    /// `merge_insert_ms` window below (decode is nested inside merge insert).
-    pub log_block_decode_ms: u64,
-    /// Wall ms spent dispatching decoded log records into the merge map
-    /// (`process_queued_blocks_for_instant`: inflate/decode + per-key upsert).
-    pub merge_insert_ms: u64,
-    /// Wall ms spent in the final base+log merge collect
+    pub log_block_read_us: u64,
+    /// Wall us spent fetching admitted log blocks' content off storage
+    /// (`fetch_window`, Pass 3's batched prefetch).
+    ///
+    /// Separate from `log_block_read_us`, which is Pass 1's headers-only walk.
+    ///
+    /// **Zero is the expected reading on a small log file**, and does not mean the
+    /// content was free. When the walk's window already covered a block's content
+    /// the walk keeps those bytes, so there is nothing left for Pass 3 to fetch and
+    /// the transfer is charged to `log_block_read_us` instead. A before-and-after
+    /// comparison across that change reads as the fetch becoming free when it has
+    /// only moved.
+    pub log_block_fetch_us: u64,
+    /// Wall us spent decoding fetched log-block bytes into arrow batches
+    /// (`LogBlock::decode_fetched`, called from `merge_blocks`).
+    ///
+    /// Timed where the decode happens. It used to be timed in the record buffer,
+    /// around a span that had become empty when the fetch moved into Pass 3, so
+    /// the counter read zero however long a decode took.
+    pub log_block_decode_us: u64,
+    /// Wall us spent upserting decoded records into the merge map
+    /// (`process_data_block` / `process_delete_block`).
+    ///
+    /// One of the three parts of `merge_insert_us`, which wraps the whole of Pass
+    /// 3 and therefore spans fetch, decode and upsert together. Subtracting
+    /// `log_block_fetch_us` and `log_block_decode_us` from it leaves this plus the
+    /// per-block dispatch around them; do not read the remainder as upsert.
+    pub merge_upsert_us: u64,
+    /// Wall us spent in the whole of Pass 3: fetching admitted blocks' content,
+    /// decoding it, and upserting into the merge map.
+    ///
+    /// `log_block_fetch_us`, `log_block_decode_us` and `merge_upsert_us` are its
+    /// parts. It is kept because their sum is not the total: the per-block dispatch
+    /// around them is real time that belongs to no one of the three.
+    pub merge_insert_us: u64,
+    /// Wall us spent in the final base+log merge collect
     /// (`merge_and_collect_with_stats`).
-    pub final_merge_ms: u64,
-    /// Wall ms spent building/projecting the output batch
+    pub final_merge_us: u64,
+    /// Wall us spent building/projecting the output batch
     /// (`apply_output_converter` + base-only concat path).
-    pub output_build_ms: u64,
+    pub output_build_us: u64,
     /// Peak number of entries held in the merge map during the log scan.
     pub merge_map_peak_entries: u64,
 

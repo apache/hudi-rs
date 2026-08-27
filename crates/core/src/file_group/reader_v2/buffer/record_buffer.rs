@@ -119,8 +119,6 @@ pub struct FileGroupRecordBuffer {
     pub log_drain_iter: Option<SpillDrainIter>,
 
     // ── Stage timings (perf harness) ──────────────────────
-    /// Cumulative wall ms inflating/decoding log blocks (subset of merge insert).
-    pub stage_decode_ms: u64,
     /// Peak `records` map size observed during the scan.
     pub merge_map_peak_entries: u64,
 }
@@ -165,7 +163,6 @@ impl FileGroupRecordBuffer {
             next_record: None,
             log_record_iter: None,
             log_drain_iter: None,
-            stage_decode_ms: 0,
             merge_map_peak_entries: 0,
         }
     }

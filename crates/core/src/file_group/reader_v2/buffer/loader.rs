@@ -253,16 +253,18 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         populated_buffer.compact_pinned_batches()?;
 
         // Populate read stats from scan stats
-        read_stats.total_log_read_time_ms = stats.total_time_taken_to_read_and_merge_blocks_ms;
+        read_stats.total_log_read_time_us = stats.total_time_taken_to_read_and_merge_blocks_us;
         read_stats.total_log_records = stats.total_log_records;
         read_stats.total_log_blocks = stats.total_log_blocks;
         read_stats.total_log_files_compacted = stats.total_log_files;
         read_stats.total_corrupt_log_blocks = stats.total_corrupt_blocks;
         read_stats.total_rollback_blocks = stats.total_rollbacks;
         // Stage timings (perf harness).
-        read_stats.log_block_read_ms = stats.log_block_read_ms;
-        read_stats.log_block_decode_ms = stats.log_block_decode_ms;
-        read_stats.merge_insert_ms = stats.merge_insert_ms;
+        read_stats.log_block_read_us = stats.log_block_read_us;
+        read_stats.merge_insert_us = stats.merge_insert_us;
+        read_stats.log_block_fetch_us = stats.log_block_fetch_us;
+        read_stats.log_block_decode_us = stats.log_block_decode_us;
+        read_stats.merge_upsert_us = stats.merge_upsert_us;
         read_stats.merge_map_peak_entries = stats.merge_map_peak_entries;
         // Spillable merge map.
         read_stats.merge_map_spilled = stats.merge_map_spilled;
