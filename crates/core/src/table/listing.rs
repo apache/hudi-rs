@@ -32,8 +32,9 @@ use crate::table::partition::{
 };
 use crate::timeline::completion_time::CompletionTimeView;
 use dashmap::DashMap;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -200,6 +201,47 @@ impl FileLister {
             .collect())
     }
 
+    /// Discover relevant partitions from the object store's recursive listing
+    /// without waiting to materialize the table-wide partition path vector.
+    ///
+    /// A set of emitted partition paths is retained because object stores do
+    /// not guarantee that objects from the same partition are contiguous. The
+    /// set holds one path string per partition; file metadata, file groups, and
+    /// slices remain bounded by downstream concurrency.
+    fn list_relevant_partition_paths_stream(&self) -> Result<BoxStream<'static, Result<String>>> {
+        if !is_table_partitioned(&self.hudi_configs)? {
+            return Ok(stream::once(async { Ok(EMPTY_PARTITION_PATH.to_string()) }).boxed());
+        }
+
+        let paths = self.storage.list_relative_paths_stream()?;
+        let partition_pruner = self.partition_pruner.clone();
+        Ok(
+            stream::try_unfold((paths, HashSet::new()), move |(mut paths, mut seen)| {
+                let partition_pruner = partition_pruner.clone();
+                async move {
+                    while let Some(relative_path) = paths.try_next().await? {
+                        let first_segment = relative_path.split('/').next().unwrap_or_default();
+                        if LAKE_FORMAT_METADATA_DIRS.contains(&first_segment) {
+                            continue;
+                        }
+
+                        let Some((partition_path, _)) = relative_path.rsplit_once('/') else {
+                            continue;
+                        };
+                        if (partition_pruner.is_empty()
+                            || partition_pruner.should_include(partition_path))
+                            && seen.insert(partition_path.to_string())
+                        {
+                            return Ok(Some((partition_path.to_string(), (paths, seen))));
+                        }
+                    }
+                    Ok(None)
+                }
+            })
+            .boxed(),
+        )
+    }
+
     /// List file groups for all relevant partitions.
     ///
     /// # Arguments
@@ -243,6 +285,49 @@ impl FileLister {
             .await?;
 
         Ok(file_groups_map.as_ref().to_owned())
+    }
+
+    /// Stream file groups one partition at a time.
+    ///
+    /// Partition discovery and per-partition file listing are both deferred
+    /// until the returned stream is polled. The recursive discovery listing
+    /// intentionally does not reuse its individual file entries: object stores
+    /// do not guarantee per-partition contiguity, so doing so correctly would
+    /// retain incomplete file groups for the whole table. Each newly discovered
+    /// partition therefore gets one delimiter listing to obtain its complete
+    /// file set. At most
+    /// `hoodie.plan.listing.parallelism` partition listings are in flight, so
+    /// callers can consume completed partitions without retaining every table
+    /// file group or slice in memory.
+    pub async fn list_file_groups_for_relevant_partitions_stream<
+        V: CompletionTimeView + Send + Sync + 'static,
+    >(
+        &self,
+        completion_time_view: Arc<V>,
+        estimator: Option<FileStatsEstimator>,
+    ) -> Result<BoxStream<'static, Result<(String, Vec<FileGroup>)>>> {
+        let partition_paths = self.list_relevant_partition_paths_stream()?;
+        let parallelism = self.hudi_configs.get_or_default(ListingParallelism).into();
+        let lister = self.clone();
+
+        Ok(partition_paths
+            .map_ok(move |partition_path| {
+                let lister = lister.clone();
+                let completion_time_view = completion_time_view.clone();
+                let estimator = estimator.clone();
+                async move {
+                    let file_groups = lister
+                        .list_file_groups_for_partition(
+                            &partition_path,
+                            completion_time_view.as_ref(),
+                            estimator.as_ref(),
+                        )
+                        .await?;
+                    Ok::<_, CoreError>((partition_path, file_groups))
+                }
+            })
+            .try_buffer_unordered(parallelism)
+            .boxed())
     }
 }
 

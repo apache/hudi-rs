@@ -39,6 +39,8 @@ use crate::table::listing::FileLister;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::view::TimelineView;
 use dashmap::DashMap;
+use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
 
 /// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and
 /// access the file groups and file slices.
@@ -326,6 +328,99 @@ impl FileSystemView {
 
         self.collect_file_slices(partition_pruner, timeline_view)
             .await
+    }
+
+    /// Stream file slices as each partition's file groups become available.
+    ///
+    /// Storage-backed listing retains only the bounded set of partition
+    /// listings in flight plus the current partition's file groups. Metadata
+    /// table records are still fetched eagerly because that reader does not yet
+    /// expose a row stream.
+    pub(crate) async fn get_file_slices_stream(
+        &self,
+        partition_pruner: &PartitionPruner,
+        file_pruner: &FilePruner,
+        table_schema: &Schema,
+        timeline_view: Arc<TimelineView>,
+        metadata_table: Option<&Table>,
+        estimator: Option<FileStatsEstimator>,
+    ) -> Result<BoxStream<'static, Result<FileSlice>>> {
+        let configured_base_file_format = self.configured_base_file_format()?;
+        let metadata_backed = metadata_table.is_some();
+
+        let file_groups_stream: BoxStream<'static, Result<(String, Vec<FileGroup>)>> =
+            if let Some(mdt) = metadata_table {
+                let records = mdt.fetch_files_partition_records(partition_pruner).await?;
+                let file_groups = file_groups_from_files_partition_records(
+                    &records,
+                    configured_base_file_format.as_ref(),
+                    timeline_view.as_ref(),
+                    estimator.as_ref(),
+                )?;
+                stream::iter(file_groups.into_iter().map(Ok)).boxed()
+            } else {
+                let lister = FileLister::new(
+                    self.hudi_configs.clone(),
+                    self.storage.clone(),
+                    partition_pruner.clone(),
+                );
+                lister
+                    .list_file_groups_for_relevant_partitions_stream(
+                        timeline_view.clone(),
+                        estimator,
+                    )
+                    .await?
+            };
+
+        let view = self.clone();
+        let partition_pruner = partition_pruner.clone();
+        let file_pruner = file_pruner.clone();
+        let table_schema = table_schema.clone();
+
+        Ok(file_groups_stream
+            .then(move |result| {
+                let view = view.clone();
+                let partition_pruner = partition_pruner.clone();
+                let file_pruner = file_pruner.clone();
+                let table_schema = table_schema.clone();
+                let timeline_view = timeline_view.clone();
+                let configured_base_file_format = configured_base_file_format.clone();
+                async move {
+                    let (partition_path, file_groups) = result?;
+                    if metadata_backed
+                        && !partition_pruner.is_empty()
+                        && !partition_pruner.should_include(&partition_path)
+                    {
+                        return Ok::<Vec<FileSlice>, crate::error::CoreError>(Vec::new());
+                    }
+
+                    let retained = view
+                        .apply_stats_pruning_from_footers(
+                            file_groups,
+                            &file_pruner,
+                            &table_schema,
+                            timeline_view.as_of_timestamp(),
+                            configured_base_file_format.as_ref(),
+                        )
+                        .await;
+
+                    let timestamp = timeline_view.as_of_timestamp();
+                    let excluding_file_groups = timeline_view.excluding_file_groups();
+                    let mut slices = Vec::new();
+                    for file_group in retained {
+                        if excluding_file_groups.contains(&file_group) {
+                            continue;
+                        }
+                        if let Some(file_slice) = file_group.get_file_slice_as_of(timestamp) {
+                            slices.push(file_slice.clone());
+                        }
+                    }
+                    Ok::<Vec<FileSlice>, crate::error::CoreError>(slices)
+                }
+            })
+            .map_ok(|slices| stream::iter(slices.into_iter().map(Ok)))
+            .try_flatten()
+            .boxed())
     }
 
     /// Get file slices using storage listing only.
