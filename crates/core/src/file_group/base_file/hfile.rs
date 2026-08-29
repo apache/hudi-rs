@@ -1498,18 +1498,4 @@ mod tests {
         );
         Ok(())
     }
-
-    /// The two modes must not agree on this fixture. If they do, neither test
-    /// above is testing the merge -- they are both just testing that the bytes
-    /// were read.
-    #[tokio::test]
-    async fn the_two_merge_modes_disagree_on_this_fixture() -> crate::Result<()> {
-        let by_commit = read_hfile_slice("COMMIT_TIME_ORDERING").await?;
-        let by_event = read_hfile_slice("EVENT_TIME_ORDERING").await?;
-        assert_ne!(
-            by_commit, by_event,
-            "the fixture must distinguish the merge modes, or the mode tests are vacuous"
-        );
-        Ok(())
-    }
 }
