@@ -1389,22 +1389,40 @@ mod tests {
         Ok(())
     }
 
-    /// An HFile base file and an HFile log block on a table that is **not** the
-    /// metadata table, read through the ordinary public path.
+    /// Reads the HFile fixture under one merge mode and returns `(key, fare)`
+    /// sorted, so the two modes can be compared on the same slice.
     ///
-    /// The fixture overlaps base and log on two keys, so the three ways this can
-    /// go wrong look different: dropping the log block returns four rows at
-    /// fares 11-14, merging in the wrong direction returns 13 and 14 on the
-    /// overlap, and losing the base returns four rows from `uuid0003`. Values are
-    /// asserted rather than a row count for that reason.
-    #[tokio::test]
-    async fn an_hfile_slice_reads_on_a_table_that_is_not_the_metadata_table() -> crate::Result<()> {
+    /// The mode is written into a copy of the table's `hoodie.properties` rather
+    /// than passed as a read option, because the merge mode is a property of the
+    /// table and a read option does not override it.
+    async fn read_hfile_slice(merge_mode: &str) -> crate::Result<Vec<(String, i64)>> {
         use crate::file_group::reader::FileGroupReader;
         use crate::table::ReadOptions;
 
-        let table_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../test/data/hfile_base_file_table");
-        let base_url = url::Url::from_file_path(std::fs::canonicalize(&table_path).unwrap())
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path();
+        std::fs::create_dir_all(dst.join(".hoodie")).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+            }
+        }
+        let props = std::fs::read_to_string(src.join(".hoodie/hoodie.properties"))
+            .unwrap()
+            .replace(
+                "hoodie.record.merge.mode=COMMIT_TIME_ORDERING",
+                &format!("hoodie.record.merge.mode={merge_mode}"),
+            );
+        assert!(
+            props.contains(&format!("hoodie.record.merge.mode={merge_mode}")),
+            "the fixture's properties must carry the mode under test, or this is vacuous"
+        );
+        std::fs::write(dst.join(".hoodie/hoodie.properties"), props).unwrap();
+
+        let base_url = url::Url::from_file_path(std::fs::canonicalize(dst).unwrap())
             .unwrap()
             .to_string();
         let reader =
@@ -1431,19 +1449,66 @@ mod tests {
             .map(|i| (keys.value(i).to_string(), fares.value(i) as i64))
             .collect();
         got.sort();
+        Ok(got)
+    }
 
+    fn expected(uuid0003: i64) -> Vec<(String, i64)> {
+        vec![
+            ("uuid0001".to_string(), 11),
+            ("uuid0002".to_string(), 12),
+            ("uuid0003".to_string(), uuid0003),
+            ("uuid0004".to_string(), 103),
+            ("uuid0005".to_string(), 104),
+            ("uuid0006".to_string(), 105),
+        ]
+    }
+
+    /// An HFile base file and an HFile log block on a table that is **not** the
+    /// metadata table, read through the ordinary public path under commit-time
+    /// ordering.
+    ///
+    /// The log is the later commit, so it wins both overlapping keys. Values are
+    /// asserted rather than a row count: dropping the log block would return four
+    /// rows at fares 11-14, and losing the base would return four rows from
+    /// `uuid0003`.
+    #[tokio::test]
+    async fn an_hfile_slice_merges_by_commit_time_outside_the_metadata_table() -> crate::Result<()>
+    {
         assert_eq!(
-            got,
-            vec![
-                ("uuid0001".to_string(), 11),
-                ("uuid0002".to_string(), 12),
-                ("uuid0003".to_string(), 102),
-                ("uuid0004".to_string(), 103),
-                ("uuid0005".to_string(), 104),
-                ("uuid0006".to_string(), 105),
-            ],
-            "the log block must be merged over the base file: the two overlapping \
-             keys take the log's fares, and all six keys survive"
+            read_hfile_slice("COMMIT_TIME_ORDERING").await?,
+            expected(102),
+            "the log block is the later commit, so it must win both overlapping keys"
+        );
+        Ok(())
+    }
+
+    /// The same slice under event-time ordering, which must reach a *different*
+    /// answer.
+    ///
+    /// `uuid0003` is the discriminator: the log's event time (1000) is older than
+    /// the base's (5003), so the base value survives even though the log is the
+    /// later commit. `uuid0004` goes the other way (9000 against 5004) so the
+    /// test cannot pass by ignoring the log entirely.
+    #[tokio::test]
+    async fn an_hfile_slice_merges_by_event_time_outside_the_metadata_table() -> crate::Result<()> {
+        assert_eq!(
+            read_hfile_slice("EVENT_TIME_ORDERING").await?,
+            expected(13),
+            "uuid0003's log record has the older event time, so the base value must survive"
+        );
+        Ok(())
+    }
+
+    /// The two modes must not agree on this fixture. If they do, neither test
+    /// above is testing the merge -- they are both just testing that the bytes
+    /// were read.
+    #[tokio::test]
+    async fn the_two_merge_modes_disagree_on_this_fixture() -> crate::Result<()> {
+        let by_commit = read_hfile_slice("COMMIT_TIME_ORDERING").await?;
+        let by_event = read_hfile_slice("EVENT_TIME_ORDERING").await?;
+        assert_ne!(
+            by_commit, by_event,
+            "the fixture must distinguish the merge modes, or the mode tests are vacuous"
         );
         Ok(())
     }
