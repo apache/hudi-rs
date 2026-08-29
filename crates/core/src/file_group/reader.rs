@@ -487,7 +487,8 @@ impl FileGroupReader {
                 "A table with a CUSTOM record merge mode needs its own merger, \
                  which no reader here implements for this table's payload class. \
                  Set hoodie.read.file.group.reader.version=1 to read it with the \
-                 reader that served it before, which merges without that merger"
+                 reader that served it before, which merges without that merger -- \
+                 unless the base file is HFile, which that reader cannot read at all"
                     .to_string(),
             ));
         }
@@ -503,10 +504,11 @@ impl FileGroupReader {
             ));
         }
 
-        // An HFile slice must not fall back. Version 1 has no HFile base file
-        // reader and its log decoder refuses HFile blocks outright, so falling
-        // back turns a readable slice into an error. Version 2 reads both, which
-        // `hfile_base_file_table` pins on an ordinary table's records.
+        // No gate here for the base file format, deliberately. An HFile slice
+        // used to fall back to version 1, which has no HFile base file reader and
+        // whose log decoder refuses HFile blocks outright -- so the fallback
+        // turned a readable slice into an error. `hfile_base_file_table` pins
+        // that version 2 reads both on an ordinary table's records.
 
         // A table that drops its partition columns from the data files leaves
         // them knowable only from the partition path, and neither reader
@@ -1479,15 +1481,16 @@ mod tests {
             )
             .await;
 
-        // The format is no longer why this fails. The path names a file that does
-        // not exist, so the reader gets past format resolution and fails on the
-        // missing object -- which is what proves the format gate is gone.
+        // Asserting what the failure IS, not what it is not: the path names no
+        // real file, so a reader that got past format resolution must fail
+        // trying to open it. Asserting the absence of the retired message would
+        // pass even if the format refusal came back under a new name.
         let error_msg = result
             .expect_err("the fixture path names no real file")
             .to_string();
         assert!(
-            !error_msg.contains("hfile is only supported"),
-            "an HFile base file must no longer be refused for its format, got: {error_msg}"
+            error_msg.contains("not found") || error_msg.contains("No such file"),
+            "the read must reach storage and fail on the missing object, got: {error_msg}"
         );
 
         Ok(())
@@ -2468,7 +2471,7 @@ mod file_group_reader_version_tests {
     /// turned it into an error; `hfile_base_file_table` reads it through version
     /// two instead.
     #[tokio::test]
-    async fn test_version_two_unsupported_reason_admits_every_known_format() -> Result<()> {
+    async fn test_version_two_unsupported_reason_admits_a_default_table() -> Result<()> {
         let reader = reader_with(Vec::<(&'static str, String)>::new()).await?;
 
         assert_eq!(
