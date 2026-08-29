@@ -1389,6 +1389,92 @@ mod tests {
         Ok(())
     }
 
+    /// Lays the HFile fixture down in a temp dir with `extra` appended to its
+    /// `hoodie.properties`, and returns the table's URL.
+    fn hfile_fixture_with(extra: &str) -> (tempfile::TempDir, String) {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../test/data/hfile_base_file_table");
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path();
+        std::fs::create_dir_all(dst.join(".hoodie")).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+            }
+        }
+        let props = std::fs::read_to_string(src.join(".hoodie/hoodie.properties")).unwrap();
+        std::fs::write(
+            dst.join(".hoodie/hoodie.properties"),
+            format!("{props}{extra}"),
+        )
+        .unwrap();
+        let url = url::Url::from_file_path(std::fs::canonicalize(dst).unwrap())
+            .unwrap()
+            .to_string();
+        (tmp, url)
+    }
+
+    /// A CUSTOM merge mode whose payload class has no merger here, on a table
+    /// whose base file is HFile -- the one combination where the CUSTOM refusal's
+    /// own advice does not work.
+    ///
+    /// That refusal tells the reader to set file group reader version 1. For an
+    /// HFile table that remedy fails, because version 1 has no HFile base file
+    /// reader and its log decoder refuses HFile blocks. The test asserts both
+    /// halves: that version 2 names HFile in its refusal, and that the fallback
+    /// it used to recommend really does fail. Asserting only the message would
+    /// pass even if the advice were sound.
+    ///
+    /// Reachable only since an HFile base file stopped being refused outside the
+    /// metadata table; before that this table could not be constructed.
+    #[tokio::test]
+    async fn a_custom_merge_mode_without_a_merger_names_hfile_in_its_refusal() -> crate::Result<()>
+    {
+        use crate::file_group::reader::FileGroupReader;
+        use crate::table::ReadOptions;
+
+        const BASE: &str = "f0000000-0000-0000-0000-000000000001-0_0-1-1_20250101000000000.hfile";
+        const LOG: &str = ".f0000000-0000-0000-0000-000000000001-0_20250101000000000.log.1_0-2-2";
+
+        // A payload class no merger in this crate implements. Deliberately not
+        // HoodieMetadataPayload, which resolves and so would not reach the gate.
+        let (_tmp, url) = hfile_fixture_with(
+            "\nhoodie.record.merge.mode=CUSTOM\n\
+             hoodie.compaction.payload.class=com.example.NoSuchPayload\n",
+        );
+
+        let by_v2 = FileGroupReader::new_with_options(&url, crate::config::util::empty_options())
+            .await?
+            .read_file_slice_from_paths(BASE, vec![LOG], &ReadOptions::new())
+            .await
+            .expect_err("a CUSTOM mode with no merger must be refused");
+        let msg = by_v2.to_string();
+        assert!(
+            msg.contains("CUSTOM record merge mode"),
+            "the CUSTOM gate must be the one refusing, got: {msg}"
+        );
+        assert!(
+            msg.contains("HFile"),
+            "the refusal must say the version 1 remedy does not work for HFile, got: {msg}"
+        );
+
+        // The other half: the remedy the message qualifies really is a dead end.
+        let by_v1 = FileGroupReader::new_with_options(
+            &url,
+            [("hoodie.read.file.group.reader.version", "1")],
+        )
+        .await?
+        .read_file_slice_from_paths(BASE, vec![LOG], &ReadOptions::new())
+        .await
+        .expect_err("version 1 cannot read an HFile log block");
+        assert!(
+            by_v1.to_string().contains("HFile records"),
+            "version 1 must fail on the HFile log block, got: {by_v1}"
+        );
+        Ok(())
+    }
+
     /// Reads the HFile fixture under one merge mode and returns `(key, fare)`
     /// sorted, so the two modes can be compared on the same slice.
     ///
