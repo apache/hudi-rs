@@ -200,8 +200,10 @@ pub(crate) fn refuse_reason(
 ) -> Option<CoreError> {
     if is_metadata_table {
         return Some(CoreError::Unsupported(
-            "The merge-on-read reader cannot read a metadata table: its base files and log \
-             blocks are HFile, which that reader has no support for."
+            "A metadata table is read through its own reader, not this one. Not for want of \
+             HFile support -- the engine reads HFile base files and log blocks on an ordinary \
+             table -- but because the metadata table's record key, merge rule and partition \
+             come from its own configuration rather than the table's."
                 .to_string(),
         ));
     }
