@@ -851,7 +851,7 @@ impl Table {
     /// `hoodie.read.file.slice.read.concurrency` already bounds the DataFusion
     /// scan; honoring it here puts the direct and Python read paths on the same
     /// knob instead of leaving them unbounded.
-    fn file_slice_read_concurrency(&self) -> usize {
+    pub(crate) fn file_slice_read_concurrency(&self) -> usize {
         let configured: usize = self
             .hudi_configs
             .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
@@ -872,22 +872,12 @@ impl Table {
         file_slices: &[FileSlice],
         fg_options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let concurrency = self.file_slice_read_concurrency();
-        let mut batches = Vec::with_capacity(file_slices.len());
-        // One `try_join_all` per chunk rather than a sliding window. A chunk waits
-        // for its slowest member, so this is slightly less busy than a true
-        // window — but the goal here is the ceiling, not maximal overlap, and the
-        // sliding-window form (`buffered` over these futures) cannot be proven
-        // `Send`: the futures borrow `&FileSlice`/`&ReadOptions`, and the
-        // higher-ranked lifetimes inside `FuturesOrdered` then defeat the
-        // auto-trait inference for any caller that spawns the read.
-        for chunk in file_slices.chunks(concurrency) {
-            let reads = chunk
-                .iter()
-                .map(|file_slice| fg_reader.read_file_slice(file_slice, fg_options));
-            batches.extend(futures::future::try_join_all(reads).await?);
-        }
-        Ok(batches)
+        crate::util::concurrency::bounded_in_order(
+            file_slices,
+            self.file_slice_read_concurrency(),
+            |file_slice| fg_reader.read_file_slice(file_slice, fg_options),
+        )
+        .await
     }
 
     /// Warn when an incremental window reaches below the active timeline.
