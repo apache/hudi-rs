@@ -37,37 +37,15 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::{StreamExt, TryStreamExt};
-use hudi_core::config::HudiConfigs;
 use hudi_core::error::Result;
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::file_group::reader::FileGroupReader;
-use hudi_core::storage::Storage;
 use hudi_core::table::Table;
 use hudi_core::table::builder::OptionResolver;
 use serde::Serialize;
 
 use host::HostSnapshot;
 use rusage::Rusage;
-
-/// Accounting-drift detector (A6e detector #3). After each run, if the measured
-/// `max_rss` greatly exceeds what the merge-map accounting + a generous base /
-/// output headroom would predict, the size accounting is lying about the resident
-/// set (the exact M5 failure: accounting read ~budget while RSS was 21.9 GB). We
-/// then print a loud WARN and set `accounting_drift: true` in the JSON.
-///
-/// `ACCOUNTING_DRIFT_FACTOR` is the multiple of (accounted retained + headroom)
-/// that `max_rss` must exceed to be flagged. 4× leaves room for allocator
-/// fragmentation + transient peaks while still catching an order-of-magnitude
-/// divergence.
-const ACCOUNTING_DRIFT_FACTOR: u64 = 4;
-
-/// Base/output headroom (bytes) added to the accounted merge-map retained bytes
-/// before applying [`ACCOUNTING_DRIFT_FACTOR`] — covers the base-file decode
-/// batch, the output chunk, and fixed runtime/RocksDB overhead that the merge-map
-/// accounting does not (and should not) include. 512 MiB is generous enough that
-/// a correctly-bounded read never trips the detector, yet far below the
-/// multi-GB divergence the M5 bug produced.
-const ACCOUNTING_DRIFT_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -155,7 +133,6 @@ struct Args {
 /// clippy argument-count limit and to make the eager/streaming split explicit.
 #[derive(Clone)]
 struct ReadConfig {
-    data_schema: SchemaRef,
     requested_schema: Option<SchemaRef>,
     batch_size: Option<usize>,
     merge_max_size: Option<u64>,
@@ -244,7 +221,6 @@ async fn run(args: &Args) -> Result<()> {
     //    hoodie.properties: record key, ordering, merge mode, table type).
     let table = Table::new(&args.table).await?;
     let hoodie_options = resolve_hoodie_options(&args.table).await?;
-    let (hudi_configs, storage) = configs_and_storage(&args.table).await?;
 
     // 2. Discover the latest file slice(s) (snapshot, no partition filters).
     // OSS `get_file_slices` takes `&ReadOptions` (the internal fork takes filter
@@ -305,7 +281,6 @@ async fn run(args: &Args) -> Result<()> {
         let wall_start = Instant::now();
 
         let read_config = ReadConfig {
-            data_schema: table_data_schema.clone(),
             requested_schema: requested_schema.clone(),
             batch_size: args.batch_size,
             merge_max_size: args.merge_max_size,
@@ -519,14 +494,16 @@ async fn read_all_slices(
     }
     let reader = FileGroupReader::new_with_options(table_path, options).await?;
 
-    let mut read_options = hudi_core::config::read_options::ReadOptions::default();
-    read_options.projection = cfg.requested_schema.as_ref().map(|schema| {
-        schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect::<Vec<String>>()
-    });
+    let read_options = hudi_core::config::read_options::ReadOptions {
+        projection: cfg.requested_schema.as_ref().map(|schema| {
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<String>>()
+        }),
+        ..Default::default()
+    };
 
     // The fan-out under test. `buffer_unordered(1)` is sequential with no
     // coordination cost, which is what the single-slice baseline must stay.
@@ -586,16 +563,6 @@ async fn resolve_hoodie_options(table_path: &str) -> Result<HashMap<String, Stri
     let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
     resolver.resolve_options().await?;
     Ok(resolver.hudi_options)
-}
-
-/// Create `HudiConfigs` + `Storage` from a table path (mirrors the FG harness).
-async fn configs_and_storage(table_path: &str) -> Result<(Arc<HudiConfigs>, Arc<Storage>)> {
-    let empty_opts: Vec<(&str, &str)> = vec![];
-    let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
-    resolver.resolve_options().await?;
-    let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
-    let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
-    Ok((hudi_configs, storage))
 }
 
 #[derive(Serialize)]
