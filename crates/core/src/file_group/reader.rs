@@ -37,7 +37,7 @@ use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::storage::Storage;
-use crate::storage::error::StorageError;
+
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
 use crate::timeline::selector::InstantRange;
@@ -159,15 +159,11 @@ impl FileGroupReader {
         storage: &Arc<Storage>,
         format: &BaseFileFormatValue,
     ) -> Result<Option<Arc<dyn BaseFileReader>>> {
-        match create_base_file_reader(storage, format) {
-            Ok(reader) => Ok(Some(reader)),
-            Err(StorageError::UnsupportedBaseFileFormat(_))
-                if matches!(format, BaseFileFormatValue::HFile) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        }
+        // Every format the factory knows now yields a reader, HFile included.
+        // The Option remains because a caller may hold no base file at all.
+        create_base_file_reader(storage, format)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     /// Returns the base-file reader for a path, reusing the cached reader when
@@ -467,11 +463,7 @@ impl FileGroupReader {
     /// Refusals are the exception, not the fallthrough: version 2 is the reader
     /// the gold fixtures compare against Hudi's own output, so a read it has no
     /// stated reason to refuse is one it serves.
-    fn version_two_unsupported_reason(
-        &self,
-        base_file_path: &str,
-        base_file_only: bool,
-    ) -> Result<Option<&'static str>> {
+    fn version_two_unsupported_reason(&self, base_file_only: bool) -> Result<Option<&'static str>> {
         // Deliberately an error rather than a fallback: falling back would use
         // version 1's own merge derivation, which drops deletes on a
         // commit-time-ordered table. Wrong rows are worse than a refusal.
@@ -511,23 +503,10 @@ impl FileGroupReader {
             ));
         }
 
-        // HFile outside a metadata table. Version 1 refuses it by name
-        // (`create_base_file_reader`), and falling back keeps that honest error
-        // rather than reaching version 2's `HFileBaseFileReader`, which is set
-        // up for the metadata table's records and not for a regular table's.
-        // Whether version 2 should serve a regular table's HFile base files is
-        // a separate question from this gate. Parquet and Lance both pass:
-        // version 2 resolves the format from the path with the same call this
-        // gate makes, so the two cannot disagree about a slice's format.
-        // Decided from the path, which is a string — still no I/O.
-        if BaseFileFormatValue::resolve_from_configs(&self.hudi_configs, Some(base_file_path))?
-            == BaseFileFormatValue::HFile
-        {
-            return Ok(Some(
-                "file group reader version 2 reads an HFile base file only through the \
-                 metadata-table reader",
-            ));
-        }
+        // An HFile slice must not fall back. Version 1 has no HFile base file
+        // reader and its log decoder refuses HFile blocks outright, so falling
+        // back turns a readable slice into an error. Version 2 reads both, which
+        // `hfile_base_file_table` pins on an ordinary table's records.
 
         // A table that drops its partition columns from the data files leaves
         // them knowable only from the partition path, and neither reader
@@ -560,7 +539,7 @@ impl FileGroupReader {
         if self.file_group_reader_version()? != FileGroupReaderVersion::Two {
             return Ok(false);
         }
-        match self.version_two_unsupported_reason(base_file_path, base_file_only)? {
+        match self.version_two_unsupported_reason(base_file_only)? {
             None => Ok(true),
             Some(reason) => {
                 log::debug!(
@@ -1480,7 +1459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hfile_base_file_read_reports_unsupported_reader() -> Result<()> {
+    async fn an_hfile_base_file_is_not_refused_for_its_format() -> Result<()> {
         let base_uri = get_base_uri_with_valid_props_minimum();
         let hudi_configs = Arc::new(HudiConfigs::new([
             (HudiTableConfig::BasePath, base_uri.as_str()),
@@ -1500,13 +1479,15 @@ mod tests {
             )
             .await;
 
+        // The format is no longer why this fails. The path names a file that does
+        // not exist, so the reader gets past format resolution and fails on the
+        // missing object -- which is what proves the format gate is gone.
         let error_msg = result
-            .expect_err("Expected unsupported HFile reader error")
+            .expect_err("the fixture path names no real file")
             .to_string();
         assert!(
-            error_msg.contains("Unsupported base file format")
-                && error_msg.contains("hfile is only supported"),
-            "Expected explicit unsupported HFile reader error, got: {error_msg}"
+            !error_msg.contains("hfile is only supported"),
+            "an HFile base file must no longer be refused for its format, got: {error_msg}"
         );
 
         Ok(())
@@ -1528,14 +1509,12 @@ mod tests {
             "no-config Parquet path should reuse the cached base-file reader"
         );
 
-        let hfile_error = match reader.reader_for_path("fileid_0-0-1_20240418173551906.hfile") {
-            Ok(_) => panic!("no-config HFile path should still use extension detection"),
-            Err(err) => err.to_string(),
-        };
+        let hfile_reader = reader
+            .reader_for_path("fileid_0-0-1_20240418173551906.hfile")
+            .expect("extension detection must now yield an HFile reader, not an error");
         assert!(
-            hfile_error.contains("Unsupported base file format")
-                && hfile_error.contains("hfile is only supported"),
-            "Expected no-config HFile path to report unsupported reader, got: {hfile_error}"
+            !Arc::ptr_eq(cached_reader, &hfile_reader),
+            "the HFile path must resolve to its own reader, not the cached Parquet one"
         );
 
         Ok(())
@@ -2186,9 +2165,7 @@ mod file_group_reader_version_tests {
             super::tests::get_metadata_table_base_uri(),
         )]));
         let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
-        let err = reader
-            .version_two_unsupported_reason("f.parquet", false)
-            .unwrap_err();
+        let err = reader.version_two_unsupported_reason(false).unwrap_err();
         assert!(
             matches!(err, CoreError::Unsupported(ref m) if m.contains("metadata table")),
             "expected an unsupported error naming the metadata table, got {err:?}"
@@ -2234,7 +2211,7 @@ mod file_group_reader_version_tests {
         );
 
         assert_eq!(
-            reader.version_two_unsupported_reason("f.parquet", false)?,
+            reader.version_two_unsupported_reason(false)?,
             None,
             "an ordinary merging read must be served by version 2"
         );
@@ -2311,7 +2288,7 @@ mod file_group_reader_version_tests {
         let reader = reader_with([("hoodie.record.merge.mode", "CUSTOM".to_string())]).await?;
 
         assert_eq!(
-            reader.version_two_unsupported_reason("f.parquet", true)?,
+            reader.version_two_unsupported_reason(true)?,
             None,
             "a read with nothing to merge must not be refused for a merge mode"
         );
@@ -2324,9 +2301,7 @@ mod file_group_reader_version_tests {
     -> Result<()> {
         let reader = reader_with([("hoodie.record.merge.mode", "CUSTOM".to_string())]).await?;
 
-        let err = reader
-            .version_two_unsupported_reason("f.parquet", false)
-            .unwrap_err();
+        let err = reader.version_two_unsupported_reason(false).unwrap_err();
         assert!(
             matches!(err, CoreError::Unsupported(_)),
             "expected a refusal, got {err:?}"
@@ -2364,7 +2339,7 @@ mod file_group_reader_version_tests {
         );
 
         let err = reader
-            .version_two_unsupported_reason("f.hfile", false)
+            .version_two_unsupported_reason(false)
             .expect_err("the metadata table is still refused, by a later gate");
         let message = err.to_string();
         assert!(
@@ -2488,28 +2463,18 @@ mod file_group_reader_version_tests {
     /// narrowing here and the per-path resolution in `resolve_reader_context`
     /// are one change: narrowing alone would make it reachable.
     ///
-    /// HFile still falls back — version 1 refuses it by name, and that is a
-    /// better answer than reaching version 2's `HFileBaseFileReader`, which is
-    /// set up for the metadata table's records.
+    /// HFile no longer falls back. Version 1 has no HFile base file reader and
+    /// its log decoder refuses HFile blocks, so diverting a readable slice there
+    /// turned it into an error; `hfile_base_file_table` reads it through version
+    /// two instead.
     #[tokio::test]
-    async fn test_version_two_unsupported_reason_refuses_hfile_and_admits_lance() -> Result<()> {
+    async fn test_version_two_unsupported_reason_admits_every_known_format() -> Result<()> {
         let reader = reader_with(Vec::<(&'static str, String)>::new()).await?;
 
-        assert!(
-            reader
-                .version_two_unsupported_reason("part/f.hfile", false)?
-                .is_some_and(|reason| reason.contains("HFile")),
-            "an HFile base file must fall back to version 1, naming HFile"
-        );
         assert_eq!(
-            reader.version_two_unsupported_reason("part/f.lance", false)?,
+            reader.version_two_unsupported_reason(false)?,
             None,
-            "a Lance base file must be served by version 2, not diverted"
-        );
-        assert_eq!(
-            reader.version_two_unsupported_reason("part/f.parquet", false)?,
-            None,
-            "a parquet base file must still be served by version 2"
+            "no known base file format is diverted to version 1 by this gate"
         );
         Ok(())
     }
@@ -2547,7 +2512,7 @@ mod file_group_reader_version_tests {
 
         for base_file_only in [false, true] {
             assert_eq!(
-                reader.version_two_unsupported_reason(&base_file, base_file_only)?,
+                reader.version_two_unsupported_reason(base_file_only)?,
                 None,
                 "base_file_only={base_file_only}: '{base_file}' must reach version 2, \
                  not fall back"
@@ -2628,7 +2593,7 @@ mod file_group_reader_version_tests {
 
         assert!(
             reader
-                .version_two_unsupported_reason("part/f.parquet", false)?
+                .version_two_unsupported_reason(false)?
                 .is_some_and(|reason| reason.contains("partition columns")),
             "a table dropping its partition columns must fall back to version 1"
         );

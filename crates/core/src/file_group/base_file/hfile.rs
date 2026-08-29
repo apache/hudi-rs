@@ -1388,4 +1388,63 @@ mod tests {
         );
         Ok(())
     }
+
+    /// An HFile base file and an HFile log block on a table that is **not** the
+    /// metadata table, read through the ordinary public path.
+    ///
+    /// The fixture overlaps base and log on two keys, so the three ways this can
+    /// go wrong look different: dropping the log block returns four rows at
+    /// fares 11-14, merging in the wrong direction returns 13 and 14 on the
+    /// overlap, and losing the base returns four rows from `uuid0003`. Values are
+    /// asserted rather than a row count for that reason.
+    #[tokio::test]
+    async fn an_hfile_slice_reads_on_a_table_that_is_not_the_metadata_table() -> crate::Result<()> {
+        use crate::file_group::reader::FileGroupReader;
+        use crate::table::ReadOptions;
+
+        let table_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../test/data/hfile_base_file_table");
+        let base_url = url::Url::from_file_path(std::fs::canonicalize(&table_path).unwrap())
+            .unwrap()
+            .to_string();
+        let reader =
+            FileGroupReader::new_with_options(&base_url, crate::config::util::empty_options())
+                .await?;
+
+        let batch = reader
+            .read_file_slice_from_paths(
+                "f0000000-0000-0000-0000-000000000001-0_0-1-1_20250101000000000.hfile",
+                vec![".f0000000-0000-0000-0000-000000000001-0_20250101000000000.log.1_0-2-2"],
+                &ReadOptions::new(),
+            )
+            .await?;
+
+        let keys = batch
+            .column_by_name("uuid")
+            .expect("uuid column")
+            .as_string::<i32>();
+        let fares = batch
+            .column_by_name("fare")
+            .expect("fare column")
+            .as_primitive::<arrow_array::types::Float64Type>();
+        let mut got: Vec<(String, i64)> = (0..batch.num_rows())
+            .map(|i| (keys.value(i).to_string(), fares.value(i) as i64))
+            .collect();
+        got.sort();
+
+        assert_eq!(
+            got,
+            vec![
+                ("uuid0001".to_string(), 11),
+                ("uuid0002".to_string(), 12),
+                ("uuid0003".to_string(), 102),
+                ("uuid0004".to_string(), 103),
+                ("uuid0005".to_string(), 104),
+                ("uuid0006".to_string(), 105),
+            ],
+            "the log block must be merged over the base file: the two overlapping \
+             keys take the log's fares, and all six keys survive"
+        );
+        Ok(())
+    }
 }

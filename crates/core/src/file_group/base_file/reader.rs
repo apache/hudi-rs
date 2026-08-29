@@ -29,7 +29,7 @@ use futures::stream::BoxStream;
 
 use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
-use crate::storage::error::{Result, StorageError};
+use crate::storage::error::Result;
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::{RowFilterBuilder, Storage};
 
@@ -280,9 +280,9 @@ pub fn create_base_file_reader(
         BaseFileFormatValue::Parquet => Ok(Arc::new(super::parquet::ParquetBaseFileReader::new(
             storage.clone(),
         ))),
-        BaseFileFormatValue::HFile => Err(StorageError::UnsupportedBaseFileFormat(
-            "hfile is only supported through the metadata-table HFile reader".to_string(),
-        )),
+        BaseFileFormatValue::HFile => Ok(Arc::new(super::hfile::HFileBaseFileReader::new(
+            storage.clone(),
+        ))),
         BaseFileFormatValue::Lance => Ok(Arc::new(super::lance::LanceBaseFileReader::new(
             storage.clone(),
         ))),
@@ -310,14 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn test_create_base_file_reader_hfile_is_unsupported() {
+    fn create_base_file_reader_builds_an_hfile_reader() {
         let storage = test_storage();
-        let reader = create_base_file_reader(&storage, &BaseFileFormatValue::HFile);
-        match reader {
-            Err(StorageError::UnsupportedBaseFileFormat(_)) => {}
-            Ok(_) => panic!("HFile should not create a generic base-file reader"),
-            Err(err) => panic!("Expected unsupported HFile error, got {err}"),
-        }
+        create_base_file_reader(&storage, &BaseFileFormatValue::HFile)
+            .expect("the factory serves HFile like any other format");
     }
 
     #[test]
