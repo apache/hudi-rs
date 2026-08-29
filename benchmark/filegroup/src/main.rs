@@ -33,6 +33,9 @@ use std::time::Instant;
 
 use arrow_schema::{Schema, SchemaRef};
 use clap::Parser;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use futures::{StreamExt, TryStreamExt};
 use hudi_core::config::HudiConfigs;
 use hudi_core::error::Result;
@@ -166,9 +169,67 @@ struct ReadConfig {
     slice_concurrency: usize,
 }
 
+/// A global allocator that refuses to exceed a byte ceiling.
+///
+/// `--max-rss-bytes` asserts *after* the fact: it reads peak RSS once the
+/// allocation has already happened, so it answers "how much did this read want"
+/// on a machine with memory to spare. It cannot answer "does this read survive
+/// on a small machine", because nothing ever told the process no.
+///
+/// This does. Past the ceiling, `alloc` returns null. Rust's runtime turns that
+/// into an abort, which is deliberately not graceful: an abort proves the
+/// ceiling is real. A read that wants to degrade instead has to stay under it by
+/// spilling, which is why this pairs with a low `--merge-max-size` rather than
+/// standing alone.
+///
+/// Off unless `FG_BENCH_ALLOC_CAP_BYTES` is set, so ordinary runs are unaffected
+/// and pay only a relaxed atomic add per allocation.
+struct CappedAllocator;
+
+static ALLOC_CAP: AtomicU64 = AtomicU64::new(0);
+static ALLOC_LIVE: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CappedAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let cap = ALLOC_CAP.load(Ordering::Relaxed);
+        if cap > 0 {
+            let live = ALLOC_LIVE.fetch_add(layout.size() as u64, Ordering::Relaxed)
+                + layout.size() as u64;
+            if live > cap {
+                ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+                // Null here, rather than a panic: a panic would unwind through
+                // an allocation path that has just been told there is no memory.
+                return std::ptr::null_mut();
+            }
+        }
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ALLOC_CAP.load(Ordering::Relaxed) > 0 {
+            ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        }
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CappedAllocator = CappedAllocator;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     env_logger::init();
+    // Read before anything large is allocated, so the cap covers the run rather
+    // than only its tail.
+    if let Ok(v) = std::env::var("FG_BENCH_ALLOC_CAP_BYTES")
+        && let Ok(n) = v.parse::<u64>()
+    {
+        ALLOC_CAP.store(n, Ordering::Relaxed);
+        eprintln!(
+            "[fg-bench] allocation ceiling: {} MiB (hard)",
+            n / (1024 * 1024)
+        );
+    }
     let args = Args::parse();
     if let Err(e) = run(&args).await {
         eprintln!("fg-bench failed: {e:?}");
@@ -253,7 +314,7 @@ async fn run(args: &Args) -> Result<()> {
             use_record_position: args.use_record_position,
             slice_concurrency: args.slice_concurrency,
         };
-        let spill_before = spill_dir_bytes(&spill_dir);
+        let spill_watch = SpillWatcher::start(spill_dir.clone());
         let rows =
             read_all_slices(&file_slices, &hoodie_options, &args.table, &read_config).await?;
 
@@ -295,7 +356,8 @@ async fn run(args: &Args) -> Result<()> {
         // the iteration means the merge map spilled. Without this a passing run
         // cannot distinguish "stayed under budget because it spilled correctly"
         // from "stayed under because the data never got large".
-        let spilled = spill_dir_bytes(&spill_dir) > spill_before;
+        let spill_peak_bytes = spill_watch.finish();
+        let spilled = spill_peak_bytes > 0;
 
         iterations.push(IterationReport {
             warmup,
@@ -307,6 +369,7 @@ async fn run(args: &Args) -> Result<()> {
             contended,
             accounting_drift: over_budget,
             spilled,
+            spill_peak_bytes,
             host: HostReport {
                 load1: host_pre.load1,
                 mem_available_kb: host_pre.mem_available_kb,
@@ -352,20 +415,73 @@ async fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Total bytes of regular files directly under `dir`, or 0 when unreadable.
+/// Watches a spill directory for its high-water mark while a read runs.
 ///
-/// Deliberately shallow and failure-tolerant: this is an observation used to
-/// report whether a run exercised the spill tier, never a correctness signal, so
-/// an unreadable directory must not fail the benchmark.
+/// A before/after comparison cannot work here. RocksDB creates its directory,
+/// writes, compacts, and removes it when the reader closes -- which happens
+/// before the read call returns. Sampling at iteration boundaries therefore sees
+/// an empty directory both times and reports "never spilled" for a read that
+/// spilled a gigabyte. Only sampling *during* the read observes it.
+struct SpillWatcher {
+    stop: Arc<AtomicBool>,
+    peak: Arc<AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SpillWatcher {
+    fn start(dir: std::path::PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let (s, pk) = (stop.clone(), peak.clone());
+        let handle = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let now = spill_dir_bytes(&dir);
+                pk.fetch_max(now, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        Self {
+            stop,
+            peak,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stops sampling and returns the largest total seen, in bytes.
+    fn finish(mut self) -> u64 {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+/// Total bytes of files under `dir`, walked recursively, or 0 when unreadable.
+///
+/// Recursive because the disk tier is RocksDB, which writes into a subdirectory
+/// rather than into `dir` itself. A shallow scan reports zero while a gigabyte
+/// of spill sits one level down, which reads as "never spilled" -- the opposite
+/// of the truth.
+///
+/// Even so this only detects spill that is still on disk when it runs: RocksDB
+/// compacts as it goes, so a sample after the read can miss a spill the read
+/// certainly did. Treat a `true` as proof and a `false` as unproven, never as
+/// proof of absence.
+///
+/// Failure-tolerant by intent: an unreadable directory is an observation
+/// problem, not a benchmark failure.
 fn spill_dir_bytes(dir: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     entries
         .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => spill_dir_bytes(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
         .sum()
 }
 
@@ -537,6 +653,8 @@ struct IterationReport {
     /// is not on the public reader surface, and a benchmark is not a reason to
     /// widen it.
     spilled: bool,
+    /// Largest total seen in the spill directory while the read ran.
+    spill_peak_bytes: u64,
     host: HostReport,
 }
 
