@@ -43,6 +43,7 @@ use crate::storage::Storage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 
 use crate::Result;
@@ -257,10 +258,21 @@ impl Table {
         &self,
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let Some((reader, file_slice)) = self.files_partition_reader().await? else {
+        let Some((reader, file_slices)) = self.files_partition_reader().await? else {
             return Ok(HashMap::new());
         };
-        reader.read_files_partition(&file_slice, keys).await
+        // Each slice holds a disjoint set of keys -- a metadata partition shards
+        // by hashing the record key -- so the per-slice maps combine by insertion
+        // with no merge rule needed. Bounded fan-out, the same ceiling the data
+        // read uses, so a sharded partition cannot open more readers at once than
+        // a table scan would.
+        let per_slice = crate::util::concurrency::bounded_in_order(
+            &file_slices,
+            self.file_slice_read_concurrency(),
+            |file_slice| reader.read_files_partition(file_slice, keys),
+        )
+        .await?;
+        Ok(per_slice.into_iter().flatten().collect())
     }
 
     /// The `files` partition's merged batch, for a caller that wants Arrow.
@@ -274,12 +286,18 @@ impl Table {
         &self,
         keys: &[&str],
     ) -> Result<arrow_array::RecordBatch> {
-        let Some((reader, file_slice)) = self.files_partition_reader().await? else {
+        let Some((reader, file_slices)) = self.files_partition_reader().await? else {
             return Ok(arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
                 Schema::empty(),
             )));
         };
-        reader.read_files_partition_batch(&file_slice, keys).await
+        let batches = crate::util::concurrency::bounded_in_order(
+            &file_slices,
+            self.file_slice_read_concurrency(),
+            |file_slice| reader.read_files_partition_batch(file_slice, keys),
+        )
+        .await?;
+        concat_metadata_batches(batches)
     }
 
     /// Resolve the `files` partition's single file slice and build a reader for it.
@@ -294,7 +312,7 @@ impl Table {
     ) -> Result<
         Option<(
             v2_reader::MetadataTableV2Reader,
-            crate::file_group::file_slice::FileSlice,
+            Vec<crate::file_group::file_slice::FileSlice>,
         )>,
     > {
         let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
@@ -329,15 +347,13 @@ impl Table {
             )
             .await?;
 
-        if file_slices.len() != 1 {
-            return Err(CoreError::MetadataTable(format!(
-                "Expected 1 file slice for {} partition, got {}",
-                FilesPartitionRecord::PARTITION_NAME,
-                file_slices.len()
-            )));
+        // No refusal on the slice count. `files` is one file group in practice,
+        // but the partitions that shard -- record index above all -- are many by
+        // design, hashing keys across file groups. Refusing anything but one made
+        // them unreadable; the reader itself never cared how many there were.
+        if file_slices.is_empty() {
+            return Ok(None);
         }
-
-        let file_slice = file_slices.into_iter().next().unwrap();
         let opts = ReadOptions::new().with_end_timestamp(timestamp);
         let configs = Arc::new(HudiConfigs::new(
             self.hudi_configs
@@ -359,8 +375,28 @@ impl Table {
         // nothing measured here establishes what that is.
         Ok(Some((
             v2_reader::MetadataTableV2Reader::new(configs, storage),
-            file_slice,
+            file_slices,
         )))
+    }
+}
+
+/// Concatenate the per-slice batches of one metadata partition.
+///
+/// A sharded partition is read slice by slice, and a caller wants one batch. The
+/// slices share a schema -- they are the same partition -- so this is a
+/// concatenation, not a union: a schema mismatch here means the read assembled
+/// slices from different partitions and should fail rather than coerce.
+fn concat_metadata_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    match batches.len() {
+        // The single-slice case, which is every `files` partition in practice,
+        // returns its batch untouched: no concat, no copy, nothing added to the
+        // path that existed before sharding was supported.
+        1 => Ok(batches.into_iter().next().expect("length checked")),
+        0 => Ok(RecordBatch::new_empty(Arc::new(Schema::empty()))),
+        _ => {
+            let schema = batches[0].schema();
+            arrow::compute::concat_batches(&schema, &batches).map_err(CoreError::ArrowError)
+        }
     }
 }
 
@@ -821,5 +857,96 @@ mod tests {
                 .contains("Cannot create metadata table from another metadata table"),
             "Error message should indicate cannot create from metadata table"
         );
+    }
+
+    /// A `files` partition spread over more than one file slice reads every
+    /// slice, rather than being refused for having more than one.
+    ///
+    /// The fixture's own `files` partition is a single file group, as it is in
+    /// practice, so a second slice is made by copying the base file under a new
+    /// file id. Slice discovery is a storage listing, so the copy is discovered
+    /// without touching the timeline -- which on table version 8 is Avro-encoded
+    /// and not something a test should have to write.
+    ///
+    /// The assertion is on **row count, doubled**. Three outcomes are then
+    /// distinguishable: the old refusal errors, a one-slice read returns N, and a
+    /// correct two-slice read returns 2N. Asserting merely that the read
+    /// succeeded would pass on the middle case, which is the one worth catching.
+    #[tokio::test]
+    async fn a_files_partition_of_several_slices_reads_all_of_them() -> Result<()> {
+        let src = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let src_root = std::path::Path::new(src.trim_start_matches("file://"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dst_root = tmp.path().join("table");
+        copy_tree(src_root, &dst_root);
+
+        let files_dir = dst_root.join(".hoodie").join("metadata").join("files");
+        // The partition holds two base files, both in file group `files-0000-0`
+        // at different instants -- two slices of one group, of which discovery
+        // takes the latest. Copying the latest under a second file id is what
+        // makes a second *group*, and so a second slice in the result.
+        let mut base: Vec<std::path::PathBuf> = std::fs::read_dir(&files_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "hfile"))
+            .collect();
+        base.sort();
+        assert!(
+            base.iter().all(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("files-0000-0")),
+            "the fixture must start with a single file group, or this test proves nothing"
+        );
+
+        let latest = base.last().expect("a base file");
+        let original = latest.file_name().unwrap().to_string_lossy().to_string();
+        // Same shape, different file id: `files-0001-0` beside `files-0000-0`.
+        let twin = original.replacen("files-0000-0", "files-0001-0", 1);
+        assert_ne!(
+            twin, original,
+            "the copy must land in a different file group"
+        );
+        std::fs::copy(latest, files_dir.join(&twin)).unwrap();
+
+        let table = Table::new(dst_root.to_str().unwrap()).await?;
+        let metadata = table.get_or_init_metadata_table().await?;
+
+        let one = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let baseline_table = Table::new(&one).await?;
+        let baseline = baseline_table
+            .get_or_init_metadata_table()
+            .await?
+            .read_files_partition_batch(&[])
+            .await?;
+
+        let doubled = metadata.read_files_partition_batch(&[]).await?;
+        assert_eq!(
+            doubled.num_rows(),
+            baseline.num_rows() * 2,
+            "both slices must be read and concatenated: one slice gives {}, two give {}",
+            baseline.num_rows(),
+            doubled.num_rows()
+        );
+        Ok(())
+    }
+
+    /// Recursive directory copy, so the test can modify a fixture without
+    /// touching the checked-in one.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap().filter_map(|e| e.ok()) {
+            let target = to.join(entry.file_name());
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => copy_tree(&entry.path(), &target),
+                Ok(t) if t.is_file() => {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+                _ => {}
+            }
+        }
     }
 }

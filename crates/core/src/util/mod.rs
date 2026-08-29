@@ -18,4 +18,5 @@
  */
 pub mod arrow;
 pub mod collection;
+pub(crate) mod concurrency;
 pub mod path;
