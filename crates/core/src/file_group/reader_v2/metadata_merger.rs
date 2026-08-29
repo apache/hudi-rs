@@ -39,6 +39,7 @@ const TYPE_FILES: i32 = 2;
 const TYPE_COLUMN_STATS: i32 = 3;
 const TYPE_PARTITION_STATS: i32 = 6;
 
+const KEY_COLUMN: &str = "key";
 const TYPE_COLUMN: &str = "type";
 const FILESYSTEM_METADATA_COLUMN: &str = "filesystemMetadata";
 const COLUMN_STATS_COLUMN: &str = "ColumnStatsMetadata";
@@ -65,6 +66,29 @@ const FILE_IS_DELETED_FIELD: &str = "isDeleted";
 pub enum CustomMerger {
     /// `org.apache.hudi.metadata.HoodieMetadataPayload`.
     MetadataPayload,
+}
+
+impl CustomMerger {
+    /// Columns this merger reads, which a projection must not remove.
+    ///
+    /// The required schema keeps a merge's own inputs even when the caller did
+    /// not ask for them, and a custom merger's inputs are known only to the
+    /// merger. Declaring them here rather than listing them at the one call site
+    /// means a merger added later cannot be forgotten there.
+    pub(crate) fn required_field_names(&self) -> &'static [&'static str] {
+        match self {
+            // Both are structural for every metadata partition: `key` identifies
+            // the record, `type` selects the rule `record_type` dispatches on.
+            //
+            // `key` is also the metadata table's configured record key, so the
+            // record-key path already keeps it -- but that protection comes from
+            // config naming it, not from the merger. Naming it here makes the
+            // merger's inputs independent of that config being right. Appending a
+            // name the list already holds is free: the caller only adds fields
+            // missing from the base schema, and deduplicates.
+            Self::MetadataPayload => &[KEY_COLUMN, TYPE_COLUMN],
+        }
+    }
 }
 
 /// Which custom merger a table's config selects, if any.

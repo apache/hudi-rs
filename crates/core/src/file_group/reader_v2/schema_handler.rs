@@ -280,6 +280,14 @@ impl FileGroupReaderSchemaHandler {
             mandatory_field_names.push("_hoodie_operation");
         }
 
+        // Add whatever the table's custom merger reads. Java delegates the merge
+        // to the payload class and never projects its inputs away; here the
+        // merger names them, so a projection cannot strip a column the merge
+        // dispatches on.
+        if let Some(custom_merger) = &self.custom_merger {
+            mandatory_field_names.extend_from_slice(custom_merger.required_field_names());
+        }
+
         // Append only fields not already in the base schema (Java line 219).
         let mut extra_fields: Vec<Arc<Field>> = Vec::new();
         for &field_name in &mandatory_field_names {
@@ -1427,6 +1435,78 @@ mod tests {
         assert!(
             required.column_with_name("_hoodie_record_key").is_some(),
             "mandatory record-key field must be appended alongside the nested struct"
+        );
+    }
+
+    /// A projection must not remove the columns the metadata merger reads.
+    ///
+    /// Both `key` and `type` are structural for every metadata partition: the
+    /// first identifies the record, the second selects the rule `record_type`
+    /// dispatches on. Without them the merge fails on a perfectly valid metadata
+    /// table -- and that failure is a correct guard, so what must not happen is
+    /// projecting the columns away.
+    ///
+    /// No record key fields are passed, deliberately. `key` is the metadata
+    /// table's configured record key in practice, so passing it would let the
+    /// record-key path keep the column and hide whether the merger's own
+    /// declaration does the work.
+    ///
+    /// `filesystemMetadata` is in the table and named by neither the request nor
+    /// the merger, so it must stay projected away. Without that check the test
+    /// would pass if nothing were projected at all.
+    #[test]
+    fn the_required_schema_keeps_the_custom_merger_s_own_columns() {
+        let table_schema =
+            make_schema(&["_hoodie_commit_time", "key", "type", "filesystemMetadata"]);
+        let requested = make_schema(&["_hoodie_commit_time"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new();
+        handler.table_schema = Some(table_schema.clone());
+        handler.data_schema = Some(table_schema);
+        handler.requested_schema = Some(requested.clone());
+
+        let props: HashMap<String, String> = HashMap::from([
+            (
+                "hoodie.compaction.payload.class".to_string(),
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+            (
+                "hoodie.record.merge.strategy.id".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+        ]);
+
+        handler
+            .prepare_required_schema(true, &[], &[], &props, false, "CUSTOM")
+            .expect("a metadata payload table resolves its merger");
+
+        assert!(
+            handler.custom_merger.is_some(),
+            "the fixture must really resolve a custom merger, or this test is vacuous"
+        );
+        for absent in ["key", "type", "filesystemMetadata"] {
+            assert!(
+                requested.column_with_name(absent).is_none(),
+                "the requested schema must omit `{absent}`, or this test proves nothing"
+            );
+        }
+
+        let required = handler
+            .required_schema
+            .as_ref()
+            .expect("a merge-on-read read has a required schema");
+        let names: Vec<&String> = required.fields().iter().map(|f| f.name()).collect();
+        for wanted in ["key", "type"] {
+            assert!(
+                required.column_with_name(wanted).is_some(),
+                "the required schema must add back `{wanted}`, which the merger names, \
+                 got: {names:?}"
+            );
+        }
+        assert!(
+            required.column_with_name("filesystemMetadata").is_none(),
+            "a column neither the request nor the merger names must stay projected away, \
+             got: {names:?}"
         );
     }
 }
