@@ -46,6 +46,7 @@ mod key;
 mod proto;
 mod reader;
 mod record;
+pub(crate) mod record_key;
 mod trailer;
 
 pub use block::BlockIndexEntry;

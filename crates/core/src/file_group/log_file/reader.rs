@@ -32,26 +32,8 @@ use crate::storage::reader::StorageReader;
 use crate::storage::{RowFilterBuilder, Storage};
 use crate::timeline::selector::InstantRange;
 use std::collections::HashMap;
-use std::io::SeekFrom;
-use std::io::{self, Read, Seek};
+use std::io::{self, Cursor};
 use std::sync::Arc;
-
-/// Read until `buf` is full or the stream ends, retrying on interrupts.
-///
-/// `Read::read` may return fewer bytes than asked for without being at EOF, so
-/// a single call cannot decide whether the scan window is exhausted.
-fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(CoreError::ReadLogFileError(e)),
-        }
-    }
-    Ok(filled)
-}
 
 /// First offset of `needle` within `haystack`.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -63,9 +45,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-pub struct LogFileReader<R: Read + Seek> {
+pub struct LogFileReader {
     hudi_configs: Arc<HudiConfigs>,
-    reader: R,
+    reader: StorageReader,
     timezone: String,
     /// Predicate to push into parquet log blocks. Unset by default, so a caller
     /// that has not decided whether pushing is sound reads every row.
@@ -77,7 +59,7 @@ pub struct LogFileReader<R: Read + Seek> {
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
 // rather than dropping the derive from the whole struct.
-impl<R: Read + Seek> std::fmt::Debug for LogFileReader<R> {
+impl std::fmt::Debug for LogFileReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogFileReader")
             .field("hudi_configs", &self.hudi_configs)
@@ -88,7 +70,7 @@ impl<R: Read + Seek> std::fmt::Debug for LogFileReader<R> {
     }
 }
 
-impl LogFileReader<StorageReader> {
+impl LogFileReader {
     pub async fn new(
         hudi_configs: Arc<HudiConfigs>,
         storage: Arc<Storage>,
@@ -135,18 +117,35 @@ impl LogFileReader<StorageReader> {
     ///
     /// `instant_range` is not applied here — the caller decides what to admit
     /// from the headers, which is the point of not decoding yet.
-    pub fn read_all_blocks_metadata_only(&mut self) -> Result<Vec<LogBlock>> {
+    /// Walk with no residency bound.
+    ///
+    /// For callers that are measuring or exercising the walk itself rather than a
+    /// scan. Production goes through [`Self::read_all_blocks_metadata_only`] with a
+    /// budget shared across every log file, which is what keeps peak residency at
+    /// one window.
+    pub async fn read_all_blocks_metadata_only_unbounded(&mut self) -> Result<Vec<LogBlock>> {
+        let mut budget = u64::MAX;
+        self.read_all_blocks_metadata_only(&mut budget).await
+    }
+
+    pub async fn read_all_blocks_metadata_only(
+        &mut self,
+        resident_budget: &mut u64,
+    ) -> Result<Vec<LogBlock>> {
         let fetcher = self.reader.block_fetcher();
         let mut blocks = Vec::new();
-        while let Some(block) = self.read_next_block_metadata_only(&fetcher)? {
+        while let Some(block) = self
+            .read_next_block_metadata_only(&fetcher, resident_budget)
+            .await?
+        {
             blocks.push(block);
         }
         Ok(blocks)
     }
 
-    pub fn read_all_blocks(&mut self, instant_range: &InstantRange) -> Result<Vec<LogBlock>> {
+    pub async fn read_all_blocks(&mut self, instant_range: &InstantRange) -> Result<Vec<LogBlock>> {
         let mut blocks = Vec::new();
-        while let Some(block) = self.read_next_block(instant_range)? {
+        while let Some(block) = self.read_next_block(instant_range).await? {
             if block.skipped {
                 continue;
             }
@@ -154,9 +153,7 @@ impl LogFileReader<StorageReader> {
         }
         Ok(blocks)
     }
-}
 
-impl<R: Read + Seek> LogFileReader<R> {
     /// Read [`MAGIC`] from the log file.
     ///
     /// Returns `Ok(true)` if the magic bytes are read successfully.
@@ -164,9 +161,9 @@ impl<R: Read + Seek> LogFileReader<R> {
     /// Returns `Ok(false)` if the end of the file is reached.
     ///
     /// Returns an error if the magic bytes are invalid or an I/O error occurs.
-    fn read_magic(&mut self) -> Result<bool> {
+    async fn read_magic(&mut self) -> Result<bool> {
         let mut magic = [0u8; 6];
-        match self.reader.read_exact(&mut magic) {
+        match self.reader.read_exact(&mut magic).await {
             Ok(_) => {
                 if magic != MAGIC {
                     return Err(CoreError::LogFormatError("Invalid magic".to_string()));
@@ -179,9 +176,9 @@ impl<R: Read + Seek> LogFileReader<R> {
     }
 
     /// Read 8 bytes for the log block's length excluding the magic.
-    fn read_block_length(&mut self) -> Result<u64> {
+    async fn read_block_length(&mut self) -> Result<u64> {
         let mut size_buf = [0u8; 8];
-        self.reader.read_exact(&mut size_buf)?;
+        self.reader.read_exact(&mut size_buf).await?;
         Ok(u64::from_be_bytes(size_buf))
     }
 
@@ -202,28 +199,12 @@ impl<R: Read + Seek> LogFileReader<R> {
     }
 
     /// Window used when scanning for the next MAGIC after a corrupt block.
-    const BLOCK_SCAN_READ_BUFFER_SIZE: usize = 1024 * 1024;
-
-    /// Total length of the stream, restoring the original position.
-    fn stream_len(&mut self) -> Result<u64> {
-        let cur = self
-            .reader
-            .stream_position()
-            .map_err(CoreError::ReadLogFileError)?;
-        let end = self
-            .reader
-            .seek(SeekFrom::End(0))
-            .map_err(CoreError::ReadLogFileError)?;
-        self.reader
-            .seek(SeekFrom::Start(cur))
-            .map_err(CoreError::ReadLogFileError)?;
-        Ok(end)
-    }
+    const BLOCK_SCAN_READ_BUFFER_SIZE: u64 = 1024 * 1024;
 
     /// Whether the next bytes are a MAGIC marker, treating end-of-file as one.
-    fn next_is_magic_or_eof(&mut self) -> Result<bool> {
+    async fn next_is_magic_or_eof(&mut self) -> Result<bool> {
         let mut magic = [0u8; 6];
-        match self.reader.read_exact(&mut magic) {
+        match self.reader.read_exact(&mut magic).await {
             Ok(_) => Ok(magic == MAGIC),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(true),
             Err(e) => Err(CoreError::ReadLogFileError(e)),
@@ -245,7 +226,7 @@ impl<R: Read + Seek> LogFileReader<R> {
     ///
     /// The reader is left just after the length field either way, which is
     /// where the caller expects to continue from.
-    fn is_block_corrupted(&mut self, magic_pos: u64, block_length: u64) -> Result<bool> {
+    async fn is_block_corrupted(&mut self, magic_pos: u64, block_length: u64) -> Result<bool> {
         let after_length = magic_pos
             .checked_add(MAGIC.len() as u64)
             .and_then(|v| v.checked_add(8));
@@ -260,25 +241,22 @@ impl<R: Read + Seek> LogFileReader<R> {
             return Ok(true);
         };
 
-        let stream_len = self.stream_len()?;
+        let stream_len = self.reader.file_len();
 
         if trailing_pos
             .checked_add(8)
             .map(|e| e > stream_len)
             .unwrap_or(true)
         {
-            self.reader
-                .seek(SeekFrom::Start(after_length))
-                .map_err(CoreError::ReadLogFileError)?;
+            self.reader.seek_to(after_length);
             return Ok(true);
         }
 
-        self.reader
-            .seek(SeekFrom::Start(trailing_pos))
-            .map_err(CoreError::ReadLogFileError)?;
+        self.reader.seek_to(trailing_pos);
         let mut buf = [0u8; 8];
         self.reader
             .read_exact(&mut buf)
+            .await
             .map_err(CoreError::ReadLogFileError)?;
         let trailing = u64::from_be_bytes(buf);
 
@@ -295,15 +273,11 @@ impl<R: Read + Seek> LogFileReader<R> {
         let result = if corrupt {
             true
         } else {
-            self.reader
-                .seek(SeekFrom::Start(block_end))
-                .map_err(CoreError::ReadLogFileError)?;
-            !self.next_is_magic_or_eof()?
+            self.reader.seek_to(block_end);
+            !self.next_is_magic_or_eof().await?
         };
 
-        self.reader
-            .seek(SeekFrom::Start(after_length))
-            .map_err(CoreError::ReadLogFileError)?;
+        self.reader.seek_to(after_length);
         Ok(result)
     }
 
@@ -314,45 +288,45 @@ impl<R: Read + Seek> LogFileReader<R> {
     ///
     /// Windows overlap by `MAGIC.len() - 1` so a marker straddling a window
     /// boundary is still found.
-    fn scan_for_next_block_offset(&mut self, from_pos: u64) -> Result<u64> {
-        let stream_len = self.stream_len()?;
+    async fn scan_for_next_block_offset(&mut self, from_pos: u64) -> Result<u64> {
+        let stream_len = self.reader.file_len();
         let mut pos = from_pos.saturating_add(MAGIC.len() as u64);
-        if pos >= stream_len {
-            return Ok(stream_len);
-        }
-        self.reader
-            .seek(SeekFrom::Start(pos))
-            .map_err(CoreError::ReadLogFileError)?;
-        let mut buf = vec![0u8; Self::BLOCK_SCAN_READ_BUFFER_SIZE];
         loop {
-            let n = read_up_to(&mut self.reader, &mut buf)?;
-            if n == 0 {
+            let Some(remaining) = stream_len.checked_sub(pos) else {
+                return Ok(stream_len);
+            };
+            let window = remaining.min(Self::BLOCK_SCAN_READ_BUFFER_SIZE);
+            if window == 0 {
                 return Ok(stream_len);
             }
-            if let Some(idx) = find_subslice(&buf[..n], MAGIC) {
+            self.reader.seek_to(pos);
+            let buf = self
+                .reader
+                .read_bytes(window)
+                .await
+                .map_err(CoreError::ReadLogFileError)?;
+            if let Some(idx) = find_subslice(&buf, MAGIC) {
                 return Ok(pos + idx as u64);
             }
-            if n < buf.len() {
+            // A short window means the file ended inside it, so there is no
+            // later marker to find. This is also what makes the loop terminate:
+            // past it the window is a full buffer, so the advance below is
+            // positive.
+            if window < Self::BLOCK_SCAN_READ_BUFFER_SIZE {
                 return Ok(stream_len);
             }
-            let advance = (n - (MAGIC.len() - 1)) as u64;
-            pos += advance;
-            self.reader
-                .seek(SeekFrom::Start(pos))
-                .map_err(CoreError::ReadLogFileError)?;
+            pos += window - (MAGIC.len() as u64 - 1);
         }
     }
 
     /// Synthesize a corrupt block and leave the reader at the recovery offset,
     /// so one bad block costs its own span rather than the rest of the file.
-    fn create_corrupted_block(&mut self, magic_pos: u64) -> Result<LogBlock> {
-        let next_offset = self.scan_for_next_block_offset(magic_pos)?;
+    async fn create_corrupted_block(&mut self, magic_pos: u64) -> Result<LogBlock> {
+        let next_offset = self.scan_for_next_block_offset(magic_pos).await?;
         log::warn!(
             "Found corrupt log block at offset {magic_pos}; next available block at {next_offset}"
         );
-        self.reader
-            .seek(SeekFrom::Start(next_offset))
-            .map_err(CoreError::ReadLogFileError)?;
+        self.reader.seek_to(next_offset);
         Ok(LogBlock::new(
             LogFormatVersion::V1,
             BlockType::Corrupted,
@@ -363,21 +337,21 @@ impl<R: Read + Seek> LogFileReader<R> {
     }
 
     /// Read 4 bytes for [`LogFormatVersion`].
-    fn read_log_format_version(&mut self) -> Result<LogFormatVersion> {
+    async fn read_log_format_version(&mut self) -> Result<LogFormatVersion> {
         let mut version_buf = [0u8; 4];
-        self.reader.read_exact(&mut version_buf)?;
+        self.reader.read_exact(&mut version_buf).await?;
         LogFormatVersion::try_from(version_buf)
     }
 
     /// Read 4 bytes for [`BlockType`].
-    fn read_block_type(&mut self, format_version: &LogFormatVersion) -> Result<BlockType> {
+    async fn read_block_type(&mut self, format_version: &LogFormatVersion) -> Result<BlockType> {
         if !format_version.has_block_type() {
             return Err(CoreError::LogFormatError(
                 "Block type is not supported".to_string(),
             ));
         }
         let mut type_buf = [0u8; 4];
-        self.reader.read_exact(&mut type_buf)?;
+        self.reader.read_exact(&mut type_buf).await?;
         BlockType::try_from(type_buf)
     }
 
@@ -389,7 +363,7 @@ impl<R: Read + Seek> LogFileReader<R> {
     ///    - 4 bytes: key ordinal (see [`BlockMetadataKey`])
     ///    - 4 bytes: value length
     ///    - N bytes: value string
-    fn read_block_metadata(
+    async fn read_block_metadata(
         &mut self,
         metadata_type: BlockMetadataType,
         format_version: &LogFormatVersion,
@@ -404,28 +378,27 @@ impl<R: Read + Seek> LogFileReader<R> {
             _ => {}
         }
         let mut num_entries_buf = [0u8; 4];
-        self.reader.read_exact(&mut num_entries_buf)?;
+        self.reader.read_exact(&mut num_entries_buf).await?;
         let num_entries = u32::from_be_bytes(num_entries_buf);
         let mut metadata: HashMap<BlockMetadataKey, String> =
             HashMap::with_capacity(num_entries as usize);
         for _ in 0..num_entries {
             let mut key_buf = [0u8; 4];
-            self.reader.read_exact(&mut key_buf)?;
+            self.reader.read_exact(&mut key_buf).await?;
             let key = BlockMetadataKey::try_from(key_buf)?;
             let mut value_len_buf = [0u8; 4];
-            self.reader.read_exact(&mut value_len_buf)?;
+            self.reader.read_exact(&mut value_len_buf).await?;
             let value_len = u32::from_be_bytes(value_len_buf);
-            let mut value_buf = vec![0u8; value_len as usize];
-            self.reader.read_exact(&mut value_buf)?;
-            let value =
-                String::from_utf8(value_buf).map_err(|e| CoreError::Utf8Error(e.utf8_error()))?;
+            let value_buf = self.reader.read_bytes(value_len as u64).await?;
+            let value = String::from_utf8(value_buf.to_vec())
+                .map_err(|e| CoreError::Utf8Error(e.utf8_error()))?;
             metadata.insert(key, value);
         }
         Ok(metadata)
     }
 
     /// Read 8 bytes for the total length of the log block.
-    fn read_total_block_length(
+    async fn read_total_block_length(
         &mut self,
         format_version: &LogFormatVersion,
     ) -> Result<Option<u64>> {
@@ -433,7 +406,7 @@ impl<R: Read + Seek> LogFileReader<R> {
             return Ok(None);
         }
         let mut size_buf = [0u8; 8];
-        self.reader.read_exact(&mut size_buf)?;
+        self.reader.read_exact(&mut size_buf).await?;
         Ok(Some(u64::from_be_bytes(size_buf)))
     }
 
@@ -451,44 +424,53 @@ impl<R: Read + Seek> LogFileReader<R> {
         instant_range.not_in_range(instant_time, &self.timezone)
     }
 
+    /// End of the block whose magic sits at `magic_pos`, which is also where
+    /// the next block's magic sits. `block_length` excludes the magic and its
+    /// own 8-byte field, so both are added back.
+    fn block_end(magic_pos: u64, block_length: u64) -> Result<u64> {
+        magic_pos
+            .checked_add(MAGIC.len() as u64)
+            .and_then(|v| v.checked_add(8))
+            .and_then(|v| v.checked_add(block_length))
+            .ok_or_else(|| CoreError::LogFormatError("Block length overflow".to_string()))
+    }
+
     /// Read one block's header, recording where its content sits and seeking
     /// past it without decoding.
     ///
     /// Corruption is still detected — a corrupt block cannot be trusted to say
     /// where the next one starts, so the check has to happen during the sweep
     /// rather than being deferred with the content.
-    fn read_next_block_metadata_only(
+    async fn read_next_block_metadata_only(
         &mut self,
         fetcher: &LogBlockFetcher,
+        resident_budget: &mut u64,
     ) -> Result<Option<LogBlock>> {
-        let magic_pos = self
-            .reader
-            .stream_position()
-            .map_err(CoreError::ReadLogFileError)?;
-        if !self.read_magic()? {
+        let magic_pos = self.reader.position();
+        if !self.read_magic().await? {
             return Ok(None);
         }
 
-        let block_length = self.read_block_length()?;
-        if self.is_block_corrupted(magic_pos, block_length)? {
-            return Ok(Some(self.create_corrupted_block(magic_pos)?));
+        let block_length = self.read_block_length().await?;
+        if self.is_block_corrupted(magic_pos, block_length).await? {
+            return Ok(Some(self.create_corrupted_block(magic_pos).await?));
         }
 
-        let format_version = self.read_log_format_version()?;
-        let block_type = self.read_block_type(&format_version)?;
-        let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+        let format_version = self.read_log_format_version().await?;
+        let block_type = self.read_block_type(&format_version).await?;
+        let header = self
+            .read_block_metadata(BlockMetadataType::Header, &format_version)
+            .await?;
 
         // The range starts at the content-length field, not after it, because
         // decoding reads that field itself — inflate hands the same bytes to the
         // same decoder the eager path uses.
-        let content_position = self
-            .reader
-            .stream_position()
-            .map_err(CoreError::ReadLogFileError)?;
+        let content_position = self.reader.position();
         let payload_length = if format_version.has_content_length() {
             let mut buf = [0u8; 8];
             self.reader
                 .read_exact(&mut buf)
+                .await
                 .map_err(CoreError::ReadLogFileError)?;
             u64::from_be_bytes(buf)
         } else {
@@ -508,15 +490,42 @@ impl<R: Read + Seek> LogFileReader<R> {
             payload_length
         };
 
-        // Skip the content; the footer and trailing length follow it.
+        // Take the content when it is already in hand, and skip past it otherwise.
+        //
+        // Deferring is what lets a scan walk a large file without holding it, and
+        // it is why a block the gates discard costs no bytes. It buys nothing when
+        // the bytes have already been transferred: a log file smaller than one
+        // fetch window arrives whole on the first fill, so deferring its blocks
+        // would re-request bytes this reader is already holding, one extra round
+        // trip per file. The slice is zero-copy, sharing the window's allocation.
         let after_content = content_position
             .checked_add(content_length)
             .ok_or_else(|| CoreError::LogFormatError("Content length overflow".to_string()))?;
-        self.reader
-            .seek(SeekFrom::Start(after_content))
-            .map_err(CoreError::ReadLogFileError)?;
-        let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
-        let _ = self.read_total_block_length(&format_version)?;
+        let affordable = *resident_budget >= content_length;
+        let resident_content =
+            if affordable && self.reader.has_resident(content_position, after_content) {
+                self.reader.seek_to(content_position);
+                let window_slice = self
+                    .reader
+                    .read_bytes(content_length)
+                    .await
+                    .map_err(CoreError::ReadLogFileError)?;
+                *resident_budget -= content_length;
+                // Copied, not sliced. `Bytes` slices share their allocation, so keeping
+                // a slice would pin the whole fetch window: one retained block would
+                // hold `hoodie.memory.dfs.buffer.max.size` rather than its own content,
+                // and a scan accumulates blocks from every log file before the gates
+                // run. Copying makes residency the block's own length, which the budget
+                // above then bounds.
+                Some(bytes::Bytes::copy_from_slice(&window_slice))
+            } else {
+                None
+            };
+        self.reader.seek_to(after_content);
+        let footer = self
+            .read_block_metadata(BlockMetadataType::Footer, &format_version)
+            .await?;
+        let _ = self.read_total_block_length(&format_version).await?;
 
         let mut block = LogBlock::new(
             format_version,
@@ -532,47 +541,35 @@ impl<R: Read + Seek> LogFileReader<R> {
             },
             fetcher: fetcher.clone(),
         });
+        // Bytes already in hand short-circuit the fetch, not the checks: the
+        // location above is what the decode validates the byte count against.
+        block.resident_content = resident_content;
         Ok(Some(block))
     }
 
-    fn read_next_block(&mut self, instant_range: &InstantRange) -> Result<Option<LogBlock>> {
+    async fn read_next_block(&mut self, instant_range: &InstantRange) -> Result<Option<LogBlock>> {
         // The magic's own offset — where a corrupt block's span starts.
-        let magic_pos = self
-            .reader
-            .stream_position()
-            .map_err(CoreError::ReadLogFileError)?;
-        if !self.read_magic()? {
+        let magic_pos = self.reader.position();
+        if !self.read_magic().await? {
             return Ok(None);
         }
 
-        let curr_pos = self
-            .reader
-            .stream_position()
-            .map_err(CoreError::ReadLogFileError)?;
-
-        let block_length = self.read_block_length()?;
+        let block_length = self.read_block_length().await?;
         // Validate before parsing the body: a corrupt or truncated block must
         // yield a corrupt marker and resume at the next block, rather than
         // failing the whole file on one bad span.
-        if self.is_block_corrupted(magic_pos, block_length)? {
-            return Ok(Some(self.create_corrupted_block(magic_pos)?));
+        if self.is_block_corrupted(magic_pos, block_length).await? {
+            return Ok(Some(self.create_corrupted_block(magic_pos).await?));
         }
-        let format_version = self.read_log_format_version()?;
-        let block_type = self.read_block_type(&format_version)?;
-        let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+        let block_end = Self::block_end(magic_pos, block_length)?;
+        let format_version = self.read_log_format_version().await?;
+        let block_type = self.read_block_type(&format_version).await?;
+        let header = self
+            .read_block_metadata(BlockMetadataType::Header, &format_version)
+            .await?;
         // If block is out of the requested range, fast skip its payload without decoding
         if self.should_skip_block(&header, instant_range)? {
-            // block_length excludes the magic; we consumed 8 bytes of length already.
-            // Jump to the end of this block (absolute seek from start of file):
-            // end_pos = curr_pos (right after magic) + 8 (length field) + block_length
-            let target = curr_pos
-                .checked_add(8)
-                .and_then(|v| v.checked_add(block_length))
-                .ok_or_else(|| CoreError::LogFormatError("Block length overflow".to_string()))?;
-            self.reader
-                .seek(SeekFrom::Start(target))
-                .map_err(CoreError::ReadLogFileError)?;
-
+            self.reader.seek_to(block_end);
             return Ok(Some(LogBlock::new_skipped(
                 format_version,
                 block_type,
@@ -583,15 +580,34 @@ impl<R: Read + Seek> LogFileReader<R> {
         let decoder = Decoder::new(self.hudi_configs.clone())
             .with_row_filter(self.row_filter.clone())
             .with_reader_schema(self.reader_schema_json.clone());
+        // Decode out of the block's own remaining bytes rather than straight off
+        // the reader: the reader is async and the decoders are not. The span
+        // ends where the block does, so a content length that lies runs out of
+        // bytes instead of reading into the next block.
+        let content_start = self.reader.position();
+        let remaining = block_end.checked_sub(content_start).ok_or_else(|| {
+            CoreError::LogFormatError(format!(
+                "the block at offset {magic_pos} declares {block_length} bytes, fewer than its \
+                 own header occupies"
+            ))
+        })?;
+        let mut content_bytes = Cursor::new(self.reader.read_bytes(remaining).await?);
         let content = decoder.decode_content(
-            self.reader.by_ref(),
+            &mut content_bytes,
             &format_version,
             block_length,
             &block_type,
             &header,
         )?;
-        let footer = self.read_block_metadata(BlockMetadataType::Footer, &format_version)?;
-        let _ = self.read_total_block_length(&format_version)?;
+        // What follows the content is at whatever offset the decoder stopped at,
+        // which is not a function of the block length: a decoder is capped at
+        // the content length but need not consume all of it.
+        self.reader
+            .seek_to(content_start + content_bytes.position());
+        let footer = self
+            .read_block_metadata(BlockMetadataType::Footer, &format_version)
+            .await?;
+        let _ = self.read_total_block_length(&format_version).await?;
 
         Ok(Some(LogBlock::new(
             format_version,
@@ -612,6 +628,125 @@ mod tests {
     use apache_avro::schema::Schema as AvroSchema;
     use std::fs::canonicalize;
     use std::path::PathBuf;
+
+    /// The walk keeps at most the budget it was given, whatever the file holds.
+    ///
+    /// Without a bound, a block's kept bytes are memory the header walk exists to
+    /// avoid: a scan accumulates blocks from every log file before the gates run,
+    /// so residency would sum across the slice rather than staying at one window.
+    #[tokio::test]
+    async fn the_walk_keeps_no_more_than_its_residency_budget() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let base_url = parse_uri(&dir)?;
+        let configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+            (HudiTableConfig::OrderingFields.as_ref(), "ts"),
+        ]));
+
+        let walk = async |budget: u64| -> Result<(usize, u64, u64)> {
+            let storage =
+                Storage::new(Arc::new(std::collections::HashMap::new()), configs.clone())?;
+            let mut reader =
+                LogFileReader::new_streaming(configs.clone(), storage, &file_name).await?;
+            let mut left = budget;
+            let blocks = reader.read_all_blocks_metadata_only(&mut left).await?;
+            let kept: u64 = blocks
+                .iter()
+                .filter_map(|b| b.resident_content.as_ref().map(|c| c.len() as u64))
+                .sum();
+            Ok((blocks.len(), kept, budget - left))
+        };
+
+        // Generous: the file is far inside one window, so every block is kept.
+        let (blocks, kept, charged) = walk(u64::MAX).await?;
+        assert!(blocks > 0, "the fixture must hold blocks");
+        assert!(kept > 0, "a generous budget must let the walk keep content");
+        assert_eq!(kept, charged, "what is kept must be what is charged");
+
+        // Zero: nothing may be kept, and the deferred path takes over.
+        let (_, kept_none, charged_none) = walk(0).await?;
+        assert_eq!(
+            (kept_none, charged_none),
+            (0, 0),
+            "a zero budget must leave the walk holding nothing"
+        );
+
+        // One byte under what the first block needs: still nothing kept, which is
+        // what makes the budget a bound rather than a suggestion.
+        let (_, kept_short, _) = walk(kept - 1).await?;
+        assert!(
+            kept_short < kept,
+            "a budget below the total must keep less than everything: {kept_short} against {kept}"
+        );
+        Ok(())
+    }
+
+    /// A log file inside one fetch window costs one request, not two.
+    ///
+    /// Asserted by request count rather than by the records returned, because both
+    /// paths return the same records over the same file: that is the point. The
+    /// counts come from a store that wraps the real one and counts what passes
+    /// through.
+    #[tokio::test]
+    async fn a_log_file_inside_one_window_is_read_in_a_single_request() -> Result<()> {
+        use crate::storage::counting::CountingObjectStore;
+
+        let (dir, file_name) = get_valid_log_avro_data();
+        let base_url = parse_uri(&dir)?;
+
+        async fn walk(
+            base_url: url::Url,
+            file_name: &str,
+            window: &str,
+        ) -> Result<(usize, usize, usize, usize)> {
+            let configs = Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+                (HudiTableConfig::OrderingFields.as_ref(), "ts"),
+                (crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE, window),
+            ]));
+            let (store, counts) =
+                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+            let storage = Storage::new_with_object_store(base_url, store, configs.clone());
+            let mut reader = LogFileReader::new_streaming(configs, storage, file_name).await?;
+            let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+            let resident = blocks
+                .iter()
+                .filter(|b| b.resident_content.is_some())
+                .count();
+            Ok((blocks.len(), resident, counts.gets(), counts.heads()))
+        }
+
+        // Inside one window: the walk holds every block's content, so nothing is
+        // left to fetch and the whole file cost one request.
+        let (blocks, resident, gets, heads) =
+            walk(base_url.clone(), &file_name, "16777216").await?;
+        assert!(blocks > 0, "the fixture must hold blocks");
+        assert_eq!(
+            resident, blocks,
+            "every block in a file inside one window must hold its own content"
+        );
+        assert_eq!(
+            (gets, heads),
+            (1, 1),
+            "one window fill and the size lookup, and nothing else"
+        );
+
+        // Smaller than the file: the walk cannot hold the content, so blocks defer
+        // and each one's bytes cost a request of its own later. Unchanged behaviour.
+        let (blocks_small, resident_small, gets_small, _) =
+            walk(base_url, &file_name, "64").await?;
+        assert_eq!(blocks_small, blocks, "the same file holds the same blocks");
+        assert_eq!(
+            resident_small, 0,
+            "a window smaller than the file must leave every block deferred"
+        );
+        assert!(
+            gets_small > gets,
+            "the windowed walk issues more requests than the single fill, got \
+             {gets_small} against {gets}"
+        );
+        Ok(())
+    }
 
     fn get_valid_log_avro_data() -> (String, String) {
         let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
@@ -645,10 +780,7 @@ mod tests {
         )
     }
 
-    async fn create_log_file_reader(
-        dir: &str,
-        file_name: &str,
-    ) -> Result<LogFileReader<StorageReader>> {
+    async fn create_log_file_reader(dir: &str, file_name: &str) -> Result<LogFileReader> {
         let dir_url = parse_uri(dir)?;
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
@@ -669,12 +801,13 @@ mod tests {
 
         let mut eager =
             LogFileReader::new(hudi_configs.clone(), storage.clone(), file_name).await?;
-        let eager_blocks =
-            eager.read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))?;
+        let eager_blocks = eager
+            .read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))
+            .await?;
 
         let mut lazy =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, file_name).await?;
-        let mut lazy_blocks = lazy.read_all_blocks_metadata_only()?;
+        let mut lazy_blocks = lazy.read_all_blocks_metadata_only_unbounded().await?;
 
         assert_eq!(
             lazy_blocks.len(),
@@ -686,7 +819,7 @@ mod tests {
         for (lazy_block, eager_block) in lazy_blocks.iter_mut().zip(eager_blocks.iter()) {
             assert_eq!(lazy_block.block_type, eager_block.block_type);
             assert_eq!(lazy_block.header, eager_block.header);
-            lazy_block.load_content(&decoder)?;
+            lazy_block.load_content(&decoder).await?;
             assert_eq!(
                 lazy_block.content.as_records().map(|b| b.num_data_rows()),
                 eager_block.content.as_records().map(|b| b.num_data_rows()),
@@ -722,15 +855,17 @@ mod tests {
 
         let magic_pos = 0;
         let real_length = {
-            reader.read_magic()?;
-            reader.read_block_length()?
+            reader.read_magic().await?;
+            reader.read_block_length().await?
         };
         assert!(
-            !reader.is_block_corrupted(magic_pos, real_length)?,
+            !reader.is_block_corrupted(magic_pos, real_length).await?,
             "a well-formed block must not be reported corrupt"
         );
         assert!(
-            reader.is_block_corrupted(magic_pos, real_length + 1)?,
+            reader
+                .is_block_corrupted(magic_pos, real_length + 1)
+                .await?,
             "a length disagreeing with the trailing pointer must be reported corrupt"
         );
         Ok(())
@@ -744,11 +879,11 @@ mod tests {
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
 
         assert!(
-            reader.is_block_corrupted(0, u64::MAX)?,
+            reader.is_block_corrupted(0, u64::MAX).await?,
             "overflow is corrupt"
         );
         assert!(
-            reader.is_block_corrupted(0, 1 << 40)?,
+            reader.is_block_corrupted(0, 1 << 40).await?,
             "a length past EOF is corrupt"
         );
         Ok(())
@@ -769,7 +904,7 @@ mod tests {
         let storage = Storage::new_with_base_url(dir_url)?;
         let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
 
-        let blocks = reader.read_all_blocks_metadata_only()?;
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
         assert!(!blocks.is_empty(), "the fixture has blocks to walk");
         for block in &blocks {
             assert!(
@@ -788,6 +923,152 @@ mod tests {
         Ok(())
     }
 
+    /// One batched read returns exactly what the same ranges return one at a
+    /// time. This is the property the Pass-3 prefetch rests on: fewer round
+    /// trips must not mean different bytes.
+    #[tokio::test]
+    async fn test_read_contents_matches_reading_each_range_alone() -> Result<()> {
+        // No shipped fixture holds more than one block, and a log file is just a
+        // sequence of self-contained blocks, so two of them concatenated is a
+        // valid two-block file and the smallest thing that can batch.
+        let (dir, file_name) = get_valid_log_avro_data();
+        let one = std::fs::read(PathBuf::from(&dir).join(&file_name)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doubled = one.clone();
+        doubled.extend_from_slice(&one);
+        std::fs::write(tmp.path().join(&file_name), &doubled).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new_streaming(hudi_configs, storage, &file_name).await?;
+        let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+
+        let deferred: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| b.deferred_content.as_ref())
+            .collect();
+        assert_eq!(
+            deferred.len(),
+            2,
+            "the doubled file must walk as two blocks for this to be a batch"
+        );
+
+        let fetcher = &deferred[0].fetcher;
+        let ranges: Vec<std::ops::Range<u64>> = deferred
+            .iter()
+            .map(|d| {
+                d.location.content_position..d.location.content_position + d.location.content_length
+            })
+            .collect();
+        let batched = fetcher.read_contents(&ranges).await?;
+        assert_eq!(batched.len(), ranges.len(), "one buffer per range");
+        for (i, d) in deferred.iter().enumerate() {
+            let alone = d
+                .fetcher
+                .read_content(d.location.content_position, d.location.content_length)
+                .await?;
+            assert_eq!(
+                batched[i], alone,
+                "batched range {i} must be byte-identical to reading it alone"
+            );
+        }
+        Ok(())
+    }
+
+    /// A block whose content runs past the end of the file must say so. The
+    /// ranged read comes back CLAMPED rather than refused, so without a length
+    /// check the decoder is handed a short buffer and fails somewhere inside the
+    /// block format instead. Also pins that a loaded block releases what it
+    /// needed to fetch itself.
+    #[tokio::test]
+    async fn test_load_content_reports_a_block_running_past_the_file_end() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join(&file_name);
+        std::fs::copy(PathBuf::from(&dir).join(&file_name), &copied).unwrap();
+
+        // A window of one byte forces every block to defer its content, which is
+        // the path where a ranged read can come back short. Left at the default,
+        // the walk would hold the whole file and decode from bytes it read before
+        // the truncation below, so the case would never arise.
+        //
+        // The window is read from the STORAGE's configs, not the reader's, so it
+        // has to be set on the storage or the setting is silently ignored.
+        let base_url = parse_uri(tmp.path().to_str().unwrap())?;
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::OrderingFields.as_ref(), "ts"),
+            (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+            (crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE, "1"),
+        ]));
+        let storage = Storage::new(
+            Arc::new(std::collections::HashMap::new()),
+            hudi_configs.clone(),
+        )?;
+        let mut reader =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
+        let mut blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+
+        let block = blocks.last_mut().expect("the fixture has a block to walk");
+        assert!(
+            block.resident_content.is_none(),
+            "the tiny window must have forced deferral, or this tests nothing"
+        );
+        let location = block
+            .deferred_content
+            .as_ref()
+            .expect("a metadata-only block records where its content is")
+            .location
+            .clone();
+
+        // Cut the file one byte short of this block's content so the ranged read
+        // returns less than it asked for.
+        let end = location.content_position + location.content_length;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&copied)
+            .unwrap()
+            .set_len(end - 1)
+            .unwrap();
+
+        let decoder = Decoder::new(hudi_configs);
+        let err = block
+            .load_content(&decoder)
+            .await
+            .expect_err("content running past the file end must be an error");
+        assert!(
+            err.to_string().contains("truncated or corrupt block"),
+            "the error must name the truncation rather than fail inside the decoder, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Loading is a no-op the second time. A block that decodes to no content —
+    /// a command block does — looks unloaded afterwards, so releasing its
+    /// location on the way out would make the second call fail instead.
+    #[tokio::test]
+    async fn test_load_content_is_idempotent_for_every_block_type() -> Result<()> {
+        let (dir, file_name) = get_valid_log_rollback();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(&dir)?)?;
+        let mut reader =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
+        let mut blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
+        assert!(
+            blocks.iter().any(|b| b.block_type == BlockType::Command),
+            "this fixture is chosen for its command block, which decodes to no content"
+        );
+
+        let decoder = Decoder::new(hudi_configs);
+        for block in blocks.iter_mut() {
+            block.load_content(&decoder).await?;
+            block
+                .load_content(&decoder)
+                .await
+                .expect("loading an already-loaded block must be a no-op, whatever it decoded to");
+        }
+        Ok(())
+    }
+
     /// A block deferred by the metadata-only pass reads back the same records
     /// the eager path produces. Deferring must change when the bytes are read,
     /// not what they decode to.
@@ -796,19 +1077,22 @@ mod tests {
         let (dir, file_name) = get_valid_log_avro_data();
 
         let mut eager_reader = create_log_file_reader(&dir, &file_name).await?;
-        let eager =
-            eager_reader.read_all_blocks(&InstantRange::up_to("29991231235959999", "utc"))?;
+        let eager = eager_reader
+            .read_all_blocks(&InstantRange::up_to("29991231235959999", "utc"))
+            .await?;
 
         let dir_url = parse_uri(&dir)?;
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
         let storage = Storage::new_with_base_url(dir_url)?;
         let mut lazy_reader =
             LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
-        let mut lazy = lazy_reader.read_all_blocks_metadata_only()?;
+        let mut lazy = lazy_reader
+            .read_all_blocks_metadata_only_unbounded()
+            .await?;
 
         let decoder = Decoder::new(hudi_configs);
         for block in lazy.iter_mut() {
-            block.load_content(&decoder)?;
+            block.load_content(&decoder).await?;
         }
 
         let rows = |bs: &[LogBlock]| -> usize {
@@ -835,15 +1119,20 @@ mod tests {
     async fn test_load_content_without_a_deferred_location_is_an_error() -> Result<()> {
         let (dir, file_name) = get_valid_log_avro_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
-        let mut blocks =
-            reader.read_all_blocks(&InstantRange::up_to("29991231235959999", "utc"))?;
+        let mut blocks = reader
+            .read_all_blocks(&InstantRange::up_to("29991231235959999", "utc"))
+            .await?;
         let decoder = Decoder::new(Arc::new(HudiConfigs::new([(
             HudiTableConfig::OrderingFields,
             "ts",
         )])));
 
         // Already decoded by the eager read: nothing to do.
-        blocks[0].load_content(&decoder)?;
+        blocks[0].load_content(&decoder).await?;
+        assert!(
+            blocks[0].deferred_content.is_none(),
+            "an eagerly read block has nothing deferred to release"
+        );
 
         // A block with content cleared and no deferred location cannot say where
         // to read from.
@@ -851,6 +1140,7 @@ mod tests {
         blocks[0].deferred_content = None;
         let err = blocks[0]
             .load_content(&decoder)
+            .await
             .expect_err("a block with nowhere to read from must be an error");
         assert!(
             err.to_string().contains("headers-only"),
@@ -903,11 +1193,195 @@ mod tests {
         let (dir, file_name) = get_valid_log_avro_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
 
-        let len = reader.stream_len()?;
-        let offset = reader.scan_for_next_block_offset(0)?;
+        let len = reader.reader.file_len();
+        let offset = reader.scan_for_next_block_offset(0).await?;
         assert!(
             offset <= len,
             "recovery offset {offset} must lie within the file ({len})"
+        );
+        Ok(())
+    }
+
+    /// Options carrying a base path, and a streaming window when one is asked
+    /// for. `Storage::new_with_base_url` builds its own configs, so the window
+    /// knob has to be set on the storage the reader is opened from.
+    fn storage_with_window(dir: &str, window: Option<u64>) -> Result<Arc<Storage>> {
+        let mut options = HashMap::new();
+        options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            parse_uri(dir)?.as_str().to_string(),
+        );
+        options.insert(
+            HudiTableConfig::OrderingFields.as_ref().to_string(),
+            "ts".to_string(),
+        );
+        if let Some(window) = window {
+            options.insert(
+                crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE.to_string(),
+                window.to_string(),
+            );
+        }
+        Ok(Storage::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HudiConfigs::new(options)),
+        )?)
+    }
+
+    /// A file whose first block is corrupt and whose second block's MAGIC starts
+    /// `straddle_by` bytes before the end of the recovery scan's first 1 MiB
+    /// window. Returns the directory, the file name, and where the good block
+    /// starts.
+    fn corrupt_then_good_file(straddle_by: u64) -> (tempfile::TempDir, String, u64) {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let good = std::fs::read(PathBuf::from(&dir).join(&file_name)).unwrap();
+
+        let magic_len = MAGIC.len() as u64;
+        let scan = LogFileReader::BLOCK_SCAN_READ_BUFFER_SIZE;
+        // The scan starts at `magic_len` and reads `scan` bytes, so its first
+        // window ends at `magic_len + scan`. Landing the good block's MAGIC
+        // `straddle_by` bytes before that end splits the marker across two
+        // windows.
+        let block_start = magic_len + scan - straddle_by;
+
+        let mut bytes = Vec::with_capacity(block_start as usize + good.len());
+        bytes.extend_from_slice(MAGIC);
+        // A length no file can hold, so the block is corrupt by arithmetic
+        // rather than by a trailing-pointer mismatch. All-ones also cannot
+        // contain MAGIC, which the scan would otherwise find.
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        bytes.resize(block_start as usize, 0);
+        bytes.extend_from_slice(&good);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(&file_name), &bytes).unwrap();
+        (tmp, file_name, block_start)
+    }
+
+    /// Recovery from a corrupt block scans forward for the next MAGIC over 1 MiB
+    /// windows, and consecutive windows overlap by `MAGIC.len() - 1` so a marker
+    /// split across a boundary is still found.
+    ///
+    /// This is the one place the header walk is not a forward parse, so it is
+    /// also the case a windowed fetch gets wrong most easily: dropping the
+    /// overlap, or refilling a fetch window without it, makes the scan miss the
+    /// marker, run to EOF, and swallow every later block into the corrupt span.
+    /// Asserted for the eager reader and for streaming readers whose fetch
+    /// window is smaller than, larger than, and unrelated to the scan window.
+    async fn assert_corrupt_recovery_finds_a_straddling_magic(window: Option<u64>) -> Result<()> {
+        let scan = LogFileReader::BLOCK_SCAN_READ_BUFFER_SIZE;
+        let magic_len = MAGIC.len() as u64;
+        let (tmp, file_name, block_start) = corrupt_then_good_file(3);
+        assert!(
+            block_start < magic_len + scan && block_start + magic_len > magic_len + scan,
+            "the fixture must split MAGIC across the scan's first window boundary"
+        );
+
+        let dir = tmp.path().to_str().unwrap();
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+
+        // The scan itself lands exactly on the good block's magic, not on EOF.
+        let storage = storage_with_window(dir, window)?;
+        let mut reader = match window {
+            None => LogFileReader::new(hudi_configs.clone(), storage.clone(), &file_name).await?,
+            Some(_) => {
+                LogFileReader::new_streaming(hudi_configs.clone(), storage.clone(), &file_name)
+                    .await?
+            }
+        };
+        assert_eq!(
+            reader.scan_for_next_block_offset(0).await?,
+            block_start,
+            "recovery must land on the good block's magic, not run to EOF"
+        );
+
+        // ... and the walk therefore reports the corrupt block followed by the
+        // good one, rather than one corrupt block covering the whole file.
+        let mut eager =
+            LogFileReader::new(hudi_configs.clone(), storage.clone(), &file_name).await?;
+        let eager_blocks = eager
+            .read_all_blocks(&InstantRange::up_to("99991231235959999", "utc"))
+            .await?;
+        assert_eq!(
+            eager_blocks
+                .iter()
+                .map(|b| b.block_type.clone())
+                .collect::<Vec<_>>(),
+            vec![BlockType::Corrupted, BlockType::AvroData],
+        );
+        assert!(
+            eager_blocks[1].record_batches().unwrap().num_data_rows() > 0,
+            "the block after the corrupt span must still decode"
+        );
+
+        let mut lazy =
+            LogFileReader::new_streaming(hudi_configs.clone(), storage, &file_name).await?;
+        let mut lazy_blocks = lazy.read_all_blocks_metadata_only_unbounded().await?;
+        assert_eq!(
+            lazy_blocks
+                .iter()
+                .map(|b| b.block_type.clone())
+                .collect::<Vec<_>>(),
+            vec![BlockType::Corrupted, BlockType::AvroData],
+        );
+        let decoder = Decoder::new(hudi_configs);
+        lazy_blocks[1].load_content(&decoder).await?;
+        assert_eq!(
+            lazy_blocks[1]
+                .content
+                .as_records()
+                .map(|b| b.num_data_rows()),
+            eager_blocks[1]
+                .content
+                .as_records()
+                .map(|b| b.num_data_rows()),
+            "the recovered block must decode the same either way"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_recovery_scan_finds_a_magic_split_across_windows() -> Result<()> {
+        let scan = LogFileReader::BLOCK_SCAN_READ_BUFFER_SIZE;
+        // Eager (whole file resident), a fetch window smaller than the scan
+        // window, one larger than it, and one that is not a multiple of it.
+        for window in [None, Some(scan / 2), Some(scan + 1024), Some(64 * 1024 + 7)] {
+            assert_corrupt_recovery_finds_a_straddling_magic(window).await?;
+        }
+        Ok(())
+    }
+
+    /// Skipping a block has to land exactly on the next block's magic. On a
+    /// one-block file it cannot: landing anywhere in the last few bytes reads as
+    /// end-of-file either way, so the arithmetic is only pinned when another
+    /// block follows. Two copies of a fixture is a valid two-block file, and
+    /// both carry the same instant time, so a window below it skips both — the
+    /// walk then has to reach the end cleanly rather than find garbage where the
+    /// second magic should be.
+    #[tokio::test]
+    async fn test_skipping_a_block_lands_on_the_next_ones_magic() -> Result<()> {
+        let (dir, file_name) = get_valid_log_avro_data();
+        let one = std::fs::read(PathBuf::from(&dir).join(&file_name)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doubled = one.clone();
+        doubled.extend_from_slice(&one);
+        std::fs::write(tmp.path().join(&file_name), &doubled).unwrap();
+
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "ts")]));
+        let storage = Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap())?)?;
+        let mut reader = LogFileReader::new(hudi_configs, storage, &file_name).await?;
+
+        // Everything is out of the window, so every block takes the skip path.
+        let instant_range = InstantRange::up_to("20200101000000000", "utc");
+        let mut skipped = 0;
+        while let Some(block) = reader.read_next_block(&instant_range).await? {
+            assert!(block.skipped, "a block below the window must be skipped");
+            skipped += 1;
+        }
+        assert_eq!(skipped, 2, "both blocks must be walked and skipped");
+        assert_eq!(
+            reader.reader.position(),
+            doubled.len() as u64,
+            "the walk must consume the file exactly, with no bytes left over"
         );
         Ok(())
     }
@@ -917,7 +1391,7 @@ mod tests {
         let (dir, file_name) = get_valid_log_avro_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250316025828811", "utc");
-        let blocks = reader.read_all_blocks(&instant_range)?;
+        let blocks = reader.read_all_blocks(&instant_range).await?;
         assert_eq!(blocks.len(), 1);
 
         let block = &blocks[0];
@@ -943,7 +1417,7 @@ mod tests {
         let (dir, file_name) = get_valid_log_parquet_data();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250113230424191", "utc");
-        let blocks = reader.read_all_blocks(&instant_range)?;
+        let blocks = reader.read_all_blocks(&instant_range).await?;
         assert_eq!(blocks.len(), 1);
 
         let block = &blocks[0];
@@ -969,7 +1443,7 @@ mod tests {
         let (dir, file_name) = get_valid_log_delete();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250618054714114", "utc");
-        let blocks = reader.read_all_blocks(&instant_range)?;
+        let blocks = reader.read_all_blocks(&instant_range).await?;
         assert_eq!(blocks.len(), 1, "Expected one delete block");
 
         let block = &blocks[0];
@@ -1023,7 +1497,7 @@ mod tests {
         let (dir, file_name) = get_valid_log_rollback();
         let mut reader = create_log_file_reader(&dir, &file_name).await?;
         let instant_range = InstantRange::up_to("20250126040936578", "utc");
-        let blocks = reader.read_all_blocks(&instant_range)?;
+        let blocks = reader.read_all_blocks(&instant_range).await?;
         assert_eq!(blocks.len(), 1, "Expected one rollback block");
 
         let block = &blocks[0];
@@ -1075,7 +1549,7 @@ mod tests {
         let instant_range = InstantRange::up_to("20200101000000000", "utc");
 
         // call the internal reader to inspect the skipped block
-        let maybe_block = reader.read_next_block(&instant_range)?;
+        let maybe_block = reader.read_next_block(&instant_range).await?;
         assert!(maybe_block.is_some(), "Expected a block to be read");
         let block = maybe_block.unwrap();
         assert!(block.skipped, "Block should be marked as skipped");
@@ -1083,7 +1557,7 @@ mod tests {
         assert!(block.record_batches().is_none());
 
         // next call should hit EOF
-        let next = reader.read_next_block(&instant_range)?;
+        let next = reader.read_next_block(&instant_range).await?;
         assert!(
             next.is_none(),
             "Should reach EOF after skipping the only block"

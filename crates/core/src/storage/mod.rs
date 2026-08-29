@@ -18,7 +18,6 @@
  */
 //! This module is responsible for interacting with the storage layer.
 
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +37,8 @@ use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
 use crate::storage::util::join_url_segments;
 
+#[cfg(test)]
+pub(crate) mod counting;
 pub mod error;
 pub mod file_metadata;
 pub mod reader;
@@ -57,45 +58,6 @@ pub type RowFilterBuilder = Arc<
         + Send
         + Sync,
 >;
-
-#[allow(dead_code)]
-/// Runtime that owns every ranged object-store read issued from synchronous
-/// code.
-///
-/// A log file is read through `std::io::Read`, which is synchronous, while
-/// `object_store` is async. Bridging the two needs somewhere to drive the
-/// future, and the obvious choices do not work: the sync read can be reached
-/// from inside another runtime, where `block_on` panics with "Cannot start a
-/// runtime from within a runtime", and a runtime built per read would take
-/// hyper's connection dispatcher down with it when dropped, failing every
-/// subsequent request against the same cached store.
-///
-/// So reads are spawned here and the calling thread waits on a channel. The
-/// runtime outlives any individual caller, which is what keeps the dispatcher
-/// alive.
-pub static OBJECT_STORE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(OBJECT_STORE_RUNTIME_WORKERS)
-        .enable_all()
-        .thread_name(OBJECT_STORE_RUNTIME_THREAD_NAME)
-        .build()
-        .expect("the object-store runtime must build")
-});
-
-/// Worker threads on [`OBJECT_STORE_RUNTIME`].
-///
-/// This runtime only drives object-store I/O, which is latency-bound rather
-/// than CPU-bound, so the count is a fixed small number rather than a function
-/// of the machine's cores: a host with 96 of them has no more requests in
-/// flight than one with 8, and sizing to cores would spend threads on nothing.
-pub(crate) const OBJECT_STORE_RUNTIME_WORKERS: usize = 8;
-
-/// Thread-name prefix for [`OBJECT_STORE_RUNTIME`]'s workers.
-///
-/// Load-bearing, not cosmetic: it is how a blocking bridge recognises that it is
-/// about to block one of its own workers — see
-/// [`in_object_store_runtime`](crate::storage::reader::in_object_store_runtime).
-pub(crate) const OBJECT_STORE_RUNTIME_THREAD_NAME: &str = "hudi-rs-objstore";
 
 #[derive(Clone, Debug)]
 pub struct Storage {
@@ -134,6 +96,27 @@ impl Storage {
             })),
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
+    }
+
+    /// Build storage over a caller-supplied object store.
+    ///
+    /// Test-only, so a test can wrap the real store and observe the requests a
+    /// reader makes. Note that a wrapper takes the trait's default `get_ranges`,
+    /// which coalesces, where `LocalFileSystem` overrides it and does not: the
+    /// counts a test sees are therefore the ones an object store would serve, not
+    /// the ones the local filesystem would.
+    #[cfg(test)]
+    pub(crate) fn new_with_object_store(
+        base_url: Url,
+        object_store: Arc<dyn ObjectStore>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Arc<Storage> {
+        Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options: Arc::new(HashMap::new()),
+            hudi_configs,
+        })
     }
 
     #[cfg(test)]

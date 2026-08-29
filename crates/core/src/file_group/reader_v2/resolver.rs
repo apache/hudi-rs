@@ -26,6 +26,7 @@ use crate::config::read::HudiReadConfig;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig};
 use crate::error::CoreError;
 use crate::file_group::reader_v2::buffer::spillable_map;
+use crate::file_group::reader_v2::metadata_merger::resolve_custom_merger;
 use crate::file_group::reader_v2::reader_context::{CONFIG_MERGE_TYPE, MergeMode, ReaderContext};
 use crate::file_group::reader_v2::record_context::RecordContext;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
@@ -34,10 +35,19 @@ use std::collections::HashMap;
 
 /// Resolve the MOR reader context from `hudi_configs`, which the caller has
 /// already merged read options into.
+///
+/// `base_file_path` decides the base file format when the table names none:
+/// a format is knowable from the extension alone, and resolving from config
+/// alone would call such a file parquet and fail on its footer. Passed as the
+/// same `Option<&str>` that `FileGroupReader::version_two_unsupported_reason`
+/// hands to `resolve_from_configs`, so the gate that admits a slice and the
+/// reader that opens it cannot disagree about its format. `None` for a caller
+/// with no base file — a log-only slice resolves no base file format.
 #[allow(dead_code)]
 pub(crate) fn resolve_reader_context(
     hudi_configs: &HudiConfigs,
     has_log_files: bool,
+    base_file_path: Option<&str>,
 ) -> Result<ReaderContext> {
     let table_path: String = hudi_configs.get(HudiTableConfig::BasePath)?.into();
 
@@ -58,9 +68,14 @@ pub(crate) fn resolve_reader_context(
         Err(CoreError::Unsupported(_)) if !has_log_files => MergeMode::CommitTimeOrdering,
         Err(e) => return Err(e),
     };
-    let base_file_format = BaseFileFormatValue::resolve_from_configs(hudi_configs, None)?;
+    let base_file_format = BaseFileFormatValue::resolve_from_configs(hudi_configs, base_file_path)?;
     let instant_range = resolve_instant_range(hudi_configs)?;
     let (table_config, hoodie_reader_config) = partition_configs(hudi_configs);
+    let merge_strategy_id = RECORD_MERGE_STRATEGY_ID_KEYS
+        .iter()
+        .find_map(|k| table_config.get(*k))
+        .cloned()
+        .unwrap_or_default();
 
     Ok(ReaderContext {
         table_path,
@@ -74,8 +89,9 @@ pub(crate) fn resolve_reader_context(
         should_merge_use_record_position: resolve_use_record_position(hudi_configs)?,
         // Only one iterator mode is implemented.
         iterator_mode: "ENGINE_RECORD".to_string(),
-        // Dispatch is on `merge_mode`; the strategy id is carried, not consulted.
-        merge_strategy_id: String::new(),
+        // Carried so a CUSTOM table's merger selection can confirm the id defers
+        // to the payload class rather than naming a merger of its own.
+        merge_strategy_id,
         // No bootstrap support in this crate.
         has_bootstrap_base_file: false,
         needs_bootstrap_merge: false,
@@ -83,6 +99,7 @@ pub(crate) fn resolve_reader_context(
         // Predicate pushdown into the merge path has no caller here, so no
         // filter is installed and the primary-key-safety gate is irrelevant.
         row_filter_builder: None,
+        key_predicate: None,
         mor_pk_safe: false,
         // The table-version < 8 completion gate needs a timeline the caller
         // has not loaded; leaving it unset keeps the gate a no-op.
@@ -201,11 +218,11 @@ fn resolve_use_record_position(hudi_configs: &HudiConfigs) -> Result<bool> {
 /// a pre-v8 table — the only kind that reaches the inference without stating a
 /// merge mode — writes the older one, so reading only the new key means the
 /// strategy is always empty for exactly the tables it exists to serve.
-const RECORD_MERGE_STRATEGY_ID_KEYS: [&str; 2] = [
+pub(crate) const RECORD_MERGE_STRATEGY_ID_KEYS: [&str; 2] = [
     "hoodie.record.merge.strategy.id",
     "hoodie.compaction.record.merger.strategy",
 ];
-const PAYLOAD_CLASS_KEYS: [&str; 3] = [
+pub(crate) const PAYLOAD_CLASS_KEYS: [&str; 3] = [
     "hoodie.compaction.payload.class",
     "hoodie.datasource.write.payload.class",
     "hoodie.table.legacy.payload.class",
@@ -363,6 +380,12 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         return match mode.to_ascii_uppercase().as_str() {
             "COMMIT_TIME_ORDERING" => Ok(MergeMode::CommitTimeOrdering),
             "EVENT_TIME_ORDERING" => Ok(MergeMode::EventTimeOrdering),
+            // A CUSTOM table is served only when its payload class names a merger
+            // this crate implements. The strategy id cannot make this call: every
+            // payload-based custom table carries the same all-zeros sentinel.
+            "CUSTOM" if resolve_custom_merger(&hudi_configs.as_options()).is_some() => {
+                Ok(MergeMode::Custom)
+            }
             other => Err(CoreError::Unsupported(format!(
                 "Record merge mode '{other}' is not supported. Set \
                  hoodie.read.file.group.reader.version=1 to read with the \
@@ -380,6 +403,11 @@ fn resolve_merge_mode(hudi_configs: &HudiConfigs) -> Result<MergeMode> {
         // marker its merge needs) says so by setting the merge mode outright,
         // which is handled above. Inferring the same thing here would read such
         // a table without those configs and drop its deletes silently.
+        // A payload this crate implements a merger for is reproducible, so it is
+        // served rather than refused. Anything else keeps the refusal.
+        InferredMode::Custom if resolve_custom_merger(&hudi_configs.as_options()).is_some() => {
+            Ok(MergeMode::Custom)
+        }
         InferredMode::Custom => Err(CoreError::Unsupported(
             "This table merges with a merger of its own, which the merge-on-read \
              reader cannot reproduce. Set hoodie.read.file.group.reader.version=1 \
@@ -456,7 +484,7 @@ mod tests {
         .create_instant_range_for_log_file_scan()
         .unwrap();
 
-        let resolved = resolve_reader_context(&configs, true)
+        let resolved = resolve_reader_context(&configs, true, /* base */ None)
             .unwrap()
             .instant_range
             .expect("the resolver always derives a range");
@@ -468,7 +496,7 @@ mod tests {
     fn resolves_table_path_from_base_path_config() {
         let configs = HudiConfigs::new(minimal_configs());
 
-        let ctx = resolve_reader_context(&configs, false).unwrap();
+        let ctx = resolve_reader_context(&configs, false, /* base */ None).unwrap();
 
         assert_eq!(ctx.table_path, "file:///tmp/t");
     }
@@ -480,7 +508,8 @@ mod tests {
     fn resolves_a_base_only_slice_of_a_custom_merge_table() {
         let mut options = minimal_configs();
         options.push(("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()));
-        let ctx = resolve_reader_context(&HudiConfigs::new(options), false).unwrap();
+        let ctx =
+            resolve_reader_context(&HudiConfigs::new(options), false, /* base */ None).unwrap();
         assert_eq!(ctx.merge_mode, "COMMIT_TIME_ORDERING");
     }
 
@@ -490,7 +519,8 @@ mod tests {
     fn refuses_a_merging_slice_of_a_custom_merge_table_naming_the_way_back() {
         let mut options = minimal_configs();
         options.push(("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()));
-        let err = resolve_reader_context(&HudiConfigs::new(options), true).unwrap_err();
+        let err =
+            resolve_reader_context(&HudiConfigs::new(options), true, /* base */ None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("hoodie.read.file.group.reader.version=1"),
@@ -508,10 +538,10 @@ mod tests {
             "com.example.MyPayload".to_string(),
         ));
         let configs = HudiConfigs::new(options);
-        let ctx = resolve_reader_context(&configs, false).unwrap();
+        let ctx = resolve_reader_context(&configs, false, /* base */ None).unwrap();
         assert_eq!(ctx.merge_mode, "COMMIT_TIME_ORDERING");
 
-        let err = resolve_reader_context(&configs, true).unwrap_err();
+        let err = resolve_reader_context(&configs, true, /* base */ None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("hoodie.read.file.group.reader.version=1"),
@@ -523,7 +553,7 @@ mod tests {
     fn resolves_latest_commit_time_from_end_timestamp() {
         let configs = HudiConfigs::new(minimal_configs());
 
-        let ctx = resolve_reader_context(&configs, false).unwrap();
+        let ctx = resolve_reader_context(&configs, false, /* base */ None).unwrap();
 
         assert_eq!(ctx.latest_commit_time, "20240101000000000");
     }
@@ -534,7 +564,7 @@ mod tests {
     fn errors_when_end_timestamp_is_absent() {
         let configs = configs_without(HudiReadConfig::EndTimestamp.as_ref());
 
-        let err = resolve_reader_context(&configs, false).unwrap_err();
+        let err = resolve_reader_context(&configs, false, /* base */ None).unwrap_err();
 
         assert!(
             err.to_string()
@@ -548,12 +578,12 @@ mod tests {
         let configs = HudiConfigs::new(minimal_configs());
 
         assert!(
-            resolve_reader_context(&configs, true)
+            resolve_reader_context(&configs, true, /* base */ None)
                 .unwrap()
                 .has_log_files
         );
         assert!(
-            !resolve_reader_context(&configs, false)
+            !resolve_reader_context(&configs, false, /* base */ None)
                 .unwrap()
                 .has_log_files
         );
@@ -563,9 +593,61 @@ mod tests {
     fn defaults_base_file_format_to_parquet() {
         let configs = HudiConfigs::new(minimal_configs());
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         assert_eq!(ctx.base_file_format, BaseFileFormatValue::Parquet.as_ref());
+    }
+
+    /// Regression test: the format came from config alone, so a base file whose
+    /// format only its extension names was resolved as parquet and opened with
+    /// the parquet reader, which fails on the footer.
+    #[test]
+    fn resolves_base_file_format_from_the_path_when_the_table_names_none() {
+        let configs = HudiConfigs::new(minimal_configs());
+        assert!(
+            BaseFileFormatValue::from_configs(&configs)
+                .unwrap()
+                .is_none(),
+            "the fixture must name no format, or the path is never consulted"
+        );
+
+        for (path, expected) in [
+            ("part/f.lance", BaseFileFormatValue::Lance),
+            ("part/f.hfile", BaseFileFormatValue::HFile),
+            ("part/f.parquet", BaseFileFormatValue::Parquet),
+            // Nothing the extension recognises: the Hudi default stands.
+            ("part/f.unknown", BaseFileFormatValue::Parquet),
+        ] {
+            let ctx = resolve_reader_context(&configs, true, Some(path)).unwrap();
+            assert_eq!(
+                ctx.base_file_format,
+                expected.as_ref(),
+                "'{path}' must resolve to {}",
+                expected.as_ref()
+            );
+        }
+    }
+
+    /// An explicit format outranks the extension, which is what
+    /// `resolve_from_configs` promises and what the fallback gate in
+    /// `FileGroupReader` assumes when it makes the same call.
+    ///
+    /// The configured format is `hfile`, not `parquet`: parquet is also the
+    /// default and also what a path resolution failure falls back to, so a
+    /// parquet expectation here would pass even if the config were ignored
+    /// entirely. `hfile` can only come from the config.
+    #[test]
+    fn an_explicit_base_file_format_outranks_the_path() {
+        let mut options = minimal_configs();
+        options.push((
+            HudiTableConfig::BaseFileFormat.as_ref().to_string(),
+            "hfile".to_string(),
+        ));
+        let configs = HudiConfigs::new(options);
+
+        let ctx = resolve_reader_context(&configs, true, Some("part/f.lance")).unwrap();
+
+        assert_eq!(ctx.base_file_format, BaseFileFormatValue::HFile.as_ref());
     }
 
     /// The log scan is bounded by the same window version 1 uses, so a version 2
@@ -579,7 +661,7 @@ mod tests {
         ));
         let configs = HudiConfigs::new(options);
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         let rendered = format!("{:?}", ctx.instant_range.expect("always derived"));
         assert!(rendered.contains("20230101000000000"), "got: {rendered}");
@@ -621,7 +703,7 @@ mod tests {
         }
         let configs = HudiConfigs::new(options);
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         for (key, value) in expected {
             assert_eq!(
@@ -654,7 +736,7 @@ mod tests {
     fn separates_table_configs_from_read_configs() {
         let configs = HudiConfigs::new(minimal_configs());
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         assert_eq!(
             ctx.table_config
@@ -697,7 +779,7 @@ mod tests {
         }
         let configs = HudiConfigs::new(options);
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         for key in crate_configs {
             assert!(
@@ -717,7 +799,7 @@ mod tests {
     fn leaves_position_based_merge_off() {
         let configs = HudiConfigs::new(minimal_configs());
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         assert!(!ctx.should_merge_use_record_position);
     }
@@ -730,7 +812,8 @@ mod tests {
             "true".to_string(),
         ));
 
-        let ctx = resolve_reader_context(&HudiConfigs::new(options), true).unwrap();
+        let ctx =
+            resolve_reader_context(&HudiConfigs::new(options), true, /* base */ None).unwrap();
 
         assert!(ctx.should_merge_use_record_position);
     }
@@ -746,7 +829,8 @@ mod tests {
             "yes".to_string(),
         ));
 
-        let err = resolve_reader_context(&HudiConfigs::new(options), true).unwrap_err();
+        let err =
+            resolve_reader_context(&HudiConfigs::new(options), true, /* base */ None).unwrap_err();
 
         assert!(
             err.to_string()
@@ -775,7 +859,7 @@ mod tests {
     fn resolves_event_time_ordering_from_an_ordering_field() {
         let configs = HudiConfigs::new(minimal_configs());
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         assert_eq!(ctx.merge_mode, MergeMode::EventTimeOrdering.as_ref());
     }
@@ -791,7 +875,7 @@ mod tests {
     fn infers_commit_time_ordering_without_an_ordering_field() {
         let configs = configs_without(HudiTableConfig::OrderingFields.as_ref());
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         assert_eq!(ctx.merge_mode, MergeMode::CommitTimeOrdering.as_ref());
     }
@@ -808,7 +892,7 @@ mod tests {
         ));
         let configs = HudiConfigs::new(options);
 
-        let ctx = resolve_reader_context(&configs, true).unwrap();
+        let ctx = resolve_reader_context(&configs, true, /* base */ None).unwrap();
 
         assert_eq!(ctx.merge_mode, MergeMode::EventTimeOrdering.as_ref());
     }
@@ -939,7 +1023,8 @@ mod tests {
             "hoodie.read.end.timestamp".to_string(),
             "99991231235959999".to_string(),
         );
-        let ctx = resolve_reader_context(&HudiConfigs::new(options), true).unwrap();
+        let ctx =
+            resolve_reader_context(&HudiConfigs::new(options), true, /* base */ None).unwrap();
 
         assert_eq!(ctx.merge_mode, MergeMode::CommitTimeOrdering.as_ref());
     }
@@ -956,7 +1041,7 @@ mod tests {
         ));
         let configs = HudiConfigs::new(options);
 
-        let err = resolve_reader_context(&configs, true).unwrap_err();
+        let err = resolve_reader_context(&configs, true, /* base */ None).unwrap_err();
 
         assert!(
             err.to_string().contains("merger of its own"),

@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// Statistics from the log scanning operation.
 #[derive(Debug, Clone, Default)]
 pub struct ScanStats {
-    pub total_time_taken_to_read_and_merge_blocks_ms: u64,
+    pub total_time_taken_to_read_and_merge_blocks_us: u64,
     /// Parity with Java's scan result; the reader reports its own counters.
     #[allow(dead_code)]
     pub num_merged_records_in_log: u64,
@@ -53,12 +53,16 @@ pub struct ScanStats {
     pub total_rollbacks: u64,
 
     // ── Stage timings (perf harness) ───────────────────────
-    /// Wall ms reading log-block metadata + bytes off storage (Pass 1).
-    pub log_block_read_ms: u64,
-    /// Wall ms inflating/decoding log blocks (nested inside merge insert).
-    pub log_block_decode_ms: u64,
-    /// Wall ms dispatching decoded records into the merge map (Pass 3).
-    pub merge_insert_ms: u64,
+    /// Wall us walking log-block headers off storage (Pass 1).
+    pub log_block_read_us: u64,
+    /// Wall us fetching admitted blocks' content (Pass 3's prefetch).
+    pub log_block_fetch_us: u64,
+    /// Wall us decoding fetched bytes into arrow batches.
+    pub log_block_decode_us: u64,
+    /// Wall us upserting decoded records into the merge map.
+    pub merge_upsert_us: u64,
+    /// Wall us dispatching blocks in Pass 3, spanning decode and upsert.
+    pub merge_insert_us: u64,
     /// Peak merge-map entry count observed during the scan.
     pub merge_map_peak_entries: u64,
     /// True if the merge map spilled to disk during the scan.
@@ -89,7 +93,7 @@ pub struct ScanStats {
 pub struct HoodieMergedLogRecordReader {
     pub(crate) base: BaseHoodieLogRecordReader,
     num_merged_records_in_log: u64,
-    total_time_taken_to_read_and_merge_blocks_ms: u64,
+    total_time_taken_to_read_and_merge_blocks_us: u64,
 }
 
 impl std::fmt::Debug for HoodieMergedLogRecordReader {
@@ -97,8 +101,8 @@ impl std::fmt::Debug for HoodieMergedLogRecordReader {
         f.debug_struct("HoodieMergedLogRecordReader")
             .field("num_merged_records", &self.num_merged_records_in_log)
             .field(
-                "total_time_ms",
-                &self.total_time_taken_to_read_and_merge_blocks_ms,
+                "total_time_us",
+                &self.total_time_taken_to_read_and_merge_blocks_us,
             )
             .finish()
     }
@@ -159,7 +163,7 @@ impl HoodieMergedLogRecordReader {
         // KeySpec filtering not yet implemented in Rust; pass skip=false
         self.base.scan_internal(false).await?;
 
-        self.total_time_taken_to_read_and_merge_blocks_ms = start.elapsed().as_millis() as u64;
+        self.total_time_taken_to_read_and_merge_blocks_us = start.elapsed().as_micros() as u64;
         self.num_merged_records_in_log = self.base.record_buffer.size() as u64;
 
         log::debug!(
@@ -178,17 +182,19 @@ impl HoodieMergedLogRecordReader {
     /// valid block instants, and scan statistics.
     pub fn into_parts(self) -> (Box<dyn HoodieFileGroupRecordBuffer>, Vec<String>, ScanStats) {
         let stats = ScanStats {
-            total_time_taken_to_read_and_merge_blocks_ms: self
-                .total_time_taken_to_read_and_merge_blocks_ms,
+            total_time_taken_to_read_and_merge_blocks_us: self
+                .total_time_taken_to_read_and_merge_blocks_us,
             num_merged_records_in_log: self.num_merged_records_in_log,
             total_log_files: self.base.total_log_files,
             total_log_blocks: self.base.total_log_blocks,
             total_log_records: self.base.total_log_records,
             total_corrupt_blocks: self.base.total_corrupt_blocks,
             total_rollbacks: self.base.total_rollbacks,
-            log_block_read_ms: self.base.log_block_read_ms,
-            log_block_decode_ms: self.base.record_buffer.stage_decode_ms(),
-            merge_insert_ms: self.base.merge_insert_ms,
+            log_block_read_us: self.base.log_block_read_us,
+            merge_insert_us: self.base.merge_insert_us,
+            log_block_fetch_us: self.base.log_block_fetch_us,
+            log_block_decode_us: self.base.log_block_decode_us,
+            merge_upsert_us: self.base.merge_upsert_us,
             merge_map_peak_entries: self.base.record_buffer.merge_map_peak_entries(),
             merge_map_spilled: self.base.record_buffer.merge_map_spilled(),
             merge_map_peak_in_memory_bytes: self
@@ -216,7 +222,7 @@ impl HoodieMergedLogRecordReader {
     }
 
     pub fn get_total_time_taken_to_read_and_merge_blocks(&self) -> u64 {
-        self.total_time_taken_to_read_and_merge_blocks_ms
+        self.total_time_taken_to_read_and_merge_blocks_us
     }
 
     pub fn get_total_log_files(&self) -> u64 {
@@ -274,7 +280,7 @@ pub struct Builder {
     allow_inflight_instants: bool,
     /// Inputs for the Gate-3 completed/inflight check; `Some` only for
     /// table version < 8. `None` (default) leaves Gate 3 a no-op.
-    completion_gate_inputs: Option<CompletionGateInputs>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 }
 
 impl Default for Builder {
@@ -347,7 +353,10 @@ impl Builder {
 
     /// Supply the Gate-3 completed/inflight sets. Callers pass `Some` only for
     /// table version < 8; `None` (the default) leaves Gate 3 disabled.
-    pub fn with_completion_gate_inputs(mut self, inputs: Option<CompletionGateInputs>) -> Self {
+    pub fn with_completion_gate_inputs(
+        mut self,
+        inputs: Option<Arc<CompletionGateInputs>>,
+    ) -> Self {
         self.completion_gate_inputs = inputs;
         self
     }
@@ -397,14 +406,17 @@ impl Builder {
             total_corrupt_blocks: 0,
             total_rollbacks: 0,
             progress: 0.0,
-            log_block_read_ms: 0,
-            merge_insert_ms: 0,
+            log_block_read_us: 0,
+            merge_insert_us: 0,
+            log_block_fetch_us: 0,
+            log_block_decode_us: 0,
+            merge_upsert_us: 0,
         };
 
         let mut reader = HoodieMergedLogRecordReader {
             base,
             num_merged_records_in_log: 0,
-            total_time_taken_to_read_and_merge_blocks_ms: 0,
+            total_time_taken_to_read_and_merge_blocks_us: 0,
         };
 
         // Mirrors Java constructor: if (forceFullScan) { performScan(); }
@@ -419,6 +431,8 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_group::log_file::log_block::BlockType;
+    use crate::file_group::reader_v2::MAX_INSTANT_TIME;
     use crate::file_group::reader_v2::buffer::key_based::KeyBasedFileGroupRecordBuffer;
     use crate::storage::util::parse_uri;
 
@@ -455,6 +469,124 @@ mod tests {
             KeyBasedFileGroupRecordBuffer::new(ctx, "COMMIT_TIME_ORDERING".to_string(), false)
                 .unwrap(),
         )
+    }
+
+    /// Copy a log-file fixture into a temp dir, so a test can rewrite its bytes.
+    fn fixture_copy() -> (tempfile::TempDir, String) {
+        let file_name =
+            ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string();
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/log_files/valid_log_avro_data")
+            .join(&file_name);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&src, dir.path().join(&file_name)).unwrap();
+        (dir, file_name)
+    }
+
+    fn storage_over(dir: &tempfile::TempDir) -> Arc<Storage> {
+        Storage::new_with_base_url(parse_uri(dir.path().to_str().unwrap()).unwrap()).unwrap()
+    }
+
+    /// Overwrite the payload of every data block, leaving the magic, lengths,
+    /// header and footer intact — well-formed on the outside, undecodable on the
+    /// inside, which is what a block from a rolled-back instant can look like.
+    /// Returns the instant time the blocks carry.
+    async fn make_payloads_undecodable(dir: &tempfile::TempDir, file_name: &str) -> String {
+        let configs = Arc::new(crate::config::HudiConfigs::new(
+            std::collections::HashMap::<String, String>::new(),
+        ));
+        let mut reader = crate::file_group::log_file::reader::LogFileReader::new_streaming(
+            configs,
+            storage_over(dir),
+            file_name,
+        )
+        .await
+        .unwrap();
+        let blocks = reader
+            .read_all_blocks_metadata_only_unbounded()
+            .await
+            .unwrap();
+
+        let path = dir.path().join(file_name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut instant = String::new();
+        for block in &blocks {
+            if !matches!(
+                block.block_type,
+                BlockType::AvroData | BlockType::ParquetData
+            ) {
+                continue;
+            }
+            instant = block.instant_time().unwrap().to_string();
+            let location = &block.deferred_content.as_ref().unwrap().location;
+            // The content range opens with the 8-byte content-length field, which
+            // inflation reads back, so only the bytes after it are overwritten.
+            let payload_start = location.content_position
+                + if block.format_version.has_content_length() {
+                    8
+                } else {
+                    0
+                };
+            let end = (location.content_position + location.content_length) as usize;
+            bytes[payload_start as usize..end].fill(0xFF);
+        }
+        assert!(!instant.is_empty(), "fixture must carry a data block");
+        std::fs::write(&path, &bytes).unwrap();
+        instant
+    }
+
+    async fn scan_with(
+        dir: &tempfile::TempDir,
+        file_name: &str,
+        latest_instant_time: &str,
+    ) -> Result<HoodieMergedLogRecordReader> {
+        HoodieMergedLogRecordReader::new_builder()
+            .with_reader_context(make_test_reader_context())
+            .with_storage(storage_over(dir))
+            .with_log_files(vec![file_name.to_string()])
+            .with_latest_instant_time(latest_instant_time.to_string())
+            .with_record_buffer(make_test_buffer())
+            .with_force_full_scan(true)
+            .build()
+            .await
+    }
+
+    /// The undecodable payload is genuinely fatal when a gate admits its instant.
+    /// Pairs with the test below: without this one, that test could pass because
+    /// the bytes still decode rather than because the gate ran first.
+    #[tokio::test]
+    async fn test_undecodable_block_fails_the_read_when_admitted() {
+        let (dir, file_name) = fixture_copy();
+        scan_with(&dir, &file_name, MAX_INSTANT_TIME)
+            .await
+            .expect("the intact fixture reads");
+
+        make_payloads_undecodable(&dir, &file_name).await;
+        assert!(
+            scan_with(&dir, &file_name, MAX_INSTANT_TIME).await.is_err(),
+            "an admitted block with an undecodable payload must fail the read"
+        );
+    }
+
+    /// A block that cannot be decoded, inside an instant the gates discard, does
+    /// not fail the read: Pass 1 walks headers, so a block that is never admitted
+    /// is never fetched or decoded.
+    #[tokio::test]
+    async fn test_undecodable_block_in_a_discarded_instant_does_not_fail_the_read() {
+        let (dir, file_name) = fixture_copy();
+        let instant = make_payloads_undecodable(&dir, &file_name).await;
+
+        // Gate 2 discards any non-command block above `latest_instant_time`.
+        let below_every_instant = "0".repeat(instant.len());
+        let reader = scan_with(&dir, &file_name, &below_every_instant)
+            .await
+            .expect("a discarded block must not fail the read");
+        assert_eq!(reader.get_total_log_files(), 1);
+        assert_eq!(
+            reader.get_num_merged_records_in_log(),
+            0,
+            "the discarded block contributes no records"
+        );
     }
 
     /// Java: TestHoodieMergedLogRecordReader — builder validation

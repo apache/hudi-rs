@@ -27,6 +27,19 @@ use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
+/// One delete record on its own, as it looks once unwrapped out of the list.
+///
+/// The wire schema is [`DELETE_RECORD_LIST_AVRO_SCHEMA_STR`]
+/// (`HoodieDeleteRecordList.avsc`) — that is what a delete log block is written
+/// as and what the live decode reads. This file is its post-unwrap companion,
+/// kept as the reference spelling of a single record's shape.
+///
+/// The two helpers over it, [`unwrap_ordering_value`] and
+/// [`avro_schema_for_delete_record`], have no callers beyond this module's own
+/// tests. Their plural namesakes are the live path and are different functions:
+/// `unwrap_ordering_values` and [`avro_schema_for_delete_record_list`], both in
+/// `file_group::log_file::content`'s decode. Singular here means one record;
+/// plural means the block.
 static DELETE_RECORD_AVRO_SCHEMA_STR: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/schemas/HoodieDeleteRecord.avsc"
@@ -159,6 +172,9 @@ pub fn avro_schema_for_delete_record(delete_record_value: &AvroValue) -> Result<
     AvroSchema::parse(&json).map_err(CoreError::AvroError)
 }
 
+/// The wire schema: what a delete log block is written as, and what the live
+/// decode reads. [`DELETE_RECORD_AVRO_SCHEMA_STR`] is the single-record
+/// companion to this one.
 static DELETE_RECORD_LIST_AVRO_SCHEMA_STR: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/schemas/HoodieDeleteRecordList.avsc"

@@ -1612,18 +1612,47 @@ fg_case_test!(
 // silently dropped. This crate does recognize HFile blocks, so the read
 // completes; the case stays #[ignore]d until the expectation is re-derived
 // (see the ignore reason) rather than being silently inverted.
+// An HFile log block merges, so its updates reach the output.
+//
+// The expectation is derived from the inputs, not from this reader: the base file
+// was read with the parquet reader and the block's two records were decoded with
+// `apache_avro::from_avro_datum` against the schema in the block header. Both
+// sides carry `ts = 100`, so event-time ordering ties and the case's commit-time
+// ordering decides, which makes the log write win on k1 and k2.
+//
+// This is NOT a Hudi-parity oracle. The fixture has no gold data, because Spark
+// cannot read it either, so nothing here checks hudi-rs against Hudi. It checks
+// the merge against the decoded inputs.
+//
+// `key` is asserted because it is the column the HFile entry key is filled into.
+// The log writer left it empty and the base file holds it, so without the fill k1
+// and k2 would read as empty next to k3 and k4 holding their own keys.
 fg_case_test!(
-    harness_hfile_log_block_rejected,
+    harness_hfile_log_block_merges,
     FgReaderCase {
-        name: "hfile_log_block_rejected",
+        name: "hfile_log_block_merges",
         fixture: QuickstartTripsTable::MorLayoutHfileLogBlock,
         partition: "",
         base_file: "c62149b1-ec4b-4f3a-9302-149ffcfe3cde-0_0-212-362_20260607061245908.parquet",
         log_files: &[".c62149b1-ec4b-4f3a-9302-149ffcfe3cde-0_20260607061248155.log.1_0-226-388"],
-        expected: Expected::ErrContains("Invalid block type: 4"),
+        expected: Expected::Rows {
+            sort_key: "_hoodie_record_key",
+            columns: &[
+                "_hoodie_record_key",
+                "key",
+                "_hoodie_commit_time",
+                "value",
+                "num"
+            ],
+            rows: &[
+                &["k1", "k1", "20260607061248155", "v1_upd", "11"],
+                &["k2", "k2", "20260607061248155", "v1_upd", "11"],
+                &["k3", "k3", "20260607061245908", "v3", "3"],
+                &["k4", "k4", "20260607061245908", "v4", "4"],
+            ],
+        },
         ..Default::default()
-    },
-    ignore = "asserts an HFile log block is rejected, which held upstream; this crate has HFile support and the read completes, so the expectation needs re-deriving rather than inverting"
+    }
 );
 
 // =============================================================================

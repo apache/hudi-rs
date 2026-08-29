@@ -28,7 +28,7 @@ use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
 use hudi_core::error::{CoreError, Result};
 use hudi_core::table::{QueryType, ReadOptions, Table};
-use hudi_test::{QuickstartTripsTable, SampleTable};
+use hudi_test::{QuickstartTripsTable, SampleTable, TableFormat};
 
 async fn collect_stream_batches(
     mut stream: BoxStream<'static, Result<RecordBatch>>,
@@ -2216,7 +2216,7 @@ mod streaming_queries {
     ///
     /// Deliberately does NOT assert a chunk count for version 2. Its cadence
     /// follows the base file's row groups, not `batch_size` — which
-    /// `FileGroupMergeIterator::new_buffered` accepts and discards (see its
+    /// `FileGroupMergeStream::new_buffered` accepts and discards (see its
     /// `_batch_size` parameter). These fixtures are a single row group, so one
     /// chunk is the correct answer for them, and asserting more would pin the
     /// fixture's size rather than the reader's behavior.
@@ -2799,6 +2799,214 @@ mod lance_tables {
         let total_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         assert_eq!(total_rows, 9);
 
+        Ok(())
+    }
+
+    /// A Lance MOR read whose table names no base file format, served by each
+    /// reader version, on both the eager and the streaming path.
+    ///
+    /// Version 2 resolves the base file format from the file's path. With
+    /// `hoodie.table.base.file.format` stripped, the extension is the only thing
+    /// that names the format — which is why this fixture discriminates and the
+    /// ones that set the config do not: they pass whether or not the path
+    /// reaches the resolution. With the resolution reverted to config alone,
+    /// this fails with `Invalid Parquet file. Corrupt footer`.
+    ///
+    /// Merge-on-read rather than copy-on-write, so the log blocks merge over a
+    /// Lance base file rather than the base file being returned alone. The
+    /// streaming path is covered too: it reaches version 2 through a separate
+    /// entry point (`read_stream`), and before this change it served Lance from
+    /// version 1 collected into one batch.
+    ///
+    /// Every shape is compared against the others as well as against literal
+    /// rows, so a shape that starts returning something different fails here
+    /// rather than in whichever downstream test happens to notice.
+    #[tokio::test]
+    async fn test_v9_lance_nonhivestyle_mor_read_resolves_format_from_path_per_reader_version()
+    -> Result<()> {
+        // Safe because this asks for a fresh extraction before mutating
+        // hoodie.properties in place.
+        let table_path = SampleTable::V9LanceNonhivestyle.path_fresh(TableFormat::MorAvro);
+        let props_path = std::path::Path::new(&table_path).join(".hoodie/hoodie.properties");
+        let props = std::fs::read_to_string(&props_path).unwrap();
+        assert!(
+            props
+                .lines()
+                .any(|line| line == "hoodie.table.base.file.format=LANCE"),
+            "the fixture must name LANCE before this test strips it, or stripping proves nothing"
+        );
+        let props_without_format = props
+            .lines()
+            .filter(|line| !line.starts_with("hoodie.table.base.file.format="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&props_path, props_without_format).unwrap();
+
+        let hudi_table = Table::new(&table_path).await?;
+
+        /// One projected row: event id, payload, ordering value, partition value.
+        /// Named so the cross-shape accumulator below reads as a list of reads
+        /// rather than as nested tuples.
+        type MergedRow = (String, String, i64, String);
+
+        let mut per_shape: Vec<(String, Vec<MergedRow>)> = Vec::new();
+        for reader_version in ["2", "1"] {
+            let options = ReadOptions::new()
+                .with_hudi_option(
+                    HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                    reader_version,
+                )
+                .with_projection(["event_id", "user_id", "payload", "event_ts", "event_date"]);
+
+            for read_path in ["eager", "streaming"] {
+                let batches = if read_path == "eager" {
+                    hudi_table.read(&options).await?
+                } else {
+                    collect_stream_batches(hudi_table.read_stream(&options).await?).await?
+                };
+                let schema = batches[0].schema();
+                let batch = concat_batches(&schema, &batches)?;
+                let shape = format!("reader version {reader_version}, {read_path}");
+
+                assert_eq!(
+                    sorted_string_values(&batch, "event_id"),
+                    [
+                        "evt-001", "evt-002", "evt-003", "evt-004", "evt-005", "evt-006",
+                        "evt-007", "evt-008", "evt-009", "evt-010", "evt-011", "evt-012",
+                        "evt-013", "evt-014",
+                    ],
+                    "{shape}: every key must survive the merge"
+                );
+
+                let event_id_col = string_column(&batch, "event_id");
+                let payload_col = string_column(&batch, "payload");
+                let event_ts_col = int64_column(&batch, "event_ts");
+                let event_date_col = string_column(&batch, "event_date");
+                let mut rows = (0..batch.num_rows())
+                    .map(|row_idx| {
+                        (
+                            event_id_col.value(row_idx).to_string(),
+                            payload_col.value(row_idx).to_string(),
+                            event_ts_col.value(row_idx),
+                            event_date_col.value(row_idx).to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort();
+
+                let by_id: HashMap<_, _> = rows
+                    .iter()
+                    .map(|(id, payload, ts, date)| (id.clone(), (payload, ts, date)))
+                    .collect();
+                // A log update, not a base-file value: this is what proves the
+                // log blocks merged over the Lance base file rather than being
+                // dropped.
+                assert_eq!(
+                    by_id.get("evt-001").unwrap().0,
+                    r#"{"page": "/home", "session": "sess-abc123"}"#,
+                    "{shape}: the log's update must win"
+                );
+                assert_eq!(
+                    *by_id.get("evt-001").unwrap().1,
+                    1700000000001,
+                    "{shape}: the log's ordering value must win"
+                );
+                // The partition column, asserted rather than merely projected.
+                // This table is non-hive-style, and a reader that null-filled the
+                // column would pass every assertion above: a null renders as an
+                // empty string here. Checked on every row, not one.
+                assert!(
+                    rows.iter().all(|(_, _, _, date)| !date.is_empty()),
+                    "{shape}: no row may lose its partition column value"
+                );
+
+                per_shape.push((shape, rows));
+            }
+        }
+
+        // Cross-check every shape against version 1's eager read, which is what
+        // served this fixture before the change.
+        let (baseline_shape, baseline) = per_shape
+            .iter()
+            .find(|(shape, _)| shape == "reader version 1, eager")
+            .expect("version 1's eager read must be one of the shapes");
+        for (shape, rows) in &per_shape {
+            assert_eq!(
+                rows, baseline,
+                "{shape} disagrees with {baseline_shape} over a Lance base file"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The same Lance MOR fixture read read-optimized, per reader version.
+    ///
+    /// A read-optimized read consults no merger and returns base rows, so it
+    /// reaches version 2 through the base-file-only shape rather than the merge
+    /// path — a different branch of the capability gate, and one that served
+    /// Lance from version 1 before this change. The format config is stripped
+    /// again, so the extension is the only thing naming the format.
+    ///
+    /// Asserted as version-1-versus-version-2 agreement rather than against
+    /// literal rows: what matters is that swapping the engine under a Lance base
+    /// file does not change what a read-optimized scan returns.
+    #[tokio::test]
+    async fn test_v9_lance_nonhivestyle_mor_read_optimized_agrees_across_reader_versions()
+    -> Result<()> {
+        // Safe because this asks for a fresh extraction before mutating
+        // hoodie.properties in place.
+        let table_path = SampleTable::V9LanceNonhivestyle.path_fresh(TableFormat::MorAvro);
+        let props_path = std::path::Path::new(&table_path).join(".hoodie/hoodie.properties");
+        let props = std::fs::read_to_string(&props_path).unwrap();
+        let props_without_format = props
+            .lines()
+            .filter(|line| !line.starts_with("hoodie.table.base.file.format="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&props_path, props_without_format).unwrap();
+
+        let hudi_table = Table::new(&table_path).await?;
+
+        let mut per_version = Vec::new();
+        for reader_version in ["2", "1"] {
+            let options = ReadOptions::new()
+                .with_hudi_option(
+                    HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                    reader_version,
+                )
+                .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true")
+                .with_projection(["event_id", "event_ts", "event_date"]);
+            let batches = hudi_table.read(&options).await?;
+            let schema = batches[0].schema();
+            let batch = concat_batches(&schema, &batches)?;
+
+            let event_id_col = string_column(&batch, "event_id");
+            let event_ts_col = int64_column(&batch, "event_ts");
+            let event_date_col = string_column(&batch, "event_date");
+            let mut rows = (0..batch.num_rows())
+                .map(|row_idx| {
+                    (
+                        event_id_col.value(row_idx).to_string(),
+                        event_ts_col.value(row_idx),
+                        event_date_col.value(row_idx).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            assert!(
+                !rows.is_empty(),
+                "reader version {reader_version}: a read-optimized Lance read must return the \
+                 base rows, or this test is vacuous"
+            );
+            per_version.push(rows);
+        }
+
+        assert_eq!(
+            per_version[0], per_version[1],
+            "the two reader versions must return the same read-optimized rows over a Lance \
+             base file"
+        );
         Ok(())
     }
 }

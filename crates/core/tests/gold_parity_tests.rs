@@ -107,6 +107,7 @@ const EXPECTED_OPTION_FIXTURES: &[&str] = &[
     "table_delete_ord_long [MorAvro]",
     "table_delete_ord_string [MorAvro]",
     "table_delete_ord_timestamp [MorAvro]",
+    "table_event_time_stale [MorAvro]",
     "table_evo_add_col [MorAvro]",
     "table_evo_promotion [MorAvro]",
     "table_log_compaction [MorAvro]",
@@ -114,6 +115,8 @@ const EXPECTED_OPTION_FIXTURES: &[&str] = &[
     "table_null_containers [MorAvro]",
     "table_parquet_log_block [MorAvro]",
     "table_partial_update [MorAvro]",
+    "table_uncommitted_log_v6 [MorAvro]",
+    "table_uncommitted_log_v9 [MorAvro]",
     "v6_trips_8i1u [MorAvro]",
     "v6_trips_8i3d [MorAvro]",
     "v8_mor_boundary_windows [MorAvro]",
@@ -502,6 +505,26 @@ impl Known {
 /// disagreement fails the build, and one that starts passing has to be removed
 /// from here, so this list cannot quietly go stale.
 const KNOWN: &[Known] = &[
+    // Version 1 only: it applies no completed/inflight check to log blocks, so
+    // the blocks of a delta commit that never completed still reach the merge.
+    // The fixture exists to pin that version 2 does check; this records that
+    // version 1 does not, which is the divergence itself rather than a fixture
+    // flaw. Only the version 6 fixture separates the two readers: on version 9
+    // the log file is dropped when the slice is built, which both of them share.
+    //
+    // Unlike the other version 1 entries here, which record a narrower or
+    // differently-shaped answer, this one records a wrong one: rows that were
+    // never committed. It is accepted rather than fixed because version 2 is the
+    // default and version 1 is on its way out. Two things would reopen that: a
+    // version 1 read reachable without asking for it, or version 1 outliving the
+    // migration. Fixing it means giving `LogFileScanner` the instant state its
+    // `scan` has no notion of, which reaches the metadata table reader too.
+    Known {
+        fixture: "table_uncommitted_log_v6",
+        scope: CaseScope::Any,
+        reader_version: "1",
+        reason: "version 1 admits blocks from an instant that never completed",
+    },
     // Version 1 only: it now reads a log-only slice but returns it without the
     // base columns. Nothing it is asked to project changes that, so the
     // fixture is blanketed.
@@ -542,6 +565,16 @@ const KNOWN: &[Known] = &[
         scope: CaseScope::Any,
         reader_version: "1",
         reason: "version 1 panics on a partial-update block",
+    },
+    // The same version 1 limitation as the fixture above, reached by the same
+    // route: the partial block's narrower schema is concatenated onto the base
+    // batch positionally, so the key column meets the ordering column. Version 2
+    // folds both blocks correctly, which is what this fixture exists to pin.
+    Known {
+        fixture: "table_partial_update_event_time",
+        scope: CaseScope::Any,
+        reader_version: "1",
+        reason: "version 1 concatenates a partial-update block onto a wider base batch",
     },
     Known {
         fixture: "table_all_data_types",

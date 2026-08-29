@@ -47,13 +47,11 @@ use std::vec::IntoIter;
 /// - `buffered_record_merger` — for delta merge (log-vs-log) and final merge (base-vs-log)
 /// - `update_processor` — strategy for processing updates during merge iteration
 /// - `base_file_source` / `current_base_batch` / `base_row_idx` — lazy
-///   counterpart of Java's `baseFileIterator`. The lazy source replaced the
-///   eagerly-loaded `Vec<RecordBatch>` with a `RecordBatchReader` so the
-///   merge loop pulls one parquet row-group at a time. For tests and the
-///   `read()` back-compat path, the source is just a `RecordBatchIterator`
-///   wrapping a pre-built Vec; for the FFI streaming path, it is a
-///   `ParquetSyncReader`. The current batch is interned into an `Arc` so
-///   base records become zero-copy `BatchRef`s into the streamed batch.
+///   counterpart of Java's `baseFileIterator`, and used only by the row-wise
+///   legacy path (`has_next`/`next`/`merge_and_collect_with_stats`) and the
+///   tests that drive it. The batch-at-a-time merge the reader uses is handed
+///   each base batch by its caller and holds no source. The current batch is
+///   interned into an `Arc` so base records become zero-copy `BatchRef`s.
 /// - `next_record` — Java's `nextRecord` (the lookahead for has_next/next pattern)
 pub struct FileGroupRecordBuffer {
     /// The per-key records map. Mirrors Java's `ExternalSpillableMap`: keeps
@@ -81,9 +79,11 @@ pub struct FileGroupRecordBuffer {
     ///
     /// A3 — the base file is pulled one parquet row-group at a
     /// time from this `RecordBatchReader` instead of being eagerly collected
-    /// and concatenated into a `Vec<RecordBatch>`. For tests and the `read()`
-    /// back-compat path the source is a `RecordBatchIterator` over a pre-built
-    /// vec; for the FFI streaming path (`open()`) it is a `ParquetSyncReader`.
+    /// and concatenated into a `Vec<RecordBatch>`.
+    ///
+    /// Only the row-wise legacy path reads it — `has_next`/`next` and
+    /// `merge_and_collect_with_stats`, plus the tests that drive them. The
+    /// reader's own path merges a batch it is handed, so it sets nothing here.
     pub base_file_source: Option<Box<dyn RecordBatchReader + Send>>,
 
     /// The current base file batch being iterated, interned into a single
@@ -119,8 +119,6 @@ pub struct FileGroupRecordBuffer {
     pub log_drain_iter: Option<SpillDrainIter>,
 
     // ── Stage timings (perf harness) ──────────────────────
-    /// Cumulative wall ms inflating/decoding log blocks (subset of merge insert).
-    pub stage_decode_ms: u64,
     /// Peak `records` map size observed during the scan.
     pub merge_map_peak_entries: u64,
 }
@@ -165,7 +163,6 @@ impl FileGroupRecordBuffer {
             next_record: None,
             log_record_iter: None,
             log_drain_iter: None,
-            stage_decode_ms: 0,
             merge_map_peak_entries: 0,
         }
     }
@@ -278,8 +275,8 @@ impl FileGroupRecordBuffer {
             };
             match source.next() {
                 None => {
-                    // Stream exhausted; release source so a future call
-                    // doesn't re-block_on a closed stream.
+                    // Source exhausted; release it so a later call cannot pull
+                    // from a reader that has already ended.
                     self.current_base_batch = None;
                     self.base_file_source = None;
                     return Ok(None);
@@ -353,7 +350,11 @@ mod tests {
     }
 
     fn buffer_with_erroring_processor() -> FileGroupRecordBuffer {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         FileGroupRecordBuffer::new(
             "COMMIT_TIME_ORDERING".to_string(),
             merger,
@@ -384,7 +385,11 @@ mod tests {
     /// returns `Ok(false)` cleanly (no false-positive error path).
     #[test]
     fn test_has_next_log_record_empty_map_is_ok_false() {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let mut buffer = FileGroupRecordBuffer::new(
             "COMMIT_TIME_ORDERING".to_string(),
             merger,
@@ -403,7 +408,11 @@ mod tests {
     }
 
     fn buffer_with_source(source: Box<dyn RecordBatchReader + Send>) -> FileGroupRecordBuffer {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let mut buffer = FileGroupRecordBuffer::new(
             "COMMIT_TIME_ORDERING".to_string(),
             merger,

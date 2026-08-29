@@ -357,10 +357,6 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
             }
         };
 
-        let decode_start = std::time::Instant::now();
-        // Blocks arrive with their content read; nothing to fetch here.
-        self.inner.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
-
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let mut pos_idx = 0usize;
             for batch in record_batches.data_batches {
@@ -417,10 +413,6 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                 return self.inner.process_delete_block(block);
             }
         };
-
-        let decode_start = std::time::Instant::now();
-        // Blocks arrive with their content read; nothing to fetch here.
-        self.inner.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let mut pos_idx = 0usize;
@@ -494,10 +486,6 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
 
     fn get_total_log_records(&self) -> u64 {
         self.inner.get_total_log_records()
-    }
-
-    fn stage_decode_ms(&self) -> u64 {
-        self.inner.stage_decode_ms()
     }
 
     fn merge_map_peak_entries(&self) -> u64 {
@@ -589,6 +577,31 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         let base_match = self.base_match();
         self.inner
             .pull_and_merge_next_base_batch(target_schema, base_match)
+    }
+
+    /// Merge one caller-supplied base batch. See
+    /// [`HoodieFileGroupRecordBuffer::merge_base_batch`].
+    ///
+    /// The hybrid strategy is refused rather than quietly merged the ordinary
+    /// way. It resolves position-only deletes row by row against a source this
+    /// method does not have, so answering without it would drop deletes and
+    /// return rows that should not exist. Nothing sets `needs_hybrid_strategy`
+    /// today; this is here so switching it on fails loudly instead.
+    fn merge_base_batch(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>> {
+        if self.needs_hybrid_strategy {
+            return Err(CoreError::Unsupported(
+                "the position buffer fell back to the hybrid strategy, which resolves \
+                 position-only deletes row by row and has no batch-at-a-time form"
+                    .to_string(),
+            ));
+        }
+        let base_match = self.base_match();
+        self.inner
+            .merge_one_base_batch_kernel(base, target_schema, base_match)
     }
 
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {

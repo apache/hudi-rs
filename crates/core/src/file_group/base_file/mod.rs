@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod hfile;
 pub mod lance;
 pub mod parquet;
 pub mod reader;

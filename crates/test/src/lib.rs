@@ -274,6 +274,27 @@ pub enum QuickstartTripsTable {
     /// merge-correct truth the applied result must match).
     #[strum(serialize = "table_partial_update")]
     MorLayoutPartialUpdate,
+    /// v9 MOR non-partitioned, EVENT_TIME_ORDERING, where two PARTIAL-update log
+    /// blocks touch the same key and the second one LOSES the ordering.
+    ///
+    /// Provenance: `table_partial_update_event_time.sql` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT). MERGE INTO writes a partial block
+    /// when the table is MOR, the operation is an upsert, and the update touches
+    /// a strict subset of the columns.
+    /// Schema: id INT, ts LONG, a STRING, b STRING (non-partitioned).
+    /// Layout: base .parquet (2 rows at ts 100) + log.1 (partial update of
+    /// `ts`,`a`) + log.1 (partial update of `ts`,`b`).
+    /// Semantics: each key folds in the opposite direction. `id=1` takes its
+    /// second update BELOW the first (200 < 300), so the earlier record wins and
+    /// still absorbs `b` from the loser; `id=2` takes its second update above
+    /// (300 > 200), so the later record wins and absorbs `a`. Either way the
+    /// column only the LOSING record carries must survive, which is what
+    /// distinguishes a both-direction fold from one that keeps the winner whole.
+    /// `table_partial_update` cannot show this: it is COMMIT_TIME_ORDERING,
+    /// where the incoming record always wins and the fold is one-directional.
+    /// gold_data = Spark `SELECT *` snapshot, 2 rows.
+    #[strum(serialize = "table_partial_update_event_time")]
+    MorPartialUpdateEventTime,
     /// v9 MOR non-partitioned, base + 1 HFILE-format log file
     /// (`HFILE_DATA_BLOCK`).
     ///
@@ -309,6 +330,71 @@ pub enum QuickstartTripsTable {
     /// `hoodie.merge.use.record.positions=true`.
     #[strum(serialize = "table_duplicate_keys")]
     MorLayoutDuplicateKeys,
+    /// v9 MOR non-partitioned, EVENT_TIME_ORDERING, where a log update and a
+    /// delete each LOSE to the live row on ordering value.
+    ///
+    /// Provenance: `table_event_time_stale.sql` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT).
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Layout: base .parquet (4 rows, all at ts 100) + one log file per write:
+    /// `a` updated at ts 50, `b` updated at ts 200, `c` deleted at ts 50,
+    /// `d` deleted at ts 300.
+    /// Semantics: `a` keeps the base row and `c` survives its delete, both
+    /// because the log side's ordering value sits below the live row; `b` takes
+    /// its update and `d` is removed, because theirs sit above. Everywhere else
+    /// the corpus only ever writes at or above the live ordering value, so
+    /// nothing else in it notices if event-time ordering degrades to
+    /// last-writer-wins. Both directions of both shapes live in this one
+    /// fixture, so inverting a comparison does not pass either.
+    /// gold_data = Spark `SELECT *` snapshot, 3 rows.
+    #[strum(serialize = "table_event_time_stale")]
+    MorEventTimeStale,
+
+    // -------------------------------------------------------------------------
+    // A delta commit that wrote log blocks and never completed: what a writer
+    // killed mid-commit leaves behind. Its blocks must not reach the merge.
+    //
+    // The two versions take different routes to that answer, which is why both
+    // are here. Below table version 8 the timeline records no completion times,
+    // so the log-block scan itself has to check the instant's state. From
+    // version 8 the completion times exist and the log file is dropped when the
+    // file slice is built, so the per-block check is redundant and Java skips it
+    // (`BaseHoodieLogRecordReader`, `tableVersion.lesserThan(EIGHT)`). A fixture
+    // for only one version would leave the other route unexercised.
+    //
+    // Provenance: `table_uncommitted_log.sql` beside these zips (Spark 3.5.3 /
+    // Hudi 1.2.0-SNAPSHOT). Generated normally — a base write then two updates —
+    // after which the *middle* delta commit's completed timeline file was
+    // deleted, leaving its `.inflight` and `.requested` and its log file behind.
+    // gold_data is Spark reading the table in that state, so it is Hudi's own
+    // answer to the doctored layout.
+    //
+    // The middle one, not the last: an orphan at the end sorts above the latest
+    // committed instant, so the future-block gate discards it and the
+    // completed/inflight gate is never reached. The first attempt at this
+    // fixture orphaned the last commit and passed with the gate disarmed —
+    // regenerate it that way and the sweep goes green proving nothing.
+    //
+    // Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    // Layout: base .parquet, 4 rows at ts 100, then two log files — the orphaned
+    // update of `b` at ts 300, then the committed update of `a` at ts 200. The
+    // versions name those files differently, which is the whole point: on v6
+    // both are `.log.1`/`.log.2` carrying the *base* instant, so no file-level
+    // check can attribute either to a delta commit and only the per-block gate
+    // can exclude the orphan; on v9 each is a `.log.1` carrying its own delta
+    // commit, so the orphan's file is dropped when the slice is built.
+    // Semantics: `a` takes its update, `b` keeps the base row. gold_data = 4 rows.
+    // The orphan's ts 300 outranks every other row, so an admitted orphan would
+    // win under `preCombineField = 'ts'` — the fixture fails loudly, not silently.
+    // -------------------------------------------------------------------------
+    /// Table version 6: the orphaned blocks are excluded by the log-block scan's
+    /// completed/inflight gate.
+    #[strum(serialize = "table_uncommitted_log_v6")]
+    MorUncommittedLogV6,
+    /// Table version 9: the orphaned blocks are excluded when the file slice is
+    /// built, with no per-block gate involved.
+    #[strum(serialize = "table_uncommitted_log_v9")]
+    MorUncommittedLogV9,
 
     // -------------------------------------------------------------------------
     // Delete-block orderingVal wrapper-type fixtures (Task 7).

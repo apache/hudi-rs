@@ -268,7 +268,8 @@ impl KeyBasedFileGroupRecordBuffer {
         merge_mode: String,
         emit_delete: bool,
     ) -> crate::Result<Self> {
-        let merger = BufferedRecordMergerFactory::create(&merge_mode)?;
+        let merger =
+            BufferedRecordMergerFactory::create_with(&merge_mode, &reader_context.table_config)?;
         let update_processor = create_update_processor(emit_delete);
         // Get the shared RecordContext from ReaderContext (mirrors Java's
         // readerContext.getRecordContext() returning the same instance).
@@ -573,6 +574,39 @@ impl KeyBasedFileGroupRecordBuffer {
                 Some(log_rec) => {
                     // Build the base ordering value only now — on a conflict row.
                     let base_ordering = orderings.value_at(idx);
+
+                    // A merge mode `pick_winner` cannot express decides through
+                    // the merger, which sees whole records rather than ordering
+                    // values. Falling into `pick_winner`'s ordering branch would
+                    // take the log record whole, dropping whatever the base row
+                    // contributed — for a metadata record that is every file the
+                    // base listed. Mirrors the row path's `has_next_base_record`.
+                    if !pick_winner_decides(merge_mode) {
+                        let base_rec = BufferedRecord::new_data(
+                            key.to_string(),
+                            base.slice(idx, 1),
+                            base_ordering.clone(),
+                        );
+                        let merged = self
+                            .base
+                            .buffered_record_merger
+                            .final_merge(&base_rec, &log_rec)?;
+                        self.base.update_processor.process_update(
+                            key,
+                            Some(&base_rec),
+                            &merged,
+                            merged.is_delete(),
+                        )?;
+                        keep.append(false);
+                        any_dropped = true;
+                        // A merged delete drops both rows, matching `Winner::LogDelete`;
+                        // this kernel never emits tombstones.
+                        if !merged.is_delete() {
+                            replacements.push(merged);
+                        }
+                        continue;
+                    }
+
                     let winner = pick_winner(merge_mode, &log_rec, &base_ordering);
                     // Mirror the per-record counting the per-row path performs in
                     // `FileGroupRecordBuffer::has_next_base_record`: a key present
@@ -801,6 +835,17 @@ enum Winner {
 /// `BufferedRecord::new_data` + `RecordBatch::slice` cost on the dominant
 /// no-conflict path. For the conflict path the cost is identical — the
 /// `BufferedRecord` only materialises if there *is* a log entry to match.
+/// Whether [`pick_winner`] can decide this merge mode from ordering values alone.
+///
+/// It models exactly the two ordering modes. Anything else — a CUSTOM table's own
+/// merger — has to go through [`BufferedRecordMerger::final_merge`], because the
+/// decision depends on the records' contents and can be a fold rather than a
+/// choice between them. Kept beside `pick_winner` so a mode added to one is
+/// visibly missing from the other.
+fn pick_winner_decides(merge_mode: &str) -> bool {
+    matches!(merge_mode, "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING")
+}
+
 fn pick_winner(
     merge_mode: &str,
     log: &BufferedRecord,
@@ -1402,11 +1447,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     fn process_data_block(&mut self, block: &mut LogBlock) -> Result<()> {
         // Mirrors Java: getRecordsIterator → getEngineRecordIterator
         //   → readRecordsFromBlockPayload → inflate → deserializeRecords → deflate
-        let decode_start = std::time::Instant::now();
-        // Upstream fetches a lazy block's content here. This crate's log file
-        // reader returns blocks with their content already read, so there is
-        // nothing to fetch and the take below finds it present.
-        self.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let total_rows: usize = record_batches
@@ -1458,37 +1498,50 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         // is the `else`:
         //
         // Partial-update (IS_PARTIAL / KEEP_VALUES): the incoming record carries only
-        // a subset of columns; overlay its present columns onto the prior buffered
-        // record for this key, producing the UNION of their columns. The result
-        // stays narrower than the reader schema until a base row or later update
-        // supplies the rest, so base-vs-log can still fill the gaps. With no prior
-        // data record it stays narrow and is padded at the base/drain step.
+        // a subset of columns; fold it together with the prior buffered record for
+        // this key, producing the UNION of their columns. The result stays narrower
+        // than the reader schema until a base row or later update supplies the rest,
+        // so base-vs-log can still fill the gaps. With no prior data record it stays
+        // narrow and is padded at the base/drain step.
         let inc_is_partial = match (record.get_record(), self.base.reader_schema.as_ref()) {
             (Some(ib), Some(target)) => schema_is_partial(&ib.schema(), target),
             _ => false,
         };
         if inc_is_partial {
-            let record = match self.base.records.get(key)? {
-                Some(prior) => match (record.get_record(), prior.get_record()) {
-                    (Some(ib), Some(prior_batch)) => {
-                        let union = union_schema(&ib.schema(), &prior_batch.schema());
-                        let merged = overlay_partial_over_prior(&ib, &prior_batch, &union)?;
-                        BufferedRecord::new_data(record.record_key, merged, record.ordering_value)
-                    }
-                    // Prior is a delete tombstone (no columns) → keep incoming as-is.
-                    _ => record,
-                },
-                None => record,
-            };
-            // Single-probe merge (perf): probe `key` once via `merge_in_place` and
-            // overwrite in place, instead of get(probe+clone) → delta_merge → insert
-            // (probe+clone+probe). The merger only reads `existing` by reference. A2
-            // semantics preserved: the merged BatchRef payload is stored in-memory
-            // (IPC serialization deferred to spill only).
+            // Mirrors Java `DefaultSparkRecordMerger.partialMerge`, which folds in BOTH
+            // directions: the ordering WINNER supplies every column it carries and the
+            // loser only the columns the winner omits. The union takes the winner's
+            // ordering value, so a later update is compared against the winner's
+            // position on the timeline rather than the loser's.
+            //
+            // Single-probe merge (perf): the fold runs inside `merge_in_place`, which
+            // probes `key` once and overwrites the slot in place rather than
+            // get(probe+clone) → merge → insert(probe+clone+probe). A2 semantics
+            // preserved: the merged payload is stored in-memory (IPC serialization
+            // deferred to spill only).
             let merger = &self.base.buffered_record_merger;
-            self.base
-                .records
-                .merge_in_place(key, |existing| merger.delta_merge(&record, existing))?;
+            let commit_time_ordering = self.base.record_merge_mode == "COMMIT_TIME_ORDERING";
+            self.base.records.merge_in_place(key, |existing| {
+                // Folding needs columns on both sides. With no prior, or a prior that
+                // is a delete tombstone, the ordering comparison alone decides.
+                let Some((prior, prior_batch, ib)) = existing
+                    .and_then(|prior| Some((prior, prior.get_record()?, record.get_record()?)))
+                else {
+                    return merger.delta_merge(&record, existing);
+                };
+                let union = union_schema(&ib.schema(), &prior_batch.schema());
+                let new_wins = commit_time_ordering || should_keep_newer_record(prior, &record);
+                let (winner, loser, ordering_value) = if new_wins {
+                    (&ib, &prior_batch, record.ordering_value.clone())
+                } else {
+                    (&prior_batch, &ib, prior.ordering_value.clone())
+                };
+                Ok(Some(BufferedRecord::new_data(
+                    record.record_key.clone(),
+                    overlay_partial_over_prior(winner, loser, &union)?,
+                    ordering_value,
+                )))
+            })?;
         } else if self.ignore_defaults || self.unavailable_value.is_some() {
             // Full-schema partial-update (IGNORE_DEFAULTS or FILL_UNAVAILABLE),
             // log-vs-log blend. Mirrors Java `EventTimePartialRecordMerger.deltaMerge`,
@@ -1556,12 +1609,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// Inflates the block on demand, then iterates delete records and calls
     /// `process_next_deleted_record` for each.
     fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()> {
-        let decode_start = std::time::Instant::now();
-        // Upstream fetches a lazy block's content here. This crate's log file
-        // reader returns blocks with their content already read, so there is
-        // nothing to fetch and the take below finds it present.
-        self.base.stage_decode_ms += decode_start.elapsed().as_millis() as u64;
-
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
             let total_deletes: usize = record_batches
                 .delete_batches
@@ -1639,10 +1686,6 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
 
     fn get_total_log_records(&self) -> u64 {
         self.base.total_log_records
-    }
-
-    fn stage_decode_ms(&self) -> u64 {
-        self.base.stage_decode_ms
     }
 
     fn merge_map_peak_entries(&self) -> u64 {
@@ -1819,6 +1862,16 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     /// flush.
     fn next_merged_base_batch(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
         self.pull_and_merge_next_base_batch(target_schema, BaseMatch::RecordKey)
+    }
+
+    /// Merge one caller-supplied base batch. See
+    /// [`HoodieFileGroupRecordBuffer::merge_base_batch`].
+    fn merge_base_batch(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>> {
+        self.merge_one_base_batch_kernel(base, target_schema, BaseMatch::RecordKey)
     }
 
     /// Drain any log records that were never matched by a base row, as one
@@ -2374,7 +2427,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -2470,7 +2523,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -2614,7 +2667,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -2942,7 +2995,7 @@ mod tests {
     }
 
     /// Drive a populated-buffer base-vs-log merge through the production
-    /// streaming path (log block → base source → `FileGroupMergeIterator`)
+    /// streaming path (log block → base source → `FileGroupMergeStream`)
     /// and return the concatenated output in the requested schema.
     fn merge_log_block_with_base_streaming(
         mut buffer: KeyBasedFileGroupRecordBuffer,
@@ -2971,7 +3024,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -3820,6 +3873,161 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // CUSTOM merge mode: the merger decides base-vs-log, not `pick_winner`
+    // =========================================================================
+
+    /// One metadata record of the FILES type, holding `entries`.
+    fn metadata_batch(key: &str, entries: &[(&str, i64)]) -> RecordBatch {
+        use arrow_array::builder::{
+            BooleanBuilder, Int64Builder, MapBuilder, StringBuilder, StructBuilder,
+        };
+        let value_fields = vec![
+            Field::new("size", DataType::Int64, false),
+            Field::new("isDeleted", DataType::Boolean, false),
+        ];
+        let mut builder = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            StructBuilder::new(
+                arrow_schema::Fields::from(value_fields),
+                vec![
+                    Box::new(Int64Builder::new()),
+                    Box::new(BooleanBuilder::new()),
+                ],
+            ),
+        );
+        for (name, size) in entries {
+            builder.keys().append_value(name);
+            let values = builder.values();
+            values
+                .field_builder::<Int64Builder>(0)
+                .unwrap()
+                .append_value(*size);
+            values
+                .field_builder::<BooleanBuilder>(1)
+                .unwrap()
+                .append_value(false);
+            values.append(true);
+        }
+        builder.append(true).unwrap();
+        let map = builder.finish();
+
+        // The builder names the entries struct and its fields its own way; the
+        // schema is taken from the built array so the batch is self-consistent.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::Int32, false),
+            Field::new("filesystemMetadata", map.data_type().clone(), false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![key])),
+                Arc::new(arrow_array::Int32Array::from(vec![2])),
+                Arc::new(map),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A buffer whose table config names the metadata payload, so CUSTOM resolves
+    /// to the metadata merger.
+    fn build_metadata_buffer(schema: SchemaRef) -> KeyBasedFileGroupRecordBuffer {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            HudiTableConfig::RecordKeyFields.as_ref().to_string(),
+            "key".to_string(),
+        );
+        ctx.table_config.insert(
+            HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
+            "false".to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.compaction.payload.class".to_string(),
+            "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+        );
+        ctx.table_config.insert(
+            "hoodie.record.merge.strategy.id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(schema.clone())
+            .with_data_schema(schema);
+        let key_field = ctx.record_key_field().to_string();
+        handler
+            .prepare_required_schema(true, &[key_field], &[], &ctx.table_config, false, "CUSTOM")
+            .unwrap();
+        ctx.schema_handler = handler;
+        KeyBasedFileGroupRecordBuffer::new(Arc::new(ctx), "CUSTOM".to_string(), false).unwrap()
+    }
+
+    /// The `filesystemMetadata` entries of the merged output, sorted.
+    fn merged_entries(batch: &RecordBatch) -> Vec<(String, i64)> {
+        use arrow_array::Array;
+        use arrow_array::cast::AsArray;
+        let map = batch
+            .column_by_name("filesystemMetadata")
+            .expect("the map column")
+            .as_map();
+        assert_eq!(batch.num_rows(), 1, "one key was merged");
+        let entries = map.value(0);
+        let names = entries.column(0).as_string::<i32>();
+        let sizes = entries
+            .column(1)
+            .as_struct()
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let mut out: Vec<(String, i64)> = (0..names.len())
+            .map(|i| (names.value(i).to_string(), sizes.value(i)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A CUSTOM merge mode folds the base row into the log record instead of
+    /// replacing it.
+    ///
+    /// Driven through `merge_base_batch`, the vectorized kernel the streaming read
+    /// actually uses (`merge_iterator.rs:470`), not through `merge_and_collect`,
+    /// which takes the row path where `final_merge` was already being called. That
+    /// distinction is the whole point of this test: the kernel decides conflicts
+    /// through `pick_winner`, which models only the two ordering modes, so CUSTOM
+    /// fell into its event-time branch, both sides carried no ordering value, and
+    /// the log record won whole. Every file listed only in the base file
+    /// disappeared from the listing, silently, on any slice with a base file and
+    /// log files, which is the steady state after a compaction.
+    ///
+    /// The metadata-table end-to-end tests do not catch it: their base file holds
+    /// one record whose entries are a subset of what the log fold already
+    /// produces, so they pass with the base row dropped.
+    #[test]
+    fn custom_merge_mode_folds_the_base_row_rather_than_replacing_it() {
+        let base = metadata_batch("p", &[("a.parquet", 100)]);
+        let schema = base.schema();
+        let mut buffer = build_metadata_buffer(schema.clone());
+
+        // The log names a file the base does not, and vice versa.
+        let mut block = make_data_block(metadata_batch("p", &[("b.parquet", 200)]), "002");
+        buffer.process_data_block(&mut block).unwrap();
+
+        let merged = buffer
+            .merge_base_batch(&base, &schema)
+            .unwrap()
+            .expect("the conflicting row is merged, so a batch is produced");
+        assert_eq!(
+            merged_entries(&merged),
+            vec![
+                ("a.parquet".to_string(), 100),
+                ("b.parquet".to_string(), 200)
+            ],
+            "the base file's entry must survive the merge; taking the log record \
+             whole loses every file only the base listed"
+        );
+    }
+
     /// End-to-end EVENT_TIME_ORDERING MOR merge over an **Int64** ordering column:
     /// a lower-ordering log update must lose to a higher-ordering base record, and a
     /// higher-ordering update must win. Ordering is extracted from the `ts` column
@@ -3898,6 +4106,104 @@ mod tests {
         let mut recs = extract_records(&out);
         recs.sort();
         (recs, spilled)
+    }
+
+    /// How long one `merge_base_batch` call blocks when the merge map has
+    /// spilled, which is the number that decides whether the merge needs
+    /// `spawn_blocking`.
+    ///
+    /// The probe is not per row: a spilled key is reconstructed from a whole
+    /// spilled Arrow batch (`SPILL_BATCH_ROWS` records), the RocksDB read is one
+    /// `get` per such batch, and the last `SPILL_BATCH_CACHE` of them are cached
+    /// decoded. So the cost per merged base batch is set by how many *distinct*
+    /// spill batches its keys touch, and whether they fit the cache.
+    ///
+    /// Two orders are measured because they differ by exactly that: base keys
+    /// ascending touch spill batches one at a time (cache-friendly), while base
+    /// keys strided across the whole key space touch a new spill batch almost
+    /// every row and evict continuously. The strided figure is the one a
+    /// `spawn_blocking` decision has to be made against.
+    ///
+    /// Ignored: a measurement, not an assertion. Run with
+    /// `cargo test -p hudi-core --release --lib spilled_merge_blocking_duration -- --ignored --nocapture`.
+    #[cfg(feature = "spill-rocksdb")]
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn spilled_merge_blocking_duration() {
+        use std::time::Instant;
+
+        // Enough distinct keys to span far more spill batches than the decoded
+        // cache holds, so a scattered probe order really does evict.
+        const KEYS: usize = 50_000;
+        // 1024 is what a real chunk holds: `base_read_options` never sets a
+        // parquet batch size, so arrow-rs's default applies. 8192 is an upper
+        // bound for what a caller that raised it would see.
+        const CHUNK_SIZES: [usize; 2] = [1_024, 8_192];
+
+        let build = |budget: &[(&str, &str)]| {
+            let mut buffer =
+                build_key_based_buffer_with_reader_config("COMMIT_TIME_ORDERING", budget);
+            let rows: Vec<(String, i32, i64)> = (0..KEYS)
+                .map(|i| (format!("k{i:06}"), i as i32, 1))
+                .collect();
+            // In chunks, so the map spills progressively as a real scan does.
+            for chunk in rows.chunks(4096) {
+                let refs: Vec<(&str, i32, i64)> =
+                    chunk.iter().map(|(k, c, t)| (k.as_str(), *c, *t)).collect();
+                buffer
+                    .process_data_block(&mut make_data_block(create_test_batch(&refs), "i0"))
+                    .unwrap();
+            }
+            buffer
+        };
+
+        let schema = create_test_schema();
+
+        // The control matters as much as the measurement: the merge kernel is
+        // synchronous CPU work whether or not the map spilled, so without the
+        // no-spill baseline there is no way to tell how much of the blocking the
+        // spill is actually responsible for.
+        let spill_budget: &[(&str, &str)] = &[("hoodie.memory.merge.max.size", "1024")];
+        let no_budget: &[(&str, &str)] = &[];
+        for rows in CHUNK_SIZES {
+            // Ascending: consecutive keys, so one spilled batch is exhausted
+            // before the next is touched.
+            let ascending: Vec<String> = (0..rows).map(|i| format!("k{i:06}")).collect();
+            // Spread across the whole key space, so consecutive base rows land in
+            // different spilled batches and evict each other from the decoded
+            // cache.
+            let scattered: Vec<String> = (0..rows)
+                .map(|i| format!("k{:06}", (i * 7919) % KEYS))
+                .collect();
+
+            for (tier, budget) in [("no-spill", no_budget), ("spilled", spill_budget)] {
+                for (order, keys) in [("ascending", &ascending), ("scattered", &scattered)] {
+                    let mut buffer = build(budget);
+                    let spilled = buffer.base.records.spill_fired();
+                    assert_eq!(
+                        spilled,
+                        tier == "spilled",
+                        "the {tier} leg must{} spill",
+                        if tier == "spilled" { "" } else { " not" }
+                    );
+                    let refs: Vec<(&str, i32, i64)> =
+                        keys.iter().map(|k| (k.as_str(), 0i32, 0i64)).collect();
+                    let base = create_test_batch(&refs);
+
+                    let start = Instant::now();
+                    let merged = buffer.merge_base_batch(&base, &schema).unwrap();
+                    let elapsed = start.elapsed();
+
+                    let rows_out = merged.map(|b| b.num_rows()).unwrap_or(0);
+                    println!(
+                        "[spill-blocking] {rows:5} rows | {tier:8} | {order:9} -> {:>12?} \
+                         ({rows_out} out, {:.2} us/row)",
+                        elapsed,
+                        elapsed.as_secs_f64() * 1e6 / rows as f64,
+                    );
+                }
+            }
+        }
     }
 
     /// A churn workload under a `merge.max.size` low enough
@@ -5343,7 +5649,7 @@ mod tests {
     }
 
     // =========================================================================
-    // streaming output via FileGroupMergeIterator.
+    // streaming output via FileGroupMergeStream.
     //
     // These tests compare the streaming iterator's output against the
     // legacy `merge_and_collect` path on the same buffer fixture. The
@@ -5353,7 +5659,7 @@ mod tests {
     // =========================================================================
 
     use crate::file_group::reader_v2::merge_iterator::{
-        FileGroupMergeIterator, new_stream_stats_handle,
+        FileGroupMergeStream, new_stream_stats_handle,
     };
 
     /// Test shim: build a streaming iterator with a throwaway stats handle.
@@ -5362,22 +5668,77 @@ mod tests {
     /// production concern (FFI timing/update-count reporting) the streaming-parity
     /// tests don't assert on, so it's defaulted here.
     fn new_buffered_test(
-        buffer: Box<dyn crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer>,
+        mut buffer: KeyBasedFileGroupRecordBuffer,
         merge_schema: SchemaRef,
         output_schema: SchemaRef,
         output_converter: Option<
             Box<dyn crate::file_group::reader_v2::output_converter::OutputConverter>,
         >,
-        batch_size: usize,
-    ) -> FileGroupMergeIterator {
-        FileGroupMergeIterator::new_buffered(
-            buffer,
+        _batch_size: usize,
+    ) -> FileGroupMergeStream {
+        let base_source = take_base_source(&mut buffer, &merge_schema);
+        FileGroupMergeStream::new_buffered(
+            Box::new(buffer),
+            base_source,
             merge_schema,
             output_schema,
             output_converter,
-            batch_size,
             new_stream_stats_handle(),
         )
+    }
+
+    /// Move the base source a test attached to the buffer into the iterator,
+    /// which is where production puts it: the iterator owns the pull, and the
+    /// buffer only merges a batch it is handed. A buffer with none set reads as
+    /// an empty base file rather than panicking, which is what a log-only file
+    /// group looks like.
+    fn take_base_source(
+        buffer: &mut KeyBasedFileGroupRecordBuffer,
+        _schema: &SchemaRef,
+    ) -> crate::file_group::reader_v2::merge_iterator::BaseBatchStream {
+        use futures::StreamExt;
+        match buffer.base.base_file_source.take() {
+            Some(reader) => futures::stream::iter(
+                reader
+                    .map(|b| {
+                        b.map_err(|e| {
+                            crate::error::CoreError::ReadFileSliceError(format!(
+                                "base file source error: {e}"
+                            ))
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .boxed(),
+            None => futures::stream::empty().boxed(),
+        }
+    }
+
+    /// As [`drain_ok`], but keeping each chunk's `Result`.
+    fn drain(
+        mut merge: crate::file_group::reader_v2::merge_iterator::FileGroupMergeStream,
+    ) -> Vec<Result<RecordBatch>> {
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(chunk) = merge.next_chunk().await {
+                out.push(chunk);
+            }
+            out
+        })
+    }
+
+    /// Drive a merge to exhaustion from a synchronous test. The base sources
+    /// here are in-memory, so a local executor is enough.
+    fn drain_ok(
+        mut merge: crate::file_group::reader_v2::merge_iterator::FileGroupMergeStream,
+    ) -> Vec<RecordBatch> {
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(chunk) = merge.next_chunk().await {
+                out.push(chunk.unwrap());
+            }
+            out
+        })
     }
 
     /// Build the same buffer state used by `test_read_with_commit_time_ordering`
@@ -5417,15 +5778,8 @@ mod tests {
         schema: SchemaRef,
         batch_size: usize,
     ) -> Vec<RecordBatch> {
-        let it = FileGroupMergeIterator::new_buffered(
-            Box::new(buffer),
-            schema.clone(),
-            schema,
-            None,
-            batch_size,
-            new_stream_stats_handle(),
-        );
-        it.map(|r| r.unwrap()).collect()
+        let it = new_buffered_test(buffer, schema.clone(), schema, None, batch_size);
+        drain_ok(it)
     }
 
     /// Streaming with batch_size larger than the merged-row count → one chunk;
@@ -5501,7 +5855,7 @@ mod tests {
     }
 
     /// A3 — the production chunked streaming iterator
-    /// (`FileGroupMergeIterator::Buffered`) driving a base source split across
+    /// (`FileGroupMergeStream::Buffered`) driving a base source split across
     /// MULTIPLE row-groups produces output byte-identical to the eager single
     /// base-batch fixture, at every chunk size. This is the end-to-end proof
     /// that the streamed base (decoded row-group-at-a-time, fed into A2
@@ -5607,15 +5961,17 @@ mod tests {
     fn stream_snapshots_update_stats_on_exhaustion() {
         let (buffer, schema) = build_commit_time_ordering_fixture();
         let stats = new_stream_stats_handle();
-        let it = FileGroupMergeIterator::new_buffered(
+        let mut buffer = buffer;
+        let base_source = take_base_source(&mut buffer, &schema);
+        let it = FileGroupMergeStream::new_buffered(
             Box::new(buffer),
+            base_source,
             schema.clone(),
             schema,
             None,
-            4096,
             stats.clone(),
         );
-        let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let chunks: Vec<RecordBatch> = drain_ok(it);
         assert_eq!(chunks.len(), 1, "should fit in one chunk");
         let records = extract_records(&chunks[0]);
         assert_eq!(chunks[0].num_rows(), 2);
@@ -5631,13 +5987,13 @@ mod tests {
     fn stream_matches_legacy_row_content() {
         let (buffer1, schema1) = build_commit_time_ordering_fixture();
         let it = new_buffered_test(
-            Box::new(buffer1),
+            buffer1,
             schema1.clone(),
             schema1.clone(),
             None,
             1, // batch_size ignored on the new path
         );
-        let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let chunks: Vec<RecordBatch> = drain_ok(it);
         let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
         assert_eq!(total_rows, 2, "two output rows total");
 
@@ -5655,16 +6011,177 @@ mod tests {
     #[test]
     fn stream_schema_is_constructor_schema() {
         let (buffer, schema) = build_commit_time_ordering_fixture();
-        let it = FileGroupMergeIterator::new_buffered(
-            Box::new(buffer),
-            schema.clone(),
-            schema.clone(),
-            None,
-            1,
-            new_stream_stats_handle(),
-        );
+        let it = new_buffered_test(buffer, schema.clone(), schema.clone(), None, 1);
         use arrow_array::RecordBatchReader as _;
         assert_eq!(it.schema(), schema);
+    }
+
+    /// The log side of `build_commit_time_ordering_fixture`, with no base
+    /// source attached, so the same buffer can be driven either by the pull it
+    /// owns or by batches handed to it.
+    fn commit_time_ordering_log_side() -> KeyBasedFileGroupRecordBuffer {
+        let mut buffer =
+            build_key_based_buffer_with_delete_marker("COMMIT_TIME_ORDERING", "counter", "3");
+        buffer
+            .process_data_block(&mut make_data_block(
+                create_test_batch(&[("1", 2, 1), ("2", 1, 2), ("2", 1, 0)]),
+                "instant1",
+            ))
+            .unwrap();
+        buffer
+            .process_data_block(&mut make_data_block(
+                create_test_batch(&[("2", 1, 0), ("3", 1, 2), ("3", 3, 1)]),
+                "instant2",
+            ))
+            .unwrap();
+        buffer
+    }
+
+    /// Where the batch boundaries fall changes the ORDER of the merged output,
+    /// and this is the test that says so out loud.
+    ///
+    /// The kernel emits a batch as kept base rows first, then the log records
+    /// that replaced the rest. So a base delivered whole yields
+    /// `[all kept][all replaced]`, while the same base split in two yields
+    /// `[kept][replaced][kept][replaced]` — the same rows, a different sequence.
+    ///
+    /// It matters because both read entry points merge a row group at a time:
+    /// that is what makes their orders equal, and it is why nothing may collapse
+    /// the base on one path only. The property is invisible on a table where
+    /// every key is updated (no base row survives to be ordered against), which
+    /// is every MOR fixture in this repo and both benchmark datasets — hence a
+    /// hand-built mixed batch here.
+    #[test]
+    fn batch_boundaries_change_the_merged_row_order() {
+        let schema = create_test_schema();
+        // Log replaces "b" and "d" only; "a", "c", "e" survive from the base.
+        // Counters avoid 3, which this fixture treats as a delete marker.
+        let mut whole =
+            build_key_based_buffer_with_delete_marker("COMMIT_TIME_ORDERING", "counter", "3");
+        let mut split =
+            build_key_based_buffer_with_delete_marker("COMMIT_TIME_ORDERING", "counter", "3");
+        for buffer in [&mut whole, &mut split] {
+            buffer
+                .process_data_block(&mut make_data_block(
+                    create_test_batch(&[("b", 20, 5), ("d", 40, 5)]),
+                    "instant1",
+                ))
+                .unwrap();
+        }
+
+        let all = create_test_batch(&[
+            ("a", 10, 1),
+            ("b", 11, 1),
+            ("c", 12, 1),
+            ("d", 13, 1),
+            ("e", 14, 1),
+        ]);
+        let first = create_test_batch(&[("a", 10, 1), ("b", 11, 1), ("c", 12, 1)]);
+        let second = create_test_batch(&[("d", 13, 1), ("e", 14, 1)]);
+
+        // In ROW order. `extract_records` sorts by key, which would make this
+        // test assert nothing about the very thing it exists to pin.
+        let keys_of = |b: &RecordBatch| -> Vec<String> {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("key column");
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect()
+        };
+
+        let mut whole_rows: Vec<String> = Vec::new();
+        if let Some(b) = whole.merge_base_batch(&all, &schema).unwrap() {
+            whole_rows.extend(keys_of(&b));
+        }
+        let mut split_rows: Vec<String> = Vec::new();
+        for b in [&first, &second] {
+            if let Some(m) = split.merge_base_batch(b, &schema).unwrap() {
+                split_rows.extend(keys_of(&m));
+            }
+        }
+
+        assert_eq!(
+            whole_rows,
+            vec!["a", "c", "e", "b", "d"],
+            "a whole base batch emits the surviving base rows, then the replacements"
+        );
+        assert_eq!(
+            split_rows,
+            vec!["a", "c", "b", "e", "d"],
+            "a split base interleaves them per batch"
+        );
+
+        let mut w = whole_rows.clone();
+        let mut sp = split_rows.clone();
+        w.sort();
+        sp.sort();
+        assert_eq!(w, sp, "the same rows either way - only the order differs");
+        assert_ne!(
+            whole_rows, split_rows,
+            "if these ever match, this test has stopped pinning anything"
+        );
+    }
+
+    /// Merging a batch the caller supplies must produce exactly what merging
+    /// the same batch pulled from the buffer's own source produces — including
+    /// the log-only drain that follows, since a merge that consumed different
+    /// log entries would show up there rather than in the merged batches.
+    ///
+    /// The two differ only in who owns the pull. If that changed the answer,
+    /// how the base file is read would be a correctness variable, which is the
+    /// whole premise of moving the pull out to an async caller.
+    #[test]
+    fn merge_base_batch_matches_the_source_owning_pull() {
+        let schema = create_test_schema();
+        // Two batches, so the pulling route crosses a batch boundary mid-merge
+        // rather than seeing the base file as one lump. Key "4" has no log
+        // entry at all: without it every base key would be superseded by a log
+        // record, and a buffer that merged nothing and drained everything would
+        // produce the same rows as one that merged correctly — the comparison
+        // could not tell the two apart.
+        let base = vec![
+            create_test_batch(&[("1", 1, 1), ("2", 1, 1)]),
+            create_test_batch(&[("3", 1, 1), ("4", 7, 7)]),
+        ];
+
+        // Route A: the buffer owns the source and pulls each batch itself.
+        let mut pulling = commit_time_ordering_log_side();
+        pulling.set_base_file_source(Box::new(arrow_array::RecordBatchIterator::new(
+            base.iter().cloned().map(Ok).collect::<Vec<_>>().into_iter(),
+            schema.clone(),
+        )));
+        let mut pulled: Vec<(String, i32, i64)> = Vec::new();
+        while let Some(b) = pulling.next_merged_base_batch(&schema).unwrap() {
+            pulled.extend(extract_records(&b));
+        }
+        while let Some(b) = pulling.drain_log_only_inserts(&schema).unwrap() {
+            pulled.extend(extract_records(&b));
+        }
+
+        // Route B: the caller owns the batches and hands them over one at a time.
+        let mut handed = commit_time_ordering_log_side();
+        let mut handed_rows: Vec<(String, i32, i64)> = Vec::new();
+        for b in &base {
+            if let Some(m) = handed.merge_base_batch(b, &schema).unwrap() {
+                handed_rows.extend(extract_records(&m));
+            }
+        }
+        while let Some(b) = handed.drain_log_only_inserts(&schema).unwrap() {
+            handed_rows.extend(extract_records(&b));
+        }
+
+        assert!(
+            pulled.iter().any(|(k, _, _)| k == "4"),
+            "the base-only key must reach the output, or this comparison cannot \
+             distinguish merging from draining"
+        );
+        assert_eq!(
+            handed_rows, pulled,
+            "who pulls the base batch must not change what the merge produces"
+        );
     }
 
     /// lazy base source: instead of `set_base_file_iterator(vec![...])`
@@ -5756,23 +6273,22 @@ mod tests {
     }
 
     // =========================================================================
-    // T1-T4: probe the STREAMING output path (FileGroupMergeIterator::new_buffered)
+    // T1-T4: probe the STREAMING output path (FileGroupMergeStream::new_buffered)
     //
     // The tests above (Part B / Phase A-C) all exercise `merge_and_collect`,
     // which is the legacy bulk-materialise API. The streaming API is what the
     // FFI now uses, over the lazy base-file source. T1-T4 verify that driving the same
-    // populated buffer through `FileGroupMergeIterator::new_buffered` produces
+    // populated buffer through `FileGroupMergeStream::new_buffered` produces
     // the same record counts.
     // =========================================================================
 
     use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 
-    /// Helper: drain a `FileGroupMergeIterator` into a Vec<RecordBatch>,
+    /// Helper: drain a `FileGroupMergeStream` into a Vec<RecordBatch>,
     /// panicking on any iteration error. Mirrors how the FFI driver consumes
     /// the stream (no error swallowing).
-    fn drain_streaming(iter: FileGroupMergeIterator) -> Vec<RecordBatch> {
-        iter.map(|r| r.expect("streaming iterator yielded error"))
-            .collect()
+    fn drain_streaming(iter: FileGroupMergeStream) -> Vec<RecordBatch> {
+        drain_ok(iter)
     }
 
     /// T1 — pins B1/B2.
@@ -5805,7 +6321,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(empty_reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -5837,7 +6353,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -5870,7 +6386,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -5929,7 +6445,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6139,7 +6655,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6172,7 +6688,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6200,7 +6716,10 @@ mod tests {
     }
 
     fn build_pu_event_buffer() -> KeyBasedFileGroupRecordBuffer {
-        let merge_mode = "EVENT_TIME_ORDERING";
+        build_pu_buffer("EVENT_TIME_ORDERING")
+    }
+
+    fn build_pu_buffer(merge_mode: &str) -> KeyBasedFileGroupRecordBuffer {
         let mut ctx = ReaderContext::empty();
         ctx.table_config.insert(
             HudiTableConfig::OrderingFields.as_ref().to_string(),
@@ -6246,6 +6765,27 @@ mod tests {
         BufferedRecord::new_data(key.to_string(), batch, Some(OrderingValue::Long(ts)))
     }
 
+    /// A partial record carrying `_hoodie_record_key` + `ts` + `note` (omits `a`),
+    /// with ordering value = `ts`. Disjoint from `pu_event_partial`'s columns, so a
+    /// fold of the two is observable in both directions.
+    fn pu_event_partial_note(key: &str, ts: i64, note: &str) -> BufferedRecord {
+        let s = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            s,
+            vec![
+                Arc::new(StringArray::from(vec![key])) as _,
+                Arc::new(Int64Array::from(vec![ts])) as _,
+                Arc::new(StringArray::from(vec![Some(note)])) as _,
+            ],
+        )
+        .unwrap();
+        BufferedRecord::new_data(key.to_string(), batch, Some(OrderingValue::Long(ts)))
+    }
+
     fn pu_event_base() -> RecordBatch {
         RecordBatch::try_new(
             pu_event_schema(),
@@ -6267,7 +6807,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6323,6 +6863,110 @@ mod tests {
             pu_event_drain(buffer),
             (5, 10, Some("keep".to_string())),
             "stale partial loses; base row kept intact"
+        );
+    }
+
+    /// EVENT_TIME, log-vs-log: the HIGHER-ordering partial arrives FIRST, so the
+    /// second (stale) partial loses the ordering comparison. Java folds in both
+    /// directions, so the loser's unique column still lands: `a` from ts=9,
+    /// `note` from ts=2.
+    #[test]
+    fn test_partial_update_event_time_out_of_order_folds_loser_columns() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial_note("k1", 2, "late"), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("late".to_string())),
+            "winner keeps a=99 at ts=9; the losing partial still contributes note"
+        );
+    }
+
+    /// The folded union carries the WINNER's ordering value: a later update at ts=5
+    /// must lose to a union whose winner sat at ts=9. Carrying the loser's ts=2
+    /// instead would let this update take over.
+    #[test]
+    fn test_partial_update_event_time_fold_keeps_winner_ordering() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial_note("k1", 2, "late"), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 5, 55), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("late".to_string())),
+            "ts=5 loses to the union's winner ordering of 9"
+        );
+    }
+
+    /// EVENT_TIME, incoming wins: on a column BOTH partials carry, the winner's
+    /// value survives. The mirror of the stale-loses tests above, which use
+    /// disjoint columns and so cannot see the overlay direction at all.
+    #[test]
+    fn test_partial_update_event_time_newer_wins_overlapping_column() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("keep".to_string())),
+            "both partials carry `a`; the ts=9 winner's value must survive, not the ts=2 loser's"
+        );
+    }
+
+    /// EVENT_TIME, incoming wins: the folded union carries the WINNER's ordering
+    /// value, so a later write between the two loses. Mirrors
+    /// `test_partial_update_event_time_fold_keeps_winner_ordering`, which pins
+    /// the same property on the other arm.
+    #[test]
+    fn test_partial_update_event_time_newer_wins_fold_keeps_winner_ordering() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 5, 55), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("keep".to_string())),
+            "ts=5 loses to a union whose winner sat at ts=9, not to the ts=2 loser it folded"
+        );
+    }
+
+    /// COMMIT_TIME_ORDERING is last-writer-wins, so a later partial update wins
+    /// even when its ordering value went DOWN. Without the short-circuit the
+    /// ordering comparison would hand it to the earlier record, which is
+    /// event-time behavior on a commit-time table.
+    #[test]
+    fn test_partial_update_commit_time_later_write_wins_a_lower_ordering_value() {
+        let mut buffer = build_pu_buffer("COMMIT_TIME_ORDERING");
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (2, 11, Some("keep".to_string())),
+            "last writer wins on a commit-time table, whichever way the ordering value moved"
         );
     }
 
@@ -6462,7 +7106,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6497,7 +7141,7 @@ mod tests {
             schema.clone(),
         )));
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6537,7 +7181,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(empty_reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -6624,7 +7268,7 @@ mod tests {
         let converter = Box::new(ProjectionConverter::new(&target_schema));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             merge_schema.clone(),
             target_schema.clone(),
             Some(converter),
@@ -6683,7 +7327,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(empty_reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             bogus_schema.clone(),
             bogus_schema.clone(),
             None,
@@ -6692,8 +7336,7 @@ mod tests {
 
         // Catch the panic from records_to_batch → reconcile_batch_to_schema.
         // Either a panic OR an Err — but NOT a silent 0-row stream.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.collect::<Vec<_>>()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drain(iter)));
 
         match result {
             Ok(chunks) => {
@@ -6878,7 +7521,7 @@ mod tests {
             .unwrap();
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required_schema,
             requested_schema.clone(),
             output_converter,
@@ -6935,7 +7578,7 @@ mod tests {
     //
     // i.e. PostMergePredicateFilter saw the iterator emit EXACTLY ONE chunk
     // of 4096 rows then stop. We need to know:
-    //   (a) does FileGroupMergeIterator::Buffered correctly continue past
+    //   (a) does FileGroupMergeStream::Buffered correctly continue past
     //       the first chunk when base_file_source has more rows?
     //   (b) if YES — the production stop is downstream (Velox/FFI/Drop).
     //   (c) if NO — the bug is here in the Buffered iterator.
@@ -6963,7 +7606,7 @@ mod tests {
         assert_eq!(buffer.size(), 0, "log map must be empty");
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7017,7 +7660,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let inner = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7025,7 +7668,7 @@ mod tests {
         );
 
         // Minimal Rust analogue of PostMergePredicateFilter that returns
-        // an EMPTY batch for every inner chunk (i.e. filter rejects all).
+        // an EMPTY batch for every merged chunk (i.e. filter rejects all).
         struct AlwaysFalseFilter<I> {
             inner: I,
             chunks_in: usize,
@@ -7033,11 +7676,11 @@ mod tests {
         }
         impl<I> Iterator for AlwaysFalseFilter<I>
         where
-            I: Iterator<Item = Result<RecordBatch, arrow_schema::ArrowError>>,
+            I: Iterator<Item = RecordBatch>,
         {
-            type Item = Result<RecordBatch, arrow_schema::ArrowError>;
+            type Item = Result<RecordBatch>;
             fn next(&mut self) -> Option<Self::Item> {
-                let batch = self.inner.next()?.ok()?;
+                let batch = self.inner.next()?;
                 self.chunks_in += 1;
                 let empty = RecordBatch::new_empty(batch.schema());
                 self.chunks_out += 1;
@@ -7046,7 +7689,7 @@ mod tests {
         }
 
         let mut wrapped = AlwaysFalseFilter {
-            inner,
+            inner: drain_ok(inner).into_iter(),
             chunks_in: 0,
             chunks_out: 0,
         };
@@ -7108,7 +7751,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7162,7 +7805,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7208,7 +7851,7 @@ mod tests {
         buffer.set_base_file_source(Box::new(reader));
 
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             schema.clone(),
             schema.clone(),
             None,
@@ -7340,7 +7983,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
@@ -7419,15 +8062,8 @@ mod tests {
             .clone()
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
-        let iter = new_buffered_test(
-            Box::new(buffer),
-            required,
-            requested,
-            conv,
-            DEFAULT_BATCH_SIZE,
-        );
-        let collected: std::result::Result<Vec<RecordBatch>, arrow_schema::ArrowError> =
-            iter.collect();
+        let iter = new_buffered_test(buffer, required, requested, conv, DEFAULT_BATCH_SIZE);
+        let collected: Result<Vec<RecordBatch>> = drain(iter).into_iter().collect();
         let err = collected.expect_err(
             "toasted log-only insert with no prior must fail loudly, not leak sentinel",
         );
@@ -7462,15 +8098,10 @@ mod tests {
             .clone()
             .unwrap();
         let conv2 = buffer2.reader_context.schema_handler.get_output_converter();
-        let iter2 = new_buffered_test(
-            Box::new(buffer2),
-            required2,
-            requested2,
-            conv2,
-            DEFAULT_BATCH_SIZE,
-        );
-        let batches: Vec<RecordBatch> = iter2
-            .collect::<std::result::Result<Vec<RecordBatch>, arrow_schema::ArrowError>>()
+        let iter2 = new_buffered_test(buffer2, required2, requested2, conv2, DEFAULT_BATCH_SIZE);
+        let batches: Vec<RecordBatch> = drain(iter2)
+            .into_iter()
+            .collect::<Result<Vec<RecordBatch>>>()
             .expect("a clean (non-sentinel) log-only insert must drain without error");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1, "the real-value insert should emit exactly one row");
@@ -7586,7 +8217,7 @@ mod tests {
             .unwrap();
         let conv = buffer.reader_context.schema_handler.get_output_converter();
         let iter = new_buffered_test(
-            Box::new(buffer),
+            buffer,
             required,
             requested.clone(),
             conv,
