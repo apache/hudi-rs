@@ -1,0 +1,32 @@
+{"namespace": "org.apache.hudi.avro.model",
+ "type": "record",
+ "name": "HoodieRestoreMetadata",
+ "fields": [
+     {"name": "startRestoreTime", "type": "string"},
+     {"name": "timeTakenInMillis", "type": "long"},
+     {"name": "instantsToRollback", "type": {"type": "array", "items": "string"}},
+     {"name": "hoodieRestoreMetadata", "type": {
+     "type" : "map", "values" : {
+        "type": "array",
+        "default": null,
+        "items": ["null","HoodieRollbackMetadata"],
+        "name": "hoodieRollbackMetadata"
+     }
+   }},
+     {
+        "name":"version",
+        "type":["int", "null"],
+        "default": 1
+     },
+     
+     {
+       "name": "restoreInstantInfo",
+       "default": [],
+       "type": {
+         "type": "array",
+         "default": null,
+         "items": "HoodieInstantInfo"
+       }
+     }
+ ]
+}
