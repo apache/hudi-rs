@@ -1,0 +1,15 @@
+{
+   "namespace":"org.apache.hudi.avro.model",
+   "type":"record",
+   "name":"HoodieInstantInfo",
+   "fields":[
+      {
+        "name":"commitTime",
+        "type":"string"
+      },
+      {
+        "name":"action",
+        "type":"string"
+      }
+   ]
+}
