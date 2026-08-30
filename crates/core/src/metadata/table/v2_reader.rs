@@ -84,7 +84,6 @@ impl MetadataTableV2Reader {
     /// which admits blocks written for a still-pending instant -- harmless for
     /// `files`, whose records are gated again downstream, and a silently wrong
     /// query result for the partitions that are not.
-    #[allow(dead_code)] // no caller until the set is threaded down the read chain
     pub(crate) fn with_valid_instants(mut self, instants: HashSet<String>) -> Self {
         self.valid_instants = Some(instants);
         self

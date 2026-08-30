@@ -567,6 +567,14 @@ impl Table {
         // and fallback storage listing.
         let estimator = self.get_or_init_estimator(timestamp).await;
 
+        // Built here rather than inside the view: it needs the data table's
+        // timeline as well as the metadata table's, and only this scope holds
+        // both.
+        let valid_instants = match metadata_table {
+            Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
+            None => None,
+        };
+
         let mut file_slices = self
             .file_system_view
             .get_file_slices(
@@ -575,6 +583,7 @@ impl Table {
                 &table_schema,
                 &timeline_view,
                 metadata_table,
+                valid_instants.as_ref(),
                 estimator,
             )
             .await?;
@@ -1175,8 +1184,9 @@ impl Table {
         let hudi_configs = self.hudi_configs.as_ref();
         let partition_pruner = PartitionPruner::new(&[], &partition_schema, hudi_configs).ok()?;
         let mdt = self.get_or_init_metadata_table().await.ok()?;
+        let valid = self.valid_instant_timestamps(mdt).await.ok()?;
         let records = mdt
-            .fetch_files_partition_records(&partition_pruner)
+            .fetch_files_partition_records(&partition_pruner, &valid)
             .await
             .ok()?;
 
@@ -3068,8 +3078,12 @@ mod tests {
         let partition_schema = table.get_partition_schema().await.unwrap();
         let partition_pruner =
             PartitionPruner::new(&[], &partition_schema, table.hudi_configs.as_ref()).unwrap();
+        let valid = table
+            .valid_instant_timestamps(metadata_table)
+            .await
+            .unwrap();
         let records = metadata_table
-            .fetch_files_partition_records(&partition_pruner)
+            .fetch_files_partition_records(&partition_pruner, &valid)
             .await
             .unwrap();
         assert!(!records.is_empty());

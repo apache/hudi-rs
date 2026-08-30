@@ -278,6 +278,11 @@ impl FileSystemView {
     /// * `table_schema` - Table schema for statistics extraction
     /// * `timeline_view` - The timeline view containing query context
     /// * `metadata_table` - Optional metadata table instance for file listing
+    // Eight parameters, one over clippy's limit. The eighth is the valid-instant
+    // set, which cannot be derived here: this view holds the metadata table's
+    // timeline and the set needs the data table's too. Bundling the existing
+    // seven to make room would be a wider refactor than this change.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn get_file_slices(
         &self,
         partition_pruner: &PartitionPruner,
@@ -285,10 +290,21 @@ impl FileSystemView {
         table_schema: &Schema,
         timeline_view: &TimelineView,
         metadata_table: Option<&Table>,
+        // The instants whose metadata log blocks may be read. Built by the data
+        // table, which holds both timelines, and passed in because this view
+        // holds only the metadata one.
+        valid_instants: Option<&std::collections::HashSet<String>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
         let files_partition_records = if let Some(mdt) = metadata_table {
-            Some(mdt.fetch_files_partition_records(partition_pruner).await?)
+            let empty = std::collections::HashSet::new();
+            Some(
+                mdt.fetch_files_partition_records(
+                    partition_pruner,
+                    valid_instants.unwrap_or(&empty),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -379,6 +395,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
+                None,
                 None,
                 None,
             )
@@ -473,6 +490,7 @@ mod tests {
                 &timeline_view,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -523,6 +541,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
+                None,
                 None,
                 estimator,
             )
@@ -745,6 +764,7 @@ mod tests {
                 &timeline_view,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -786,6 +806,7 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
+                None,
                 None,
                 None,
             )
@@ -966,6 +987,7 @@ mod tests {
                 &table_schema,
                 &timeline_view,
                 Some(metadata_table),
+                None,
                 None,
             )
             .await
