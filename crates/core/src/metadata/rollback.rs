@@ -22,6 +22,7 @@ use crate::error::CoreError;
 use apache_avro::Reader as AvroReader;
 use apache_avro::from_value;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::Cursor;
 
 /// The fields of `HoodieRollbackMetadata` this crate reads.
@@ -71,6 +72,59 @@ impl RollbackMetadata {
     }
 }
 
+/// The fields of `HoodieRestoreMetadata` this crate reads.
+///
+/// A restore is made up of several rollbacks, so the commits it rolled back are
+/// the union of its rollbacks' own -- which is why this reuses
+/// [`RollbackMetadata`] rather than redeclaring those fields.
+///
+/// Mirrors Java's `getRollbackedCommits` for a restore instant
+/// (`HoodieTableMetadataUtil.java:2178-2183`), which walks
+/// `getHoodieRestoreMetadata().values()` and flattens each entry's
+/// `commitsRollback`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreMetadata {
+    /// The instant this restore ran at.
+    pub start_restore_time: String,
+    /// Rollbacks keyed by the instant they rolled back. The value is a list
+    /// because one instant can be rolled back in several pieces.
+    pub hoodie_restore_metadata: HashMap<String, Vec<RollbackMetadata>>,
+}
+
+impl RestoreMetadata {
+    /// Decode the bytes of a completed `.restore` instant.
+    pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
+        let reader = AvroReader::new(Cursor::new(bytes)).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to create Avro reader for restore: {e}"))
+        })?;
+        let mut records = reader;
+        let value = records
+            .next()
+            .ok_or_else(|| {
+                CoreError::CommitMetadata("Restore metadata contains no records".to_string())
+            })?
+            .map_err(|e| {
+                CoreError::CommitMetadata(format!("Failed to read restore record: {e}"))
+            })?;
+        from_value::<Self>(&value).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to deserialize restore metadata: {e}"))
+        })
+    }
+
+    /// Every commit this restore rolled back, across all its rollbacks.
+    ///
+    /// Flattened rather than kept per-instant: the valid-instant set is a set,
+    /// and which rollback covered which commit does not affect membership.
+    pub fn commits_rolled_back(&self) -> Vec<String> {
+        self.hoodie_restore_metadata
+            .values()
+            .flatten()
+            .flat_map(|rollback| rollback.commits_rollback.iter().cloned())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,38 +150,33 @@ mod tests {
     /// schema files, unedited apart from splicing one into the other where the
     /// reference sits.
     fn inlined_schema_text() -> String {
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/data/avro_schemas");
-        let read = |name: &str| {
-            std::fs::read_to_string(dir.join(name))
-                .unwrap_or_else(|e| panic!("{name} must be present: {e}"))
-        };
-        let info = read("HoodieInstantInfo.avsc");
-        let rollback = read("HoodieRollbackMetadata.avsc");
-        let reference = "\"HoodieInstantInfo\"";
-        assert!(
-            rollback.contains(reference),
-            "the rollback schema must reference HoodieInstantInfo, or this splice is stale"
-        );
-        rollback.replace(reference, info.trim())
+        inline_named_types("HoodieRollbackMetadata.avsc", &["HoodieInstantInfo.avsc"])
     }
 
-    #[allow(dead_code)]
-    fn hudi_schemas() -> Vec<Schema> {
+    /// A schema with its named dependencies spliced in, in the order given.
+    ///
+    /// Each dependency must actually be referenced, asserted rather than assumed:
+    /// a splice that silently matched nothing would leave the reference
+    /// unresolved and fail later with a message about the format rather than
+    /// about the fixture.
+    fn inline_named_types(root: &str, deps: &[&str]) -> String {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/data/avro_schemas");
         let read = |name: &str| {
             std::fs::read_to_string(dir.join(name))
                 .unwrap_or_else(|e| panic!("{name} must be present: {e}"))
         };
-        // `HoodieRollbackMetadata` names `HoodieInstantInfo`, which lives in its
-        // own file -- Hudi's build resolves the reference across files, so a
-        // standalone parse of the one schema fails on an unknown type. Both are
-        // parsed together, dependency first.
-        let info = read("HoodieInstantInfo.avsc");
-        let rollback = read("HoodieRollbackMetadata.avsc");
-        Schema::parse_list([info.as_str(), rollback.as_str()])
-            .expect("Hudi's schemas must parse together")
+        let mut text = read(root);
+        for dep in deps {
+            let type_name = dep.trim_end_matches(".avsc");
+            let reference = format!("\"{type_name}\"");
+            assert!(
+                text.contains(&reference),
+                "{root} must reference {type_name}, or this splice is stale"
+            );
+            text = text.replacen(&reference, read(dep).trim(), 1);
+        }
+        text
     }
 
     /// An Avro object-container file, the shape `DataFileWriter` produces and so
@@ -198,5 +247,77 @@ mod tests {
             err.to_string().contains("rollback"),
             "the error must name what failed to read, got: {err}"
         );
+    }
+
+    /// A restore's rolled-back commits are the union of its rollbacks'.
+    ///
+    /// Two rollbacks under two different keys, each naming a different commit,
+    /// so the test distinguishes "flattened both" from "took the first map
+    /// entry" -- a single-entry fixture would pass either way.
+    #[test]
+    fn a_restore_yields_every_commit_its_rollbacks_rolled_back() -> Result<()> {
+        // HoodieRollbackMetadata must be inlined before HoodieInstantInfo,
+        // because the rollback schema is what carries the reference to it.
+        let text = inline_named_types(
+            "HoodieRestoreMetadata.avsc",
+            &["HoodieRollbackMetadata.avsc", "HoodieInstantInfo.avsc"],
+        );
+        let schema = Schema::parse_str(&text).expect("the restore schema must parse once inlined");
+
+        let rollback = |start: &str, commit: &str| {
+            Value::Record(vec![
+                ("startRollbackTime".into(), Value::String(start.into())),
+                ("timeTakenInMillis".into(), Value::Long(1)),
+                ("totalFilesDeleted".into(), Value::Int(0)),
+                (
+                    "commitsRollback".into(),
+                    Value::Array(vec![Value::String(commit.into())]),
+                ),
+                ("partitionMetadata".into(), Value::Map(Default::default())),
+                ("version".into(), Value::Union(0, Box::new(Value::Int(1)))),
+                ("instantsRollback".into(), Value::Array(vec![])),
+            ])
+        };
+        let mut nested = std::collections::HashMap::new();
+        nested.insert(
+            "20250101000000000".to_string(),
+            Value::Array(vec![Value::Union(
+                1,
+                Box::new(rollback("20250104000000000", "20250101000000000")),
+            )]),
+        );
+        nested.insert(
+            "20250102000000000".to_string(),
+            Value::Array(vec![Value::Union(
+                1,
+                Box::new(rollback("20250104000000000", "20250102000000000")),
+            )]),
+        );
+
+        let mut writer = Writer::new(&schema, Vec::new());
+        writer
+            .append(Value::Record(vec![
+                (
+                    "startRestoreTime".into(),
+                    Value::String("20250104000000000".into()),
+                ),
+                ("timeTakenInMillis".into(), Value::Long(9)),
+                ("instantsToRollback".into(), Value::Array(vec![])),
+                ("hoodieRestoreMetadata".into(), Value::Map(nested)),
+                ("version".into(), Value::Union(0, Box::new(Value::Int(1)))),
+                ("restoreInstantInfo".into(), Value::Array(vec![])),
+            ]))
+            .expect("append restore");
+        let bytes = writer.into_inner().expect("container bytes");
+
+        let parsed = RestoreMetadata::from_avro_bytes(&bytes)?;
+        let mut got = parsed.commits_rolled_back();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["20250101000000000", "20250102000000000"],
+            "a restore must yield every commit across all of its rollbacks"
+        );
+        Ok(())
     }
 }
