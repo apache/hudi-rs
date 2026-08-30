@@ -123,6 +123,14 @@ struct Args {
     /// it may not grow without bound.
     #[arg(long)]
     max_rss_bytes: Option<u64>,
+    /// Total memory the scan may use for concurrent slice reads
+    /// (`hoodie.read.scan.max.memory.size`). When set, slices-in-flight is
+    /// derived from it by `hudi_core::file_group::admission::slices_in_flight`
+    /// — the same function the DataFusion plan uses — and `--slice-concurrency`
+    /// becomes the ceiling it may not exceed rather than the value used.
+    #[arg(long)]
+    scan_memory_budget: Option<u64>,
+
     /// Directory the merge map spills into (`hoodie.memory.spillable.map.path`).
     /// Watched to report whether a run actually exercised the disk tier.
     #[arg(long, default_value = "/tmp")]
@@ -142,8 +150,10 @@ struct ReadConfig {
     async_stream: bool,
     /// True → position-based merge (`use_record_position`); false → key-based.
     use_record_position: bool,
-    /// How many slices to read concurrently.
+    /// How many slices to read concurrently — a ceiling when a budget is set.
     slice_concurrency: usize,
+    /// Scan-wide memory budget, in bytes.
+    scan_memory_budget: Option<u64>,
     /// Where the merge map spills (`hoodie.memory.spillable.map.path`). Passed
     /// to the reader, not only watched: the reader's own default is `/tmp`, and
     /// on a host where anything else lives under `/tmp` a watcher pointed there
@@ -293,6 +303,7 @@ async fn run(args: &Args) -> Result<()> {
             async_stream: args.async_stream,
             use_record_position: args.use_record_position,
             slice_concurrency: args.slice_concurrency,
+            scan_memory_budget: args.scan_memory_budget,
             spill_dir: args.spill_dir.clone(),
         };
         let spill_watch = SpillWatcher::start(spill_dir.clone());
@@ -520,7 +531,27 @@ async fn read_all_slices(
 
     // The fan-out under test. `buffer_unordered(1)` is sequential with no
     // coordination cost, which is what the single-slice baseline must stay.
-    let concurrency = cfg.slice_concurrency.max(1);
+    // Derived by the library, not by the harness: the gate has to exercise the
+    // shipped decision, or it measures the benchmark instead of the product.
+    // One benchmark process is one engine partition, hence `partitions = 1`.
+    let slice_log_bytes: Vec<Option<u64>> = file_slices
+        .iter()
+        .map(hudi_core::file_group::file_slice::FileSlice::log_size_bytes)
+        .collect();
+    let concurrency = hudi_core::file_group::admission::slices_in_flight(
+        cfg.scan_memory_budget,
+        1,
+        &slice_log_bytes,
+        cfg.slice_concurrency,
+    );
+    if cfg.scan_memory_budget.is_some() {
+        eprintln!(
+            "[fg-bench] budget {} MiB over {} slices -> concurrency {concurrency} (ceiling {})",
+            cfg.scan_memory_budget.unwrap_or(0) / (1024 * 1024),
+            file_slices.len(),
+            cfg.slice_concurrency,
+        );
+    }
     let total_rows = futures::stream::iter(file_slices.iter())
         .map(|slice| {
             let reader = &reader;

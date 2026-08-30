@@ -176,6 +176,22 @@ impl FileSlice {
             .sum();
         base + logs
     }
+
+    /// Total bytes of this slice's log files, or `None` when any of them has no
+    /// recorded size.
+    ///
+    /// Distinct from [`Self::total_size_bytes`], which counts an unmeasured file
+    /// as zero. That is the right answer for a statistic and the wrong one for a
+    /// memory estimate: a slice whose logs were never listed would look free and
+    /// be admitted most freely, exactly when least is known about it. Callers
+    /// sizing a read against a budget need the difference between "no log bytes"
+    /// and "unknown log bytes", so this reports it.
+    #[inline]
+    pub fn log_size_bytes(&self) -> Option<u64> {
+        self.log_files.iter().try_fold(0u64, |acc, lf| {
+            lf.file_metadata.as_ref().map(|m| acc + m.size)
+        })
+    }
 }
 
 #[cfg(test)]
