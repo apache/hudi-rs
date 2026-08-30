@@ -91,6 +91,27 @@ impl InstantRange {
         self.explicit_instants.is_some()
     }
 
+    /// Whether this range excludes nothing.
+    ///
+    /// No lower bound, an upper bound at or above the maximum instant, **and no
+    /// explicit instant set** — then every instant is admitted, so filtering
+    /// against it cannot remove a row. The merge-on-read path builds exactly this
+    /// range by default (`with_unbounded_end_timestamp`) and materializes the
+    /// whole base file to apply it; this lets that path tell the difference.
+    ///
+    /// The explicit-set clause is load-bearing: [`Self::exact_match`] leaves both
+    /// timestamps `None`, so a bounds-only test would call it unbounded and skip
+    /// the filter for the metadata table, which is the one caller that admits by
+    /// membership.
+    pub fn admits_all(&self) -> bool {
+        self.explicit_instants.is_none()
+            && self.start_timestamp.is_none()
+            && self
+                .end_timestamp
+                .as_deref()
+                .is_none_or(|e| e >= crate::file_group::reader_v2::MAX_INSTANT_TIME)
+    }
+
     /// Create a new [InstantRange] with a closed end timestamp range.
     pub fn up_to(end_timestamp: &str, timezone: &str) -> Self {
         Self::new(
@@ -1126,5 +1147,49 @@ mod tests {
         let range = InstantRange::exact_match(Vec::<String>::new(), "UTC");
         assert!(!range.is_in_range("20250101000000000", "UTC").unwrap());
         assert!(!range.is_in_range_lexicographic("20250101000000000"));
+    }
+    /// `admits_all` is the whole safety argument for skipping the base file's
+    /// materialization, so it is pinned directly.
+    ///
+    /// The merge-on-read path materializes the entire base file to apply an
+    /// instant-range gate. Skipping that is safe only when the range excludes
+    /// nothing — and on a table with `populate.meta.fields = false` the
+    /// downstream row filter does nothing, so this gate is the only enforcement
+    /// there. A predicate that answered `true` for a range that actually bounds
+    /// something would silently drop that enforcement.
+    #[test]
+    fn admits_all_is_true_only_for_a_range_that_bounds_nothing() {
+        let tz = "UTC".to_string();
+        let range = |start: Option<&str>, end: Option<&str>| {
+            InstantRange::new(
+                tz.clone(),
+                start.map(str::to_string),
+                end.map(str::to_string),
+                false,
+                true,
+            )
+        };
+        const MAX: &str = crate::file_group::reader_v2::MAX_INSTANT_TIME;
+
+        // Bounds nothing.
+        assert!(range(None, None).admits_all(), "no bounds at all");
+        assert!(
+            range(None, Some(MAX)).admits_all(),
+            "the default the read path builds: unbounded end"
+        );
+
+        // Bounds something — each of these must materialize and filter.
+        assert!(
+            !range(Some("20240101000000000"), None).admits_all(),
+            "a lower bound excludes earlier commits"
+        );
+        assert!(
+            !range(Some("20240101000000000"), Some(MAX)).admits_all(),
+            "a lower bound still bounds when the end is unbounded"
+        );
+        assert!(
+            !range(None, Some("20240101000000000")).admits_all(),
+            "an upper bound below the maximum excludes later commits"
+        );
     }
 }
