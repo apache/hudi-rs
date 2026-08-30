@@ -1554,6 +1554,75 @@ mod tests {
         (base_url.as_str().to_string(), first)
     }
 
+    /// A bounded instant range excludes a base file whose commit falls outside
+    /// it, leaving the log records that do not.
+    ///
+    /// The gate is whole-file: `apply_instant_range_filter` keeps every batch or
+    /// none, decided by the base file's single commit instant. Observing it needs
+    /// a slice where excluding the base leaves something behind, which is why
+    /// this fixture's log records **insert** under keys the base does not hold.
+    /// Every other merge-on-read fixture here updates base keys, so excluding the
+    /// base leaves the updates with nothing to update and the read returns
+    /// nothing whether the gate fired or not — which is why the gate could be
+    /// disabled outright with the whole suite still green.
+    ///
+    /// Meta fields are turned off deliberately. With them on,
+    /// `create_commit_time_filter_mask` removes the same rows at row level after
+    /// the merge, so both mechanisms agree and neither is isolated. Off, that
+    /// mask returns `None` — and that is the real configuration in which this
+    /// gate is the only thing enforcing an instant window.
+    #[tokio::test]
+    async fn a_bounded_instant_range_drops_the_base_file_and_keeps_the_log() -> Result<()> {
+        const BASE: &str =
+            "f00000000-0000-0000-0000-000000000000-0_0-1-0_20250101000000000.parquet";
+        const LOG: &str = ".f00000000-0000-0000-0000-000000000000-0_20250101000000000.log.1_0-2-0";
+        // Between the base file's commit (…0101…) and the log records' (…0102…).
+        // A bound outside that span would admit or exclude both and prove nothing.
+        const START: &str = "20250101120000000";
+
+        // Canonicalized: object_store rejects a path containing "..".
+        let table = std::fs::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/data/mor_log_inserts"),
+        )
+        .unwrap();
+        let table = table.to_string_lossy().to_string();
+        let slice = || -> Result<FileSlice> {
+            let mut fs = FileSlice::new(BaseFile::from_str(BASE)?, String::new());
+            fs.log_files
+                .insert(crate::file_group::log_file::LogFile::from_str(LOG)?);
+            Ok(fs)
+        };
+        async fn rows(
+            table: &str,
+            file_slice: &FileSlice,
+            opts: Vec<(&str, &str)>,
+        ) -> Result<usize> {
+            let reader = FileGroupReader::new_with_options(table, opts).await?;
+            Ok(reader
+                .read_file_slice(file_slice, &ReadOptions::new())
+                .await?
+                .num_rows())
+        }
+
+        let meta_off = vec![("hoodie.populate.meta.fields", "false")];
+        let fs = slice()?;
+        let unbounded = rows(&table, &fs, meta_off.clone()).await?;
+        assert_eq!(
+            unbounded, 2040,
+            "2000 base rows plus 40 inserted log records"
+        );
+
+        let mut bounded = meta_off;
+        bounded.push(("hoodie.read.start.timestamp", START));
+        let filtered = rows(&table, &fs, bounded).await?;
+        assert_eq!(
+            filtered, 40,
+            "the base file's commit is outside the range, so only the log records \
+             remain; {unbounded} means the whole base survived the gate"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_read_file_slice_stream_with_real_base_file_and_small_batches() -> Result<()> {
         use futures::StreamExt;

@@ -62,6 +62,18 @@ struct Args {
     /// read does not avoid.
     #[arg(long, default_value_t = 0)]
     log_files: usize,
+    /// Shift the log records' key range by this many keys, making them inserts
+    /// rather than updates.
+    ///
+    /// Zero (the default) reuses the base file's keys, so every log record
+    /// updates a base row and the merged row count equals the base row count.
+    /// A table generated that way cannot show whether excluding the base file
+    /// worked: excluding it leaves updates with nothing to update, so the read
+    /// returns nothing either way. Offsetting past the base's key range gives
+    /// log records that survive on their own.
+    #[arg(long, default_value_t = 0)]
+    log_key_offset: u64,
+
     /// Records per log block. Each log file gets one block.
     #[arg(long, default_value_t = 200_000)]
     log_records: usize,
@@ -288,7 +300,7 @@ fn run(args: &Args) -> Result<(), String> {
             let log_name = format!(".{file_id}_{INSTANT}.log.{v}_0-2-{i}");
             log_bytes += write_log_file(
                 &root.join(&log_name),
-                (i as u64) * 100_000_000,
+                (i as u64) * 100_000_000 + args.log_key_offset,
                 args.log_records,
             );
         }
