@@ -565,6 +565,16 @@ impl HFileReader {
         }
     }
 
+    /// A clone of the fetcher, sharing this reader's counts. Lets a caller keep
+    /// measuring across a read it hands the reader off to, which `reads` — a
+    /// borrow — cannot.
+    pub fn reads_handle(&self) -> Option<crate::storage::reader::LogBlockFetcher> {
+        match &self.source {
+            Source::Ranged { fetcher, .. } => Some(fetcher.clone()),
+            Source::Whole(_) => None,
+        }
+    }
+
     /// The data blocks in key order, each with the range it occupies, so a
     /// caller can decide how many to read at once.
     pub fn data_block_entries(&self) -> Vec<BlockIndexEntry> {
