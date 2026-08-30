@@ -182,7 +182,7 @@ impl RollbackPlan {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use apache_avro::types::Value;
     use apache_avro::{Schema, Writer};
@@ -205,7 +205,7 @@ mod tests {
     /// The substitution is textual and deliberate: both halves are Hudi's own
     /// schema files, unedited apart from splicing one into the other where the
     /// reference sits.
-    fn inlined_schema_text() -> String {
+    pub(crate) fn inlined_schema_text() -> String {
         inline_named_types("HoodieRollbackMetadata.avsc", &["HoodieInstantInfo.avsc"])
     }
 
@@ -215,7 +215,7 @@ mod tests {
     /// a splice that silently matched nothing would leave the reference
     /// unresolved and fail later with a message about the format rather than
     /// about the fixture.
-    fn inline_named_types(root: &str, deps: &[&str]) -> String {
+    pub(crate) fn inline_named_types(root: &str, deps: &[&str]) -> String {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/data/avro_schemas");
         let read = |name: &str| {
@@ -237,7 +237,7 @@ mod tests {
 
     /// An Avro object-container file, the shape `DataFileWriter` produces and so
     /// the shape a real `.rollback` instant has on disk.
-    fn container_bytes(start: &str, rolled_back: &[&str]) -> Vec<u8> {
+    pub(crate) fn container_bytes(start: &str, rolled_back: &[&str]) -> Vec<u8> {
         let schema = Schema::parse_str(&inlined_schema_text())
             .expect("Hudi's schema, with its dependency inlined, must parse");
         let mut writer = Writer::new(&schema, Vec::new());
