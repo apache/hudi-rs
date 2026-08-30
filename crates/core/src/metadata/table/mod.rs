@@ -312,8 +312,33 @@ impl Table {
     ///
     /// # Note
     /// Must be called on a METADATA table instance.
+    /// The reader and slices for the `files` partition.
+    ///
+    /// A thin wrapper over [`Self::partition_reader`]: `files` is the only
+    /// partition with a decoded record type and a caller today. The others are
+    /// reachable through `partition_reader` for tests, which is what lets shard
+    /// routing be checked against real file ids rather than synthetic ones.
     async fn files_partition_reader(
         &self,
+    ) -> Result<
+        Option<(
+            v2_reader::MetadataTableV2Reader,
+            Vec<crate::file_group::file_slice::FileSlice>,
+        )>,
+    > {
+        self.partition_reader(FilesPartitionRecord::PARTITION_NAME)
+            .await
+    }
+
+    /// The reader and every file slice of one metadata partition.
+    ///
+    /// Parameterised rather than pinned to `files` because the partitions that
+    /// shard -- record index, secondary index -- differ from it only in how many
+    /// slices come back and how their records decode. Slice discovery does not
+    /// care which partition it is listing.
+    async fn partition_reader(
+        &self,
+        partition: &str,
     ) -> Result<
         Option<(
             v2_reader::MetadataTableV2Reader,
@@ -326,11 +351,7 @@ impl Table {
 
         let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
 
-        let filters = from_str_tuples([(
-            METADATA_TABLE_PARTITION_FIELD,
-            "=",
-            FilesPartitionRecord::PARTITION_NAME,
-        )])?;
+        let filters = from_str_tuples([(METADATA_TABLE_PARTITION_FIELD, "=", partition)])?;
         let partition_schema = self.get_partition_schema().await?;
         let partition_pruner =
             PartitionPruner::new(&filters, &partition_schema, self.hudi_configs.as_ref())?;
@@ -953,5 +974,48 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// Shard routing, checked against the fixture's **real** record index: ten
+    /// file groups, written by Hudi, with Hudi's own file-id naming.
+    ///
+    /// The routing tests elsewhere use synthetic `FileSlice`s, so they prove the
+    /// selection logic but not that it survives real file ids -- where the sort
+    /// that recovers shard order has to work on names like
+    /// `record-index-0003-0` rather than ones a test chose.
+    ///
+    /// What this does *not* do is read the records: `record_index` has no decoded
+    /// type yet, so the keys each shard holds are unknown here. It pins
+    /// discovery and selection, and says so.
+    #[tokio::test]
+    async fn routing_selects_one_of_the_record_index_s_real_shards() -> Result<()> {
+        let data_table = get_data_table().await;
+        let metadata = data_table.get_or_init_metadata_table().await?;
+
+        let Some((_reader, slices)) = metadata.partition_reader("record_index").await? else {
+            panic!("the fixture must have a record_index partition, or this test proves nothing");
+        };
+        assert_eq!(
+            slices.len(),
+            10,
+            "the fixture's record index is sharded across ten file groups; a different \
+             number means discovery changed and this test's premise is stale"
+        );
+
+        let key = "some-record-key";
+        let picked = routing::slices_for_keys(&slices, &[key]);
+        assert_eq!(picked.len(), 1, "one key opens one shard, not ten");
+
+        // The shard the hash names, computed over the real ids sorted into shard
+        // order -- not merely "some shard", which a broken sort would also give.
+        let mut ordered: Vec<&str> = slices.iter().map(|s| s.file_id()).collect();
+        ordered.sort();
+        let expected = ordered[routing::file_group_index(key, ordered.len())];
+        assert_eq!(
+            picked[0].file_id(),
+            expected,
+            "selection must follow shard order recovered from Hudi's own file ids"
+        );
+        Ok(())
     }
 }
