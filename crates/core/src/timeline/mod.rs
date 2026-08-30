@@ -312,6 +312,16 @@ impl Timeline {
         self.active_loader.load_instant_metadata(instant).await
     }
 
+    /// The raw bytes of one instant file, for readers that decode a record
+    /// other than commit metadata — a rollback, a restore, or a rollback plan.
+    ///
+    /// Reached only from the valid-instant set builder, which is not yet wired
+    /// into a read.
+    #[allow(dead_code)]
+    pub(crate) async fn load_instant_bytes(&self, instant: &Instant) -> Result<Vec<u8>> {
+        self.active_loader.load_instant_bytes(instant).await
+    }
+
     /// Get the instant metadata in JSON format.
     pub async fn get_instant_metadata_in_json(&self, instant: &Instant) -> Result<String> {
         self.active_loader
