@@ -176,8 +176,11 @@ impl Table {
         partition_pruner: &PartitionPruner,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         let metadata_table = self.get_or_init_metadata_table().await?;
+        // Built here because it needs both timelines: the data table's completed
+        // and pending instants, and the metadata table's own.
+        let valid = self.valid_instant_timestamps(metadata_table).await?;
         metadata_table
-            .fetch_files_partition_records(partition_pruner)
+            .fetch_files_partition_records(partition_pruner, &valid)
             .await
     }
 
@@ -201,7 +204,10 @@ impl Table {
         keys: &[&str],
     ) -> Result<arrow_array::RecordBatch> {
         let metadata_table = self.get_or_init_metadata_table().await?;
-        metadata_table.read_files_partition_batch(keys).await
+        let valid = self.valid_instant_timestamps(metadata_table).await?;
+        metadata_table
+            .read_files_partition_batch(keys, &valid)
+            .await
     }
 
     /// Fetch records from the `files` partition with optional partition pruning.
@@ -217,22 +223,26 @@ impl Table {
     pub async fn fetch_files_partition_records(
         &self,
         partition_pruner: &PartitionPruner,
+        valid_instants: &HashSet<String>,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         // Non-partitioned table: directly fetch "." record
         if !partition_pruner.is_table_partitioned() {
             return self
-                .read_files_partition(&[FilesPartitionRecord::NON_PARTITIONED_NAME])
+                .read_files_partition(
+                    &[FilesPartitionRecord::NON_PARTITIONED_NAME],
+                    valid_instants,
+                )
                 .await;
         }
 
         // Partitioned table without filters: read all records
         if partition_pruner.is_empty() {
-            return self.read_files_partition(&[]).await;
+            return self.read_files_partition(&[], valid_instants).await;
         }
 
         // Partitioned table with filters: prune partitions first, then read only matching records
         let all_partitions_records = self
-            .read_files_partition(&[FilesPartitionRecord::ALL_PARTITIONS_KEY])
+            .read_files_partition(&[FilesPartitionRecord::ALL_PARTITIONS_KEY], valid_instants)
             .await?;
 
         let partition_names: Vec<&str> = all_partitions_records
@@ -249,7 +259,7 @@ impl Table {
             return Ok(HashMap::new());
         }
 
-        self.read_files_partition(&pruned).await
+        self.read_files_partition(&pruned, valid_instants).await
     }
 
     /// Read records from the `files` partition.
@@ -261,10 +271,12 @@ impl Table {
     async fn read_files_partition(
         &self,
         keys: &[&str],
+        valid_instants: &HashSet<String>,
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
         let Some((reader, file_slices)) = self.files_partition_reader().await? else {
             return Ok(HashMap::new());
         };
+        let reader = reader.with_valid_instants(valid_instants.clone());
         // Each slice holds a disjoint set of keys -- a metadata partition shards
         // by hashing the record key -- so the per-slice maps combine by insertion
         // with no merge rule needed. Bounded fan-out, the same ceiling the data
@@ -292,12 +304,14 @@ impl Table {
     pub(crate) async fn read_files_partition_batch(
         &self,
         keys: &[&str],
+        valid_instants: &HashSet<String>,
     ) -> Result<arrow_array::RecordBatch> {
         let Some((reader, file_slices)) = self.files_partition_reader().await? else {
             return Ok(arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
                 Schema::empty(),
             )));
         };
+        let reader = reader.with_valid_instants(valid_instants.clone());
         let targets = routing::slices_for_keys(&file_slices, keys);
         let batches = crate::util::concurrency::bounded_in_order(
             &targets,
@@ -415,12 +429,6 @@ impl Table {
 /// timeline (`HoodieTableMetadata.SOLO_COMMIT_TIMESTAMP`).
 const SOLO_COMMIT_TIMESTAMP: &str = "00000000000000";
 
-// Built and tested, not yet wired into a read. The set is assembled by the
-// *data* table, while `read_files_partition` runs on the *metadata* table, so
-// attaching it means threading it down that chain — the next step, and a change
-// to the read path rather than to this builder. Marked rather than given a
-// synthetic caller, so the gap stays visible in the code and not only in a note.
-#[allow(dead_code)]
 impl Table {
     /// The instants whose metadata log blocks may be read.
     ///
@@ -1103,13 +1111,18 @@ mod tests {
 
         let one = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
         let baseline_table = Table::new(&one).await?;
-        let baseline = baseline_table
-            .get_or_init_metadata_table()
-            .await?
-            .read_files_partition_batch(&[])
+        let baseline_mdt = baseline_table.get_or_init_metadata_table().await?;
+        let baseline_valid = baseline_table
+            .valid_instant_timestamps(baseline_mdt)
+            .await?;
+        let baseline = baseline_mdt
+            .read_files_partition_batch(&[], &baseline_valid)
             .await?;
 
-        let doubled = metadata.read_files_partition_batch(&[]).await?;
+        let doubled_valid = table.valid_instant_timestamps(metadata).await?;
+        let doubled = metadata
+            .read_files_partition_batch(&[], &doubled_valid)
+            .await?;
         assert_eq!(
             doubled.num_rows(),
             baseline.num_rows() * 2,
