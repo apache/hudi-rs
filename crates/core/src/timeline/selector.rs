@@ -23,6 +23,7 @@ use crate::error::CoreError;
 use crate::timeline::Timeline;
 use crate::timeline::instant::{Action, Instant, State};
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -33,6 +34,20 @@ pub struct InstantRange {
     end_timestamp: Option<String>,
     start_inclusive: bool,
     end_inclusive: bool,
+    /// Explicit membership, mirroring Java's `RangeType::EXACT_MATCH`.
+    ///
+    /// A window cannot express the set the metadata table filters its log blocks
+    /// by: that set has **holes** -- a pending data instant is excluded while
+    /// instants on either side of it are included -- and members from outside the
+    /// data timeline entirely, such as metadata-only indexing delta commits.
+    /// Approximating it with bounds would admit blocks written for a pending
+    /// instant, and for every partition except `files` those records are used
+    /// as-is: wrong column statistics prune away files that hold matching rows,
+    /// which is a silently wrong query result rather than a failure.
+    ///
+    /// When set, bounds are ignored entirely -- membership is the whole test, as
+    /// it is in Java.
+    explicit_instants: Option<HashSet<String>>,
 }
 
 impl InstantRange {
@@ -49,7 +64,31 @@ impl InstantRange {
             end_timestamp,
             start_inclusive,
             end_inclusive,
+            explicit_instants: None,
         }
+    }
+
+    /// A range that admits exactly the instants in `instants`, and nothing else.
+    ///
+    /// See [`Self::explicit_instants`] for why a window cannot stand in for this.
+    pub fn exact_match<I, S>(instants: I, timezone: &str) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            timezone: timezone.to_string(),
+            start_timestamp: None,
+            end_timestamp: None,
+            start_inclusive: false,
+            end_inclusive: false,
+            explicit_instants: Some(instants.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    /// Whether this range admits by explicit membership rather than by bounds.
+    pub fn is_exact_match(&self) -> bool {
+        self.explicit_instants.is_some()
     }
 
     /// Create a new [InstantRange] with a closed end timestamp range.
@@ -83,6 +122,9 @@ impl InstantRange {
     /// short instants still bound correctly rather than being kept
     /// unconditionally.
     pub fn is_in_range_lexicographic(&self, timestamp: &str) -> bool {
+        if let Some(allowed) = &self.explicit_instants {
+            return allowed.contains(timestamp);
+        }
         if let Some(start) = self.start_timestamp.as_deref() {
             if self.start_inclusive {
                 if timestamp < start {
@@ -133,6 +175,12 @@ impl InstantRange {
     }
 
     pub fn is_in_range(&self, timestamp: &str, timezone: &str) -> Result<bool> {
+        // Membership short-circuits before any parsing: an exact-match set may
+        // hold instants the bounds would reject, and parsing would be wasted
+        // work besides.
+        if let Some(allowed) = &self.explicit_instants {
+            return Ok(allowed.contains(timestamp));
+        }
         let t = Instant::parse_datetime(timestamp, timezone)?;
         if let Some(start) = self.start_timestamp()? {
             if self.start_inclusive {
@@ -1011,5 +1059,72 @@ mod tests {
             &["20240103153020999"]
         );
         Ok(())
+    }
+
+    /// The property a window cannot have: a set with a hole in it.
+    ///
+    /// The metadata table's valid-instant set excludes a *pending* data instant
+    /// while including instants on either side. Any bounded range that admits
+    /// both neighbours necessarily admits the pending one too, so this is the
+    /// test that separates the two representations rather than merely exercising
+    /// the new constructor.
+    #[test]
+    fn an_exact_match_set_can_exclude_an_instant_between_two_it_admits() {
+        let range = InstantRange::exact_match(["20250101000000000", "20250103000000000"], "UTC");
+
+        assert!(range.is_in_range("20250101000000000", "UTC").unwrap());
+        assert!(range.is_in_range("20250103000000000", "UTC").unwrap());
+        assert!(
+            !range.is_in_range("20250102000000000", "UTC").unwrap(),
+            "the instant between two admitted ones must be excluded -- this is \
+             exactly what a bounded range cannot express"
+        );
+
+        // And the equivalent window really would admit it, which is what makes
+        // the assertion above meaningful rather than trivially true.
+        let window =
+            InstantRange::within_open_closed("20241231000000000", "20250103000000000", "UTC");
+        assert!(
+            window.is_in_range("20250102000000000", "UTC").unwrap(),
+            "a window covering both endpoints admits the hole, by construction"
+        );
+    }
+
+    /// Membership ignores bounds entirely, as Java's EXACT_MATCH does.
+    #[test]
+    fn an_exact_match_set_admits_an_instant_no_window_would() {
+        // An instant from outside the data timeline -- a metadata-only indexing
+        // delta commit -- is admitted purely because it is in the set.
+        let range = InstantRange::exact_match(["00000000000000000"], "UTC");
+        assert!(range.is_in_range("00000000000000000", "UTC").unwrap());
+        assert!(range.is_exact_match());
+    }
+
+    /// The lexicographic predicate must agree with the parsing one, since the
+    /// log-block gate falls back to it for instants that will not parse.
+    #[test]
+    fn both_predicates_agree_on_an_exact_match_set() {
+        let range = InstantRange::exact_match(["20250101000000000"], "UTC");
+        for (instant, expected) in [("20250101000000000", true), ("20250102000000000", false)] {
+            assert_eq!(
+                range.is_in_range(instant, "UTC").unwrap(),
+                expected,
+                "parsing predicate disagreed on {instant}"
+            );
+            assert_eq!(
+                range.is_in_range_lexicographic(instant),
+                expected,
+                "lexicographic predicate disagreed on {instant}"
+            );
+        }
+    }
+
+    /// An empty set admits nothing. A range that silently admitted everything
+    /// when handed no instants would turn a filter into a no-op.
+    #[test]
+    fn an_empty_exact_match_set_admits_nothing() {
+        let range = InstantRange::exact_match(Vec::<String>::new(), "UTC");
+        assert!(!range.is_in_range("20250101000000000", "UTC").unwrap());
+        assert!(!range.is_in_range_lexicographic("20250101000000000"));
     }
 }
