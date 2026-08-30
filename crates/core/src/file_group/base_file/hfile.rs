@@ -1930,4 +1930,116 @@ mod tests {
         );
         Ok(())
     }
+
+    /// The `bloom_filters` slice, base HFile plus the log written after it.
+    const MDT_BLOOM_DIR: &str = "../test/data/metadata_bloom_filters_slice";
+    const MDT_BLOOM_BASE: &str = "bloom-filters-0000-0_0-51-131_20260830093346422.hfile";
+    const MDT_BLOOM_LOG: &str = ".bloom-filters-0000-0_20260830093352285.log.1_0-109-277";
+
+    /// A `bloom_filters` slice reads through the metadata table's CUSTOM merge
+    /// path, base and log both contributing.
+    ///
+    /// The corpus reaches `files`, `partition_stats` and `secondary_index`; this
+    /// is the fourth metadata partition type and nothing covered it. It is the one
+    /// whose payload is a raw byte buffer rather than a struct of scalars, so a
+    /// decoder that works for the others can still fail here — which is what makes
+    /// the type worth a fixture rather than a unit test on constructed records.
+    ///
+    /// The row count is what gives the log side weight: the base holds 2 records
+    /// and the log 2 more, under keys the base does not have, so a read that
+    /// dropped the log would return 2 and every other assertion here would still
+    /// hold.
+    ///
+    /// It does **not** pin partition routing. Rebuilding the record context for
+    /// `files` instead of `bloom_filters` changes nothing observable here — the
+    /// `type` field is decoded from the record, not chosen by the context — so
+    /// that is measured, not asserted.
+    #[tokio::test]
+    async fn v2_reads_a_bloom_filters_slice() -> crate::Result<()> {
+        use arrow_array::Array;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(MDT_BLOOM_DIR);
+        let uri = url::Url::from_directory_path(std::fs::canonicalize(&dir).unwrap()).unwrap();
+        let configs = Arc::new(HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                uri.to_string(),
+            ),
+            (
+                HudiTableConfig::BaseFileFormat.as_ref().to_string(),
+                "hfile".to_string(),
+            ),
+            (
+                HudiReadConfig::EndTimestamp.as_ref().to_string(),
+                MAX_INSTANT_TIME.to_string(),
+            ),
+            (
+                HudiTableConfig::RecordKeyFields.as_ref().to_string(),
+                "key".to_string(),
+            ),
+            (
+                HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
+                "false".to_string(),
+            ),
+            ("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()),
+            (
+                "hoodie.record.merge.strategy.id".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+            (
+                "hoodie.compaction.payload.class".to_string(),
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+        ]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let mut context = resolve_reader_context(&configs, true, Some("hfile"))?;
+        // The partition drives which metadata payload the merger decodes into.
+        context.rebuild_record_context("bloom_filters".to_string());
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(context),
+            storage,
+            InputSplit::new(
+                Some(MDT_BLOOM_BASE.to_string()),
+                Some(MAX_INSTANT_TIME.to_string()),
+                vec![MDT_BLOOM_LOG.to_string()],
+                String::new(),
+            ),
+            ReaderParameters::default(),
+            None,
+            None,
+        )?;
+        let batch = reader.read().await?;
+
+        assert_eq!(
+            batch.num_rows(),
+            4,
+            "2 records from the base and 2 from the log; a dropped log side reads 2"
+        );
+        let types = batch
+            .column_by_name("type")
+            .expect("a metadata record carries its partition type")
+            .as_primitive::<arrow_array::types::Int32Type>();
+        // 4 is BLOOM_FILTERS in Hudi's metadata record schema.
+        assert!(
+            (0..batch.num_rows()).all(|i| types.value(i) == 4),
+            "every record must be a bloom-filter record"
+        );
+
+        let bloom = batch
+            .column_by_name("BloomFilterMetadata")
+            .expect("the bloom-filter column")
+            .as_struct();
+        let filters = bloom
+            .column_by_name("bloomFilter")
+            .expect("the filter payload")
+            .as_binary::<i32>();
+        let non_empty = (0..batch.num_rows())
+            .filter(|i| !filters.is_null(*i) && !filters.value(*i).is_empty())
+            .count();
+        assert_eq!(
+            non_empty,
+            batch.num_rows(),
+            "every bloom-filter record must carry a non-empty filter buffer"
+        );
+        Ok(())
+    }
 }
