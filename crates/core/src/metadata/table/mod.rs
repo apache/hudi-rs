@@ -287,7 +287,7 @@ impl Table {
         let targets = routing::slices_for_keys(&file_slices, keys);
         let per_slice = crate::util::concurrency::bounded_in_order(
             &targets,
-            self.file_slice_read_concurrency(),
+            self.bounded_read_concurrency_for(&targets),
             |file_slice| reader.read_files_partition(file_slice, keys),
         )
         .await?;
@@ -315,7 +315,7 @@ impl Table {
         let targets = routing::slices_for_keys(&file_slices, keys);
         let batches = crate::util::concurrency::bounded_in_order(
             &targets,
-            self.file_slice_read_concurrency(),
+            self.bounded_read_concurrency_for(&targets),
             |file_slice| reader.read_files_partition_batch(file_slice, keys),
         )
         .await?;

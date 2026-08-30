@@ -851,25 +851,67 @@ impl Table {
         FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
     }
 
+    /// The scan's memory budget, when the table set one.
+    ///
+    /// Absent means `hoodie.read.file.slice.read.concurrency` stands on its own,
+    /// which is the behaviour every existing table keeps.
+    fn scan_max_memory_size(&self) -> Option<u64> {
+        self.hudi_configs
+            .try_get(HudiReadConfig::ScanMaxMemorySize)
+            .ok()
+            .flatten()
+            .map(|v| -> usize { v.into() })
+            .map(|v| v as u64)
+    }
+
     /// How many file slices to read at once.
     ///
     /// `try_join_all` over every slice was unbounded, so a table with a thousand
     /// file groups issued a thousand concurrent reads and held a thousand merged
-    /// batches at the same time — and under file group reader version 2 each of those
-    /// also carries its own merge map and, on spill, its own RocksDB instance.
-    /// `hoodie.read.file.slice.read.concurrency` already bounds the DataFusion
-    /// scan; honoring it here puts the direct and Python read paths on the same
-    /// knob instead of leaving them unbounded.
-    pub(crate) fn file_slice_read_concurrency(&self) -> usize {
-        let configured: usize = self
+    /// batches at once — and under file group reader version 2 each of those also
+    /// carries its own merge map and, on spill, its own RocksDB instance.
+    ///
+    /// The same derivation the DataFusion plan uses, so the two paths cannot
+    /// bound a scan differently. This is the **only** way to obtain a
+    /// concurrency for a read: the raw `hoodie.read.file.slice.read.concurrency`
+    /// lookup lives inside it rather than in a method of its own, so a read
+    /// cannot reach the ceiling while bypassing the budget. A test can miss that
+    /// bypass — one did — but a compile error cannot. One `Table` read is one partition's worth of
+    /// work, so the budget is not divided further here — dividing twice would
+    /// bound this path below what the caller asked for.
+    ///
+    /// Separated from the read so it can be asserted directly: it is a single
+    /// call whose absence compiles perfectly, and the arithmetic behind it is
+    /// tested elsewhere in isolation, which says nothing about whether anything
+    /// calls it.
+    /// [`Self::bounded_read_concurrency`] for a borrowed selection.
+    ///
+    /// The metadata read routes keys to a subset of a partition's slices, so it
+    /// holds `&FileSlice` rather than owning them. The budget must see that
+    /// subset, not the whole partition: routing a single key to one shard should
+    /// admit on that shard's cost.
+    pub(crate) fn bounded_read_concurrency_for(&self, file_slices: &[&FileSlice]) -> usize {
+        let owned: Vec<FileSlice> = file_slices.iter().map(|s| (*s).clone()).collect();
+        self.bounded_read_concurrency(&owned)
+    }
+
+    fn bounded_read_concurrency(&self, file_slices: &[FileSlice]) -> usize {
+        let slice_log_bytes: Vec<Option<u64>> =
+            file_slices.iter().map(FileSlice::log_size_bytes).collect();
+        let ceiling: usize = self
             .hudi_configs
             .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
             .into();
-        configured.max(1)
+        crate::file_group::admission::slices_in_flight(
+            self.scan_max_memory_size(),
+            1,
+            &slice_log_bytes,
+            ceiling.max(1),
+        )
     }
 
     /// Read `file_slices` with at most [`Self::file_slice_read_concurrency`] in
-    /// flight, in slice order.
+    /// flight, or fewer when a scan memory budget admits fewer, in slice order.
     ///
     /// Order is preserved (`buffered`, not `buffer_unordered`) because a caller
     /// that concatenates these batches should not see its row order shift with
@@ -883,7 +925,7 @@ impl Table {
     ) -> Result<Vec<RecordBatch>> {
         crate::util::concurrency::bounded_in_order(
             file_slices,
-            self.file_slice_read_concurrency(),
+            self.bounded_read_concurrency(file_slices),
             |file_slice| fg_reader.read_file_slice(file_slice, fg_options),
         )
         .await
@@ -1346,6 +1388,57 @@ mod tests {
             file_paths.push(file_url.to_string());
         }
         Ok(file_paths)
+    }
+
+    /// A scan memory budget lowers the core fan-out's concurrency; without one
+    /// the configured ceiling stands.
+    ///
+    /// Pins the wiring rather than the arithmetic — `slices_in_flight` has its
+    /// own tests, and passing those tells you nothing about whether this path
+    /// calls it. The equivalent wiring on the DataFusion side was claimed,
+    /// compiled, and shipped absent; this is the same class of gap on the core
+    /// path.
+    #[tokio::test]
+    async fn a_scan_memory_budget_lowers_the_core_fan_out() {
+        use crate::file_group::base_file::BaseFile;
+        use crate::file_group::file_slice::FileSlice;
+        use crate::storage::file_metadata::FileMetadata;
+        use std::str::FromStr;
+
+        // Log files with recorded sizes: an unmeasured slice is unestimatable and
+        // floors at 1, which would make the bounded arm pass for the wrong reason.
+        let slices: Vec<FileSlice> = (0..4)
+            .map(|i| {
+                let name = format!("a{i}0000-0000-0000-0000-00000000000{i}-0_0-1-0_001.parquet");
+                let mut fs = FileSlice::new(BaseFile::from_str(&name).unwrap(), String::new());
+                let log = format!(".a{i}0000-0000-0000-0000-00000000000{i}-0_002.log.1_0-1-0");
+                let mut lf = crate::file_group::log_file::LogFile::from_str(&log).unwrap();
+                lf.file_metadata = Some(FileMetadata::new(&log, 8 * 1024 * 1024));
+                fs.log_files.insert(lf);
+                fs
+            })
+            .collect();
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let unbounded = Table::new(base_url.path()).await.unwrap();
+        assert_eq!(
+            unbounded.bounded_read_concurrency(&slices),
+            4,
+            "with no budget the configured ceiling stands"
+        );
+
+        // Each slice estimates at 33 MiB + 4 x 8 MiB = 65 MiB, so 128 MiB admits one.
+        let bounded = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.read.scan.max.memory.size", "134217728")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bounded.bounded_read_concurrency(&slices),
+            1,
+            "a 128 MiB budget must admit one 65 MiB slice, not the ceiling of 4"
+        );
     }
 
     #[tokio::test]
@@ -2396,7 +2489,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(serial.file_slice_read_concurrency(), 1);
+        assert_eq!(serial.bounded_read_concurrency(&[]), 1);
         let serial_rows = serial
             .read(&ReadOptions::new())
             .await
@@ -2427,7 +2520,7 @@ mod tests {
             "the error must name the offending key, got: {err}"
         );
         // And the ceiling the fan-out would have used is never zero regardless.
-        assert!(zero.file_slice_read_concurrency() >= 1);
+        assert!(zero.bounded_read_concurrency(&[]) >= 1);
     }
 
     /// Regression test: the file group reader version set at TABLE level must
